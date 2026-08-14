@@ -97,13 +97,36 @@ PlannerNode::PlannerNode(const rclcpp::NodeOptions& options)
       },
       rclcpp::ServicesQoS(), callback_group_);
 
+  global_vertex_spacing_ =
+      declareOrGet<double>(this, "global_vertex_spacing", 1.0);
+
   const double publish_period =
       declareOrGet<double>(this, "graph_publish_period_sec", 2.0);
-  // create_wall_timer would ignore /clock; with the ARGoS bridge publishing
-  // simulated time that would make the publish rate wrong in simulation.
+  // Node::create_timer drives off get_clock(), the node's RCL_ROS_TIME clock.
+  // That is correct in both deployments: on a real robot use_sim_time is false
+  // and ROS time follows the system clock, while in simulation it follows
+  // /clock. create_wall_timer would be wrong in the second case, running at
+  // wall rate while the ARGoS bridge steps simulated time at its own pace.
   graph_timer_ = create_timer(
       std::chrono::duration<double>(publish_period),
       [this]() { publishOwnGraph(); publishMarkers(); }, callback_group_);
+
+  // The one way that choice bites: use_sim_time true with nothing publishing
+  // /clock leaves ROS time pinned at zero, so the timer never fires and the
+  // node looks alive but silent. Deliberately a wall timer, since it has to
+  // fire while ROS time is frozen. One shot.
+  if (get_parameter("use_sim_time").as_bool()) {
+    sim_time_check_ = create_wall_timer(std::chrono::seconds(5), [this]() {
+      sim_time_check_->cancel();
+      if (now().nanoseconds() == 0) {
+        RCLCPP_WARN(get_logger(),
+                    "use_sim_time is set but /clock has not been seen: ROS "
+                    "time is still zero, so timers will never fire. Start the "
+                    "simulation's clock publisher, or unset use_sim_time when "
+                    "running on a robot.");
+      }
+    });
+  }
 
   RCLCPP_INFO(get_logger(),
               "mggplanner ready: robot %u, frame '%s', grid %.2f x %.2f x %.2f",
@@ -221,6 +244,8 @@ std::string PlannerNode::buildLocalGraph() {
   if (!have_odometry_) return "no odometry received yet";
   if (!map_->getStatus()) return "map is empty; no point cloud received yet";
 
+  updateGlobalGraph();
+
   local_graph_->reset();
   auto* root = new mgg::Vertex(0, current_state_);
   root->robot_id = static_cast<int>(planning_params_.robot_id);
@@ -240,6 +265,54 @@ std::string PlannerNode::buildLocalGraph() {
                 r.free_cells, r.vertices_added, r.edges_added,
                 r.hit_limit ? " (hit a size limit)" : "");
   return std::string(buf);
+}
+
+void PlannerNode::updateGlobalGraph() {
+  if (!have_odometry_) return;
+
+  mgg::StateVec state = current_state_;
+  // Drop the pose onto the terrain first, so global vertices sit where the
+  // robot could actually stand. Matches what searchHomingPath does before
+  // linking the current state in.
+  if (robot_params_.type == mgg::RobotType::kGroundRobot) {
+    Eigen::Vector3d pos(state[0], state[1], state[2]);
+    mgg::VoxelStatus vs;
+    const double ground_height = ground_->projectSample(pos, vs);
+    if (vs != mgg::VoxelStatus::kOccupied) return;  // nothing to stand on yet
+    state[0] = pos[0];
+    state[1] = pos[1];
+    state[2] = pos[2] - (ground_height - planning_params_.max_ground_height);
+  }
+
+  if (global_graph_->getNumVertices() == 0) {
+    auto* root = new mgg::Vertex(0, state);
+    root->robot_id = static_cast<int>(planning_params_.robot_id);
+    global_graph_->addVertex(root);
+    RCLCPP_INFO(get_logger(), "global graph seeded at (%.2f, %.2f, %.2f)",
+                state[0], state[1], state[2]);
+    return;
+  }
+
+  mgg::Vertex* nearest = nullptr;
+  if (!global_graph_->getNearestVertex(&state, &nearest) ||
+      nearest == nullptr) {
+    return;
+  }
+  const Eigen::Vector3d origin(nearest->state[0], nearest->state[1],
+                               nearest->state[2]);
+  const Eigen::Vector3d here(state[0], state[1], state[2]);
+  const double d = (here - origin).norm();
+  // Only extend once the robot has actually moved, or the graph fills with
+  // near-duplicate vertices every cycle.
+  if (d < global_vertex_spacing_) return;
+
+  auto* v = new mgg::Vertex(global_graph_->generateVertexID(), state);
+  v->robot_id = static_cast<int>(planning_params_.robot_id);
+  v->parent = nearest;
+  v->distance = nearest->distance + d;
+  nearest->children.push_back(v);
+  global_graph_->addVertex(v);
+  global_graph_->addEdge(v, nearest, d);
 }
 
 void PlannerNode::onBuildRequest(

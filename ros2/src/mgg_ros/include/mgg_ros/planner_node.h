@@ -57,6 +57,14 @@ class PlannerNode : public rclcpp::Node {
   /// suitable for a service response.
   std::string buildLocalGraph();
 
+  /// Extends the global topological graph with the robot's current pose.
+  ///
+  /// The global graph is the sparse, persistent one that robots exchange: a
+  /// root, the trajectory, and (once gain evaluation is ported) frontiers.
+  /// Without the trajectory backbone there is nothing to broadcast and no
+  /// geometry for a neighbour's graph to rendezvous with.
+  void updateGlobalGraph();
+
   mgg::ExpandContext makeContext();
 
   // Core state. None of these know about ROS.
@@ -74,6 +82,7 @@ class PlannerNode : public rclcpp::Node {
 
   mgg::StateVec current_state_ = mgg::StateVec::Zero();
   bool have_odometry_ = false;
+  double global_vertex_spacing_ = 1.0;
   std::string world_frame_ = "world";
 
   rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr odom_sub_;
@@ -84,6 +93,8 @@ class PlannerNode : public rclcpp::Node {
       marker_pub_;
   rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr build_srv_;
   rclcpp::TimerBase::SharedPtr graph_timer_;
+  /// One-shot guard against use_sim_time with no /clock.
+  rclcpp::TimerBase::SharedPtr sim_time_check_;
 
   /// Reentrant, so the planning service and the subscriptions can run
   /// concurrently under a MultiThreadedExecutor. See the note in main().
