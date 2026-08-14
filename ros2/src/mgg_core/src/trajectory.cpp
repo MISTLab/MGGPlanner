@@ -29,11 +29,10 @@ double computeDistanceBetweenTrajectoryAndDirection(
   std::vector<Eigen::Vector3d> path_ref;
   int n = (int)(path_length / discrete_length);
   for (int i = 0; i < n; ++i) {
-    // NOTE: `n`, not `i`. Reproduced from the ROS 1 code, where it makes every
-    // reference point identical so the comparison is against a single point
-    // rather than a ray along the heading. See the header. Changing it to `i`
-    // alters path selection in every shipped configuration.
-    Eigen::Vector3d ei = p0 + uvector * n;
+    // `i`, not `n`. The ROS 1 code used n here, which made every reference
+    // point identical, so the DTW measured distance to a single point instead
+    // of deviation from a ray along the heading.
+    Eigen::Vector3d ei = p0 + uvector * i;
     path_ref.push_back(ei);
   }
 

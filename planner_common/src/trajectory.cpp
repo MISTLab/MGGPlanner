@@ -90,7 +90,10 @@ double Trajectory::computeDistanceBetweenTrajectoryAndDirection(
   std::vector<Eigen::Vector3d> path_ref;
   int n = (int)(path_length / discrete_length);
   for (int i = 0; i < n; ++i) {
-    Eigen::Vector3d ei = p0 + uvector * n;
+    // `i`, not `n`: with n every reference point coincided, so the DTW below
+    // measured distance to a single point instead of deviation from a ray
+    // along the heading.
+    Eigen::Vector3d ei = p0 + uvector * i;
     path_ref.push_back(ei);
   }
 

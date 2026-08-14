@@ -33,21 +33,15 @@ double estimateDirectionFromPath(const PathType& path);
 
 /// How far `path` deviates from travelling along `heading`.
 ///
-/// KNOWN DEFECT, reproduced deliberately. The reference path this compares
-/// against is built as
+/// Compares the path against a straight reference ray of the same length
+/// running along `heading`, using a dynamic time warping distance, optionally
+/// normalised by the squared path length.
 ///
-///     for (i = 0; i < n; ++i) path_ref.push_back(p0 + uvector * n);
-///
-/// using `n` where `i` was meant, so every reference point is identical and
-/// the "direction" is a single point at p0 + heading * path_length rather
-/// than a ray along the heading. The DTW is therefore degenerate: it measures
-/// distance to one point, not deviation from a direction.
-///
-/// This is live. path_direction_penalty is 0.3 in three shipped configs and
-/// 0.2 in the fourth, so the term is applied on every path. The planner does
-/// still prefer forward paths, but by a different measure than intended.
-/// Correcting it would change path selection, so it is left as-is pending a
-/// decision. See ROS2_PORT_PLAN.md section 4.4.
+/// The ROS 1 version built that reference with `p0 + uvector * n` inside a
+/// loop over `i`, so every reference point coincided and the DTW measured
+/// distance to a single point rather than deviation from a direction. It was
+/// live, since path_direction_penalty is non-zero in every shipped config.
+/// Corrected here; see ROS2_PORT_PLAN.md section 4.4.
 double computeDistanceBetweenTrajectoryAndDirection(const PathType& path,
                                                     double heading,
                                                     double discrete_length,
