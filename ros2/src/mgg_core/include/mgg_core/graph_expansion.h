@@ -18,6 +18,7 @@
 #include "mgg_core/graph_manager.h"
 #include "mgg_core/ground_projection.h"
 #include "mgg_core/map_interface.h"
+#include "mgg_core/path_selection.h"
 #include "mgg_core/params.h"
 #include "mgg_core/types.h"
 
@@ -36,6 +37,12 @@ struct ExpandContext {
   /// which the ROS 1 code always built for RViz. Null skips that work
   /// entirely, which is the common case off-robot.
   GraphManager* projected_graph = nullptr;
+
+  /// Optional. Receives the average inclination of each accepted edge, which
+  /// selectBestPath needs for its negative-slope check. Without it that check
+  /// falls back to straight-line geometry and misses terrain undulating
+  /// between the endpoints.
+  EdgeInclinations* inclinations = nullptr;
 
   int robot_id = 0;
   /// Planning footprint, i.e. robot->getPlanningSize().

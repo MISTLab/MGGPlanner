@@ -40,6 +40,18 @@ bool geofenceBlocks(const ExpandContext& ctx, const Eigen::Vector3d& start,
          GeofenceManager::CoordinateStatus::kViolated;
 }
 
+/// Mean inclination of a ground-projected polyline, as the ROS 1 code
+/// computed it before storing.
+double averageInclination(const std::vector<Eigen::Vector3d>& edge) {
+  if (edge.size() < 2) return 0.0;
+  double total = 0.0;
+  for (size_t i = 1; i < edge.size(); ++i) {
+    const Eigen::Vector3d seg = edge[i] - edge[i - 1];
+    total += std::atan2(std::abs(seg(2)), seg.head(2).norm());
+  }
+  return total / static_cast<double>(edge.size() - 1);
+}
+
 /// Can the robot travel the segment? Fills `projected_edge` for ground robots.
 bool edgeTraversable(const ExpandContext& ctx, const Eigen::Vector3d& start,
                      const Eigen::Vector3d& end, bool is_hanging,
@@ -163,6 +175,10 @@ void expandGraph(GraphManager& graph, Vertex& new_vertex,
   rep.vertex_added = added;
   graph.addEdge(added, nearest_vertex, direction_norm);
   ++rep.num_edges_added;
+  if (ctx.inclinations != nullptr && !projected_edge.empty()) {
+    ctx.inclinations->set(added->id, nearest_vertex->id,
+                          averageInclination(projected_edge));
+  }
 
   if (ctx.planning->rr_mode != RRModeType::kGraph) {
     rep.status = ExpandGraphStatus::kSuccess;
@@ -206,6 +222,10 @@ void expandGraph(GraphManager& graph, Vertex& new_vertex,
     }
     graph.addEdge(added, neighbour, d_norm);
     ++rep.num_edges_added;
+    if (ctx.inclinations != nullptr && !neighbour_edge.empty()) {
+      ctx.inclinations->set(added->id, neighbour->id,
+                            averageInclination(neighbour_edge));
+    }
   }
 
   rep.status = ExpandGraphStatus::kSuccess;

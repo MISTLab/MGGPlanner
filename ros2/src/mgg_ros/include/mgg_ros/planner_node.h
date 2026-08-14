@@ -19,6 +19,7 @@
 #include <unordered_map>
 
 #include <nav_msgs/msg/odometry.hpp>
+#include <nav_msgs/msg/path.hpp>
 #include <sensor_msgs/msg/point_cloud2.hpp>
 #include <rclcpp/rclcpp.hpp>
 #include <std_srvs/srv/trigger.hpp>
@@ -32,6 +33,7 @@
 #include "mgg_core/graph_manager.h"
 #include "mgg_core/graph_merge.h"
 #include "mgg_core/grid_graph.h"
+#include "mgg_core/path_selection.h"
 #include "mgg_core/ground_projection.h"
 #include "mgg_core/params.h"
 #include "mgg_core/sensor_params.h"
@@ -52,6 +54,7 @@ class PlannerNode : public rclcpp::Node {
       const std::shared_ptr<std_srvs::srv::Trigger::Request> request,
       std::shared_ptr<std_srvs::srv::Trigger::Response> response);
   void publishOwnGraph();
+  void publishPath();
   void publishMarkers();
 
   /// Builds the local grid graph around the current state. Returns a summary
@@ -87,6 +90,11 @@ class PlannerNode : public rclcpp::Node {
   mgg::StateVec current_state_ = mgg::StateVec::Zero();
   bool have_odometry_ = false;
   double global_vertex_spacing_ = 1.0;
+  /// Heading the robot has been travelling, for the direction penalty.
+  double exploring_direction_ = 0.0;
+  mgg::EdgeInclinations edge_inclinations_;
+  /// Last chosen path, in world coordinates.
+  std::vector<mgg::StateVec> best_path_;
   std::string world_frame_ = "world";
 
   rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr odom_sub_;
@@ -95,6 +103,7 @@ class PlannerNode : public rclcpp::Node {
   rclcpp::Publisher<mgg_msgs::msg::Graph>::SharedPtr graph_pub_;
   rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr
       marker_pub_;
+  rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr path_pub_;
   rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr build_srv_;
   rclcpp::TimerBase::SharedPtr graph_timer_;
   /// One-shot guard against use_sim_time with no /clock.

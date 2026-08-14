@@ -5,6 +5,7 @@
 #include <sensor_msgs/point_cloud2_iterator.hpp>
 
 #include "mgg_core/log.h"
+#include "mgg_core/trajectory.h"
 #include "mgg_ros/conversions.h"
 #include "mgg_ros/param_loader.h"
 
@@ -88,6 +89,11 @@ PlannerNode::PlannerNode(const rclcpp::NodeOptions& options)
                                                       rclcpp::QoS(10));
   marker_pub_ = create_publisher<visualization_msgs::msg::MarkerArray>(
       "graph_markers", rclcpp::QoS(1));
+  // Latched: the best path is a latest-value topic, and a follower or RViz
+  // started after the planner would otherwise see nothing until the next
+  // cycle.
+  path_pub_ = create_publisher<nav_msgs::msg::Path>(
+      "best_path", rclcpp::QoS(1).transient_local());
 
   build_srv_ = create_service<std_srvs::srv::Trigger>(
       "build_local_graph",
@@ -177,6 +183,7 @@ mgg::GainContext PlannerNode::makeGainContext() {
 
 mgg::ExpandContext PlannerNode::makeContext() {
   mgg::ExpandContext ctx;
+  ctx.inclinations = &edge_inclinations_;
   ctx.map = map_.get();
   ctx.planning = &planning_params_;
   ctx.robot = &robot_params_;
@@ -260,6 +267,8 @@ std::string PlannerNode::buildLocalGraph() {
   updateGlobalGraph();
 
   local_graph_->reset();
+  // Inclinations are keyed by vertex id and the ids restart with the graph.
+  edge_inclinations_.clear();
   auto* root = new mgg::Vertex(0, current_state_);
   root->robot_id = static_cast<int>(planning_params_.robot_id);
   local_graph_->addVertex(root);
@@ -281,27 +290,42 @@ std::string PlannerNode::buildLocalGraph() {
       *local_graph_, gain_ctx, planning_params_.leafs_only_for_volumetric_gain,
       planning_params_.cluster_vertices_for_gain);
 
-  // Best frontier, which is what the path selection will consume once
-  // evaluateGraph and getBestPath are ported.
-  const mgg::Vertex* best = nullptr;
   int frontiers = 0;
   for (const auto& entry : local_graph_->vertices_map_) {
-    const mgg::Vertex* v = entry.second;
-    if (v == nullptr) continue;
-    if (v->type == mgg::VertexType::kFrontier) ++frontiers;
-    if (best == nullptr || v->vol_gain.gain > best->vol_gain.gain) best = v;
+    if (entry.second != nullptr &&
+        entry.second->type == mgg::VertexType::kFrontier) {
+      ++frontiers;
+    }
   }
 
-  char buf[288];
-  std::snprintf(buf, sizeof(buf),
-                "grid graph: %d free cells, %d vertices, %d edges%s; "
-                "%d viewpoints evaluated, %d frontiers, best gain %.1f at "
-                "(%.2f, %.2f, %.2f)",
-                r.free_cells, r.vertices_added, r.edges_added,
-                r.hit_limit ? " (hit a size limit)" : "", evaluated, frontiers,
-                best ? best->vol_gain.gain : 0.0,
-                best ? best->state[0] : 0.0, best ? best->state[1] : 0.0,
-                best ? best->state[2] : 0.0);
+  const mgg::PathSelectionResult sel = mgg::selectBestPath(
+      *local_graph_, planning_params_, robot_params_, edge_inclinations_,
+      map_->getResolution(), exploring_direction_);
+
+  best_path_.clear();
+  for (const mgg::Vertex* v : sel.best_path) {
+    if (v != nullptr) best_path_.push_back(v->state);
+  }
+  if (best_path_.size() >= 2) {
+    // Remember where this path is heading, so the next cycle penalises
+    // doubling back.
+    std::vector<Eigen::Vector3d> points;
+    points.reserve(best_path_.size());
+    for (const mgg::StateVec& s : best_path_) points.push_back(s.head(3));
+    exploring_direction_ = mgg::estimateDirectionFromPath(points);
+  }
+  publishPath();
+
+  char buf[352];
+  std::snprintf(
+      buf, sizeof(buf),
+      "grid graph: %d free cells, %d vertices, %d edges%s; %d viewpoints, "
+      "%d frontiers; best path %zu poses, gain %.1f%s, heading %.2f rad",
+      r.free_cells, r.vertices_added, r.edges_added,
+      r.hit_limit ? " (hit a size limit)" : "", evaluated, frontiers,
+      best_path_.size(), sel.best_gain,
+      sel.paths_rejected_steep > 0 ? " (some paths too steep)" : "",
+      exploring_direction_);
   return std::string(buf);
 }
 
@@ -359,6 +383,19 @@ void PlannerNode::onBuildRequest(
   response->message = buildLocalGraph();
   response->success = local_graph_->getNumVertices() > 1;
   RCLCPP_INFO(get_logger(), "%s", response->message.c_str());
+}
+
+void PlannerNode::publishPath() {
+  nav_msgs::msg::Path msg;
+  msg.header.stamp = now();
+  msg.header.frame_id = world_frame_;
+  for (const mgg::StateVec& s : best_path_) {
+    geometry_msgs::msg::PoseStamped pose;
+    pose.header = msg.header;
+    pose.pose = toPoseMsg(s);
+    msg.poses.push_back(pose);
+  }
+  path_pub_->publish(msg);
 }
 
 void PlannerNode::publishOwnGraph() {

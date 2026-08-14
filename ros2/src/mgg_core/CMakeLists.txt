@@ -1,6 +1,21 @@
 cmake_minimum_required(VERSION 3.8)
 project(mgg_core)
 
+# Default to Release.
+#
+# catkin took the build type from the workspace (the ROS 1 image runs
+# "catkin config -DCMAKE_BUILD_TYPE=Release"); colcon has no equivalent, so a
+# plain "colcon build" produces an unoptimised binary. That is not a small
+# difference here: the planner is Eigen-heavy, and measured on the dynamic time
+# warping inner loop of the direction penalty, -O0 costs 199 ns per cell
+# against 4.8 ns with -O2, a factor of 41. An unoptimised planner misses its
+# planning cycle by an order of magnitude.
+#
+# An explicit -DCMAKE_BUILD_TYPE still wins.
+if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
+  set(CMAKE_BUILD_TYPE Release CACHE STRING "Build type" FORCE)
+endif()
+
 if(NOT CMAKE_CXX_STANDARD)
   set(CMAKE_CXX_STANDARD 17)
 endif()

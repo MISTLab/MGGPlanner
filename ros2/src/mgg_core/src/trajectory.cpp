@@ -115,33 +115,34 @@ double estimateDirectionFromPath(const PathType& path) {
 }
 
 double computeDTWDistance(const PathType& pa, const PathType& pb) {
-  int n = pa.size();
-  int m = pb.size();
+  const int n = static_cast<int>(pa.size());
+  const int m = static_cast<int>(pb.size());
+  if (n == 0 || m == 0) return std::numeric_limits<double>::max();
 
-  std::vector<std::vector<double>> dist;
-  dist.resize(n + 1);
-  for (auto& v : dist) {
-    v.resize(m + 1);
-  }
+  // Two rolling rows rather than the full (n+1) x (m+1) table. The recurrence
+  // only ever reads the previous row and the cell to the left, so the extra
+  // rows are dead weight, and the ROS 1 version allocated one std::vector per
+  // row on every call. This is the dominant cost of a planning cycle: the
+  // direction penalty runs this once per leaf, and a representative graph has
+  // a few hundred leaves with paths of a hundred-odd interpolated points.
+  //
+  // Results are identical; only the storage changed.
+  const double inf = std::numeric_limits<double>::infinity();
+  std::vector<double> prev(m + 1, inf);
+  std::vector<double> curr(m + 1, inf);
+  prev[0] = 0.0;
 
   for (int i = 1; i <= n; ++i) {
-    dist[i][0] = std::numeric_limits<double>::infinity();
-  }
-  for (int j = 1; j <= m; ++j) {
-    dist[0][j] = std::numeric_limits<double>::infinity();
-  }
-
-  dist[0][0] = 0;
-  for (int i = 1; i <= n; ++i) {
+    curr[0] = inf;
     for (int j = 1; j <= m; ++j) {
-      double d = (pa[i - 1] - pb[j - 1]).norm();
-      dist[i][j] = d + std::min(std::min(dist[i - 1][j - 1], dist[i - 1][j]),
-                                dist[i][j - 1]);
+      const double d = (pa[i - 1] - pb[j - 1]).norm();
+      curr[j] = d + std::min(std::min(prev[j - 1], prev[j]), curr[j - 1]);
     }
+    prev.swap(curr);
   }
-
-  return dist[n][m];
+  return prev[m];
 }
+
 
 
 }  // namespace mgg
