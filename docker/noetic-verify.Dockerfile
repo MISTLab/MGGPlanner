@@ -74,7 +74,9 @@ RUN git clone https://github.com/ethz-asl/protobuf_catkin.git misc/protobuf_catk
 # voxblox_ros find_package()s it, so rviz has to be installed above.
 RUN git clone --branch dev/noetic https://github.com/ntnu-arl/voxblox.git mapping/voxblox
 RUN git clone --branch main https://github.com/ntnu-arl/pci_general.git exploration/pci_general
-RUN git clone https://github.com/ntnu-arl/adaptive_obb_ros.git exploration/adaptive_obb_ros
+# adaptive_obb is NOT cloned: it is vendored into MGGPlanner itself, because it
+# build-depends on planner_common and was welded to the voxblox map manager.
+# See MGGPlanner/adaptive_obb/PROVENANCE.md.
 
 WORKDIR /ws
 RUN source /opt/ros/noetic/setup.bash \
@@ -83,12 +85,6 @@ RUN source /opt/ros/noetic/setup.bash \
 
 # Pre-build everything that does not depend on MGGPlanner, so that iterating
 # on the planner source is fast and does not rebuild voxblox each time.
-#
-# adaptive_obb is deliberately NOT pre-built here: despite living in its own
-# repository it build-depends on planner_common and includes
-# planner_common/map_manager_voxblox_impl.h directly, so it cannot compile
-# until MGGPlanner is mounted. It gets built at verify time along with the
-# planner.
 RUN source /opt/ros/noetic/setup.bash \
     && catkin build voxblox_ros --no-status -j"$(nproc)"
 
