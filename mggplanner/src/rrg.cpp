@@ -1076,15 +1076,8 @@ void Rrg::expandGraph(std::shared_ptr<GraphManager> graph_manager,
       }
       avg_inclination /= projected_edge.size();
 
-      // Written once; the original repeated this identical assignment.
-      // Note it is stored one way only, [new][nearest], while evaluateGraph
-      // reads [path[i]][path[i-1]]. That matches for the primary link, where
-      // the new vertex is always the one further from the root, but a
-      // neighbour edge added below can be oriented either way and then reads
-      // back as 0.0. Preserved as-is: making it symmetric would newly reject
-      // paths that are accepted today.
-      edge_inclinations_[edgeKey(new_vertex_ptr->id, nearest_vertex->id)] =
-          avg_inclination;
+      setEdgeInclination(new_vertex_ptr->id, nearest_vertex->id,
+                         avg_inclination);
     }
 
     // Form more edges from neighbors if set RRG mode.
@@ -1178,9 +1171,8 @@ void Rrg::expandGraph(std::shared_ptr<GraphManager> graph_manager,
                 }
                 avg_inclination /= projected_edge.size();
                 
-                edge_inclinations_[edgeKey(new_vertex_ptr->id,
-                                           nearest_vertices[i]->id)] =
-                    avg_inclination;
+                setEdgeInclination(new_vertex_ptr->id,
+                                   nearest_vertices[i]->id, avg_inclination);
               }
               graph_manager->addEdge(new_vertex_ptr, nearest_vertices[i],
                                      d_norm);

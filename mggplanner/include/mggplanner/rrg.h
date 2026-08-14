@@ -323,6 +323,17 @@ class Rrg {
     auto it = edge_inclinations_.find(edgeKey(a, b));
     return it == edge_inclinations_.end() ? 0.0 : it->second;
   }
+  // Stored both ways. An edge's inclination does not depend on which end you
+  // name first, but the original wrote only [new][nearest] while
+  // evaluateGraph reads [path[i]][path[i-1]]. Those coincide for the primary
+  // link, where the new vertex is always further from the root, but a
+  // neighbour edge in RRG mode can be oriented either way and then read back
+  // as 0.0, i.e. flat. Steep neighbour edges were therefore invisible to the
+  // negative-slope rejection.
+  void setEdgeInclination(int a, int b, double value) {
+    edge_inclinations_[edgeKey(a, b)] = value;
+    edge_inclinations_[edgeKey(b, a)] = value;
+  }
 
   // Add a collision-free path to the graph.
   bool addRefPathToGraph(const std::shared_ptr<GraphManager> graph_manager,
