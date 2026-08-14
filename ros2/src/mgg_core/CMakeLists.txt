@@ -15,7 +15,8 @@ find_package(Boost REQUIRED)  # Boost.Graph, header-only
 # planner_common.
 add_library(${PROJECT_NAME}
   src/graph.cpp
-  src/sensor_params.cpp)
+  src/sensor_params.cpp
+  src/graph_base.cpp)
 target_include_directories(${PROJECT_NAME} PUBLIC
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
   $<INSTALL_INTERFACE:include>
@@ -38,6 +39,8 @@ if(BUILD_TESTING)
   target_link_libraries(test_graph ${PROJECT_NAME})
   ament_add_gtest(test_sensor_params test/test_sensor_params.cpp)
   target_link_libraries(test_sensor_params ${PROJECT_NAME})
+  ament_add_gtest(test_graph_base test/test_graph_base.cpp)
+  target_link_libraries(test_graph_base ${PROJECT_NAME})
 endif()
 
 ament_package()
