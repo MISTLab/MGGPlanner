@@ -23,6 +23,8 @@ add_library(${PROJECT_NAME}
   src/params.cpp
   src/geofence_manager.cpp
   src/ground_projection.cpp
+  src/graph_expansion.cpp
+  src/grid_graph.cpp
   src/log.cpp)
 target_include_directories(${PROJECT_NAME} PUBLIC
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
@@ -58,6 +60,8 @@ if(BUILD_TESTING)
   target_link_libraries(test_geofence ${PROJECT_NAME})
   ament_add_gtest(test_ground_projection test/test_ground_projection.cpp)
   target_link_libraries(test_ground_projection ${PROJECT_NAME})
+  ament_add_gtest(test_grid_graph test/test_grid_graph.cpp)
+  target_link_libraries(test_grid_graph ${PROJECT_NAME})
 endif()
 
 ament_package()

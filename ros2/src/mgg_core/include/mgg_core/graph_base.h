@@ -152,6 +152,10 @@ struct ExpandGraphReport {
   int num_vertices_added = 0;
   int num_edges_added = 0;
   Vertex* vertex_added = nullptr;
+  /// Candidate edges rejected for exceeding max_inclination. The ROS 1 code
+  /// counted these in a local that was never read; reporting it makes the
+  /// "the robot is boxed in by slopes" case visible to the caller.
+  int steep_edges = 0;
 };
 
 struct RandomSamplingParams {
