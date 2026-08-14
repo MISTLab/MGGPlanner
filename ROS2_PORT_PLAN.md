@@ -257,6 +257,44 @@ free space near surfaces, so frontier positions and gain tallies will not be
 bit-identical to published runs. Capture a ROS 1 baseline before touching
 anything and compare.
 
+### 4.1 Result of that comparison (open question)
+
+The baseline was captured (`tools/map_baseline/baseline_ros1.csv`) and
+`mgg_map_octomap` was measured against it on the same scene and query battery.
+
+Agrees: voxel classification (free inside, occupied on surfaces, unknown
+outside), ray verdicts, path verdicts, resolution.
+
+Differs, understood: OctoMap reports more free and less unknown on the voxel
+lattice (1422/2512 against voxblox's 1047/2874), because it carves along every
+ray to `max_range` and its obstacles lack the truncation band, making them
+roughly a voxel thinner. `occupied_dilation_voxels` can compensate; it
+defaults to 0.
+
+Also learned: voxblox's `getScanStatus` deduplicates shared free space across
+neighbouring rays via its `starting_points` matrix, so the correct counterpart
+is `getScanStatusIterative`, not the plain variant.
+
+**Differs, unresolved:** the baseline ranks the room centre above the corner
+for unknown volume (2361 against 1798); OctoMap ranks them the other way.
+Frontier selection acts on that ordering, so this could change where a robot
+chooses to explore.
+
+Hypothesis: `nonuniform_ray_cast_` is on by default in the voxblox
+implementation. It grows the ray step with distance and extrapolates counts
+with `ceil(step_size/og_step_size)`, so a ray can step straight over a
+one-voxel-thick wall and accumulate the unknown space behind it. From the room
+centre the walls are about 10 m away, in the coarse-step region; from the
+corner about 2 m, in the fine region. That would inflate the centre's unknown
+count specifically, which would make the baseline ordering partly a sampling
+artifact rather than a property of the scene.
+
+**Decision needed:** reproduce the artifact (match published behaviour), or
+keep exact traversal (defensible, but exploration choices will differ from the
+paper). The assertion is committed as a DISABLED test so it is visible rather
+than silently dropped. Settling this needs a run in a real environment, not
+just the synthetic scene: phase 6 or 7 is the natural point.
+
 ---
 
 ## 5. ARGoS harness
@@ -329,19 +367,19 @@ by design rather than after debugging a hang.
 
 ## 7. Phases
 
-**Phase 0: baseline and skeleton (3 to 4 days).** Build the Jazzy dev image.
+**Phase 0 [DONE]: baseline and skeleton (3 to 4 days).** Build the Jazzy dev image.
 Capture a ROS 1 behavioural baseline (gain values, frontier positions on a
 fixed cloud) as the reference for the OctoMap swap. Stand up the workspace on
 a `ros2` branch so the ROS 1 tree stays runnable for comparison.
 
-**Phase 1: prune, on the ROS 1 tree (2 to 3 days).** Delete the dead
+**Phase 1 [DONE]: prune, on the ROS 1 tree (2 to 3 days).** Delete the dead
 distance-field paths (`COL_CHECK_METHOD != 0`, `EDGE_CHECK_METHOD != 1`,
 `getPointDistance`, `getVoxelDistance`, the `interpolate_projection_distance`
 branch), then revert `rrg.h`'s 3 declarations and `rrg.cpp:15` to
 `MapManager*`. Pure deletion; proves section 4 empirically; worth doing to the
 original codebase regardless.
 
-**Phase 2: `mgg_core` extraction (1.5 to 2.5 weeks).** Move the algorithm into
+**Phase 2 [STARTED]: `mgg_core` extraction (1.5 to 2.5 weeks).** Move the algorithm into
 a ROS-free library. Abstract logging, timing, and the graph-exchange type.
 Convert `params.cpp` to plain structs. **Add unit tests against synthetic
 maps** (this is the packaging deliverable: the core becomes testable without
@@ -361,10 +399,10 @@ Carried over from phase 1, as interface-design changes rather than deletions:
   dependency-light core; consider returning plain `Eigen::Vector3d` and
   converting at the ROS boundary.
 
-**Phase 3: `mgg_msgs` (2 to 3 days).** The section 6 interface fixes. Verify
+**Phase 3 [DONE]: `mgg_msgs` (2 to 3 days).** The section 6 interface fixes. Verify
 by re-running the `rosidl_adapter` check to 43/43.
 
-**Phase 4: `mgg_map_octomap` (4 days to 1.5 weeks).** `MapInterface` over
+**Phase 4 [MOSTLY DONE]: `mgg_map_octomap` (4 days to 1.5 weeks).** `MapInterface` over
 OctoMap plus a `PointCloud2` + TF front end. Validate against the phase 0
 baseline before building on it.
 
@@ -412,7 +450,17 @@ Phases 3, 4, and 6 are largely independent of 2 and 5 and can be parallelized.
 | OctoMap query cost in hot loops | Planning rate drops | Voxel-hash fallback behind the same interface |
 | Filament + Vulkan in Docker | Blocks all-in-Docker | Keep host-ARGoS working as fallback |
 
-## 9. Recommended first move
+## 9. Status
+
+Phases 0, 1 and 3 are complete and verified in Docker. Phase 4 has a working
+OctoMap backend measured against the baseline, with the gain-ordering question
+in 4.1 outstanding and a PointCloud2/TF front end still to write. Phase 2 has
+its map contract and value types; the algorithm itself (grid graph, global
+graph, merge) is still in the ROS 1 tree.
+
+Next: finish phase 4's ROS front end, then move the planner core across.
+
+## 10. Recommended first move
 
 Phases 0 and 1 are cheap, are pure improvements to the existing ROS 1 codebase,
 and de-risk the largest assumption in the plan. Start there before committing
