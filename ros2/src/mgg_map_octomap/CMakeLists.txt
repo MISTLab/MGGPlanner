@@ -10,6 +10,11 @@ find_package(ament_cmake REQUIRED)
 find_package(mgg_core REQUIRED)
 find_package(octomap REQUIRED)
 find_package(Eigen3 REQUIRED)
+find_package(rclcpp REQUIRED)
+find_package(sensor_msgs REQUIRED)
+find_package(tf2 REQUIRED)
+find_package(tf2_ros REQUIRED)
+find_package(tf2_geometry_msgs REQUIRED)
 
 add_library(${PROJECT_NAME} src/octomap_map.cpp)
 target_include_directories(${PROJECT_NAME} PUBLIC
@@ -22,6 +27,13 @@ target_link_libraries(${PROJECT_NAME} mgg_core::mgg_core ${OCTOMAP_LIBRARIES}
 install(DIRECTORY include/ DESTINATION include)
 install(TARGETS ${PROJECT_NAME} EXPORT export_${PROJECT_NAME}
   ARCHIVE DESTINATION lib LIBRARY DESTINATION lib RUNTIME DESTINATION bin)
+
+# The ingest node is the only ROS-aware target here.
+add_executable(octomap_map_node src/octomap_map_node.cpp)
+target_link_libraries(octomap_map_node ${PROJECT_NAME})
+ament_target_dependencies(octomap_map_node
+  rclcpp sensor_msgs tf2 tf2_ros tf2_geometry_msgs)
+install(TARGETS octomap_map_node DESTINATION lib/${PROJECT_NAME})
 
 ament_export_targets(export_${PROJECT_NAME} HAS_LIBRARY_TARGET)
 ament_export_dependencies(mgg_core octomap Eigen3)

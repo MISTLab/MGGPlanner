@@ -22,6 +22,14 @@
   <depend>octomap</depend>
   <depend>eigen</depend>
 
+  <!-- ROS dependencies of the ingest node only; the OctomapMap class itself
+       links none of these. -->
+  <depend>rclcpp</depend>
+  <depend>sensor_msgs</depend>
+  <depend>tf2</depend>
+  <depend>tf2_ros</depend>
+  <depend>tf2_geometry_msgs</depend>
+
   <test_depend>ament_cmake_gtest</test_depend>
 
   <export>
