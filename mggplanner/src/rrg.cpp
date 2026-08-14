@@ -1395,7 +1395,6 @@ Rrg::GraphStatus Rrg::buildGridGraphExapnd(StateVec state, Eigen::Vector3d robot
   int loop_count = 0;
   int num_vertices = 1;
   int num_edges = 0;
-  GraphManager* grid_graph = new GraphManager();
 
   // Root vertex must be exactly at the state.
 
@@ -1549,7 +1548,6 @@ Rrg::GraphStatus Rrg::buildGridGraph(StateVec state, Eigen::Vector3d robot_size,
   // edges only. Clean unconnected vertices or edges to provide a clean graph.
   // ??? Grid_min <= 0; Grid_max >= 0; grid_res >= 0;
 
-  GraphManager* grid_graph = new GraphManager();
 
   // Root vertex must be exactly at the state.
 
