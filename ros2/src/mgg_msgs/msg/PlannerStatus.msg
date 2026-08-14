@@ -1,0 +1,8 @@
+std_msgs/Header header
+
+bool success
+TriggerMode trigger_mode
+BoundMode bound_mode
+PlanningMode planning_mode
+ExecutionPathMode exe_path_mode
+float32 max_vel

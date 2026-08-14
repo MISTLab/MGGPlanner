@@ -51,3 +51,7 @@ qtcreator-*
 CATKIN_IGNORE
 
 .vscode/
+# ROS 2 (colcon) build artifacts
+ros2/build/
+ros2/install/
+ros2/log/
