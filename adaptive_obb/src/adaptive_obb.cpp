@@ -119,11 +119,19 @@ void AdaptiveObb::constructBoundingBox(const Eigen::Vector3d& pos,
                            voxel_filter_leaf_size_);
   voxel_filter.filter(*local_filtered);
 
-  // Compute rotation matrix depending on selected method
-  Eigen::Matrix3d rot_w2b;
-  Eigen::Vector3d variance;
+  // Compute rotation matrix depending on selected method.
+  // Both are initialised: every branch below must leave them well defined,
+  // and an empty local cloud must not leave them as uninitialised memory.
+  Eigen::Matrix3d rot_w2b = Eigen::Matrix3d::Identity();
+  Eigen::Vector3d variance = Eigen::Vector3d::Ones();
 
-  if (type_ == AdaptiveObbType::kPca) {
+  if (local_filtered->size() < 2) {
+    // PCA and the sample variance below both need at least two points.
+    ROS_WARN_COND(global_verbosity >= Verbosity::WARN,
+                  "[AdaptiveObb]: only %zu local points; falling back to an "
+                  "axis-aligned box",
+                  local_filtered->size());
+  } else if (type_ == AdaptiveObbType::kPca) {
     // Matrix constructed from the vectors of the principal component analysis
     // Works bad in self-similar environments
     pcl::PCA<pcl::PointXYZI> pca;
@@ -135,7 +143,15 @@ void AdaptiveObb::constructBoundingBox(const Eigen::Vector3d& pos,
 
     double cloud_size = local_filtered->size();
     variance = pca.getEigenValues().cast<double>() / (cloud_size - 1);
-    variance.cwiseAbs();
+    // cwiseAbs() is const and returns an expression, so the result has to be
+    // assigned back. Leaving it unassigned (as this line originally did) meant
+    // a negative eigenvalue would reach cwiseSqrt() below and produce NaN
+    // bounds.
+    variance = variance.cwiseAbs();
+  } else {
+    // kAabb: keep the world axes and just measure the spread along them.
+    computeVarianceInReferenceFrame(variance, local_filtered_ptr, rot_w2b);
+    variance = variance.cwiseAbs();
   }
 
   // Change to a representation convertible to euler angles
@@ -154,6 +170,16 @@ void AdaptiveObb::constructBoundingBox(const Eigen::Vector3d& pos,
   // reference frame
   Eigen::Vector3d sigma = variance.cwiseSqrt();
   double sigma_max = sigma.maxCoeff();
+  if (!(sigma_max > 0.0) || !sigma.allFinite()) {
+    // Degenerate spread (all points coincident, or a non-finite eigenvalue).
+    // Without this the divisions below yield NaN bounds, which propagate
+    // straight into the sampler.
+    ROS_WARN_COND(global_verbosity >= Verbosity::WARN,
+                  "[AdaptiveObb]: degenerate point distribution; using an "
+                  "isotropic box");
+    sigma = Eigen::Vector3d::Ones();
+    sigma_max = 1.0;
+  }
 
   min_val = offset - sigma / sigma_max * bounding_box_size_max_ / 2;
   max_val = offset + sigma / sigma_max * bounding_box_size_max_ / 2;
@@ -175,9 +201,14 @@ bool AdaptiveObb::loadParams(std::string ns) {
   ros::param::get(param_name, parse_str);
   if (!parse_str.compare("kPca"))
     type_ = AdaptiveObbType::kPca;
-  else if (!parse_str.compare("kMvbb"))
-    type_ = AdaptiveObbType::kMvbb;
-  else if (!parse_str.compare("kAabb"))
+  else if (!parse_str.compare("kMvbb")) {
+    // kMvbb (minimum volume bounding box) has never been implemented:
+    // constructBoundingBox only ever had a kPca branch. Accepting it here used
+    // to leave the rotation and variance uninitialised and produce a garbage
+    // box, so refuse it instead of failing silently at run time.
+    ROS_ERROR("[AdaptiveObb]: type kMvbb is not implemented; use kPca or kAabb");
+    return false;
+  } else if (!parse_str.compare("kAabb"))
     type_ = AdaptiveObbType::kAabb;
   else {
     ROSPARAM_ERROR(param_name);
