@@ -1105,12 +1105,6 @@ bool PlanningParams::loadParams(std::string ns) {
     ROSPARAM_WARN(param_name, relaxed_corridor_multiplier);
   }
 
-  param_name = ns + "/interpolate_projection_distance";
-  if (!ros::param::get(param_name, interpolate_projection_distance)) {
-    interpolate_projection_distance = false;
-    ROSPARAM_WARN(param_name, interpolate_projection_distance);
-  }
-
   param_name = ns + "/go_home_if_fully_explored";
   if (!ros::param::get(param_name, go_home_if_fully_explored)) {
     go_home_if_fully_explored = false;

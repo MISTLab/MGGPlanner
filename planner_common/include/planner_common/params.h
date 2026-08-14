@@ -291,7 +291,6 @@ struct PlanningParams {
   double max_ground_height;
   double robot_height;
   double max_inclination;
-  bool interpolate_projection_distance;
   // Clearing free space before planning (depricated)
   double augment_free_voxels_time;
   bool augment_free_frustum_en;

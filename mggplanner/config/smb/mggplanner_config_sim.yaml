@@ -155,7 +155,6 @@ PlanningParams:
   max_ground_height: 0.8 # All points will be projected to this height from ground
   robot_height: 0.6  # Height of robot's base frame from ground
   max_inclination: rad(20.0*pi/180)
-  interpolate_projection_distance: false
   
   yaw_tangent_correction: true
   traverse_length_max: 5.0

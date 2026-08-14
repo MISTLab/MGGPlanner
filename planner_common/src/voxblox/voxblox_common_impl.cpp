@@ -22,7 +22,6 @@ MapManagerVoxblox<SDFServerType, SDFVoxelType>::MapManagerVoxblox(
       occupancy_distance_voxelsize_factor_(1.0F) {
   sdf_layer_ = getSDFLayer();
   CHECK_NOTNULL(sdf_layer_);
-  interpolator_ = new voxblox::Interpolator<SDFVoxelType>(sdf_layer_);
 
   // Get local parameters from passed nodehandle
   if (!nh_private.getParam("occupancy_distance_voxelsize_factor",
@@ -40,44 +39,15 @@ MapManagerVoxblox<SDFServerType, SDFVoxelType>::MapManagerVoxblox(
   esdf_integrator_config_ =
       voxblox::getEsdfIntegratorConfigFromRosParam(nh_private);
 
-#if (COL_CHECK_METHOD == 0)
   ROS_INFO_COND(global_verbosity >= Verbosity::INFO,
                 "[MapManager]: Point collision checking method: Box check");
-#elif (COL_CHECK_METHOD == 1)
-  ROS_INFO_COND(global_verbosity >= Verbosity::INFO,
-                "[MapManager]: Point collision checking method: Direct T/ESDF");
-#elif (COL_CHECK_METHOD == 2)
-  ROS_INFO_COND(
-      global_verbosity >= Verbosity::INFO,
-      "[MapManager]: Point collision checking method: Interpolated T/ESDF");
-#endif
 
-#if (EDGE_CHECK_METHOD == 0)
-  ROS_INFO_COND(
-      global_verbosity >= Verbosity::INFO,
-      "[MapManager]: Line collision checking method: Multiple box checks");
-#elif (EDGE_CHECK_METHOD == 1)
   ROS_INFO_COND(
       global_verbosity >= Verbosity::INFO,
       "[MapManager]: Line collision checking method: Cuboid around the");
-#elif (EDGE_CHECK_METHOD == 2)
-  ROS_INFO_COND(
-      global_verbosity >= Verbosity::INFO,
-      "[MapManager]: Line collision checking method: Direct T/ESDF check");
-#elif (EDGE_CHECK_METHOD == 3)
-  ROS_INFO_COND(
-      global_verbosity >= Verbosity::INFO,
-      "[MapManager]: Line collision checking method: Interpolated T/ESDF "
-      "check");
-#endif
 
-#if (RAY_CAST_METHOD == 0)
-  ROS_INFO_COND(global_verbosity >= Verbosity::INFO,
-                "[MapManager]: Ray casting method: Original");
-#elif (RAY_CAST_METHOD == 1)
   ROS_INFO_COND(global_verbosity >= Verbosity::INFO,
                 "[MapManager]: Ray casting method: Iterative");
-#endif
 }
 
 template <typename SDFServerType, typename SDFVoxelType>
@@ -261,22 +231,6 @@ MapManagerVoxblox<SDFServerType, SDFVoxelType>::getBoxStatusInVoxels(
   return current_status;
 }
 
-// [NEED TO REVIEW]
-template <typename SDFServerType, typename SDFVoxelType>
-float MapManagerVoxblox<SDFServerType, SDFVoxelType>::getVoxelDistance(
-    const Eigen::Vector3d& center) const {
-  float voxel_size = sdf_layer_->voxel_size();
-  float voxel_size_inv =
-      1.0 /
-      voxel_size;  // Get the center of the bounding box as a global index.
-  voxblox::LongIndex center_voxel_index =
-      voxblox::getGridIndexFromPoint<voxblox::LongIndex>(
-          center.cast<voxblox::FloatingPoint>(), voxel_size_inv);
-  SDFVoxelType* voxel =
-      sdf_layer_->getVoxelPtrByGlobalIndex(center_voxel_index);
-  if (checkUnknownStatus(voxel)) return -1.0;
-  return voxel->distance;
-}
 
 // TSDF
 template <typename SDFServerType, typename SDFVoxelType>
@@ -325,28 +279,6 @@ bool MapManagerVoxblox<SDFServerType, SDFVoxelType>::augmentFreeBox(
     }
   }
   return true;
-}
-
-template <typename SDFServerType, typename SDFVoxelType>
-double MapManagerVoxblox<SDFServerType, SDFVoxelType>::getPointDistance(
-    const Eigen::Vector3d& point) const {
-  voxblox::FloatingPoint out_dist;
-  voxblox::Point out_grad;
-  bool success = interpolator_->getDistance(
-      point.cast<voxblox::FloatingPoint>(), &out_dist, true);
-  if (!success) {
-    success = interpolator_->getDistance(point.cast<voxblox::FloatingPoint>(),
-                                         &out_dist, false);
-    if (!success)
-      out_dist = -1.0;  // Unknown
-    else {
-      if (out_dist < 0.0) out_dist = 0.001;  // Occupied
-    }
-  } else {
-    if (out_dist < 0.0) out_dist = 0.001;  // Occupied
-  }
-
-  return out_dist;  // Free
 }
 
 // [NEED TO REVIEW]

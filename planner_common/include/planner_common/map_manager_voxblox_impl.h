@@ -142,9 +142,6 @@ class MapManagerVoxblox : MapManager {
                            const Eigen::Vector3d& size,
                            bool stop_at_unknown_voxel) const;
 
-  float getVoxelDistance(const Eigen::Vector3d& center) const;
-  double getPointDistance(const Eigen::Vector3d& point) const;
-
   VoxelStatus getPathStatus(const Eigen::Vector3d& start,
                             const Eigen::Vector3d& end,
                             const Eigen::Vector3d& box_size,
@@ -217,8 +214,6 @@ class MapManagerVoxblox : MapManager {
 
   SDFServerType sdf_server_;
   voxblox::Layer<SDFVoxelType>* sdf_layer_;
-
-  voxblox::Interpolator<SDFVoxelType>* interpolator_;
 
   // multiplier of a single voxel size to consider as a distance metric for
   // occupancy threshold
