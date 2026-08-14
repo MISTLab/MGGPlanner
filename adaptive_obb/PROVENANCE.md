@@ -32,10 +32,17 @@ The only map method this package calls is the four-argument
 `getLocalPointcloud`, which was promoted onto the abstract `MapManager`
 interface to support the change. No algorithmic code was touched.
 
-## Licensing: unresolved
+## Licensing
 
-**Upstream ships no LICENSE file, and its `package.xml` declares
-`<license>TODO</license>`.** The licensing terms are therefore unspecified,
-and vendoring it here does not resolve that. Before this repository is
-redistributed, the terms should be confirmed with the upstream authors and a
-proper license recorded both here and in `adaptive_obb/package.xml`.
+**BSD-3-Clause**, confirmed with the upstream authors.
+
+The upstream repository ships no LICENSE file and its `package.xml` declared
+`<license>TODO</license>`, so the terms were not discoverable from the source
+tree alone. They were checked directly rather than assumed. `package.xml`
+here now records BSD-3-Clause.
+
+BSD-3-Clause permits redistribution in source and binary form provided the
+copyright notice, the condition list and the disclaimer are retained, and
+that the authors are not used to endorse derived work without permission.
+Retaining this file and the attribution header in
+`include/adaptive_obb/adaptive_obb.h` satisfies the attribution requirement.

@@ -6,8 +6,7 @@
 
   <maintainer email="magnufh@stud.ntnu.no">Magnus Flaten Lindefjeld</maintainer>
 
-  <!-- Upstream declares no license; see PROVENANCE.md -->
-  <license>TODO</license>
+  <license>BSD-3-Clause</license>
   
   <buildtool_depend>catkin</buildtool_depend>
   <buildtool_depend>catkin_simple</buildtool_depend>
