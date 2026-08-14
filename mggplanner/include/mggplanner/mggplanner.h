@@ -34,8 +34,7 @@ class Mggplanner {
 
   Mggplanner(const ros::NodeHandle& nh, const ros::NodeHandle& nh_private);
   Mggplanner(const ros::NodeHandle& nh, const ros::NodeHandle& nh_private,
-            MapManagerVoxblox<MapManagerVoxbloxServer, MapManagerVoxbloxVoxel>*
-                map_manager);
+            MapManager* map_manager);
 
   void initializeAttributes();
 

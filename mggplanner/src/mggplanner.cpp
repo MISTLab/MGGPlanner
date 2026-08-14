@@ -20,8 +20,7 @@ Mggplanner::Mggplanner(const ros::NodeHandle& nh,
 
 Mggplanner::Mggplanner(const ros::NodeHandle& nh,
                      const ros::NodeHandle& nh_private,
-                     MapManagerVoxblox<MapManagerVoxbloxServer,
-                                       MapManagerVoxbloxVoxel>* map_manager)
+                     MapManager* map_manager)
     : nh_(nh), nh_private_(nh_private) {
   
   planner_status_ = Mggplanner::PlannerStatus::NOT_READY;

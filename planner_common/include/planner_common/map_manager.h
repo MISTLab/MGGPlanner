@@ -13,6 +13,9 @@ class MapManager {
 
   MapManager(const ros::NodeHandle& nh, const ros::NodeHandle& nh_private)
       : nh_(nh), nh_private_(nh_private) {}
+  // The planner now holds the map through this base pointer, so destruction
+  // through it has to be well defined.
+  virtual ~MapManager() = default;
   virtual double getResolution() const = 0;
   virtual bool getStatus() const = 0;
   virtual VoxelStatus getVoxelStatus(const Eigen::Vector3d& position) const = 0;
@@ -39,6 +42,27 @@ class MapManager {
       std::tuple<int, int, int>& gain_log,
       std::vector<std::pair<Eigen::Vector3d, VoxelStatus>>& voxel_log,
       SensorParamsBase& sensor_params) = 0;
+
+  virtual void getScanStatusIterative(
+      Eigen::Vector3d& pos, std::vector<Eigen::Vector3d>& multiray_endpoints,
+      std::tuple<int, int, int>& gain_log,
+      std::vector<std::pair<Eigen::Vector3d, VoxelStatus>>& voxel_log,
+      SensorParamsBase& sensor_params) = 0;
+
+  virtual void getFreeSpacePointCloud(std::vector<Eigen::Vector3d> multiray_endpoints,
+                                      StateVec state,
+                                      pcl::PointCloud<pcl::PointXYZ>::Ptr cloud) = 0;
+
+  virtual void setRaycastingParams(bool nonuniform_ray_cast,
+                                   double ray_cast_step_size_multiplier) = 0;
+
+  virtual void setRobotRadius(double robot_radius) = 0;
+
+  // Used by adaptive_obb to fit a bounding box to nearby geometry.
+  virtual void getLocalPointcloud(const Eigen::Vector3d& center,
+                                  const double& range, const double& yaw,
+                                  pcl::PointCloud<pcl::PointXYZI>& pcl,
+                                  bool include_unknown_voxels = false) = 0;
 
   virtual void augmentFreeFrustum() = 0;
 

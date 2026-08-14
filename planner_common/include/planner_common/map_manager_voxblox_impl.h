@@ -122,7 +122,7 @@ struct hash<Eigen::Matrix<Scalar, Rows, Cols>> {
 
 // namespace explorer {
 template <typename SDFServerType, typename SDFVoxelType>
-class MapManagerVoxblox : MapManager {
+class MapManagerVoxblox : public MapManager {
  public:
   MapManagerVoxblox(const ros::NodeHandle& nh,
                     const ros::NodeHandle& nh_private);

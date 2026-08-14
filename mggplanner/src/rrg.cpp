@@ -1,5 +1,7 @@
 #include "mggplanner/rrg.h"
 
+#include "planner_common/map_manager_voxblox_impl.h"
+
 #include <opencv2/highgui.hpp>
 #include <opencv2/opencv.hpp>
 #include <pcl/common/transforms.h>
@@ -21,8 +23,7 @@ Rrg::Rrg(const ros::NodeHandle& nh, const ros::NodeHandle& nh_private)
 }
 
 Rrg::Rrg(const ros::NodeHandle& nh, const ros::NodeHandle& nh_private,
-         MapManagerVoxblox<MapManagerVoxbloxServer, MapManagerVoxbloxVoxel>*
-             map_manager)
+         MapManager* map_manager)
     : nh_(nh), nh_private_(nh_private), map_manager_(map_manager) {
   adaptive_obb_ = new AdaptiveObb(map_manager_);
 

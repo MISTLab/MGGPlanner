@@ -1,12 +1,20 @@
 #pragma once
 
+// Vendored into MGGPlanner from https://github.com/ntnu-arl/adaptive_obb_ros
+// at commit 7dc24c973d233f63d73f2a8548e6f5227bc422bb (2021-11-02,
+// Mihir Dharmadhikari). See adaptive_obb/PROVENANCE.md.
+//
+// Local change: the map is held through the abstract MapManager interface
+// rather than MapManagerVoxblox<Server,Voxel>, so the planner is not welded
+// to a TSDF backend. The only map method used here is getLocalPointcloud.
+
 #include <string>
 
 #include <eigen3/Eigen/Dense>
 #include <pcl/search/impl/search.hpp>
 
 #include "pcl_ros/point_cloud.h"
-#include "planner_common/map_manager_voxblox_impl.h"
+#include "planner_common/map_manager.h"
 #include "planner_common/params.h"
 #include "sensor_msgs/PointCloud2.h"
 
@@ -14,9 +22,7 @@ enum AdaptiveObbType { kPca = 0, kMvbb, kAabb };
 
 class AdaptiveObb {
  public:
-  AdaptiveObb(MapManagerVoxblox<MapManagerVoxbloxServer,
-                                MapManagerVoxbloxVoxel>* map_manager)
-      : map_manager_(map_manager) {}
+  AdaptiveObb(MapManager* map_manager) : map_manager_(map_manager) {}
   ~AdaptiveObb();
 
   void computeBounds(Eigen::Vector3d& min_val, Eigen::Vector3d& max_val,
@@ -41,8 +47,7 @@ class AdaptiveObb {
   bool loadParams(std::string ns);
 
  private:
-  MapManagerVoxblox<MapManagerVoxbloxServer, MapManagerVoxbloxVoxel>*
-      map_manager_;
+  MapManager* map_manager_;
 
   AdaptiveObbType type_;
   double local_pointcloud_range_;

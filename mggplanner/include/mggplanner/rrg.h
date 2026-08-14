@@ -38,7 +38,6 @@
 #include "planner_common/graph_manager.h"
 // #include "planner_common/neighbour_graph_manager.h"
 #include "planner_common/map_manager.h"
-#include "planner_common/map_manager_voxblox_impl.h"
 #include "planner_common/params.h"
 #include "planner_common/random_sampler.h"
 #include "planner_common/trajectory.h"
@@ -86,8 +85,7 @@ class Rrg {
   Rrg(const ros::NodeHandle& nh, const ros::NodeHandle& nh_private);
   // If the external map manager is to be passed
   Rrg(const ros::NodeHandle& nh, const ros::NodeHandle& nh_private,
-      MapManagerVoxblox<MapManagerVoxbloxServer, MapManagerVoxbloxVoxel>*
-          map_manager);
+      MapManager* map_manager);
 
   // Initialize the graph to start a new planning session.
   void reset();
@@ -128,10 +126,7 @@ class Rrg {
   void computeExplorationGain(bool only_leaf_vertices = false,
                               bool clustering = false);
 
-  MapManagerVoxblox<MapManagerVoxbloxServer, MapManagerVoxbloxVoxel>*
-  getMapManager() {
-    return map_manager_;
-  }
+  MapManager* getMapManager() { return map_manager_; }
 
   // Evaluate gains of all vertices and find the best path.
   GraphStatus evaluateGraph();
@@ -450,12 +445,7 @@ class Rrg {
   // config file
   BoundingBoxType global_bound_;
 
-#ifdef USE_OCTOMAP
-  MapManagerOctomap* map_manager_;
-#else
-  MapManagerVoxblox<MapManagerVoxbloxServer, MapManagerVoxbloxVoxel>*
-      map_manager_;
-#endif
+  MapManager* map_manager_;
 
   std::shared_ptr<GeofenceManager> geofence_manager_;
 
