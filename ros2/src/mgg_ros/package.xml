@@ -16,6 +16,10 @@
 
   <depend>mgg_core</depend>
   <depend>mgg_msgs</depend>
+  <depend>mgg_map_octomap</depend>
+  <depend>nav_msgs</depend>
+  <depend>sensor_msgs</depend>
+  <depend>std_srvs</depend>
   <depend>rclcpp</depend>
   <depend>std_msgs</depend>
   <depend>geometry_msgs</depend>

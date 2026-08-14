@@ -33,6 +33,24 @@
 
 namespace mgg_ros {
 
+/// Declares `name` only if it is not declared already, then returns its value.
+///
+/// Necessary because the node uses
+/// automatically_declare_parameters_from_overrides: any parameter the user
+/// actually supplies is already declared by the time the constructor runs, and
+/// calling declare_parameter on it again throws
+/// ParameterAlreadyDeclaredException. A plain declare_parameter therefore works
+/// while a setting is left at its default and crashes as soon as somebody sets
+/// it, which is exactly backwards.
+template <typename T>
+T declareOrGet(rclcpp::Node* node, const std::string& name,
+               const T& default_value) {
+  if (!node->has_parameter(name)) {
+    return node->declare_parameter<T>(name, default_value);
+  }
+  return node->get_parameter(name).get_value<T>();
+}
+
 /// Reads nested parameters using the ROS 1 '/' spelling, so ported call sites
 /// keep their original names.
 class ParamLoader {
