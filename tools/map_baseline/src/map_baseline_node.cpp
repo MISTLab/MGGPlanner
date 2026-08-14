@@ -290,8 +290,13 @@ int main(int argc, char** argv) {
     std::vector<std::pair<Eigen::Vector3d, MapManager::VoxelStatus>> voxel_log;
     Eigen::Vector3d pos(s[0], s[1], s[2]);
     map->getScanStatus(pos, endpoints, gain_log, voxel_log, sensor);
+    // Field order is (unknown, free, occupied). It is easy to get wrong:
+    // MapManagerVoxblox builds the tuple as
+    //   make_tuple(num_unknown_voxels, num_free_voxels, num_occupied_voxels)
+    // and Rrg::computeVolumetricGain unpacks it in that same order, but
+    // nothing in the type says so.
     char buf[128];
-    std::snprintf(buf, sizeof(buf), "unknown=%d;occupied=%d;free=%d",
+    std::snprintf(buf, sizeof(buf), "unknown=%d;free=%d;occupied=%d",
                   std::get<0>(gain_log), std::get<1>(gain_log),
                   std::get<2>(gain_log));
     out << "gain," << s[0] << "," << s[1] << "," << s[2] << "," << i << ","
