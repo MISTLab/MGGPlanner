@@ -106,6 +106,14 @@ PlannerNode::PlannerNode(const rclcpp::NodeOptions& options)
   global_vertex_spacing_ =
       declareOrGet<double>(this, "global_vertex_spacing", 1.0);
 
+  plan_srv_ = create_service<mgg_msgs::srv::PlannerSrv>(
+      "mggplanner",
+      [this](const std::shared_ptr<mgg_msgs::srv::PlannerSrv::Request> req,
+             std::shared_ptr<mgg_msgs::srv::PlannerSrv::Response> res) {
+        onPlanRequest(req, res);
+      },
+      rclcpp::ServicesQoS(), callback_group_);
+
   const double publish_period =
       declareOrGet<double>(this, "graph_publish_period_sec", 2.0);
   // Node::create_timer drives off get_clock(), the node's RCL_ROS_TIME clock.
@@ -383,6 +391,26 @@ void PlannerNode::onBuildRequest(
   response->message = buildLocalGraph();
   response->success = local_graph_->getNumVertices() > 1;
   RCLCPP_INFO(get_logger(), "%s", response->message.c_str());
+}
+
+void PlannerNode::onPlanRequest(
+    const std::shared_ptr<mgg_msgs::srv::PlannerSrv::Request> request,
+    std::shared_ptr<mgg_msgs::srv::PlannerSrv::Response> response) {
+  // A caller may pin the bound mode for this cycle, e.g. to squeeze through a
+  // gap it would normally refuse.
+  const mgg::BoundModeType previous = robot_params_.bound_mode;
+  robot_params_.bound_mode =
+      static_cast<mgg::BoundModeType>(request->bound_mode);
+
+  const std::string summary = buildLocalGraph();
+  robot_params_.bound_mode = previous;
+
+  response->planning_bound_mode = request->bound_mode;
+  response->status = mgg_msgs::srv::PlannerSrv::Response::FORWARD;
+  for (const mgg::StateVec& s : best_path_) {
+    response->path.push_back(toPoseMsg(s));
+  }
+  RCLCPP_INFO(get_logger(), "plan request: %s", summary.c_str());
 }
 
 void PlannerNode::publishPath() {

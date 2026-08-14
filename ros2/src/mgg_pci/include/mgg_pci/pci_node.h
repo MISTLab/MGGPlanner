@@ -1,0 +1,69 @@
+// Planner control interface: the thing that decides when to ask the planner
+// for a path and what to do with the answer.
+//
+// Written fresh rather than ported. The ROS 1 role was filled by
+// pci_general, which is a separate ROS 1 repository built around actionlib and
+// a PCIManager abstraction; the surface actually needed is narrow (trigger,
+// stop, path out) and a clean implementation serves the packaging goal better
+// than a port.
+//
+// This is where the executor question from section 6 of ROS2_PORT_PLAN.md
+// becomes concrete. The interface calls the planner's service from inside its
+// own service callback. Under a SingleThreadedExecutor that deadlocks: the one
+// executor thread is already occupied running the trigger callback, so it can
+// never process the planner's response, and the wait times out. The callbacks
+// therefore live in a reentrant group and main() spins a MultiThreadedExecutor.
+// test_pci_deadlock demonstrates the failure directly.
+
+#ifndef MGG_PCI_PCI_NODE_H_
+#define MGG_PCI_PCI_NODE_H_
+
+#include <memory>
+#include <string>
+
+#include <nav_msgs/msg/odometry.hpp>
+#include <nav_msgs/msg/path.hpp>
+#include <rclcpp/rclcpp.hpp>
+#include <std_srvs/srv/trigger.hpp>
+
+#include <mgg_msgs/srv/planner_srv.hpp>
+
+namespace mgg_pci {
+
+class PciNode : public rclcpp::Node {
+ public:
+  explicit PciNode(const rclcpp::NodeOptions& options);
+
+ private:
+  void onTrigger(const std::shared_ptr<std_srvs::srv::Trigger::Request> request,
+                 std::shared_ptr<std_srvs::srv::Trigger::Response> response);
+  void onStop(const std::shared_ptr<std_srvs::srv::Trigger::Request> request,
+              std::shared_ptr<std_srvs::srv::Trigger::Response> response);
+  void onOdometry(nav_msgs::msg::Odometry::ConstSharedPtr msg);
+  void tick();
+
+  /// Asks the planner for a path. Blocks until it answers or the timeout
+  /// expires, which is only safe because of the executor arrangement above.
+  bool requestPlan(std::vector<geometry_msgs::msg::Pose>& path,
+                   std::string& error);
+
+  void publishPath(const std::vector<geometry_msgs::msg::Pose>& path);
+
+  rclcpp::Client<mgg_msgs::srv::PlannerSrv>::SharedPtr planner_client_;
+  rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr trigger_srv_;
+  rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr stop_srv_;
+  rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr odom_sub_;
+  rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr path_pub_;
+  rclcpp::TimerBase::SharedPtr auto_timer_;
+  rclcpp::CallbackGroup::SharedPtr callback_group_;
+
+  bool running_ = false;
+  bool have_odometry_ = false;
+  double service_timeout_sec_ = 30.0;
+  int bound_mode_ = 0;
+  std::string world_frame_ = "world";
+};
+
+}  // namespace mgg_pci
+
+#endif  // MGG_PCI_PCI_NODE_H_

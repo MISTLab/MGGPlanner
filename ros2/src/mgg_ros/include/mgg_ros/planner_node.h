@@ -26,6 +26,7 @@
 #include <visualization_msgs/msg/marker_array.hpp>
 
 #include <mgg_msgs/msg/graph.hpp>
+#include <mgg_msgs/srv/planner_srv.hpp>
 
 #include "mgg_core/geofence_manager.h"
 #include "mgg_core/gain.h"
@@ -53,6 +54,10 @@ class PlannerNode : public rclcpp::Node {
   void onBuildRequest(
       const std::shared_ptr<std_srvs::srv::Trigger::Request> request,
       std::shared_ptr<std_srvs::srv::Trigger::Response> response);
+  /// The planning service proper: run a cycle and hand back the chosen path.
+  void onPlanRequest(
+      const std::shared_ptr<mgg_msgs::srv::PlannerSrv::Request> request,
+      std::shared_ptr<mgg_msgs::srv::PlannerSrv::Response> response);
   void publishOwnGraph();
   void publishPath();
   void publishMarkers();
@@ -105,6 +110,7 @@ class PlannerNode : public rclcpp::Node {
       marker_pub_;
   rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr path_pub_;
   rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr build_srv_;
+  rclcpp::Service<mgg_msgs::srv::PlannerSrv>::SharedPtr plan_srv_;
   rclcpp::TimerBase::SharedPtr graph_timer_;
   /// One-shot guard against use_sim_time with no /clock.
   rclcpp::TimerBase::SharedPtr sim_time_check_;
