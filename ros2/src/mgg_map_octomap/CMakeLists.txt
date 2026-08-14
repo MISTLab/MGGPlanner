@@ -1,0 +1,36 @@
+cmake_minimum_required(VERSION 3.8)
+project(mgg_map_octomap)
+
+if(NOT CMAKE_CXX_STANDARD)
+  set(CMAKE_CXX_STANDARD 17)
+endif()
+add_compile_options(-Wall -Wextra -Wpedantic)
+
+find_package(ament_cmake REQUIRED)
+find_package(mgg_core REQUIRED)
+find_package(octomap REQUIRED)
+find_package(Eigen3 REQUIRED)
+
+add_library(${PROJECT_NAME} src/octomap_map.cpp)
+target_include_directories(${PROJECT_NAME} PUBLIC
+  $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+  $<INSTALL_INTERFACE:include>
+  ${OCTOMAP_INCLUDE_DIRS})
+target_link_libraries(${PROJECT_NAME} mgg_core::mgg_core ${OCTOMAP_LIBRARIES}
+  Eigen3::Eigen)
+
+install(DIRECTORY include/ DESTINATION include)
+install(TARGETS ${PROJECT_NAME} EXPORT export_${PROJECT_NAME}
+  ARCHIVE DESTINATION lib LIBRARY DESTINATION lib RUNTIME DESTINATION bin)
+
+ament_export_targets(export_${PROJECT_NAME} HAS_LIBRARY_TARGET)
+ament_export_dependencies(mgg_core octomap Eigen3)
+ament_export_include_directories(include)
+
+if(BUILD_TESTING)
+  find_package(ament_cmake_gtest REQUIRED)
+  ament_add_gtest(test_octomap_map test/test_octomap_map.cpp)
+  target_link_libraries(test_octomap_map ${PROJECT_NAME})
+endif()
+
+ament_package()

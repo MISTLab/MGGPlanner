@@ -1,0 +1,30 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <name>mgg_map_octomap</name>
+  <version>1.0.0</version>
+  <description>
+    An OctoMap-backed implementation of mgg_core's MapInterface, replacing
+    the ROS 1 voxblox map manager. The planner only ever queried ternary
+    occupancy, so a TSDF was never required; see section 4 of
+    ROS2_PORT_PLAN.md.
+
+    The OctomapMap class itself is free of ROS so it can be unit tested
+    off-robot; the PointCloud2 and TF front end is separate.
+  </description>
+
+  <maintainer email="giovanni.beltrame@polymtl.ca">Giovanni Beltrame</maintainer>
+  <license>TODO</license>
+
+  <buildtool_depend>ament_cmake</buildtool_depend>
+
+  <depend>mgg_core</depend>
+  <depend>octomap</depend>
+  <depend>eigen</depend>
+
+  <test_depend>ament_cmake_gtest</test_depend>
+
+  <export>
+    <build_type>ament_cmake</build_type>
+  </export>
+</package>
