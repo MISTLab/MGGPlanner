@@ -62,11 +62,14 @@ bool BoundedSpaceParams::isInsideSpace(const Eigen::Vector3d& pos) const {
   if (type == BoundedSpaceType::kSphere) {
     return (pos - root_pos_).norm() <= radius_total_;
   }
-  // kCuboid. Compares against min_val/max_val rather than the extended
-  // bounds, matching the ROS 1 behaviour; see the note in the header.
+  // kCuboid. Uses the totals, so min_extension/max_extension take effect
+  // when setCenter was called with use_extension. The ROS 1 code compared
+  // against min_val/max_val here and never read the totals at all.
   const Eigen::Vector3d pos_b = rot_b2w_ * (pos - root_pos_);
   for (int i = 0; i < 3; ++i) {
-    if (pos_b[i] < min_val[i] || pos_b[i] > max_val[i]) return false;
+    if (pos_b[i] < min_val_total_[i] || pos_b[i] > max_val_total_[i]) {
+      return false;
+    }
   }
   return true;
 }

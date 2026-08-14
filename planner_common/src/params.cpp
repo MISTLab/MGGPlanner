@@ -751,9 +751,13 @@ bool BoundedSpaceParams::isInsideSpace(Eigen::Vector3d& pos) {
     if (dist_norm > radius_total) res = false;
   } else if (type == BoundedSpaceType::kCuboid) {
     // Have to check orientation.
+    // Uses the totals so min_extension/max_extension actually apply; they
+    // were previously computed in setCenter and never read. The shipped
+    // configs set the Local extensions to zero, so this is behaviour
+    // neutral until they are deliberately widened.
     Eigen::Vector3d pos_B = rot_B2W * (pos - root_pos);
     for (int i = 0; i < 3; ++i) {
-      if ((pos_B[i] < min_val[i]) || (pos_B[i] > max_val[i])) {
+      if ((pos_B[i] < min_val_total[i]) || (pos_B[i] > max_val_total[i])) {
         res = false;
         break;
       }

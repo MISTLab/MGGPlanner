@@ -322,31 +322,34 @@ floating-point steps leave room for a 73rd azimuth step. Changing it would
 alter the ray density itself. Flagged here as a separate call if the exact
 sensor discretisation ever matters.
 
-### 4.3 Cuboid bound extensions are inert (open question)
+### 4.3 Cuboid bound extensions, resolved
 
-`BoundedSpaceParams` distinguishes the volume the planner *samples* in from a
+`BoundedSpaceParams` separates the volume the planner *samples* in from a
 larger volume used to evaluate exploration *gain*, via `min_extension` and
-`max_extension`. For `kCuboid` spaces that distinction does not exist:
-`isInsideSpace` compares against `min_val`/`max_val`, and the extended bounds
-are never read. In the ROS 1 code `min_val_total` and `max_val_total` were
+`max_extension`. For `kCuboid` spaces that separation did not work:
+`isInsideSpace` compared against `min_val`/`max_val`, and the extended bounds
+were never read. In the ROS 1 code `min_val_total` and `max_val_total` were
 assigned in three places and read in none; only `radius_total`, on the sphere
-path, was ever used.
+path, was used. Since every shipped space is `kCuboid`, the extensions were
+dead configuration.
 
-This is live, not theoretical. `BoundedSpaceParams/Local` in every shipped
-config sets `min_extension: [-20,-20,-20]` and `max_extension: [20,20,20]`,
-intending gain to be evaluated over roughly +/-35 m while sampling stays
-within +/-15 m. Every shipped space is `kCuboid`, so those values do nothing.
+**Decision: honour the extensions, and zero them in the shipped configs.**
 
-Ported faithfully rather than fixed: honouring them would enlarge the gain
-volume by a large factor and change exploration behaviour and runtime
-substantially. `mgg_core` computes the extended bounds and exposes them
-(`minValTotal()`, `maxValTotal()`) so the change can be evaluated, and a
-characterisation test pins the current behaviour so that changing it produces
-a visible diff.
+The mechanism now works in both trees (`mgg_core` and the ROS 1
+`planner_common`, so the two cannot diverge), and the `Local` extensions are
+set to `[0, 0, 0]`, which makes the change behaviour-neutral today. Widening
+the gain volume becomes a deliberate configuration edit rather than something
+that silently does nothing.
 
-**Decision needed:** honour the extensions (probably the original intent, at
-some cost in gain-computation time) or drop the parameters as dead
-configuration.
+**Trap worth knowing:** `GridGraphLocal/min_extension` is *not* a bound
+extension. It carries the grid resolution, assigned at `rrg.cpp:3216` as
+`grid_graph_res_val_ = grid_graph_params_.min_extension`, and its config entry
+is commented "# Resolution". It is deliberately left non-zero. Zeroing it
+would set the grid resolution to zero, and `buildGridGraphExapnd` returns
+`NOT_OK` when any resolution component is zero, so the grid planner, the
+"grid" in MGG, would silently stop producing a local graph. When the grid
+builder moves into `mgg_core` it should take a properly named `resolution`
+field instead of overloading a bounds parameter.
 
 ---
 

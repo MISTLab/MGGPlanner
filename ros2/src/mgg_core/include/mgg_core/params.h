@@ -52,8 +52,8 @@ class BoundedSpaceParams {
   /// Vertex sampling space, metres.
   Eigen::Vector3d min_val = Eigen::Vector3d::Zero();
   Eigen::Vector3d max_val = Eigen::Vector3d::Zero();
-  /// Enlargement applied for exploration gain. See the caveat on
-  /// isInsideSpace: for kCuboid these are currently inert.
+  /// Enlargement applied for exploration gain, active when setCenter is
+  /// called with use_extension.
   Eigen::Vector3d min_extension = Eigen::Vector3d::Zero();
   Eigen::Vector3d max_extension = Eigen::Vector3d::Zero();
   /// [yaw, pitch, roll] of the volume relative to world.
@@ -72,20 +72,18 @@ class BoundedSpaceParams {
 
   /// Is `pos` (world frame) inside the volume?
   ///
-  /// KNOWN LIMITATION, carried over deliberately. For kCuboid this compares
-  /// against min_val/max_val, NOT against the extended bounds, so
-  /// min_extension and max_extension have no effect. In the ROS 1 code
-  /// min_val_total and max_val_total were assigned in three places and never
-  /// read; only radius_total, on the sphere path, was ever used.
+  /// Honours min_extension/max_extension (via setCenter's use_extension flag)
+  /// for both kCuboid and kSphere. The ROS 1 version did so only for
+  /// kSphere: for kCuboid it compared against min_val/max_val, and
+  /// min_val_total/max_val_total were assigned in three places and read in
+  /// none. Since every shipped space is kCuboid, the extensions were dead
+  /// configuration.
   ///
-  /// This is live in the shipped configuration: BoundedSpaceParams/Local sets
-  /// min_extension [-20,-20,-20] and max_extension [20,20,20], intending gain
-  /// to be evaluated over +/-35 m while sampling stays within +/-15 m. Those
-  /// values are silently discarded, and every shipped space is kCuboid.
-  ///
-  /// Honouring them would enlarge the gain volume substantially and change
-  /// exploration behaviour, so it is not done unilaterally. See
-  /// ROS2_PORT_PLAN.md section 4.3.
+  /// The shipped configs set the Local extensions to zero, so enabling this
+  /// changes nothing until someone deliberately widens them. Note that
+  /// GridGraphLocal's min_extension is NOT a bound extension: it carries the
+  /// grid resolution (rrg.cpp assigns it to grid_graph_res_val_), which is
+  /// why it is left non-zero.
   bool isInsideSpace(const Eigen::Vector3d& pos) const;
 
   /// The extended bounds, exposed so the fix above can be evaluated without

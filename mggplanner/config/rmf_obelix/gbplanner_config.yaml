@@ -43,8 +43,8 @@ BoundedSpaceParams:
     type:           kCuboid
     min_val:        [-15.0, -15.0, -3.0]
     max_val:        [15.0, 15.0, 3.0]
-    min_extension:  [-20.0, -20.0, -20.0]
-    max_extension:  [20.0, 20.0, 20.0]
+    min_extension:  [0.0, 0.0, 0.0]
+    max_extension:  [0.0, 0.0, 0.0]
   LocalSearch:
     type:           kCuboid
     min_val:        [-50.0, -50.0, -1.0]

@@ -87,24 +87,44 @@ TEST(BoundedSpace, SphereHonoursTheRadiusExtension) {
   EXPECT_TRUE(s.isInsideSpace(Eigen::Vector3d(7, 0, 0)));
 }
 
-// CHARACTERISATION, not an endorsement. For kCuboid the extension is computed
-// and then ignored by isInsideSpace, exactly as in ROS 1. Every shipped
-// BoundedSpaceParams is kCuboid, and Local configures a +/-20 m extension that
-// therefore does nothing. This test pins the current behaviour so that
-// changing it is a deliberate act with a visible diff. See plan section 4.3.
-TEST(BoundedSpace, CuboidExtensionIsComputedButNotApplied) {
+// The extension now applies to cuboids as well as spheres. In ROS 1 it was
+// computed and discarded for cuboids, which made min_extension/max_extension
+// dead configuration in every shipped file.
+TEST(BoundedSpace, CuboidHonoursTheExtension) {
   BoundedSpaceParams s;
   s.type = BoundedSpaceType::kCuboid;
   s.min_val = Eigen::Vector3d(-15, -15, -3);
   s.max_val = Eigen::Vector3d(15, 15, 3);
   s.min_extension = Eigen::Vector3d(-20, -20, -20);
   s.max_extension = Eigen::Vector3d(20, 20, 20);
-  s.setCenter(Eigen::Vector3d(0.0, 0.0, 0.0), true);
 
-  // The extended bounds are computed correctly...
-  EXPECT_TRUE(s.maxValTotal().isApprox(Eigen::Vector3d(35, 35, 23)));
-  // ...and isInsideSpace ignores them.
+  // Sampling volume: the extension is not applied.
+  s.setCenter(Eigen::Vector3d(0.0, 0.0, 0.0), false);
+  EXPECT_TRUE(s.isInsideSpace(Eigen::Vector3d(10, 0, 0)));
   EXPECT_FALSE(s.isInsideSpace(Eigen::Vector3d(30, 0, 0)));
+
+  // Gain volume: it is.
+  s.setCenter(Eigen::Vector3d(0.0, 0.0, 0.0), true);
+  EXPECT_TRUE(s.maxValTotal().isApprox(Eigen::Vector3d(35, 35, 23)));
+  EXPECT_TRUE(s.isInsideSpace(Eigen::Vector3d(30, 0, 0)));
+  EXPECT_FALSE(s.isInsideSpace(Eigen::Vector3d(40, 0, 0)));
+}
+
+// The shipped configs zero the Local extensions, so use_extension makes no
+// difference in practice until someone widens them deliberately. This pins
+// that, so enabling the mechanism cannot quietly change behaviour.
+TEST(BoundedSpace, ZeroExtensionMakesUseExtensionANoOp) {
+  BoundedSpaceParams s;
+  s.type = BoundedSpaceType::kCuboid;
+  s.min_val = Eigen::Vector3d(-15, -15, -3);
+  s.max_val = Eigen::Vector3d(15, 15, 3);
+  // min_extension and max_extension default to zero, as the configs now set.
+
+  s.setCenter(Eigen::Vector3d(0.0, 0.0, 0.0), true);
+  EXPECT_TRUE(s.minValTotal().isApprox(s.min_val));
+  EXPECT_TRUE(s.maxValTotal().isApprox(s.max_val));
+  EXPECT_TRUE(s.isInsideSpace(Eigen::Vector3d(14.9, 0, 0)));
+  EXPECT_FALSE(s.isInsideSpace(Eigen::Vector3d(15.1, 0, 0)));
 }
 
 }  // namespace
