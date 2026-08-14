@@ -19,6 +19,7 @@ add_library(${PROJECT_NAME}
   src/sensor_params.cpp
   src/graph_base.cpp
   src/graph_manager.cpp
+  src/graph_merge.cpp
   src/log.cpp)
 target_include_directories(${PROJECT_NAME} PUBLIC
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
@@ -46,6 +47,8 @@ if(BUILD_TESTING)
   target_link_libraries(test_graph_base ${PROJECT_NAME})
   ament_add_gtest(test_graph_manager test/test_graph_manager.cpp)
   target_link_libraries(test_graph_manager ${PROJECT_NAME})
+  ament_add_gtest(test_graph_merge test/test_graph_merge.cpp)
+  target_link_libraries(test_graph_merge ${PROJECT_NAME})
 endif()
 
 ament_package()
