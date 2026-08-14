@@ -21,6 +21,7 @@ add_library(${PROJECT_NAME}
   src/graph_manager.cpp
   src/graph_merge.cpp
   src/params.cpp
+  src/geofence_manager.cpp
   src/log.cpp)
 target_include_directories(${PROJECT_NAME} PUBLIC
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
@@ -52,6 +53,8 @@ if(BUILD_TESTING)
   target_link_libraries(test_graph_merge ${PROJECT_NAME})
   ament_add_gtest(test_params test/test_params.cpp)
   target_link_libraries(test_params ${PROJECT_NAME})
+  ament_add_gtest(test_geofence test/test_geofence.cpp)
+  target_link_libraries(test_geofence ${PROJECT_NAME})
 endif()
 
 ament_package()

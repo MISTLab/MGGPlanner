@@ -7,6 +7,11 @@
 #ifndef MGG_CORE_PARAMS_H_
 #define MGG_CORE_PARAMS_H_
 
+#include <cstdint>
+#include <limits>
+#include <string>
+#include <vector>
+
 #include <Eigen/Dense>
 
 #include "mgg_core/types.h"
@@ -100,6 +105,101 @@ class BoundedSpaceParams {
   Eigen::Vector3d min_val_total_ = Eigen::Vector3d::Zero();
   Eigen::Vector3d max_val_total_ = Eigen::Vector3d::Zero();
   double radius_total_ = 0.0;
+};
+
+
+enum class PlanningModeType {
+  kBasicExploration = 0,      ///< bare-bones
+  kNarrowEnvExploration = 1,  ///< tuned for narrow environments
+  kAdaptiveExploration = 2,   ///< adapts the sampling volume to the geometry
+};
+
+enum class RRModeType {
+  kGraph = 0,  ///< graph based search (default)
+  kTree,       ///< tree based search
+};
+
+/// Everything the planner reads from configuration.
+///
+/// The ROS 1 struct had no constructor, so every field was indeterminate until
+/// loadParams ran. The defaults below are the fallbacks loadParams itself
+/// used, recovered from planner_common/src/params.cpp, so a default-constructed
+/// PlanningParams behaves like a config file that specified nothing.
+struct PlanningParams {
+  uint32_t robot_id = 1;
+  uint32_t sim = 0;
+
+  std::string global_frame_id = "world";
+  bool freespace_cloud_enable = false;
+
+  // Robot dynamics.
+  double v_max = 0.2;
+  double v_homing_max = 0.2;
+  double yaw_rate_max = 0.4;
+  bool yaw_tangent_correction = false;
+
+  // Graph building.
+  PlanningModeType type = PlanningModeType::kBasicExploration;
+  RRModeType rr_mode = RRModeType::kGraph;
+  double edge_length_min = 0.2;
+  double edge_length_max = 0.2;
+  double edge_overshoot = 0.2;
+  double num_vertices_max = 500;
+  double num_edges_max = 5000;
+  double num_loops_cutoff = 1000;
+  double num_loops_max = 10000;
+  double nearest_range = 1.0;
+  double nearest_range_z = 1.0;
+  double nearest_range_min = 0.5;
+  double nearest_range_max = 2.0;
+  bool build_grid_local_graph = false;
+  bool use_current_state = true;
+  bool geofence_checking_enable = false;
+
+  // Ground robots.
+  double max_ground_height = 1.2;
+  double robot_height = 1.0;
+  double max_inclination = 0.52;
+
+  // Free-space augmentation (deprecated upstream).
+  double augment_free_voxels_time = 5.0;
+  bool augment_free_frustum_en = false;
+  bool free_frustum_before_planning = false;
+
+  // Exploration gain.
+  std::vector<std::string> exp_sensor_list;
+  std::vector<std::string> no_gain_zones_list;
+  double exp_gain_voxel_size = 0.4;
+  bool use_ray_model_for_volumetric_gain = false;
+  double free_voxel_gain = 1.0;
+  double occupied_voxel_gain = 1.0;
+  double unknown_voxel_gain = 10.0;
+  double path_length_penalty = 0.0;
+  double path_direction_penalty = 0.0;
+  double hanging_vertex_penalty = 0.0;
+  bool leafs_only_for_volumetric_gain = false;
+  bool cluster_vertices_for_gain = false;
+  double clustering_radius = 2.0;
+  double ray_cast_step_size_multiplier = 1.0;
+  bool nonuniform_ray_cast = true;
+
+  // Path generation and safety.
+  double traverse_length_max = 0.2;
+  double traverse_time_max = 1.0;
+  bool planning_backward = false;
+  bool path_safety_enhance_enable = false;
+  double path_interpolation_distance = 0.5;
+
+  // Global planner.
+  double relaxed_corridor_multiplier = 1.0;
+  bool auto_global_planner_enable = true;
+  bool go_home_if_fully_explored = false;
+  bool auto_homing_enable = false;
+  bool homing_backward = false;
+  double time_budget_limit = std::numeric_limits<double>::max();
+  bool auto_landing_enable = false;
+  double time_budget_before_landing = std::numeric_limits<double>::max();
+  double max_negative_inclination = 0.37;
 };
 
 }  // namespace mgg
