@@ -1,0 +1,262 @@
+# Generated from mgg_simple.yaml by tools/convert_config.py.
+#
+# rad()/deg() expressions have been evaluated: ROS 1's rosparam did
+# that at load time, ROS 2's parameter loader does not.
+mggplanner_node:
+  ros__parameters:
+    RobotParams:
+      type: kGroundRobot
+      size:
+      - 0.8
+      - 0.8
+      - 0.2
+      size_extension_min:
+      - 0.0
+      - 0.0
+      - 0.0
+      size_extension:
+      - 0.2
+      - 0.2
+      - 0.2
+      center_offset:
+      - 0.0
+      - 0.0
+      - 0.0
+      relax_ratio: 0.5
+      bound_mode: kExtendedBound
+      safety_extension:
+      - 2.0
+      - 3.0
+      - 0.2
+    SensorParams:
+      sensor_list:
+      - VLP16
+      VLP16:
+        type: kLidar
+        max_range: 20.0
+        center_offset:
+        - 0.0
+        - 0.0
+        - 0.0
+        rotations:
+        - 0.0
+        - 0.0
+        - 0.0
+        fov:
+        - 6.283185307179586
+        - 0.5235987755982988
+        resolution:
+        - 0.08726646259971647
+        - 0.08726646259971647
+        frontier_percentage_threshold: 0.05
+    BoundedSpaceParams:
+      Global:
+        type: kCuboid
+        min_val:
+        - 0.0
+        - -1000.0
+        - -30.0
+        max_val:
+        - 1000.0
+        - 1000.0
+        - 30.0
+      Local:
+        type: kCuboid
+        min_val:
+        - -15.0
+        - -15.0
+        - -3.0
+        max_val:
+        - 15.0
+        - 15.0
+        - 3.0
+        min_extension:
+        - 0.0
+        - 0.0
+        - 0.0
+        max_extension:
+        - 0.0
+        - 0.0
+        - 0.0
+      LocalSearch:
+        type: kCuboid
+        min_val:
+        - -50.0
+        - -50.0
+        - -10.0
+        max_val:
+        - 50.0
+        - 50.0
+        - 10.0
+      LocalAdaptiveExp:
+        type: kCuboid
+        min_val:
+        - -10.0
+        - -10.0
+        - -0.75
+        max_val:
+        - 10.0
+        - 10.0
+        - 0.75
+      GridGraphLocal:
+        type: kCuboid
+        min_val:
+        - -10.0
+        - -10.0
+        - -1.0
+        max_val:
+        - 10.0
+        - 10.0
+        - 0.2
+        resolution:
+        - 0.5
+        - 0.5
+        - 0.2
+    NoGainZones:
+      g1:
+        type: kCuboid
+        min_val:
+        - -50.0
+        - -50.0
+        - -20.0
+        max_val:
+        - 2.0
+        - 50.0
+        - 20.0
+    RandomSamplerParams:
+      SamplerForExploration:
+        X:
+          pdf_type: kUniform
+          sample_mode: kLocal
+        Y:
+          pdf_type: kUniform
+          sample_mode: kLocal
+        Z:
+          pdf_type: kUniform
+          sample_mode: kLocal
+        Heading:
+          pdf_type: kUniform
+          sample_mode: kManual
+          min_val: -3.141592653589793
+          max_val: 3.141592653589793
+      SamplerForSearching:
+        X:
+          pdf_type: kUniform
+          sample_mode: kLocal
+        Y:
+          pdf_type: kUniform
+          sample_mode: kLocal
+        Z:
+          pdf_type: kUniform
+          sample_mode: kLocal
+        Heading:
+          pdf_type: kUniform
+          sample_mode: kManual
+          min_val: -3.141592653589793
+          max_val: 3.141592653589793
+      SamplerForAdaptiveExp:
+        X:
+          pdf_type: kUniform
+          sample_mode: kLocal
+        Y:
+          pdf_type: kUniform
+          sample_mode: kLocal
+        Z:
+          pdf_type: kUniform
+          sample_mode: kLocal
+        Heading:
+          pdf_type: kUniform
+          sample_mode: kManual
+          min_val: -3.141592653589793
+          max_val: 3.141592653589793
+    PlanningParams:
+      robot_id: 1
+      type: kAdaptiveExploration
+      rr_mode: kGraph
+      bound_mode: kExtremeBound
+      exp_sensor_list:
+      - VLP16
+      no_gain_zones_list:
+      - g1
+      edge_length_min: 0.1
+      edge_length_max: 3.0
+      edge_overshoot: 0.0
+      num_vertices_max: 8000
+      num_edges_max: 50000
+      num_loops_cutoff: 2000
+      num_loops_max: 200000
+      nearest_range: 1.0
+      nearest_range_z: 0.51
+      nearest_range_min: 0.1
+      nearest_range_max: 1.75
+      use_current_state: true
+      augment_free_voxels_time: 1
+      free_frustum_before_planning: false
+      use_ray_model_for_volumetric_gain: true
+      path_length_penalty: 0.07
+      path_direction_penalty: 0.3
+      hanging_vertex_penalty: 5.0
+      exp_gain_voxel_size: 0.8
+      occupied_voxel_gain: 0.0
+      free_voxel_gain: 0.0
+      unknown_voxel_gain: 60.0
+      nonuniform_ray_cast: true
+      ray_cast_step_size_multiplier: 1.0
+      freespace_cloud_enable: false
+      leafs_only_for_volumetric_gain: false
+      cluster_vertices_for_gain: true
+      clustering_radius: 0.5
+      build_grid_local_graph: true
+      max_ground_height: 0.8
+      robot_height: 0.6
+      max_inclination: 1.6580627893946132
+      yaw_tangent_correction: true
+      traverse_length_max: 6.0
+      traverse_time_max: 40.0
+      path_safety_enhance_enable: true
+      path_interpolation_distance: 0.5
+      auto_global_planner_enable: true
+      relaxed_corridor_multiplier: 1.5
+      homing_backward: false
+      auto_homing_enable: true
+      time_budget_limit: 3600
+      global_frame_id: map
+      global_path_inclination_check: true
+      go_home_if_fully_explored: true
+      geofence_checking_enable: true
+    AdaptiveObbParams:
+      type: kPca
+      local_pointcloud_range: 50.0
+      bounding_box_size_max: 35
+    GeofenceParams:
+      AreaList:
+      - GLeft
+      - GBack
+      - GRight
+      GBack:
+        center:
+        - -3.0
+        - 0.0
+        - 0.0
+        size:
+        - 2.0
+        - 6.0
+        - 0.0
+      GLeft:
+        center:
+        - 0.0
+        - 4.0
+        - 0.0
+        size:
+        - 6.0
+        - 2.0
+        - 0.0
+      GRight:
+        center:
+        - 0.0
+        - -4.0
+        - 0.0
+        size:
+        - 6.0
+        - 2.0
+        - 0.0
