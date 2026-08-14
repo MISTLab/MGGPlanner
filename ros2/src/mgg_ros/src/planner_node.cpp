@@ -150,6 +150,9 @@ void PlannerNode::loadParameters() {
                 "config came from ROS 1, run tools/convert_config.py, which "
                 "renames min_extension to resolution.");
   }
+  if (!loadBoundedSpace(p, "BoundedSpaceParams/Global", global_space_)) {
+    RCLCPP_WARN(get_logger(), "BoundedSpaceParams/Global missing");
+  }
   if (!loadSensorSet(p, "SensorParams", sensors_)) {
     RCLCPP_WARN(get_logger(), "no sensors loaded from SensorParams");
   }
@@ -160,6 +163,16 @@ void PlannerNode::loadParameters() {
                 "%zu parameter(s) absent, defaults used (first: '%s')",
                 p.missing().size(), p.missing().front().c_str());
   }
+}
+
+mgg::GainContext PlannerNode::makeGainContext() {
+  mgg::GainContext ctx;
+  ctx.map = map_.get();
+  ctx.planning = &planning_params_;
+  ctx.global_space = &global_space_;
+  ctx.no_gain_zones = no_gain_zones_.empty() ? nullptr : &no_gain_zones_;
+  ctx.sensors = &sensors_;
+  return ctx;
 }
 
 mgg::ExpandContext PlannerNode::makeContext() {
@@ -259,11 +272,36 @@ std::string PlannerNode::buildLocalGraph() {
     return "grid bounds invalid: min_val must be <= 0, max_val >= 0 and "
            "resolution non-zero";
   }
-  char buf[192];
+  // The gain evaluation needs the sampling volume centred on the robot, since
+  // it rejects voxels outside it.
+  global_space_.setCenter(current_state_, /*use_extension=*/true);
+
+  mgg::GainContext gain_ctx = makeGainContext();
+  const int evaluated = mgg::computeExplorationGain(
+      *local_graph_, gain_ctx, planning_params_.leafs_only_for_volumetric_gain,
+      planning_params_.cluster_vertices_for_gain);
+
+  // Best frontier, which is what the path selection will consume once
+  // evaluateGraph and getBestPath are ported.
+  const mgg::Vertex* best = nullptr;
+  int frontiers = 0;
+  for (const auto& entry : local_graph_->vertices_map_) {
+    const mgg::Vertex* v = entry.second;
+    if (v == nullptr) continue;
+    if (v->type == mgg::VertexType::kFrontier) ++frontiers;
+    if (best == nullptr || v->vol_gain.gain > best->vol_gain.gain) best = v;
+  }
+
+  char buf[288];
   std::snprintf(buf, sizeof(buf),
-                "grid graph: %d free cells, %d vertices, %d edges%s",
+                "grid graph: %d free cells, %d vertices, %d edges%s; "
+                "%d viewpoints evaluated, %d frontiers, best gain %.1f at "
+                "(%.2f, %.2f, %.2f)",
                 r.free_cells, r.vertices_added, r.edges_added,
-                r.hit_limit ? " (hit a size limit)" : "");
+                r.hit_limit ? " (hit a size limit)" : "", evaluated, frontiers,
+                best ? best->vol_gain.gain : 0.0,
+                best ? best->state[0] : 0.0, best ? best->state[1] : 0.0,
+                best ? best->state[2] : 0.0);
   return std::string(buf);
 }
 

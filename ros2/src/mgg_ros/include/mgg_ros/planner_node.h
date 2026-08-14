@@ -27,6 +27,7 @@
 #include <mgg_msgs/msg/graph.hpp>
 
 #include "mgg_core/geofence_manager.h"
+#include "mgg_core/gain.h"
 #include "mgg_core/graph_expansion.h"
 #include "mgg_core/graph_manager.h"
 #include "mgg_core/graph_merge.h"
@@ -66,6 +67,7 @@ class PlannerNode : public rclcpp::Node {
   void updateGlobalGraph();
 
   mgg::ExpandContext makeContext();
+  mgg::GainContext makeGainContext();
 
   // Core state. None of these know about ROS.
   std::unique_ptr<mgg::OctomapMap> map_;
@@ -78,6 +80,8 @@ class PlannerNode : public rclcpp::Node {
   mgg::RobotParams robot_params_;
   mgg::PlanningParams planning_params_;
   mgg::GridGraphParams grid_params_;
+  mgg::BoundedSpaceParams global_space_;
+  std::vector<mgg::BoundedSpaceParams> no_gain_zones_;
   std::unordered_map<std::string, mgg::SensorParams> sensors_;
 
   mgg::StateVec current_state_ = mgg::StateVec::Zero();
