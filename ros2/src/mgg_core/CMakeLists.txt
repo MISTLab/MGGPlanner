@@ -14,7 +14,8 @@ find_package(Boost REQUIRED)  # Boost.Graph, header-only
 # deployable on its own. Grows as the algorithm moves across from
 # planner_common.
 add_library(${PROJECT_NAME}
-  src/graph.cpp)
+  src/graph.cpp
+  src/sensor_params.cpp)
 target_include_directories(${PROJECT_NAME} PUBLIC
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
   $<INSTALL_INTERFACE:include>
@@ -35,6 +36,8 @@ if(BUILD_TESTING)
   target_link_libraries(test_map_interface ${PROJECT_NAME})
   ament_add_gtest(test_graph test/test_graph.cpp)
   target_link_libraries(test_graph ${PROJECT_NAME})
+  ament_add_gtest(test_sensor_params test/test_sensor_params.cpp)
+  target_link_libraries(test_sensor_params ${PROJECT_NAME})
 endif()
 
 ament_package()
