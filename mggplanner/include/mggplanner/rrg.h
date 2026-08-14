@@ -306,7 +306,23 @@ class Rrg {
   ShortestPathsReport local_graph_rep_;  // shortest path to root vertex
   std::shared_ptr<GraphManager> global_graph_;
   ShortestPathsReport global_graph_rep_;  // shortest path to root vertex
-  std::vector<std::vector<double>> edge_inclinations_;
+  // Inclination of each graph edge, keyed by the ordered vertex pair.
+  //
+  // Was a dense num_vertices_max x num_vertices_max matrix of doubles,
+  // rebuilt in reset() on every planning cycle. With the shipped
+  // num_vertices_max of 8000 that allocated and freed 512 MB per iteration,
+  // in 8000 separate 64 KB blocks, to hold an entry per real edge: a
+  // representative run has around 11,000 of them against 64 million slots.
+  std::unordered_map<uint64_t, double> edge_inclinations_;
+  static uint64_t edgeKey(int a, int b) {
+    return (static_cast<uint64_t>(static_cast<uint32_t>(a)) << 32) |
+           static_cast<uint32_t>(b);
+  }
+  // Missing entries read as 0.0, matching the zero-filled matrix.
+  double edgeInclination(int a, int b) const {
+    auto it = edge_inclinations_.find(edgeKey(a, b));
+    return it == edge_inclinations_.end() ? 0.0 : it->second;
+  }
 
   // Add a collision-free path to the graph.
   bool addRefPathToGraph(const std::shared_ptr<GraphManager> graph_manager,

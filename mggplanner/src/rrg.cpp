@@ -217,14 +217,7 @@ void Rrg::reset() {
   }
   visualization_->visualizeNoGainZones(no_gain_zones_);
 
-  std::vector<double> empty_vec;
-  for (int i = 0; i < planning_num_vertices_max_; ++i) {
-    empty_vec.push_back(0.0);
-  }
   edge_inclinations_.clear();
-  for (int i = 0; i < planning_num_vertices_max_; ++i) {
-    edge_inclinations_.push_back(empty_vec);
-  }
 }
 
 void Rrg::clear() {}
@@ -1083,9 +1076,14 @@ void Rrg::expandGraph(std::shared_ptr<GraphManager> graph_manager,
       }
       avg_inclination /= projected_edge.size();
 
-      edge_inclinations_[new_vertex_ptr->id][nearest_vertex->id] =
-          avg_inclination;
-      edge_inclinations_[new_vertex_ptr->id][nearest_vertex->id] =
+      // Written once; the original repeated this identical assignment.
+      // Note it is stored one way only, [new][nearest], while evaluateGraph
+      // reads [path[i]][path[i-1]]. That matches for the primary link, where
+      // the new vertex is always the one further from the root, but a
+      // neighbour edge added below can be oriented either way and then reads
+      // back as 0.0. Preserved as-is: making it symmetric would newly reject
+      // paths that are accepted today.
+      edge_inclinations_[edgeKey(new_vertex_ptr->id, nearest_vertex->id)] =
           avg_inclination;
     }
 
@@ -1180,10 +1178,9 @@ void Rrg::expandGraph(std::shared_ptr<GraphManager> graph_manager,
                 }
                 avg_inclination /= projected_edge.size();
                 
-                edge_inclinations_[new_vertex_ptr->id]
-                                  [nearest_vertices[i]->id] = avg_inclination;
-                edge_inclinations_[new_vertex_ptr->id]
-                                  [nearest_vertices[i]->id] = avg_inclination;
+                edge_inclinations_[edgeKey(new_vertex_ptr->id,
+                                           nearest_vertices[i]->id)] =
+                    avg_inclination;
               }
               graph_manager->addEdge(new_vertex_ptr, nearest_vertices[i],
                                      d_norm);
@@ -2069,7 +2066,7 @@ Rrg::GraphStatus Rrg::evaluateGraph() {
 
         if (ind > 0 && robot_params_.type == RobotType::kGroundRobot) {
           double inclination =
-              edge_inclinations_[path[ind]->id][path[ind - 1]->id];
+              edgeInclination(path[ind]->id, path[ind - 1]->id);
           Eigen::Vector3d segment =
               path[ind]->state.head(3) - path[ind - 1]->state.head(3);
           if ((path[ind]->state(2) - path[ind - 1]->state(2)) <
@@ -3153,13 +3150,7 @@ bool Rrg::loadParams(bool shared_params) {
   for(int i = 0; i < init_offsets_.size(); ++i){
     ROS_WARN("graph offset robot %i: (%f,%f,%f) \n", i+1,init_offsets_[i][0],init_offsets_[i][1],init_offsets_[i][2]);
   }
-  std::vector<double> empty_vec;
-  for (int i = 0; i < planning_params_.num_vertices_max; ++i) {
-    empty_vec.push_back(0.0);
-  }
-  for (int i = 0; i < planning_params_.num_vertices_max; ++i) {
-    edge_inclinations_.push_back(empty_vec);
-  }
+  edge_inclinations_.clear();
 
   map_manager_->setRaycastingParams(
       planning_params_.nonuniform_ray_cast,
