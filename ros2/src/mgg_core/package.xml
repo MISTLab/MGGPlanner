@@ -1,0 +1,31 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <name>mgg_core</name>
+  <version>1.0.0</version>
+  <description>
+    The MGG planner core: grid-based local exploration, the global
+    topological graph, and the multi-robot graph merge.
+
+    Deliberately free of ROS. It depends on Eigen and nothing else, so the
+    planning algorithm can be unit tested without a ROS installation, a
+    simulator or a robot, and so the same code can run in ARGoS and on a
+    deployed robot. ROS types are converted at the mgg_ros boundary.
+
+    ament_cmake is used to build and install it, but that is a build system
+    choice; the library links no ROS libraries.
+  </description>
+
+  <maintainer email="giovanni.beltrame@polymtl.ca">Giovanni Beltrame</maintainer>
+  <license>TODO</license>
+
+  <buildtool_depend>ament_cmake</buildtool_depend>
+
+  <depend>eigen</depend>
+
+  <test_depend>ament_cmake_gtest</test_depend>
+
+  <export>
+    <build_type>ament_cmake</build_type>
+  </export>
+</package>
