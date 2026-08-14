@@ -351,6 +351,43 @@ would set the grid resolution to zero, and `buildGridGraphExapnd` returns
 builder moves into `mgg_core` it should take a properly named `resolution`
 field instead of overloading a bounds parameter.
 
+### 4.4 Two defects found while porting path selection (open)
+
+**The direction penalty compares against a degenerate reference.**
+`Trajectory::computeDistanceBetweenTrajectoryAndDirection` builds its
+reference path as
+
+    for (i = 0; i < n; ++i) path_ref.push_back(p0 + uvector * n);
+
+using `n` where `i` was meant. Every reference point is therefore identical,
+so the DTW measures distance to a single point at `p0 + heading * path_length`
+rather than deviation from a ray along the heading.
+
+It is live: `path_direction_penalty` is 0.3 in three shipped configs and 0.2
+in the fourth, so the term multiplies every candidate path's gain. Forward
+paths still score better than sideways ones, which is presumably why it went
+unnoticed, but the quantity is not the one the code intends.
+
+Reproduced as-is in `mgg_core`, with a characterisation test pinning the
+current behaviour so a correction shows up as a failing test rather than a
+silent change in where the robot goes.
+
+**`edge_inclinations_` is a dense matrix rebuilt every planning cycle.**
+`Rrg::reset()`, called from `plannerServiceCallback` on every planning
+iteration, rebuilds `edge_inclinations_` as `num_vertices_max` vectors of
+`num_vertices_max` doubles. The shipped configs set `num_vertices_max: 8000`,
+so that is 64 million doubles: **512 MB allocated and freed per planning
+cycle**, in 8000 separate 64 KB allocations.
+
+The table is inherently sparse. It holds an inclination per graph *edge*, and
+a representative run produced about 11,000 edges against 64 million slots. A
+map keyed by the vertex pair, or an inclination stored on the edge, replaces
+it at a fraction of the cost.
+
+**Decisions needed:** whether to correct the `n`/`i` defect, accepting that
+path selection changes, and whether to replace the inclination matrix (very
+likely yes, but it changes `evaluateGraph`'s shape).
+
 ---
 
 ## 5. ARGoS harness

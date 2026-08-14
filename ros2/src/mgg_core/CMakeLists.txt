@@ -26,6 +26,7 @@ add_library(${PROJECT_NAME}
   src/graph_expansion.cpp
   src/grid_graph.cpp
   src/gain.cpp
+  src/trajectory.cpp
   src/log.cpp)
 target_include_directories(${PROJECT_NAME} PUBLIC
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
@@ -65,6 +66,8 @@ if(BUILD_TESTING)
   target_link_libraries(test_grid_graph ${PROJECT_NAME})
   ament_add_gtest(test_gain test/test_gain.cpp)
   target_link_libraries(test_gain ${PROJECT_NAME})
+  ament_add_gtest(test_trajectory test/test_trajectory.cpp)
+  target_link_libraries(test_trajectory ${PROJECT_NAME})
 endif()
 
 ament_package()
