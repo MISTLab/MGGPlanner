@@ -322,6 +322,32 @@ floating-point steps leave room for a 73rd azimuth step. Changing it would
 alter the ray density itself. Flagged here as a separate call if the exact
 sensor discretisation ever matters.
 
+### 4.3 Cuboid bound extensions are inert (open question)
+
+`BoundedSpaceParams` distinguishes the volume the planner *samples* in from a
+larger volume used to evaluate exploration *gain*, via `min_extension` and
+`max_extension`. For `kCuboid` spaces that distinction does not exist:
+`isInsideSpace` compares against `min_val`/`max_val`, and the extended bounds
+are never read. In the ROS 1 code `min_val_total` and `max_val_total` were
+assigned in three places and read in none; only `radius_total`, on the sphere
+path, was ever used.
+
+This is live, not theoretical. `BoundedSpaceParams/Local` in every shipped
+config sets `min_extension: [-20,-20,-20]` and `max_extension: [20,20,20]`,
+intending gain to be evaluated over roughly +/-35 m while sampling stays
+within +/-15 m. Every shipped space is `kCuboid`, so those values do nothing.
+
+Ported faithfully rather than fixed: honouring them would enlarge the gain
+volume by a large factor and change exploration behaviour and runtime
+substantially. `mgg_core` computes the extended bounds and exposes them
+(`minValTotal()`, `maxValTotal()`) so the change can be evaluated, and a
+characterisation test pins the current behaviour so that changing it produces
+a visible diff.
+
+**Decision needed:** honour the extensions (probably the original intent, at
+some cost in gain-computation time) or drop the parameters as dead
+configuration.
+
 ---
 
 ## 5. ARGoS harness
