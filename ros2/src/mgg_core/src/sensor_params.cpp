@@ -48,12 +48,21 @@ void SensorParams::update() {
   }
 
   // Ray table, identical for camera and lidar in the ROS 1 code.
+  //
+  // DELIBERATE BEHAVIOUR CHANGE from ROS 1. The original built rays as
+  //     max_range * (cos dh, sin dh, sin dv)
+  // which is not a unit-sphere parameterisation: the length came out as
+  // max_range * sqrt(1 + sin^2 dv), so rays at the vertical extremes
+  // overshot the nominal range by about 3% (20.66 m for a configured 20 m at
+  // +/-15 degrees), and the sensor swept a subtly barrel-shaped volume rather
+  // than a spherical cap. The correct spherical form scales the horizontal
+  // components by cos(dv):
   const double h_lim = fov[0] / 2.0;
   const double v_lim = fov[1] / 2.0;
   for (double dv = -v_lim; dv < v_lim; dv += v_res) {
     for (double dh = -h_lim; dh < h_lim; dh += h_res) {
-      const Eigen::Vector3d ray(max_range * std::cos(dh),
-                                max_range * std::sin(dh),
+      const Eigen::Vector3d ray(max_range * std::cos(dv) * std::cos(dh),
+                                max_range * std::cos(dv) * std::sin(dh),
                                 max_range * std::sin(dv));
       frustum_endpoints_body_.push_back(rot_body_to_sensor_ * ray +
                                         center_offset);

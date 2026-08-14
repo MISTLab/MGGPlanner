@@ -62,7 +62,7 @@ TEST(SensorParams, RayCountMatchesTheRos1Implementation) {
   EXPECT_EQ(endpoints.size(), 73u * 6u);
 }
 
-TEST(SensorParams, EndpointsSitAroundMaxRangeWithTheRos1Skew) {
+TEST(SensorParams, EveryRayIsExactlyMaxRange) {
   const SensorParams s = makeVlp16();
   const Eigen::Vector3d origin(3.0, -2.0, 1.0);
   std::vector<Eigen::Vector3d> endpoints;
@@ -70,21 +70,14 @@ TEST(SensorParams, EndpointsSitAroundMaxRangeWithTheRos1Skew) {
                         endpoints);
   ASSERT_FALSE(endpoints.empty());
 
-  // Rays are built as max_range * (cos dh, sin dh, sin dv), which is not a
-  // unit-sphere parameterisation: the norm is max_range * sqrt(1 + sin^2 dv),
-  // so rays at the vertical extremes overshoot by about 3% (20.66 m for a
-  // nominal 20 m at +/-15 degrees). That is what the ROS 1 code does and what
-  // the recorded baseline measured, so it is reproduced rather than corrected
-  // here; changing it would silently move every gain number.
-  double min_norm = 1e9, max_norm = 0.0;
+  // The ROS 1 code built rays as max_range * (cos dh, sin dh, sin dv), whose
+  // length is max_range * sqrt(1 + sin^2 dv): rays at the vertical extremes
+  // overshot by about 3% and the swept volume was barrel-shaped rather than a
+  // spherical cap. The spherical form is used instead, so every ray now ends
+  // exactly max_range from the sensor.
   for (const auto& e : endpoints) {
-    const double n = (e - origin).norm();
-    min_norm = std::min(min_norm, n);
-    max_norm = std::max(max_norm, n);
+    EXPECT_NEAR((e - origin).norm(), 20.0, 1e-9);
   }
-  EXPECT_NEAR(min_norm, 20.0, 1e-6);
-  EXPECT_NEAR(max_norm, 20.0 * std::sqrt(1.0 + std::pow(std::sin(M_PI / 12.0), 2)),
-              1e-3);
 }
 
 TEST(SensorParams, RangeScaleShortensTheRays) {

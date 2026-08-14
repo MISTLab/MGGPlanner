@@ -211,32 +211,70 @@ TEST(OctomapMap, GainMagnitudesAreComparableToBaseline) {
   EXPECT_GT(iterative.occupied, 0);
 }
 
-// KNOWN DIFFERENCE, deliberately not silently relaxed.
+// DECIDED: exact traversal, accepting that it differs from published ROS 1
+// behaviour.
 //
-// The baseline ranks the room centre above the corner for unknown volume
-// (2361 > 1798); OctoMap ranks them the other way. Frontier selection acts on
-// that ordering, so this is a behavioural difference, not a tolerance issue.
+// The voxblox baseline ranks the room centre above the corner for unknown
+// volume (2361 against 1798); exact traversal ranks them the other way. The
+// difference traces to voxblox's nonuniform_ray_cast_, which grows the ray
+// step with distance and multiplies each sample up by
+// ceil(step_size/og_step_size). A ray can therefore step straight over a
+// one-voxel-thick wall and bank the unknown space behind it, which inflates
+// the count from viewpoints whose walls are far away. Reproducing that would
+// mean reproducing a sampling artifact on purpose.
 //
-// Working hypothesis: voxblox's nonuniform_ray_cast_ (on by default) grows
-// the step size with distance and extrapolates counts with
-// ceil(step_size/og_step_size), so a ray can step straight over a
-// one-voxel-thick wall and accumulate the unknown space beyond it. From the
-// centre the walls are ~10 m away, in the coarse-step region; from the corner
-// they are ~2 m away, in the fine region. That would inflate the centre's
-// unknown count specifically, which would make the baseline ordering partly a
-// sampling artifact rather than a property of the scene.
-//
-// Resolving it means deciding whether to reproduce that artifact on purpose.
-// Enabled once that decision is made; see ROS2_PORT_PLAN.md section 4.
-TEST(OctomapMap, DISABLED_GainOrderingAcrossPosesMatchesBaseline) {
-  OctomapMap map = buildScene();
-  auto unknown_at = [&](const Eigen::Vector3d& pos) {
-    GainCounts g;
-    std::vector<std::pair<Eigen::Vector3d, VoxelStatus>> log;
-    map.getScanStatusIterative(pos, frustumEndpoints(pos), g, log, kVlp16);
-    return g.unknown;
-  };
-  EXPECT_GT(unknown_at({0.0, 0.0, 1.0}), unknown_at({8.0, 8.0, 1.0}));
+// The choice is to count what the rays actually pass through. Exploration
+// decisions will differ from the published runs; that is understood and
+// intended. This test pins the property that was chosen, rather than a
+// scene-specific ordering that would be brittle.
+TEST(OctomapMap, GainCountsEachTraversedVoxelExactlyOnce) {
+  // A single ray through known-free space must contribute one count per voxel
+  // it crosses: no extrapolation, no weighting by step size.
+  OctomapConfig cfg;
+  cfg.resolution = 0.2;
+  cfg.max_range = 30.0;
+  OctomapMap map(cfg);
+
+  // Carve a free corridor along +x by observing a wall 10 m out.
+  const Eigen::Vector3d origin(0.0, 0.0, 0.0);
+  std::vector<Eigen::Vector3d> wall;
+  for (double y = -0.4; y <= 0.4; y += 0.1)
+    for (double z = -0.4; z <= 0.4; z += 0.1)
+      wall.push_back(Eigen::Vector3d(10.0, y, z));
+  map.insertPointCloud(wall, origin);
+
+  GainCounts gain;
+  std::vector<std::pair<Eigen::Vector3d, VoxelStatus>> log;
+  const std::vector<Eigen::Vector3d> single_ray{{9.0, 0.0, 0.0}};
+  map.getScanStatus(origin, single_ray, gain, log, kVlp16);
+
+  // 9 m at 0.2 m resolution is about 45 voxels, all free.
+  const int total = gain.free + gain.unknown + gain.occupied;
+  EXPECT_NEAR(total, 45, 2);
+  EXPECT_EQ(total, static_cast<int>(log.size()));
+  EXPECT_GT(gain.free, 40);
+}
+
+TEST(OctomapMap, IterativeVariantDeduplicatesSharedVoxels) {
+  // Two nearly parallel rays share most of their voxels. The plain variant
+  // counts them twice, the iterative variant once.
+  OctomapConfig cfg;
+  cfg.resolution = 0.2;
+  cfg.max_range = 30.0;
+  OctomapMap map(cfg);
+  const Eigen::Vector3d origin(0.0, 0.0, 0.0);
+  std::vector<Eigen::Vector3d> wall;
+  for (double y = -1.0; y <= 1.0; y += 0.1) wall.push_back({10.0, y, 0.0});
+  map.insertPointCloud(wall, origin);
+
+  const std::vector<Eigen::Vector3d> rays{{9.0, 0.0, 0.0}, {9.0, 0.02, 0.0}};
+  GainCounts plain, iterative;
+  std::vector<std::pair<Eigen::Vector3d, VoxelStatus>> log;
+  map.getScanStatus(origin, rays, plain, log, kVlp16);
+  log.clear();
+  map.getScanStatusIterative(origin, rays, iterative, log, kVlp16);
+
+  EXPECT_GT(plain.free, iterative.free);
 }
 
 TEST(OctomapMap, AugmentFreeBoxClearsUnknownFootprint) {

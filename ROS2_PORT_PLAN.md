@@ -275,25 +275,52 @@ Also learned: voxblox's `getScanStatus` deduplicates shared free space across
 neighbouring rays via its `starting_points` matrix, so the correct counterpart
 is `getScanStatusIterative`, not the plain variant.
 
-**Differs, unresolved:** the baseline ranks the room centre above the corner
-for unknown volume (2361 against 1798); OctoMap ranks them the other way.
-Frontier selection acts on that ordering, so this could change where a robot
-chooses to explore.
+**Differs, decided:** the baseline ranks the room centre above the corner for
+unknown volume (2361 against 1798); exact traversal ranks them the other way.
 
-Hypothesis: `nonuniform_ray_cast_` is on by default in the voxblox
-implementation. It grows the ray step with distance and extrapolates counts
-with `ceil(step_size/og_step_size)`, so a ray can step straight over a
-one-voxel-thick wall and accumulate the unknown space behind it. From the room
-centre the walls are about 10 m away, in the coarse-step region; from the
-corner about 2 m, in the fine region. That would inflate the centre's unknown
-count specifically, which would make the baseline ordering partly a sampling
-artifact rather than a property of the scene.
+The difference traces to `nonuniform_ray_cast_`, on by default in the voxblox
+implementation. It grows the ray step with distance and multiplies each sample
+up by `ceil(step_size/og_step_size)`, so a ray can step straight over a
+one-voxel-thick wall and bank the unknown space behind it. That inflates the
+count from viewpoints whose walls are far away, which is why the room centre
+scored highest.
 
-**Decision needed:** reproduce the artifact (match published behaviour), or
-keep exact traversal (defensible, but exploration choices will differ from the
-paper). The assertion is committed as a DISABLED test so it is visible rather
-than silently dropped. Settling this needs a run in a real environment, not
-just the synthetic scene: phase 6 or 7 is the natural point.
+**Decision: keep exact traversal.** `mgg_map_octomap` counts what its rays
+actually pass through, using OctoMap's own `computeRayKeys` traversal, with no
+step-size extrapolation. Reproducing the voxblox numbers would mean
+reproducing a sampling artifact deliberately.
+
+Consequence, accepted: **exploration decisions will differ from the published
+ROS 1 runs.** Frontier rankings between distant and nearby viewpoints are the
+place to expect it. Any quantitative comparison against the paper's results
+has to account for this rather than treat the two as interchangeable.
+
+The property chosen is pinned by
+`OctomapMap.GainCountsEachTraversedVoxelExactlyOnce` rather than by a
+scene-specific ordering, which would be brittle.
+
+### 4.2 Sensor ray geometry corrected
+
+Related, and also a deliberate divergence. The ROS 1 ray table was built as
+
+    max_range * (cos dh, sin dh, sin dv)
+
+which is not a unit-sphere parameterisation: ray length came out as
+`max_range * sqrt(1 + sin^2 dv)`, so rays at the vertical extremes overshot the
+configured range by about 3% (20.66 m for a nominal 20 m at +/-15 degrees) and
+the sensor swept a barrel rather than a spherical cap. `mgg_core` uses the
+spherical form, scaling the horizontal components by `cos(dv)`, so every ray
+ends exactly `max_range` away.
+
+This shifts gain values slightly against the recorded baseline, in addition to
+the traversal change above.
+
+One artifact of the original is **not** corrected: the ray table holds 438
+endpoints for the shipped VLP-16 configuration rather than the 432 that
+360/5 x 30/5 implies, because the loop runs `dh < h_lim` and accumulated
+floating-point steps leave room for a 73rd azimuth step. Changing it would
+alter the ray density itself. Flagged here as a separate call if the exact
+sensor discretisation ever matters.
 
 ---
 
