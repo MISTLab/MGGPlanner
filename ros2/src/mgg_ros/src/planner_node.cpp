@@ -1,8 +1,10 @@
 #include "mgg_ros/planner_node.h"
 
 #include <cstdio>
+#include <geometry_msgs/msg/transform_stamped.hpp>
 #include <sensor_msgs/msg/point_cloud2.hpp>
 #include <sensor_msgs/point_cloud2_iterator.hpp>
+#include <tf2/exceptions.hpp>
 
 #include "mgg_core/log.h"
 #include "mgg_core/trajectory.h"
@@ -60,6 +62,11 @@ PlannerNode::PlannerNode(const rclcpp::NodeOptions& options)
                   offsets[i + 3]);
     }
   }
+
+  cloud_tf_timeout_sec_ =
+      declareOrGet<double>(this, "cloud_tf_timeout_sec", cloud_tf_timeout_sec_);
+  tf_buffer_ = std::make_unique<tf2_ros::Buffer>(get_clock());
+  tf_listener_ = std::make_shared<tf2_ros::TransformListener>(*tf_buffer_);
 
   callback_group_ =
       create_callback_group(rclcpp::CallbackGroupType::Reentrant);
@@ -210,30 +217,60 @@ void PlannerNode::onOdometry(nav_msgs::msg::Odometry::ConstSharedPtr msg) {
 
 void PlannerNode::onPointCloud(
     sensor_msgs::msg::PointCloud2::ConstSharedPtr msg) {
-  // Points arrive in the sensor frame; without odometry there is nothing to
-  // place them against.
-  if (!have_odometry_) return;
-  const Eigen::Vector3d origin(current_state_[0], current_state_[1],
-                               current_state_[2]);
+  // Points arrive in the sensor frame and have to be rotated as well as
+  // translated. Placing them with the odometry position alone, as this used
+  // to, is only correct while the robot never turns: past the first turn the
+  // whole scan goes into the map at the wrong bearing. TF also supplies the
+  // sensor's mount offset, which decides where the rays are carved from - a
+  // lidar 0.4 m up otherwise clears free space through the floor.
+  geometry_msgs::msg::TransformStamped tf;
+  try {
+    tf = tf_buffer_->lookupTransform(
+        world_frame_, msg->header.frame_id, msg->header.stamp,
+        rclcpp::Duration::from_seconds(cloud_tf_timeout_sec_));
+  } catch (const tf2::TransformException& ex) {
+    // Throttled: with a missing transform this fires at full sensor rate.
+    RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000,
+                         "dropping cloud, no transform %s -> %s: %s",
+                         msg->header.frame_id.c_str(), world_frame_.c_str(),
+                         ex.what());
+    return;
+  }
+
+  const Eigen::Quaterniond q(tf.transform.rotation.w, tf.transform.rotation.x,
+                             tf.transform.rotation.y, tf.transform.rotation.z);
+  const Eigen::Vector3d origin(tf.transform.translation.x,
+                               tf.transform.translation.y,
+                               tf.transform.translation.z);
+  const Eigen::Matrix3d rot = q.normalized().toRotationMatrix();
+
   std::vector<Eigen::Vector3d> points;
   points.reserve(msg->width * msg->height);
   sensor_msgs::PointCloud2ConstIterator<float> it_x(*msg, "x");
   sensor_msgs::PointCloud2ConstIterator<float> it_y(*msg, "y");
   sensor_msgs::PointCloud2ConstIterator<float> it_z(*msg, "z");
   for (; it_x != it_x.end(); ++it_x, ++it_y, ++it_z) {
+    // Non-finite entries are normal in organised clouds (no return on that
+    // ray) and would otherwise poison the octree bounds.
     if (!std::isfinite(*it_x) || !std::isfinite(*it_y) ||
         !std::isfinite(*it_z)) {
       continue;
     }
-    points.emplace_back(origin + Eigen::Vector3d(*it_x, *it_y, *it_z));
+    points.emplace_back(rot * Eigen::Vector3d(*it_x, *it_y, *it_z) + origin);
   }
-  if (!points.empty()) map_->insertPointCloud(points, origin);
+  if (!points.empty()) {
+    const std::lock_guard<std::mutex> lock(planner_mutex_);
+    map_->insertPointCloud(points, origin);
+  }
 }
 
 void PlannerNode::onNeighbourGraph(mgg_msgs::msg::Graph::ConstSharedPtr msg) {
   if (msg->vertices.empty()) return;
   const int sender = msg->vertices.front().robot_id;
   if (sender == static_cast<int>(planning_params_.robot_id)) return;
+
+  // Merging reads the map to decide reachability and writes the global graph.
+  const std::lock_guard<std::mutex> lock(planner_mutex_);
 
   const mgg::GraphExchange incoming = fromGraphMsg(*msg);
   const mgg::ExpandContext ctx = makeContext();
@@ -269,6 +306,10 @@ void PlannerNode::onNeighbourGraph(mgg_msgs::msg::Graph::ConstSharedPtr msg) {
 }
 
 std::string PlannerNode::buildLocalGraph() {
+  // Held for the whole cycle: the map must not change under a planner that is
+  // ray-casting through it. Point clouds arriving meanwhile queue up, and the
+  // subscription's best-effort depth decides how many survive.
+  const std::lock_guard<std::mutex> lock(planner_mutex_);
   if (!have_odometry_) return "no odometry received yet";
   if (!map_->getStatus()) return "map is empty; no point cloud received yet";
 
@@ -324,13 +365,27 @@ std::string PlannerNode::buildLocalGraph() {
   }
   publishPath();
 
-  char buf[352];
+  // Free cells with no vertices is the characteristic bring-up failure: the
+  // lattice is finding space but every candidate is being turned away. The
+  // reason breakdown is the only thing that separates a geometry mistake from
+  // a genuinely blocked robot, so report it whenever it happens.
+  char why[128] = "";
+  if (r.vertices_added == 0 && r.free_cells > 0) {
+    std::snprintf(why, sizeof(why),
+                  " (rejected: %d collision, %d no ground; edges: %d ok, "
+                  "%d steep, %d occupied, %d unmapped, %d hanging)",
+                  r.rejected[static_cast<int>(mgg::ExpandGraphStatus::
+                                                  kErrorCollisionEdge)],
+                  r.no_ground, r.edge_status[0], r.edge_status[1],
+                  r.edge_status[2], r.edge_status[3], r.edge_status[4]);
+  }
+  char buf[512];
   std::snprintf(
       buf, sizeof(buf),
-      "grid graph: %d free cells, %d vertices, %d edges%s; %d viewpoints, "
+      "grid graph: %d free cells, %d vertices, %d edges%s%s; %d viewpoints, "
       "%d frontiers; best path %zu poses, gain %.1f%s, heading %.2f rad",
       r.free_cells, r.vertices_added, r.edges_added,
-      r.hit_limit ? " (hit a size limit)" : "", evaluated, frontiers,
+      r.hit_limit ? " (hit a size limit)" : "", why, evaluated, frontiers,
       best_path_.size(), sel.best_gain,
       sel.paths_rejected_steep > 0 ? " (some paths too steep)" : "",
       exploring_direction_);
@@ -427,6 +482,9 @@ void PlannerNode::publishPath() {
 }
 
 void PlannerNode::publishOwnGraph() {
+  // Runs on a timer, so it can land in the middle of a planning cycle
+  // rewriting the very graph it is serialising.
+  const std::lock_guard<std::mutex> lock(planner_mutex_);
   if (global_graph_->getNumVertices() == 0) return;
   auto msg = toGraphMsg(*global_graph_,
                         static_cast<int>(planning_params_.robot_id));
@@ -438,6 +496,7 @@ void PlannerNode::publishOwnGraph() {
 
 void PlannerNode::publishMarkers() {
   if (marker_pub_->get_subscription_count() == 0) return;
+  const std::lock_guard<std::mutex> lock(planner_mutex_);
 
   visualization_msgs::msg::MarkerArray array;
   visualization_msgs::msg::Marker vertices;

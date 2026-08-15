@@ -15,6 +15,7 @@
 #define MGG_ROS_PLANNER_NODE_H_
 
 #include <memory>
+#include <mutex>
 #include <string>
 #include <unordered_map>
 
@@ -23,6 +24,8 @@
 #include <sensor_msgs/msg/point_cloud2.hpp>
 #include <rclcpp/rclcpp.hpp>
 #include <std_srvs/srv/trigger.hpp>
+#include <tf2_ros/buffer.h>
+#include <tf2_ros/transform_listener.h>
 #include <visualization_msgs/msg/marker_array.hpp>
 
 #include <mgg_msgs/msg/graph.hpp>
@@ -92,8 +95,31 @@ class PlannerNode : public rclcpp::Node {
   std::vector<mgg::BoundedSpaceParams> no_gain_zones_;
   std::unordered_map<std::string, mgg::SensorParams> sensors_;
 
+  /// Serialises everything that touches the map or the graphs.
+  ///
+  /// Every callback here shares one reentrant group under a
+  /// MultiThreadedExecutor - which the PCI needs, or a service call made from
+  /// inside a callback deadlocks - and reentrant means genuinely concurrent.
+  /// OctoMap is not thread-safe, so two point clouds arriving faster than one
+  /// can be inserted will corrupt the octree and segfault inside
+  /// insertPointCloud. Slow, occasional callbacks hide this: it takes a real
+  /// sensor rate to make the callbacks overlap.
+  ///
+  /// One mutex rather than one per structure, because planning reads the map
+  /// and writes the graphs as a single unit and would need both anyway.
+  std::mutex planner_mutex_;
+
   mgg::StateVec current_state_ = mgg::StateVec::Zero();
   bool have_odometry_ = false;
+  /// Point clouds arrive in the sensor frame and have to be placed in the
+  /// world frame before they go into the map. TF, rather than the odometry
+  /// pose, because it is the only thing that knows where the sensor is
+  /// mounted: rays have to be carved from the sensor, not from the robot's
+  /// origin.
+  std::unique_ptr<tf2_ros::Buffer> tf_buffer_;
+  std::shared_ptr<tf2_ros::TransformListener> tf_listener_;
+  /// How long to wait for the transform matching a cloud's stamp.
+  double cloud_tf_timeout_sec_ = 0.1;
   double global_vertex_spacing_ = 1.0;
   /// Heading the robot has been travelling, for the direction penalty.
   double exploring_direction_ = 0.0;
