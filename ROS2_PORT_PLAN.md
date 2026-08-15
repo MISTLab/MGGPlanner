@@ -406,11 +406,11 @@ per-robot topics), `bistro_footbot_live.argos`, and a
    a hardcoded route.
 3. **No `PointCloud2`** (project the depth image) and **no TF**.
 4. **FOV mismatch.** Config assumes a VLP-16 (360 deg x 30 deg); the foot-bots
-   have one 60 deg camera. Since gain is computed from declared FOV,
-   recommend a **ring of 6 depth-only cameras** merged into one cloud, which
-   preserves the planner's tuning. Alternative is retuning `SensorParams`,
-   which changes exploration behaviour and tends to make robots spin to look
-   around.
+   have one 60 deg camera. **Resolved differently than planned:** rather than
+   merging a ring of 6 depth cameras, ARGoS gained a `photorealistic_lidar`
+   sensor that renders a ring of depth faces internally and resamples them
+   into the VLP-16 ray pattern. It reports ranges directly, so no merging step
+   exists to get wrong, and the declared FOV is whatever the config asks for.
 5. **Scale.** Foot-bots are ~0.17 m; configs assume an SMB at 0.8 m. Robot
    size, local bound (15 m), and velocities all need retuning.
 
@@ -506,9 +506,34 @@ within the phase). Write a minimal `mgg_pci` rather than porting
 `pci_general`: the interface is narrow (trigger, path, execute, home, stop)
 and a clean one serves packaging better.
 
-**Phase 6: `mgg_argos` (1.5 to 2 weeks).** Bidirectional bridge protocol v2,
-a commandable foot-bot controller, depth-ring to `PointCloud2`, TF, the
-experiment file, and compose. Single robot exploring bistro end to end.
+**Phase 6 [DONE, except compose and bistro]: `mgg_argos`.** Bidirectional
+protocol v2, a commandable foot-bot controller, lidar to `PointCloud2`, TF,
+`/clock`, the experiment file, a launch file and a foot-bot-scaled config. A
+single robot explores a partitioned arena end to end: 1453 free cells, 567
+vertices, 5531 edges, a 17-pose path, and the PCI replanning on its own every
+8 s while the robot drives.
+
+Four things this phase established that the plan did not anticipate:
+
+- **A level VLP-16 is nearly blind to the ground.** Its lowest ray meets the
+  floor at `height / tan(15 deg)`: 1.5 m out for a 0.4 m mount, 3 m for an
+  SMB. The floor arrives as a few thin concentric rings and never near the
+  robot. The harness tilts the sensor down to -30 deg and declares the wider
+  band in `SensorParams`, so the planner values viewpoints by what the sensor
+  actually sees.
+- **The planner cannot bootstrap from a standing start.** No sensor sees the
+  ground under the robot, so every edge out of the root is rejected as
+  hanging. It needs to be driven a short distance first, after which the map
+  closes up and planning proceeds unaided. Worth a `bootstrap` mode in the
+  PCI rather than a manual path publish.
+- **`max_ground_height` is not a clearance.** It is the height at which the
+  collision box rides, and every edge is swept there. It has to clear the
+  floor's mapped thickness, which the lidar reconstructs about 0.05 m thick
+  at grazing incidence. The cost is that obstacles below it are invisible to
+  collision checking.
+- **`mgg_pci`'s auto mode does not self-start.** `running_` is false until
+  `pci_trigger` is called, so `auto_period_sec` only continues a loop that
+  something else began.
 
 **Phase 7: multi-robot with static offsets (1 week).** Three foot-bots, graph
 merge via the existing constants moved to config. This validates the merge
@@ -545,13 +570,18 @@ Phases 3, 4, and 6 are largely independent of 2 and 5 and can be parallelized.
 
 ## 9. Status
 
-Phases 0, 1 and 3 are complete and verified in Docker. Phase 4 has a working
-OctoMap backend measured against the baseline, with the gain-ordering question
-in 4.1 outstanding and a PointCloud2/TF front end still to write. Phase 2 has
-its map contract and value types; the algorithm itself (grid graph, global
-graph, merge) is still in the ROS 1 tree.
+Phases 0 through 6 are complete and verified in Docker, bar the compose file
+and running against bistro rather than a synthetic arena. A foot-bot explores
+under planner control end to end, with ARGoS on the host and the planner in a
+container sharing a Unix socket.
 
-Next: finish phase 4's ROS front end, then move the planner core across.
+Outstanding within finished phases: the gain-ordering question in 4.1, and
+full RViz markers (`mggplanner_rviz.cpp` is 2,632 lines of mechanical marker
+code, deliberately deprioritised).
+
+Next: phase 7, three foot-bots with static offsets, which needs only the
+experiment file and per-robot namespacing - the bridge already keys everything
+by robot id and the protocol carries a robot list.
 
 ## 10. Recommended first move
 
