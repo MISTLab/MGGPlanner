@@ -1,0 +1,38 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <name>mgg_argos</name>
+  <version>1.0.0</version>
+  <description>
+    Runs the MGG planner against the ARGoS simulator.
+
+    Holds both ends of a small binary protocol: a ROS 2 node that publishes
+    /clock, odometry, lidar point clouds and TF, and the ARGoS loop function
+    and controller that feed it and drive the robots with the paths that come
+    back. ARGoS never links against ROS 2, so the two only share
+    include/mgg_argos/protocol.h.
+
+    The ARGoS half is built only when ARGoS is installed; the ROS 2 bridge
+    builds either way.
+  </description>
+
+  <maintainer email="giovanni.beltrame@polymtl.ca">Giovanni Beltrame</maintainer>
+  <license>TODO</license>
+
+  <buildtool_depend>ament_cmake</buildtool_depend>
+
+  <depend>rclcpp</depend>
+  <depend>nav_msgs</depend>
+  <depend>sensor_msgs</depend>
+  <depend>geometry_msgs</depend>
+  <depend>rosgraph_msgs</depend>
+  <depend>tf2_ros</depend>
+
+  <exec_depend>mgg_ros</exec_depend>
+  <exec_depend>mgg_pci</exec_depend>
+  <exec_depend>mgg_map_octomap</exec_depend>
+
+  <export>
+    <build_type>ament_cmake</build_type>
+  </export>
+</package>
