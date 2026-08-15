@@ -75,6 +75,9 @@ GridGraphResult buildGridGraph(GraphManager& graph, const StateVec& state,
         candidate.robot_id = ctx.robot_id;
         ExpandGraphReport rep;
         expandGraph(graph, candidate, rep, ctx);
+        ++result.rejected[static_cast<int>(rep.status)];
+        if (rep.no_ground) ++result.no_ground;
+        for (int e = 0; e < 5; ++e) result.edge_status[e] += rep.edge_status[e];
         if (rep.status == ExpandGraphStatus::kSuccess) {
           num_vertices += rep.num_vertices_added;
           num_edges += rep.num_edges_added;

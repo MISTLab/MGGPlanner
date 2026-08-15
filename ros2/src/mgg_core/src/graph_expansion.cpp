@@ -56,7 +56,7 @@ double averageInclination(const std::vector<Eigen::Vector3d>& edge) {
 bool edgeTraversable(const ExpandContext& ctx, const Eigen::Vector3d& start,
                      const Eigen::Vector3d& end, bool is_hanging,
                      std::vector<Eigen::Vector3d>& projected_edge,
-                     int& steep_edges) {
+                     ExpandGraphReport& rep) {
   if (ctx.robot->type == RobotType::kAerialRobot) {
     return ctx.map->getPathStatus(start, end, ctx.robot_box_size, true) ==
            VoxelStatus::kFree;
@@ -64,8 +64,9 @@ bool edgeTraversable(const ExpandContext& ctx, const Eigen::Vector3d& start,
   // Ground robot: the edge has to follow the terrain.
   const ProjectedEdgeStatus es = ctx.ground->getProjectedEdgeStatus(
       start, end, ctx.robot_box_size, true, projected_edge, is_hanging);
+  ++rep.edge_status[static_cast<int>(es)];
   if (es == ProjectedEdgeStatus::kAdmissible) return true;
-  if (es == ProjectedEdgeStatus::kSteep) ++steep_edges;
+  if (es == ProjectedEdgeStatus::kSteep) ++rep.steep_edges;
   return false;
 }
 
@@ -110,6 +111,7 @@ void expandGraph(GraphManager& graph, Vertex& new_vertex,
     VoxelStatus vs;
     const double ground_height = ctx.ground->projectSample(new_pos, vs);
     if (vs != VoxelStatus::kOccupied) {
+      rep.no_ground = true;
       rep.status = ExpandGraphStatus::kErrorCollisionEdge;
       return;
     }
@@ -136,7 +138,7 @@ void expandGraph(GraphManager& graph, Vertex& new_vertex,
   std::vector<Eigen::Vector3d> projected_edge;
   const bool is_hanging = nearest_vertex->is_hanging || new_vertex.is_hanging;
   bool admissible_edge = edgeTraversable(ctx, start_pos, end_pos, is_hanging,
-                                         projected_edge, rep.steep_edges);
+                                         projected_edge, rep);
   if (admissible_edge && ctx.robot->type == RobotType::kGroundRobot) {
     recordProjectedEdge(ctx.projected_graph, projected_edge, ctx.robot_id);
   }
@@ -213,8 +215,7 @@ void expandGraph(GraphManager& graph, Vertex& new_vertex,
     if (geofenceBlocks(ctx, p_start, p_end)) continue;
 
     std::vector<Eigen::Vector3d> neighbour_edge;
-    if (!edgeTraversable(ctx, p_start, p_end, false, neighbour_edge,
-                         rep.steep_edges)) {
+    if (!edgeTraversable(ctx, p_start, p_end, false, neighbour_edge, rep)) {
       continue;
     }
     if (ctx.robot->type == RobotType::kGroundRobot) {

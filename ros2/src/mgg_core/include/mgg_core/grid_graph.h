@@ -52,6 +52,16 @@ struct GridGraphResult {
   int edges_added = 0;
   /// True when a size or loop cap stopped the sweep early.
   bool hit_limit = false;
+  /// Why the candidates that were offered got turned away, indexed by
+  /// ExpandGraphStatus. A sweep that finds plenty of free cells and produces
+  /// no vertices is otherwise indistinguishable from one that found nothing,
+  /// and the two have completely different causes.
+  int rejected[6] = {0, 0, 0, 0, 0, 0};
+  /// Candidates rejected because no ground was found beneath them.
+  int no_ground = 0;
+  /// Edge verdicts summed over every candidate, indexed by
+  /// ProjectedEdgeStatus.
+  int edge_status[5] = {0, 0, 0, 0, 0};
 };
 
 /// Sweeps the lattice around `state` and grows `graph` through it.

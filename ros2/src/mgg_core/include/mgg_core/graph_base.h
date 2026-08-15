@@ -156,6 +156,18 @@ struct ExpandGraphReport {
   /// counted these in a local that was never read; reporting it makes the
   /// "the robot is boxed in by slopes" case visible to the caller.
   int steep_edges = 0;
+  /// Set when the candidate was rejected because no ground was found beneath
+  /// it, as opposed to because an edge to it was blocked. Both report
+  /// kErrorCollisionEdge, and they mean very different things: the first says
+  /// the sensor never saw the floor there, the second that something is in
+  /// the way.
+  bool no_ground = false;
+  /// How the first blocked edge was blocked, indexed by ProjectedEdgeStatus.
+  /// Ground robots reject a candidate for four quite different reasons and
+  /// all four surface as kErrorCollisionEdge; without this, a lattice that
+  /// produces no vertices gives no clue whether the terrain is too steep, the
+  /// space is unmapped, or something is genuinely in the way.
+  int edge_status[5] = {0, 0, 0, 0, 0};
 };
 
 struct RandomSamplingParams {
