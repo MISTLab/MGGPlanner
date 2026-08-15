@@ -15,6 +15,17 @@ double GroundProjection::projectSample(Eigen::Vector3d& sample,
       {0.0, 0.0, 0.0}, {0.5, 0.0, 0.5}, {-0.5, 0.0, 0.5},
       {0.0, 0.5, 0.5}, {0.0, -0.5, 0.5}};
 
+  // The offset probes start half a metre higher as well as to the side, so
+  // the drop has to be measured from the sample itself rather than from where
+  // the ray began. The ROS 1 code measured from the ray's own start, which
+  // makes an offset hit report 0.5 m more clearance than there is; callers
+  // then place the point 0.5 m too low. It is invisible on a robot whose
+  // max_ground_height is 0.8 - the point still lands 0.3 m above the terrain
+  // - and fatal on a small one, where the collision box ends up inside the
+  // ground and every edge is rejected as occupied. This function's contract
+  // is "how far below `sample` the ground lies", so measure that.
+  const double sample_z = sample(2);
+
   for (size_t i = 0; i < extra_samples.size(); ++i) {
     const Eigen::Vector3d start = sample + extra_samples[i];
     const Eigen::Vector3d end =
@@ -24,7 +35,7 @@ double GroundProjection::projectSample(Eigen::Vector3d& sample,
     const VoxelStatus vs = map_.getRayStatus(start, end, true, end_voxel);
 
     if (vs == VoxelStatus::kOccupied) {
-      const double ray_len = std::abs(start(2) - end_voxel(2));
+      const double ray_len = std::abs(sample_z - end_voxel(2));
       if (i == 0) central_ray_len = ray_len;
       status = VoxelStatus::kOccupied;
       sample(0) = start(0);
@@ -32,7 +43,7 @@ double GroundProjection::projectSample(Eigen::Vector3d& sample,
       return ray_len;
     }
     if (vs == VoxelStatus::kUnknown) {
-      const double ray_len = std::abs(start(2) - end_voxel(2));
+      const double ray_len = std::abs(sample_z - end_voxel(2));
       if (i == 0) central_ray_len = ray_len;
       ++unknown_count;
     }
