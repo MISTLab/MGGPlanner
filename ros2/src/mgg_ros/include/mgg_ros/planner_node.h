@@ -122,6 +122,10 @@ class PlannerNode : public rclcpp::Node {
   /// How long to wait for the transform matching a cloud's stamp.
   double cloud_tf_timeout_sec_ = 0.1;
   double global_vertex_spacing_ = 1.0;
+  /// Where the last global-graph vertex was dropped, so odometry can decide
+  /// cheaply whether the backbone needs extending without touching the map.
+  Eigen::Vector3d last_global_anchor_ = Eigen::Vector3d::Zero();
+  bool have_global_anchor_ = false;
   /// Heading the robot has been travelling, for the direction penalty.
   double exploring_direction_ = 0.0;
   mgg::EdgeInclinations edge_inclinations_;

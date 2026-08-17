@@ -1,12 +1,15 @@
-"""Four foot-bots exploring the Bistro street under the MGG planner.
+"""Four foot-bots exploring under the MGG planner.
+
+Used for both scenes: the maze and the Bistro street differ only in the
+experiment file and the parameters, not in how the nodes are wired.
 
 Start this first: the bridge creates the Unix socket and ARGoS connects to it.
 Then run the simulator with the generated experiment,
 
-    argos3 -c $(ros2 pkg prefix mgg_argos)/share/mgg_argos/experiments/bistro_mgg.argos
+    argos3 -c $(ros2 pkg prefix mgg_argos)/share/mgg_argos/experiments/<scene>.argos
 
 with ARGOS_PLUGIN_PATH covering the directory holding libmgg_footbot.so and
-libmgg_bridge.so. tools/run_argos_demo.sh --bistro does both.
+libmgg_bridge.so. tools/run_argos_demo.sh --maze or --bistro does both.
 
 One bridge serves all four robots: it is the single socket ARGoS talks to, and
 it keys everything by robot id. Each robot then gets its own planner and its
@@ -32,7 +35,7 @@ from launch_ros.actions import Node
 
 def generate_launch_description():
     share = get_package_share_directory('mgg_argos')
-    default_params = os.path.join(share, 'config', 'bistro.yaml')
+    default_params = os.path.join(share, 'config', 'maze.yaml')
 
     params_arg = DeclareLaunchArgument(
         'params', default_value=default_params,

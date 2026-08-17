@@ -3,6 +3,7 @@
 # One foot-bot exploring under the MGG planner, in ARGoS.
 #
 #   tools/run_argos_demo.sh              headless, one robot, small arena
+#   tools/run_argos_demo.sh --maze       four robots in the maze
 #   tools/run_argos_demo.sh --bistro     four robots in the Bistro street
 #   tools/run_argos_demo.sh --gui        with the Filament visualisation
 #   tools/run_argos_demo.sh --length 600 explore for 600 s of wall clock
@@ -42,11 +43,13 @@ PLUGINS="$REPO/ros2/src/mgg_argos/argos/build"
 LENGTH=240
 GUI=0
 BISTRO=0
+MAZE=0
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --gui) GUI=1; shift ;;
     --bistro) BISTRO=1; shift ;;
+    --maze) MAZE=1; shift ;;
     --length) LENGTH="$2"; shift 2 ;;
     -h|--help) sed -n '2,30p' "$0"; exit 0 ;;
     *) echo "unknown argument: $1" >&2; exit 1 ;;
@@ -113,7 +116,7 @@ rm -f "$IPC"/argos.sock "$IPC"/ros.log "$IPC"/argos.log
 # experiment file can know where this script decided to put it.
 if [[ $BISTRO -eq 1 ]]; then
   CONFIG="$REPO/ros2/src/mgg_argos/config/bistro.yaml"
-  LAUNCH="bistro.launch.py"
+  LAUNCH="swarm.launch.py"
   ROBOTS=(r0 r1 r2 r3)
   # Generated rather than shipped: the experiment inlines 4346 collision boxes
   # and 28 lamps from the argos3-examples scene, and its asset paths are
@@ -123,26 +126,40 @@ if [[ $BISTRO -eq 1 ]]; then
   quietly python3 "$REPO/tools/make_bistro_mgg.py" \
     --socket "$IPC/argos.sock" --length 0 \
     $([[ $GUI -eq 1 ]] && echo --gui) -o "$IPC/run.argos"
+elif [[ $MAZE -eq 1 ]]; then
+  # Same arena as the single-robot run, one robot per corner. The interior
+  # partitions mean no robot can see another's territory from its start, so
+  # they have to explore towards each other before any graph exchange happens.
+  CONFIG="$REPO/ros2/src/mgg_argos/config/maze.yaml"
+  LAUNCH="swarm.launch.py"
+  ROBOTS=(r0 r1 r2 r3)
+  sed "s|/tmp/mgg_argos.sock|$IPC/argos.sock|" \
+    "$REPO/ros2/src/mgg_argos/experiments/maze_mgg.argos" > "$IPC/run.argos"
 else
   CONFIG="$REPO/ros2/src/mgg_argos/config/argos_footbot.yaml"
   LAUNCH="argos_single.launch.py"
   ROBOTS=(r0)
   sed "s|/tmp/mgg_argos.sock|$IPC/argos.sock|" \
     "$REPO/ros2/src/mgg_argos/experiments/mgg_footbot.argos" > "$IPC/run.argos"
-  if [[ $GUI -eq 1 ]]; then
-    # Swap the trailing comment for a real visualisation block.
-    python3 - "$IPC/run.argos" <<'PY'
+fi
+# The maze and single-robot scenes are hand-written files carrying a
+# placeholder comment where a viewer would go; the Bistro generator emits its
+# own block, so this applies to the other two only.
+if [[ $GUI -eq 1 && $BISTRO -eq 0 ]]; then
+  python3 - "$IPC/run.argos" <<'VIZ'
 import sys
 path = sys.argv[1]
 text = open(path).read()
 marker = "  <!-- No visualization by default"
+if marker not in text:
+    raise SystemExit("no visualisation placeholder in " + path)
 block = ("  <visualization>\n    <filament medium=\"pr\" resolution=\"1280,720\"\n"
-         "              position=\"-8,-8,6\" look_at=\"0,0,0\" />\n"
+         "              position=\"-9,-9,11\" look_at=\"0,0,0\" />\n"
          "  </visualization>\n\n" + marker)
-open(path, 'w').write(text.replace(marker, block, 1))
-PY
-  fi
+open(path, "w").write(text.replace(marker, block, 1))
+VIZ
 fi
+
 sed "s|socket_path: /tmp/mgg_argos.sock|socket_path: $IPC/argos.sock|" \
   "$CONFIG" > "$IPC/run.yaml"
 
@@ -228,6 +245,20 @@ for robot in "${ROBOTS[@]}"; do
 done
 merges=$(grep -c "merged robot" "$IPC/ros.log" || true)
 echo "  graph merges between robots: $merges"
+if [[ $merges -gt 0 ]]; then
+  # Which pairs actually met, not just how many times. Four robots that all
+  # merged with one neighbour and none with the others is a different result
+  # from a swarm that has joined up.
+  grep -oE "\[r[0-9]\.mggplanner_node\]: merged robot [0-9]+" "$IPC/ros.log" |
+    sed -E 's/\[(r[0-9])\.mggplanner_node\]: merged robot ([0-9]+)/  \1 <- robot \2/' |
+    sort | uniq -c | sed 's/^/  /'
+fi
+# The global graph is what the robots exchange, so its size is the thing to
+# watch: a graph that never grows means nothing is being shared.
+for robot in "${ROBOTS[@]}"; do
+  vertices=$(grep -oE "$robot\.mggplanner_node.*global graph seeded" "$IPC/ros.log" | wc -l)
+  printf '  %s: global graph seeded %s time(s)\n' "$robot" "$vertices"
+done
 
 echo
 echo "==> done. Logs: $IPC/ros.log (planner), $IPC/argos.log (simulator)"

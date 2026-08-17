@@ -22,12 +22,13 @@ import time
 
 import rclpy
 from nav_msgs.msg import Odometry, Path
-from geometry_msgs.msg import PoseStamped
+from geometry_msgs.msg import Point, PoseStamped
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, ReliabilityPolicy, DurabilityPolicy
 from rosgraph_msgs.msg import Clock
 from sensor_msgs.msg import PointCloud2
 from tf2_msgs.msg import TFMessage
+from visualization_msgs.msg import Marker, MarkerArray
 
 OBS_MAGIC = b'MGGB'
 CMD_MAGIC = b'MGGC'
@@ -35,6 +36,7 @@ VERSION = 3
 BLOCK_ODOMETRY, BLOCK_LIDAR, BLOCK_IMU, BLOCK_TRUTH = 1, 2, 4, 5
 CMD_NONE, CMD_PATH, CMD_STOP = 0, 1, 2
 OVERLAY_PATH, OVERLAY_GRAPH_EDGES, OVERLAY_POINTS = 1, 2, 3
+OVERLAY_GLOBAL_GRAPH, OVERLAY_MERGE = 4, 5
 
 RINGS, AZIMUTHS = 16, 360
 ELEV_MIN, ELEV_MAX = math.radians(-15.0), math.radians(15.0)
@@ -153,6 +155,8 @@ class Listener(Node):
         latched = QoSProfile(depth=1)
         latched.durability = DurabilityPolicy.TRANSIENT_LOCAL
         self.path_pub = self.create_publisher(Path, '/r0/path', latched)
+        self.marker_pub = self.create_publisher(
+            MarkerArray, '/r0/graph_markers', QoSProfile(depth=1))
 
 
 def read_points(msg):
@@ -300,6 +304,40 @@ def main():
                                 % (floats[:3],))
             else:
                 print('overlay: path echoed as %d points' % count)
+
+        # The graph overlays. The bridge sorts the planner's markers by
+        # namespace into three separate overlay streams, and getting that
+        # mapping wrong is invisible until someone looks at the viewer, so
+        # check each one arrives as its own block type.
+        markers = MarkerArray()
+        for ns, count in (('local_graph_edges', 2),
+                          ('global_graph_edges', 3),
+                          ('graph_merges', 1)):
+            marker = Marker()
+            marker.ns = ns
+            marker.type = Marker.LINE_LIST
+            for i in range(count * 2):
+                point = Point()
+                point.x, point.y, point.z = float(i), float(ns == 'graph_merges'), 0.0
+                marker.points.append(point)
+            markers.markers.append(marker)
+        node.marker_pub.publish(markers)
+        time.sleep(1.5)
+
+        client.sendall(observation(8, 'r0', ranges, hits, (0.0, 0.0, 0.0)))
+        _, commands = read_command(client)
+        _, _, overlays = commands.get('r0', (None, [], {}))
+        for name, block, want in (('local graph', OVERLAY_GRAPH_EDGES, 2),
+                                  ('global graph', OVERLAY_GLOBAL_GRAPH, 3),
+                                  ('merge beacons', OVERLAY_MERGE, 1)):
+            if block not in overlays:
+                failures.append('no %s overlay block reached ARGoS' % name)
+            elif overlays[block][0] != want:
+                failures.append('%s overlay carried %d segments, expected %d'
+                                % (name, overlays[block][0], want))
+            else:
+                print('overlay: %s forwarded as %d segments'
+                      % (name, overlays[block][0]))
 
         # And it must not be sent again: re-forwarding the same path would
         # restart the robot at waypoint zero every tick.

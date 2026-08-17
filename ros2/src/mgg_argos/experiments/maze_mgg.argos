@@ -1,0 +1,226 @@
+<?xml version="1.0" ?>
+<!--
+  Four foot-bots exploring the maze under the MGG planner.
+
+  One per corner, each facing into the maze. The three interior partitions
+  divide it into regions that connect only through gaps, so a robot cannot see
+  another's territory from its own start: they have to explore towards each
+  other, which is what makes the graph exchange mean anything. Verified before
+  the positions were fixed: every start has 1.40 m of clearance, keeps it over
+  the whole opening nudge, and all four corners are mutually reachable across
+  114.6 m2 of connected free space.
+
+  The robot has no route: it stands still until the planner sends a path over
+  the bridge. Nothing here decides where it goes.
+
+  Run the ROS 2 side first (it creates the socket and the simulator connects
+  to it):
+
+    ros2 launch mgg_argos swarm.launch.py params:=<maze.yaml>
+
+  then, with ARGOS_PLUGIN_PATH covering the mgg_argos plugin build directory:
+
+    argos3 -c maze_mgg.argos
+
+  length="0" runs until interrupted, because the run ends when the planner
+  says the arena is explored rather than after a fixed time.
+-->
+<argos-configuration>
+
+  <framework>
+    <system threads="0" />
+    <experiment length="0" ticks_per_second="10" random_seed="42" />
+  </framework>
+
+  <controllers>
+    <mgg_footbot library="libmgg_footbot.so" id="mfb0">
+      <actuators>
+        <differential_steering implementation="default" />
+      </actuators>
+      <sensors>
+        <!-- Ground truth, used only to drive the wheels; the planner never
+             sees it. -->
+        <positioning implementation="default" />
+        <!-- What the planner does see: a drifting pose estimate. -->
+        <odometry implementation="drift" />
+        <imu implementation="default" />
+        <!-- A VLP-16's own 30 degree band is useless to a small ground
+             robot: level at 0.4 m, its lowest ray only reaches the floor
+             1.5 m out, so the ground is seen as a few thin rings and never
+             near the robot. Ground projection then finds nothing to stand on
+             and the planner rejects every candidate vertex.
+
+             So: mounted low, and tilted down to -30 rather than -15. The
+             nearest floor return comes back at 0.43 m instead of 1.49 m.
+             SensorParams/VLP16 in the config declares the same 60 degree
+             band, because the planner sizes its gain from what it is told
+             the sensor sees. The bridge's lidar_translation must match this
+             height. -->
+        <photorealistic_lidar implementation="default" medium="pr"
+                              anchor="origin" position="0,0,0.25"
+                              vertical_fov="-30,15" rings="24"
+                              face_resolution="512,352" max_range="20" />
+      </sensors>
+      <params robot_id="r0" cruise_speed="20" turn_speed="10"
+              waypoint_tolerance="0.15" goal_tolerance="0.2" />
+    </mgg_footbot>
+    <mgg_footbot library="libmgg_footbot.so" id="mfb1">
+      <actuators>
+        <differential_steering implementation="default" />
+      </actuators>
+      <sensors>
+        <!-- Ground truth, used only to drive the wheels; the planner never
+             sees it. -->
+        <positioning implementation="default" />
+        <!-- What the planner does see: a drifting pose estimate. -->
+        <odometry implementation="drift" />
+        <imu implementation="default" />
+        <!-- A VLP-16's own 30 degree band is useless to a small ground
+             robot: level at 0.4 m, its lowest ray only reaches the floor
+             1.5 m out, so the ground is seen as a few thin rings and never
+             near the robot. Ground projection then finds nothing to stand on
+             and the planner rejects every candidate vertex.
+
+             So: mounted low, and tilted down to -30 rather than -15. The
+             nearest floor return comes back at 0.43 m instead of 1.49 m.
+             SensorParams/VLP16 in the config declares the same 60 degree
+             band, because the planner sizes its gain from what it is told
+             the sensor sees. The bridge's lidar_translation must match this
+             height. -->
+        <photorealistic_lidar implementation="default" medium="pr"
+                              anchor="origin" position="0,0,0.25"
+                              vertical_fov="-30,15" rings="24"
+                              face_resolution="512,352" max_range="20" />
+      </sensors>
+      <params robot_id="r1" cruise_speed="20" turn_speed="10"
+              waypoint_tolerance="0.15" goal_tolerance="0.2" />
+    </mgg_footbot>
+    <mgg_footbot library="libmgg_footbot.so" id="mfb2">
+      <actuators>
+        <differential_steering implementation="default" />
+      </actuators>
+      <sensors>
+        <!-- Ground truth, used only to drive the wheels; the planner never
+             sees it. -->
+        <positioning implementation="default" />
+        <!-- What the planner does see: a drifting pose estimate. -->
+        <odometry implementation="drift" />
+        <imu implementation="default" />
+        <!-- A VLP-16's own 30 degree band is useless to a small ground
+             robot: level at 0.4 m, its lowest ray only reaches the floor
+             1.5 m out, so the ground is seen as a few thin rings and never
+             near the robot. Ground projection then finds nothing to stand on
+             and the planner rejects every candidate vertex.
+
+             So: mounted low, and tilted down to -30 rather than -15. The
+             nearest floor return comes back at 0.43 m instead of 1.49 m.
+             SensorParams/VLP16 in the config declares the same 60 degree
+             band, because the planner sizes its gain from what it is told
+             the sensor sees. The bridge's lidar_translation must match this
+             height. -->
+        <photorealistic_lidar implementation="default" medium="pr"
+                              anchor="origin" position="0,0,0.25"
+                              vertical_fov="-30,15" rings="24"
+                              face_resolution="512,352" max_range="20" />
+      </sensors>
+      <params robot_id="r2" cruise_speed="20" turn_speed="10"
+              waypoint_tolerance="0.15" goal_tolerance="0.2" />
+    </mgg_footbot>
+    <mgg_footbot library="libmgg_footbot.so" id="mfb3">
+      <actuators>
+        <differential_steering implementation="default" />
+      </actuators>
+      <sensors>
+        <!-- Ground truth, used only to drive the wheels; the planner never
+             sees it. -->
+        <positioning implementation="default" />
+        <!-- What the planner does see: a drifting pose estimate. -->
+        <odometry implementation="drift" />
+        <imu implementation="default" />
+        <!-- A VLP-16's own 30 degree band is useless to a small ground
+             robot: level at 0.4 m, its lowest ray only reaches the floor
+             1.5 m out, so the ground is seen as a few thin rings and never
+             near the robot. Ground projection then finds nothing to stand on
+             and the planner rejects every candidate vertex.
+
+             So: mounted low, and tilted down to -30 rather than -15. The
+             nearest floor return comes back at 0.43 m instead of 1.49 m.
+             SensorParams/VLP16 in the config declares the same 60 degree
+             band, because the planner sizes its gain from what it is told
+             the sensor sees. The bridge's lidar_translation must match this
+             height. -->
+        <photorealistic_lidar implementation="default" medium="pr"
+                              anchor="origin" position="0,0,0.25"
+                              vertical_fov="-30,15" rings="24"
+                              face_resolution="512,352" max_range="20" />
+      </sensors>
+      <params robot_id="r3" cruise_speed="20" turn_speed="10"
+              waypoint_tolerance="0.15" goal_tolerance="0.2" />
+    </mgg_footbot>
+  </controllers>
+
+  <loop_functions library="libmgg_bridge.so" label="mgg_bridge"
+                  socket="/tmp/mgg_argos.sock" robots="r0,r1,r2,r3"
+                  send_ground_truth="true" draw_medium="pr" />
+
+  <arena size="14, 14, 3" center="0,0,1.5">
+    <!-- Outer walls -->
+    <box id="w_north" size="12.2,0.2,1" movable="false">
+      <body position="0,6,0" orientation="0,0,0" />
+    </box>
+    <box id="w_south" size="12.2,0.2,1" movable="false">
+      <body position="0,-6,0" orientation="0,0,0" />
+    </box>
+    <box id="w_east" size="0.2,12.2,1" movable="false">
+      <body position="6,0,0" orientation="0,0,0" />
+    </box>
+    <box id="w_west" size="0.2,12.2,1" movable="false">
+      <body position="-6,0,0" orientation="0,0,0" />
+    </box>
+    <!-- Interior partitions, leaving gaps to drive through. Without them the
+         whole arena is visible from the start and there is nothing to
+         explore: the planner would report it complete on the first cycle. -->
+    <box id="p_1" size="0.2,7,1" movable="false">
+      <body position="-2,2.5,0" orientation="0,0,0" />
+    </box>
+    <box id="p_2" size="0.2,7,1" movable="false">
+      <body position="2,-2.5,0" orientation="0,0,0" />
+    </box>
+    <box id="p_3" size="5,0.2,1" movable="false">
+      <body position="3.5,2,0" orientation="0,0,0" />
+    </box>
+
+    <foot-bot id="r0">
+      <body position="-4.5,-4.5,0" orientation="0.0,0,0" />
+      <controller config="mfb0" />
+    </foot-bot>
+    <foot-bot id="r1">
+      <body position="-4.5,4.5,0" orientation="-90.0,0,0" />
+      <controller config="mfb1" />
+    </foot-bot>
+    <foot-bot id="r2">
+      <body position="4.5,4.5,0" orientation="180.0,0,0" />
+      <controller config="mfb2" />
+    </foot-bot>
+    <foot-bot id="r3">
+      <body position="4.5,-4.5,0" orientation="90.0,0,0" />
+      <controller config="mfb3" />
+    </foot-bot>
+  </arena>
+
+
+  <physics_engines>
+    <dynamics2d id="dyn2d" />
+  </physics_engines>
+
+  <media>
+    <photorealism id="pr" backend="vulkan" latency="immediate">
+      <sun direction="0.6,0.2,-1" intensity="100000" cast_shadows="true" />
+      <skybox color="0.53,0.71,0.92" />
+    </photorealism>
+  </media>
+
+  <!-- No visualization by default so the run works headless. Add a
+       <visualization><filament .../></visualization> block to watch it. -->
+
+</argos-configuration>

@@ -215,6 +215,28 @@ mgg::ExpandContext PlannerNode::makeContext() {
 void PlannerNode::onOdometry(nav_msgs::msg::Odometry::ConstSharedPtr msg) {
   current_state_ = fromPoseMsg(msg->pose.pose);
   have_odometry_ = true;
+
+  // The global graph is a trajectory backbone, so it has to be laid down as
+  // the robot drives rather than once a planning cycle. A new vertex only
+  // attaches to a parent within global_vertex_spacing * 5, and a cycle can be
+  // forty seconds apart: the robot covers several metres in that time, ends up
+  // beyond the attachment radius of everything, and the graph stays at the one
+  // seed vertex for the whole run. That is silent - the seed is published, so
+  // the exchange looks healthy - and it means two robots' graphs are two
+  // isolated points that can never come close enough to merge. Measured: four
+  // robots, 0.65 Hz of graph traffic, one vertex per message, zero merges.
+  //
+  // Only the distance test runs at odometry rate. The rest is behind it and
+  // fires every global_vertex_spacing of travel, so the map queries and the
+  // sweep over existing vertices happen a couple of times a metre.
+  const Eigen::Vector3d here(current_state_[0], current_state_[1],
+                             current_state_[2]);
+  if (have_global_anchor_ &&
+      (here - last_global_anchor_).norm() < global_vertex_spacing_) {
+    return;
+  }
+  const std::lock_guard<std::recursive_mutex> lock(planner_mutex_);
+  updateGlobalGraph();
 }
 
 void PlannerNode::onPointCloud(
@@ -531,6 +553,8 @@ void PlannerNode::updateGlobalGraph() {
     auto* root = new mgg::Vertex(0, state);
     root->robot_id = static_cast<int>(planning_params_.robot_id);
     global_graph_->addVertex(root);
+    last_global_anchor_ = Eigen::Vector3d(state[0], state[1], state[2]);
+    have_global_anchor_ = true;
     RCLCPP_INFO(get_logger(), "global graph seeded at (%.2f, %.2f, %.2f)",
                 state[0], state[1], state[2]);
     return;
@@ -597,6 +621,15 @@ void PlannerNode::updateGlobalGraph() {
   // If no candidate has an admissible line of sight (e.g. turned a blind wall corner),
   // do NOT create an edge cutting through the wall.
   if (parent_vertex == nullptr) {
+    // Nothing in range with a clear line to it. Expected briefly around a
+    // blind corner, and the right answer is to wait rather than run an edge
+    // through the wall - but if it persists the backbone has stalled and the
+    // robot will never share anything, so say so.
+    RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 10000,
+                         "global graph has no reachable parent within %.1f m of "
+                         "(%.2f, %.2f); it has %d vertices and is not growing",
+                         global_vertex_spacing_ * 5.0, here.x(), here.y(),
+                         global_graph_->getNumVertices());
     return;
   }
 
@@ -607,6 +640,8 @@ void PlannerNode::updateGlobalGraph() {
   parent_vertex->children.push_back(v);
   global_graph_->addVertex(v);
   global_graph_->addEdge(v, parent_vertex, edge_distance);
+  last_global_anchor_ = here;
+  have_global_anchor_ = true;
 }
 
 

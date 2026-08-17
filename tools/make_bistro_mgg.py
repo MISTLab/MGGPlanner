@@ -311,7 +311,7 @@ def main():
       Start the ROS 2 side first - it creates the socket, the simulator
       connects to it:
 
-          ros2 launch mgg_argos bistro.launch.py
+          ros2 launch mgg_argos swarm.launch.py params:=<bistro.yaml>
 
       then, with ARGOS_PLUGIN_PATH covering the mgg_argos plugin build:
 
