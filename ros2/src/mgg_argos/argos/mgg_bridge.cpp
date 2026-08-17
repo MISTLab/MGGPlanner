@@ -277,10 +277,11 @@ void CMGGBridge::RecvPoints(std::vector<CVector3>& vec_out,
                             std::uint32_t un_count) {
    vec_out.clear();
    vec_out.reserve(un_count);
+   constexpr Real fOverlayLift = 0.12;
    for(std::uint32_t i = 0; i < un_count; ++i) {
       float pfPoint[3];
       RecvAll(pfPoint, sizeof(pfPoint));
-      vec_out.emplace_back(pfPoint[0], pfPoint[1], pfPoint[2]);
+      vec_out.emplace_back(pfPoint[0], pfPoint[1], pfPoint[2] + fOverlayLift);
    }
 }
 
@@ -306,6 +307,7 @@ void CMGGBridge::RecvOverlays(size_t un_robot_index) {
    const CColor cGraphColor(UInt8(cColor.GetRed() * 0.55),
                             UInt8(cColor.GetGreen() * 0.55),
                             UInt8(cColor.GetBlue() * 0.55));
+   constexpr Real fOverlayLift = 0.12;
 
    for(UInt8 b = 0; b < unBlocks; ++b) {
       UInt8 unType = 0;
@@ -324,16 +326,16 @@ void CMGGBridge::RecvOverlays(size_t un_robot_index) {
             std::uint32_t unCount = 0;
             RecvAll(&unCount, sizeof(unCount));
             RecvPoints(m_vecPoints, unCount);
-            /* Thick, unlike the graph. Filament draws its LINES primitive one
-             * pixel wide with no way to widen it, which over a photorealistic
-             * street is close to invisible; the path is the one thing being
-             * watched and is only a few dozen segments, so it can afford the
-             * twelve vertices a segment that real geometry costs. */
             cDraw.AddThickPolyline(m_vecPoints, m_fPathWidth, cColor);
-            for(const CVector3& cPoint : m_vecPoints) {
-               cDraw.AddThickLine(cPoint - CVector3(0.0, 0.0, m_fPathWidth),
-                                  cPoint + CVector3(0.0, 0.0, m_fPathWidth * 3.0),
-                                  m_fPathWidth * 0.6, cColor);
+            if(!m_vecPoints.empty()) {
+               const CVector3& cGoal = m_vecPoints.back();
+               const Real fR = 0.3;
+               cDraw.AddThickLine(cGoal - CVector3(fR, 0.0, 0.0),
+                                  cGoal + CVector3(fR, 0.0, 0.0),
+                                  m_fPathWidth * 0.8, cColor);
+               cDraw.AddThickLine(cGoal - CVector3(0.0, fR, 0.0),
+                                  cGoal + CVector3(0.0, fR, 0.0),
+                                  m_fPathWidth * 0.8, cColor);
             }
             break;
          }
@@ -343,18 +345,49 @@ void CMGGBridge::RecvOverlays(size_t un_robot_index) {
             for(std::uint32_t e = 0; e < unCount; ++e) {
                float pfSegment[6];
                RecvAll(pfSegment, sizeof(pfSegment));
-               cDraw.AddLine(CVector3(pfSegment[0], pfSegment[1], pfSegment[2]),
-                             CVector3(pfSegment[3], pfSegment[4], pfSegment[5]),
+               cDraw.AddLine(CVector3(pfSegment[0], pfSegment[1], pfSegment[2] + fOverlayLift),
+                             CVector3(pfSegment[3], pfSegment[4], pfSegment[5] + fOverlayLift),
                              cGraphColor);
             }
             break;
          }
+         case kOverlayGlobalGraph: {
+            std::uint32_t unCount = 0;
+            RecvAll(&unCount, sizeof(unCount));
+            const CColor cGlobalColor(255, 215, 0); /* Bright Gold */
+            for(std::uint32_t e = 0; e < unCount; ++e) {
+               float pfSegment[6];
+               RecvAll(pfSegment, sizeof(pfSegment));
+               cDraw.AddThickLine(CVector3(pfSegment[0], pfSegment[1], pfSegment[2] + fOverlayLift),
+                                  CVector3(pfSegment[3], pfSegment[4], pfSegment[5] + fOverlayLift),
+                                  m_fPathWidth * 0.75, cGlobalColor);
+            }
+            break;
+         }
+         case kOverlayMerge: {
+            std::uint32_t unCount = 0;
+            RecvAll(&unCount, sizeof(unCount));
+            const CColor cMergeColor(0, 255, 255); /* Bright Cyan */
+            for(std::uint32_t e = 0; e < unCount; ++e) {
+               float pfSegment[6];
+               RecvAll(pfSegment, sizeof(pfSegment));
+               cDraw.AddThickLine(CVector3(pfSegment[0], pfSegment[1], pfSegment[2] + fOverlayLift),
+                                  CVector3(pfSegment[3], pfSegment[4], pfSegment[5] + fOverlayLift),
+                                  m_fPathWidth * 1.2, cMergeColor);
+            }
+            break;
+         }
+
          case kOverlayPoints: {
             std::uint32_t unCount = 0;
             RecvAll(&unCount, sizeof(unCount));
             RecvPoints(m_vecPoints, unCount);
+            const Real fR = 0.2;
             for(const CVector3& cPoint : m_vecPoints) {
-               cDraw.AddMarker(cPoint, 0.4, cColor);
+               cDraw.AddLine(cPoint - CVector3(fR, 0.0, 0.0),
+                             cPoint + CVector3(fR, 0.0, 0.0), cColor);
+               cDraw.AddLine(cPoint - CVector3(0.0, fR, 0.0),
+                             cPoint + CVector3(0.0, fR, 0.0), cColor);
             }
             break;
          }
@@ -365,6 +398,7 @@ void CMGGBridge::RecvOverlays(size_t un_robot_index) {
             break;
          }
       }
+
    }
 }
 

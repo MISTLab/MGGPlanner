@@ -48,6 +48,7 @@ class PciNode : public rclcpp::Node {
                    std::string& error);
 
   void publishPath(const std::vector<geometry_msgs::msg::Pose>& path);
+  void planAndPublish();
 
   rclcpp::Client<mgg_msgs::srv::PlannerSrv>::SharedPtr planner_client_;
   rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr trigger_srv_;
@@ -57,12 +58,25 @@ class PciNode : public rclcpp::Node {
   rclcpp::TimerBase::SharedPtr auto_timer_;
   rclcpp::CallbackGroup::SharedPtr callback_group_;
 
+  std::mutex mutex_;
   bool running_ = false;
   bool have_odometry_ = false;
-  double service_timeout_sec_ = 30.0;
+  bool planning_in_progress_ = false;
+  bool path_in_progress_ = false;
+
+  geometry_msgs::msg::Pose current_pose_;
+  geometry_msgs::msg::Pose goal_pose_;
+  geometry_msgs::msg::Point last_progress_pos_;
+  rclcpp::Time last_progress_time_;
+  rclcpp::Time path_start_time_;
+
+  double service_timeout_sec_ = 60.0;
+  double reach_distance_ = 0.3;
+  double stuck_timeout_sec_ = 20.0;
   int bound_mode_ = 0;
   std::string world_frame_ = "world";
 };
+
 
 }  // namespace mgg_pci
 

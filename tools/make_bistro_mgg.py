@@ -220,7 +220,7 @@ def controller(i):
 
 def robot(i, pose):
     x, y, yaw = pose
-    return f"""    <foot-bot id="fb{i}">
+    return f"""    <foot-bot id="r{i}">
       <body position="{x},{y},0" orientation="{yaw:.1f},0,0" />
       <controller config="mgg{i}" />
     </foot-bot>"""
@@ -280,10 +280,10 @@ def main():
     poses, total = start_poses(args.robots, parse_boxes(boxes))
     controllers = "".join(controller(i) for i in range(args.robots))
     robots = "\n".join(robot(i, p) for i, p in enumerate(poses))
-    robot_ids = ",".join(f"fb{i}" for i in range(args.robots))
+    robot_ids = ",".join(f"r{i}" for i in range(args.robots))
 
     if args.gui:
-        insets = ",".join(f"fb{i}" for i in range(args.robots))
+        insets = ",".join(f"r{i}" for i in range(args.robots))
         visualization = f"""  <visualization>
     <!-- Street level on purpose: Bistro is a street-level game asset with
          hollow, single-sided roofs, so an aerial viewpoint sees through the
@@ -291,9 +291,10 @@ def main():
          and nowhere else - no sensor can see them. -->
     <filament medium="pr" resolution="1280,720" speed="1"
               near="0.3" far="400"
-              position="-7.25,-12.75,3.0" look_at="-9.5,0.5,1.2"
+              position="-12.0,-14.5,3.5" look_at="5.0,-14.0,0.5"
               inset_camera="{insets}" inset_size="0.24" />
   </visualization>"""
+
     else:
         visualization = ("  <!-- Headless. Re-run the generator with the gui\n"
                      "       option for a window. -->")

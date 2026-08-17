@@ -129,7 +129,16 @@ enum EOverlayType : std::uint8_t {
   ///   u32 count
   ///   f32 x, y, z  per point
   kOverlayPoints = 3,
+  /// Swarm-wide global topological roadmap edges:
+  ///   u32 count
+  ///   f32 x0, y0, z0, x1, y1, z1  per segment
+  kOverlayGlobalGraph = 4,
+  /// Graph merge beacon and connecting lines:
+  ///   u32 count
+  ///   f32 x0, y0, z0, x1, y1, z1  per segment
+  kOverlayMerge = 5,
 };
+
 
 enum ECommandType : std::uint8_t {
   /// Keep following the current path.

@@ -60,10 +60,12 @@ docker image inspect "$IMAGE" >/dev/null 2>&1 || {
   exit 1; }
 
 cleanup() {
+  pkill -P $$ 2>/dev/null || true
   [[ -n "${ARGOS_PID:-}" ]] && kill "$ARGOS_PID" 2>/dev/null || true
   [[ -n "${CID:-}" ]] && docker rm -f "$CID" >/dev/null 2>&1 || true
 }
 trap cleanup EXIT INT TERM
+
 
 # Refuse to start alongside a previous run. Two of these share one ROS graph and
 # one socket path, so the second bridge publishes a second /clock and every node
@@ -192,24 +194,26 @@ done
 wait "${BOOTSTRAP_PIDS[@]}" 2>/dev/null || true
 
 echo "==> handing over to the planner"
+TRIGGER_PIDS=()
 for robot in "${ROBOTS[@]}"; do
-  # The PCI's auto mode continues a loop but does not start one, so each robot
-  # needs a first trigger. In a single-robot run the PCI is at /pci_trigger;
-  # under the bistro launch each is namespaced.
   if [[ ${#ROBOTS[@]} -eq 1 ]]; then srv="/pci_trigger"; else srv="/$robot/pci_trigger"; fi
-  printf '  %s: ' "$robot"
   docker exec "$CID" bash -c \
     "source /opt/ros/jazzy/setup.bash && source /ws/install/setup.bash && \
-     ros2 service call $srv std_srvs/srv/Trigger" 2>&1 | tail -1
+     ros2 service call $srv std_srvs/srv/Trigger" >/dev/null 2>&1 &
+  TRIGGER_PIDS+=($!)
 done
+wait "${TRIGGER_PIDS[@]}" 2>/dev/null || true
+
 
 echo
 echo "==> exploring for ${LENGTH}s; ^C to stop early. Planning cycles as they land:"
-tail -f "$IPC/ros.log" | grep --line-buffered -E "grid graph|forwarded a|merged robot" &
+tail -n 0 -f --pid=$$ "$IPC/ros.log" | grep --line-buffered -E "grid graph|forwarded a|merged robot" &
 TAIL_PID=$!
 DEADLINE=$(( SECONDS + LENGTH ))
 while kill -0 "$ARGOS_PID" 2>/dev/null && (( SECONDS < DEADLINE )); do sleep 2; done
 kill "$TAIL_PID" 2>/dev/null || true
+pkill -P $$ 2>/dev/null || true
+
 # Stop the simulator rather than waiting for a length it was never given.
 kill "$ARGOS_PID" 2>/dev/null || true
 wait "$ARGOS_PID" 2>/dev/null || true

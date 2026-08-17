@@ -59,9 +59,41 @@ void CMGGFootbot::Reset() {
 void CMGGFootbot::SetPath(const std::vector<CVector3>& vec_waypoints) {
    m_vecPath = vec_waypoints;
    m_unCurrentWaypoint = 0;
-   /* The planner's first waypoint is normally the robot's current pose,
-    * which would be reached immediately; leaving it in costs nothing
-    * because the tolerance check below skips it on the first step. */
+   if(m_vecPath.empty() || m_pcPositioning == nullptr) return;
+
+   const CCI_PositioningSensor::SReading& sPose = m_pcPositioning->GetReading();
+   const Real fRobotX = sPose.Position.GetX();
+   const Real fRobotY = sPose.Position.GetY();
+
+   /* If the robot has already moved ahead of the start of this path
+    * (e.g. while the planner was computing), advance to the first waypoint
+    * that is actually ahead of the robot so it never doubles back. */
+   while(m_unCurrentWaypoint + 1 < m_vecPath.size()) {
+      const CVector3& cA = m_vecPath[m_unCurrentWaypoint];
+      const CVector3& cB = m_vecPath[m_unCurrentWaypoint + 1];
+      const Real fDistA = std::sqrt(std::pow(cA.GetX() - fRobotX, 2) +
+                                    std::pow(cA.GetY() - fRobotY, 2));
+      if(fDistA <= m_fWaypointTolerance) {
+         ++m_unCurrentWaypoint;
+         continue;
+      }
+      const Real fAbX = cB.GetX() - cA.GetX();
+      const Real fAbY = cB.GetY() - cA.GetY();
+      const Real fAbLenSq = fAbX * fAbX + fAbY * fAbY;
+      if(fAbLenSq > 1e-6) {
+         const Real fApX = fRobotX - cA.GetX();
+         const Real fApY = fRobotY - cA.GetY();
+         const Real fProj = (fApX * fAbX + fApY * fAbY) / fAbLenSq;
+         if(fProj >= 0.5) {
+            const Real fPerpDistSq = (fApX * fApX + fApY * fApY) - fProj * fProj * fAbLenSq;
+            if(fPerpDistSq <= std::pow(m_fWaypointTolerance * 2.0, 2)) {
+               ++m_unCurrentWaypoint;
+               continue;
+            }
+         }
+      }
+      break;
+   }
 }
 
 /****************************************/
@@ -88,25 +120,43 @@ void CMGGFootbot::ControlStep() {
    CRadians cYaw, cPitch, cRoll;
    sPose.Orientation.ToEulerAngles(cYaw, cPitch, cRoll);
 
-   /* Retire every waypoint already within tolerance, not just the next
-    * one: a path that doubles back can put several behind the robot in
-    * one step, and advancing one per tick would make it crawl through
-    * them. The last waypoint gets its own, looser tolerance. */
+   /* Retire every waypoint already within tolerance or behind the robot.
+    * The last waypoint gets its own, looser tolerance. */
    while(m_unCurrentWaypoint < m_vecPath.size()) {
       const bool bIsLast = (m_unCurrentWaypoint + 1 == m_vecPath.size());
       const CVector3& cTarget = m_vecPath[m_unCurrentWaypoint];
       const Real fDistance =
          std::sqrt(std::pow(cTarget.GetX() - sPose.Position.GetX(), 2) +
                    std::pow(cTarget.GetY() - sPose.Position.GetY(), 2));
-      if(fDistance > (bIsLast ? m_fGoalTolerance : m_fWaypointTolerance)) {
-         break;
+      if(fDistance <= (bIsLast ? m_fGoalTolerance : m_fWaypointTolerance)) {
+         ++m_unCurrentWaypoint;
+         continue;
       }
-      ++m_unCurrentWaypoint;
+      if(!bIsLast) {
+         const CVector3& cNext = m_vecPath[m_unCurrentWaypoint + 1];
+         const Real fAbX = cNext.GetX() - cTarget.GetX();
+         const Real fAbY = cNext.GetY() - cTarget.GetY();
+         const Real fAbLenSq = fAbX * fAbX + fAbY * fAbY;
+         if(fAbLenSq > 1e-6) {
+            const Real fApX = sPose.Position.GetX() - cTarget.GetX();
+            const Real fApY = sPose.Position.GetY() - cTarget.GetY();
+            const Real fProj = (fApX * fAbX + fApY * fAbY) / fAbLenSq;
+            if(fProj >= 0.5) {
+               const Real fPerpDistSq = (fApX * fApX + fApY * fApY) - fProj * fProj * fAbLenSq;
+               if(fPerpDistSq <= std::pow(m_fWaypointTolerance * 1.5, 2)) {
+                  ++m_unCurrentWaypoint;
+                  continue;
+               }
+            }
+         }
+      }
+      break;
    }
    if(!HasPath()) {
       m_pcWheels->SetLinearVelocity(0.0, 0.0);
       return;
    }
+
 
    const CVector3& cTarget = m_vecPath[m_unCurrentWaypoint];
    const Real fDx = cTarget.GetX() - sPose.Position.GetX();

@@ -153,23 +153,23 @@
        draw_medium makes it also draw each robot's path and graph into the
        photorealism overlay, which only the viewer above can see. -->
   <loop_functions library="libmgg_bridge.so" label="mgg_bridge"
-                  socket="/tmp/mgg_argos.sock" robots="fb0,fb1,fb2,fb3"
+                  socket="/tmp/mgg_argos.sock" robots="r0,r1,r2,r3"
                   send_ground_truth="true" draw_medium="pr" />
 
   <arena size="200,210,70" center="24,-4,25">
-    <foot-bot id="fb0">
+    <foot-bot id="r0">
       <body position="-2.77,-13.62,0" orientation="-7.1,0,0" />
       <controller config="mgg0" />
     </foot-bot>
-    <foot-bot id="fb1">
+    <foot-bot id="r1">
       <body position="-10.14,4.18,0" orientation="98.5,0,0" />
       <controller config="mgg1" />
     </foot-bot>
-    <foot-bot id="fb2">
+    <foot-bot id="r2">
       <body position="8.25,-14.75,0" orientation="180.0,0,0" />
       <controller config="mgg2" />
     </foot-bot>
-    <foot-bot id="fb3">
+    <foot-bot id="r3">
       <body position="3.18,-14.37,0" orientation="-7.1,0,0" />
       <controller config="mgg3" />
     </foot-bot>

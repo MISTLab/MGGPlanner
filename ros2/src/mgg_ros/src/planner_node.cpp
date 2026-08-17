@@ -300,12 +300,23 @@ void PlannerNode::onNeighbourGraph(mgg_msgs::msg::Graph::ConstSharedPtr msg) {
     return;
   }
   if (r.vertices_added > 0 || r.edges_added > 0) {
+    Eigen::Isometry3d t_ours_theirs = Eigen::Isometry3d::Identity();
+    if (poses_->getRobotTransform(sender, t_ours_theirs) && !incoming.vertices.empty()) {
+      const Eigen::Vector3d their_local(incoming.vertices.front().state[0],
+                                        incoming.vertices.front().state[1],
+                                        incoming.vertices.front().state[2]);
+      const Eigen::Vector3d their_world = t_ours_theirs * their_local;
+      const Eigen::Vector3d our_pos(current_state_[0], current_state_[1], current_state_[2]);
+      recent_merges_.push_back({now(), sender, our_pos, their_world});
+    }
+    publishMarkers();
     RCLCPP_INFO(get_logger(),
                 "merged robot %d: +%d vertices, +%d edges, %d updated%s",
                 sender, r.vertices_added, r.edges_added, r.vertices_updated,
                 r.merged ? "" : " (not yet connected)");
   }
 }
+
 
 std::string PlannerNode::buildLocalGraph() {
   // Held for the whole cycle: the map must not change under a planner that is
@@ -378,9 +389,13 @@ std::string PlannerNode::buildLocalGraph() {
       map_->getResolution(), exploring_direction_);
 
   best_path_.clear();
+  path_shortcut_from_ = 0;
+  path_shortcut_corners_ = 0;
+  path_shortcut_to_ = 0;
   for (const mgg::Vertex* v : sel.best_path) {
     if (v != nullptr) best_path_.push_back(v->state);
   }
+
 
   // What comes out of the graph is a walk along lattice edges: it steps
   // between cell centres and reads as a staircase even across open floor. ROS 1
@@ -521,27 +536,79 @@ void PlannerNode::updateGlobalGraph() {
     return;
   }
 
-  mgg::Vertex* nearest = nullptr;
-  if (!global_graph_->getNearestVertex(&state, &nearest) ||
-      nearest == nullptr) {
+  const mgg::ExpandContext ctx = makeContext();
+  const auto is_admissible = [this, &ctx](const Eigen::Vector3d& from,
+                                          const Eigen::Vector3d& to) {
+    // Check if the path between vertices is clear of walls/obstacles
+    return map_->getPathStatus(from, to, ctx.robot_box_size, /*stop_at_unknown=*/false) !=
+           mgg::VoxelStatus::kOccupied;
+  };
+
+
+  const Eigen::Vector3d here(state[0], state[1], state[2]);
+
+  // First, verify we are at least global_vertex_spacing_ from any existing vertex
+  // of this robot to avoid cluttering the graph with near-duplicates.
+  double min_dist_to_any = std::numeric_limits<double>::max();
+  for (const auto& entry : global_graph_->vertices_map_) {
+    if (entry.second == nullptr) continue;
+    if (entry.second->robot_id != static_cast<int>(planning_params_.robot_id)) {
+      continue;
+    }
+    const Eigen::Vector3d vpos(entry.second->state[0], entry.second->state[1],
+                               entry.second->state[2]);
+    const double d = (vpos - here).norm();
+    if (d < min_dist_to_any) {
+      min_dist_to_any = d;
+    }
+  }
+  if (min_dist_to_any < global_vertex_spacing_) return;
+
+  // Find candidate vertices of this robot sorted by Euclidean distance,
+  // and choose the closest one whose connecting edge is collision-free (admissible).
+  std::vector<std::pair<double, mgg::Vertex*>> candidates;
+  for (const auto& entry : global_graph_->vertices_map_) {
+    if (entry.second == nullptr) continue;
+    if (entry.second->robot_id != static_cast<int>(planning_params_.robot_id)) {
+      continue;
+    }
+    const Eigen::Vector3d vpos(entry.second->state[0], entry.second->state[1],
+                               entry.second->state[2]);
+    const double d = (vpos - here).norm();
+    if (d <= global_vertex_spacing_ * 5.0) {
+      candidates.emplace_back(d, entry.second);
+    }
+  }
+  std::sort(candidates.begin(), candidates.end(),
+            [](const auto& a, const auto& b) { return a.first < b.first; });
+
+  mgg::Vertex* parent_vertex = nullptr;
+  double edge_distance = 0.0;
+  for (const auto& cand : candidates) {
+    const Eigen::Vector3d origin(cand.second->state[0], cand.second->state[1],
+                                 cand.second->state[2]);
+    if (is_admissible(origin, here)) {
+      parent_vertex = cand.second;
+      edge_distance = cand.first;
+      break;
+    }
+  }
+
+  // If no candidate has an admissible line of sight (e.g. turned a blind wall corner),
+  // do NOT create an edge cutting through the wall.
+  if (parent_vertex == nullptr) {
     return;
   }
-  const Eigen::Vector3d origin(nearest->state[0], nearest->state[1],
-                               nearest->state[2]);
-  const Eigen::Vector3d here(state[0], state[1], state[2]);
-  const double d = (here - origin).norm();
-  // Only extend once the robot has actually moved, or the graph fills with
-  // near-duplicate vertices every cycle.
-  if (d < global_vertex_spacing_) return;
 
   auto* v = new mgg::Vertex(global_graph_->generateVertexID(), state);
   v->robot_id = static_cast<int>(planning_params_.robot_id);
-  v->parent = nearest;
-  v->distance = nearest->distance + d;
-  nearest->children.push_back(v);
+  v->parent = parent_vertex;
+  v->distance = parent_vertex->distance + edge_distance;
+  parent_vertex->children.push_back(v);
   global_graph_->addVertex(v);
-  global_graph_->addEdge(v, nearest, d);
+  global_graph_->addEdge(v, parent_vertex, edge_distance);
 }
+
 
 void PlannerNode::onBuildRequest(
     const std::shared_ptr<std_srvs::srv::Trigger::Request>,
@@ -715,8 +782,55 @@ void PlannerNode::publishMarkers() {
     }
   }
 
+  // Swarm graph merge beacons & connecting lines
+  const rclcpp::Time current_time = now();
+  recent_merges_.erase(
+      std::remove_if(recent_merges_.begin(), recent_merges_.end(),
+                     [&](const MergeEvent& ev) {
+                       return (current_time - ev.stamp).seconds() > 3.0;
+                     }),
+      recent_merges_.end());
+
+  if (!recent_merges_.empty()) {
+    visualization_msgs::msg::Marker merge_marker;
+    merge_marker.header.frame_id = world_frame_;
+    merge_marker.header.stamp = current_time;
+    merge_marker.ns = "graph_merges";
+    merge_marker.type = visualization_msgs::msg::Marker::LINE_LIST;
+    merge_marker.action = visualization_msgs::msg::Marker::ADD;
+    merge_marker.scale.x = 0.08;
+    merge_marker.color.r = 0.0;
+    merge_marker.color.g = 1.0;
+    merge_marker.color.b = 1.0;
+    merge_marker.color.a = 1.0;
+    merge_marker.pose.orientation.w = 1.0;
+
+    for (const auto& ev : recent_merges_) {
+      // Connecting line between our robot and their graph origin
+      geometry_msgs::msg::Point p1, p2;
+      p1.x = ev.our_pos.x(); p1.y = ev.our_pos.y(); p1.z = ev.our_pos.z();
+      p2.x = ev.their_pos.x(); p2.y = ev.their_pos.y(); p2.z = ev.their_pos.z();
+      merge_marker.points.push_back(p1);
+      merge_marker.points.push_back(p2);
+
+      // Horizontal beacon cross around their position
+      const double r = 0.5;
+      geometry_msgs::msg::Point a, b, c, d;
+      a.x = ev.their_pos.x() - r; a.y = ev.their_pos.y(); a.z = ev.their_pos.z();
+      b.x = ev.their_pos.x() + r; b.y = ev.their_pos.y(); b.z = ev.their_pos.z();
+      c.x = ev.their_pos.x(); c.y = ev.their_pos.y() - r; c.z = ev.their_pos.z();
+      d.x = ev.their_pos.x(); d.y = ev.their_pos.y() + r; d.z = ev.their_pos.z();
+      merge_marker.points.push_back(a);
+      merge_marker.points.push_back(b);
+      merge_marker.points.push_back(c);
+      merge_marker.points.push_back(d);
+    }
+    array.markers.push_back(merge_marker);
+  }
+
   marker_pub_->publish(array);
 }
+
 
 
 }  // namespace mgg_ros

@@ -138,6 +138,15 @@ class PlannerNode : public rclcpp::Node {
   int path_shortcut_to_ = 0;
   std::string world_frame_ = "world";
 
+  struct MergeEvent {
+    rclcpp::Time stamp;
+    int sender_id = 0;
+    Eigen::Vector3d our_pos = Eigen::Vector3d::Zero();
+    Eigen::Vector3d their_pos = Eigen::Vector3d::Zero();
+  };
+  std::vector<MergeEvent> recent_merges_;
+
+
   rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr odom_sub_;
   rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr cloud_sub_;
   rclcpp::Subscription<mgg_msgs::msg::Graph>::SharedPtr neighbour_sub_;

@@ -176,25 +176,31 @@ void BridgeNode::onMarkers(const std::string& id,
                            const visualization_msgs::msg::MarkerArray& msg) {
   const auto it = robot_index_.find(id);
   if (it == robot_index_.end()) return;
-  std::vector<float> edges;
+  std::vector<float> local_edges;
+  std::vector<float> global_edges;
+  std::vector<float> merge_edges;
   std::vector<float> points;
   for (const auto& marker : msg.markers) {
     if (marker.type == visualization_msgs::msg::Marker::LINE_LIST) {
-      // A LINE_LIST is consecutive pairs; an odd count would mean a truncated
-      // marker, so the last point is simply left out rather than paired with
-      // whatever follows it.
+      std::vector<float>* target = &local_edges;
+      if (marker.ns == "global_graph_edges") {
+        target = &global_edges;
+      } else if (marker.ns == "graph_merges") {
+        target = &merge_edges;
+      }
       const size_t pairs = marker.points.size() / 2;
-      edges.reserve(edges.size() + pairs * 6);
+      target->reserve(target->size() + pairs * 6);
       for (size_t i = 0; i + 1 < marker.points.size(); i += 2) {
-        if (static_cast<int>(edges.size() / 6) >= max_overlay_edges_) break;
+        if (target == &local_edges &&
+            static_cast<int>(target->size() / 6) >= max_overlay_edges_) break;
         const auto& a = marker.points[i];
         const auto& b = marker.points[i + 1];
-        edges.push_back(static_cast<float>(a.x));
-        edges.push_back(static_cast<float>(a.y));
-        edges.push_back(static_cast<float>(a.z));
-        edges.push_back(static_cast<float>(b.x));
-        edges.push_back(static_cast<float>(b.y));
-        edges.push_back(static_cast<float>(b.z));
+        target->push_back(static_cast<float>(a.x));
+        target->push_back(static_cast<float>(a.y));
+        target->push_back(static_cast<float>(a.z));
+        target->push_back(static_cast<float>(b.x));
+        target->push_back(static_cast<float>(b.y));
+        target->push_back(static_cast<float>(b.z));
       }
     } else if (marker.type == visualization_msgs::msg::Marker::POINTS ||
                marker.type == visualization_msgs::msg::Marker::SPHERE_LIST) {
@@ -208,7 +214,9 @@ void BridgeNode::onMarkers(const std::string& id,
     }
   }
   std::lock_guard<std::mutex> lock(overlay_mutex_);
-  robots_[it->second].graph_edges = std::move(edges);
+  robots_[it->second].graph_edges = std::move(local_edges);
+  robots_[it->second].global_graph_edges = std::move(global_edges);
+  robots_[it->second].merge_edges = std::move(merge_edges);
   robots_[it->second].overlay_points = std::move(points);
 }
 
@@ -240,12 +248,11 @@ void BridgeNode::appendOverlays(Robot& robot, std::vector<std::uint8_t>& out) {
   std::uint8_t count = 0;
   if (!robot.drawn_path.empty()) ++count;
   if (!robot.graph_edges.empty()) ++count;
+  if (!robot.global_graph_edges.empty()) ++count;
+  if (!robot.merge_edges.empty()) ++count;
   if (!robot.overlay_points.empty()) ++count;
   append(&count, 1);
-  // Geometry is resent every tick even though it does not change every tick: the
-  // far side clears its overlay each tick, so anything not resent disappears.
-  // That is deliberate - a stale graph on screen is worse than none - and the
-  // cost is a memcpy of geometry that is already in hand.
+
   if (!robot.drawn_path.empty()) {
     block(kOverlayPath, robot.drawn_path,
           std::uint32_t(robot.drawn_path.size() / 3));
@@ -254,11 +261,20 @@ void BridgeNode::appendOverlays(Robot& robot, std::vector<std::uint8_t>& out) {
     block(kOverlayGraphEdges, robot.graph_edges,
           std::uint32_t(robot.graph_edges.size() / 6));
   }
+  if (!robot.global_graph_edges.empty()) {
+    block(kOverlayGlobalGraph, robot.global_graph_edges,
+          std::uint32_t(robot.global_graph_edges.size() / 6));
+  }
+  if (!robot.merge_edges.empty()) {
+    block(kOverlayMerge, robot.merge_edges,
+          std::uint32_t(robot.merge_edges.size() / 6));
+  }
   if (!robot.overlay_points.empty()) {
     block(kOverlayPoints, robot.overlay_points,
           std::uint32_t(robot.overlay_points.size() / 3));
   }
 }
+
 
 
 /****************************************/
