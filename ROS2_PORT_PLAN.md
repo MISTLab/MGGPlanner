@@ -535,9 +535,43 @@ Four things this phase established that the plan did not anticipate:
   `pci_trigger` is called, so `auto_period_sec` only continues a loop that
   something else began.
 
+**Phase 6b [IN PROGRESS]: Bistro, four robots, and drawing what the planner
+thinks.** ARGoS gained a debug-overlay API (line geometry on its own Filament
+visibility layer, so it reaches the viewer and never a sensor) and the bridge
+protocol gained overlay blocks, so each robot's path and graph are drawn in the
+simulator. `tools/make_bistro_mgg.py` generates a four-robot experiment on the
+argos3-examples Bistro street, and `tools/run_argos_demo.sh --bistro` runs it.
+
+Working: the whole loop turns. 71 to 86 planning cycles per robot at about
+25 ms each, paths forwarded, graph exchange wired through one shared topic,
+overlays drawn.
+
+**Not working: every candidate edge in Bistro is rejected as occupied, so no
+robot has yet planned a path there.** The small arena is unaffected. Ground
+projection reports finding ground everywhere (`0 no ground`, `0 unmapped`), so
+the collision box, riding at `max_ground_height` above whatever ground was
+found, is intersecting mapped geometry every time. Two things to check first:
+
+- Bistro's kerb proxies are 0.3 m tall and the box rides from 0.2 to 0.4 m, so
+  a kerb inside the box footprint is a genuine obstacle. `max_ground_height`
+  was tuned against a flat arena floor and has never been checked against a
+  street with kerbs.
+- `projectSample` moves the sample's x and y onto whichever of its four
+  lateral probes found ground, and those probes are 0.5 m out. On a street
+  that is far enough to land on the pavement, so a vertex meant for the road
+  can be placed on the kerb top.
+
+Measured along the way, and worth knowing before touching any bound: gain
+evaluation is 96 to 97 percent of a planning cycle (1897 of 1977 ms; 3237 of
+3347 ms). Widening a bound costs ray casting, not sweeping.
+
 **Phase 7: multi-robot with static offsets (1 week).** Three foot-bots, graph
 merge via the existing constants moved to config. This validates the merge
-independently of Swarm-SLAM.
+independently of Swarm-SLAM. Most of the wiring now exists: the bistro launch
+runs four planner/PCI pairs with `neighbour_offsets` declared and the graph
+exchange on one shared topic. Note that `StaticPoseSource` returns false for a
+robot it has not been told about and the merge then silently drops that graph,
+so the offsets have to be declared even when they are all zero.
 
 **Phase 8: `mgg_cslam` (2 to 3 weeks).** Keyframe-anchored submaps, deformation
 on `optimized_estimates`, global-graph vertices anchored to keyframes, and
