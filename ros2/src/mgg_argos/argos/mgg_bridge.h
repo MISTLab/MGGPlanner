@@ -25,6 +25,7 @@
  *                    (default 60), since the container needs a moment
  *   send_ground_truth  default false; adds a ground-truth pose block for
  *                    evaluation. The planner never reads it.
+ *   path_width       width of the drawn path in metres (default 0.12)
  *   draw_medium      optional; the id of a <photorealism> medium. When given,
  *                    each robot's planned path and graph are drawn into that
  *                    medium's debug overlay, which only the interactive viewer
@@ -86,6 +87,10 @@ private:
     *  graphs are then drawn into the viewer. Optional, because a headless
     *  run has nothing to draw into and should not pay for the geometry. */
    CPROverlay* m_pcOverlay = nullptr;
+   /** Width of the drawn path, metres. The graph stays as hairlines: at a few
+    *  thousand edges, giving it real geometry costs twelve vertices an edge
+    *  and buries the path it is supposed to be context for. */
+   Real m_fPathWidth = 0.12;
    /** Scratch, reused per tick so a long run does not churn the allocator */
    std::vector<CVector3> m_vecPoints;
    /* Reused every tick so a long run does not churn the allocator */

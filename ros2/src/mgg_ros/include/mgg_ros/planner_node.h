@@ -127,6 +127,15 @@ class PlannerNode : public rclcpp::Node {
   mgg::EdgeInclinations edge_inclinations_;
   /// Last chosen path, in world coordinates.
   std::vector<mgg::StateVec> best_path_;
+  /// Points before and after shortcutting, reported so it is visible whether
+  /// the smoothing did anything.
+  int path_shortcut_from_ = 0;
+  /// Corners left after shortcutting, before resampling puts points back.
+  /// This is the number that says whether the smoothing did anything: the
+  /// final count goes up again, because interpolation adds evenly spaced
+  /// points along the straightened route.
+  int path_shortcut_corners_ = 0;
+  int path_shortcut_to_ = 0;
   std::string world_frame_ = "world";
 
   rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr odom_sub_;

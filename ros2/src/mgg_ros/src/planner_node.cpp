@@ -1,6 +1,7 @@
 #include "mgg_ros/planner_node.h"
 
 #include <chrono>
+#include <cmath>
 #include <cstdio>
 #include <geometry_msgs/msg/transform_stamped.hpp>
 #include <sensor_msgs/msg/point_cloud2.hpp>
@@ -380,6 +381,70 @@ std::string PlannerNode::buildLocalGraph() {
   for (const mgg::Vertex* v : sel.best_path) {
     if (v != nullptr) best_path_.push_back(v->state);
   }
+
+  // What comes out of the graph is a walk along lattice edges: it steps
+  // between cell centres and reads as a staircase even across open floor. ROS 1
+  // ran every path it returned through improveFreePath and interpolatePath
+  // (rrg.cpp:4160, 4176) and this port was publishing the raw walk, which is
+  // why the paths looked erratic in a map with nothing in them to avoid.
+  //
+  // Shortcut first, then resample. The other order interpolates points that
+  // are about to be discarded, and leaves the corners the shortcut removed
+  // still bent.
+  if (best_path_.size() > 2) {
+    const mgg::ExpandContext path_ctx = makeContext();
+    const auto segment_free = [this, &path_ctx](const Eigen::Vector3d& from,
+                                                const Eigen::Vector3d& to) {
+      // stop_at_unknown_voxel is true: a shortcut may only cross space
+      // already known to be free.
+      //
+      // Upstream passes false here (rrg.cpp:4610), which treats unknown space
+      // as passable. That is survivable there because its shortcut only ever
+      // collapses a node when the segment leading to it is under half a metre,
+      // so the leap is short. Applied to a general shortcut it is not: a
+      // partly explored map is mostly unknown, so every candidate line
+      // qualifies and the path collapses to a straight run from the robot to
+      // the goal - measured, 15 lattice points became 2 - straight through
+      // whatever has not been seen yet. The lattice detour stays wherever the
+      // map cannot yet vouch for the straight line, which near a frontier is
+      // exactly where it should.
+      return map_->getPathStatus(from, to, path_ctx.robot_box_size, true) ==
+             mgg::VoxelStatus::kFree;
+    };
+    mgg::PathType points;
+    points.reserve(best_path_.size());
+    for (const mgg::StateVec& s : best_path_) points.push_back(s.head(3));
+
+    const size_t before = points.size();
+    points = mgg::shortcutPath(points, segment_free);
+    path_shortcut_corners_ = static_cast<int>(points.size());
+    mgg::PathType resampled;
+    if (planning_params_.path_interpolation_distance > 0.0 &&
+        mgg::interpolatePath(points,
+                             planning_params_.path_interpolation_distance,
+                             resampled) &&
+        resampled.size() >= 2) {
+      points = resampled;
+    }
+    path_shortcut_from_ = static_cast<int>(before);
+    path_shortcut_to_ = static_cast<int>(points.size());
+
+    // Rebuild the states, keeping each point's heading pointing along the path
+    // it is now on rather than along the lattice edge it came from.
+    std::vector<mgg::StateVec> rebuilt;
+    rebuilt.reserve(points.size());
+    for (size_t i = 0; i < points.size(); ++i) {
+      const Eigen::Vector3d& here = points[i];
+      const Eigen::Vector3d& ahead = points[i + 1 < points.size() ? i + 1 : i];
+      const Eigen::Vector3d step = ahead - here;
+      const double yaw = step.head(2).norm() > 1e-9
+                             ? std::atan2(step.y(), step.x())
+                             : (rebuilt.empty() ? best_path_.front()[3]
+                                                : rebuilt.back()[3]);
+      rebuilt.emplace_back(here.x(), here.y(), here.z(), yaw);
+    }
+    best_path_ = rebuilt;
+  }
   if (best_path_.size() >= 2) {
     // Remember where this path is heading, so the next cycle penalises
     // doubling back.
@@ -418,10 +483,13 @@ std::string PlannerNode::buildLocalGraph() {
   std::snprintf(
       buf, sizeof(buf),
       "grid graph: %d free cells, %d vertices, %d edges%s%s; %d viewpoints, "
-      "%d frontiers; best path %zu poses, gain %.1f%s, heading %.2f rad%s",
+      "%d frontiers; best path %zu poses (%d lattice -> %d corners -> %d "
+      "resampled), gain %.1f%s, "
+      "heading %.2f rad%s",
       r.free_cells, r.vertices_added, r.edges_added,
       r.hit_limit ? " (hit a size limit)" : "", why, evaluated, frontiers,
-      best_path_.size(), sel.best_gain,
+      best_path_.size(), path_shortcut_from_, path_shortcut_corners_,
+      path_shortcut_to_, sel.best_gain,
       sel.paths_rejected_steep > 0 ? " (some paths too steep)" : "",
       exploring_direction_, timing);
   return std::string(buf);

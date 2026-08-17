@@ -145,4 +145,28 @@ double computeDTWDistance(const PathType& pa, const PathType& pb) {
 
 
 
+PathType shortcutPath(const PathType& path, const SegmentFreeFn& segment_free) {
+  if (path.size() < 3 || !segment_free) return path;
+
+  PathType out;
+  out.push_back(path.front());
+  size_t at = 0;
+  while (at + 1 < path.size()) {
+    // Farthest first: the point of the pass is to take the longest admissible
+    // leap, and walking outwards from the near end would stop at the first
+    // blocked pair even when a later one is clear (a segment that clips a
+    // corner can be blocked while a longer one that passes wide of it is not).
+    size_t next = at + 1;
+    for (size_t candidate = path.size() - 1; candidate > at + 1; --candidate) {
+      if (segment_free(path[at], path[candidate])) {
+        next = candidate;
+        break;
+      }
+    }
+    out.push_back(path[next]);
+    at = next;
+  }
+  return out;
+}
+
 }  // namespace mgg

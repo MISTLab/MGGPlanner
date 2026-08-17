@@ -35,6 +35,7 @@ void CMGGBridge::Init(TConfigurationNode& t_tree) {
                              m_bSendGroundTruth, m_bSendGroundTruth);
    std::string strDrawMedium;
    GetNodeAttributeOrDefault(t_tree, "draw_medium", strDrawMedium, strDrawMedium);
+   GetNodeAttributeOrDefault(t_tree, "path_width", m_fPathWidth, m_fPathWidth);
    if(!strDrawMedium.empty()) {
       m_pcOverlay = &GetPhotorealismOverlay(strDrawMedium);
    }
@@ -323,9 +324,16 @@ void CMGGBridge::RecvOverlays(size_t un_robot_index) {
             std::uint32_t unCount = 0;
             RecvAll(&unCount, sizeof(unCount));
             RecvPoints(m_vecPoints, unCount);
-            cDraw.AddPolyline(m_vecPoints, cColor);
+            /* Thick, unlike the graph. Filament draws its LINES primitive one
+             * pixel wide with no way to widen it, which over a photorealistic
+             * street is close to invisible; the path is the one thing being
+             * watched and is only a few dozen segments, so it can afford the
+             * twelve vertices a segment that real geometry costs. */
+            cDraw.AddThickPolyline(m_vecPoints, m_fPathWidth, cColor);
             for(const CVector3& cPoint : m_vecPoints) {
-               cDraw.AddMarker(cPoint, 0.25, cColor);
+               cDraw.AddThickLine(cPoint - CVector3(0.0, 0.0, m_fPathWidth),
+                                  cPoint + CVector3(0.0, 0.0, m_fPathWidth * 3.0),
+                                  m_fPathWidth * 0.6, cColor);
             }
             break;
          }
