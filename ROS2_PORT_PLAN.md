@@ -535,35 +535,41 @@ Four things this phase established that the plan did not anticipate:
   `pci_trigger` is called, so `auto_period_sec` only continues a loop that
   something else began.
 
-**Phase 6b [IN PROGRESS]: Bistro, four robots, and drawing what the planner
-thinks.** ARGoS gained a debug-overlay API (line geometry on its own Filament
-visibility layer, so it reaches the viewer and never a sensor) and the bridge
-protocol gained overlay blocks, so each robot's path and graph are drawn in the
-simulator. `tools/make_bistro_mgg.py` generates a four-robot experiment on the
-argos3-examples Bistro street, and `tools/run_argos_demo.sh --bistro` runs it.
+**Phase 6b [DONE]: drawing what the planner thinks, and four robots in the
+maze.** ARGoS gained a debug-overlay API (line and thick-line geometry on its
+own Filament visibility layer, so it reaches the viewer and never a sensor) and
+the bridge protocol gained overlay blocks. Five streams are drawn: the path,
+the local grid graph, frontiers, the global roadmap, and merge beacons.
 
-Working: the whole loop turns. 71 to 86 planning cycles per robot at about
-25 ms each, paths forwarded, graph exchange wired through one shared topic,
-overlays drawn.
+Verified with four robots in the maze, one per corner, `tools/run_argos_demo.sh
+--maze`:
 
-**Not working: every candidate edge in Bistro is rejected as occupied, so no
-robot has yet planned a path there.** The small arena is unaffected. Ground
-projection reports finding ground everywhere (`0 no ground`, `0 unmapped`), so
-the collision box, riding at `max_ground_height` above whatever ground was
-found, is intersecting mapped geometry every time. Two things to check first:
+| robot | cycles | vertices | edges | path |
+|---|---|---|---|---|
+| r0 | 10 | 1603 | 13463 | 32 poses |
+| r1 | 7 | 1078 | 8837 | 31 poses |
+| r2 | 8 | 1692 | 14445 | 24 poses |
+| r3 | 8 | 965 | 7934 | 35 poses |
 
-- Bistro's kerb proxies are 0.3 m tall and the box rides from 0.2 to 0.4 m, so
-  a kerb inside the box footprint is a genuine obstacle. `max_ground_height`
-  was tuned against a flat arena floor and has never been checked against a
-  street with kerbs.
-- `projectSample` moves the sample's x and y onto whichever of its four
-  lateral probes found ground, and those probes are 0.5 m out. On a street
-  that is far enough to land on the pavement, so a vertex meant for the road
-  can be placed on the kerb top.
+606 graph merges covering all twelve ordered pairs, none left unconnected.
 
-Measured along the way, and worth knowing before touching any bound: gain
-evaluation is 96 to 97 percent of a planning cycle (1897 of 1977 ms; 3237 of
-3347 ms). Widening a bound costs ray casting, not sweeping.
+Two things this phase established:
+
+- **The global graph has to be extended at odometry rate, not per planning
+  cycle.** It is a trajectory backbone, and a new vertex only attaches to a
+  parent within `global_vertex_spacing * 5`. Cycles are tens of seconds apart,
+  the robot covers metres in that time, and after the seed nothing could ever
+  attach again. Nothing looked wrong: the seed was published on schedule so the
+  exchange appeared healthy, and each message simply held one vertex. Two
+  isolated points cannot rendezvous, so the merge count was zero.
+- **A path taken straight off the grid graph is a lattice walk.** It steps
+  between cell centres and reads as a staircase across open floor. ROS 1 ran
+  every path through `improveFreePath` and `interpolatePath`; the port had
+  neither. `mgg_core::shortcutPath` plus resampling now turns 10-21 lattice
+  points into 2-3 corners. The shortcut only crosses **known free** space:
+  upstream passes `stop_at_unknown_voxel` false, which its half-metre limit
+  makes survivable, but a general shortcut with that rule collapses the whole
+  path into a straight run through everything not yet seen.
 
 **Phase 7: multi-robot with static offsets (1 week).** Three foot-bots, graph
 merge via the existing constants moved to config. This validates the merge
@@ -605,7 +611,7 @@ Phases 3, 4, and 6 are largely independent of 2 and 5 and can be parallelized.
 ## 9. Status
 
 Phases 0 through 6 are complete and verified in Docker, bar the compose file
-and running against bistro rather than a synthetic arena. A foot-bot explores
+and Bistro (below). A foot-bot explores
 under planner control end to end, with ARGoS on the host and the planner in a
 container sharing a Unix socket.
 
