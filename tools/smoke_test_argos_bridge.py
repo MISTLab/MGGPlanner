@@ -31,9 +31,10 @@ from tf2_msgs.msg import TFMessage
 
 OBS_MAGIC = b'MGGB'
 CMD_MAGIC = b'MGGC'
-VERSION = 2
+VERSION = 3
 BLOCK_ODOMETRY, BLOCK_LIDAR, BLOCK_IMU, BLOCK_TRUTH = 1, 2, 4, 5
 CMD_NONE, CMD_PATH, CMD_STOP = 0, 1, 2
+OVERLAY_PATH, OVERLAY_GRAPH_EDGES, OVERLAY_POINTS = 1, 2, 3
 
 RINGS, AZIMUTHS = 16, 360
 ELEV_MIN, ELEV_MAX = math.radians(-15.0), math.radians(15.0)
@@ -114,7 +115,19 @@ def read_command(sock):
             (n,) = struct.unpack('<I', recv_exactly(sock, 4))
             for _ in range(n):
                 waypoints.append(struct.unpack('<4d', recv_exactly(sock, 32)))
-        out[name] = (kind, waypoints)
+        # Overlay blocks. Parsing them by their length prefix rather than by
+        # their contents is the point: an unknown type has to be skippable, or
+        # the two ends cannot be upgraded independently.
+        overlays = {}
+        (blocks,) = struct.unpack('<B', recv_exactly(sock, 1))
+        for _ in range(blocks):
+            btype, blen = struct.unpack('<BI', recv_exactly(sock, 5))
+            payload = recv_exactly(sock, blen)
+            (bcount,) = struct.unpack('<I', payload[:4])
+            floats = struct.unpack('<%df' % ((len(payload) - 4) // 4),
+                                   payload[4:])
+            overlays[btype] = (bcount, floats)
+        out[name] = (kind, waypoints, overlays)
     return tick, out
 
 
@@ -263,7 +276,7 @@ def main():
 
         client.sendall(observation(6, 'r0', ranges, hits, (0.0, 0.0, 0.0)))
         _, commands = read_command(client)
-        kind, waypoints = commands.get('r0', (None, []))
+        kind, waypoints, overlays = commands.get('r0', (None, [], {}))
         if kind != CMD_PATH:
             failures.append('path was not forwarded, got command %r' % kind)
         elif len(waypoints) != 3:
@@ -273,12 +286,35 @@ def main():
             print('path: forwarded %d waypoints, first %s'
                   % (len(waypoints), waypoints[0][:3]))
 
+        # The path must also come back as overlay geometry, so the simulator
+        # can draw it. Same points, as f32 triplets.
+        if OVERLAY_PATH not in overlays:
+            failures.append('no path overlay accompanied the path command')
+        else:
+            count, floats = overlays[OVERLAY_PATH]
+            if count != 3 or len(floats) != 9:
+                failures.append('path overlay has %d points / %d floats, '
+                                'expected 3 / 9' % (count, len(floats)))
+            elif abs(floats[0] - 1.0) > 1e-5 or abs(floats[1] - 0.0) > 1e-5:
+                failures.append('path overlay starts at %s, expected (1, 0)'
+                                % (floats[:3],))
+            else:
+                print('overlay: path echoed as %d points' % count)
+
         # And it must not be sent again: re-forwarding the same path would
         # restart the robot at waypoint zero every tick.
         client.sendall(observation(7, 'r0', ranges, hits, (0.0, 0.0, 0.0)))
         _, commands = read_command(client)
         if commands.get('r0', (None,))[0] != CMD_NONE:
             failures.append('the same path was forwarded twice')
+        # ... but the overlay must still be resent, because the far side
+        # clears its overlay every tick and anything not resent vanishes.
+        _, _, overlays = commands.get('r0', (None, [], {}))
+        if OVERLAY_PATH not in overlays:
+            failures.append('the path overlay was not resent on a tick with '
+                            'no new path; it would flicker off')
+        else:
+            print('overlay: path redrawn on a tick with no new command')
 
         rclpy.shutdown()
         if failures:

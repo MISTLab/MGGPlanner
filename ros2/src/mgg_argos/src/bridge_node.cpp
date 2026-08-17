@@ -59,6 +59,10 @@ BridgeNode::BridgeNode(const rclcpp::NodeOptions& options)
   real_time_factor_ = declare_parameter("real_time_factor", real_time_factor_);
   publish_ground_truth_ =
       declare_parameter("publish_ground_truth", publish_ground_truth_);
+  send_overlays_ = declare_parameter("send_overlays", send_overlays_);
+  max_overlay_edges_ =
+      static_cast<int>(declare_parameter("max_overlay_edges",
+                                         max_overlay_edges_));
   const auto ids =
       declare_parameter("robots", std::vector<std::string>{"r0"});
   if (lidar_translation_.size() != 3) {
@@ -96,6 +100,16 @@ BridgeNode::BridgeNode(const rclcpp::NodeOptions& options)
     robot.path_sub = create_subscription<nav_msgs::msg::Path>(
         ns + "path", rclcpp::QoS(10),
         [this, id](const nav_msgs::msg::Path& msg) { onPath(id, msg); });
+    if (send_overlays_) {
+      // The planner publishes these only when something subscribes, so this
+      // subscription is also what switches the marker work on.
+      robot.markers_sub =
+          create_subscription<visualization_msgs::msg::MarkerArray>(
+              ns + "graph_markers", rclcpp::QoS(1),
+              [this, id](const visualization_msgs::msg::MarkerArray& msg) {
+                onMarkers(id, msg);
+              });
+    }
     // The lidar mount is fixed on the robot, so it is a static transform.
     // It has to agree with the <photorealistic_lidar position="..."> in the
     // experiment file; there is no way to discover it from this side.
@@ -153,6 +167,79 @@ void BridgeNode::onPath(const std::string& id, const nav_msgs::msg::Path& msg) {
     robot.path = msg;
     robot.path_points = std::move(points);
     robot.path_pending = true;
+  }
+}
+
+/****************************************/
+
+void BridgeNode::onMarkers(const std::string& id,
+                           const visualization_msgs::msg::MarkerArray& msg) {
+  const auto it = robot_index_.find(id);
+  if (it == robot_index_.end()) return;
+  std::vector<float> edges;
+  for (const auto& marker : msg.markers) {
+    if (marker.type != visualization_msgs::msg::Marker::LINE_LIST) continue;
+    // A LINE_LIST is consecutive pairs; an odd count would mean a truncated
+    // marker, so the last point is simply left out rather than paired with
+    // whatever follows it.
+    const size_t pairs = marker.points.size() / 2;
+    edges.reserve(edges.size() + pairs * 6);
+    for (size_t i = 0; i + 1 < marker.points.size(); i += 2) {
+      if (static_cast<int>(edges.size() / 6) >= max_overlay_edges_) break;
+      const auto& a = marker.points[i];
+      const auto& b = marker.points[i + 1];
+      edges.push_back(static_cast<float>(a.x));
+      edges.push_back(static_cast<float>(a.y));
+      edges.push_back(static_cast<float>(a.z));
+      edges.push_back(static_cast<float>(b.x));
+      edges.push_back(static_cast<float>(b.y));
+      edges.push_back(static_cast<float>(b.z));
+    }
+  }
+  std::lock_guard<std::mutex> lock(overlay_mutex_);
+  robots_[it->second].graph_edges = std::move(edges);
+}
+
+/****************************************/
+
+void BridgeNode::appendOverlays(Robot& robot, std::vector<std::uint8_t>& out) {
+  const auto append = [&out](const void* data, size_t n) {
+    const auto* in = static_cast<const std::uint8_t*>(data);
+    out.insert(out.end(), in, in + n);
+  };
+  const auto block = [&](std::uint8_t type, const std::vector<float>& payload,
+                         std::uint32_t count) {
+    append(&type, 1);
+    const auto length =
+        std::uint32_t(sizeof(std::uint32_t) + payload.size() * sizeof(float));
+    append(&length, sizeof(length));
+    append(&count, sizeof(count));
+    if (!payload.empty()) {
+      append(payload.data(), payload.size() * sizeof(float));
+    }
+  };
+
+  if (!send_overlays_) {
+    const std::uint8_t none = 0;
+    append(&none, 1);
+    return;
+  }
+  std::lock_guard<std::mutex> lock(overlay_mutex_);
+  std::uint8_t count = 0;
+  if (!robot.drawn_path.empty()) ++count;
+  if (!robot.graph_edges.empty()) ++count;
+  append(&count, 1);
+  // Both are resent every tick even though neither changes every tick: the
+  // far side clears its overlay each tick, so anything not resent disappears.
+  // That is deliberate - a stale graph on screen is worse than none - and the
+  // cost is a memcpy of geometry that is already in hand.
+  if (!robot.drawn_path.empty()) {
+    block(kOverlayPath, robot.drawn_path,
+          std::uint32_t(robot.drawn_path.size() / 3));
+  }
+  if (!robot.graph_edges.empty()) {
+    block(kOverlayGraphEdges, robot.graph_edges,
+          std::uint32_t(robot.graph_edges.size() / 6));
   }
 }
 
@@ -486,11 +573,17 @@ void BridgeNode::buildCommands(std::uint32_t tick,
       const std::uint8_t type = kCommandStop;
       append(&type, 1);
       robot.stop_pending = false;
+      {
+        std::lock_guard<std::mutex> lock(overlay_mutex_);
+        robot.drawn_path.clear();
+      }
+      appendOverlays(robot, out);
       continue;
     }
     if (!robot.path_pending) {
       const std::uint8_t type = kCommandNone;
       append(&type, 1);
+      appendOverlays(robot, out);
       continue;
     }
     const std::uint8_t type = kCommandPath;
@@ -511,6 +604,17 @@ void BridgeNode::buildCommands(std::uint32_t tick,
     robot.have_forwarded = true;
     robot.last_path_stamp = rclcpp::Time(robot.path.header.stamp);
     robot.last_path_points = robot.path_points;
+    {
+      std::lock_guard<std::mutex> lock(overlay_mutex_);
+      robot.drawn_path.clear();
+      robot.drawn_path.reserve(robot.path.poses.size() * 3);
+      for (const auto& pose : robot.path.poses) {
+        robot.drawn_path.push_back(float(pose.pose.position.x));
+        robot.drawn_path.push_back(float(pose.pose.position.y));
+        robot.drawn_path.push_back(float(pose.pose.position.z));
+      }
+    }
+    appendOverlays(robot, out);
     RCLCPP_INFO(get_logger(), "forwarded a %u-waypoint path to %s", count,
                 robot.id.c_str());
   }

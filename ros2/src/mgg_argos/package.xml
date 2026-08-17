@@ -27,6 +27,7 @@
   <depend>geometry_msgs</depend>
   <depend>rosgraph_msgs</depend>
   <depend>tf2_ros</depend>
+  <depend>visualization_msgs</depend>
 
   <exec_depend>mgg_ros</exec_depend>
   <exec_depend>mgg_pci</exec_depend>

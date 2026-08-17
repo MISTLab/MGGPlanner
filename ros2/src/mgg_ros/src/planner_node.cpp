@@ -519,6 +519,38 @@ void PlannerNode::publishMarkers() {
     vertices.points.push_back(p);
   }
   array.markers.push_back(vertices);
+
+  // The edges, as a LINE_LIST. The vertices alone say where the planner
+  // considered standing; the edges say where it believes it can drive, which
+  // is the part that shows a graph split by an obstacle or stranded in a
+  // corner. The ARGoS bridge draws these too.
+  visualization_msgs::msg::Marker edges;
+  edges.header.frame_id = world_frame_;
+  edges.header.stamp = now();
+  edges.ns = "local_graph_edges";
+  edges.type = visualization_msgs::msg::Marker::LINE_LIST;
+  edges.action = visualization_msgs::msg::Marker::ADD;
+  edges.scale.x = 0.03;
+  edges.color.b = 1.0;
+  edges.color.g = 0.6;
+  edges.color.a = 0.6;
+  edges.pose.orientation.w = 1.0;
+  std::pair<mgg::Graph::GraphType::edge_iterator,
+            mgg::Graph::GraphType::edge_iterator> edge_range;
+  local_graph_->graph_->getEdgeIterator(edge_range);
+  for (auto it = edge_range.first; it != edge_range.second; ++it) {
+    const auto property = local_graph_->graph_->getEdgeProperty(it);
+    const mgg::Vertex* u = local_graph_->getVertex(std::get<0>(property));
+    const mgg::Vertex* v = local_graph_->getVertex(std::get<1>(property));
+    if (u == nullptr || v == nullptr) continue;
+    geometry_msgs::msg::Point a, b;
+    a.x = u->state[0]; a.y = u->state[1]; a.z = u->state[2];
+    b.x = v->state[0]; b.y = v->state[1]; b.z = v->state[2];
+    edges.points.push_back(a);
+    edges.points.push_back(b);
+  }
+  array.markers.push_back(edges);
+
   marker_pub_->publish(array);
 }
 

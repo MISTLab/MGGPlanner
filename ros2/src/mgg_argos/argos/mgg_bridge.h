@@ -25,15 +25,25 @@
  *                    (default 60), since the container needs a moment
  *   send_ground_truth  default false; adds a ground-truth pose block for
  *                    evaluation. The planner never reads it.
+ *   draw_medium      optional; the id of a <photorealism> medium. When given,
+ *                    each robot's planned path and graph are drawn into that
+ *                    medium's debug overlay, which only the interactive viewer
+ *                    shows. Leave it out for headless runs.
  */
 
 #ifndef MGG_BRIDGE_H
 #define MGG_BRIDGE_H
 
 #include <argos3/core/simulator/loop_functions.h>
+#include <argos3/core/utility/math/vector3.h>
 
+#include <cstdint>
 #include <string>
 #include <vector>
+
+namespace argos {
+   class CPROverlay;
+}
 
 class CMGGFootbot;
 
@@ -59,6 +69,10 @@ private:
    void EndBlock(size_t un_length_offset);
    /** Reads one command message and applies it to the controllers */
    void RecvCommands(UInt32 un_tick);
+   /** Reads one robot's overlay blocks and hands them to the debug draw */
+   void RecvOverlays(size_t un_robot_index);
+   /** Reads a length-prefixed run of f32 triplets */
+   void RecvPoints(std::vector<CVector3>& vec_out, std::uint32_t un_count);
 
    int m_nSocket = -1;
    std::string m_strSocketPath;
@@ -68,6 +82,12 @@ private:
    Real m_fConnectTimeout = 60.0;
    UInt32 m_unTicksPerSecond = 10;
    bool m_bSendGroundTruth = false;
+   /** Set when a <photorealism> medium is named: the planner's paths and
+    *  graphs are then drawn into the viewer. Optional, because a headless
+    *  run has nothing to draw into and should not pay for the geometry. */
+   CPROverlay* m_pcOverlay = nullptr;
+   /** Scratch, reused per tick so a long run does not churn the allocator */
+   std::vector<CVector3> m_vecPoints;
    /* Reused every tick so a long run does not churn the allocator */
    std::vector<UInt8> m_vecBuffer;
    std::vector<UInt8> m_vecReply;

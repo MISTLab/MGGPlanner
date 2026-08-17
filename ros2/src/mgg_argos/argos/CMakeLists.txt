@@ -30,7 +30,9 @@ endif()
 
 list(APPEND CMAKE_MODULE_PATH /usr/local/share/argos3/cmake
                              /usr/share/argos3/cmake)
-find_package(ARGoS REQUIRED COMPONENTS genericrobot)
+# photorealism as well as genericrobot: the loop function draws the planner's
+# paths and graphs into the medium's debug overlay.
+find_package(ARGoS REQUIRED COMPONENTS genericrobot photorealism)
 
 # The lidar control interface arrived with the photorealism plugin; without it
 # the controller cannot compile, and the error from a missing header is far
@@ -62,7 +64,9 @@ target_link_libraries(mgg_footbot
 add_library(mgg_bridge MODULE mgg_bridge.cpp mgg_footbot.cpp)
 target_include_directories(mgg_bridge PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/..)
 target_link_libraries(mgg_bridge
-  argos3core_${ARGOS_BUILD_FOR} argos3plugin_${ARGOS_BUILD_FOR}_genericrobot)
+  argos3core_${ARGOS_BUILD_FOR}
+  argos3plugin_${ARGOS_BUILD_FOR}_genericrobot
+  argos3plugin_${ARGOS_BUILD_FOR}_photorealism)
 
 if(MGG_ARGOS_STANDALONE)
   message(STATUS

@@ -49,9 +49,20 @@
 ///     if kCommandPath:
 ///       u32 waypoint_count
 ///       per waypoint: f64 x, y, z, yaw   (world frame, radians)
+///     u8    block_count    overlay blocks that follow
+///     per block:
+///       u8  type           one of EOverlayType
+///       u32 length         payload bytes
+///       u8  payload[length]
 ///
 /// A robot may be omitted from the command message, which means the same as
 /// kCommandNone: carry on with the current path.
+///
+/// The overlay blocks are length-prefixed for the same reason the observation
+/// blocks are: a reader that does not know a type skips it, so the two ends
+/// can be upgraded separately. They carry geometry purely so the simulator can
+/// draw what the planner is thinking; nothing the robot does depends on them,
+/// and a bridge that sends none is perfectly valid.
 
 #ifndef MGG_ARGOS_PROTOCOL_H
 #define MGG_ARGOS_PROTOCOL_H
@@ -64,7 +75,7 @@ namespace protocol {
 /// Bumped whenever the layout changes incompatibly. Both ends check it and
 /// refuse to run on a mismatch, because the failure mode of silently
 /// misparsing a binary stream is far worse than not starting.
-inline constexpr std::uint16_t kVersion = 2;
+inline constexpr std::uint16_t kVersion = 3;
 
 inline constexpr char kObservationMagic[4] = {'M', 'G', 'G', 'B'};
 inline constexpr char kCommandMagic[4] = {'M', 'G', 'G', 'C'};
@@ -96,6 +107,28 @@ enum EBlockType : std::uint8_t {
   /// f64 x, y, z, qw, qx, qy, qz. Ground truth, for evaluation only; the
   /// planner never sees it.
   kBlockGroundTruth = 5,
+};
+
+/// Geometry the simulator draws so a human can watch the planner work. Purely
+/// for display: it reaches the viewer's overlay layer and never a sensor.
+enum EOverlayType : std::uint8_t {
+  /// The path the robot is following:
+  ///   u32 count
+  ///   f32 x, y, z  per point
+  /// Sent alongside a path command rather than derived from it, so that a
+  /// bridge which drops overlays does not change what the robot does.
+  kOverlayPath = 1,
+  /// The planner's graph, as disjoint segments rather than a polyline:
+  ///   u32 count
+  ///   f32 x0, y0, z0, x1, y1, z1  per segment
+  /// f32 because this is the largest thing on the wire by far - a local graph
+  /// runs to thousands of edges every cycle - and it is being drawn, not
+  /// measured.
+  kOverlayGraphEdges = 2,
+  /// Points of interest (frontiers, viewpoints), drawn as small crosses:
+  ///   u32 count
+  ///   f32 x, y, z  per point
+  kOverlayPoints = 3,
 };
 
 enum ECommandType : std::uint8_t {

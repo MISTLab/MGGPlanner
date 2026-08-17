@@ -11,6 +11,7 @@
 #include <argos3/plugins/robots/generic/control_interface/ci_odometry_sensor.h>
 #include <argos3/plugins/robots/generic/control_interface/ci_photorealistic_lidar_sensor.h>
 #include <argos3/plugins/robots/generic/control_interface/ci_positioning_sensor.h>
+#include <argos3/plugins/simulator/photorealism/pr_overlay.h>
 
 #include <cerrno>
 #include <cstring>
@@ -32,6 +33,11 @@ void CMGGBridge::Init(TConfigurationNode& t_tree) {
                              m_fConnectTimeout, m_fConnectTimeout);
    GetNodeAttributeOrDefault(t_tree, "send_ground_truth",
                              m_bSendGroundTruth, m_bSendGroundTruth);
+   std::string strDrawMedium;
+   GetNodeAttributeOrDefault(t_tree, "draw_medium", strDrawMedium, strDrawMedium);
+   if(!strDrawMedium.empty()) {
+      m_pcOverlay = &GetPhotorealismOverlay(strDrawMedium);
+   }
    std::string strRobots;
    GetNodeAttribute(t_tree, "robots", strRobots);
    std::istringstream cRobots(strRobots);
@@ -207,6 +213,12 @@ void CMGGBridge::RecvCommands(UInt32 un_tick) {
    }
    std::uint32_t unRobots = 0;
    RecvAll(&unRobots, sizeof(unRobots));
+   /* Overlays are rebuilt from scratch each tick rather than accumulated:
+    * a graph that is not resent has been superseded, and leaving the old one
+    * on screen would show a plan the robot is no longer following. */
+   if(m_pcOverlay != nullptr) {
+      m_pcOverlay->Clear();
+   }
    for(std::uint32_t i = 0; i < unRobots; ++i) {
       UInt8 unIdLength = 0;
       RecvAll(&unIdLength, 1);
@@ -249,6 +261,101 @@ void CMGGBridge::RecvCommands(UInt32 un_tick) {
       if(pcController == nullptr) {
          LOGERR << "[BRIDGE] Command for unknown robot \"" << strId
                 << "\", ignored" << std::endl;
+      }
+      /* Read the overlay blocks whether or not anything will be drawn with
+       * them: they are in the stream either way, and skipping the read would
+       * leave the parser mid-message. */
+      RecvOverlays(i);
+   }
+}
+
+/****************************************/
+/****************************************/
+
+void CMGGBridge::RecvPoints(std::vector<CVector3>& vec_out,
+                            std::uint32_t un_count) {
+   vec_out.clear();
+   vec_out.reserve(un_count);
+   for(std::uint32_t i = 0; i < un_count; ++i) {
+      float pfPoint[3];
+      RecvAll(pfPoint, sizeof(pfPoint));
+      vec_out.emplace_back(pfPoint[0], pfPoint[1], pfPoint[2]);
+   }
+}
+
+/****************************************/
+/****************************************/
+
+void CMGGBridge::RecvOverlays(size_t un_robot_index) {
+   UInt8 unBlocks = 0;
+   RecvAll(&unBlocks, 1);
+   /* One colour per robot, so four robots' graphs stay distinguishable when
+    * they overlap. Deliberately saturated: these are drawn over a
+    * photorealistic scene and have to read against it. */
+   static const CColor pcPalette[] = {
+      CColor(51, 153, 255),    /* blue    */
+      CColor(255, 115, 26),    /* orange  */
+      CColor(77, 230, 90),     /* green   */
+      CColor(242, 64, 191),    /* magenta */
+   };
+   const CColor& cColor =
+      pcPalette[un_robot_index % (sizeof(pcPalette) / sizeof(pcPalette[0]))];
+   /* The graph is the same hue, dimmed: it is context for the path, and at a
+    * few thousand edges it would otherwise drown the path out entirely. */
+   const CColor cGraphColor(UInt8(cColor.GetRed() * 0.55),
+                            UInt8(cColor.GetGreen() * 0.55),
+                            UInt8(cColor.GetBlue() * 0.55));
+
+   for(UInt8 b = 0; b < unBlocks; ++b) {
+      UInt8 unType = 0;
+      std::uint32_t unLength = 0;
+      RecvAll(&unType, 1);
+      RecvAll(&unLength, sizeof(unLength));
+      if(m_pcOverlay == nullptr) {
+         /* Nothing to draw into: consume the payload and move on */
+         std::vector<UInt8> vecSkip(unLength);
+         if(unLength > 0) RecvAll(vecSkip.data(), unLength);
+         continue;
+      }
+      CPROverlay& cDraw = *m_pcOverlay;
+      switch(unType) {
+         case kOverlayPath: {
+            std::uint32_t unCount = 0;
+            RecvAll(&unCount, sizeof(unCount));
+            RecvPoints(m_vecPoints, unCount);
+            cDraw.AddPolyline(m_vecPoints, cColor);
+            for(const CVector3& cPoint : m_vecPoints) {
+               cDraw.AddMarker(cPoint, 0.25, cColor);
+            }
+            break;
+         }
+         case kOverlayGraphEdges: {
+            std::uint32_t unCount = 0;
+            RecvAll(&unCount, sizeof(unCount));
+            for(std::uint32_t e = 0; e < unCount; ++e) {
+               float pfSegment[6];
+               RecvAll(pfSegment, sizeof(pfSegment));
+               cDraw.AddLine(CVector3(pfSegment[0], pfSegment[1], pfSegment[2]),
+                             CVector3(pfSegment[3], pfSegment[4], pfSegment[5]),
+                             cGraphColor);
+            }
+            break;
+         }
+         case kOverlayPoints: {
+            std::uint32_t unCount = 0;
+            RecvAll(&unCount, sizeof(unCount));
+            RecvPoints(m_vecPoints, unCount);
+            for(const CVector3& cPoint : m_vecPoints) {
+               cDraw.AddMarker(cPoint, 0.4, cColor);
+            }
+            break;
+         }
+         default: {
+            /* Length-prefixed precisely so an unknown overlay can be skipped */
+            std::vector<UInt8> vecSkip(unLength);
+            if(unLength > 0) RecvAll(vecSkip.data(), unLength);
+            break;
+         }
       }
    }
 }

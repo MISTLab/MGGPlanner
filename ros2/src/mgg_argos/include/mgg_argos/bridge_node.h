@@ -28,6 +28,7 @@
 #include <rosgraph_msgs/msg/clock.hpp>
 #include <sensor_msgs/msg/imu.hpp>
 #include <sensor_msgs/msg/point_cloud2.hpp>
+#include <visualization_msgs/msg/marker_array.hpp>
 #include <tf2_ros/static_transform_broadcaster.h>
 #include <tf2_ros/transform_broadcaster.h>
 
@@ -47,6 +48,16 @@ class BridgeNode : public rclcpp::Node {
     rclcpp::Publisher<sensor_msgs::msg::Imu>::SharedPtr imu_pub;
     rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr truth_pub;
     rclcpp::Subscription<nav_msgs::msg::Path>::SharedPtr path_sub;
+    /// Graph geometry for drawing, from the planner's marker array. Display
+    /// only: nothing the robot does depends on it.
+    rclcpp::Subscription<visualization_msgs::msg::MarkerArray>::SharedPtr
+        markers_sub;
+    /// Flattened edge endpoints, six floats per segment. Guarded by
+    /// overlay_mutex_.
+    std::vector<float> graph_edges;
+    /// The path last forwarded, kept so it can be redrawn every tick rather
+    /// than only on the tick it changed.
+    std::vector<float> drawn_path;
     /// Latest path from the planner, and whether it still has to be sent.
     /// Guarded by paths_mutex_.
     nav_msgs::msg::Path path;
@@ -98,6 +109,10 @@ class BridgeNode : public rclcpp::Node {
   /// Builds the reply for this tick into `out`.
   void buildCommands(std::uint32_t tick, std::vector<std::uint8_t>& out);
   void onPath(const std::string& id, const nav_msgs::msg::Path& msg);
+  void onMarkers(const std::string& id,
+                 const visualization_msgs::msg::MarkerArray& msg);
+  /// Appends this robot's overlay blocks to the reply.
+  void appendOverlays(Robot& robot, std::vector<std::uint8_t>& out);
 
   std::string socket_path_;
   std::string world_frame_;
@@ -115,6 +130,15 @@ class BridgeNode : public rclcpp::Node {
   std::vector<Robot> robots_;
   std::map<std::string, size_t> robot_index_;
   std::mutex paths_mutex_;
+  /// Guards the overlay geometry, which arrives on marker callbacks and is
+  /// read when the reply is built.
+  std::mutex overlay_mutex_;
+  /// Whether to send overlay geometry at all. Off costs nothing; on costs a
+  /// few hundred kB a tick for a large graph.
+  bool send_overlays_ = true;
+  /// Cap on edges sent per robot per tick, so a graph that grows without
+  /// bound cannot swamp the socket.
+  int max_overlay_edges_ = 20000;
 
   rclcpp::Publisher<rosgraph_msgs::msg::Clock>::SharedPtr clock_pub_;
   std::unique_ptr<tf2_ros::TransformBroadcaster> tf_broadcaster_;
