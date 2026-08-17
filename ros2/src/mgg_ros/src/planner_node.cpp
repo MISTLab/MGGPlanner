@@ -180,6 +180,8 @@ void PlannerNode::loadParameters() {
     RCLCPP_WARN(get_logger(), "no sensors loaded from SensorParams");
   }
   world_frame_ = planning_params_.global_frame_id;
+  communication_range_ =
+      declareOrGet<double>(this, "communication_range", 15.0);
 
   if (!p.missing().empty()) {
     RCLCPP_INFO(get_logger(),
@@ -241,32 +243,30 @@ void PlannerNode::onOdometry(nav_msgs::msg::Odometry::ConstSharedPtr msg) {
 
 void PlannerNode::onPointCloud(
     sensor_msgs::msg::PointCloud2::ConstSharedPtr msg) {
-  // Points arrive in the sensor frame and have to be rotated as well as
-  // translated. Placing them with the odometry position alone, as this used
-  // to, is only correct while the robot never turns: past the first turn the
-  // whole scan goes into the map at the wrong bearing. TF also supplies the
-  // sensor's mount offset, which decides where the rays are carved from - a
-  // lidar 0.4 m up otherwise clears free space through the floor.
-  geometry_msgs::msg::TransformStamped tf;
+  if (msg->data.empty()) return;
+
+  // Transform into world coordinates before projecting into the octree.
+  // The sensor publishes in its own frame (e.g. "r0/lidar") and the map lives
+  // in world_frame_.
+  geometry_msgs::msg::TransformStamped tf_msg;
   try {
-    tf = tf_buffer_->lookupTransform(
-        world_frame_, msg->header.frame_id, msg->header.stamp,
-        rclcpp::Duration::from_seconds(cloud_tf_timeout_sec_));
+    tf_msg = tf_buffer_->lookupTransform(world_frame_, msg->header.frame_id,
+                                         msg->header.stamp,
+                                         rclcpp::Duration::from_seconds(0.1));
   } catch (const tf2::TransformException& ex) {
-    // Throttled: with a missing transform this fires at full sensor rate.
     RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000,
-                         "dropping cloud, no transform %s -> %s: %s",
+                         "cannot transform point cloud from '%s' to '%s': %s",
                          msg->header.frame_id.c_str(), world_frame_.c_str(),
                          ex.what());
     return;
   }
 
-  const Eigen::Quaterniond q(tf.transform.rotation.w, tf.transform.rotation.x,
-                             tf.transform.rotation.y, tf.transform.rotation.z);
-  const Eigen::Vector3d origin(tf.transform.translation.x,
-                               tf.transform.translation.y,
-                               tf.transform.translation.z);
-  const Eigen::Matrix3d rot = q.normalized().toRotationMatrix();
+  const Eigen::Vector3d origin(tf_msg.transform.translation.x,
+                               tf_msg.transform.translation.y,
+                               tf_msg.transform.translation.z);
+  const Eigen::Quaterniond rot(
+      tf_msg.transform.rotation.w, tf_msg.transform.rotation.x,
+      tf_msg.transform.rotation.y, tf_msg.transform.rotation.z);
 
   std::vector<Eigen::Vector3d> points;
   points.reserve(msg->width * msg->height);
@@ -296,6 +296,22 @@ void PlannerNode::onNeighbourGraph(mgg_msgs::msg::Graph::ConstSharedPtr msg) {
   // Merging reads the map to decide reachability and writes the global graph.
   const std::lock_guard<std::recursive_mutex> lock(planner_mutex_);
 
+  // Communication range filter: robots must be within direct radio range.
+  Eigen::Isometry3d t_ours_theirs = Eigen::Isometry3d::Identity();
+  if (poses_->getRobotTransform(sender, t_ours_theirs) && !msg->vertices.empty()) {
+    const auto& last_v = msg->vertices.back();
+    const Eigen::Vector3d their_latest(last_v.pose.position.x,
+                                       last_v.pose.position.y,
+                                       last_v.pose.position.z);
+    const Eigen::Vector3d their_world = t_ours_theirs * their_latest;
+    const Eigen::Vector3d our_world(current_state_[0], current_state_[1], current_state_[2]);
+    const double dist = (their_world - our_world).norm();
+    if (communication_range_ > 0.0 && dist > communication_range_) {
+      return;
+    }
+  }
+
+
   const mgg::GraphExchange incoming = fromGraphMsg(*msg);
   const mgg::ExpandContext ctx = makeContext();
   // The merge asks whether the robot could actually drive between two graphs
@@ -321,8 +337,7 @@ void PlannerNode::onNeighbourGraph(mgg_msgs::msg::Graph::ConstSharedPtr msg) {
                          "supply a SLAM-backed PoseSource", sender);
     return;
   }
-  if (r.vertices_added > 0 || r.edges_added > 0) {
-    Eigen::Isometry3d t_ours_theirs = Eigen::Isometry3d::Identity();
+  if (r.newly_connected) {
     if (poses_->getRobotTransform(sender, t_ours_theirs) && !incoming.vertices.empty()) {
       const Eigen::Vector3d their_local(incoming.vertices.front().state[0],
                                         incoming.vertices.front().state[1],
@@ -333,11 +348,16 @@ void PlannerNode::onNeighbourGraph(mgg_msgs::msg::Graph::ConstSharedPtr msg) {
     }
     publishMarkers();
     RCLCPP_INFO(get_logger(),
-                "merged robot %d: +%d vertices, +%d edges, %d updated%s",
-                sender, r.vertices_added, r.edges_added, r.vertices_updated,
-                r.merged ? "" : " (not yet connected)");
+                "*** Swarm Graph Merge: Connected with robot %d (+%d vertices, +%d edges) ***",
+                sender, r.vertices_added, r.edges_added);
+  } else if (r.vertices_added > 0) {
+    publishMarkers();
+    RCLCPP_INFO(get_logger(),
+                "roadmap update from robot %d: +%d new vertices, +%d edges",
+                sender, r.vertices_added, r.edges_added);
   }
 }
+
 
 
 std::string PlannerNode::buildLocalGraph() {

@@ -151,7 +151,9 @@ MergeResult mergeNeighbourGraph(GraphManager& global_graph,
   }
 
   result.merged = global_graph.merged_graphs_[neighbour_id];
+  result.newly_connected = !already_merged && result.merged;
   if (!result.merged) return result;
+
 
   // Connected: take everything else the neighbour knows.
   for (const GraphExchangeVertex& v : incoming.vertices) {

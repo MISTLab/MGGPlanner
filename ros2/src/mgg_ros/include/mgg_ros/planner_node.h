@@ -141,6 +141,8 @@ class PlannerNode : public rclcpp::Node {
   int path_shortcut_corners_ = 0;
   int path_shortcut_to_ = 0;
   std::string world_frame_ = "world";
+  double communication_range_ = 10.0;
+
 
   struct MergeEvent {
     rclcpp::Time stamp;

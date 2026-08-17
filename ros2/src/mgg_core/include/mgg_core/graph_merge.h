@@ -109,6 +109,8 @@ using EdgeAdmissibleFn =
 struct MergeResult {
   /// True once this robot's graph and the neighbour's are connected.
   bool merged = false;
+  /// True specifically on the cycle when the connection is first established.
+  bool newly_connected = false;
   int vertices_added = 0;
   int vertices_updated = 0;
   int edges_added = 0;
@@ -118,6 +120,7 @@ struct MergeResult {
   /// Set when the neighbour's transform is not yet known.
   bool transform_unavailable = false;
 };
+
 
 /// Folds `incoming` into `global_graph`.
 ///
