@@ -14,6 +14,9 @@ PciNode::PciNode(const rclcpp::NodeOptions& options)
   world_frame_ = declare_parameter("world_frame", world_frame_);
   reach_distance_ = declare_parameter("reach_distance", reach_distance_);
   stuck_timeout_sec_ = declare_parameter("stuck_timeout_sec", stuck_timeout_sec_);
+  bootstrap_distance_ = declare_parameter("bootstrap_distance", bootstrap_distance_);
+  max_empty_plans_before_stop_ =
+      declare_parameter("max_empty_plans_before_stop", max_empty_plans_before_stop_);
   const double auto_period = declare_parameter("auto_period_sec", 1.0);
 
   callback_group_ =
@@ -56,6 +59,47 @@ PciNode::PciNode(const rclcpp::NodeOptions& options)
                 auto_period);
   }
   RCLCPP_INFO(get_logger(), "pci ready; call pci_trigger to plan");
+}
+
+bool PciNode::executeBootstrap() {
+  if (!have_odometry_) {
+    RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 3000,
+                         "cannot bootstrap: no odometry received yet");
+    return false;
+  }
+  const double qx = current_pose_.orientation.x;
+  const double qy = current_pose_.orientation.y;
+  const double qz = current_pose_.orientation.z;
+  const double qw = current_pose_.orientation.w;
+  const double yaw = std::atan2(2.0 * (qw * qz + qx * qy),
+                                1.0 - 2.0 * (qy * qy + qz * qz));
+
+  const double x0 = current_pose_.position.x;
+  const double y0 = current_pose_.position.y;
+  const double z0 = current_pose_.position.z;
+
+  std::vector<geometry_msgs::msg::Pose> path;
+  for (double fraction : {0.33, 0.66, 1.0}) {
+    geometry_msgs::msg::Pose p;
+    p.position.x = x0 + bootstrap_distance_ * fraction * std::cos(yaw);
+    p.position.y = y0 + bootstrap_distance_ * fraction * std::sin(yaw);
+    p.position.z = z0;
+    p.orientation = current_pose_.orientation;
+    path.push_back(p);
+  }
+
+  has_bootstrapped_ = true;
+  publishPath(path);
+  goal_pose_ = path.back();
+  path_in_progress_ = true;
+  last_progress_pos_ = current_pose_.position;
+  last_progress_time_ = now();
+  path_start_time_ = now();
+
+  RCLCPP_INFO(get_logger(),
+              "bootstrapping: driving forward %.1f m (heading %.0f deg) to sweep local terrain",
+              bootstrap_distance_, yaw * 180.0 / M_PI);
+  return true;
 }
 
 void PciNode::onOdometry(nav_msgs::msg::Odometry::ConstSharedPtr msg) {
@@ -130,6 +174,9 @@ void PciNode::publishPath(const std::vector<geometry_msgs::msg::Pose>& path) {
 }
 
 void PciNode::planAndPublish() {
+  if (exploration_completed_) {
+    return;
+  }
   {
     std::lock_guard<std::mutex> lock(mutex_);
     if (planning_in_progress_) return;
@@ -144,16 +191,41 @@ void PciNode::planAndPublish() {
   planning_in_progress_ = false;
 
   if (!ok) {
+    if (!has_bootstrapped_) {
+      executeBootstrap();
+      return;
+    }
     RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 5000, "%s", error.c_str());
     return;
   }
+
   if (path.empty()) {
+    if (!has_bootstrapped_) {
+      // First attempt on standing start without mapped ground: bootstrap forward
+      executeBootstrap();
+      return;
+    }
+
+    ++consecutive_empty_plans_;
+    if (consecutive_empty_plans_ >= max_empty_plans_before_stop_) {
+      exploration_completed_ = true;
+      running_ = false;
+      path_in_progress_ = false;
+      publishPath({});
+      RCLCPP_INFO(get_logger(),
+                  "*** EXPLORATION COMPLETED: Environment fully explored (no remaining frontiers) ***");
+      return;
+    }
+
     RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 5000,
-                         "planner returned no path");
+                         "planner returned no path (attempt %d/%d)",
+                         consecutive_empty_plans_, max_empty_plans_before_stop_);
     path_in_progress_ = false;
     return;
   }
 
+  consecutive_empty_plans_ = 0;
+  has_bootstrapped_ = true;
   publishPath(path);
   goal_pose_ = path.back();
   path_in_progress_ = true;
@@ -164,7 +236,7 @@ void PciNode::planAndPublish() {
 
 void PciNode::tick() {
   std::unique_lock<std::mutex> lock(mutex_);
-  if (!running_ || planning_in_progress_) return;
+  if (!running_ || planning_in_progress_ || exploration_completed_) return;
 
   if (!path_in_progress_) {
     // If running in auto mode and not following any path, trigger planning
@@ -193,6 +265,8 @@ void PciNode::onTrigger(
   {
     std::lock_guard<std::mutex> lock(mutex_);
     running_ = true;
+    exploration_completed_ = false;
+    consecutive_empty_plans_ = 0;
     path_in_progress_ = false;
   }
   planAndPublish();
@@ -203,6 +277,7 @@ void PciNode::onTrigger(
                           ? "started autonomous exploration"
                           : "failed to start path";
 }
+
 
 void PciNode::onStop(const std::shared_ptr<std_srvs::srv::Trigger::Request>,
                      std::shared_ptr<std_srvs::srv::Trigger::Response> response) {

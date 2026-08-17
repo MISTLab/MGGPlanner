@@ -192,25 +192,7 @@ sleep 20
 kill -0 "$ARGOS_PID" 2>/dev/null || { echo "ARGoS exited early:" >&2
                                       tail -20 "$IPC/argos.log" >&2; exit 1; }
 
-echo "==> nudging each robot so it can see the ground it is standing on"
-# All of them at once: they are independent, and driving them in series would
-# cost a minute each while the rest sat idle.
-BOOTSTRAP_PIDS=()
-for robot in "${ROBOTS[@]}"; do
-  docker exec "$CID" bash -c \
-    "source /opt/ros/jazzy/setup.bash && source /ws/install/setup.bash && \
-     python3 /tools/argos_bootstrap.py $robot" &
-  BOOTSTRAP_PIDS+=($!)
-done
-# These PIDs specifically, not a bare "wait". ARGoS is a background job of this
-# shell too, and it is now started unbounded, so a bare wait blocks until the
-# simulator exits - which only happens when this script kills it, after an
-# exploration phase it has not reached yet. The run then sits in the bootstrap
-# phase forever having triggered nothing, which looks from the logs exactly
-# like a planner that cannot plan.
-wait "${BOOTSTRAP_PIDS[@]}" 2>/dev/null || true
-
-echo "==> handing over to the planner"
+echo "==> triggering autonomous exploration across all robots"
 TRIGGER_PIDS=()
 for robot in "${ROBOTS[@]}"; do
   if [[ ${#ROBOTS[@]} -eq 1 ]]; then srv="/pci_trigger"; else srv="/$robot/pci_trigger"; fi
@@ -220,6 +202,7 @@ for robot in "${ROBOTS[@]}"; do
   TRIGGER_PIDS+=($!)
 done
 wait "${TRIGGER_PIDS[@]}" 2>/dev/null || true
+
 
 
 echo

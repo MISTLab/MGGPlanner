@@ -666,10 +666,13 @@ void PlannerNode::onPlanRequest(
   robot_params_.bound_mode = previous;
 
   response->planning_bound_mode = request->bound_mode;
-  response->status = mgg_msgs::srv::PlannerSrv::Response::FORWARD;
+  response->status = best_path_.empty()
+                         ? mgg_msgs::srv::PlannerSrv::Response::HOMING
+                         : mgg_msgs::srv::PlannerSrv::Response::FORWARD;
   for (const mgg::StateVec& s : best_path_) {
     response->path.push_back(toPoseMsg(s));
   }
+
   RCLCPP_INFO(get_logger(), "plan request: %s", summary.c_str());
 }
 
@@ -841,15 +844,8 @@ void PlannerNode::publishMarkers() {
     merge_marker.pose.orientation.w = 1.0;
 
     for (const auto& ev : recent_merges_) {
-      // Connecting line between our robot and their graph origin
-      geometry_msgs::msg::Point p1, p2;
-      p1.x = ev.our_pos.x(); p1.y = ev.our_pos.y(); p1.z = ev.our_pos.z();
-      p2.x = ev.their_pos.x(); p2.y = ev.their_pos.y(); p2.z = ev.their_pos.z();
-      merge_marker.points.push_back(p1);
-      merge_marker.points.push_back(p2);
-
-      // Horizontal beacon cross around their position
-      const double r = 0.5;
+      // Horizontal beacon cross at the rendezvous position
+      const double r = 0.6;
       geometry_msgs::msg::Point a, b, c, d;
       a.x = ev.their_pos.x() - r; a.y = ev.their_pos.y(); a.z = ev.their_pos.z();
       b.x = ev.their_pos.x() + r; b.y = ev.their_pos.y(); b.z = ev.their_pos.z();
@@ -862,6 +858,7 @@ void PlannerNode::publishMarkers() {
     }
     array.markers.push_back(merge_marker);
   }
+
 
   marker_pub_->publish(array);
 }
