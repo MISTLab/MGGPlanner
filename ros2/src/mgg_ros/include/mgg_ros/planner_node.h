@@ -107,7 +107,8 @@ class PlannerNode : public rclcpp::Node {
   ///
   /// One mutex rather than one per structure, because planning reads the map
   /// and writes the graphs as a single unit and would need both anyway.
-  std::mutex planner_mutex_;
+  std::recursive_mutex planner_mutex_;
+
 
   mgg::StateVec current_state_ = mgg::StateVec::Zero();
   bool have_odometry_ = false;

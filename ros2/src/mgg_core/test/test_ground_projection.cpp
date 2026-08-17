@@ -198,4 +198,20 @@ TEST(GroundProjection, EdgeEndingOnASampleDoesNotCorruptThePath) {
   EXPECT_GT((path[path.size() - 2] - path.back()).norm(), 1e-6);
 }
 
+TEST(GroundProjection, ProjectsEndpointHeightToDrivingHeight) {
+  Terrain map;
+  PlanningParams params = makeParams();
+  GroundProjection gp(map, params);
+
+  std::vector<Eigen::Vector3d> path;
+  // End point passed at ground level z = 0.0 (unprojected lattice height)
+  const auto s = gp.getProjectedEdgeStatus({0.0, 0.0, 0.5}, {2.0, 0.0, 0.0},
+                                           {0.4, 0.4, 0.4}, true, path, false);
+  EXPECT_EQ(s, ProjectedEdgeStatus::kAdmissible);
+  ASSERT_FALSE(path.empty());
+  // The endpoint in the projected edge MUST be at driving height z = 0.5
+  EXPECT_NEAR(path.back().z(), 0.5, 1e-3);
+}
+
 }  // namespace
+

@@ -177,27 +177,39 @@ void BridgeNode::onMarkers(const std::string& id,
   const auto it = robot_index_.find(id);
   if (it == robot_index_.end()) return;
   std::vector<float> edges;
+  std::vector<float> points;
   for (const auto& marker : msg.markers) {
-    if (marker.type != visualization_msgs::msg::Marker::LINE_LIST) continue;
-    // A LINE_LIST is consecutive pairs; an odd count would mean a truncated
-    // marker, so the last point is simply left out rather than paired with
-    // whatever follows it.
-    const size_t pairs = marker.points.size() / 2;
-    edges.reserve(edges.size() + pairs * 6);
-    for (size_t i = 0; i + 1 < marker.points.size(); i += 2) {
-      if (static_cast<int>(edges.size() / 6) >= max_overlay_edges_) break;
-      const auto& a = marker.points[i];
-      const auto& b = marker.points[i + 1];
-      edges.push_back(static_cast<float>(a.x));
-      edges.push_back(static_cast<float>(a.y));
-      edges.push_back(static_cast<float>(a.z));
-      edges.push_back(static_cast<float>(b.x));
-      edges.push_back(static_cast<float>(b.y));
-      edges.push_back(static_cast<float>(b.z));
+    if (marker.type == visualization_msgs::msg::Marker::LINE_LIST) {
+      // A LINE_LIST is consecutive pairs; an odd count would mean a truncated
+      // marker, so the last point is simply left out rather than paired with
+      // whatever follows it.
+      const size_t pairs = marker.points.size() / 2;
+      edges.reserve(edges.size() + pairs * 6);
+      for (size_t i = 0; i + 1 < marker.points.size(); i += 2) {
+        if (static_cast<int>(edges.size() / 6) >= max_overlay_edges_) break;
+        const auto& a = marker.points[i];
+        const auto& b = marker.points[i + 1];
+        edges.push_back(static_cast<float>(a.x));
+        edges.push_back(static_cast<float>(a.y));
+        edges.push_back(static_cast<float>(a.z));
+        edges.push_back(static_cast<float>(b.x));
+        edges.push_back(static_cast<float>(b.y));
+        edges.push_back(static_cast<float>(b.z));
+      }
+    } else if (marker.type == visualization_msgs::msg::Marker::POINTS ||
+               marker.type == visualization_msgs::msg::Marker::SPHERE_LIST) {
+      points.reserve(points.size() + marker.points.size() * 3);
+      for (const auto& p : marker.points) {
+        if (static_cast<int>(points.size() / 3) >= 2000) break;
+        points.push_back(static_cast<float>(p.x));
+        points.push_back(static_cast<float>(p.y));
+        points.push_back(static_cast<float>(p.z));
+      }
     }
   }
   std::lock_guard<std::mutex> lock(overlay_mutex_);
   robots_[it->second].graph_edges = std::move(edges);
+  robots_[it->second].overlay_points = std::move(points);
 }
 
 /****************************************/
@@ -228,8 +240,9 @@ void BridgeNode::appendOverlays(Robot& robot, std::vector<std::uint8_t>& out) {
   std::uint8_t count = 0;
   if (!robot.drawn_path.empty()) ++count;
   if (!robot.graph_edges.empty()) ++count;
+  if (!robot.overlay_points.empty()) ++count;
   append(&count, 1);
-  // Both are resent every tick even though neither changes every tick: the
+  // Geometry is resent every tick even though it does not change every tick: the
   // far side clears its overlay each tick, so anything not resent disappears.
   // That is deliberate - a stale graph on screen is worse than none - and the
   // cost is a memcpy of geometry that is already in hand.
@@ -241,7 +254,12 @@ void BridgeNode::appendOverlays(Robot& robot, std::vector<std::uint8_t>& out) {
     block(kOverlayGraphEdges, robot.graph_edges,
           std::uint32_t(robot.graph_edges.size() / 6));
   }
+  if (!robot.overlay_points.empty()) {
+    block(kOverlayPoints, robot.overlay_points,
+          std::uint32_t(robot.overlay_points.size() / 3));
+  }
 }
+
 
 /****************************************/
 

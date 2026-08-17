@@ -55,9 +55,13 @@ class BridgeNode : public rclcpp::Node {
     /// Flattened edge endpoints, six floats per segment. Guarded by
     /// overlay_mutex_.
     std::vector<float> graph_edges;
+    /// Points of interest (frontiers, viewpoints), three floats per point.
+    /// Guarded by overlay_mutex_.
+    std::vector<float> overlay_points;
     /// The path last forwarded, kept so it can be redrawn every tick rather
     /// than only on the tick it changed.
     std::vector<float> drawn_path;
+
     /// Latest path from the planner, and whether it still has to be sent.
     /// Guarded by paths_mutex_.
     nav_msgs::msg::Path path;

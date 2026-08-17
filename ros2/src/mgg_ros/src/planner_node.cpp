@@ -260,7 +260,7 @@ void PlannerNode::onPointCloud(
     points.emplace_back(rot * Eigen::Vector3d(*it_x, *it_y, *it_z) + origin);
   }
   if (!points.empty()) {
-    const std::lock_guard<std::mutex> lock(planner_mutex_);
+    const std::lock_guard<std::recursive_mutex> lock(planner_mutex_);
     map_->insertPointCloud(points, origin);
   }
 }
@@ -271,7 +271,7 @@ void PlannerNode::onNeighbourGraph(mgg_msgs::msg::Graph::ConstSharedPtr msg) {
   if (sender == static_cast<int>(planning_params_.robot_id)) return;
 
   // Merging reads the map to decide reachability and writes the global graph.
-  const std::lock_guard<std::mutex> lock(planner_mutex_);
+  const std::lock_guard<std::recursive_mutex> lock(planner_mutex_);
 
   const mgg::GraphExchange incoming = fromGraphMsg(*msg);
   const mgg::ExpandContext ctx = makeContext();
@@ -310,7 +310,7 @@ std::string PlannerNode::buildLocalGraph() {
   // Held for the whole cycle: the map must not change under a planner that is
   // ray-casting through it. Point clouds arriving meanwhile queue up, and the
   // subscription's best-effort depth decides how many survive.
-  const std::lock_guard<std::mutex> lock(planner_mutex_);
+  const std::lock_guard<std::recursive_mutex> lock(planner_mutex_);
   if (!have_odometry_) return "no odometry received yet";
   if (!map_->getStatus()) return "map is empty; no point cloud received yet";
 
@@ -325,9 +325,24 @@ std::string PlannerNode::buildLocalGraph() {
   local_graph_->reset();
   // Inclinations are keyed by vertex id and the ids restart with the graph.
   edge_inclinations_.clear();
-  auto* root = new mgg::Vertex(0, current_state_);
+  mgg::StateVec root_state = current_state_;
+  bool root_hanging = false;
+  if (robot_params_.type == mgg::RobotType::kGroundRobot) {
+    Eigen::Vector3d pos(root_state[0], root_state[1], root_state[2]);
+    mgg::VoxelStatus vs;
+    const double ground_height = ground_->projectSample(pos, vs);
+    if (vs == mgg::VoxelStatus::kOccupied) {
+      root_state[2] = pos[2] - (ground_height - planning_params_.max_ground_height);
+    } else {
+      root_hanging = true;
+    }
+  }
+  auto* root = new mgg::Vertex(0, root_state);
   root->robot_id = static_cast<int>(planning_params_.robot_id);
+  root->is_hanging = root_hanging;
   local_graph_->addVertex(root);
+
+
 
   const mgg::ExpandContext ctx = makeContext();
   const auto t_global = Clock::now();
@@ -374,6 +389,7 @@ std::string PlannerNode::buildLocalGraph() {
     exploring_direction_ = mgg::estimateDirectionFromPath(points);
   }
   publishPath();
+  publishMarkers();
 
   // Free cells with no vertices is the characteristic bring-up failure: the
   // lattice is finding space but every candidate is being turned away. The
@@ -503,7 +519,7 @@ void PlannerNode::publishPath() {
 void PlannerNode::publishOwnGraph() {
   // Runs on a timer, so it can land in the middle of a planning cycle
   // rewriting the very graph it is serialising.
-  const std::lock_guard<std::mutex> lock(planner_mutex_);
+  const std::lock_guard<std::recursive_mutex> lock(planner_mutex_);
   if (global_graph_->getNumVertices() == 0) return;
   auto msg = toGraphMsg(*global_graph_,
                         static_cast<int>(planning_params_.robot_id));
@@ -515,7 +531,7 @@ void PlannerNode::publishOwnGraph() {
 
 void PlannerNode::publishMarkers() {
   if (marker_pub_->get_subscription_count() == 0) return;
-  const std::lock_guard<std::mutex> lock(planner_mutex_);
+  const std::lock_guard<std::recursive_mutex> lock(planner_mutex_);
 
   visualization_msgs::msg::MarkerArray array;
   visualization_msgs::msg::Marker vertices;
@@ -570,7 +586,69 @@ void PlannerNode::publishMarkers() {
   }
   array.markers.push_back(edges);
 
+  // Frontiers, as POINTS. Shows candidate exploration targets.
+  visualization_msgs::msg::Marker frontiers;
+  frontiers.header.frame_id = world_frame_;
+  frontiers.header.stamp = now();
+  frontiers.ns = "frontiers";
+  frontiers.type = visualization_msgs::msg::Marker::POINTS;
+  frontiers.action = visualization_msgs::msg::Marker::ADD;
+  frontiers.scale.x = 0.25;
+  frontiers.scale.y = 0.25;
+  frontiers.color.r = 1.0;
+  frontiers.color.g = 0.2;
+  frontiers.color.b = 0.2;
+  frontiers.color.a = 1.0;
+  frontiers.pose.orientation.w = 1.0;
+  for (const auto& entry : local_graph_->vertices_map_) {
+    if (entry.second != nullptr &&
+        entry.second->type == mgg::VertexType::kFrontier) {
+      geometry_msgs::msg::Point p;
+      p.x = entry.second->state[0];
+      p.y = entry.second->state[1];
+      p.z = entry.second->state[2];
+      frontiers.points.push_back(p);
+    }
+  }
+  if (!frontiers.points.empty()) {
+    array.markers.push_back(frontiers);
+  }
+
+  // Swarm global graph edges, as a LINE_LIST.
+  if (global_graph_->getNumVertices() > 0) {
+    visualization_msgs::msg::Marker global_edges;
+    global_edges.header.frame_id = world_frame_;
+    global_edges.header.stamp = now();
+    global_edges.ns = "global_graph_edges";
+    global_edges.type = visualization_msgs::msg::Marker::LINE_LIST;
+    global_edges.action = visualization_msgs::msg::Marker::ADD;
+    global_edges.scale.x = 0.05;
+    global_edges.color.r = 1.0;
+    global_edges.color.g = 0.8;
+    global_edges.color.b = 0.2;
+    global_edges.color.a = 1.0;
+    global_edges.pose.orientation.w = 1.0;
+    std::pair<mgg::Graph::GraphType::edge_iterator,
+              mgg::Graph::GraphType::edge_iterator> g_edge_range;
+    global_graph_->graph_->getEdgeIterator(g_edge_range);
+    for (auto it = g_edge_range.first; it != g_edge_range.second; ++it) {
+      const auto property = global_graph_->graph_->getEdgeProperty(it);
+      const mgg::Vertex* u = global_graph_->getVertex(std::get<0>(property));
+      const mgg::Vertex* v = global_graph_->getVertex(std::get<1>(property));
+      if (u == nullptr || v == nullptr) continue;
+      geometry_msgs::msg::Point a, b;
+      a.x = u->state[0]; a.y = u->state[1]; a.z = u->state[2];
+      b.x = v->state[0]; b.y = v->state[1]; b.z = v->state[2];
+      global_edges.points.push_back(a);
+      global_edges.points.push_back(b);
+    }
+    if (!global_edges.points.empty()) {
+      array.markers.push_back(global_edges);
+    }
+  }
+
   marker_pub_->publish(array);
 }
+
 
 }  // namespace mgg_ros

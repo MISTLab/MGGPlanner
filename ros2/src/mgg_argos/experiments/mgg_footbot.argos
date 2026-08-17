@@ -59,8 +59,8 @@
   </controllers>
 
   <loop_functions library="libmgg_bridge.so" label="mgg_bridge"
-                  socket="/tmp/mgg_argos.sock" robots="fb"
-                  send_ground_truth="true" />
+                  socket="/tmp/mgg_argos.sock" robots="r0"
+                  send_ground_truth="true" draw_medium="pr" />
 
   <arena size="14, 14, 3" center="0,0,1.5">
     <!-- Outer walls -->
@@ -89,11 +89,12 @@
       <body position="3.5,2,0" orientation="0,0,0" />
     </box>
 
-    <foot-bot id="fb">
+    <foot-bot id="r0">
       <body position="-4.5,-4.5,0" orientation="0,0,0" />
       <controller config="mfb" />
     </foot-bot>
   </arena>
+
 
   <physics_engines>
     <dynamics2d id="dyn2d" />

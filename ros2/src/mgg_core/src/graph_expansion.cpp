@@ -119,16 +119,22 @@ void expandGraph(GraphManager& graph, Vertex& new_vertex,
     new_state[0] = new_pos[0];
     new_state[1] = new_pos[1];
     new_state[2] = new_pos[2];
+    direction = new_state.head<3>() - origin;
+    direction_norm = direction.norm();
   }
 
   // Overshoot both ends, except at the root, so an edge that just grazes an
   // obstacle is rejected.
   const Eigen::Vector3d overshoot =
-      ctx.planning->edge_overshoot * direction.normalized();
+      (direction_norm > 1e-12)
+          ? Eigen::Vector3d(ctx.planning->edge_overshoot * direction.normalized())
+          : Eigen::Vector3d::Zero();
+
   Eigen::Vector3d start_pos = origin + ctx.robot->center_offset;
   if (nearest_vertex->id != 0) start_pos -= overshoot;
   const Eigen::Vector3d end_pos =
       origin + ctx.robot->center_offset + direction + overshoot;
+
 
   if (geofenceBlocks(ctx, start_pos, end_pos)) {
     rep.status = ExpandGraphStatus::kErrorGeofenceViolated;

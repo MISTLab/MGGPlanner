@@ -155,9 +155,14 @@ for _ in $(seq 60); do [[ -S "$IPC/argos.sock" ]] && break; sleep 1; done
 [[ -S "$IPC/argos.sock" ]] || { echo "the bridge never created its socket:" >&2
                                 tail -20 "$IPC/ros.log" >&2; exit 1; }
 
-echo "==> starting ARGoS"
-# Only the demo's own plugins need adding; argos3 finds its installed ones.
-export ARGOS_PLUGIN_PATH="$PLUGINS"
+# Prefer local argos3 build if present, falling back to installed plugins.
+ARGOS_BUILD="$REPO/../argos3/build"
+if [[ -d "$ARGOS_BUILD" ]]; then
+  export ARGOS_PLUGIN_PATH="$PLUGINS:$ARGOS_BUILD/plugins/simulator/photorealism:$ARGOS_BUILD/plugins/simulator/visualizations/filament"
+else
+  export ARGOS_PLUGIN_PATH="$PLUGINS"
+fi
+
 if [[ $GUI -eq 1 ]]; then
   ( cd "$IPC" && argos3 -c run.argos > "$IPC/argos.log" 2>&1 ) & ARGOS_PID=$!
 else

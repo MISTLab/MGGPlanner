@@ -57,7 +57,9 @@ def generate_launch_description():
         remappings=[
             ('odometry', [robot, '/odometry']),
             ('pointcloud', [robot, '/pointcloud']),
+            ('graph_markers', [robot, '/graph_markers']),
         ])
+
 
     pci = Node(
         package='mgg_pci', executable='mgg_pci_node',
