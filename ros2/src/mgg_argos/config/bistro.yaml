@@ -1,0 +1,273 @@
+# MGG planner for four foot-bots exploring the Bistro street.
+#
+# Derived from argos_footbot.yaml, the small-arena config, by scaling the
+# things that describe the site and leaving alone the things that describe the
+# robot. Bistro is a 141 m street loop spanning roughly 60 m by 40 m, against
+# the small arena's 12 m square: the global bound, the sampling volumes and the
+# grid extent all grow, while the robot's size, its collision box and the
+# height its lidar sits at do not.
+#
+# The local bound is the one to watch, and it is not the sweep that makes it
+# expensive. The sweep is proportional to the volume over the grid resolution,
+# which is cheap; what follows it is not. Every surviving cell becomes a
+# vertex, every vertex a candidate viewpoint, and every viewpoint is scored by
+# casting the declared sensor's 720 rays 20 m through the octree. A generous
+# bound on an open street fills the vertex cap and the cycle stops returning.
+# So bound the cycle with num_vertices_max, and keep the sampled volume only as
+# large as one cycle should reach.
+#
+# Two site-specific blocks from the source config are gone rather than
+# rescaled, because they encode a particular field trial and not a robot:
+#   - NoGainZones "g1" suppressed all gain for x < 2, which here would blind
+#     the planner to most of the arena.
+#   - GeofenceParams fenced three corridors around the origin; with
+#     geofence_checking_enable the robot could not leave its start.
+
+# Wildcard keys. Each robot's planner runs in its own namespace (/r0/... to
+# /r3/...), so the node names are not known here; "/**" matches any namespace.
+# What differs per robot is only PlanningParams/robot_id, which the launch file
+# overrides, because the merge keys every vertex by it.
+/**/mggplanner_node:
+  ros__parameters:
+    # OctoMap resolution follows the robot: 0.2 m voxels are a fifth of the
+    # arena's gaps and would close the doorways the planner has to drive
+    # through.
+    map:
+      resolution: 0.15
+      max_range: 20.0
+
+    RobotParams:
+      type: kGroundRobot
+      size: [0.2, 0.2, 0.15]
+      size_extension_min: [0.0, 0.0, 0.0]
+      size_extension: [0.05, 0.05, 0.05]
+      # Zero, because it cannot do the job it looks like it does:
+      # getProjectedEdgeStatus re-projects every edge point onto the ground
+      # and back up by max_ground_height, which discards whatever offset the
+      # endpoints carried. max_ground_height is the knob that lifts the
+      # collision box off the floor.
+      center_offset: [0.0, 0.0, 0.0]
+      relax_ratio: 0.5
+      bound_mode: kExtendedBound
+      safety_extension: [0.5, 0.75, 0.05]
+
+    SensorParams:
+      sensor_list: ["VLP16"]
+      VLP16:
+        type: kLidar
+        max_range: 20.0
+        # Matches <photorealistic_lidar position="0,0,0.25"> in the
+        # experiment file. The planner uses this to decide what a viewpoint
+        # would see.
+        center_offset: [0.0, 0.0, 0.25]
+        rotations: [0.0, 0.0, 0.0]
+        # 360 x 45 degrees: the sensor is tilted down to -30 so a ground
+        # robot can see the ground it drives on. Declaring the VLP-16's
+        # nominal 30 would make the planner value viewpoints by less than
+        # they actually reveal.
+        fov: [6.283185307179586, 0.7853981633974483]
+        resolution: [0.08726646259971647, 0.08726646259971647]
+        frontier_percentage_threshold: 0.05
+
+    BoundedSpaceParams:
+      Global:
+        type: kCuboid
+        min_val: [-25.0, -40.0, -1.0]
+        max_val: [55.0, 20.0, 3.0]
+      Local:
+        type: kCuboid
+        min_val: [-8.0, -8.0, -0.5]
+        max_val: [8.0, 8.0, 0.5]
+        min_extension: [0.0, 0.0, 0.0]
+        max_extension: [0.0, 0.0, 0.0]
+      LocalSearch:
+        type: kCuboid
+        min_val: [-60.0, -60.0, -3.0]
+        max_val: [60.0, 60.0, 3.0]
+      LocalAdaptiveExp:
+        type: kCuboid
+        min_val: [-8.0, -8.0, -0.3]
+        max_val: [8.0, 8.0, 0.3]
+      GridGraphLocal:
+        type: kCuboid
+        min_val: [-6.0, -6.0, -0.2]
+        max_val: [6.0, 6.0, 0.3]
+        resolution: [0.4, 0.4, 0.1]
+
+    # NoGainZones and GeofenceParams are absent rather than empty. ROS 2's
+    # parameter YAML parser rejects flow mappings ("{}") outright and cannot
+    # infer the element type of an empty sequence ("[]"); an omitted parameter
+    # leaves the struct default in place, which is what is wanted here.
+
+    RandomSamplerParams:
+      SamplerForExploration:
+        X:
+          pdf_type: kUniform
+          sample_mode: kLocal
+        Y:
+          pdf_type: kUniform
+          sample_mode: kLocal
+        Z:
+          pdf_type: kUniform
+          sample_mode: kLocal
+        Heading:
+          pdf_type: kUniform
+          sample_mode: kManual
+          min_val: -3.141592653589793
+          max_val: 3.141592653589793
+      SamplerForSearching:
+        X:
+          pdf_type: kUniform
+          sample_mode: kLocal
+        Y:
+          pdf_type: kUniform
+          sample_mode: kLocal
+        Z:
+          pdf_type: kUniform
+          sample_mode: kLocal
+        Heading:
+          pdf_type: kUniform
+          sample_mode: kManual
+          min_val: -3.141592653589793
+          max_val: 3.141592653589793
+      SamplerForAdaptiveExp:
+        X:
+          pdf_type: kUniform
+          sample_mode: kLocal
+        Y:
+          pdf_type: kUniform
+          sample_mode: kLocal
+        Z:
+          pdf_type: kUniform
+          sample_mode: kLocal
+        Heading:
+          pdf_type: kUniform
+          sample_mode: kManual
+          min_val: -3.141592653589793
+          max_val: 3.141592653589793
+
+    PlanningParams:
+      robot_id: 1
+      type: kAdaptiveExploration
+      rr_mode: kGraph
+      bound_mode: kExtremeBound
+      exp_sensor_list: ["VLP16"]
+      edge_length_min: 0.05
+      edge_length_max: 1.2
+      edge_overshoot: 0.0
+      # 1500, not the stock 8000. This is what actually bounds a planning
+      # cycle. Gain evaluation costs vertices x rays x steps: the declared
+      # 360 x 45 degree sensor at 5 degree resolution is 720 rays, each cast
+      # 20 m in 0.4 m steps, so 8000 vertices is about 290 million octomap
+      # queries and a cycle that never returns. Measured on an open street:
+      # the lattice filled to the cap, all four planners sat at 100% CPU with
+      # ARGoS killed and no data arriving at all, and not one cycle completed
+      # in twenty minutes. The small arena never showed this because its
+      # geometry kept it to 567 vertices, well under the cap.
+      num_vertices_max: 1500
+      num_edges_max: 50000
+      num_loops_cutoff: 2000
+      num_loops_max: 200000
+      nearest_range: 0.6
+      nearest_range_z: 0.15
+      nearest_range_min: 0.05
+      nearest_range_max: 1.0
+      use_current_state: true
+      augment_free_voxels_time: 1
+      free_frustum_before_planning: false
+      use_ray_model_for_volumetric_gain: true
+      path_length_penalty: 0.07
+      path_direction_penalty: 0.3
+      hanging_vertex_penalty: 5.0
+      exp_gain_voxel_size: 0.5
+      occupied_voxel_gain: 0.0
+      free_voxel_gain: 0.0
+      unknown_voxel_gain: 60.0
+      nonuniform_ray_cast: true
+      ray_cast_step_size_multiplier: 1.0
+      freespace_cloud_enable: false
+      leafs_only_for_volumetric_gain: false
+      cluster_vertices_for_gain: true
+      clustering_radius: 0.2
+      build_grid_local_graph: true
+      # Not a clearance: this is the height at which the robot's collision
+      # box rides above the ground. Vertices land here, and every edge is
+      # projected onto the terrain and swept at this height. Zero puts the
+      # 0.20-tall box centred on the floor, which collides with it along
+      # every single edge - the whole lattice is then rejected while the free
+      # cell count stays healthy, because free cells are tested before the
+      # edges are. The stock config's 0.8 is the SMB's body centre.
+      # 0.3, not the robot's actual half-height. The box is 0.20 tall and is
+      # swept centred here, so its underside sits at 0.2; the floor occupies
+      # voxels up to about 0.1 because the lidar reconstructs it with ~0.05 m
+      # of thickness at grazing incidence, and a 0.1 m map rounds that up.
+      # Anything lower and every edge collides with the ground itself.
+      # The cost is that obstacles below 0.2 m are invisible to collision
+      # checking; the arena's walls are 1 m, so nothing here is missed.
+      max_ground_height: 0.3
+      robot_height: 0.2
+      max_inclination: 1.6580627893946132
+      yaw_tangent_correction: true
+      traverse_length_max: 10.0
+      traverse_time_max: 40.0
+      path_safety_enhance_enable: true
+      path_interpolation_distance: 0.25
+      auto_global_planner_enable: true
+      relaxed_corridor_multiplier: 1.5
+      homing_backward: false
+      auto_homing_enable: true
+      time_budget_limit: 3600
+      global_frame_id: map
+      global_path_inclination_check: true
+      go_home_if_fully_explored: true
+      # The arena is the geofence; there is nothing to fence off inside it.
+      geofence_checking_enable: false
+
+    AdaptiveObbParams:
+      type: kPca
+      local_pointcloud_range: 40.0
+      bounding_box_size_max: 60
+
+    # Static inter-robot transforms. All zero, because ARGoS reports odometry
+    # in the world frame and every robot therefore already shares one: the
+    # drift is per-robot but the frame is not. Phase 8 replaces this with a
+    # Swarm-SLAM pose source, where the frames really are separate.
+    #
+    # They still have to be declared. StaticPoseSource returns false for a
+    # robot it has never heard of, and the merge treats that as "I cannot place
+    # this graph" and drops it - so an empty list does not mean "assume
+    # identity", it means no robot ever merges with any other, silently.
+    # The self entry is harmless: a planner discards its own graph before the
+    # transform is ever looked up.
+    neighbour_offsets: [1.0, 0.0, 0.0, 0.0,
+                        2.0, 0.0, 0.0, 0.0,
+                        3.0, 0.0, 0.0, 0.0,
+                        4.0, 0.0, 0.0, 0.0]
+    graph_publish_period_sec: 3.0
+
+/**/mgg_pci:
+  ros__parameters:
+    world_frame: map
+    service_timeout_sec: 120.0
+    # Bistro legs are long, so a path takes a while to drive. Replanning too
+    # often just discards progress: the robot would restart on a fresh path
+    # every few metres and never reach anything.
+    auto_period_sec: 15.0
+    bound_mode: 0
+
+mgg_argos_bridge:
+  ros__parameters:
+    socket_path: /tmp/mgg_argos.sock
+    world_frame: map
+    robots: ["r0", "r1", "r2", "r3"]
+    # Must match <photorealistic_lidar position="..."> in the experiment.
+    lidar_translation: [0.0, 0.0, 0.25]
+    publish_ground_truth: true
+    send_overlays: true
+    # Four robots' graphs at a few thousand edges each is the largest thing on
+    # the wire; this caps one robot's contribution at about 0.5 MB a tick.
+    max_overlay_edges: 20000
+    # Bistro renders far more than the small arena, so the simulator will not
+    # keep up with wall-clock anyway. 0 lets it run as fast as it can rather
+    # than pretending to a rate it cannot hold.
+    real_time_factor: 0.0

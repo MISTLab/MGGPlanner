@@ -16,6 +16,7 @@ the wire protocol, the ARGoS controller and the wheels are all working.
 Usage: argos_bootstrap.py [robot_id] [--distance M]
 """
 import argparse
+import math
 import time
 
 import rclpy
@@ -34,7 +35,11 @@ def main():
     args = parser.parse_args()
 
     rclpy.init()
-    node = Node('argos_bootstrap')
+    # Named per robot. The demo bootstraps all of them at once, and four nodes
+    # sharing a name in one ROS graph is undefined: DDS matched some of the
+    # publishers and silently dropped others, so a robot would sit still while
+    # its path went nowhere.
+    node = Node('argos_bootstrap_' + args.robot)
     node.set_parameters([rclpy.parameter.Parameter(
         'use_sim_time', rclpy.Parameter.Type.BOOL, True)])
 
@@ -54,23 +59,46 @@ def main():
               'with publish_ground_truth?' % args.robot)
         return 1
     start = poses[-1].pose.pose.position
-    print('bootstrap: starting from (%.2f, %.2f)' % (start.x, start.y))
+    # Along the robot's own heading, not along +x. The robots are placed facing
+    # down a street, so a fixed direction would drive some of them into a
+    # building, and this only has to cover the few metres it takes for the
+    # ground under the robot to become mapped.
+    q = poses[-1].pose.pose.orientation
+    yaw = math.atan2(2.0 * (q.w * q.z + q.x * q.y),
+                     1.0 - 2.0 * (q.y * q.y + q.z * q.z))
+    print('bootstrap: starting from (%.2f, %.2f) facing %.0f deg'
+          % (start.x, start.y, math.degrees(yaw)))
 
-    # Straight ahead along +x in three steps. The follower retires waypoints
-    # within tolerance, so intermediate ones keep it on the line rather than
-    # letting it arc.
+    # Three steps rather than one. The follower retires every waypoint already
+    # within tolerance, so the intermediate ones cost nothing when the robot
+    # runs straight, and keep it on the line when it does not.
     path = Path()
     path.header.frame_id = 'map'
     path.header.stamp = node.get_clock().now().to_msg()
     for fraction in (0.33, 0.66, 1.0):
         pose = PoseStamped()
-        pose.pose.position.x = start.x + args.distance * fraction
-        pose.pose.position.y = start.y
+        pose.pose.position.x = start.x + args.distance * fraction * math.cos(yaw)
+        pose.pose.position.y = start.y + args.distance * fraction * math.sin(yaw)
         pose.pose.orientation.w = 1.0
         path.poses.append(pose)
+    # Wait for the bridge's subscription to be discovered before publishing.
+    # A message sent before discovery completes is simply dropped - the
+    # publisher is transient-local but the bridge subscribes volatile, so
+    # there is no replay - and the robot then sits still for the whole run
+    # while its path goes nowhere. Intermittent, because it is a race between
+    # this process starting and DDS discovery finishing, and it bit exactly
+    # one of four robots on two separate runs.
+    deadline = time.time() + 30.0
+    while publisher.get_subscription_count() == 0 and time.time() < deadline:
+        rclpy.spin_once(node, timeout_sec=0.1)
+    if publisher.get_subscription_count() == 0:
+        print('bootstrap: %s found no subscriber on /%s/path after 30 s; is '
+              'the bridge running with this robot in its list?'
+              % (args.robot, args.robot))
+        return 1
     publisher.publish(path)
-    print('bootstrap: published %d waypoints, driving %.1f m'
-          % (len(path.poses), args.distance))
+    print('bootstrap: %s published %d waypoints, driving %.1f m'
+          % (args.robot, len(path.poses), args.distance))
 
     # Stop as soon as it has gone far enough; no point burning the full budget.
     deadline = time.time() + args.timeout
@@ -82,7 +110,8 @@ def main():
             break
     now = poses[-1].pose.pose.position
     moved = ((now.x - start.x) ** 2 + (now.y - start.y) ** 2) ** 0.5
-    print('bootstrap: now at (%.2f, %.2f), moved %.2f m' % (now.x, now.y, moved))
+    print('bootstrap: %s now at (%.2f, %.2f), moved %.2f m'
+          % (args.robot, now.x, now.y, moved))
     rclpy.shutdown()
     if moved < 0.2:
         print('bootstrap: the robot did not move. The planner will have no '
