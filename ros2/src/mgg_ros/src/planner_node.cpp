@@ -1,5 +1,6 @@
 #include "mgg_ros/planner_node.h"
 
+#include <chrono>
 #include <cstdio>
 #include <geometry_msgs/msg/transform_stamped.hpp>
 #include <sensor_msgs/msg/point_cloud2.hpp>
@@ -313,6 +314,12 @@ std::string PlannerNode::buildLocalGraph() {
   if (!have_odometry_) return "no odometry received yet";
   if (!map_->getStatus()) return "map is empty; no point cloud received yet";
 
+  // Per-phase timing. A cycle that never returns says nothing about which of
+  // the three phases is responsible, and they scale with completely different
+  // things: the sweep with the lattice volume, the gain with the number of
+  // viewpoints times the sensor's ray count, the selection with the graph.
+  using Clock = std::chrono::steady_clock;
+  const auto t_start = Clock::now();
   updateGlobalGraph();
 
   local_graph_->reset();
@@ -323,6 +330,7 @@ std::string PlannerNode::buildLocalGraph() {
   local_graph_->addVertex(root);
 
   const mgg::ExpandContext ctx = makeContext();
+  const auto t_global = Clock::now();
   const mgg::GridGraphResult r = buildGridGraph(
       *local_graph_, current_state_, grid_params_, ctx, current_state_[3]);
 
@@ -330,6 +338,7 @@ std::string PlannerNode::buildLocalGraph() {
     return "grid bounds invalid: min_val must be <= 0, max_val >= 0 and "
            "resolution non-zero";
   }
+  const auto t_grid = Clock::now();
   // The gain evaluation needs the sampling volume centred on the robot, since
   // it rejects voxels outside it.
   global_space_.setCenter(current_state_, /*use_extension=*/true);
@@ -347,6 +356,7 @@ std::string PlannerNode::buildLocalGraph() {
     }
   }
 
+  const auto t_gain = Clock::now();
   const mgg::PathSelectionResult sel = mgg::selectBestPath(
       *local_graph_, planning_params_, robot_params_, edge_inclinations_,
       map_->getResolution(), exploring_direction_);
@@ -379,16 +389,25 @@ std::string PlannerNode::buildLocalGraph() {
                   r.no_ground, r.edge_status[0], r.edge_status[1],
                   r.edge_status[2], r.edge_status[3], r.edge_status[4]);
   }
-  char buf[512];
+  const auto t_end = Clock::now();
+  const auto ms = [](Clock::time_point a, Clock::time_point b) {
+    return std::chrono::duration<double, std::milli>(b - a).count();
+  };
+  char timing[128];
+  std::snprintf(timing, sizeof(timing),
+                "; %.0f ms (global %.0f, grid %.0f, gain %.0f, select %.0f)",
+                ms(t_start, t_end), ms(t_start, t_global), ms(t_global, t_grid),
+                ms(t_grid, t_gain), ms(t_gain, t_end));
+  char buf[640];
   std::snprintf(
       buf, sizeof(buf),
       "grid graph: %d free cells, %d vertices, %d edges%s%s; %d viewpoints, "
-      "%d frontiers; best path %zu poses, gain %.1f%s, heading %.2f rad",
+      "%d frontiers; best path %zu poses, gain %.1f%s, heading %.2f rad%s",
       r.free_cells, r.vertices_added, r.edges_added,
       r.hit_limit ? " (hit a size limit)" : "", why, evaluated, frontiers,
       best_path_.size(), sel.best_gain,
       sel.paths_rejected_steep > 0 ? " (some paths too steep)" : "",
-      exploring_direction_);
+      exploring_direction_, timing);
   return std::string(buf);
 }
 
