@@ -58,10 +58,16 @@ add_library(mgg_footbot MODULE mgg_footbot.cpp)
 target_link_libraries(mgg_footbot
   argos3core_${ARGOS_BUILD_FOR} argos3plugin_${ARGOS_BUILD_FOR}_genericrobot)
 
+add_library(mgg_bunker_mini MODULE mgg_bunker_mini.cpp)
+target_link_libraries(mgg_bunker_mini
+  argos3core_${ARGOS_BUILD_FOR} argos3plugin_${ARGOS_BUILD_FOR}_genericrobot)
+
+
 # The loop function needs the controller's symbols: it downcasts each robot's
 # controller to read the same sensor readings the controller sees, rather than
 # taking a second copy of a 28800-ray scan.
-add_library(mgg_bridge MODULE mgg_bridge.cpp mgg_footbot.cpp)
+add_library(mgg_bridge MODULE mgg_bridge.cpp)
+
 target_include_directories(mgg_bridge PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/..)
 target_link_libraries(mgg_bridge
   argos3core_${ARGOS_BUILD_FOR}

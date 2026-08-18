@@ -46,7 +46,7 @@ namespace argos {
    class CPROverlay;
 }
 
-class CMGGFootbot;
+class CMGGRobotController;
 
 using namespace argos;
 
@@ -78,7 +78,8 @@ private:
    int m_nSocket = -1;
    std::string m_strSocketPath;
    std::vector<std::string> m_vecRobotIds;
-   std::vector<CMGGFootbot*> m_vecControllers;
+   std::vector<CMGGRobotController*> m_vecControllers;
+
    Real m_fTimeout = 300.0;
    Real m_fConnectTimeout = 60.0;
    UInt32 m_unTicksPerSecond = 10;

@@ -35,11 +35,7 @@
 #ifndef MGG_FOOTBOT_H
 #define MGG_FOOTBOT_H
 
-#include <argos3/core/control_interface/ci_controller.h>
-#include <argos3/core/utility/math/vector3.h>
-
-#include <string>
-#include <vector>
+#include "mgg_robot_controller.h"
 
 namespace argos {
    class CCI_DifferentialSteeringActuator;
@@ -51,31 +47,34 @@ namespace argos {
 
 using namespace argos;
 
-class CMGGFootbot : public CCI_Controller {
+class CMGGFootbot : public CMGGRobotController {
 
 public:
 
-   virtual void Init(TConfigurationNode& t_tree);
-   virtual void ControlStep();
-   virtual void Reset();
+   virtual void Init(TConfigurationNode& t_tree) override;
+   virtual void ControlStep() override;
+   virtual void Reset() override;
+   virtual void Destroy() override {}
 
-   /* Read by the bridge loop function */
-   CCI_PhotorealisticLidarSensor* m_pcLidar = nullptr;
-   CCI_IMUSensor* m_pcIMU = nullptr;
-   CCI_OdometrySensor* m_pcOdometry = nullptr;
-   CCI_PositioningSensor* m_pcPositioning = nullptr;
+   virtual void SetPath(const std::vector<CVector3>& vec_waypoints) override;
 
-   const std::string& GetRobotId() const { return m_strRobotId; }
+   virtual const std::vector<CVector3>& GetPath() const override { return m_vecPath; }
+   virtual size_t GetCurrentWaypointIndex() const override { return m_unCurrentWaypoint; }
+   virtual bool HasActivePath() const override {
+      return !m_vecPath.empty() && m_unCurrentWaypoint < m_vecPath.size();
+   }
 
-   /** Replaces the path being followed. Called by the bridge when the
-    *  planner sends one. Poses are in the world frame. */
-   void SetPath(const std::vector<CVector3>& vec_waypoints);
+   virtual const std::string& GetRobotId() const override { return m_strRobotId; }
+
+   virtual CCI_PositioningSensor* GetPositioning() override { return m_pcPositioning; }
+   virtual CCI_PhotorealisticLidarSensor* GetLidar() override { return m_pcLidar; }
+   virtual CCI_OdometrySensor* GetOdometry() override { return m_pcOdometry; }
+   virtual CCI_IMUSensor* GetIMU() override { return m_pcIMU; }
 
    /** Drops the current path and stops the wheels. */
    void StopPath();
 
-   /** True while there are waypoints left to reach. The bridge reports
-    *  this so the planner knows when to plan again. */
+   /** True while there are waypoints left to reach. */
    bool HasPath() const { return m_unCurrentWaypoint < m_vecPath.size(); }
 
    /** How many waypoints of the current path are still ahead. */
@@ -86,6 +85,10 @@ public:
 private:
 
    CCI_DifferentialSteeringActuator* m_pcWheels = nullptr;
+   CCI_PositioningSensor*            m_pcPositioning = nullptr;
+   CCI_PhotorealisticLidarSensor*    m_pcLidar = nullptr;
+   CCI_OdometrySensor*               m_pcOdometry = nullptr;
+   CCI_IMUSensor*                    m_pcIMU = nullptr;
 
    std::string m_strRobotId = "r0";
    std::vector<CVector3> m_vecPath;
@@ -101,3 +104,4 @@ private:
 };
 
 #endif
+

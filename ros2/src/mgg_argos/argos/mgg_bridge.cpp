@@ -1,6 +1,7 @@
 #include "mgg_bridge.h"
-#include "mgg_footbot.h"
+#include "mgg_robot_controller.h"
 #include "../include/mgg_argos/protocol.h"
+
 
 #include <argos3/core/simulator/simulator.h>
 #include <argos3/core/simulator/space/space.h>
@@ -59,12 +60,13 @@ void CMGGBridge::Init(TConfigurationNode& t_tree) {
       auto& cControllable =
          cEntity.GetComponent<CControllableEntity>("controller");
       auto* pcController =
-         dynamic_cast<CMGGFootbot*>(&cControllable.GetController());
+         dynamic_cast<CMGGRobotController*>(&cControllable.GetController());
       if(pcController == nullptr) {
          THROW_ARGOSEXCEPTION("Robot \"" << strId << "\" does not run an "
-                              "mgg_footbot controller");
+                              "MGG robot controller (e.g. mgg_footbot or mgg_bunker_mini)");
       }
       m_vecControllers.push_back(pcController);
+
    }
    m_unTicksPerSecond =
       UInt32(CPhysicsEngine::GetInverseSimulationClockTick());
@@ -229,13 +231,14 @@ void CMGGBridge::RecvCommands(UInt32 un_tick) {
       RecvAll(&unType, 1);
       /* Resolve the target before reading the payload, so an unknown id
        * still consumes its bytes and leaves the stream aligned */
-      CMGGFootbot* pcController = nullptr;
-      for(CMGGFootbot* pcCandidate : m_vecControllers) {
+      CMGGRobotController* pcController = nullptr;
+      for(CMGGRobotController* pcCandidate : m_vecControllers) {
          if(pcCandidate->GetRobotId() == strId) {
             pcController = pcCandidate;
             break;
          }
       }
+
       if(unType == kCommandPath) {
          std::uint32_t unWaypoints = 0;
          RecvAll(&unWaypoints, sizeof(unWaypoints));
@@ -415,14 +418,14 @@ void CMGGBridge::PostStep() {
    Append(&unTick, sizeof(unTick));
    Append(&m_unTicksPerSecond, sizeof(m_unTicksPerSecond));
    Append(&unRobots, sizeof(unRobots));
-   for(CMGGFootbot* pcController : m_vecControllers) {
+   for(CMGGRobotController* pcController : m_vecControllers) {
       AppendString(pcController->GetRobotId());
       /* Count the blocks this robot will emit before writing any */
       UInt8 unBlocks = 0;
-      const bool bHasOdometry = pcController->m_pcOdometry != nullptr;
-      const bool bHasImu = pcController->m_pcIMU != nullptr;
-      const bool bHasScan = pcController->m_pcLidar != nullptr &&
-                            pcController->m_pcLidar->HasNewScan();
+      const bool bHasOdometry = pcController->GetOdometry() != nullptr;
+      const bool bHasImu = pcController->GetIMU() != nullptr;
+      const bool bHasScan = pcController->GetLidar() != nullptr &&
+                            pcController->GetLidar()->HasNewScan();
       if(bHasOdometry) ++unBlocks;
       if(bHasImu) ++unBlocks;
       if(bHasScan) ++unBlocks;
@@ -432,7 +435,7 @@ void CMGGBridge::PostStep() {
       if(bHasOdometry) {
          const size_t unBlock = BeginBlock(kBlockOdometry);
          const CCI_OdometrySensor::SReading& sOdom =
-            pcController->m_pcOdometry->GetReading();
+            pcController->GetOdometry()->GetReading();
          const double pfOdom[7] = {
             double(sOdom.Position.GetX()), double(sOdom.Position.GetY()),
             double(sOdom.Position.GetZ()), double(sOdom.Orientation.GetW()),
@@ -446,7 +449,7 @@ void CMGGBridge::PostStep() {
           * sees exactly the scan rate the sensor delivers */
          const size_t unBlock = BeginBlock(kBlockLidar);
          const CCI_PhotorealisticLidarSensor::SScan& sScan =
-            pcController->m_pcLidar->GetScan();
+            pcController->GetLidar()->GetScan();
          const auto unRings = std::uint32_t(sScan.NumRings);
          const auto unAzimuths = std::uint32_t(sScan.NumAzimuths);
          Append(&unRings, sizeof(unRings));
@@ -481,7 +484,7 @@ void CMGGBridge::PostStep() {
       }
       if(bHasImu) {
          const size_t unBlock = BeginBlock(kBlockImu);
-         const CCI_IMUSensor::SReading& sImu = pcController->m_pcIMU->GetReading();
+         const CCI_IMUSensor::SReading& sImu = pcController->GetIMU()->GetReading();
          const double pfImu[6] = {
             double(sImu.AngularVelocity.GetX()),
             double(sImu.AngularVelocity.GetY()),
@@ -492,10 +495,10 @@ void CMGGBridge::PostStep() {
          Append(pfImu, sizeof(pfImu));
          EndBlock(unBlock);
       }
-      if(m_bSendGroundTruth) {
+      if(m_bSendGroundTruth && pcController->GetPositioning() != nullptr) {
          const size_t unBlock = BeginBlock(kBlockGroundTruth);
          const CCI_PositioningSensor::SReading& sPose =
-            pcController->m_pcPositioning->GetReading();
+            pcController->GetPositioning()->GetReading();
          const double pfPose[7] = {
             double(sPose.Position.GetX()), double(sPose.Position.GetY()),
             double(sPose.Position.GetZ()), double(sPose.Orientation.GetW()),
@@ -505,6 +508,7 @@ void CMGGBridge::PostStep() {
          EndBlock(unBlock);
       }
    }
+
    SendAll(m_vecBuffer.data(), m_vecBuffer.size());
    /* Blocks here: this is what makes the run lockstep rather than
     * best-effort, and what lets a slow planning cycle cost wall-clock
