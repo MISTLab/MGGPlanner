@@ -8,13 +8,13 @@
 
     RobotParams:
       type: kGroundRobot
-      size: [0.66, 0.584, 0.281]
+      size: [0.55, 0.50, 0.20]
       size_extension_min: [0.0, 0.0, 0.0]
-      size_extension: [0.08, 0.08, 0.05]
+      size_extension: [0.03, 0.03, 0.02]
       center_offset: [0.0, 0.0, 0.0]
       relax_ratio: 0.5
       bound_mode: kExtendedBound
-      safety_extension: [0.6, 0.8, 0.05]
+      safety_extension: [0.15, 0.15, 0.05]
 
     SensorParams:
       sensor_list: ["VLP16"]
@@ -54,6 +54,8 @@
         min_val: [-5.0, -5.0, -0.2]
         max_val: [5.0, 5.0, 0.3]
         resolution: [0.25, 0.25, 0.1]
+
+
 
     RandomSamplerParams:
       SamplerForExploration:
@@ -106,19 +108,19 @@
       robot_id: 1
       type: kAdaptiveExploration
       rr_mode: kGraph
-      bound_mode: kExtremeBound
+      bound_mode: kExtendedBound
       exp_sensor_list: ["VLP16"]
       edge_length_min: 0.10
-      edge_length_max: 1.0
+      edge_length_max: 0.80
       edge_overshoot: 0.0
       num_vertices_max: 8000
       num_edges_max: 50000
       num_loops_cutoff: 2000
       num_loops_max: 200000
-      nearest_range: 0.5
+      nearest_range: 0.40
       nearest_range_z: 0.20
       nearest_range_min: 0.10
-      nearest_range_max: 0.9
+      nearest_range_max: 0.70
       use_current_state: true
       augment_free_voxels_time: 1
       free_frustum_before_planning: false
@@ -137,8 +139,10 @@
       cluster_vertices_for_gain: true
       clustering_radius: 0.3
       build_grid_local_graph: true
-      max_ground_height: 0.35
+      max_ground_height: 0.30
       robot_height: 0.281
+
+
       max_inclination: 1.6580627893946132
       yaw_tangent_correction: true
       traverse_length_max: 4.0
@@ -171,10 +175,14 @@
   ros__parameters:
     world_frame: map
     service_timeout_sec: 60.0
-    auto_period_sec: 8.0
+    auto_period_sec: 4.0
+    stuck_timeout_sec: 12.0
+    reach_distance: 0.35
+    bootstrap_distance: 2.0
     bound_mode: 0
 
 mgg_argos_bridge:
+
   ros__parameters:
     socket_path: /tmp/mgg_argos.sock
     world_frame: map

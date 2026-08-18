@@ -58,17 +58,18 @@ bool edgeTraversable(const ExpandContext& ctx, const Eigen::Vector3d& start,
                      std::vector<Eigen::Vector3d>& projected_edge,
                      ExpandGraphReport& rep) {
   if (ctx.robot->type == RobotType::kAerialRobot) {
-    return ctx.map->getPathStatus(start, end, ctx.robot_box_size, true) ==
+    return ctx.map->getPathStatus(start, end, ctx.robot_box_size, false) ==
            VoxelStatus::kFree;
   }
   // Ground robot: the edge has to follow the terrain.
   const ProjectedEdgeStatus es = ctx.ground->getProjectedEdgeStatus(
-      start, end, ctx.robot_box_size, true, projected_edge, is_hanging);
+      start, end, ctx.robot_box_size, false, projected_edge, is_hanging);
   ++rep.edge_status[static_cast<int>(es)];
   if (es == ProjectedEdgeStatus::kAdmissible) return true;
   if (es == ProjectedEdgeStatus::kSteep) ++rep.steep_edges;
   return false;
 }
+
 
 }  // namespace
 
@@ -171,6 +172,8 @@ void expandGraph(GraphManager& graph, Vertex& new_vertex,
     rep.status = ExpandGraphStatus::kErrorCollisionEdge;
     return;
   }
+
+
 
   Vertex* added = new Vertex(graph.generateVertexID(), new_state);
   added->robot_id = ctx.robot_id;

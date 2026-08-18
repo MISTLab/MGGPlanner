@@ -544,13 +544,12 @@ void BridgeNode::publishCloud(const Robot& robot, const Observation& obs,
   modifier.setPointCloud2Fields(3, "x", 1, sensor_msgs::msg::PointField::FLOAT32,
                                 "y", 1, sensor_msgs::msg::PointField::FLOAT32,
                                 "z", 1, sensor_msgs::msg::PointField::FLOAT32);
-  modifier.resize(rays);
-  sensor_msgs::PointCloud2Iterator<float> it_x(cloud, "x");
-  sensor_msgs::PointCloud2Iterator<float> it_y(cloud, "y");
-  sensor_msgs::PointCloud2Iterator<float> it_z(cloud, "z");
+  struct Point3D {
+    float x, y, z;
+  };
+  std::vector<Point3D> points;
+  points.reserve(rays);
 
-  // Rebuild the ray directions from the grid the scan was sampled on. The
-  // sender leaves them out because they are implied.
   const double elevation_step =
       obs.rings > 1
           ? (double(obs.elevation_max) - obs.elevation_min) / double(obs.rings - 1)
@@ -559,6 +558,7 @@ void BridgeNode::publishCloud(const Robot& robot, const Observation& obs,
       obs.azimuths > 0 ? 2.0 * M_PI / double(obs.azimuths) : 0.0;
 
   for (std::uint32_t a = 0; a < obs.azimuths; ++a) {
+
     const double azimuth = azimuth_step * a;
     const double cos_azimuth = std::cos(azimuth);
     const double sin_azimuth = std::sin(azimuth);
@@ -566,20 +566,43 @@ void BridgeNode::publishCloud(const Robot& robot, const Observation& obs,
       const size_t i = size_t(a) * obs.rings + r;
       const double elevation = obs.elevation_min + elevation_step * r;
       const double cos_elevation = std::cos(elevation);
-      // A miss is pushed just past the maximum range so that octomap clears
-      // the ray without marking its endpoint. Dropping misses instead would
-      // cost most of the free space the planner needs: an unexplored corridor
-      // reads as unknown rather than empty, and the frontier never opens.
-      const double range = obs.hits[i] ? double(obs.ranges[i])
-                                       : double(obs.max_range) * miss_range_scale_;
-      *it_x = float(range * cos_elevation * cos_azimuth);
-      *it_y = float(range * cos_elevation * sin_azimuth);
-      *it_z = float(range * std::sin(elevation));
-      ++it_x;
-      ++it_y;
-      ++it_z;
+
+      if (obs.hits[i]) {
+        // Real obstacle or ground return (ignore any stray returns on robot chassis < 0.50m)
+        if (obs.ranges[i] >= 0.50f) {
+          const double range = double(obs.ranges[i]);
+          points.push_back({
+              float(range * cos_elevation * cos_azimuth),
+              float(range * cos_elevation * sin_azimuth),
+              float(range * std::sin(elevation))});
+        }
+      } else if (obs.ranges[i] > 0.0f) {
+        // True open-air miss: push past max range so OctoMap clears free space.
+        // Rays occluded by host robot body have range == 0.0 and are dropped
+        // so they do not falsely clear the ground underneath the chassis.
+        const double range = double(obs.max_range) * miss_range_scale_;
+        points.push_back({
+            float(range * cos_elevation * cos_azimuth),
+            float(range * cos_elevation * sin_azimuth),
+            float(range * std::sin(elevation))});
+      }
     }
   }
+
+  if (points.empty()) return;
+  modifier.resize(points.size());
+  sensor_msgs::PointCloud2Iterator<float> it_x(cloud, "x");
+  sensor_msgs::PointCloud2Iterator<float> it_y(cloud, "y");
+  sensor_msgs::PointCloud2Iterator<float> it_z(cloud, "z");
+  for (const auto& pt : points) {
+    *it_x = pt.x;
+    *it_y = pt.y;
+    *it_z = pt.z;
+    ++it_x;
+    ++it_y;
+    ++it_z;
+  }
+
   robot.cloud_pub->publish(cloud);
 }
 

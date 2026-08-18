@@ -116,20 +116,28 @@ VoxelStatus OctomapMap::getBoxStatus(const Eigen::Vector3d& center,
                                      const Eigen::Vector3d& size,
                                      bool stop_at_unknown_voxel) const {
   const double r = tree_->getResolution();
-  bool saw_unknown = false;
+  int total = 0;
+  int unknown_count = 0;
   for (double dx = -size.x() / 2; dx <= size.x() / 2; dx += r)
     for (double dy = -size.y() / 2; dy <= size.y() / 2; dy += r)
       for (double dz = -size.z() / 2; dz <= size.z() / 2; dz += r) {
+        ++total;
         const VoxelStatus s =
             statusAt(toOct(center + Eigen::Vector3d(dx, dy, dz)));
-        // Occupied always wins: a box straddling an obstacle is in collision
-        // regardless of how much unknown space it also covers.
         if (s == VoxelStatus::kOccupied) return VoxelStatus::kOccupied;
-        if (s == VoxelStatus::kUnknown) saw_unknown = true;
+        if (s == VoxelStatus::kUnknown) ++unknown_count;
+
       }
-  if (saw_unknown && stop_at_unknown_voxel) return VoxelStatus::kUnknown;
+  // If stop_at_unknown_voxel is requested, allow a small fraction of unknown
+  // voxels (e.g. beam dispersion / ray gaps between elevation rings), but
+  // reject if a significant portion (>25%) of the box is unmapped.
+  if (stop_at_unknown_voxel && total > 0 &&
+      double(unknown_count) / double(total) > 0.25) {
+    return VoxelStatus::kUnknown;
+  }
   return VoxelStatus::kFree;
 }
+
 
 VoxelStatus OctomapMap::getPathStatus(const Eigen::Vector3d& start,
                                       const Eigen::Vector3d& end,

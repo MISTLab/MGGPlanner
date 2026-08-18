@@ -11,13 +11,14 @@ double GroundProjection::projectSample(Eigen::Vector3d& sample,
 
   // The centre plus four local offsets, so a sample straddling a small hole
   // still finds ground without probing onto distant sidewalks or kerbs.
-  const double probe_offset = std::min(0.15, 2.0 * map_.getResolution());
+  const double probe_offset = std::max(0.20, 2.0 * map_.getResolution());
   const std::vector<Eigen::Vector3d> extra_samples = {
-      {0.0, 0.0, 0.0},
+      {0.0, 0.0, probe_offset},
       {probe_offset, 0.0, probe_offset},
       {-probe_offset, 0.0, probe_offset},
       {0.0, probe_offset, probe_offset},
       {0.0, -probe_offset, probe_offset}};
+
 
   // The offset probes start slightly higher as well as to the side, so
   // the drop has to be measured from the sample itself rather than from where
@@ -100,17 +101,14 @@ ProjectedEdgeStatus GroundProjection::getProjectedEdgeStatus(
   } else {
     VoxelStatus vs;
     Eigen::Vector3d start_m = start;
-    double ground_height = projectSample(start_m, vs);
-    if ((vs == VoxelStatus::kUnknown || ground_height < 0.0) && !is_hanging) {
+    const double start_ground = projectSample(start_m, vs);
+    if ((vs == VoxelStatus::kUnknown || start_ground < 0.0) && !is_hanging) {
       return ProjectedEdgeStatus::kHanging;
     }
-    Eigen::Vector3d end_probe = end;
-    ground_height = projectSample(end_probe, vs);
-    if ((vs == VoxelStatus::kUnknown || ground_height < 0.0) && !is_hanging) {
-      return ProjectedEdgeStatus::kHanging;
-    }
-    projected_edge.push_back(start);
+    start_m(2) -= (start_ground - params_.max_ground_height);
+    projected_edge.push_back(start_m);
   }
+
 
   VoxelStatus vs;
   Eigen::Vector3d end_m = end;
