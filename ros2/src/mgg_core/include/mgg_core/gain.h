@@ -26,6 +26,7 @@ namespace mgg {
 struct GainContext {
   MapInterface* map = nullptr;
   const PlanningParams* planning = nullptr;
+  const RobotParams* robot = nullptr;
   /// Voxels outside this volume are ignored, so a viewpoint is not rewarded
   /// for seeing space the robot is not allowed to explore.
   const BoundedSpaceParams* global_space = nullptr;
@@ -34,6 +35,7 @@ struct GainContext {
   /// Sensors named by planning->exp_sensor_list.
   const std::unordered_map<std::string, SensorParams>* sensors = nullptr;
 };
+
 
 /// Gain of a single viewpoint.
 ///

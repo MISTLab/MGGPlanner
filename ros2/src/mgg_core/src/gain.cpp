@@ -56,6 +56,21 @@ void computeVolumetricGain(
       // outside any zone declared uninteresting.
       if (!ctx.global_space->isInsideSpace(voxel)) continue;
       if (inNoGainZone(ctx, voxel)) continue;
+
+      // Ground robot awareness: ground robots only explore the traversable ground layer.
+      // Voxels high up in the sky or deep below the ground plane have no relevance to ground navigation.
+      if (ctx.robot != nullptr && ctx.robot->type == RobotType::kGroundRobot) {
+        const double max_h_above = (ctx.planning != nullptr)
+                                       ? std::max(ctx.planning->robot_height * 2.5, 1.2)
+                                       : 1.2;
+        const double max_h_below = (ctx.planning != nullptr)
+                                       ? std::max(ctx.planning->max_ground_height * 2.0, 1.0)
+                                       : 1.0;
+        if (voxel.z() - origin.z() > max_h_above || origin.z() - voxel.z() > max_h_below) {
+          continue;
+        }
+      }
+
       switch (entry.second) {
         case VoxelStatus::kUnknown: ++unknown; break;
         case VoxelStatus::kFree: ++free; break;
@@ -63,6 +78,7 @@ void computeVolumetricGain(
       }
       if (voxel_log != nullptr) voxel_log->emplace_back(voxel, entry.second);
     }
+
 
     gain.num_unknown_voxels += unknown;
     gain.num_free_voxels += free;

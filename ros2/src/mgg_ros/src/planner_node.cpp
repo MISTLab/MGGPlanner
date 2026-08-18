@@ -194,11 +194,13 @@ mgg::GainContext PlannerNode::makeGainContext() {
   mgg::GainContext ctx;
   ctx.map = map_.get();
   ctx.planning = &planning_params_;
+  ctx.robot = &robot_params_;
   ctx.global_space = &global_space_;
   ctx.no_gain_zones = no_gain_zones_.empty() ? nullptr : &no_gain_zones_;
   ctx.sensors = &sensors_;
   return ctx;
 }
+
 
 mgg::ExpandContext PlannerNode::makeContext() {
   mgg::ExpandContext ctx;

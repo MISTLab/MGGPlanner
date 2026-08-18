@@ -226,16 +226,15 @@ for robot in "${ROBOTS[@]}"; do
          sed 's/.*grid graph: //' | cut -c1-96)
   printf '  %s: %s planning cycles | %s\n' "$robot" "$cycles" "${last:-none}"
 done
-merges=$(grep -c "merged robot" "$IPC/ros.log" || true)
-echo "  graph merges between robots: $merges"
-if [[ $merges -gt 0 ]]; then
-  # Which pairs actually met, not just how many times. Four robots that all
-  # merged with one neighbour and none with the others is a different result
-  # from a swarm that has joined up.
-  grep -oE "\[r[0-9]\.mggplanner_node\]: merged robot [0-9]+" "$IPC/ros.log" |
-    sed -E 's/\[(r[0-9])\.mggplanner_node\]: merged robot ([0-9]+)/  \1 <- robot \2/' |
+rendezvous=$(grep -c "Swarm Graph Merge" "$IPC/ros.log" || true)
+updates=$(grep -c -E "roadmap update|merged robot" "$IPC/ros.log" || true)
+echo "  graph rendezvous connections: $rendezvous (roadmap updates: $updates)"
+if [[ $((rendezvous + updates)) -gt 0 ]]; then
+  grep -oE "\[r[0-9]\.mggplanner_node\]: (\*\*\* Swarm Graph Merge: Connected with robot [0-9]+|roadmap update from robot [0-9]+|merged robot [0-9]+)" "$IPC/ros.log" |
+    sed -E 's/\[(r[0-9])\.mggplanner_node\]:.*robot ([0-9]+).*/  \1 <- robot \2/' |
     sort | uniq -c | sed 's/^/  /'
 fi
+
 # The global graph is what the robots exchange, so its size is the thing to
 # watch: a graph that never grows means nothing is being shared.
 for robot in "${ROBOTS[@]}"; do
