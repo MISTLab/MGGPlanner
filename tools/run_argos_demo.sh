@@ -4,9 +4,11 @@
 #
 #   tools/run_argos_demo.sh              headless, one robot, small arena
 #   tools/run_argos_demo.sh --maze       four robots in the maze
+#   tools/run_argos_demo.sh --bunker-maze four AgileX Bunker Minis in the maze
 #   tools/run_argos_demo.sh --bistro     four robots in the Bistro street
 #   tools/run_argos_demo.sh --gui        with the Filament visualisation
 #   tools/run_argos_demo.sh --length 600 explore for 600 s of wall clock
+
 #
 # --gui is also what makes the planner's work visible: the bridge draws each
 # robot's path and graph into the photorealism overlay, which the viewer shows
@@ -44,13 +46,16 @@ LENGTH=240
 GUI=0
 BISTRO=0
 MAZE=0
+BUNKER_MAZE=0
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --gui) GUI=1; shift ;;
     --bistro) BISTRO=1; shift ;;
     --maze) MAZE=1; shift ;;
+    --bunker-maze) BUNKER_MAZE=1; shift ;;
     --length) LENGTH="$2"; shift 2 ;;
+
     -h|--help) sed -n '2,30p' "$0"; exit 0 ;;
     *) echo "unknown argument: $1" >&2; exit 1 ;;
   esac
@@ -135,6 +140,13 @@ elif [[ $MAZE -eq 1 ]]; then
   ROBOTS=(r0 r1 r2 r3)
   sed "s|/tmp/mgg_argos.sock|$IPC/argos.sock|" \
     "$REPO/ros2/src/mgg_argos/experiments/maze_mgg.argos" > "$IPC/run.argos"
+elif [[ $BUNKER_MAZE -eq 1 ]]; then
+  # 4 AgileX Bunker Mini tracked robots exploring the maze.
+  CONFIG="$REPO/ros2/src/mgg_argos/config/bunker_maze.yaml"
+  LAUNCH="swarm.launch.py"
+  ROBOTS=(r0 r1 r2 r3)
+  sed "s|/tmp/mgg_argos.sock|$IPC/argos.sock|" \
+    "$REPO/ros2/src/mgg_argos/experiments/maze_bunker_mini.argos" > "$IPC/run.argos"
 else
   CONFIG="$REPO/ros2/src/mgg_argos/config/argos_footbot.yaml"
   LAUNCH="argos_single.launch.py"
@@ -177,10 +189,11 @@ for _ in $(seq 60); do [[ -S "$IPC/argos.sock" ]] && break; sleep 1; done
 # Prefer local argos3 build if present, falling back to installed plugins.
 ARGOS_BUILD="$REPO/../argos3/build"
 if [[ -d "$ARGOS_BUILD" ]]; then
-  export ARGOS_PLUGIN_PATH="$PLUGINS:$ARGOS_BUILD/plugins/simulator/photorealism:$ARGOS_BUILD/plugins/simulator/visualizations/filament"
+  export ARGOS_PLUGIN_PATH="$PLUGINS:$ARGOS_BUILD/plugins/robots/bunker-mini:$ARGOS_BUILD/plugins/simulator/photorealism:$ARGOS_BUILD/plugins/simulator/visualizations/filament:${ARGOS_PLUGIN_PATH:-}"
 else
-  export ARGOS_PLUGIN_PATH="$PLUGINS"
+  export ARGOS_PLUGIN_PATH="$PLUGINS:${ARGOS_PLUGIN_PATH:-}"
 fi
+
 
 if [[ $GUI -eq 1 ]]; then
   ( cd "$IPC" && argos3 -c run.argos > "$IPC/argos.log" 2>&1 ) & ARGOS_PID=$!

@@ -1,0 +1,152 @@
+<?xml version="1.0" ?>
+<!--
+  Four AgileX Bunker Mini tracked robots exploring the maze under the MGG planner.
+
+  One per corner, each facing into the maze. The three interior partitions
+  divide it into regions that connect only through gaps, so a robot cannot see
+  another's territory from its own start: they have to explore towards each
+  other, which is what makes the graph exchange mean anything.
+
+  The robots follow paths sent by the MGG planner over the IPC bridge.
+-->
+<argos-configuration>
+
+  <framework>
+    <system threads="0" />
+    <experiment length="0" ticks_per_second="10" random_seed="42" />
+  </framework>
+
+  <controllers>
+    <mgg_bunker_mini_controller library="libmgg_bunker_mini.so" id="mbm0">
+      <actuators>
+        <differential_steering implementation="default" />
+      </actuators>
+      <sensors>
+        <positioning implementation="default" />
+        <odometry implementation="drift" />
+        <imu implementation="default" />
+        <photorealistic_lidar implementation="default" medium="pr"
+                              anchor="lidar" position="0,0,0.05"
+                              vertical_fov="-30,15" rings="24"
+                              face_resolution="512,352" max_range="20" />
+      </sensors>
+      <params robot_id="r0" cruise_speed="40" turn_speed="20"
+              waypoint_tolerance="0.25" goal_tolerance="0.30" />
+    </mgg_bunker_mini_controller>
+
+    <mgg_bunker_mini_controller library="libmgg_bunker_mini.so" id="mbm1">
+      <actuators>
+        <differential_steering implementation="default" />
+      </actuators>
+      <sensors>
+        <positioning implementation="default" />
+        <odometry implementation="drift" />
+        <imu implementation="default" />
+        <photorealistic_lidar implementation="default" medium="pr"
+                              anchor="lidar" position="0,0,0.05"
+                              vertical_fov="-30,15" rings="24"
+                              face_resolution="512,352" max_range="20" />
+      </sensors>
+      <params robot_id="r1" cruise_speed="40" turn_speed="20"
+              waypoint_tolerance="0.25" goal_tolerance="0.30" />
+    </mgg_bunker_mini_controller>
+
+    <mgg_bunker_mini_controller library="libmgg_bunker_mini.so" id="mbm2">
+      <actuators>
+        <differential_steering implementation="default" />
+      </actuators>
+      <sensors>
+        <positioning implementation="default" />
+        <odometry implementation="drift" />
+        <imu implementation="default" />
+        <photorealistic_lidar implementation="default" medium="pr"
+                              anchor="lidar" position="0,0,0.05"
+                              vertical_fov="-30,15" rings="24"
+                              face_resolution="512,352" max_range="20" />
+      </sensors>
+      <params robot_id="r2" cruise_speed="40" turn_speed="20"
+              waypoint_tolerance="0.25" goal_tolerance="0.30" />
+    </mgg_bunker_mini_controller>
+
+    <mgg_bunker_mini_controller library="libmgg_bunker_mini.so" id="mbm3">
+      <actuators>
+        <differential_steering implementation="default" />
+      </actuators>
+      <sensors>
+        <positioning implementation="default" />
+        <odometry implementation="drift" />
+        <imu implementation="default" />
+        <photorealistic_lidar implementation="default" medium="pr"
+                              anchor="lidar" position="0,0,0.05"
+                              vertical_fov="-30,15" rings="24"
+                              face_resolution="512,352" max_range="20" />
+      </sensors>
+      <params robot_id="r3" cruise_speed="40" turn_speed="20"
+              waypoint_tolerance="0.25" goal_tolerance="0.30" />
+    </mgg_bunker_mini_controller>
+  </controllers>
+
+  <loop_functions library="libmgg_bridge.so" label="mgg_bridge"
+                  socket="/tmp/mgg_argos.sock" robots="r0,r1,r2,r3"
+                  send_ground_truth="true" draw_medium="pr" />
+
+  <arena size="14, 14, 3" center="0,0,1.5">
+    <!-- Outer walls -->
+    <box id="w_north" size="12.2,0.2,1" movable="false">
+      <body position="0,6,0" orientation="0,0,0" />
+    </box>
+    <box id="w_south" size="12.2,0.2,1" movable="false">
+      <body position="0,-6,0" orientation="0,0,0" />
+    </box>
+    <box id="w_east" size="0.2,12.2,1" movable="false">
+      <body position="6,0,0" orientation="0,0,0" />
+    </box>
+    <box id="w_west" size="0.2,12.2,1" movable="false">
+      <body position="-6,0,0" orientation="0,0,0" />
+    </box>
+
+    <!-- Interior partitions -->
+    <box id="p_1" size="0.2,7,1" movable="false">
+      <body position="-2,2.5,0" orientation="0,0,0" />
+    </box>
+    <box id="p_2" size="0.2,7,1" movable="false">
+      <body position="2,-2.5,0" orientation="0,0,0" />
+    </box>
+    <box id="p_3" size="5,0.2,1" movable="false">
+      <body position="3.5,2,0" orientation="0,0,0" />
+    </box>
+
+    <!-- Four Bunker Minis stationed at the 4 corners -->
+    <bunker_mini id="r0">
+      <body position="-4.5,-4.5,0" orientation="0.0,0,0" />
+      <controller config="mbm0" />
+    </bunker_mini>
+    <bunker_mini id="r1">
+      <body position="-4.5,4.5,0" orientation="-90.0,0,0" />
+      <controller config="mbm1" />
+    </bunker_mini>
+    <bunker_mini id="r2">
+      <body position="4.5,4.5,0" orientation="180.0,0,0" />
+      <controller config="mbm2" />
+    </bunker_mini>
+    <bunker_mini id="r3">
+      <body position="4.5,-4.5,0" orientation="90.0,0,0" />
+      <controller config="mbm3" />
+    </bunker_mini>
+  </arena>
+
+  <physics_engines>
+    <dynamics2d id="dyn2d" />
+  </physics_engines>
+
+  <media>
+    <photorealism id="pr" backend="vulkan" latency="immediate">
+      <sun direction="0.6,0.2,-1" intensity="100000" cast_shadows="true" />
+      <skybox color="0.53,0.71,0.92" />
+    </photorealism>
+  </media>
+
+  <!-- No visualization by default so the run works headless. Add a
+       <visualization><filament .../></visualization> block to watch it. -->
+
+</argos-configuration>
