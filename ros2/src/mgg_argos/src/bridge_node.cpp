@@ -6,6 +6,7 @@
 #include <cmath>
 #include <cstring>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <sys/un.h>
 #include <unistd.h>
 
@@ -299,6 +300,15 @@ void BridgeNode::listenAndServe() {
     RCLCPP_FATAL(get_logger(), "cannot bind %s: %s", socket_path_.c_str(),
                  ::strerror(errno));
     return;
+  }
+  /* bind() applies the umask, and this node runs as root inside a container
+   * while ARGoS connects from the host as an ordinary user. Connecting to a
+   * Unix socket needs write permission on it, so the default 0755 leaves the
+   * simulator with "Permission denied". The uf_link and swarm_slam bridges
+   * both widen their socket the same way for the same reason. */
+  if (::chmod(socket_path_.c_str(), 0777) < 0) {
+    RCLCPP_WARN(get_logger(), "cannot chmod %s: %s; the simulator may not be "
+                "able to connect", socket_path_.c_str(), ::strerror(errno));
   }
   if (::listen(listen_fd_, 1) < 0) {
     RCLCPP_FATAL(get_logger(), "cannot listen: %s", ::strerror(errno));
