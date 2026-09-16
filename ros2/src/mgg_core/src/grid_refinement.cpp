@@ -201,12 +201,18 @@ FeasiblePath BoundedGridPlanner::refine(const RouteCorridor& corridor) {
   std::size_t active_from_index = kNoCorridorIndex;
   std::size_t active_to_index = kNoCorridorIndex;
   bool active_segment_known = false;
+  // A deadline or a cancellation says nothing about the corridor: the checks
+  // that would have judged it never ran. Such a failure must not be reported
+  // as corridor evidence, or a loaded planner would mark good corridors and
+  // push the robot onto worse routes.
+  bool interruption_observed = false;
   const auto fail = [&](const std::string& reason) {
     result.status = PlanningStatus::kBlocked;
     result.poses.clear();
     result.partial = false;
     result.reason = reason;
-    result.blocked_segment_identified = active_segment_known;
+    result.blocked_segment_identified =
+        active_segment_known && !interruption_observed;
     result.blocked_from_index = active_from_index;
     result.blocked_to_index = active_to_index;
     const std::size_t projections =
@@ -262,13 +268,16 @@ FeasiblePath BoundedGridPlanner::refine(const RouteCorridor& corridor) {
   const auto timedOut = [this, started]() {
     return std::chrono::steady_clock::now() - started >= limits_.timeout;
   };
-  const auto interrupted = [this, &timedOut](std::string& reason) {
+  const auto interrupted = [this, &timedOut,
+                            &interruption_observed](std::string& reason) {
     if (cancelled_ && cancelled_()) {
       reason = "grid refinement was cancelled";
+      interruption_observed = true;
       return true;
     }
     if (timedOut()) {
       reason = "grid refinement exceeded its cooperative deadline";
+      interruption_observed = true;
       return true;
     }
     return false;

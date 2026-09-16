@@ -489,6 +489,29 @@ TEST(GridRefinement, NamesTheCorridorSegmentWithNoTraversableDetour) {
   EXPECT_EQ(path.blocked_to_index, 1u);
 }
 
+TEST(GridRefinement, ADeadlineNeverBlamesTheCorridorItDidNotFinishChecking) {
+  GridRefinementLimits tight = limits();
+  tight.timeout = std::chrono::milliseconds(1);
+  RouteCorridor route;
+  route.status = PlanningStatus::kSucceeded;
+  route.request.objective = mgg::ObjectiveKind::kExplore;
+  route.poses.push_back(StateVec(1.0, 0.0, 0.0, 0.0));
+  route.poses.push_back(StateVec(2.0, 0.0, 0.0, 0.0));
+  route.request.goal.pose = route.poses.back();
+  auto slow = [](StateVec& state) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(3));
+    state.z() = 0.0;
+    return GridProjectionStatus::kSupported;
+  };
+  BoundedGridPlanner planner(StateVec::Zero(), tight, slow,
+                             sampledTraversal({}));
+  const FeasiblePath path = planner.refine(route);
+  ASSERT_EQ(path.status, PlanningStatus::kBlocked);
+  EXPECT_NE(path.reason.find("cooperative deadline"), std::string::npos)
+      << path.reason;
+  EXPECT_FALSE(path.blocked_segment_identified);
+}
+
 TEST(GridRefinement, PartialCorridorNamesTheSegmentEndingAtItsProxy) {
   RouteCorridor route;
   route.status = PlanningStatus::kSucceeded;
