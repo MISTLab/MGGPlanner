@@ -1906,6 +1906,63 @@ TEST(PlannerObjective, PhysicalCurrentMayEscapeRejectedTerrainButCannotCrossIt) 
       << refused_endpoint.reason;
 }
 
+TEST(PlannerObjective,
+     PlannedPhysicalCurrentFootprintExceptionSurvivesImmediateValidation) {
+  using Peer = mgg_ros::PlannerNodeTestPeer;
+  using Validation = mgg_msgs::srv::ValidateObjectiveRoute;
+  rclcpp::NodeOptions options;
+  options.parameter_overrides(
+      {rclcpp::Parameter("use_sim_time", true),
+       rclcpp::Parameter("mission_id", "physical-current-validation"),
+       rclcpp::Parameter("map.resolution", 0.05),
+       rclcpp::Parameter("objective_body_evidence_policy", "observed_ground"),
+       rclcpp::Parameter("objective_ground_evidence_policy",
+                         "provisional_unknown")});
+  auto node = std::make_shared<mgg_ros::PlannerNode>(options);
+  Peer::configureBackboneTest(*node);
+  Peer::setPlanningBody(*node, Eigen::Vector3d(0.40, 0.20, 0.15));
+  Peer::acceptOdometry(*node, 0.0, 0.0, 0.075);
+  Peer::observeGroundRectangle(*node, -1.5, 1.5, -1.0, 1.0);
+  Peer::observeFreeBodyBox(*node, Eigen::Vector3d(0.0, 0.0, 0.40),
+                           Eigen::Vector3d(3.2, 2.2, 0.20));
+  for (double x = 0.0; x <= 1.0 + 1e-9; x += 0.05) {
+    Peer::addMeasuredSurface(*node, x, 0.0, 0.0);
+  }
+  Peer::addMeasuredSurface(*node, -0.24, 0.0, 0.125);
+  Peer::finishMapRevision(*node);
+  ASSERT_FALSE(Peer::footprintTerrainSupported(
+      *node, Eigen::Vector3d(0.0, 0.0, 0.30),
+      Eigen::Vector3d(0.40, 0.20, 0.15)));
+
+  const auto planned =
+      Peer::requestBoundNavigate(*node, mgg::StateVec(1.0, 0.0, 0.075, 0.0));
+  ASSERT_EQ(planned->status,
+            mgg_msgs::srv::PlanObjective::Response::SUCCEEDED)
+      << planned->reason;
+  ASSERT_GE(planned->path.size(), 2u);
+
+  auto validation = std::make_shared<Validation::Request>();
+  validation->mission_id = "physical-current-validation";
+  validation->component_id = planned->component_id;
+  validation->frame_id = "world";
+  validation->lookahead_m = 2.0;
+  validation->path = planned->path;
+  const auto immediate = Peer::validateRoute(*node, validation);
+  ASSERT_EQ(immediate->status, Validation::Response::VALID)
+      << immediate->reason;
+  EXPECT_EQ(immediate->map_revision, planned->map_revision);
+
+  // The physical-pose exception applies only to the first remaining sample.
+  // A lateral rise under the same route's later footprint remains a veto.
+  Peer::addMeasuredSurface(*node, 0.75, 0.10, 0.125);
+  const auto later_hazard = Peer::validateRoute(*node, validation);
+  EXPECT_EQ(later_hazard->status, Validation::Response::INVALID)
+      << later_hazard->reason;
+  EXPECT_NE(later_hazard->reason.find("footprint"), std::string::npos)
+      << later_hazard->reason;
+  EXPECT_GT(later_hazard->map_revision, immediate->map_revision);
+}
+
 TEST(PlannerObjective, ObservedGroundVetoesKnownFootprintTerrainHazards) {
   using Peer = mgg_ros::PlannerNodeTestPeer;
   const auto make = [] {

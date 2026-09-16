@@ -2917,8 +2917,20 @@ void PlannerNode::onValidateObjectiveRoute(
   body.x() = diagonal;
   body.y() = diagonal;
   const Eigen::Vector3d center_offset = robot_params_.center_offset;
+  const mgg::StateVec physical_anchor =
+      physicalAnchorAtDrivingHeight(current_state_);
+  const auto isPhysicalCurrent = [this, &physical_anchor](
+                                     const Eigen::Vector3d& pose) {
+    return (pose.head<2>() - physical_anchor.head<2>())
+                   .cwiseAbs().maxCoeff() <= 1e-6 &&
+           (std::abs(pose.z() - current_state_.z()) <= 1e-6 ||
+            std::abs(pose.z() - physical_anchor.z()) <=
+                planning_params_.max_step_height + map_->getResolution() +
+                    1e-6);
+  };
   if (ahead.size() < 2) {
     const Eigen::Vector3d pose = ahead.front().head<3>();
+    const bool physical_current = isPhysicalCurrent(pose);
     const auto footprint_status =
         objectiveFootprintTerrainStatus(pose, footprint);
     const mgg::VoxelStatus box = objectiveBodyStatus(pose + center_offset, body);
@@ -2929,7 +2941,8 @@ void PlannerNode::onValidateObjectiveRoute(
                                  body.head<2>()) ==
              mgg::GeofenceManager::CoordinateStatus::kViolated);
     if (box == mgg::VoxelStatus::kOccupied || geofence_invalid ||
-        footprint_status == mgg::GridProjectionStatus::kNoGround) {
+        (footprint_status == mgg::GridProjectionStatus::kNoGround &&
+         !physical_current)) {
       invalid("stationary route intersects a known hazard");
     } else if (footprint_status == mgg::GridProjectionStatus::kBodyUnknown ||
                box == mgg::VoxelStatus::kUnknown) {
@@ -2968,7 +2981,11 @@ void PlannerNode::onValidateObjectiveRoute(
     }
     Eigen::Vector3d previous;
     bool have_previous = false;
-    for (const Eigen::Vector3d& pose : projected) {
+    for (std::size_t projected_index = 0;
+         projected_index < projected.size(); ++projected_index) {
+      const Eigen::Vector3d& pose = projected[projected_index];
+      const bool physical_current =
+          segment == 1 && projected_index == 0 && isPhysicalCurrent(pose);
       const Eigen::Vector3d center = pose + center_offset;
       const mgg::VoxelStatus box = objectiveBodyStatus(center, body);
       if (box == mgg::VoxelStatus::kOccupied) {
@@ -2977,7 +2994,8 @@ void PlannerNode::onValidateObjectiveRoute(
       }
       const auto footprint_status =
           objectiveFootprintTerrainStatus(pose, footprint);
-      if (footprint_status == mgg::GridProjectionStatus::kNoGround) {
+      if (footprint_status == mgg::GridProjectionStatus::kNoGround &&
+          !physical_current) {
         invalid("remaining route footprint intersects known terrain");
         return;
       }
