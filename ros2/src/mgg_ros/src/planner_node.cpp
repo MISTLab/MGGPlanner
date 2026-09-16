@@ -712,7 +712,7 @@ void PlannerNode::onNeighbourGraph(mgg_msgs::msg::Graph::ConstSharedPtr msg) {
 
 
 
-std::string PlannerNode::buildLocalGraph() {
+std::string PlannerNode::buildLocalGraph(bool strict_projected_endpoints) {
   // Held for the whole cycle: the map must not change under a planner that is
   // ray-casting through it. Point clouds arriving meanwhile queue up, and the
   // subscription's best-effort depth decides how many survive.
@@ -763,7 +763,8 @@ std::string PlannerNode::buildLocalGraph() {
 
 
 
-  const mgg::ExpandContext ctx = makeContext();
+  mgg::ExpandContext ctx = makeContext();
+  ctx.strict_projected_endpoint = strict_projected_endpoints;
   const auto t_global = Clock::now();
   const mgg::GridGraphResult r = buildGridGraph(
       *local_graph_, current_state_, grid_params_, ctx, current_state_[3]);
@@ -1961,7 +1962,12 @@ void PlannerNode::onObjectiveRequest(
     // the already-built snapshot and never rebuild underneath the request.
     std::string summary;
     if (local_objective && request->graph_revision == 0) {
-      summary = buildLocalGraph();
+      // Explore retains the legacy frontier policy that may admit projected
+      // endpoints with partially unknown body volume. A fresh Navigate graph
+      // filters those endpoints before topological selection so refinement
+      // can consider another observed candidate instead of failing on its
+      // first corridor waypoint.
+      summary = buildLocalGraph(core.objective == mgg::ObjectiveKind::kNavigate);
     }
     core.graph_revision = local_objective ? local_graph_revision_
                                           : graph_revision_;

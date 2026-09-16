@@ -1,6 +1,8 @@
 // Tests for the grid local planner, the "grid" in Multi-robot Grid Graph.
 // The ROS 1 version had none: it ran only inside a full planning cycle.
 
+#include <cmath>
+#include <memory>
 #include <utility>
 #include <vector>
 
@@ -93,6 +95,23 @@ class OpenSpace : public MapInterface {
 
  private:
   double wall_x_;
+};
+
+/// Ground projection moves raw samples from z=1.0 to driving height z=0.5.
+/// The raw lattice box is free, while one projected endpoint is unknown.
+class ProjectionMismatchSpace : public OpenSpace {
+ public:
+  VoxelStatus getVoxelStatus(const Eigen::Vector3d& p) const override {
+    return p.z() <= 0.0 ? VoxelStatus::kOccupied : VoxelStatus::kFree;
+  }
+  VoxelStatus getStrictBoxStatus(const Eigen::Vector3d& center,
+                                 const Eigen::Vector3d&) const override {
+    if (std::abs(center.x() - 0.5) < 1e-9 &&
+        std::abs(center.z() - 0.5) < 1e-9) {
+      return VoxelStatus::kUnknown;
+    }
+    return VoxelStatus::kFree;
+  }
 };
 
 struct Fixture {
@@ -218,6 +237,61 @@ TEST(GridGraph, LatticeFollowsTheRobotPosition) {
                                 smallGrid(), f.ctx, 0.0);
   EXPECT_EQ(r.status, GridGraphStatus::kOk);
   EXPECT_EQ(r.free_cells, 25);
+}
+
+TEST(GridGraph, ExplicitBuildRejectsUnknownProjectedEndpointAndKeepsAlternative) {
+  ProjectionMismatchSpace map;
+  RobotParams robot;
+  robot.type = RobotType::kGroundRobot;
+  robot.size = Eigen::Vector3d(0.2, 0.2, 0.2);
+  PlanningParams planning;
+  planning.max_ground_height = 0.5;
+  planning.max_step_height = 0.2;
+  planning.max_inclination = 0.6;
+  planning.edge_length_min = 0.1;
+  planning.edge_length_max = 2.0;
+  planning.edge_overshoot = 0.0;
+  planning.nearest_range = 1.1;
+  planning.nearest_range_min = 0.1;
+  planning.nearest_range_max = 100.0;
+  planning.nearest_range_z = 100.0;
+  planning.num_vertices_max = 20;
+  planning.num_edges_max = 40;
+  planning.num_loops_max = 20;
+  mgg::GroundProjection ground(map, planning);
+  ExpandContext ctx;
+  ctx.map = &map;
+  ctx.planning = &planning;
+  ctx.robot = &robot;
+  ctx.ground = &ground;
+  ctx.robot_box_size = robot.getPlanningSize();
+
+  GridGraphParams grid;
+  grid.min_val = Eigen::Vector3d(0.0, 0.0, 0.0);
+  grid.max_val = Eigen::Vector3d(1.0, 0.0, 0.0);
+  grid.resolution = Eigen::Vector3d(0.5, 0.5, 0.5);
+  const StateVec sample_origin(0.0, 0.0, 1.0, 0.0);
+
+  const auto build = [&](bool strict) {
+    auto graph = std::make_unique<GraphManager>();
+    graph->addVertex(new Vertex(0, StateVec(0.0, 0.0, 0.5, 0.0)));
+    ctx.strict_projected_endpoint = strict;
+    buildGridGraph(*graph, sample_origin, grid, ctx, 0.0);
+    return graph;
+  };
+  const auto legacy = build(false);
+  const auto explicit_graph = build(true);
+
+  StateVec unknown_endpoint(0.5, 0.0, 0.5, 0.0);
+  Vertex* found = nullptr;
+  EXPECT_TRUE(legacy->getNearestVertexInRange(&unknown_endpoint, 1e-6, &found));
+  found = nullptr;
+  EXPECT_FALSE(
+      explicit_graph->getNearestVertexInRange(&unknown_endpoint, 1e-6, &found));
+  StateVec observed_alternative(1.0, 0.0, 0.5, 0.0);
+  found = nullptr;
+  EXPECT_TRUE(explicit_graph->getNearestVertexInRange(
+      &observed_alternative, 1e-6, &found));
 }
 
 }  // namespace

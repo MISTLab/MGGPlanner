@@ -128,6 +128,17 @@ void expandGraph(GraphManager& graph, Vertex& new_vertex,
     new_state[2] = new_pos[2];
     direction = new_state.head<3>() - origin;
     direction_norm = direction.norm();
+    // The lattice precheck happens before ground projection, so its Z may not
+    // describe the body box ultimately stored in the graph. Explicit
+    // objectives cannot admit a waypoint that their refiner must immediately
+    // reject at the projected driving height.
+    if (ctx.strict_projected_endpoint &&
+        ctx.map->getStrictBoxStatus(new_state.head<3>() +
+                                        ctx.robot->center_offset,
+                                    ctx.robot_box_size) != VoxelStatus::kFree) {
+      rep.status = ExpandGraphStatus::kErrorCollisionEdge;
+      return;
+    }
   }
 
   // Overshoot both ends, except at the root, so an edge that just grazes an

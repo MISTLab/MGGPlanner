@@ -51,6 +51,11 @@ struct ExpandContext {
   /// sensor's near-field ground blind spot. The edge is only topology here;
   /// explicit objectives revalidate it with strict body/unknown checks.
   double hanging_root_edge_length_max = 0.0;
+  /// Explicit-objective graph builds require a ground-projected candidate's
+  /// final body box to be observed free. Explore leaves this false to retain
+  /// its legacy frontier policy; explicit refinement still validates the full
+  /// swept route independently.
+  bool strict_projected_endpoint = false;
 };
 
 /// Attaches `new_vertex` to `graph`: finds the nearest existing vertex, checks

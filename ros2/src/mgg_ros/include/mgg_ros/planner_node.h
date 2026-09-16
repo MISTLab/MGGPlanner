@@ -108,7 +108,7 @@ class PlannerNode : public rclcpp::Node {
 
   /// Builds the local grid graph around the current state. Returns a summary
   /// suitable for a service response.
-  std::string buildLocalGraph();
+  std::string buildLocalGraph(bool strict_projected_endpoints = false);
 
   /// Extends the global topological graph with the robot's current pose.
   ///
