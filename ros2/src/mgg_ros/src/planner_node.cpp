@@ -103,6 +103,23 @@ PlannerNode::PlannerNode(const rclcpp::NodeOptions& options)
         "objective_body_evidence_policy must be strict_volume or "
         "observed_ground");
   }
+  const std::string ground_evidence_policy = declareOrGet<std::string>(
+      this, "objective_ground_evidence_policy", "observed_ground");
+  if (ground_evidence_policy == "provisional_unknown") {
+    if (!observed_ground_body_evidence_ || map_backend_ != "cloud_octomap" ||
+        !get_parameter("use_sim_time").as_bool() ||
+        robot_params_.type != mgg::RobotType::kGroundRobot) {
+      throw std::invalid_argument(
+          "objective_ground_evidence_policy=provisional_unknown requires "
+          "objective_body_evidence_policy=observed_ground on a simulated "
+          "ground robot using map.backend=cloud_octomap");
+    }
+    provisional_unknown_ground_ = true;
+  } else if (ground_evidence_policy != "observed_ground") {
+    throw std::invalid_argument(
+        "objective_ground_evidence_policy must be observed_ground or "
+        "provisional_unknown");
+  }
   ground_ = std::make_unique<mgg::GroundProjection>(*map_, planning_params_);
   const double grid_resolution_floor = map_->getResolution();
   grid_refinement_limits_.resolution_m = std::clamp(
@@ -1943,6 +1960,13 @@ mgg::FeasiblePath PlannerNode::refineCorridor(
                   .cwiseAbs().maxCoeff() <= 1e-6;
       if (!ground_ ||
           !projectStateToDrivingHeight(state, exact_explicit_goal)) {
+        if (provisional_unknown_ground_) {
+          // Unknown terrain carries no height evidence. Continue from the
+          // physical robot's current driving plane without modifying XY/yaw;
+          // known terrain encountered by traversal is still projected and
+          // checked against step, footprint, occupancy, and geofence limits.
+          state[2] = current_anchor[2];
+        } else {
         // Only two unsupported coordinates carry physical provenance: the
         // robot's current footprint and the retained initial Home anchor after
         // that anchor gained a checked connection. Arbitrary unsupported
@@ -1970,6 +1994,7 @@ mgg::FeasiblePath PlannerNode::refineCorridor(
           return mgg::GridProjectionStatus::kGeofenceViolation;
         }
         return mgg::GridProjectionStatus::kSupported;
+        }
       }
     }
     const Eigen::Vector3d center = state.head<3>() + center_offset;
@@ -2003,9 +2028,11 @@ mgg::FeasiblePath PlannerNode::refineCorridor(
         mgg::StateVec projected_a = a;
         mgg::StateVec projected_b = b;
         const bool a_anchor =
-            a_provenance && !projectStateToDrivingHeight(projected_a);
+            !provisional_unknown_ground_ && a_provenance &&
+            !projectStateToDrivingHeight(projected_a);
         const bool b_anchor =
-            b_provenance && !projectStateToDrivingHeight(projected_b);
+            !provisional_unknown_ground_ && b_provenance &&
+            !projectStateToDrivingHeight(projected_b);
         if (robot_params_.type == mgg::RobotType::kGroundRobot &&
             (a_anchor || b_anchor)) {
           if (a_anchor && b_anchor) {
@@ -2052,7 +2079,7 @@ mgg::FeasiblePath PlannerNode::refineCorridor(
         if (ground_->getProjectedEdgeStatus(
                 a.head<3>(), b.head<3>(), body,
                 /*stop_at_unknown_voxel=*/!observed_ground_body_evidence_,
-                projected, false) !=
+                projected, provisional_unknown_ground_) !=
                 mgg::ProjectedEdgeStatus::kAdmissible ||
             projected.size() < 2) {
           return false;

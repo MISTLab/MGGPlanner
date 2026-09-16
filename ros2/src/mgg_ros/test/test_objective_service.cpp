@@ -149,6 +149,20 @@ class PlannerNodeTestPeer {
     }
     ++node.map_revision_;
   }
+  static void addBlockingWall(PlannerNode& node, double x) {
+    const std::lock_guard<std::recursive_mutex> lock(node.planner_mutex_);
+    for (int repeat = 0; repeat < 20; ++repeat) {
+      for (double y = -2.0; y <= 2.0; y += 0.10) {
+        for (double z = 0.15; z <= 0.75; z += 0.10) {
+          node.cloud_map_->tree()->updateNode(
+              octomap::point3d(static_cast<float>(x), static_cast<float>(y),
+                               static_cast<float>(z)),
+              true);
+        }
+      }
+    }
+    ++node.map_revision_;
+  }
 
   static void finishMapRevision(PlannerNode& node) {
     const std::lock_guard<std::recursive_mutex> lock(node.planner_mutex_);
@@ -688,6 +702,77 @@ TEST(PlannerConfiguration, ObservedGroundPolicyIsExplicitAndSimulationCloudOnly)
   EXPECT_THROW(
       { auto planner = std::make_shared<mgg_ros::PlannerNode>(mola); },
       std::invalid_argument);
+}
+
+TEST(PlannerConfiguration, ProvisionalGroundRequiresObservedSimulationCloud) {
+  for (const std::string body : {"strict_volume", "observed_ground"}) {
+    rclcpp::NodeOptions options;
+    options.parameter_overrides(
+        {rclcpp::Parameter("objective_body_evidence_policy", body),
+         rclcpp::Parameter("objective_ground_evidence_policy",
+                           "provisional_unknown")});
+    EXPECT_THROW(
+        { auto planner = std::make_shared<mgg_ros::PlannerNode>(options); },
+        std::invalid_argument);
+  }
+  rclcpp::NodeOptions invalid;
+  invalid.parameter_overrides(
+      {rclcpp::Parameter("objective_ground_evidence_policy", "unknown")});
+  EXPECT_THROW(
+      { auto planner = std::make_shared<mgg_ros::PlannerNode>(invalid); },
+      std::invalid_argument);
+}
+
+TEST(PlannerObjective, ProvisionalUnknownGroundRetainsGoalAndKnownVetoes) {
+  using Peer = mgg_ros::PlannerNodeTestPeer;
+  auto make = [] {
+    rclcpp::NodeOptions options;
+    options.parameter_overrides(
+        {rclcpp::Parameter("use_sim_time", true),
+         rclcpp::Parameter("map.resolution", 0.15),
+         rclcpp::Parameter("objective_body_evidence_policy", "observed_ground"),
+         rclcpp::Parameter("objective_ground_evidence_policy",
+                           "provisional_unknown")});
+    auto node = std::make_shared<mgg_ros::PlannerNode>(options);
+    Peer::configureBackboneTest(*node);
+    Peer::acceptOdometry(*node, 0.0, 0.0, 0.075);
+    // Give the map valid data away from the requested corridor while leaving
+    // the entire route's ground and air unobserved.
+    Peer::observeGroundRectangle(*node, -0.3, 0.3, 8.0, 8.3);
+    Peer::finishMapRevision(*node);
+    return node;
+  };
+  auto corridor = [] {
+    mgg::RouteCorridor route;
+    route.status = mgg::PlanningStatus::kSucceeded;
+    route.request.objective = mgg::ObjectiveKind::kNavigate;
+    route.request.goal.pose = mgg::StateVec(4.0, 0.0, 0.075, 1.1);
+    return route;
+  };
+
+  auto clear = make();
+  const mgg::FeasiblePath path = Peer::refine(*clear, corridor());
+  ASSERT_EQ(path.status, mgg::PlanningStatus::kSucceeded) << path.reason;
+  ASSERT_FALSE(path.poses.empty());
+  EXPECT_NEAR(path.poses.back().x(), 4.0, 1e-9);
+  EXPECT_NEAR(path.poses.back().y(), 0.0, 1e-9);
+  EXPECT_NEAR(path.poses.back()[3], 1.1, 1e-9);
+  EXPECT_FALSE(path.indexed_map_validated);
+
+  auto wall = make();
+  Peer::addBlockingWall(*wall, 2.0);
+  EXPECT_EQ(Peer::refine(*wall, corridor()).status,
+            mgg::PlanningStatus::kBlocked);
+
+  auto curb = make();
+  Peer::addMeasuredSurface(*curb, 4.0, 0.0, 0.125);
+  EXPECT_EQ(Peer::refine(*curb, corridor()).status,
+            mgg::PlanningStatus::kBlocked);
+
+  auto fenced = make();
+  Peer::setGridGeofence(*fenced, -0.5, 0.5, -0.5, 0.5);
+  EXPECT_EQ(Peer::refine(*fenced, corridor()).status,
+            mgg::PlanningStatus::kBlocked);
 }
 
 TEST(PlannerObjective, ObservedGroundAllowsUnknownAirButNotWallOrMissingGround) {

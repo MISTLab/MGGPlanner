@@ -146,6 +146,7 @@ class PlannerNode : public rclcpp::Node {
   mgg::MolaMap* mola_map_ = nullptr;
   std::string map_backend_ = "cloud_octomap";
   bool observed_ground_body_evidence_ = false;
+  bool provisional_unknown_ground_ = false;
   std::uint64_t observed_mola_generation_ = 0;
   std::unique_ptr<mgg::GroundProjection> ground_;
   std::unique_ptr<mgg::GeofenceManager> geofence_;
