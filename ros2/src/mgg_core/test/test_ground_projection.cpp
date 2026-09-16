@@ -117,6 +117,21 @@ TEST(GroundProjection, FindsGroundBelowASample) {
   EXPECT_NEAR(d, 2.0, 0.3);  // ground is 2 m below
 }
 
+TEST(GroundProjection, DoesNotMirrorAnObstacleAboveTheSampleIntoGround) {
+  Terrain map;
+  PlanningParams params = makeParams();
+  GroundProjection gp(map, params);
+
+  // Terrain's wall occupies 0 < z < 2. The centre ray starts 0.4 m above
+  // this sample and immediately hits it. A magnitude would turn that hit
+  // into fictitious ground below the robot; signed clearance rejects it.
+  Eigen::Vector3d sample(8.5, 0.0, 0.5);
+  VoxelStatus status;
+  const double d = gp.projectSample(sample, status);
+  EXPECT_EQ(status, VoxelStatus::kOccupied);
+  EXPECT_LT(d, 0.0);
+}
+
 TEST(GroundProjection, ReportsFreeWhenNothingIsWithinReach) {
   Terrain map;
   PlanningParams params = makeParams();

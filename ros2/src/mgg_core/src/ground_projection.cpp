@@ -41,14 +41,14 @@ double GroundProjection::projectSample(Eigen::Vector3d& sample,
         map_.getGroundRayStatus(start, end, false, end_voxel);
 
     if (vs == VoxelStatus::kOccupied) {
-      const double ray_len = std::abs(sample_z - end_voxel(2));
+      const double ray_len = sample_z - end_voxel(2);
       if (i == 0) central_ray_len = ray_len;
       status = VoxelStatus::kOccupied;
       return ray_len;
     }
 
     if (vs == VoxelStatus::kUnknown) {
-      const double ray_len = std::abs(sample_z - end_voxel(2));
+      const double ray_len = sample_z - end_voxel(2);
       if (i == 0) central_ray_len = ray_len;
       ++unknown_count;
     }
