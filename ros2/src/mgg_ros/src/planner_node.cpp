@@ -893,17 +893,19 @@ std::string PlannerNode::buildLocalGraph(bool strict_projected_endpoints) {
   // the lattice finds free body boxes while projection or swept edges reject
   // nearly every candidate. Keep this aggregate; per-sample logs would flood
   // the fleet and perturb planning timing.
-  char why[128] = "";
+  char why[192] = "";
   const bool low_acceptance =
       r.free_cells > 0 &&
       static_cast<std::int64_t>(r.vertices_added) * 20 < r.free_cells;
   if (low_acceptance) {
     std::snprintf(why, sizeof(why),
-                  " (rejected: %d collision, %d no ground; edges: %d ok, "
+                  " (rejected: %d collision, %d no ground, projected body "
+                  "%d occupied/%d unknown; edges: %d ok, "
                   "%d steep, %d occupied, %d unmapped, %d hanging)",
                   r.rejected[static_cast<int>(mgg::ExpandGraphStatus::
                                                   kErrorCollisionEdge)],
-                  r.no_ground, r.edge_status[0], r.edge_status[1],
+                  r.no_ground, r.projected_endpoint_occupied,
+                  r.projected_endpoint_unknown, r.edge_status[0], r.edge_status[1],
                   r.edge_status[2], r.edge_status[3], r.edge_status[4]);
   }
   const auto t_end = Clock::now();

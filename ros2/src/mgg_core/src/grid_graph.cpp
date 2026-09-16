@@ -77,6 +77,11 @@ GridGraphResult buildGridGraph(GraphManager& graph, const StateVec& state,
         expandGraph(graph, candidate, rep, ctx);
         ++result.rejected[static_cast<int>(rep.status)];
         if (rep.no_ground) ++result.no_ground;
+        if (rep.projected_endpoint_status == VoxelStatus::kOccupied) {
+          ++result.projected_endpoint_occupied;
+        } else if (rep.projected_endpoint_status == VoxelStatus::kUnknown) {
+          ++result.projected_endpoint_unknown;
+        }
         for (int e = 0; e < 5; ++e) result.edge_status[e] += rep.edge_status[e];
         if (rep.status == ExpandGraphStatus::kSuccess) {
           num_vertices += rep.num_vertices_added;

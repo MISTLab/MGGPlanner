@@ -162,6 +162,11 @@ struct ExpandGraphReport {
   /// the sensor never saw the floor there, the second that something is in
   /// the way.
   bool no_ground = false;
+  /// Strict projected-endpoint verdict for explicit-objective graph builds.
+  /// Kept separate from edge_status because this check happens before an
+  /// edge is attempted and otherwise collapses occupied and unknown into the
+  /// same kErrorCollisionEdge bucket.
+  VoxelStatus projected_endpoint_status = VoxelStatus::kFree;
   /// How the first blocked edge was blocked, indexed by ProjectedEdgeStatus.
   /// Ground robots reject a candidate for four quite different reasons and
   /// all four surface as kErrorCollisionEdge; without this, a lattice that

@@ -16,6 +16,7 @@ using mgg::ExpandContext;
 using mgg::GainCounts;
 using mgg::GraphManager;
 using mgg::GridGraphParams;
+using mgg::GridGraphResult;
 using mgg::GridGraphStatus;
 using mgg::MapInterface;
 using mgg::PlanningParams;
@@ -111,6 +112,16 @@ class ProjectionMismatchSpace : public OpenSpace {
       return VoxelStatus::kUnknown;
     }
     return VoxelStatus::kFree;
+  }
+};
+
+class OccupiedProjectionMismatchSpace : public ProjectionMismatchSpace {
+ public:
+  VoxelStatus getStrictBoxStatus(const Eigen::Vector3d& center,
+                                 const Eigen::Vector3d& size) const override {
+    const VoxelStatus base =
+        ProjectionMismatchSpace::getStrictBoxStatus(center, size);
+    return base == VoxelStatus::kUnknown ? VoxelStatus::kOccupied : base;
   }
 };
 
@@ -272,15 +283,21 @@ TEST(GridGraph, ExplicitBuildRejectsUnknownProjectedEndpointAndKeepsAlternative)
   grid.resolution = Eigen::Vector3d(0.5, 0.5, 0.5);
   const StateVec sample_origin(0.0, 0.0, 1.0, 0.0);
 
-  const auto build = [&](bool strict) {
+  const auto build = [&](bool strict, GridGraphResult* result = nullptr) {
     auto graph = std::make_unique<GraphManager>();
     graph->addVertex(new Vertex(0, StateVec(0.0, 0.0, 0.5, 0.0)));
     ctx.strict_projected_endpoint = strict;
-    buildGridGraph(*graph, sample_origin, grid, ctx, 0.0);
+    const GridGraphResult built =
+        buildGridGraph(*graph, sample_origin, grid, ctx, 0.0);
+    if (result != nullptr) *result = built;
     return graph;
   };
   const auto legacy = build(false);
-  const auto explicit_graph = build(true);
+  GridGraphResult explicit_result;
+  const auto explicit_graph = build(true, &explicit_result);
+
+  EXPECT_EQ(explicit_result.projected_endpoint_unknown, 1);
+  EXPECT_EQ(explicit_result.projected_endpoint_occupied, 0);
 
   StateVec unknown_endpoint(0.5, 0.0, 0.5, 0.0);
   Vertex* found = nullptr;
@@ -292,6 +309,45 @@ TEST(GridGraph, ExplicitBuildRejectsUnknownProjectedEndpointAndKeepsAlternative)
   found = nullptr;
   EXPECT_TRUE(explicit_graph->getNearestVertexInRange(
       &observed_alternative, 1e-6, &found));
+}
+
+TEST(GridGraph, CountsOccupiedProjectedEndpointSeparatelyFromUnknown) {
+  OccupiedProjectionMismatchSpace map;
+  RobotParams robot;
+  robot.type = RobotType::kGroundRobot;
+  robot.size = Eigen::Vector3d(0.2, 0.2, 0.2);
+  PlanningParams planning;
+  planning.max_ground_height = 0.5;
+  planning.max_step_height = 0.2;
+  planning.max_inclination = 0.6;
+  planning.edge_length_min = 0.1;
+  planning.edge_length_max = 2.0;
+  planning.nearest_range = 1.1;
+  planning.nearest_range_min = 0.1;
+  planning.nearest_range_max = 100.0;
+  planning.nearest_range_z = 100.0;
+  planning.num_vertices_max = 20;
+  planning.num_edges_max = 40;
+  planning.num_loops_max = 20;
+  mgg::GroundProjection ground(map, planning);
+  ExpandContext ctx;
+  ctx.map = &map;
+  ctx.planning = &planning;
+  ctx.robot = &robot;
+  ctx.ground = &ground;
+  ctx.robot_box_size = robot.getPlanningSize();
+  ctx.strict_projected_endpoint = true;
+  GridGraphParams grid;
+  grid.min_val = Eigen::Vector3d(0.0, 0.0, 0.0);
+  grid.max_val = Eigen::Vector3d(0.5, 0.0, 0.0);
+  grid.resolution = Eigen::Vector3d(0.5, 0.5, 0.5);
+  GraphManager graph;
+  graph.addVertex(new Vertex(0, StateVec(0.0, 0.0, 0.5, 0.0)));
+
+  const GridGraphResult result = buildGridGraph(
+      graph, StateVec(0.0, 0.0, 1.0, 0.0), grid, ctx, 0.0);
+  EXPECT_EQ(result.projected_endpoint_occupied, 1);
+  EXPECT_EQ(result.projected_endpoint_unknown, 0);
 }
 
 }  // namespace

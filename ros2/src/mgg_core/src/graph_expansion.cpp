@@ -132,12 +132,14 @@ void expandGraph(GraphManager& graph, Vertex& new_vertex,
     // describe the body box ultimately stored in the graph. Explicit
     // objectives cannot admit a waypoint that their refiner must immediately
     // reject at the projected driving height.
-    if (ctx.strict_projected_endpoint &&
-        ctx.map->getStrictBoxStatus(new_state.head<3>() +
-                                        ctx.robot->center_offset,
-                                    ctx.robot_box_size) != VoxelStatus::kFree) {
-      rep.status = ExpandGraphStatus::kErrorCollisionEdge;
-      return;
+    if (ctx.strict_projected_endpoint) {
+      rep.projected_endpoint_status = ctx.map->getStrictBoxStatus(
+          new_state.head<3>() + ctx.robot->center_offset,
+          ctx.robot_box_size);
+      if (rep.projected_endpoint_status != VoxelStatus::kFree) {
+        rep.status = ExpandGraphStatus::kErrorCollisionEdge;
+        return;
+      }
     }
   }
 
