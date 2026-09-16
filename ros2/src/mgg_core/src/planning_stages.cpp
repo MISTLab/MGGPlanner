@@ -40,7 +40,10 @@ RouteCorridor TopologicalGoalPlanner::plan(
   Vertex* source = nullptr;
   Vertex* target = nullptr;
   StateVec goal = request.goal.pose;
-  if (!graph.getNearestVertex(&current, &source) ||
+  // Both ends must bind to the active graph.  An unbounded source lookup can
+  // turn a lone home landmark into an apparently valid one-pose route after
+  // the robot has travelled far beyond the last admitted breadcrumb.
+  if (!graph.getNearestVertexInRange(&current, goal_vertex_tolerance_, &source) ||
       !graph.getNearestVertexInRange(&goal, goal_vertex_tolerance_, &target)) {
     result.reason = "current pose or goal is outside the graph";
     return result;

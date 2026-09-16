@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdint>
 
 namespace mgg {
 namespace {
@@ -146,12 +147,17 @@ VoxelStatus OctomapMap::getPathStatus(const Eigen::Vector3d& start,
   const double r = tree_->getResolution();
   const double len = (end - start).norm();
   if (len < 1e-9) return getBoxStatus(start, box_size, stop_at_unknown_voxel);
-  const Eigen::Vector3d dir = (end - start) / len;
+  const int steps = std::max(1, static_cast<int>(std::ceil(len / r)));
 
   bool saw_unknown = false;
-  for (double d = 0.0; d <= len; d += r) {
+  // Sample the same endpoint-inclusive boxes in either direction.  Advancing
+  // by `r` omitted the final endpoint whenever len was not an exact multiple
+  // and made an undirected graph edge pass outward but fail on the Home route.
+  for (int i = 0; i <= steps; ++i) {
+    const double t = static_cast<double>(i) / static_cast<double>(steps);
     const VoxelStatus s =
-        getBoxStatus(start + d * dir, box_size, stop_at_unknown_voxel);
+        getBoxStatus(start + t * (end - start), box_size,
+                     stop_at_unknown_voxel);
     if (s == VoxelStatus::kOccupied) return VoxelStatus::kOccupied;
     if (s == VoxelStatus::kUnknown) saw_unknown = true;
   }
@@ -216,15 +222,28 @@ void OctomapMap::getScanStatusIterative(
 
 bool OctomapMap::augmentFreeBox(const Eigen::Vector3d& position,
                                 const Eigen::Vector3d& box_size) {
-  const double r = tree_->getResolution();
-  for (double dx = -box_size.x() / 2; dx <= box_size.x() / 2; dx += r)
-    for (double dy = -box_size.y() / 2; dy <= box_size.y() / 2; dy += r)
-      for (double dz = -box_size.z() / 2; dz <= box_size.z() / 2; dz += r) {
-        const Eigen::Vector3d p = position + Eigen::Vector3d(dx, dy, dz);
+  octomap::OcTreeKey min_key;
+  octomap::OcTreeKey max_key;
+  const Eigen::Vector3d half = box_size / 2.0;
+  if (!tree_->coordToKeyChecked(toOct(position - half), min_key) ||
+      !tree_->coordToKeyChecked(toOct(position + half), max_key)) {
+    return false;
+  }
+  // Iterate discrete keys rather than adding resolution-sized doubles. At
+  // coordinate boundaries, accumulated floating-point error could skip one
+  // key and leave a thin unknown slice through an otherwise cleared robot
+  // footprint.
+  for (std::uint32_t x = min_key[0]; x <= max_key[0]; ++x)
+    for (std::uint32_t y = min_key[1]; y <= max_key[1]; ++y)
+      for (std::uint32_t z = min_key[2]; z <= max_key[2]; ++z) {
+        const octomap::OcTreeKey key(
+            static_cast<octomap::key_type>(x),
+            static_cast<octomap::key_type>(y),
+            static_cast<octomap::key_type>(z));
         // setNodeValue, not updateNode: this must assert free rather than
         // accumulate evidence, or clearing the robot's own footprint would
         // take several calls to take effect.
-        tree_->setNodeValue(toOct(p), tree_->getClampingThresMinLog());
+        tree_->setNodeValue(key, tree_->getClampingThresMinLog());
       }
   has_data_ = true;
   return true;

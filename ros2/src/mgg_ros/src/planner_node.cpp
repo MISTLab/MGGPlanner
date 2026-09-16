@@ -270,8 +270,20 @@ mgg::ExpandContext PlannerNode::makeContext() {
 }
 
 void PlannerNode::onOdometry(nav_msgs::msg::Odometry::ConstSharedPtr msg) {
-  current_state_ = fromPoseMsg(msg->pose.pose);
+  const mgg::StateVec state = fromPoseMsg(msg->pose.pose);
+  if (!state.allFinite()) {
+    RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000,
+                         "ignoring non-finite odometry");
+    return;
+  }
+
+  const std::lock_guard<std::recursive_mutex> lock(planner_mutex_);
+  current_state_ = state;
   have_odometry_ = true;
+  if (!have_initial_state_) {
+    initial_state_ = state;
+    have_initial_state_ = true;
+  }
 
   // The global graph is a trajectory backbone, so it has to be laid down as
   // the robot drives rather than once a planning cycle. A new vertex only
@@ -292,7 +304,6 @@ void PlannerNode::onOdometry(nav_msgs::msg::Odometry::ConstSharedPtr msg) {
       (here - last_global_anchor_).norm() < global_vertex_spacing_) {
     return;
   }
-  const std::lock_guard<std::recursive_mutex> lock(planner_mutex_);
   updateGlobalGraph();
 }
 
@@ -341,6 +352,17 @@ void PlannerNode::onPointCloud(
     const std::lock_guard<std::recursive_mutex> lock(planner_mutex_);
     map_->insertPointCloud(points, origin);
     ++map_revision_;
+    // A graph update can be waiting on ground/free-space evidence at the
+    // initial anchor or at the next spaced breadcrumb.  Retry only in those
+    // states; ordinary clouds do not cause a full graph sweep.
+    if (have_odometry_) {
+      const Eigen::Vector3d here(current_state_[0], current_state_[1],
+                                 current_state_[2]);
+      if (!initial_anchor_supported_ || !have_global_anchor_ ||
+          (here - last_global_anchor_).norm() >= global_vertex_spacing_) {
+        updateGlobalGraph();
+      }
+    }
   }
 }
 
@@ -676,44 +698,71 @@ std::string PlannerNode::buildLocalGraph() {
   return std::string(buf);
 }
 
-void PlannerNode::updateGlobalGraph() {
-  if (!have_odometry_) return;
-
-  mgg::StateVec state = current_state_;
-  // Drop the pose onto the terrain first, so global vertices sit where the
-  // robot could actually stand. Matches what searchHomingPath does before
-  // linking the current state in.
-  if (robot_params_.type == mgg::RobotType::kGroundRobot) {
-    Eigen::Vector3d pos(state[0], state[1], state[2]);
-    mgg::VoxelStatus vs;
-    const double ground_height = ground_->projectSample(pos, vs);
-    if (vs != mgg::VoxelStatus::kOccupied) return;  // nothing to stand on yet
-    state[0] = pos[0];
-    state[1] = pos[1];
-    state[2] = pos[2] - (ground_height - planning_params_.max_ground_height);
+bool PlannerNode::projectStateToDrivingHeight(mgg::StateVec& state) const {
+  if (robot_params_.type != mgg::RobotType::kGroundRobot) return true;
+  Eigen::Vector3d pos(state[0], state[1], state[2]);
+  mgg::VoxelStatus status;
+  const double ground_height = ground_->projectSample(pos, status);
+  if (status != mgg::VoxelStatus::kOccupied || ground_height < 0.0) {
+    return false;
   }
+  state[0] = pos[0];
+  state[1] = pos[1];
+  state[2] = pos[2] - (ground_height - planning_params_.max_ground_height);
+  return true;
+}
+
+void PlannerNode::updateGlobalGraph() {
+  if (!have_odometry_ || !have_initial_state_) return;
 
   if (global_graph_->getNumVertices() == 0) {
-    auto* root = new mgg::Vertex(0, state);
+    // A lone root is a landmark, not a traversability claim.  Capture it from
+    // the first finite odometry immediately, before the first point cloud or
+    // command can move the robot away from home.  Until support is observed no
+    // outgoing edge is admitted below.
+    mgg::StateVec root_state = initial_state_;
+    if (robot_params_.type == mgg::RobotType::kGroundRobot) {
+      root_state[2] += planning_params_.max_ground_height -
+                       robot_params_.size[2] / 2.0;
+    } else {
+      initial_anchor_supported_ = true;
+    }
+    auto* root = new mgg::Vertex(0, root_state);
     root->robot_id = static_cast<int>(planning_params_.robot_id);
+    root->is_hanging = !initial_anchor_supported_;
     global_graph_->addVertex(root);
-    last_global_anchor_ = Eigen::Vector3d(state[0], state[1], state[2]);
+    last_global_anchor_ = initial_state_.head<3>();
     have_global_anchor_ = true;
     ++graph_revision_;
-    RCLCPP_INFO(get_logger(), "global graph seeded at (%.2f, %.2f, %.2f)",
-                state[0], state[1], state[2]);
-    return;
+    RCLCPP_INFO(get_logger(),
+                "global graph captured initial anchor at (%.2f, %.2f, %.2f)%s",
+                root_state[0], root_state[1], root_state[2],
+                initial_anchor_supported_ ? "" : " (awaiting mapped support)");
   }
 
+  if (!initial_anchor_supported_) {
+    mgg::StateVec supported_root = initial_state_;
+    if (!projectStateToDrivingHeight(supported_root)) return;
+    auto* root = global_graph_->getVertex(0);
+    if (root == nullptr ||
+        !global_graph_->updateVertexState(0, supported_root)) return;
+    root->is_hanging = false;
+    initial_anchor_supported_ = true;
+    ++graph_revision_;
+    RCLCPP_INFO(get_logger(),
+                "global graph initial anchor support observed at "
+                "(%.2f, %.2f, %.2f)",
+                supported_root[0], supported_root[1], supported_root[2]);
+  }
+
+  const Eigen::Vector3d raw_here(current_state_[0], current_state_[1],
+                                 current_state_[2]);
+  if ((raw_here - last_global_anchor_).norm() < global_vertex_spacing_) return;
+
+  mgg::StateVec state = current_state_;
+  if (!projectStateToDrivingHeight(state)) return;
+
   const mgg::ExpandContext ctx = makeContext();
-  const auto is_admissible = [this, &ctx](const Eigen::Vector3d& from,
-                                          const Eigen::Vector3d& to) {
-    // Check if the path between vertices is clear of walls/obstacles
-    return map_->getPathStatus(from, to, ctx.robot_box_size, /*stop_at_unknown=*/false) !=
-           mgg::VoxelStatus::kOccupied;
-  };
-
-
   const Eigen::Vector3d here(state[0], state[1], state[2]);
 
   // First, verify we are at least global_vertex_spacing_ from any existing vertex
@@ -756,9 +805,34 @@ void PlannerNode::updateGlobalGraph() {
   for (const auto& cand : candidates) {
     const Eigen::Vector3d origin(cand.second->state[0], cand.second->state[1],
                                  cand.second->state[2]);
-    if (is_admissible(origin, here)) {
+    bool admissible = false;
+    double projected_distance = cand.first;
+    if (robot_params_.type == mgg::RobotType::kGroundRobot) {
+      std::vector<Eigen::Vector3d> projected_edge;
+      const auto status = ground_->getProjectedEdgeStatus(
+          origin, here, ctx.robot_box_size, /*stop_at_unknown_voxel=*/true,
+          projected_edge, /*is_hanging=*/false);
+      if (status == mgg::ProjectedEdgeStatus::kAdmissible) {
+        admissible = true;
+        projected_distance = 0.0;
+        for (size_t i = 1; i < projected_edge.size(); ++i) {
+          projected_distance +=
+              (projected_edge[i] - projected_edge[i - 1]).norm();
+        }
+        if (!projected_edge.empty()) {
+          state[0] = projected_edge.back().x();
+          state[1] = projected_edge.back().y();
+          state[2] = projected_edge.back().z();
+        }
+      }
+    } else {
+      admissible = map_->getPathStatus(
+                       origin, here, ctx.robot_box_size,
+                       /*stop_at_unknown=*/true) == mgg::VoxelStatus::kFree;
+    }
+    if (admissible) {
       parent_vertex = cand.second;
-      edge_distance = cand.first;
+      edge_distance = projected_distance;
       break;
     }
   }
@@ -785,7 +859,7 @@ void PlannerNode::updateGlobalGraph() {
   parent_vertex->children.push_back(v);
   global_graph_->addVertex(v);
   global_graph_->addEdge(v, parent_vertex, edge_distance);
-  last_global_anchor_ = here;
+  last_global_anchor_ = raw_here;
   have_global_anchor_ = true;
   ++graph_revision_;
 }
@@ -846,18 +920,23 @@ void PlannerNode::onPlanRequest(
   const bool indexed_route_rejected =
       indexed_map_client_ && corridor.status == mgg::PlanningStatus::kSucceeded &&
       feasible.status != mgg::PlanningStatus::kSucceeded;
-  if (feasible.status == mgg::PlanningStatus::kSucceeded) {
-    best_path_ = feasible.poses;
-  } else if (indexed_map_client_) {
+  if (feasible.status != mgg::PlanningStatus::kSucceeded) {
+    // A failed local terrain/current-pose refinement is just as terminal as a
+    // failed indexed query.  Keeping the selector's graph-height path here
+    // bypassed the rejection whenever the optional indexed service was off.
     best_path_.clear();
   }
+
+  const auto& response_path =
+      feasible.status == mgg::PlanningStatus::kSucceeded ? feasible.poses
+                                                         : best_path_;
 
   response->planning_bound_mode = request->bound_mode;
   response->status = !have_odometry_ || !map_->getStatus() ? -1
       : indexed_snapshot_missing || indexed_route_rejected ? -2
-      : best_path_.empty() ? (local_graph_->getNumVertices() <= 1 ? -2 : -3)
+      : response_path.empty() ? (local_graph_->getNumVertices() <= 1 ? -2 : -3)
       : mgg_msgs::srv::PlannerSrv::Response::FORWARD;
-  for (const mgg::StateVec& s : best_path_) {
+  for (const mgg::StateVec& s : response_path) {
     response->path.push_back(toPoseMsg(s));
   }
 
@@ -1033,10 +1112,29 @@ mgg::FeasiblePath PlannerNode::refineCorridor(
   if (corridor.status != mgg::PlanningStatus::kSucceeded) return result;
 
   result.poses = corridor.poses;
+  if (corridor.request.objective == mgg::ObjectiveKind::kExplore) {
+    // Explore corridors come only from buildLocalGraph's selector.  Their
+    // edges have already passed graph_expansion's ground/body policy, which
+    // deliberately permits a hanging local root and unknown beyond observed
+    // rays during cold start.  Rechecking with the strict explicit-objective
+    // policy here deadlocks a stationary robot whose lidar cannot see beneath
+    // itself.  The optional indexed query remains a stricter opt-in gate.
+    convertPathToNavigationBase(result);
+    queryIndexedMap(result);
+    return result;
+  }
+
   const auto admissible = [this](const mgg::StateVec& a,
                                  const mgg::StateVec& b) {
-    const Eigen::Vector3d from = a.head(3);
-    const Eigen::Vector3d to = b.head(3);
+    mgg::StateVec projected_a = a;
+    mgg::StateVec projected_b = b;
+    if (robot_params_.type == mgg::RobotType::kGroundRobot &&
+        (!projectStateToDrivingHeight(projected_a) ||
+         !projectStateToDrivingHeight(projected_b))) {
+      return false;
+    }
+    const Eigen::Vector3d from = projected_a.head(3);
+    const Eigen::Vector3d to = projected_b.head(3);
     if (from.isApprox(to)) return true;
     const Eigen::Vector3d body = robot_params_.getPlanningSize();
     if (robot_params_.type == mgg::RobotType::kAerialRobot) {
@@ -1058,27 +1156,48 @@ mgg::FeasiblePath PlannerNode::refineCorridor(
     if (!admissible(result.poses[i - 1], result.poses[i])) {
       result.status = mgg::PlanningStatus::kBlocked;
       result.poses.clear();
-      result.reason = "route corridor is blocked in the current map";
+      result.reason = "route corridor segment " + std::to_string(i - 1) +
+                      "->" + std::to_string(i) +
+                      " is blocked in the current map";
       return result;
     }
   }
 
   // Explicit objectives retain the requested target separately from the
   // graph vertex. Connect it only after the same terrain/footprint check.
-  if (corridor.request.objective != mgg::ObjectiveKind::kExplore &&
-      !result.poses.empty() &&
-      !result.poses.back().head(3).isApprox(
-          corridor.request.goal.pose.head(3))) {
-    if (!admissible(result.poses.back(), corridor.request.goal.pose)) {
+  if (!result.poses.empty()) {
+    mgg::StateVec projected_goal = corridor.request.goal.pose;
+    if (!projectStateToDrivingHeight(projected_goal)) {
+      result.status = mgg::PlanningStatus::kBlocked;
+      result.poses.clear();
+      result.reason = "the exact goal has no mapped terrain support";
+      return result;
+    }
+    // Internally keep the whole corridor in the terrain-projected graph
+    // convention.  The response is converted back to navigation/base poses
+    // below, avoiding an artificial vertical tail from graph height to the
+    // caller's exact ground-robot goal.
+    if (!result.poses.back().isApprox(projected_goal) &&
+        !admissible(result.poses.back(), projected_goal)) {
       result.status = mgg::PlanningStatus::kBlocked;
       result.poses.clear();
       result.reason = "the exact goal cannot be connected to its graph corridor";
       return result;
     }
-    result.poses.push_back(corridor.request.goal.pose);
+    if (!result.poses.back().isApprox(projected_goal)) {
+      result.poses.push_back(projected_goal);
+    }
   }
+  convertPathToNavigationBase(result);
   queryIndexedMap(result);
   return result;
+}
+
+void PlannerNode::convertPathToNavigationBase(mgg::FeasiblePath& path) const {
+  if (robot_params_.type != mgg::RobotType::kGroundRobot) return;
+  const double graph_to_base =
+      planning_params_.max_ground_height - robot_params_.size[2] / 2.0;
+  for (auto& pose : path.poses) pose[2] -= graph_to_base;
 }
 
 void PlannerNode::onObjectiveRequest(
@@ -1181,7 +1300,19 @@ void PlannerNode::onObjectiveRequest(
                                                             : *local_graph_;
       mgg::TopologicalGoalPlanner planner(
           core.component_id, core.graph_revision, core.map_revision, 1.0);
-      corridor = planner.plan(graph, current_state_, core);
+      mgg::StateVec graph_current = current_state_;
+      mgg::PlanningRequest graph_request = core;
+      if (!projectStateToDrivingHeight(graph_current) ||
+          !projectStateToDrivingHeight(graph_request.goal.pose)) {
+        corridor.request = core;
+        corridor.status = mgg::PlanningStatus::kUnreachable;
+        corridor.reason = "current pose or goal has no mapped terrain support";
+      } else {
+        corridor = planner.plan(graph, graph_current, graph_request);
+        // Graph lookup uses driving height, while refinement and the response
+        // retain the caller's exact base-pose goal.
+        corridor.request = core;
+      }
     }
   }
 
@@ -1203,7 +1334,10 @@ void PlannerNode::publishPath() {
   nav_msgs::msg::Path msg;
   msg.header.stamp = now();
   msg.header.frame_id = world_frame_;
-  for (const mgg::StateVec& s : best_path_) {
+  mgg::FeasiblePath navigation_path;
+  navigation_path.poses = best_path_;
+  convertPathToNavigationBase(navigation_path);
+  for (const mgg::StateVec& s : navigation_path.poses) {
     geometry_msgs::msg::PoseStamped pose;
     pose.header = msg.header;
     pose.pose = toPoseMsg(s);

@@ -63,6 +63,14 @@ class GraphManager {
   void addNeighbourEdge(Vertex* v, Vertex* u, double weight);
   void removeEdge(Vertex* v, Vertex* u);
 
+  /// Replace a vertex pose and rebuild the nearest-neighbour index.
+  ///
+  /// Vertex states are normally immutable after addVertex().  The trajectory
+  /// root is the exception: it is captured before the map sees the floor, then
+  /// corrected to driving height once support is observed.  Rebuilding keeps
+  /// nearest-neighbour queries consistent with the corrected state.
+  bool updateVertexState(int id, const StateVec& state);
+
   int getNumVertices() { return graph_->getNumVertices(); }
   int getNumEdges() { return graph_->getNumEdges(); }
 

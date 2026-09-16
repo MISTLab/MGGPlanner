@@ -79,6 +79,7 @@ class PlannerNode : public rclcpp::Node {
       const std::shared_ptr<mgg_msgs::srv::PlanObjective::Request> request,
       std::shared_ptr<mgg_msgs::srv::PlanObjective::Response> response);
   mgg::FeasiblePath refineCorridor(const mgg::RouteCorridor& corridor);
+  void convertPathToNavigationBase(mgg::FeasiblePath& path) const;
   bool queryIndexedMap(mgg::FeasiblePath& path);
   void publishOwnGraph();
   void publishPath();
@@ -95,6 +96,7 @@ class PlannerNode : public rclcpp::Node {
   /// Without the trajectory backbone there is nothing to broadcast and no
   /// geometry for a neighbour's graph to rendezvous with.
   void updateGlobalGraph();
+  bool projectStateToDrivingHeight(mgg::StateVec& state) const;
 
   mgg::ExpandContext makeContext();
   mgg::GainContext makeGainContext();
@@ -131,6 +133,13 @@ class PlannerNode : public rclcpp::Node {
 
   mgg::StateVec current_state_ = mgg::StateVec::Zero();
   bool have_odometry_ = false;
+  /// First finite navigation pose.  This is the mission home landmark and is
+  /// latched before mapping or commanded motion can move the current pose.
+  mgg::StateVec initial_state_ = mgg::StateVec::Zero();
+  bool have_initial_state_ = false;
+  /// The root exists immediately, but no edge may attach to it until mapped
+  /// ground support has corrected it to the graph's driving-height convention.
+  bool initial_anchor_supported_ = false;
   /// Point clouds arrive in the sensor frame and have to be placed in the
   /// world frame before they go into the map. TF, rather than the odometry
   /// pose, because it is the only thing that knows where the sensor is
@@ -141,8 +150,9 @@ class PlannerNode : public rclcpp::Node {
   /// How long to wait for the transform matching a cloud's stamp.
   double cloud_tf_timeout_sec_ = 0.1;
   double global_vertex_spacing_ = 1.0;
-  /// Where the last global-graph vertex was dropped, so odometry can decide
-  /// cheaply whether the backbone needs extending without touching the map.
+  /// Raw navigation-frame odometry at the last global-graph vertex.  Keeping
+  /// this separate from the terrain-projected vertex avoids mixing base height
+  /// with collision-box driving height in the spacing test.
   Eigen::Vector3d last_global_anchor_ = Eigen::Vector3d::Zero();
   bool have_global_anchor_ = false;
   /// Heading the robot has been travelling, for the direction penalty.

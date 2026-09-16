@@ -159,6 +159,26 @@ TEST(OctomapMap, RayAndPathQueriesMatchBaselineVerdicts) {
   EXPECT_NEAR(end_voxel.x(), 2.0, 0.5);  // obstacle near face
 }
 
+TEST(OctomapMap, PathStatusIsSymmetricAndIncludesBothEndpoints) {
+  OctomapMap map = buildScene();
+  const Eigen::Vector3d box(0.4, 0.4, 0.4);
+  const Eigen::Vector3d a(0.13, -3.07, 1.0);
+  const Eigen::Vector3d b(0.91, -3.07, 1.0);
+  EXPECT_EQ(map.getPathStatus(a, b, box, true),
+            map.getPathStatus(b, a, box, true));
+
+  // The obstacle surface is at x=2.0.  A segment ending there must be blocked
+  // even when its length is not an exact multiple of the map resolution.
+  const Eigen::Vector3d free(1.31, 0.0, 1.0);
+  const Eigen::Vector3d occupied_endpoint(2.0, 0.0, 1.0);
+  EXPECT_EQ(map.getPathStatus(free, occupied_endpoint,
+                              Eigen::Vector3d::Zero(), false),
+            VoxelStatus::kOccupied);
+  EXPECT_EQ(map.getPathStatus(occupied_endpoint, free,
+                              Eigen::Vector3d::Zero(), false),
+            VoxelStatus::kOccupied);
+}
+
 // Endpoints matching the baseline's VLP-16 model: 72 azimuth x 6 elevation
 // rays at 20 m, which is what SensorParamsBase produced for the ROS 1 run.
 std::vector<Eigen::Vector3d> frustumEndpoints(const Eigen::Vector3d& pos) {
@@ -287,6 +307,19 @@ TEST(OctomapMap, AugmentFreeBoxClearsUnknownFootprint) {
   // Must take effect in one call: this clears the robot's own footprint at
   // startup, which would otherwise block every outgoing edge.
   EXPECT_EQ(map.getVoxelStatus(p), VoxelStatus::kFree);
+}
+
+TEST(OctomapMap, AugmentFreeBoxFillsEveryKeyAcrossCoordinateBoundaries) {
+  OctomapConfig cfg;
+  cfg.resolution = 0.05;
+  OctomapMap map(cfg);
+  map.augmentFreeBox({0.60, 0.0, 0.40}, {2.40, 1.20, 0.60});
+
+  for (double x = 0.0; x <= 1.20; x += 0.10) {
+    EXPECT_EQ(map.getBoxStatus({x, 0.0, 0.325}, {0.20, 0.20, 0.15}, true),
+              VoxelStatus::kFree)
+        << "unknown key remained at x=" << x;
+  }
 }
 
 TEST(OctomapMap, LocalPointcloudReturnsNearbyOccupiedVoxels) {

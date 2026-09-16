@@ -72,6 +72,15 @@ TEST(PlanningStages, GoalMustResolveToTheActiveGraph) {
             PlanningStatus::kUnreachable);
 }
 
+TEST(PlanningStages, CurrentPoseMustResolveToTheActiveGraph) {
+  Chain chain;
+  TopologicalGoalPlanner planner("component-a", 12, 34, 0.25);
+  auto home = request(ObjectiveKind::kReturnHome);
+  home.goal.pose = StateVec::Zero();
+  EXPECT_EQ(planner.plan(chain.graph, StateVec(30.0, 0.0, 0.0, 0.0), home).status,
+            PlanningStatus::kUnreachable);
+}
+
 TEST(PlanningStages, NonfiniteGoalIsRejectedBeforeGraphLookup) {
   Chain chain;
   TopologicalGoalPlanner planner("component-a", 12, 34, 0.25);
