@@ -1503,6 +1503,17 @@ mgg::GridProjectionStatus PlannerNode::objectiveFootprintTerrainStatus(
   int samples = 0;
   const double nominal_ground_z =
       driving_pose.z() - planning_params_.max_ground_height;
+  struct FootprintGroundHit {
+    double z;
+    int grid_index;
+    bool connected;
+  };
+  const int grid_width = intervals + 1;
+  std::vector<FootprintGroundHit> ground_hits;
+  ground_hits.reserve(std::min(kMaxFootprintSamples,
+                               grid_width * grid_width));
+  bool needs_connected_support = false;
+  double first_unsupported_delta = 0.0;
 
   // getRayStatus(..., false) deliberately treats unobserved cells as
   // traversable and its legacy API also returns Free when ray setup fails.
@@ -1549,30 +1560,88 @@ mgg::GridProjectionStatus PlannerNode::objectiveFootprintTerrainStatus(
       // support for ordinary poses, while sparse simulated sensors cannot
       // certify every footprint column. Known terrain is a veto when it rises
       // or drops beyond the conservative platform step envelope.
-      if (ray == mgg::VoxelStatus::kUnknown ||
-          (ray == mgg::VoxelStatus::kOccupied &&
-           (!hit.allFinite() ||
-            std::abs(hit.z() - nominal_ground_z) >
-                planning_params_.max_step_height + 1e-6))) {
-        if (objective_footprint_failure_.empty()) {
-          if (ray == mgg::VoxelStatus::kUnknown) {
-            record_failure("footprint ray unavailable");
-          } else if (!hit.allFinite()) {
-            record_failure("non-finite footprint ground hit");
-          } else {
-            const double delta = hit.z() - nominal_ground_z;
-            char detail[160];
-            std::snprintf(detail, sizeof(detail),
-                          "known %s %.3f m exceeds step limit %.3f m",
-                          delta > 0.0 ? "rise" : "drop", std::abs(delta),
-                          planning_params_.max_step_height);
-            record_failure(detail);
-          }
-        }
-        return ray == mgg::VoxelStatus::kUnknown || !hit.allFinite()
-                   ? mgg::GridProjectionStatus::kBodyUnknown
-                   : mgg::GridProjectionStatus::kNoGround;
+      if (ray == mgg::VoxelStatus::kUnknown) {
+        record_failure("footprint ray unavailable");
+        return mgg::GridProjectionStatus::kBodyUnknown;
       }
+      if (ray != mgg::VoxelStatus::kOccupied) continue;
+      if (!hit.allFinite()) {
+        record_failure("non-finite footprint ground hit");
+        return mgg::GridProjectionStatus::kBodyUnknown;
+      }
+      const double delta = hit.z() - nominal_ground_z;
+      const bool center_compatible =
+          std::abs(delta) <= planning_params_.max_step_height + 1e-6;
+      if (!center_compatible && !needs_connected_support) {
+        first_unsupported_delta = delta;
+        needs_connected_support = true;
+      }
+      const int grid_index = ix * grid_width + iy;
+      ground_hits.push_back({hit.z(), grid_index, center_compatible});
+    }
+  }
+  // Preserve the original all-to-centre check as the common fast path.  If a
+  // footprint spans more than one individually traversable rise, accept it
+  // only when every measured outlier has a chain of measured four-neighbour
+  // support back to terrain within the centre's step envelope.  Missing rays
+  // never create support or bridge a gap.
+  if (needs_connected_support) {
+    if (!std::isfinite(planning_params_.max_inclination) ||
+        planning_params_.max_inclination < 0.0) {
+      record_failure("invalid footprint query configuration");
+      return mgg::GridProjectionStatus::kBodyUnknown;
+    }
+    std::vector<int> ground_hit_at(grid_width * grid_width, -1);
+    for (std::size_t i = 0; i < ground_hits.size(); ++i) {
+      ground_hit_at[ground_hits[i].grid_index] = static_cast<int>(i);
+    }
+    std::vector<std::size_t> pending;
+    pending.reserve(ground_hits.size());
+    for (std::size_t i = 0; i < ground_hits.size(); ++i) {
+      if (ground_hits[i].connected) pending.push_back(i);
+    }
+    constexpr int kDx[] = {-1, 1, 0, 0};
+    constexpr int kDy[] = {0, 0, -1, 1};
+    for (std::size_t head = 0; head < pending.size(); ++head) {
+      const FootprintGroundHit& current = ground_hits[pending[head]];
+      const int ix = current.grid_index / grid_width;
+      const int iy = current.grid_index % grid_width;
+      for (int direction = 0; direction < 4; ++direction) {
+        const int nx = ix + kDx[direction];
+        const int ny = iy + kDy[direction];
+        if (nx < 0 || nx >= grid_width || ny < 0 || ny >= grid_width) {
+          continue;
+        }
+        const int neighbour_index = ground_hit_at[nx * grid_width + ny];
+        if (neighbour_index < 0 ||
+            ground_hits[neighbour_index].connected) {
+          continue;
+        }
+        const double dz =
+            std::abs(ground_hits[neighbour_index].z - current.z);
+        const double inclination = std::atan2(dz, resolution);
+        if (dz > planning_params_.max_step_height + 1e-6 &&
+            inclination > planning_params_.max_inclination + 1e-6) {
+          continue;
+        }
+        ground_hits[neighbour_index].connected = true;
+        pending.push_back(static_cast<std::size_t>(neighbour_index));
+      }
+    }
+    if (std::any_of(ground_hits.begin(), ground_hits.end(),
+                    [nominal_ground_z, this](const FootprintGroundHit& hit) {
+                      return !hit.connected &&
+                             std::abs(hit.z - nominal_ground_z) >
+                                 planning_params_.max_step_height + 1e-6;
+                    })) {
+      char detail[160];
+      std::snprintf(detail, sizeof(detail),
+                    "known %s %.3f m exceeds step limit %.3f m",
+                    first_unsupported_delta > 0.0 ? "rise" : "drop",
+                    std::abs(first_unsupported_delta),
+                    planning_params_.max_step_height);
+      record_failure(detail);
+      return mgg::GridProjectionStatus::kNoGround;
     }
   }
   return samples > 0 ? mgg::GridProjectionStatus::kSupported

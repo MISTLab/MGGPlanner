@@ -72,6 +72,10 @@ class PlannerNodeTestPeer {
     const std::lock_guard<std::recursive_mutex> lock(node.planner_mutex_);
     node.planning_params_.max_step_height = height;
   }
+  static void setMaxInclination(PlannerNode& node, double inclination) {
+    const std::lock_guard<std::recursive_mutex> lock(node.planner_mutex_);
+    node.planning_params_.max_inclination = inclination;
+  }
   static void setMaxGroundHeight(PlannerNode& node, double height) {
     const std::lock_guard<std::recursive_mutex> lock(node.planner_mutex_);
     node.planning_params_.max_ground_height = height;
@@ -1768,6 +1772,95 @@ TEST(PlannerObjective, ObservedGroundVetoesKnownFootprintTerrainHazards) {
 
   EXPECT_FALSE(Peer::footprintTerrainSupported(
       *shallow, driving_pose, Eigen::Vector3d(10.0, 10.0, 0.15)));
+}
+
+TEST(PlannerObjective, ConnectedMeasuredSupportAllowsStagedFootprintTerrain) {
+  using Peer = mgg_ros::PlannerNodeTestPeer;
+  const Eigen::Vector3d body(0.90, 0.15, 0.15);
+  const Eigen::Vector3d low_pose(0.0, 0.0, 0.30);
+  const auto make = [&body] {
+    rclcpp::NodeOptions options;
+    options.parameter_overrides(
+        {rclcpp::Parameter("use_sim_time", true),
+         rclcpp::Parameter("map.resolution", 0.15),
+         rclcpp::Parameter("objective_body_evidence_policy", "observed_ground")});
+    auto node = std::make_shared<mgg_ros::PlannerNode>(options);
+    Peer::configureBackboneTest(*node);
+    Peer::setPlanningBody(*node, body);
+    return node;
+  };
+  const auto add_column = [](mgg_ros::PlannerNode& node, double x,
+                             double z) {
+    // Samples lie in both map-cell rows touched by y=0.  The 15 cm phase
+    // matches the measured-surface cells used by the Bistro simulation.
+    Peer::addMeasuredSurface(node, x, -0.075, z);
+    Peer::addMeasuredSurface(node, x, 0.075, z);
+  };
+
+  auto staged = make();
+  for (const double x : {-0.525, -0.375, -0.225}) {
+    add_column(*staged, x, 0.0);
+  }
+  add_column(*staged, -0.075, 0.068);
+  for (const double x : {0.075, 0.225, 0.375, 0.525}) {
+    add_column(*staged, x, 0.143);
+  }
+  // The complete footprint spans 14.3 cm relative to the low centre, but
+  // each measured transition is inside the 10 cm step budget.
+  EXPECT_TRUE(Peer::footprintTerrainSupported(*staged, low_pose, body));
+  EXPECT_TRUE(Peer::terrainPathSupported(
+      *staged, {Eigen::Vector3d(-0.30, 0.0, 0.30),
+                Eigen::Vector3d(0.0, 0.0, 0.368),
+                Eigen::Vector3d(0.30, 0.0, 0.443)}));
+
+  auto invalid_inclination = make();
+  for (const double x : {-0.525, -0.375, -0.225}) {
+    add_column(*invalid_inclination, x, 0.0);
+  }
+  add_column(*invalid_inclination, -0.075, 0.068);
+  for (const double x : {0.075, 0.225, 0.375, 0.525}) {
+    add_column(*invalid_inclination, x, 0.143);
+  }
+  Peer::setMaxInclination(*invalid_inclination,
+                          std::numeric_limits<double>::quiet_NaN());
+  EXPECT_FALSE(Peer::footprintTerrainSupported(*invalid_inclination,
+                                               low_pose, body));
+
+  auto grade = make();
+  const std::vector<double> grade_x = {
+      -0.525, -0.375, -0.225, -0.075, 0.075, 0.225, 0.375, 0.525};
+  for (std::size_t i = 0; i < grade_x.size(); ++i) {
+    add_column(*grade, grade_x[i], 0.025 * static_cast<double>(i));
+  }
+  // A continuous measured grade may exceed one centre-to-edge step while
+  // each adjacent cell remains below both the step and inclination limits.
+  EXPECT_TRUE(Peer::footprintTerrainSupported(*grade, low_pose, body));
+
+  auto curb = make();
+  for (const double x : {-0.525, -0.375, -0.225, -0.075}) {
+    add_column(*curb, x, 0.0);
+  }
+  for (const double x : {0.075, 0.225, 0.375, 0.525}) {
+    add_column(*curb, x, 0.16);
+  }
+  // A fully measured single 16 cm curb has no admissible support edge and
+  // retains the known-terrain veto.
+  EXPECT_FALSE(Peer::footprintTerrainSupported(*curb, low_pose, body));
+  EXPECT_FALSE(Peer::terrainPathSupported(
+      *curb, {Eigen::Vector3d(-0.30, 0.0, 0.30),
+              Eigen::Vector3d(0.30, 0.0, 0.46)}));
+
+  auto missing_middle = make();
+  for (const double x : {-0.525, -0.375}) {
+    add_column(*missing_middle, x, 0.0);
+  }
+  for (const double x : {0.375, 0.525}) {
+    add_column(*missing_middle, x, 0.143);
+  }
+  // Absent ground observations remain neutral for the footprint query, but
+  // they cannot bridge known support to an otherwise unsupported outlier.
+  EXPECT_FALSE(
+      Peer::footprintTerrainSupported(*missing_middle, low_pose, body));
 }
 
 TEST(PlannerObjective, FootprintQueriesEachIntersectingMapCellExactlyOnce) {
