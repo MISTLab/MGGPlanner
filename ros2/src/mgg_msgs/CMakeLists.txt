@@ -64,6 +64,7 @@ rosidl_generate_interfaces(${PROJECT_NAME}
   "srv/PlannerSetSearchMode.srv"
   "srv/PlannerSetVel.srv"
   "srv/PlanObjective.srv"
+  "srv/RefineObjectiveRoute.srv"
   "srv/QueryMapBatch.srv"
   "srv/ValidateObjectiveRoute.srv"
   "srv/PlannerSrv.srv"

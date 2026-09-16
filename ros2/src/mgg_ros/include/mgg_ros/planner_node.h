@@ -39,6 +39,7 @@
 #include <mgg_msgs/msg/mapping_snapshot.hpp>
 #include <mgg_msgs/srv/plan_objective.hpp>
 #include <mgg_msgs/srv/query_map_batch.hpp>
+#include <mgg_msgs/srv/refine_objective_route.hpp>
 #include <mgg_msgs/srv/validate_objective_route.hpp>
 #include <mgg_msgs/srv/planner_srv.hpp>
 
@@ -86,6 +87,9 @@ class PlannerNode : public rclcpp::Node {
   void onObjectiveRequest(
       const std::shared_ptr<mgg_msgs::srv::PlanObjective::Request> request,
       std::shared_ptr<mgg_msgs::srv::PlanObjective::Response> response);
+  void onRefineObjectiveRoute(
+      const std::shared_ptr<mgg_msgs::srv::RefineObjectiveRoute::Request> request,
+      std::shared_ptr<mgg_msgs::srv::RefineObjectiveRoute::Response> response);
   mgg::FeasiblePath refineCorridor(
       const mgg::RouteCorridor& corridor,
       const mgg::GridRefinementLimits* limits = nullptr);
@@ -178,6 +182,9 @@ class PlannerNode : public rclcpp::Node {
   mgg::GridRefinementLimits objective_grid_limits_;
   double partial_route_min_progress_m_ = 1.0;
   double objective_start_support_max_distance_m_ = 3.0;
+  double objective_route_horizon_m_ = 8.0;
+  double objective_route_progress_tolerance_m_ = 1.0;
+  std::size_t objective_route_max_poses_ = 4096;
   mutable std::string objective_start_support_failure_;
   mutable std::string objective_footprint_failure_;
   mgg::BoundedSpaceParams global_space_;
@@ -201,6 +208,18 @@ class PlannerNode : public rclcpp::Node {
 
   mgg::StateVec current_state_ = mgg::StateVec::Zero();
   bool have_odometry_ = false;
+  struct CachedHomeRoute {
+    std::string id;
+    std::string mission_id;
+    std::string component_id;
+    mgg::PlanningGoal exact_goal;
+    std::vector<mgg::StateVec> global_poses;
+    std::size_t next_index = 0;
+    mgg::StateVec expected_endpoint = mgg::StateVec::Zero();
+  };
+  std::unique_ptr<CachedHomeRoute> cached_home_route_;
+  std::string route_instance_id_;
+  std::uint64_t route_sequence_ = 0;
   /// First finite navigation pose.  This is the mission home landmark and is
   /// latched before mapping or commanded motion can move the current pose.
   mgg::StateVec initial_state_ = mgg::StateVec::Zero();
@@ -306,6 +325,8 @@ class PlannerNode : public rclcpp::Node {
   rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr build_srv_;
   rclcpp::Service<mgg_msgs::srv::PlannerSrv>::SharedPtr plan_srv_;
   rclcpp::Service<mgg_msgs::srv::PlanObjective>::SharedPtr objective_srv_;
+  rclcpp::Service<mgg_msgs::srv::RefineObjectiveRoute>::SharedPtr
+      refine_objective_route_srv_;
   rclcpp::Service<mgg_msgs::srv::ValidateObjectiveRoute>::SharedPtr
       validate_objective_route_srv_;
   rclcpp::Client<mgg_msgs::srv::QueryMapBatch>::SharedPtr indexed_map_client_;
