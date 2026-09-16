@@ -1,13 +1,23 @@
 #include "mgg_pci/pci_node.h"
 
 #include <chrono>
+#include <limits>
 
 namespace mgg_pci {
+
+double boundedRetryDelaySeconds(int attempt, double initial, double maximum) {
+  double delay = initial;
+  for (int n = 1; n < attempt && delay < maximum; ++n) {
+    delay = std::min(maximum, delay * 2.0);
+  }
+  return delay;
+}
 
 PciNode::PciNode(const rclcpp::NodeOptions& options)
     : rclcpp::Node("mgg_pci", options),
       last_progress_time_(0, 0, RCL_ROS_TIME),
-      path_start_time_(0, 0, RCL_ROS_TIME) {
+      path_start_time_(0, 0, RCL_ROS_TIME),
+      retry_not_before_(0, 0, RCL_ROS_TIME) {
   service_timeout_sec_ =
       declare_parameter("service_timeout_sec", service_timeout_sec_);
   bound_mode_ = static_cast<int>(declare_parameter("bound_mode", 0));
@@ -15,6 +25,14 @@ PciNode::PciNode(const rclcpp::NodeOptions& options)
   reach_distance_ = declare_parameter("reach_distance", reach_distance_);
   stuck_timeout_sec_ = declare_parameter("stuck_timeout_sec", stuck_timeout_sec_);
   bootstrap_distance_ = declare_parameter("bootstrap_distance", bootstrap_distance_);
+  external_path_execution_ =
+      declare_parameter("external_path_execution", external_path_execution_);
+  empty_plan_retry_initial_sec_ = std::max(
+      0.1, declare_parameter("empty_plan_retry_initial_sec",
+                             empty_plan_retry_initial_sec_));
+  empty_plan_retry_max_sec_ = std::max(
+      empty_plan_retry_initial_sec_,
+      declare_parameter("empty_plan_retry_max_sec", empty_plan_retry_max_sec_));
   max_empty_plans_before_stop_ =
       declare_parameter("max_empty_plans_before_stop", max_empty_plans_before_stop_);
   const double auto_period = declare_parameter("auto_period_sec", 1.0);
@@ -69,6 +87,10 @@ PciNode::PciNode(const rclcpp::NodeOptions& options)
                 auto_period);
   }
   RCLCPP_INFO(get_logger(), "pci ready; call pci_trigger to plan");
+  if (external_path_execution_) {
+    RCLCPP_INFO(get_logger(),
+                "external path execution enabled; FollowPath owns arrival and watchdog decisions");
+  }
 }
 
 bool PciNode::executeBootstrap() {
@@ -118,7 +140,8 @@ void PciNode::onOdometry(nav_msgs::msg::Odometry::ConstSharedPtr msg) {
   have_odometry_ = true;
   current_pose_ = msg->pose.pose;
 
-  if (!running_ || !path_in_progress_ || planning_in_progress_) {
+  if (!running_ || !path_in_progress_ || planning_in_progress_ ||
+      external_path_execution_) {
     return;
   }
 
@@ -194,6 +217,29 @@ void PciNode::publishPath(const std::vector<geometry_msgs::msg::Pose>& path) {
   path_pub_->publish(msg);
 }
 
+bool PciNode::pathEndpointMakesExternalProgress(
+    const std::vector<geometry_msgs::msg::Pose>& path) const {
+  const auto& endpoint = path.back();
+  const double dx = endpoint.position.x - current_pose_.position.x;
+  const double dy = endpoint.position.y - current_pose_.position.y;
+  return std::hypot(dx, dy) > reach_distance_;
+}
+
+void PciNode::deferExternalRetry(const std::string& reason) {
+  if (consecutive_empty_plans_ < std::numeric_limits<int>::max()) {
+    ++consecutive_empty_plans_;
+  }
+  const double delay = boundedRetryDelaySeconds(
+      consecutive_empty_plans_, empty_plan_retry_initial_sec_,
+      empty_plan_retry_max_sec_);
+  path_in_progress_ = false;
+  waiting_for_plan_ = true;
+  retry_not_before_ = now() + rclcpp::Duration::from_seconds(delay);
+  publishStatus("waiting");
+  RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 5000,
+                       "%s; retrying in %.1f s", reason.c_str(), delay);
+}
+
 void PciNode::planAndPublish() {
   if (exploration_completed_) {
     return;
@@ -219,7 +265,14 @@ void PciNode::planAndPublish() {
       executeBootstrap();
       return;
     }
-    if (++consecutive_empty_plans_ >= max_empty_plans_before_stop_) {
+    if (external_path_execution_) {
+      deferExternalRetry(error);
+      return;
+    }
+    if (consecutive_empty_plans_ < std::numeric_limits<int>::max()) {
+      ++consecutive_empty_plans_;
+    }
+    if (consecutive_empty_plans_ >= max_empty_plans_before_stop_) {
       running_ = false;
       path_in_progress_ = false;
       publishPath({});
@@ -229,14 +282,25 @@ void PciNode::planAndPublish() {
     return;
   }
 
-  if (path.empty()) {
+  const bool insufficient_external_progress =
+      external_path_execution_ && have_odometry_ && !path.empty() &&
+      !pathEndpointMakesExternalProgress(path);
+  if (path.empty() || insufficient_external_progress) {
     if (!has_bootstrapped_ && bootstrap_distance_ > 0.0) {
       // First attempt on standing start without mapped ground: bootstrap forward
       executeBootstrap();
       return;
     }
 
-    ++consecutive_empty_plans_;
+    if (external_path_execution_) {
+      deferExternalRetry(insufficient_external_progress
+                             ? "planner path makes no progress beyond the controller goal tolerance"
+                             : "planner returned no path");
+      return;
+    }
+    if (consecutive_empty_plans_ < std::numeric_limits<int>::max()) {
+      ++consecutive_empty_plans_;
+    }
     if (consecutive_empty_plans_ >= max_empty_plans_before_stop_) {
       exploration_completed_ = true;
       running_ = false;
@@ -256,6 +320,8 @@ void PciNode::planAndPublish() {
   }
 
   consecutive_empty_plans_ = 0;
+  waiting_for_plan_ = false;
+  retry_not_before_ = rclcpp::Time(0, 0, RCL_ROS_TIME);
   has_bootstrapped_ = true;
   publishPath(path);
   publishStatus("exploring");
@@ -271,11 +337,19 @@ void PciNode::tick() {
   if (!running_ || planning_in_progress_ || exploration_completed_) return;
 
   if (!path_in_progress_) {
+    if (external_path_execution_ && waiting_for_plan_ &&
+        now() < retry_not_before_) {
+      return;
+    }
     // If running in auto mode and not following any path, trigger planning
     lock.unlock();
     planAndPublish();
     return;
   }
+
+  // FollowPath owns arrival and controller progress in this mode. PCI waits
+  // for an explicit pci_replan after the action reaches a terminal result.
+  if (external_path_execution_) return;
 
   // Path is active: check if stuck or timed out
   if (last_progress_time_.nanoseconds() > 0) {
@@ -310,6 +384,8 @@ void PciNode::onTrigger(
     exploration_completed_ = false;
     consecutive_empty_plans_ = 0;
     path_in_progress_ = false;
+    waiting_for_plan_ = false;
+    retry_not_before_ = rclcpp::Time(0, 0, RCL_ROS_TIME);
   }
   planAndPublish();
 
@@ -317,7 +393,9 @@ void PciNode::onTrigger(
   response->success = running_ || exploration_completed_;
   response->message = path_in_progress_
                           ? "started autonomous exploration"
-                          : "failed to start path";
+                          : waiting_for_plan_
+                                ? "exploration active; waiting for a path"
+                                : "failed to start path";
 }
 
 void PciNode::onReplan(
@@ -336,15 +414,21 @@ void PciNode::onReplan(
       return;
     }
     exploration_completed_ = false;
-    consecutive_empty_plans_ = 0;
+    if (!waiting_for_plan_) consecutive_empty_plans_ = 0;
     path_in_progress_ = false;
+    waiting_for_plan_ = false;
+    retry_not_before_ = rclcpp::Time(0, 0, RCL_ROS_TIME);
   }
   planAndPublish();
 
   std::lock_guard<std::mutex> lock(mutex_);
-  response->success = path_in_progress_;
-  response->message = path_in_progress_ ? "published a fresh exploration path"
-                                        : "failed to produce a fresh path";
+  response->success = path_in_progress_ ||
+                      (external_path_execution_ && running_ && waiting_for_plan_);
+  response->message = path_in_progress_
+                          ? "published a fresh exploration path"
+                          : waiting_for_plan_
+                                ? "exploration active; waiting for a path"
+                                : "failed to produce a fresh path";
 }
 
 
@@ -355,6 +439,7 @@ void PciNode::onStop(const std::shared_ptr<std_srvs::srv::Trigger::Request>,
     running_ = false;
     ++generation_;
     path_in_progress_ = false;
+    waiting_for_plan_ = false;
   }
   publishPath({});
   publishStatus("stopped");

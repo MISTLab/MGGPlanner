@@ -32,6 +32,8 @@
 
 namespace mgg_pci {
 
+double boundedRetryDelaySeconds(int attempt, double initial, double maximum);
+
 class StallBudget {
  public:
   explicit StallBudget(int limit = 3) : limit_(std::max(1, limit)) {}
@@ -65,6 +67,9 @@ class PciNode : public rclcpp::Node {
 
   void publishStatus(const std::string& state);
   void publishPath(const std::vector<geometry_msgs::msg::Pose>& path);
+  bool pathEndpointMakesExternalProgress(
+      const std::vector<geometry_msgs::msg::Pose>& path) const;
+  void deferExternalRetry(const std::string& reason);
   void planAndPublish();
   bool executeBootstrap();
 
@@ -86,8 +91,10 @@ class PciNode : public rclcpp::Node {
   bool have_odometry_ = false;
   bool planning_in_progress_ = false;
   bool path_in_progress_ = false;
+  bool waiting_for_plan_ = false;
   bool has_bootstrapped_ = false;
   bool exploration_completed_ = false;
+  bool external_path_execution_ = false;
   int consecutive_empty_plans_ = 0;
 
   geometry_msgs::msg::Pose current_pose_;
@@ -95,11 +102,14 @@ class PciNode : public rclcpp::Node {
   geometry_msgs::msg::Point last_progress_pos_;
   rclcpp::Time last_progress_time_;
   rclcpp::Time path_start_time_;
+  rclcpp::Time retry_not_before_;
 
   double service_timeout_sec_ = 60.0;
   double reach_distance_ = 0.3;
   double stuck_timeout_sec_ = 20.0;
   double bootstrap_distance_ = 3.0;
+  double empty_plan_retry_initial_sec_ = 1.0;
+  double empty_plan_retry_max_sec_ = 10.0;
   int max_empty_plans_before_stop_ = 3;
   int bound_mode_ = 0;
   std::string world_frame_ = "world";

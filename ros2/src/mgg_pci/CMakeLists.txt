@@ -45,7 +45,7 @@ if(BUILD_TESTING)
   find_package(ament_cmake_gtest REQUIRED)
   ament_add_gtest(test_pci_deadlock test/test_pci_deadlock.cpp TIMEOUT 120)
   target_link_libraries(test_pci_deadlock ${PROJECT_NAME})
-  ament_target_dependencies(test_pci_deadlock rclcpp std_srvs)
+  ament_target_dependencies(test_pci_deadlock rclcpp std_srvs nav_msgs mgg_msgs)
 endif()
 
 ament_package()
