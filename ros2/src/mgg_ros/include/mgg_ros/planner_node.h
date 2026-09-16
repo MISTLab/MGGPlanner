@@ -108,8 +108,8 @@ class PlannerNode : public rclcpp::Node {
     bool observed_ground_body_evidence = false;
     bool provisional_unknown_ground = false;
     bool have_mapping_snapshot = false;
+    bool mapping_snapshot_fresh_at_capture = false;
     mgg_msgs::msg::MappingSnapshot mapping_snapshot;
-    std::chrono::steady_clock::time_point mapping_snapshot_received;
   };
   IndexedQueryContext indexedQueryContext() const;
   bool queryIndexedMap(mgg::FeasiblePath& path,

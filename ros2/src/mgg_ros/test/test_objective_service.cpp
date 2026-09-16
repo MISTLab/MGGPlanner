@@ -900,6 +900,41 @@ class PlannerNodeTestPeer {
                                 allow_explore_height_refinement);
   }
 
+  static bool queryAfterCapturedSnapshotReceiptAges(
+      PlannerNode& node, mgg::FeasiblePath& path) {
+    PlannerNode::IndexedQueryContext context;
+    std::chrono::steady_clock::time_point received;
+    {
+      const std::lock_guard<std::recursive_mutex> lock(node.planner_mutex_);
+      context = node.indexedQueryContext();
+      received = node.mapping_snapshot_received_;
+      node.mapping_snapshot_received_ =
+          std::chrono::steady_clock::now() - std::chrono::seconds(10);
+    }
+    const bool result = node.queryIndexedMap(path, context);
+    {
+      const std::lock_guard<std::recursive_mutex> lock(node.planner_mutex_);
+      node.mapping_snapshot_received_ = received;
+    }
+    return result;
+  }
+
+  static bool queryAfterCapturedSnapshotIdentityChanges(
+      PlannerNode& node, mgg::FeasiblePath& path) {
+    PlannerNode::IndexedQueryContext context;
+    {
+      const std::lock_guard<std::recursive_mutex> lock(node.planner_mutex_);
+      context = node.indexedQueryContext();
+      ++node.mapping_snapshot_.graph_revision;
+    }
+    const bool result = node.queryIndexedMap(path, context);
+    {
+      const std::lock_guard<std::recursive_mutex> lock(node.planner_mutex_);
+      --node.mapping_snapshot_.graph_revision;
+    }
+    return result;
+  }
+
   static bool queryReady(const PlannerNode& node) {
     return node.indexed_map_client_ && node.indexed_map_client_->service_is_ready();
   }
@@ -3612,10 +3647,40 @@ TEST(IndexedObjectiveService, BatchedQueryIsBoundedAndUsesComponentFrame) {
     EXPECT_NEAR(received.front().z, 0.225, 1e-6);
   }
 
+  // A snapshot that was fresh when planning began remains valid for that
+  // bounded in-flight query even if graph construction consumed the remaining
+  // receipt TTL. Exact authority identity is still checked after the query.
+  path.status = mgg::PlanningStatus::kSucceeded;
+  path.poses = {mgg::StateVec(1.0, 0.0, 0.0, 0.0)};
+  EXPECT_TRUE(
+      mgg_ros::PlannerNodeTestPeer::queryAfterCapturedSnapshotReceiptAges(
+          *planner, path));
+  EXPECT_TRUE(path.indexed_map_validated);
+
+  path.status = mgg::PlanningStatus::kSucceeded;
+  path.poses = {mgg::StateVec(1.0, 0.0, 0.0, 0.0)};
+  EXPECT_FALSE(
+      mgg_ros::PlannerNodeTestPeer::queryAfterCapturedSnapshotIdentityChanges(
+          *planner, path));
+  EXPECT_EQ(path.status, mgg::PlanningStatus::kStaleRevision);
+  EXPECT_NE(path.reason.find("authority changed during query"),
+            std::string::npos);
+
+  mgg_ros::PlannerNodeTestPeer::expireSnapshot(*planner);
+  path.status = mgg::PlanningStatus::kSucceeded;
+  path.poses = {mgg::StateVec(1.0, 0.0, 0.0, 0.0)};
+  EXPECT_FALSE(mgg_ros::PlannerNodeTestPeer::query(*planner, path));
+  EXPECT_EQ(path.status, mgg::PlanningStatus::kStaleRevision);
+  EXPECT_NE(path.reason.find("authority is unavailable or expired"),
+            std::string::npos);
+  mgg_ros::PlannerNodeTestPeer::acceptSnapshot(*planner, snapshot);
+
   // Strict hardware policy still rejects unknown body occupancy and missing
   // overhead clearance even when the exact terrain arrays are complete.
   sample_occupancy = Query::Response::UNKNOWN;
   sample_clearance = std::numeric_limits<double>::quiet_NaN();
+  path.status = mgg::PlanningStatus::kSucceeded;
+  path.poses = {mgg::StateVec(1.0, 0.0, 0.0, 0.0)};
   EXPECT_FALSE(mgg_ros::PlannerNodeTestPeer::query(*planner, path));
   EXPECT_TRUE(received_stop_at_unknown.load());
   EXPECT_FALSE(path.indexed_map_validated);

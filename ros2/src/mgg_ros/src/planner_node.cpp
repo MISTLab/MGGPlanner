@@ -2020,6 +2020,11 @@ void PlannerNode::onPlanRequest(
   const mgg::BoundModeType previous = robot_params_.bound_mode;
   robot_params_.bound_mode =
       static_cast<mgg::BoundModeType>(request->bound_mode);
+  // Capture receipt freshness and the requested body bound before graph
+  // construction and gain evaluation. Those bounded operations hold
+  // planner_mutex_, so a current snapshot must not expire merely because its
+  // callback cannot refresh the receipt time.
+  const IndexedQueryContext query_context = indexedQueryContext();
 
   best_path_.clear();
   const std::string summary = buildLocalGraph();
@@ -2030,18 +2035,14 @@ void PlannerNode::onPlanRequest(
   core.component_id = component_id_;
   core.graph_revision = local_graph_revision_;
   core.map_revision = map_revision_;
-  const bool mapping_authority_fresh =
-      have_mapping_snapshot_ &&
-      std::chrono::duration<double>(std::chrono::steady_clock::now() -
-                                    mapping_snapshot_received_).count() <=
-          indexed_map_snapshot_ttl_s_;
-  if (mapping_authority_fresh) {
-    core.component_id = mapping_snapshot_.component_id;
-    core.map_epoch = mapping_snapshot_.epoch;
-    core.mapping_graph_revision = mapping_snapshot_.graph_revision;
-    core.geometry_revision = mapping_snapshot_.geometry_revision;
-    core.map_source_stamp_sec = mapping_snapshot_.source_stamp.sec;
-    core.map_source_stamp_nanosec = mapping_snapshot_.source_stamp.nanosec;
+  if (query_context.mapping_snapshot_fresh_at_capture) {
+    const auto& snapshot = query_context.mapping_snapshot;
+    core.component_id = snapshot.component_id;
+    core.map_epoch = snapshot.epoch;
+    core.mapping_graph_revision = snapshot.graph_revision;
+    core.geometry_revision = snapshot.geometry_revision;
+    core.map_source_stamp_sec = snapshot.source_stamp.sec;
+    core.map_source_stamp_nanosec = snapshot.source_stamp.nanosec;
   }
   mgg::RouteCorridor corridor;
   corridor.request = core;
@@ -2049,7 +2050,6 @@ void PlannerNode::onPlanRequest(
   corridor.status = best_path_.empty() ? mgg::PlanningStatus::kUnreachable
                                        : mgg::PlanningStatus::kSucceeded;
   mgg::FeasiblePath feasible = refineCorridor(corridor);
-  const IndexedQueryContext query_context = indexedQueryContext();
   const bool allow_explore_height_refinement =
       map_backend_ == "mola_snapshot" && provisional_unknown_ground_ &&
       observed_ground_body_evidence_;
@@ -2076,10 +2076,8 @@ void PlannerNode::onPlanRequest(
   }
   const bool indexed_snapshot_missing =
       indexed_map_client_ &&
-      (!have_mapping_snapshot_ ||
-       std::chrono::duration<double>(std::chrono::steady_clock::now() -
-                                     mapping_snapshot_received_).count() >
-           indexed_map_snapshot_ttl_s_);
+      (!query_context.have_mapping_snapshot ||
+       !query_context.mapping_snapshot_fresh_at_capture);
   const bool indexed_route_rejected =
       indexed_map_client_ && corridor.status == mgg::PlanningStatus::kSucceeded &&
       feasible.status != mgg::PlanningStatus::kSucceeded;
@@ -2130,8 +2128,12 @@ PlannerNode::IndexedQueryContext PlannerNode::indexedQueryContext() const {
   context.observed_ground_body_evidence = observed_ground_body_evidence_;
   context.provisional_unknown_ground = provisional_unknown_ground_;
   context.have_mapping_snapshot = have_mapping_snapshot_;
+  context.mapping_snapshot_fresh_at_capture =
+      have_mapping_snapshot_ &&
+      std::chrono::duration<double>(std::chrono::steady_clock::now() -
+                                    mapping_snapshot_received_).count() <=
+          indexed_map_snapshot_ttl_s_;
   context.mapping_snapshot = mapping_snapshot_;
-  context.mapping_snapshot_received = mapping_snapshot_received_;
   return context;
 }
 
@@ -2165,9 +2167,7 @@ bool PlannerNode::queryIndexedMap(mgg::FeasiblePath& path,
                 "indexed mapping snapshot key or source stamp is invalid");
   }
   if (!context.have_mapping_snapshot ||
-      std::chrono::duration<double>(std::chrono::steady_clock::now() -
-                                    context.mapping_snapshot_received).count() >
-          indexed_map_snapshot_ttl_s_) {
+      !context.mapping_snapshot_fresh_at_capture) {
     return fail(mgg::PlanningStatus::kStaleRevision,
                 "indexed mapping authority is unavailable or expired");
   }
@@ -3322,6 +3322,7 @@ void PlannerNode::onObjectiveRequest(
   refreshMolaRevision();
   const std::uint64_t mola_generation_at_start =
       mola_map_ != nullptr ? mola_map_->activeGeneration() : 0;
+  const IndexedQueryContext query_context = indexedQueryContext();
   mgg::PlanningRequest core;
   core.mission_id = request->mission_id;
   core.objective = static_cast<mgg::ObjectiveKind>(request->objective);
@@ -3359,18 +3360,16 @@ void PlannerNode::onObjectiveRequest(
       core.map_source_stamp_nanosec < 1000000000u &&
       (core.map_source_stamp_sec != 0 || core.map_source_stamp_nanosec != 0);
   const bool mapping_authority_fresh =
-      have_mapping_snapshot_ &&
-      std::chrono::duration<double>(std::chrono::steady_clock::now() -
-                                    mapping_snapshot_received_).count() <=
-          indexed_map_snapshot_ttl_s_;
+      query_context.mapping_snapshot_fresh_at_capture;
+  const auto& captured_snapshot = query_context.mapping_snapshot;
   const bool mapping_key_matches =
       mapping_authority_fresh &&
-      core.component_id == mapping_snapshot_.component_id &&
-      core.map_epoch == mapping_snapshot_.epoch &&
-      core.mapping_graph_revision == mapping_snapshot_.graph_revision &&
-      core.geometry_revision == mapping_snapshot_.geometry_revision &&
-      core.map_source_stamp_sec == mapping_snapshot_.source_stamp.sec &&
-      core.map_source_stamp_nanosec == mapping_snapshot_.source_stamp.nanosec;
+      core.component_id == captured_snapshot.component_id &&
+      core.map_epoch == captured_snapshot.epoch &&
+      core.mapping_graph_revision == captured_snapshot.graph_revision &&
+      core.geometry_revision == captured_snapshot.geometry_revision &&
+      core.map_source_stamp_sec == captured_snapshot.source_stamp.sec &&
+      core.map_source_stamp_nanosec == captured_snapshot.source_stamp.nanosec;
   const bool request_has_mapping_key =
       core.map_epoch != 0 || core.mapping_graph_revision != 0 ||
       !core.geometry_revision.empty() || core.map_source_stamp_sec != 0 ||
@@ -3647,7 +3646,6 @@ void PlannerNode::onObjectiveRequest(
       path = std::move(fallback);
     }
   }
-  const IndexedQueryContext query_context = indexedQueryContext();
   const bool allow_explore_height_refinement =
       core.objective == mgg::ObjectiveKind::kExplore &&
       map_backend_ == "mola_snapshot" && provisional_unknown_ground_ &&
@@ -3719,6 +3717,7 @@ void PlannerNode::onRefineObjectiveRoute(
   refreshMolaRevision();
   const std::uint64_t mola_generation_at_start =
       mola_map_ != nullptr ? mola_map_->activeGeneration() : 0;
+  const IndexedQueryContext query_context = indexedQueryContext();
   auto finish = [&](mgg::PlanningStatus status, const std::string& reason) {
     response->status = static_cast<std::uint8_t>(status);
     response->component_id = cached_home_route_
@@ -3752,20 +3751,18 @@ void PlannerNode::onRefineObjectiveRoute(
   const bool require_mapping_key =
       indexed_map_client_ || have_mapping_snapshot_ || request_has_mapping_key;
   const bool mapping_authority_fresh =
-      have_mapping_snapshot_ &&
-      std::chrono::duration<double>(std::chrono::steady_clock::now() -
-                                    mapping_snapshot_received_).count() <=
-          indexed_map_snapshot_ttl_s_;
+      query_context.mapping_snapshot_fresh_at_capture;
+  const auto& captured_snapshot = query_context.mapping_snapshot;
   const bool mapping_key_matches =
       !require_mapping_key ||
       (mapping_authority_fresh &&
-       request->component_id == mapping_snapshot_.component_id &&
-       request->map_epoch == mapping_snapshot_.epoch &&
-       request->mapping_graph_revision == mapping_snapshot_.graph_revision &&
-       request->geometry_revision == mapping_snapshot_.geometry_revision &&
-       request->map_source_stamp.sec == mapping_snapshot_.source_stamp.sec &&
+       request->component_id == captured_snapshot.component_id &&
+       request->map_epoch == captured_snapshot.epoch &&
+       request->mapping_graph_revision == captured_snapshot.graph_revision &&
+       request->geometry_revision == captured_snapshot.geometry_revision &&
+       request->map_source_stamp.sec == captured_snapshot.source_stamp.sec &&
        request->map_source_stamp.nanosec ==
-           mapping_snapshot_.source_stamp.nanosec);
+           captured_snapshot.source_stamp.nanosec);
   if (!native_revision_matches || !mapping_key_matches) {
     finish(mgg::PlanningStatus::kStaleRevision,
            "current planning or mapping snapshot does not match");
@@ -3855,7 +3852,6 @@ void PlannerNode::onRefineObjectiveRoute(
       path = std::move(fallback);
     }
   }
-  const IndexedQueryContext query_context = indexedQueryContext();
   map_read = mgg::MolaMap::ReadLease{};
   lock.unlock();
   if (path.status == mgg::PlanningStatus::kSucceeded)
