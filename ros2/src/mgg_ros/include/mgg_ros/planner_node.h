@@ -90,9 +90,39 @@ class PlannerNode : public rclcpp::Node {
   void onRefineObjectiveRoute(
       const std::shared_ptr<mgg_msgs::srv::RefineObjectiveRoute::Request> request,
       std::shared_ptr<mgg_msgs::srv::RefineObjectiveRoute::Response> response);
+  struct CachedObjectiveRoute;
   mgg::FeasiblePath refineCorridor(
       const mgg::RouteCorridor& corridor,
       const mgg::GridRefinementLimits* limits = nullptr);
+  /// Everything one objective needs to ask the topological stage again after
+  /// a corridor has been marked blocked. Shared by Explore, Navigate and Home.
+  struct TopologicalRetry {
+    bool valid = false;
+    mgg::GraphManager* graph = nullptr;
+    mgg::StateVec current = mgg::StateVec::Zero();
+    mgg::PlanningRequest request;
+    double goal_tolerance = 1.0;
+    double minimum_partial_progress = 0.0;
+  };
+  /// Slices a complete topological route into the next bounded local section
+  /// and, when the route continues past it, prepares the continuation token.
+  /// `corridor` carries the full route in and the local section out.
+  bool sliceObjectiveRouteWindow(
+      const mgg::PlanningRequest& core, mgg::RouteCorridor& corridor,
+      std::vector<mgg::StateVec>& global_objective_path,
+      std::unique_ptr<CachedObjectiveRoute>& pending_objective_route);
+  /// Which indexed-authority relaxations an objective may use.
+  struct ObjectiveIndexedFlags {
+    bool height_refinement = false;
+    bool prefix_truncation = false;
+    bool bounded_unknown_tail = false;
+  };
+  ObjectiveIndexedFlags objectiveIndexedQueryFlags(
+      mgg::ObjectiveKind objective) const;
+  /// Monotonic seconds for the blocked-corridor memory. Deliberately not the
+  /// ROS clock: these marks must expire even when /clock stops.
+  static double steadyNowSeconds();
+  mgg::BlockedCorridorView blockedCorridorView() const;
   void convertPathToNavigationBase(mgg::FeasiblePath& path) const;
   struct IndexedQueryContext {
     mgg::StateVec route_start = mgg::StateVec::Zero();
@@ -142,12 +172,21 @@ class PlannerNode : public rclcpp::Node {
       const mgg::StateVec& base_pose) const;
   bool validateObjectiveStartSupport(
       const mgg::StateVec& anchor, const mgg::StateVec& supported,
-      std::vector<mgg::StateVec>& checked) const;
+      std::vector<mgg::StateVec>& checked,
+      bool tolerate_unknown_body = false) const;
+  /// Body-volume verdicts for the shared refinement stage.
+  ///
+  /// `tolerate_unknown` reproduces graph_expansion's lattice policy, which
+  /// admits an edge whose body volume is not fully observed. Exploration must
+  /// keep it: a frontier is by definition adjacent to unknown space, so a
+  /// strict body volume would stop a robot from ever approaching one. Occupied
+  /// space is still a veto, and unknown is never recorded as free.
   mgg::VoxelStatus objectiveBodyStatus(const Eigen::Vector3d& center,
-                                       const Eigen::Vector3d& body) const;
+                                       const Eigen::Vector3d& body,
+                                       bool tolerate_unknown = false) const;
   mgg::VoxelStatus objectiveSweptBodyStatus(
       const Eigen::Vector3d& from, const Eigen::Vector3d& to,
-      const Eigen::Vector3d& body) const;
+      const Eigen::Vector3d& body, bool tolerate_unknown = false) const;
   bool objectiveFootprintTerrainSupported(
       const Eigen::Vector3d& driving_pose,
       const Eigen::Vector3d& body) const;
@@ -195,6 +234,16 @@ class PlannerNode : public rclcpp::Node {
   double objective_route_horizon_m_ = 8.0;
   double objective_route_progress_tolerance_m_ = 1.0;
   std::size_t objective_route_max_poses_ = 4096;
+  /// Corridors whose bounded refinement or execution has just been rejected.
+  /// Bounded and expiring; it only steers corridor choice and never relaxes a
+  /// terrain, body, step, drop or geofence veto.
+  mgg::BlockedCorridorRegistry blocked_corridors_;
+  /// Exploration selection handed to the shared topological stage. The
+  /// utility/gain selector still chooses the target; the stage plans the
+  /// corridor to it.
+  mgg::StateVec explore_root_ = mgg::StateVec::Zero();
+  mgg::StateVec explore_target_ = mgg::StateVec::Zero();
+  bool have_explore_selection_ = false;
   mutable std::string objective_start_support_failure_;
   mutable std::string objective_footprint_failure_;
   mgg::BoundedSpaceParams global_space_;

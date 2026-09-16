@@ -11,6 +11,7 @@
 #include <rclcpp/rclcpp.hpp>
 
 #include <mgg_msgs/srv/plan_objective.hpp>
+#include <mgg_msgs/srv/refine_objective_route.hpp>
 #include <mgg_msgs/srv/planner_srv.hpp>
 #include <mgg_msgs/msg/mapping_snapshot.hpp>
 #include <mgg_msgs/srv/query_map_batch.hpp>
@@ -1002,6 +1003,66 @@ class PlannerNodeTestPeer {
     node.planning_params_.max_ground_height = max_ground_height;
   }
 
+  static PlannerNode::ObjectiveIndexedFlags indexedFlags(
+      const PlannerNode& node, mgg::ObjectiveKind objective) {
+    return node.objectiveIndexedQueryFlags(objective);
+  }
+  static void setRouteHorizon(PlannerNode& node, double horizon,
+                              double tolerance) {
+    const std::lock_guard<std::recursive_mutex> lock(node.planner_mutex_);
+    node.objective_route_horizon_m_ = horizon;
+    node.objective_route_progress_tolerance_m_ = tolerance;
+  }
+  static mgg::StateVec exploreTarget(const PlannerNode& node) {
+    return node.explore_target_;
+  }
+  static bool haveExploreSelection(const PlannerNode& node) {
+    return node.have_explore_selection_;
+  }
+  static void clearExploreSelection(PlannerNode& node) {
+    const std::lock_guard<std::recursive_mutex> lock(node.planner_mutex_);
+    node.have_explore_selection_ = false;
+  }
+  static void buildTopology(mgg::GraphManager& graph,
+                            const std::vector<mgg::StateVec>& vertices,
+                            const std::vector<std::pair<int, int>>& edges) {
+    graph.reset();
+    for (std::size_t i = 0; i < vertices.size(); ++i) {
+      graph.addVertex(new mgg::Vertex(static_cast<int>(i), vertices[i]));
+    }
+    for (const auto& edge : edges) {
+      graph.addEdge(graph.getVertex(edge.first), graph.getVertex(edge.second),
+                    (vertices[static_cast<std::size_t>(edge.second)].head<3>() -
+                     vertices[static_cast<std::size_t>(edge.first)].head<3>())
+                        .norm());
+    }
+  }
+  /// Replaces the local lattice with an explicit topology and pins the
+  /// selector's chosen target, so a test can drive the shared Explore stage
+  /// deterministically without depending on volumetric gain.
+  static void setExploreSelection(
+      PlannerNode& node, const std::vector<mgg::StateVec>& vertices,
+      const std::vector<std::pair<int, int>>& edges, int target_id) {
+    const std::lock_guard<std::recursive_mutex> lock(node.planner_mutex_);
+    buildTopology(*node.local_graph_, vertices, edges);
+    node.explore_root_ = vertices.front();
+    node.explore_target_ = vertices[static_cast<std::size_t>(target_id)];
+    node.have_explore_selection_ = true;
+    node.local_graph_revision_ = 23;
+    node.local_graph_map_revision_ = node.map_revision_;
+  }
+  static std::shared_ptr<mgg_msgs::srv::PlanObjective::Response>
+  requestPinnedExplore(PlannerNode& node) {
+    auto request = std::make_shared<mgg_msgs::srv::PlanObjective::Request>();
+    request->objective = mgg_msgs::srv::PlanObjective::Request::EXPLORE;
+    request->component_id = node.component_id_;
+    request->graph_revision = node.local_graph_revision_;
+    request->map_revision = node.local_graph_map_revision_;
+    auto response =
+        std::make_shared<mgg_msgs::srv::PlanObjective::Response>();
+    node.onObjectiveRequest(request, response);
+    return response;
+  }
   static void expireSnapshot(PlannerNode& node) {
     const std::lock_guard<std::recursive_mutex> lock(node.planner_mutex_);
     node.mapping_snapshot_received_ =
@@ -1749,6 +1810,102 @@ TEST(PlannerExplore, InvalidSmoothedPathRestoresExactValidatedLattice) {
   ASSERT_EQ(smoothed.size(), lattice.size());
   for (std::size_t i = 0; i < lattice.size(); ++i) {
     EXPECT_TRUE(smoothed[i].isApprox(lattice[i], 0.0));
+  }
+}
+
+TEST(PlannerExplore, SharedStageRollsExploreAcrossHorizonWindows) {
+  using Peer = mgg_ros::PlannerNodeTestPeer;
+  rclcpp::NodeOptions options;
+  options.parameter_overrides({rclcpp::Parameter("map.resolution", 0.05)});
+  auto node = std::make_shared<mgg_ros::PlannerNode>(options);
+  Peer::configureGridServiceScene(*node);
+  Peer::acceptOdometry(*node, 0.0, 0.0, 0.075);
+  Peer::setObjectiveGridWindow(*node, 0.50, 0.50);
+  Peer::setRouteHorizon(*node, 0.60, 1.0);
+  const std::vector<mgg::StateVec> lattice{
+      mgg::StateVec(0.0, 0.0, 0.30, 0.0), mgg::StateVec(0.50, 0.0, 0.30, 0.0),
+      mgg::StateVec(1.00, 0.0, 0.30, 0.0), mgg::StateVec(1.50, 0.0, 0.30, 0.0)};
+  Peer::setExploreSelection(*node, lattice, {{0, 1}, {1, 2}, {2, 3}}, 3);
+
+  const auto first = Peer::requestPinnedExplore(*node);
+  ASSERT_EQ(first->status, mgg_msgs::srv::PlanObjective::Response::SUCCEEDED)
+      << first->reason;
+  // Explore now returns the same three things as Navigate and Home: the whole
+  // topological corridor, one bounded executable section, and a continuation
+  // token for the rest.
+  EXPECT_TRUE(first->partial);
+  EXPECT_FALSE(first->route_id.empty());
+  ASSERT_EQ(first->global_path.size(), lattice.size());
+  EXPECT_NEAR(first->global_path.back().position.x, 1.50, 1e-9);
+  ASSERT_GE(first->path.size(), 2u);
+  EXPECT_LT(first->path.back().position.x, 1.0);
+
+  Peer::acceptOdometry(*node, first->path.back().position.x, 0.0, 0.075);
+  auto refine = std::make_shared<mgg_msgs::srv::RefineObjectiveRoute::Request>();
+  refine->route_id = first->route_id;
+  refine->mission_id = "";
+  refine->component_id = first->component_id;
+  const auto second = Peer::refineObjectiveRoute(*node, refine);
+  ASSERT_EQ(second->status,
+            mgg_msgs::srv::RefineObjectiveRoute::Response::SUCCEEDED)
+      << second->reason;
+  ASSERT_GE(second->path.size(), 1u);
+  EXPECT_GT(second->path.back().position.x, first->path.back().position.x);
+
+  // A stale token is refused exactly as it is for the explicit objectives.
+  auto stale = std::make_shared<mgg_msgs::srv::RefineObjectiveRoute::Request>();
+  stale->route_id = "not-a-route";
+  stale->component_id = first->component_id;
+  EXPECT_EQ(Peer::refineObjectiveRoute(*node, stale)->status,
+            mgg_msgs::srv::RefineObjectiveRoute::Response::BLOCKED);
+}
+
+TEST(PlannerExplore, WithoutASelectedTargetExploreIsUnreachable) {
+  using Peer = mgg_ros::PlannerNodeTestPeer;
+  rclcpp::NodeOptions options;
+  options.parameter_overrides({rclcpp::Parameter("map.resolution", 0.05)});
+  auto node = std::make_shared<mgg_ros::PlannerNode>(options);
+  Peer::configureGridServiceScene(*node);
+  Peer::acceptOdometry(*node, 0.0, 0.0, 0.075);
+  const std::vector<mgg::StateVec> lattice{
+      mgg::StateVec(0.0, 0.0, 0.30, 0.0), mgg::StateVec(0.50, 0.0, 0.30, 0.0)};
+  Peer::setExploreSelection(*node, lattice, {{0, 1}}, 1);
+  Peer::clearExploreSelection(*node);
+  const auto response = Peer::requestPinnedExplore(*node);
+  EXPECT_EQ(response->status,
+            mgg_msgs::srv::PlanObjective::Response::UNREACHABLE);
+  EXPECT_TRUE(response->path.empty());
+}
+
+TEST(PlannerObjective, ExploreKeepsSoleAccessToValidatedPrefixTruncation) {
+  using Peer = mgg_ros::PlannerNodeTestPeer;
+  rclcpp::NodeOptions options;
+  options.parameter_overrides({rclcpp::Parameter("map.resolution", 0.05)});
+  auto node = std::make_shared<mgg_ros::PlannerNode>(options);
+  Peer::configureBackboneTest(*node);
+  Peer::setObservedGroundBodyEvidence(*node, true);
+  Peer::setProvisionalUnknownGround(*node, true);
+  Peer::qualifyMolaPolicyForTest(*node);
+
+  const auto explore = Peer::indexedFlags(*node, mgg::ObjectiveKind::kExplore);
+  EXPECT_TRUE(explore.prefix_truncation);
+  EXPECT_FALSE(explore.bounded_unknown_tail);
+  EXPECT_TRUE(explore.height_refinement);
+  for (const auto objective : {mgg::ObjectiveKind::kNavigate,
+                               mgg::ObjectiveKind::kReturnHome}) {
+    const auto flags = Peer::indexedFlags(*node, objective);
+    EXPECT_FALSE(flags.prefix_truncation);
+    EXPECT_TRUE(flags.bounded_unknown_tail);
+    EXPECT_TRUE(flags.height_refinement);
+  }
+  Peer::clearMolaPolicyForTest(*node);
+  for (const auto objective : {mgg::ObjectiveKind::kExplore,
+                               mgg::ObjectiveKind::kNavigate,
+                               mgg::ObjectiveKind::kReturnHome}) {
+    const auto flags = Peer::indexedFlags(*node, objective);
+    EXPECT_FALSE(flags.prefix_truncation);
+    EXPECT_FALSE(flags.bounded_unknown_tail);
+    EXPECT_FALSE(flags.height_refinement);
   }
 }
 
@@ -3401,7 +3558,7 @@ TEST(PlannerBackbone, NumericNoProgressLatchesLostHistoryOnce) {
             std::string::npos);
 }
 
-TEST(PlannerBackbone, LegacyExploreRetainsHangingRootBootstrapPolicy) {
+TEST(PlannerBackbone, ExploreKeepsItsLatticeBodyPolicyInTheSharedStage) {
   rclcpp::NodeOptions options;
   options.parameter_overrides(
       {rclcpp::Parameter("map.resolution", 0.05)});
@@ -3411,24 +3568,34 @@ TEST(PlannerBackbone, LegacyExploreRetainsHangingRootBootstrapPolicy) {
   ASSERT_FALSE(mgg_ros::PlannerNodeTestPeer::initialAnchorSupported(*planner));
   mgg_ros::PlannerNodeTestPeer::observeDestinationSupport(*planner, 0.50);
 
-  // Response-boundary fixture for output already admitted by local graph
-  // expansion, whose established bootstrap policy permits a hanging root.
+  // Explore now goes through the shared refinement stage, including the
+  // bounded blind-start connector from the physical anchor. It keeps the
+  // lattice body policy that admits an unobserved body volume, because a
+  // frontier is by definition next to unknown space.
   mgg::RouteCorridor explore;
   explore.status = mgg::PlanningStatus::kSucceeded;
   explore.request.objective = mgg::ObjectiveKind::kExplore;
   explore.poses.push_back(mgg::StateVec(0.50, 0.0, 0.30, 0.0));
+  explore.request.goal.pose = explore.poses.back();
   const mgg::FeasiblePath response =
       mgg_ros::PlannerNodeTestPeer::refine(*planner, explore);
   ASSERT_EQ(response.status, mgg::PlanningStatus::kSucceeded)
       << response.reason;
-  ASSERT_EQ(response.poses.size(), 1u);
+  ASSERT_GE(response.poses.size(), 2u);
   EXPECT_NEAR(response.poses.front().z(), 0.075, 1e-9);
+  EXPECT_NEAR(response.poses.back().x(), 0.50, 0.05);
 
-  // Explicit objectives do not inherit the hanging-root exception.
+  // Explicit objectives do not inherit that body policy: the same corridor
+  // over an unobserved body volume is still refused.
   mgg::RouteCorridor home = explore;
   home.request.objective = mgg::ObjectiveKind::kReturnHome;
   home.request.goal.pose = mgg::StateVec(0.50, 0.0, 0.075, 0.0);
   EXPECT_EQ(mgg_ros::PlannerNodeTestPeer::refine(*planner, home).status,
+            mgg::PlanningStatus::kBlocked);
+
+  // Occupied space remains a veto for Explore as well.
+  mgg_ros::PlannerNodeTestPeer::addBlockingWall(*planner, 0.30);
+  EXPECT_EQ(mgg_ros::PlannerNodeTestPeer::refine(*planner, explore).status,
             mgg::PlanningStatus::kBlocked);
 }
 

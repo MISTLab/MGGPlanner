@@ -352,6 +352,29 @@ PlannerNode::PlannerNode(const rclcpp::NodeOptions& options)
           : 3.0;
   objective_grid_limits_.start_connector_max_distance_m =
       objective_start_support_max_distance_m_;
+  {
+    mgg::BlockedCorridorLimits blocked;
+    blocked.max_entries = static_cast<std::size_t>(std::clamp(
+        declareOrGet<std::int64_t>(this, "blocked_corridor_max_entries", 64),
+        std::int64_t{0}, std::int64_t{4096}));
+    const double requested_cell = declareOrGet<double>(
+        this, "blocked_corridor_cell_size_m", 0.5);
+    blocked.cell_size_m = std::isfinite(requested_cell)
+                              ? std::clamp(requested_cell, 0.05, 5.0)
+                              : 0.5;
+    const double requested_ttl =
+        declareOrGet<double>(this, "blocked_corridor_ttl_s", 10.0);
+    blocked.ttl_s = std::isfinite(requested_ttl)
+                        ? std::clamp(requested_ttl, 0.0, 600.0)
+                        : 10.0;
+    // A mark also dies once this many new map revisions have arrived: new
+    // measurements are the only thing that can change the verdict that
+    // produced it.
+    blocked.revision_window = static_cast<std::uint64_t>(std::clamp(
+        declareOrGet<std::int64_t>(this, "blocked_corridor_revision_window", 8),
+        std::int64_t{1}, std::int64_t{100000}));
+    blocked_corridors_.setLimits(blocked);
+  }
   const double requested_route_horizon = declareOrGet<double>(
       this, "objective_route_horizon_m", objective_route_horizon_m_);
   objective_route_horizon_m_ =
@@ -1011,6 +1034,7 @@ std::string PlannerNode::buildLocalGraph(bool strict_projected_endpoints) {
   updateGlobalGraph();
 
   local_graph_->reset();
+  have_explore_selection_ = false;
   // Inclinations are keyed by vertex id and the ids restart with the graph.
   edge_inclinations_.clear();
   mgg::StateVec root_state = current_state_;
@@ -1129,6 +1153,13 @@ std::string PlannerNode::buildLocalGraph(bool strict_projected_endpoints) {
     if (v != nullptr) best_path_.push_back(v->state);
   }
   const std::vector<mgg::StateVec> selected_lattice_path = best_path_;
+  // The gain selector owns the exploration target. The shared topological
+  // stage plans the corridor to it, so the exact lattice root and the chosen
+  // leaf are what Explore hands across that boundary.
+  have_explore_selection_ = !selected_lattice_path.empty();
+  explore_root_ = root_state;
+  explore_target_ = have_explore_selection_ ? selected_lattice_path.back()
+                                            : root_state;
 
 
   // What comes out of the graph is a walk along lattice edges: it steps
@@ -1364,7 +1395,7 @@ mgg::StateVec PlannerNode::physicalAnchorAtDrivingHeight(
 
 bool PlannerNode::validateObjectiveStartSupport(
     const mgg::StateVec& anchor, const mgg::StateVec& supported,
-    std::vector<mgg::StateVec>& checked) const {
+    std::vector<mgg::StateVec>& checked, bool tolerate_unknown_body) const {
   checked.clear();
   if (robot_params_.type != mgg::RobotType::kGroundRobot || !ground_ ||
       !anchor.allFinite() || !supported.allFinite() ||
@@ -1462,7 +1493,8 @@ bool PlannerNode::validateObjectiveStartSupport(
       checked.clear();
       return false;
     }
-    const mgg::VoxelStatus swept = objectiveSweptBodyStatus(from, to, body);
+    const mgg::VoxelStatus swept =
+        objectiveSweptBodyStatus(from, to, body, tolerate_unknown_body);
     if (swept != mgg::VoxelStatus::kFree) {
       const bool collect_detail =
           objective_start_support_failure_.empty() ||
@@ -1506,15 +1538,21 @@ bool PlannerNode::validateObjectiveStartSupport(
 }
 
 mgg::VoxelStatus PlannerNode::objectiveBodyStatus(
-    const Eigen::Vector3d& center, const Eigen::Vector3d& body) const {
-  return observed_ground_body_evidence_
+    const Eigen::Vector3d& center, const Eigen::Vector3d& body,
+    bool tolerate_unknown) const {
+  return observed_ground_body_evidence_ || tolerate_unknown
              ? map_->getBoxStatus(center, body, false)
              : map_->getStrictBoxStatus(center, body);
 }
 
 mgg::VoxelStatus PlannerNode::objectiveSweptBodyStatus(
     const Eigen::Vector3d& from, const Eigen::Vector3d& to,
-    const Eigen::Vector3d& body) const {
+    const Eigen::Vector3d& body, bool tolerate_unknown) const {
+  if (!observed_ground_body_evidence_ && tolerate_unknown) {
+    // graph_expansion's own lattice rule: occupied space blocks the sweep,
+    // unobserved space does not.
+    return map_->getPathStatus(from, to, body, false);
+  }
   if (observed_ground_body_evidence_) {
     const Eigen::Vector3d planning_body = robot_params_.getPlanningSize();
     if (map_backend_ == "mola_snapshot" && provisional_unknown_ground_ &&
@@ -2069,11 +2107,24 @@ void PlannerNode::onPlanRequest(
     core.map_source_stamp_sec = snapshot.source_stamp.sec;
     core.map_source_stamp_nanosec = snapshot.source_stamp.nanosec;
   }
+  // The legacy service shares the unified Explore corridor: the gain selector
+  // picks the target, the topological stage plans the route to it. It keeps
+  // its own tighter refinement profile and has no route continuation, so no
+  // horizon window is taken here.
   mgg::RouteCorridor corridor;
   corridor.request = core;
-  corridor.poses = best_path_;
-  corridor.status = best_path_.empty() ? mgg::PlanningStatus::kUnreachable
-                                       : mgg::PlanningStatus::kSucceeded;
+  if (have_explore_selection_) {
+    core.goal.pose = explore_target_;
+    core.goal.landmark_id.clear();
+    mgg::TopologicalGoalPlanner explore_planner(
+        core.component_id, core.graph_revision, core.map_revision,
+        std::max(1e-3, 0.5 * map_->getResolution()));
+    corridor = explore_planner.plan(*local_graph_, explore_root_, core,
+                                    blockedCorridorView());
+    corridor.request = core;
+  } else {
+    corridor.status = mgg::PlanningStatus::kUnreachable;
+  }
   mgg::FeasiblePath feasible = refineCorridor(corridor);
   const bool allow_explore_height_refinement =
       map_backend_ == "mola_snapshot" && provisional_unknown_ground_ &&
@@ -2816,17 +2867,6 @@ mgg::FeasiblePath PlannerNode::refineCorridor(
   if (corridor.status != mgg::PlanningStatus::kSucceeded) return result;
 
   result.poses = corridor.poses;
-  if (corridor.request.objective == mgg::ObjectiveKind::kExplore) {
-    // Explore corridors come only from buildLocalGraph's selector.  Their
-    // edges have already passed graph_expansion's ground/body policy, which
-    // deliberately permits a hanging local root and unknown beyond observed
-    // rays during cold start.  Rechecking with the strict explicit-objective
-    // policy here deadlocks a stationary robot whose lidar cannot see beneath
-    // itself. The caller applies the optional indexed query after releasing
-    // planner_mutex_.
-    convertPathToNavigationBase(result);
-    return result;
-  }
 
   const Eigen::Vector3d footprint_body = robot_params_.getPlanningSize();
   Eigen::Vector3d body = footprint_body;
@@ -2836,6 +2876,12 @@ mgg::FeasiblePath PlannerNode::refineCorridor(
     body.x() = xy_diagonal;
     body.y() = xy_diagonal;
   }
+  // Explore shares this stage's structure and every known-hazard veto, but
+  // keeps the body-evidence policy its lattice has always used: a frontier is
+  // adjacent to unknown space, so requiring a fully observed body volume would
+  // stop the robot from ever reaching one. Explicit objectives stay strict.
+  const bool tolerate_unknown_body =
+      corridor.request.objective == mgg::ObjectiveKind::kExplore;
   // Projection and traversal revisit the same grid poses many times during a
   // refinement. The map is held stable for this RPC, so cache the relatively
   // expensive footprint terrain query for this refinement only. A later RPC
@@ -2915,6 +2961,7 @@ mgg::FeasiblePath PlannerNode::refineCorridor(
   const auto project = [this, body, footprint_body, center_offset,
                         current_anchor, home_anchor,
                         have_connected_home_anchor, request_targets_home_anchor,
+                        tolerate_unknown_body,
                         &corridor, &samePosition, &isPhysicalCurrent,
                         &geofenceContains,
                         &footprintTerrainStatus](mgg::StateVec& state) {
@@ -3010,7 +3057,7 @@ mgg::FeasiblePath PlannerNode::refineCorridor(
     const mgg::VoxelStatus body_status =
         qualified_mola_ground
             ? objectiveSweptBodyStatus(center, center, footprint_body)
-            : objectiveBodyStatus(center, body);
+            : objectiveBodyStatus(center, body, tolerate_unknown_body);
     if (body_status == mgg::VoxelStatus::kOccupied) {
       return mgg::GridProjectionStatus::kBodyOccupied;
     }
@@ -3026,7 +3073,7 @@ mgg::FeasiblePath PlannerNode::refineCorridor(
   };
   const auto traverse =
       [this, body, footprint_body, center_offset, current_anchor, home_anchor,
-       have_connected_home_anchor, &samePosition,
+       have_connected_home_anchor, tolerate_unknown_body, &samePosition,
        &isPhysicalCurrent,
        &geofenceAllows,
        &footprintTerrainStatus, &corridor](const mgg::StateVec& a,
@@ -3068,7 +3115,8 @@ mgg::FeasiblePath PlannerNode::refineCorridor(
           mgg::StateVec projected_mapped = mapped;
           if (!projectStateToDrivingHeight(projected_mapped) ||
               !samePosition(projected_mapped, mapped) ||
-              !validateObjectiveStartSupport(anchor, mapped, checked)) {
+              !validateObjectiveStartSupport(anchor, mapped, checked,
+                                             tolerate_unknown_body)) {
             checked.clear();
             return false;
           }
@@ -3079,7 +3127,8 @@ mgg::FeasiblePath PlannerNode::refineCorridor(
         const Eigen::Vector3d body_to = b.head<3>() + center_offset;
         if (!geofenceAllows(body_from, body_to)) return false;
         if (robot_params_.type == mgg::RobotType::kAerialRobot) {
-          if (map_->getStrictPathStatus(body_from, body_to, body) !=
+          if (map_->getPathStatus(body_from, body_to, body,
+                                  !tolerate_unknown_body) !=
               mgg::VoxelStatus::kFree) {
             return false;
           }
@@ -3098,7 +3147,8 @@ mgg::FeasiblePath PlannerNode::refineCorridor(
         if (ground_->getProjectedEdgeStatus(
                 a.head<3>(), b.head<3>(),
                 qualified_mola_ground ? footprint_body : body,
-                /*stop_at_unknown_voxel=*/!observed_ground_body_evidence_,
+                /*stop_at_unknown_voxel=*/!observed_ground_body_evidence_ &&
+                    !tolerate_unknown_body,
                 projected, provisional_unknown_ground_,
                 qualified_mola_ground && a_physical_current) !=
                 mgg::ProjectedEdgeStatus::kAdmissible ||
@@ -3180,7 +3230,8 @@ mgg::FeasiblePath PlannerNode::refineCorridor(
           const Eigen::Vector3d checked_to =
               checked[i].head<3>() + center_offset;
           if (!geofenceAllows(checked_from, checked_to) ||
-              objectiveSweptBodyStatus(checked_from, checked_to, body) !=
+              objectiveSweptBodyStatus(checked_from, checked_to, body,
+                                       tolerate_unknown_body) !=
                   mgg::VoxelStatus::kFree) {
             return false;
           }
@@ -3192,7 +3243,8 @@ mgg::FeasiblePath PlannerNode::refineCorridor(
       limits != nullptr ? limits : &grid_refinement_limits_;
   if (limits != nullptr &&
       (corridor.request.objective == mgg::ObjectiveKind::kNavigate ||
-       corridor.request.objective == mgg::ObjectiveKind::kReturnHome)) {
+       corridor.request.objective == mgg::ObjectiveKind::kReturnHome ||
+       corridor.request.objective == mgg::ObjectiveKind::kExplore)) {
     widened_objective_limits = *limits;
     widened_objective_limits.detour_margin_m = widestObjectiveGridMargin(
         corridor, current_state_, *limits, objective_grid_max_margin_m_);
@@ -3553,6 +3605,102 @@ void PlannerNode::onValidateObjectiveRoute(
   response->reason = "remaining route has no known hazard";
 }
 
+PlannerNode::ObjectiveIndexedFlags PlannerNode::objectiveIndexedQueryFlags(
+    mgg::ObjectiveKind objective) const {
+  // Joining the shared corridor stage must not move Explore's indexed-query
+  // policy: it remains the only objective allowed to emit a shorter validated
+  // prefix, and the explicit objectives remain the only ones allowed a bounded
+  // unknown tail.
+  const bool qualified_mola_ground =
+      map_backend_ == "mola_snapshot" && provisional_unknown_ground_ &&
+      observed_ground_body_evidence_ &&
+      robot_params_.type == mgg::RobotType::kGroundRobot;
+  ObjectiveIndexedFlags flags;
+  flags.prefix_truncation =
+      qualified_mola_ground && objective == mgg::ObjectiveKind::kExplore;
+  flags.bounded_unknown_tail =
+      qualified_mola_ground && (objective == mgg::ObjectiveKind::kNavigate ||
+                                objective == mgg::ObjectiveKind::kReturnHome);
+  flags.height_refinement =
+      flags.prefix_truncation || flags.bounded_unknown_tail;
+  return flags;
+}
+
+double PlannerNode::steadyNowSeconds() {
+  return std::chrono::duration<double>(
+             std::chrono::steady_clock::now().time_since_epoch())
+      .count();
+}
+
+mgg::BlockedCorridorView PlannerNode::blockedCorridorView() const {
+  mgg::BlockedCorridorView view;
+  view.registry = &blocked_corridors_;
+  view.map_revision = map_revision_;
+  view.now_s = steadyNowSeconds();
+  return view;
+}
+
+bool PlannerNode::sliceObjectiveRouteWindow(
+    const mgg::PlanningRequest& core, mgg::RouteCorridor& corridor,
+    std::vector<mgg::StateVec>& global_objective_path,
+    std::unique_ptr<CachedObjectiveRoute>& pending_objective_route) {
+  global_objective_path.clear();
+  pending_objective_route.reset();
+  if (corridor.status != mgg::PlanningStatus::kSucceeded ||
+      corridor.poses.empty()) {
+    return false;
+  }
+  if (corridor.poses.size() > objective_route_max_poses_) {
+    corridor.status = mgg::PlanningStatus::kBlocked;
+    corridor.reason = "persistent objective route exceeds the bounded pose limit";
+    corridor.poses.clear();
+    return false;
+  }
+  global_objective_path = corridor.poses;
+  global_objective_path.back()[3] = core.goal.pose[3];
+  mgg::RouteCorridor local = corridor;
+  local.poses.clear();
+  double remaining = objective_route_horizon_m_;
+  mgg::StateVec previous = current_state_;
+  std::size_t next_index = 0;
+  while (next_index < corridor.poses.size()) {
+    const mgg::StateVec& target = corridor.poses[next_index];
+    const double distance = (target.head<2>() - previous.head<2>()).norm();
+    if (distance > remaining + 1e-9) {
+      mgg::StateVec endpoint = previous;
+      endpoint.head<3>() +=
+          (target.head<3>() - previous.head<3>()) * (remaining / distance);
+      endpoint[3] = target[3];
+      local.poses.push_back(endpoint);
+      break;
+    }
+    local.poses.push_back(target);
+    remaining = std::max(0.0, remaining - distance);
+    previous = target;
+    ++next_index;
+    if (remaining <= 1e-9) break;
+  }
+  const bool more = next_index < corridor.poses.size();
+  local.partial = more;
+  if (more) {
+    local.request.goal.pose = local.poses.back();
+    local.request.goal.landmark_id.clear();
+    pending_objective_route = std::make_unique<CachedObjectiveRoute>();
+    pending_objective_route->id =
+        route_instance_id_ + "-" + std::to_string(++route_sequence_);
+    pending_objective_route->mission_id = core.mission_id;
+    pending_objective_route->component_id = core.component_id;
+    pending_objective_route->objective = core.objective;
+    pending_objective_route->graph_revision = core.graph_revision;
+    pending_objective_route->exact_goal = core.goal;
+    pending_objective_route->global_poses = global_objective_path;
+    pending_objective_route->next_index = next_index;
+    pending_objective_route->expected_endpoint = local.poses.back();
+  }
+  corridor = std::move(local);
+  return true;
+}
+
 void PlannerNode::onObjectiveRequest(
     const std::shared_ptr<mgg_msgs::srv::PlanObjective::Request> request,
   std::shared_ptr<mgg_msgs::srv::PlanObjective::Response> response) {
@@ -3584,6 +3732,7 @@ void PlannerNode::onObjectiveRequest(
   corridor.request = core;
   bool explicit_objective_planned = false;
   bool provisional_physical_home = false;
+  TopologicalRetry topological_retry;
   const bool local_objective = core.objective == mgg::ObjectiveKind::kExplore;
   const std::uint64_t active_graph_revision =
       local_objective ? local_graph_revision_ : graph_revision_;
@@ -3659,11 +3808,39 @@ void PlannerNode::onObjectiveRequest(
                                           : graph_revision_;
     core.map_revision = map_revision_;
     if (core.objective == mgg::ObjectiveKind::kExplore) {
-      corridor.request = core;
-      corridor.poses = best_path_;
-      corridor.status = best_path_.empty() ? mgg::PlanningStatus::kUnreachable
-                                           : mgg::PlanningStatus::kSucceeded;
-      corridor.reason = best_path_.empty() ? summary : "";
+      // Explore's utility/gain selector still chooses the target frontier.
+      // The corridor to it now comes from the same topological stage that
+      // Navigate and ReturnHome use, so all three share terrain decisions,
+      // the bounded local window and route continuation.
+      if (!have_explore_selection_) {
+        corridor.request = core;
+        corridor.status = mgg::PlanningStatus::kUnreachable;
+        corridor.reason =
+            summary.empty()
+                ? "exploration selector produced no gain-bearing target"
+                : summary;
+      } else {
+        // The selector's leaf is the objective goal from here on, so the
+        // window, the response and the continuation token all agree on it.
+        core.goal.pose = explore_target_;
+        core.goal.landmark_id.clear();
+        // A lattice vertex is an exact graph state. Bind it tightly so the
+        // stage cannot substitute a neighbouring vertex for the chosen leaf.
+        const double explore_tolerance =
+            std::max(1e-3, 0.5 * map_->getResolution());
+        mgg::TopologicalGoalPlanner explore_planner(
+            core.component_id, core.graph_revision, core.map_revision,
+            explore_tolerance);
+        topological_retry.valid = true;
+        topological_retry.graph = local_graph_.get();
+        topological_retry.current = explore_root_;
+        topological_retry.request = core;
+        topological_retry.goal_tolerance = explore_tolerance;
+        topological_retry.minimum_partial_progress = 0.0;
+        corridor = explore_planner.plan(*local_graph_, explore_root_, core,
+                                        blockedCorridorView());
+        corridor.request = core;
+      }
     } else {
       // All explicit objectives use the persistent graph snapshot. Missing or
       // disconnected topology cannot suppress Navigate's bounded map A*.
@@ -3743,14 +3920,22 @@ void PlannerNode::onObjectiveRequest(
         if (projected_goal_supported) {
           graph_request.goal.pose = projected_goal;
         }
-        mgg::TopologicalGoalPlanner objective_planner(
-            core.component_id, core.graph_revision, core.map_revision, 1.0,
+        const double explicit_minimum_progress =
             core.objective == mgg::ObjectiveKind::kNavigate
                 ? partial_route_min_progress_m_
-                : 0.0);
+                : 0.0;
+        mgg::TopologicalGoalPlanner objective_planner(
+            core.component_id, core.graph_revision, core.map_revision, 1.0,
+            explicit_minimum_progress);
         explicit_objective_planned = true;
-        corridor =
-            objective_planner.plan(graph, graph_current, graph_request);
+        topological_retry.valid = true;
+        topological_retry.graph = &graph;
+        topological_retry.current = graph_current;
+        topological_retry.request = graph_request;
+        topological_retry.goal_tolerance = 1.0;
+        topological_retry.minimum_partial_progress = explicit_minimum_progress;
+        corridor = objective_planner.plan(graph, graph_current, graph_request,
+                                          blockedCorridorView());
         if (core.objective == mgg::ObjectiveKind::kNavigate &&
             robot_params_.type == mgg::RobotType::kGroundRobot &&
             !projected_goal_supported && corridor.poses.size() >= 2u &&
@@ -3773,68 +3958,15 @@ void PlannerNode::onObjectiveRequest(
     }
   }
 
+  // All three objectives take the same bounded first section out of their
+  // persistent topological route, and mint the same continuation token.
   std::vector<mgg::StateVec> global_objective_path;
   std::unique_ptr<CachedObjectiveRoute> pending_objective_route;
-  if ((core.objective == mgg::ObjectiveKind::kNavigate ||
-       core.objective == mgg::ObjectiveKind::kReturnHome) &&
-      corridor.status == mgg::PlanningStatus::kSucceeded &&
-      !corridor.poses.empty()) {
-    if (corridor.poses.size() > objective_route_max_poses_) {
-      corridor.status = mgg::PlanningStatus::kBlocked;
-      corridor.reason = "persistent objective route exceeds the bounded pose limit";
-      corridor.poses.clear();
-    } else {
-      global_objective_path = corridor.poses;
-      global_objective_path.back()[3] = core.goal.pose[3];
-      mgg::RouteCorridor local = corridor;
-      local.poses.clear();
-      double remaining = objective_route_horizon_m_;
-      mgg::StateVec previous = current_state_;
-      std::size_t next_index = 0;
-      while (next_index < corridor.poses.size()) {
-        const mgg::StateVec& target = corridor.poses[next_index];
-        const double distance =
-            (target.head<2>() - previous.head<2>()).norm();
-        if (distance > remaining + 1e-9) {
-          mgg::StateVec endpoint = previous;
-          endpoint.head<3>() +=
-              (target.head<3>() - previous.head<3>()) * (remaining / distance);
-          endpoint[3] = target[3];
-          local.poses.push_back(endpoint);
-          break;
-        }
-        local.poses.push_back(target);
-        remaining = std::max(0.0, remaining - distance);
-        previous = target;
-        ++next_index;
-        if (remaining <= 1e-9) break;
-      }
-      const bool more = next_index < corridor.poses.size();
-      local.partial = more;
-      if (more) {
-        local.request.goal.pose = local.poses.back();
-        local.request.goal.landmark_id.clear();
-        pending_objective_route = std::make_unique<CachedObjectiveRoute>();
-        pending_objective_route->id = route_instance_id_ + "-" +
-                                 std::to_string(++route_sequence_);
-        pending_objective_route->mission_id = core.mission_id;
-        pending_objective_route->component_id = core.component_id;
-        pending_objective_route->objective = core.objective;
-        pending_objective_route->graph_revision = core.graph_revision;
-        pending_objective_route->exact_goal = core.goal;
-        pending_objective_route->global_poses = global_objective_path;
-        pending_objective_route->next_index = next_index;
-        pending_objective_route->expected_endpoint = local.poses.back();
-      }
-      corridor = std::move(local);
-    }
-  }
+  sliceObjectiveRouteWindow(core, corridor, global_objective_path,
+                            pending_objective_route);
 
-  const mgg::GridRefinementLimits* objective_limits =
-      (core.objective == mgg::ObjectiveKind::kNavigate ||
-       core.objective == mgg::ObjectiveKind::kReturnHome)
-          ? &objective_grid_limits_
-          : nullptr;
+  // All three objectives now refine against the same bounded grid profile.
+  const mgg::GridRefinementLimits* objective_limits = &objective_grid_limits_;
   mgg::RouteCorridor primary = corridor;
   const bool objective_graph_primary =
       explicit_objective_planned &&
@@ -3911,23 +4043,14 @@ void PlannerNode::onObjectiveRequest(
       path = std::move(fallback);
     }
   }
-  const bool qualified_mola_ground =
-      map_backend_ == "mola_snapshot" && provisional_unknown_ground_ &&
-      observed_ground_body_evidence_ &&
-      robot_params_.type == mgg::RobotType::kGroundRobot;
-  const bool qualified_explore_ground =
-      qualified_mola_ground &&
-      core.objective == mgg::ObjectiveKind::kExplore;
-  const bool qualified_explicit_ground =
-      qualified_mola_ground &&
-      (core.objective == mgg::ObjectiveKind::kNavigate ||
-       core.objective == mgg::ObjectiveKind::kReturnHome);
+  const ObjectiveIndexedFlags indexed_flags =
+      objectiveIndexedQueryFlags(core.objective);
   map_read.allowPublication();
   lock.unlock();
   if (path.status == mgg::PlanningStatus::kSucceeded) {
-    queryIndexedMap(path, query_context,
-                    qualified_explore_ground || qualified_explicit_ground,
-                    qualified_explore_ground, qualified_explicit_ground);
+    queryIndexedMap(path, query_context, indexed_flags.height_refinement,
+                    indexed_flags.prefix_truncation,
+                    indexed_flags.bounded_unknown_tail);
   }
   if (mola_map_ != nullptr) {
     lock.lock();
@@ -3957,9 +4080,7 @@ void PlannerNode::onObjectiveRequest(
       pending_objective_route) {
     if (!lock.owns_lock()) lock.lock();
     cached_objective_route_ = std::move(pending_objective_route);
-  } else if (objective_generation == objective_request_generation_ &&
-             (core.objective == mgg::ObjectiveKind::kReturnHome ||
-              core.objective == mgg::ObjectiveKind::kNavigate)) {
+  } else if (objective_generation == objective_request_generation_) {
     if (!lock.owns_lock()) lock.lock();
     cached_objective_route_.reset();
   }
@@ -3985,7 +4106,13 @@ void PlannerNode::onObjectiveRequest(
     convertPathToNavigationBase(display);
     for (const auto& pose : display.poses)
       response->global_path.push_back(toPoseMsg(pose));
-    response->global_path.back() = toPoseMsg(core.goal.pose);
+    if (core.objective != mgg::ObjectiveKind::kExplore) {
+      // Navigate and ReturnHome own an exact caller-supplied goal already
+      // expressed in the navigation base frame. Explore's goal is a graph
+      // vertex the selector chose, so it takes the same conversion as the
+      // rest of the corridor.
+      response->global_path.back() = toPoseMsg(core.goal.pose);
+    }
   }
   if (cached_objective_route_ && path.status == mgg::PlanningStatus::kSucceeded &&
       path.partial) {
@@ -4008,7 +4135,13 @@ void PlannerNode::onRefineObjectiveRoute(
     response->component_id = cached_objective_route_
                                  ? cached_objective_route_->component_id
                                  : component_id_;
-    response->graph_revision = graph_revision_;
+    // An exploration route is pinned to the local lattice snapshot, not to the
+    // persistent graph revision the explicit objectives bind.
+    response->graph_revision =
+        cached_objective_route_ && cached_objective_route_->objective ==
+                                       mgg::ObjectiveKind::kExplore
+            ? local_graph_revision_
+            : graph_revision_;
     response->map_revision = map_revision_;
     if (have_mapping_snapshot_) {
       response->map_epoch = mapping_snapshot_.epoch;
