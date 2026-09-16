@@ -2082,6 +2082,7 @@ void PlannerNode::onPlanRequest(
   lock.unlock();
   if (feasible.status == mgg::PlanningStatus::kSucceeded) {
     queryIndexedMap(feasible, query_context,
+                    allow_explore_height_refinement,
                     allow_explore_height_refinement);
   }
   lock.lock();
@@ -2167,7 +2168,9 @@ PlannerNode::IndexedQueryContext PlannerNode::indexedQueryContext() const {
 
 bool PlannerNode::queryIndexedMap(mgg::FeasiblePath& path,
                                   const IndexedQueryContext& context,
-                                  bool allow_explore_height_refinement) {
+                                  bool allow_height_refinement,
+                                  bool allow_prefix_truncation,
+                                  bool allow_bounded_unknown_tail) {
   path.indexed_map_validated = false;
   if (!indexed_map_client_) return true;
   const auto fail = [&path](mgg::PlanningStatus status,
@@ -2180,12 +2183,16 @@ bool PlannerNode::queryIndexedMap(mgg::FeasiblePath& path,
   };
   const auto query_deadline = std::chrono::steady_clock::now() +
       std::chrono::duration<double>(indexed_map_query_timeout_s_);
-  const bool explore_route_recovery_allowed =
-      allow_explore_height_refinement &&
+  const bool qualified_height_refinement_allowed =
+      allow_height_refinement &&
       context.observed_ground_body_evidence &&
       context.provisional_unknown_ground &&
       context.robot_type == mgg::RobotType::kGroundRobot;
-  bool height_refinement_available = explore_route_recovery_allowed;
+  const bool prefix_truncation_allowed =
+      allow_prefix_truncation && qualified_height_refinement_allowed;
+  const bool bounded_unknown_tail_allowed =
+      allow_bounded_unknown_tail && qualified_height_refinement_allowed;
+  bool height_refinement_available = qualified_height_refinement_allowed;
   static const std::regex kDigest("^[0-9a-fA-F]{64}$");
   if (path.component_id.empty() ||
       !std::regex_match(path.geometry_revision, kDigest) ||
@@ -2297,7 +2304,7 @@ bool PlannerNode::queryIndexedMap(mgg::FeasiblePath& path,
       // that corrected height. Every other caller retains full 3-D spacing.
       const Eigen::Vector3d segment_delta = b.head<3>() - a.head<3>();
       const double distance =
-          explore_route_recovery_allowed
+          qualified_height_refinement_allowed
               ? segment_delta.head<2>().norm()
               : segment_delta.norm();
       const double scaled_steps = distance / indexed_map_sample_spacing_m_;
@@ -2521,8 +2528,9 @@ bool PlannerNode::queryIndexedMap(mgg::FeasiblePath& path,
               }
               return unsupported("ground or roughness is unavailable");
             }
-            // The native MOLA edge checks support this bounded connector, but
-            // a finite sample must close it before an emitted endpoint.
+            // Native MOLA edge checks support this bounded connector. Explore
+            // still requires later measured support before emitting a prefix;
+            // qualified Navigate/Home may retain a bounded unknown tail.
             provisional_gap_open = true;
             used_provisional_missing_terrain = true;
             continue;
@@ -2557,7 +2565,7 @@ bool PlannerNode::queryIndexedMap(mgg::FeasiblePath& path,
           refined_base_z[i] = dense_base_states[i].z();
           if (ground_mismatch > indexed_map_ground_tolerance_m_ + 1e-9) {
             const bool physical_start_sample =
-                explore_route_recovery_allowed &&
+                qualified_height_refinement_allowed &&
                 context.preserve_physical_start_height &&
                 dense_route_distance[i] <= 1e-9 &&
                 (dense_base_states[i].head<3>() -
@@ -2633,14 +2641,15 @@ bool PlannerNode::queryIndexedMap(mgg::FeasiblePath& path,
         }
       }
       if (context.robot_type != mgg::RobotType::kAerialRobot) {
-        if (provisional_gap_open) {
+        if (provisional_gap_open && !bounded_unknown_tail_allowed) {
           return "indexed map route ends without measured terrain support";
         }
-        if (!have_measured_terrain) {
+        if (!have_measured_terrain && !bounded_unknown_tail_allowed) {
           return "indexed map route has no measured terrain support";
         }
         if (used_provisional_missing_terrain &&
-            !have_positive_progress_terrain) {
+            !have_positive_progress_terrain &&
+            !bounded_unknown_tail_allowed) {
           return "indexed map provisional terrain has no positive-progress "
                  "support";
         }
@@ -2652,7 +2661,7 @@ bool PlannerNode::queryIndexedMap(mgg::FeasiblePath& path,
     std::size_t accepted_count = count;
     bool used_validated_prefix = false;
     if (route_failure) {
-      if (!explore_route_recovery_allowed || !prefix_end ||
+      if (!prefix_truncation_allowed || !prefix_end ||
           !path.speed_limits.empty()) {
         return fail(mgg::PlanningStatus::kBlocked, *route_failure);
       }
@@ -2691,8 +2700,19 @@ bool PlannerNode::queryIndexedMap(mgg::FeasiblePath& path,
           ++end;
         }
         if (end >= accepted_count) {
-          return fail(mgg::PlanningStatus::kBlocked,
-                      "indexed map route ends without measured terrain support");
+          if (!bounded_unknown_tail_allowed || begin == 0) {
+            return fail(
+                mgg::PlanningStatus::kBlocked,
+                "indexed map route ends without measured terrain support");
+          }
+          // Unknown terrain cannot define a new slope. Carry the last checked
+          // driving height through this bounded tail, then require the native
+          // swept-body check and repeated pinned indexed query below.
+          const double inherited_z = refined[begin - 1].z();
+          for (std::size_t i = begin; i < accepted_count; ++i) {
+            refined[i].z() = inherited_z;
+          }
+          break;
         }
         const std::size_t anchor = begin == 0 ? 0 : begin - 1;
         const double span = dense_route_distance[end] -
@@ -3891,14 +3911,23 @@ void PlannerNode::onObjectiveRequest(
       path = std::move(fallback);
     }
   }
-  const bool allow_explore_height_refinement =
-      core.objective == mgg::ObjectiveKind::kExplore &&
+  const bool qualified_mola_ground =
       map_backend_ == "mola_snapshot" && provisional_unknown_ground_ &&
-      observed_ground_body_evidence_;
+      observed_ground_body_evidence_ &&
+      robot_params_.type == mgg::RobotType::kGroundRobot;
+  const bool qualified_explore_ground =
+      qualified_mola_ground &&
+      core.objective == mgg::ObjectiveKind::kExplore;
+  const bool qualified_explicit_ground =
+      qualified_mola_ground &&
+      (core.objective == mgg::ObjectiveKind::kNavigate ||
+       core.objective == mgg::ObjectiveKind::kReturnHome);
   map_read.allowPublication();
   lock.unlock();
   if (path.status == mgg::PlanningStatus::kSucceeded) {
-    queryIndexedMap(path, query_context, allow_explore_height_refinement);
+    queryIndexedMap(path, query_context,
+                    qualified_explore_ground || qualified_explicit_ground,
+                    qualified_explore_ground, qualified_explicit_ground);
   }
   if (mola_map_ != nullptr) {
     lock.lock();
@@ -4111,8 +4140,15 @@ void PlannerNode::onRefineObjectiveRoute(
   }
   map_read.allowPublication();
   lock.unlock();
-  if (path.status == mgg::PlanningStatus::kSucceeded)
-    queryIndexedMap(path, query_context);
+  if (path.status == mgg::PlanningStatus::kSucceeded) {
+    const bool qualified_explicit_ground =
+        map_backend_ == "mola_snapshot" && provisional_unknown_ground_ &&
+        observed_ground_body_evidence_ &&
+        robot_params_.type == mgg::RobotType::kGroundRobot;
+    queryIndexedMap(path, query_context, qualified_explicit_ground,
+                    /*allow_prefix_truncation=*/false,
+                    qualified_explicit_ground);
+  }
   lock.lock();
   if (mola_map_ != nullptr) {
     map_read.reacquirePublication();

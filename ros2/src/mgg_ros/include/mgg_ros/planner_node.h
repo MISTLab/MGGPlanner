@@ -115,7 +115,9 @@ class PlannerNode : public rclcpp::Node {
   IndexedQueryContext indexedQueryContext() const;
   bool queryIndexedMap(mgg::FeasiblePath& path,
                        const IndexedQueryContext& context,
-                       bool allow_explore_height_refinement = false);
+                       bool allow_height_refinement = false,
+                       bool allow_prefix_truncation = false,
+                       bool allow_bounded_unknown_tail = false);
   void publishOwnGraph();
   void publishPath();
   void publishMarkers();

@@ -449,7 +449,7 @@ class PlannerNodeTestPeer {
     node.objective_grid_limits_.max_expansions = 4096;
     node.objective_grid_limits_.timeout = std::chrono::milliseconds(1000);
     std::vector<Eigen::Vector3d> floor;
-    for (int x = -4; x <= 40; ++x) {
+    for (int x = -4; x <= 80; ++x) {
       const double world_x = x * 0.05 + 0.025;
       const double ground_z =
           world_x <= 1.50 ? std::max(0.0, 0.08 * world_x) : 0.12;
@@ -911,8 +911,21 @@ class PlannerNodeTestPeer {
       const std::lock_guard<std::recursive_mutex> lock(node.planner_mutex_);
       context = node.indexedQueryContext();
     }
+    return node.queryIndexedMap(
+        path, context, allow_explore_height_refinement,
+        /*allow_prefix_truncation=*/allow_explore_height_refinement);
+  }
+
+  static bool queryExplicit(PlannerNode& node, mgg::FeasiblePath& path) {
+    PlannerNode::IndexedQueryContext context;
+    {
+      const std::lock_guard<std::recursive_mutex> lock(node.planner_mutex_);
+      context = node.indexedQueryContext();
+    }
     return node.queryIndexedMap(path, context,
-                                allow_explore_height_refinement);
+                                /*allow_height_refinement=*/true,
+                                /*allow_prefix_truncation=*/false,
+                                /*allow_bounded_unknown_tail=*/true);
   }
 
   static bool queryAfterCapturedSnapshotReceiptAges(
@@ -2658,9 +2671,10 @@ TEST(PlannerObjective, ProvisionalUnknownContinuesFromLastKnownRampHeight) {
   Peer::configureKnownRampThenUnknown(*planner);
 
   // The known road climbs gradually to a 12 cm plateau and observations end
-  // at x=2 m. The remaining unknown suffix must inherit that locally reached
+  // at x=4 m. This six-metre objective fits within the final local horizon;
+  // its unknown suffix must inherit that locally reached
   // driving plane instead of snapping back to the initial height.
-  const mgg::StateVec goal(3.5, 0.0, 0.075, 0.6);
+  const mgg::StateVec goal(6.0, 0.0, 0.075, 0.6);
   const auto response = Peer::requestBoundNavigate(*planner, goal);
 
   ASSERT_NE(response, nullptr);
@@ -4279,6 +4293,28 @@ TEST(IndexedObjectiveService, BatchedQueryIsBoundedAndUsesComponentFrame) {
   EXPECT_NE(path.reason.find("ends without measured terrain support"),
             std::string::npos);
 
+  // Qualified Navigate/Home keeps its exact local endpoint when the indexed
+  // authority reports a bounded unknown tail. The strict/default call above
+  // rejects the same terrain evidence.
+  sample_occupancy = Query::Response::UNKNOWN;
+  sample_clearance = std::numeric_limits<double>::quiet_NaN();
+  path.status = mgg::PlanningStatus::kSucceeded;
+  path.partial = false;
+  path.poses = {mgg::StateVec(0.0, 0.0, 0.0, 0.3),
+                mgg::StateVec(1.2, 0.0, 0.0, -0.4)};
+  EXPECT_TRUE(mgg_ros::PlannerNodeTestPeer::queryExplicit(*planner, path))
+      << path.reason;
+  EXPECT_TRUE(path.indexed_map_validated);
+  EXPECT_FALSE(path.partial);
+  EXPECT_FALSE(path.poses.empty());
+  if (!path.poses.empty()) {
+    EXPECT_NEAR(path.poses.back().x(), 1.2, 1e-9);
+    EXPECT_NEAR(path.poses.back().y(), 0.0, 1e-9);
+    EXPECT_NEAR(path.poses.back()[3], -0.4, 1e-9);
+  }
+  sample_occupancy = Query::Response::FREE;
+  sample_clearance = 100.0;
+
   terrain_case = kFiniteRootThenBlind;
   path.status = mgg::PlanningStatus::kSucceeded;
   path.poses = {mgg::StateVec(0.0, 0.0, 0.0, 0.0),
@@ -4286,6 +4322,27 @@ TEST(IndexedObjectiveService, BatchedQueryIsBoundedAndUsesComponentFrame) {
   EXPECT_FALSE(mgg_ros::PlannerNodeTestPeer::query(*planner, path));
   EXPECT_NE(path.reason.find("ends without measured terrain support"),
             std::string::npos);
+
+  // Physical provenance is sufficient for a wholly unknown bounded local
+  // window. The existing connector limit remains hard.
+  sample_occupancy = Query::Response::UNKNOWN;
+  sample_clearance = std::numeric_limits<double>::quiet_NaN();
+  path.status = mgg::PlanningStatus::kSucceeded;
+  path.partial = false;
+  path.poses = {mgg::StateVec(0.0, 0.0, 0.0, 0.0),
+                mgg::StateVec(1.2, 0.0, 0.0, 0.0)};
+  EXPECT_TRUE(mgg_ros::PlannerNodeTestPeer::queryExplicit(*planner, path))
+      << path.reason;
+  EXPECT_TRUE(path.indexed_map_validated);
+  EXPECT_FALSE(path.partial);
+
+  path.status = mgg::PlanningStatus::kSucceeded;
+  path.poses = {mgg::StateVec(0.0, 0.0, 0.0, 0.0),
+                mgg::StateVec(3.6, 0.0, 0.0, 0.0)};
+  EXPECT_FALSE(mgg_ros::PlannerNodeTestPeer::queryExplicit(*planner, path));
+  EXPECT_NE(path.reason.find("connector exceeds its bound"), std::string::npos);
+  sample_occupancy = Query::Response::FREE;
+  sample_clearance = 100.0;
 
   const auto expect_gap_hazard = [&](int active_case,
                                      const char* expected_reason) {
@@ -4297,6 +4354,14 @@ TEST(IndexedObjectiveService, BatchedQueryIsBoundedAndUsesComponentFrame) {
     EXPECT_FALSE(path.indexed_map_validated);
     EXPECT_NE(path.reason.find(expected_reason), std::string::npos)
         << "case " << active_case << ": " << path.reason;
+    path.status = mgg::PlanningStatus::kSucceeded;
+    path.partial = false;
+    path.poses = {mgg::StateVec(0.0, 0.0, 0.0, 0.0),
+                  mgg::StateVec(1.2, 0.0, 0.0, 0.0)};
+    EXPECT_FALSE(mgg_ros::PlannerNodeTestPeer::queryExplicit(*planner, path));
+    EXPECT_FALSE(path.indexed_map_validated);
+    EXPECT_NE(path.reason.find(expected_reason), std::string::npos)
+        << "explicit case " << active_case << ": " << path.reason;
   };
   expect_gap_hazard(kOccupiedInsideGap, "occupied or unknown");
   expect_gap_hazard(kLowClearanceInsideGap,
@@ -4508,6 +4573,25 @@ TEST(IndexedObjectiveService, BatchedQueryIsBoundedAndUsesComponentFrame) {
   ASSERT_FALSE(path.poses.empty());
   EXPECT_NEAR(path.poses.back().z(), 0.010, 2e-6);
   refinement_dip = 0.11;
+
+  // Explicit objectives may use the same bounded terrain-height correction,
+  // but must retain the requested endpoint and may not become an Explore
+  // prefix when indexed evidence is sparse.
+  query_count = 0;
+  path.status = mgg::PlanningStatus::kSucceeded;
+  path.partial = false;
+  path.poses = {mgg::StateVec(0.0, 0.0, 0.0, 0.25),
+                mgg::StateVec(1.2, 0.0, 0.0, -0.35)};
+  EXPECT_TRUE(mgg_ros::PlannerNodeTestPeer::queryExplicit(*planner, path))
+      << path.reason;
+  EXPECT_EQ(query_count.load(), 2u);
+  EXPECT_FALSE(path.partial);
+  EXPECT_FALSE(path.poses.empty());
+  if (!path.poses.empty()) {
+    EXPECT_NEAR(path.poses.back().x(), 1.2, 1e-9);
+    EXPECT_NEAR(path.poses.back().y(), 0.0, 1e-9);
+    EXPECT_NEAR(path.poses.back()[3], -0.35, 1e-9);
+  }
 
   // A later fitted sample must not rewrite earlier poses whose emitted
   // heights already agreed with the indexed terrain. The second response
