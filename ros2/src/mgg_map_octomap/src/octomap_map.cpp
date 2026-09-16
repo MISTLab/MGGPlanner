@@ -19,7 +19,7 @@ inline Eigen::Vector3d toEigen(const octomap::point3d& p) {
 }  // namespace
 
 OctomapMap::OctomapMap(const OctomapConfig& config)
-    : tree_(std::make_unique<octomap::OcTree>(config.resolution)),
+    : tree_(std::make_unique<UpdateAwareOcTree>(config.resolution)),
       config_(config) {
   tree_->setProbHit(config_.probability_hit);
   tree_->setProbMiss(config_.probability_miss);
@@ -33,8 +33,66 @@ void OctomapMap::insertPointCloud(const std::vector<Eigen::Vector3d>& points,
   octomap::Pointcloud cloud;
   cloud.reserve(points.size());
   for (const auto& p : points) cloud.push_back(toOct(p));
-  tree_->insertPointCloud(cloud, toOct(sensor_origin), config_.max_range);
+  if (!track_measured_surface_z_) {
+    tree_->insertPointCloud(cloud, toOct(sensor_origin), config_.max_range);
+    has_data_ = has_data_ || !points.empty();
+    return;
+  }
+
+  // This is OctoMap's non-discretized insertPointCloud update sequence, kept
+  // in an opt-in branch so surface bookkeeping can use the exact same free
+  // and occupied key sets without computing every sensor ray twice.
+  octomap::KeySet free_cells;
+  octomap::KeySet occupied_cells;
+  tree_->computeUpdate(cloud, toOct(sensor_origin), free_cells, occupied_cells,
+                       config_.max_range);
+  for (const octomap::OcTreeKey& key : free_cells) {
+    tree_->updateNode(key, false);
+    const octomap::OcTreeNode* node = tree_->search(key);
+    if (node == nullptr || !tree_->isNodeOccupied(node)) {
+      measured_surface_max_z_.erase({key[0], key[1], key[2]});
+    }
+  }
+  for (const octomap::OcTreeKey& key : occupied_cells) {
+    const octomap::OcTreeNode* before = tree_->search(key);
+    const bool was_occupied =
+        before != nullptr && tree_->isNodeOccupied(before);
+    tree_->updateNode(key, true);
+    if (!was_occupied) {
+      measured_surface_max_z_.erase({key[0], key[1], key[2]});
+    }
+  }
+  for (const Eigen::Vector3d& point : points) {
+    if (!point.allFinite() || !sensor_origin.allFinite()) continue;
+    // Match computeUpdate's float-coordinate range decision exactly at the
+    // configured boundary.
+    const octomap::point3d oct_point = toOct(point);
+    const double range = (oct_point - toOct(sensor_origin)).norm();
+    if (!std::isfinite(range) ||
+        (config_.max_range >= 0.0 && range > config_.max_range)) {
+      continue;
+    }
+    octomap::OcTreeKey key;
+    if (!tree_->coordToKeyChecked(oct_point, key) ||
+        occupied_cells.find(key) == occupied_cells.end()) {
+      continue;
+    }
+    const octomap::OcTreeNode* node = tree_->search(key);
+    if (node == nullptr || !tree_->isNodeOccupied(node)) continue;
+    const SurfaceKey surface_key{key[0], key[1], key[2]};
+    const auto found = measured_surface_max_z_.find(surface_key);
+    if (found == measured_surface_max_z_.end()) {
+      measured_surface_max_z_.emplace(surface_key, point.z());
+    } else {
+      found->second = std::max(found->second, point.z());
+    }
+  }
   has_data_ = has_data_ || !points.empty();
+}
+
+void OctomapMap::setTrackMeasuredSurfaceZ(bool enabled) {
+  track_measured_surface_z_ = enabled;
+  if (!enabled) measured_surface_max_z_.clear();
 }
 
 double OctomapMap::getResolution() const { return tree_->getResolution(); }
@@ -111,6 +169,26 @@ VoxelStatus OctomapMap::getRayStatus(const Eigen::Vector3d& view_point,
             return true;
           });
   return result;
+}
+
+VoxelStatus OctomapMap::getGroundRayStatus(
+    const Eigen::Vector3d& view_point,
+    const Eigen::Vector3d& voxel_to_test, bool stop_at_unknown_voxel,
+    Eigen::Vector3d& end_voxel) const {
+  const VoxelStatus status = getRayStatus(
+      view_point, voxel_to_test, stop_at_unknown_voxel, end_voxel);
+  if (status != VoxelStatus::kOccupied || !track_measured_surface_z_) {
+    return status;
+  }
+  octomap::OcTreeKey key;
+  if (!tree_->coordToKeyChecked(toOct(end_voxel), key)) return status;
+  const auto found =
+      measured_surface_max_z_.find({key[0], key[1], key[2]});
+  if (found != measured_surface_max_z_.end() &&
+      std::isfinite(found->second)) {
+    end_voxel.z() = found->second;
+  }
+  return status;
 }
 
 VoxelStatus OctomapMap::queryBox(const Eigen::Vector3d& center,
@@ -321,6 +399,7 @@ bool OctomapMap::augmentFreeBox(const Eigen::Vector3d& position,
         // accumulate evidence, or clearing the robot's own footprint would
         // take several calls to take effect.
         tree_->setNodeValue(key, tree_->getClampingThresMinLog());
+        measured_surface_max_z_.erase({key[0], key[1], key[2]});
       }
   has_data_ = true;
   return true;
@@ -334,6 +413,7 @@ void OctomapMap::augmentFreeFrustum() {
 
 void OctomapMap::resetMap() {
   tree_->clear();
+  measured_surface_max_z_.clear();
   has_data_ = false;
 }
 

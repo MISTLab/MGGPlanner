@@ -421,4 +421,128 @@ TEST(OctomapMap, LocalPointcloudReturnsNearbyOccupiedVoxels) {
   }
 }
 
+TEST(OctomapMap, GroundRayUsesMeasuredMaximumWithinCoarseVoxel) {
+  OctomapConfig cfg;
+  cfg.resolution = 0.15;
+  cfg.max_range = 20.0;
+  const Eigen::Vector3d origin(0.01, 0.01, 1.0);
+  const Eigen::Vector3d low(0.01, 0.01, 0.02);
+  const Eigen::Vector3d high(0.02, 0.02, 0.12);
+
+  OctomapMap fallback(cfg);
+  fallback.insertPointCloud({low}, origin);
+  Eigen::Vector3d fallback_hit;
+  ASSERT_EQ(fallback.getGroundRayStatus(origin, {0.01, 0.01, -1.0}, false,
+                                        fallback_hit),
+            VoxelStatus::kOccupied);
+  EXPECT_NEAR(fallback_hit.z(), 0.075, 1e-5);
+
+  OctomapMap measured(cfg);
+  measured.setTrackMeasuredSurfaceZ(true);
+  measured.insertPointCloud({low, high}, origin);
+  Eigen::Vector3d measured_hit;
+  ASSERT_EQ(measured.getGroundRayStatus(origin, {0.01, 0.01, -1.0}, false,
+                                        measured_hit),
+            VoxelStatus::kOccupied);
+  EXPECT_NEAR(measured_hit.z(), high.z(), 1e-6);
+  EXPECT_EQ(measured.measuredSurfaceCount(), 1u);
+}
+
+TEST(OctomapMap, MeasuredSurfaceExcludesClippedFarEndpointsAndClears) {
+  OctomapConfig cfg;
+  cfg.resolution = 0.15;
+  cfg.max_range = 20.0;
+  OctomapMap map(cfg);
+  map.setTrackMeasuredSurfaceZ(true);
+  const Eigen::Vector3d origin(0.01, 0.01, 1.0);
+  const Eigen::Vector3d surface(0.01, 0.01, 0.12);
+  for (int i = 0; i < 8; ++i) map.insertPointCloud({surface}, origin);
+  ASSERT_EQ(map.measuredSurfaceCount(), 1u);
+
+  // ARGoS represents background at its finite 40 m far plane. With a 20 m
+  // map range this carves a bounded miss ray and must not create metadata.
+  map.insertPointCloud({Eigen::Vector3d(40.0, 0.01, 1.0)}, origin);
+  EXPECT_EQ(map.measuredSurfaceCount(), 1u);
+
+  // Repeated rays through the old hit eventually make its voxel free. The
+  // height must survive early misses, then disappear exactly with occupancy.
+  const Eigen::Vector3d through(0.01, 0.01, -2.0);
+  map.insertPointCloud({through}, origin);
+  EXPECT_EQ(map.measuredSurfaceCount(), 2u);
+  Eigen::Vector3d retained_hit;
+  ASSERT_EQ(map.getGroundRayStatus(origin, {0.01, 0.01, -1.0}, false,
+                                   retained_hit),
+            VoxelStatus::kOccupied);
+  EXPECT_NEAR(retained_hit.z(), surface.z(), 1e-6);
+  for (int i = 0; i < 30; ++i) map.insertPointCloud({through}, origin);
+  EXPECT_EQ(map.getVoxelStatus(surface), VoxelStatus::kFree);
+  EXPECT_EQ(map.measuredSurfaceCount(), 1u);  // the deeper endpoint remains
+
+  map.augmentFreeBox(through, {0.20, 0.20, 0.20});
+  EXPECT_EQ(map.measuredSurfaceCount(), 0u);
+  const Eigen::Vector3d replacement(0.01, 0.01, 0.02);
+  for (int i = 0; i < 8; ++i) map.insertPointCloud({replacement}, origin);
+  EXPECT_EQ(map.measuredSurfaceCount(), 1u);
+  Eigen::Vector3d replacement_hit;
+  ASSERT_EQ(map.getGroundRayStatus(origin, {0.01, 0.01, -1.0}, false,
+                                   replacement_hit),
+            VoxelStatus::kOccupied);
+  EXPECT_NEAR(replacement_hit.z(), replacement.z(), 1e-6);
+  map.resetMap();
+  EXPECT_EQ(map.measuredSurfaceCount(), 0u);
+}
+
+TEST(OctomapMap, ZeroMaxRangeClipsEveryNonzeroEndpointForMetadata) {
+  OctomapConfig cfg;
+  cfg.resolution = 0.15;
+  cfg.max_range = 0.0;
+  OctomapMap map(cfg);
+  map.setTrackMeasuredSurfaceZ(true);
+  const Eigen::Vector3d origin(0.01, 0.01, 0.01);
+  const Eigen::Vector3d same_voxel(0.02, 0.01, 0.01);
+  map.insertPointCloud({same_voxel}, origin);
+  EXPECT_NE(map.getVoxelStatus(same_voxel), VoxelStatus::kOccupied);
+  EXPECT_EQ(map.measuredSurfaceCount(), 0u);
+
+  // Zero distance satisfies OctoMap's <= maxrange endpoint condition.
+  map.insertPointCloud({origin}, origin);
+  EXPECT_EQ(map.getVoxelStatus(origin), VoxelStatus::kOccupied);
+  EXPECT_EQ(map.measuredSurfaceCount(), 1u);
+}
+
+TEST(OctomapMap, TrackedInsertionPreservesOccupancyUpdates) {
+  OctomapConfig cfg;
+  cfg.resolution = 0.15;
+  cfg.max_range = 3.0;
+  OctomapMap ordinary(cfg);
+  OctomapMap tracked(cfg);
+  tracked.setTrackMeasuredSurfaceZ(true);
+  const Eigen::Vector3d origin(0.01, 0.01, 1.0);
+  const std::vector<std::vector<Eigen::Vector3d>> scans{
+      {{0.01, 0.01, 0.02}, {0.61, 0.01, 0.12}},
+      {{0.01, 0.01, -2.0}, {4.0, 0.01, 1.0}},
+      {{0.01, 0.01, 0.02}, {0.61, 0.01, -2.0}}};
+  for (int repeat = 0; repeat < 8; ++repeat) {
+    for (const auto& scan : scans) {
+      ordinary.insertPointCloud(scan, origin);
+      tracked.insertPointCloud(scan, origin);
+    }
+  }
+  for (double x = -0.15; x <= 3.0; x += 0.15) {
+    for (double z = -2.1; z <= 1.05; z += 0.15) {
+      const Eigen::Vector3d sample(x, 0.01, z);
+      EXPECT_EQ(tracked.getVoxelStatus(sample),
+                ordinary.getVoxelStatus(sample));
+      const auto* a = ordinary.tree()->search(
+          octomap::point3d(sample.x(), sample.y(), sample.z()));
+      const auto* b = tracked.tree()->search(
+          octomap::point3d(sample.x(), sample.y(), sample.z()));
+      ASSERT_EQ(a == nullptr, b == nullptr);
+      if (a != nullptr && b != nullptr) {
+        EXPECT_FLOAT_EQ(a->getLogOdds(), b->getLogOdds());
+      }
+    }
+  }
+}
+
 }  // namespace

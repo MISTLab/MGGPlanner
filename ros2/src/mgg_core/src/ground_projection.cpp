@@ -37,7 +37,8 @@ double GroundProjection::projectSample(Eigen::Vector3d& sample,
     // Ground rays may cross unobserved air above the lidar. Ordinary body and edge
     // collision checks still run; only known occupied ground can support a
     // projected point.
-    const VoxelStatus vs = map_.getRayStatus(start, end, false, end_voxel);
+    const VoxelStatus vs =
+        map_.getGroundRayStatus(start, end, false, end_voxel);
 
     if (vs == VoxelStatus::kOccupied) {
       const double ray_len = std::abs(sample_z - end_voxel(2));

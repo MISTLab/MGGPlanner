@@ -140,6 +140,16 @@ class PlannerNodeTestPeer {
     }
   }
 
+  static void addMeasuredSurface(PlannerNode& node, double x, double y,
+                                 double z) {
+    const std::lock_guard<std::recursive_mutex> lock(node.planner_mutex_);
+    for (int repeat = 0; repeat < 20; ++repeat) {
+      node.cloud_map_->insertPointCloud({Eigen::Vector3d(x, y, z)},
+                                        Eigen::Vector3d(x, y, 1.5));
+    }
+    ++node.map_revision_;
+  }
+
   static void finishMapRevision(PlannerNode& node) {
     const std::lock_guard<std::recursive_mutex> lock(node.planner_mutex_);
     ++node.map_revision_;
@@ -767,7 +777,7 @@ TEST(PlannerObjective, ObservedGroundBlindStartConnectorRetainsDistanceBound) {
   auto curb = make(2.5);
   // The kerb top remains below the raised body box, isolating the terrain
   // footprint veto from the ordinary occupied-body check.
-  Peer::addOccupiedVoxel(*curb, 1.25, 0.10, 0.125);
+  Peer::addMeasuredSurface(*curb, 1.25, 0.10, 0.125);
   EXPECT_EQ(Peer::refine(*curb, corridor(2.5)).status,
             mgg::PlanningStatus::kBlocked);
 
@@ -797,7 +807,7 @@ TEST(PlannerObjective, ObservedGroundVetoesKnownFootprintTerrainHazards) {
 
   // This obstacle is outside the narrow body's centreline but under a corner
   // of the body at some yaw. The circumscribed footprint must see it.
-  Peer::addOccupiedVoxel(*flat, 0.20, 0.10, 0.125);
+  Peer::addMeasuredSurface(*flat, 0.20, 0.10, 0.125);
   EXPECT_FALSE(Peer::footprintTerrainSupported(*flat, driving_pose, body));
 
   auto missing_corner = make();

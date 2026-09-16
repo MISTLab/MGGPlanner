@@ -65,6 +65,16 @@ class MapInterface {
                                    bool stop_at_unknown_voxel,
                                    Eigen::Vector3d& end_voxel) const = 0;
 
+  /// Ground queries may use a backend's measured surface height while
+  /// retaining the ordinary ray's occupancy and stopping semantics.
+  virtual VoxelStatus getGroundRayStatus(
+      const Eigen::Vector3d& view_point,
+      const Eigen::Vector3d& voxel_to_test, bool stop_at_unknown_voxel,
+      Eigen::Vector3d& end_voxel) const {
+    return getRayStatus(view_point, voxel_to_test, stop_at_unknown_voxel,
+                        end_voxel);
+  }
+
   /// Occupancy of an axis-aligned box. kOccupied if any voxel is occupied.
   virtual VoxelStatus getBoxStatus(const Eigen::Vector3d& center,
                                    const Eigen::Vector3d& size,

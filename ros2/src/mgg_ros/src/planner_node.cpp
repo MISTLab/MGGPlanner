@@ -97,6 +97,7 @@ PlannerNode::PlannerNode(const rclcpp::NodeOptions& options)
           "simulated ground robot using map.backend=cloud_octomap");
     }
     observed_ground_body_evidence_ = true;
+    cloud_map_->setTrackMeasuredSurfaceZ(true);
   } else if (body_evidence_policy != "strict_volume") {
     throw std::invalid_argument(
         "objective_body_evidence_policy must be strict_volume or "
@@ -1219,7 +1220,8 @@ bool PlannerNode::objectiveFootprintTerrainSupported(
       const Eigen::Vector3d end =
           start - Eigen::Vector3d(0.0, 0.0, ground_->max_projection_length);
       Eigen::Vector3d hit;
-      const mgg::VoxelStatus ray = map_->getRayStatus(start, end, false, hit);
+      const mgg::VoxelStatus ray =
+          map_->getGroundRayStatus(start, end, false, hit);
       // Lateral absence of a hit is neutral: the centre ray already proves
       // support for ordinary poses, while sparse simulated sensors cannot
       // certify every footprint column. Known terrain is a veto when it rises

@@ -24,6 +24,8 @@
 #ifndef MGG_MAP_OCTOMAP_OCTOMAP_MAP_H_
 #define MGG_MAP_OCTOMAP_OCTOMAP_MAP_H_
 
+#include <array>
+#include <map>
 #include <memory>
 #include <utility>
 #include <vector>
@@ -55,6 +57,10 @@ class OctomapMap : public MapInterface {
   /// Integrate a scan taken from `sensor_origin`; points are in world frame.
   void insertPointCloud(const std::vector<Eigen::Vector3d>& points,
                         const Eigen::Vector3d& sensor_origin);
+  void setTrackMeasuredSurfaceZ(bool enabled);
+  std::size_t measuredSurfaceCount() const {
+    return measured_surface_max_z_.size();
+  }
 
   octomap::OcTree* tree() { return tree_.get(); }
   const octomap::OcTree* tree() const { return tree_.get(); }
@@ -73,6 +79,10 @@ class OctomapMap : public MapInterface {
                            const Eigen::Vector3d& voxel_to_test,
                            bool stop_at_unknown_voxel,
                            Eigen::Vector3d& end_voxel) const override;
+  VoxelStatus getGroundRayStatus(
+      const Eigen::Vector3d& view_point,
+      const Eigen::Vector3d& voxel_to_test, bool stop_at_unknown_voxel,
+      Eigen::Vector3d& end_voxel) const override;
 
   VoxelStatus getBoxStatus(const Eigen::Vector3d& center,
                            const Eigen::Vector3d& size,
@@ -128,6 +138,12 @@ class OctomapMap : public MapInterface {
   void setRobotRadius(double robot_radius) override;
 
  private:
+  class UpdateAwareOcTree : public octomap::OcTree {
+   public:
+    using octomap::OcTree::OcTree;
+    using octomap::OccupancyOcTreeBase<octomap::OcTreeNode>::computeUpdate;
+  };
+
   /// Walks a segment voxel by voxel, applying `visit` to each status until it
   /// returns false. Shared by every ray-shaped query so they cannot drift
   /// apart.
@@ -140,12 +156,15 @@ class OctomapMap : public MapInterface {
                        const Eigen::Vector3d& size,
                        double unknown_fraction) const;
 
-  std::unique_ptr<octomap::OcTree> tree_;
+  std::unique_ptr<UpdateAwareOcTree> tree_;
   OctomapConfig config_;
   bool nonuniform_ray_cast_ = true;
   double ray_cast_step_size_multiplier_ = 1.0;
   double robot_radius_ = 0.0;
   bool has_data_ = false;
+  bool track_measured_surface_z_ = false;
+  using SurfaceKey = std::array<octomap::key_type, 3>;
+  std::map<SurfaceKey, double> measured_surface_max_z_;
 };
 
 }  // namespace mgg
