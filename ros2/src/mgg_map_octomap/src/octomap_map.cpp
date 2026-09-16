@@ -97,6 +97,26 @@ void OctomapMap::setTrackMeasuredSurfaceZ(bool enabled) {
 
 double OctomapMap::getResolution() const { return tree_->getResolution(); }
 
+bool OctomapMap::getAxisAlignedXYCellCenter(
+    const Eigen::Vector2d& position, Eigen::Vector2d& center) const {
+  if (!position.allFinite()) return false;
+  const double extent = tree_->getResolution() * 32768.0;
+  if (!std::isfinite(extent) || extent <= 0.0 ||
+      (position.array() < -extent).any() ||
+      (position.array() >= extent).any()) {
+    return false;
+  }
+  octomap::OcTreeKey key;
+  if (!tree_->coordToKeyChecked(
+          octomap::point3d(float(position.x()), float(position.y()), 0.0f),
+          key)) {
+    return false;
+  }
+  center = Eigen::Vector2d(tree_->keyToCoord(key[0]),
+                           tree_->keyToCoord(key[1]));
+  return center.allFinite();
+}
+
 bool OctomapMap::getStatus() const { return has_data_; }
 
 VoxelStatus OctomapMap::statusAt(const octomap::point3d& p) const {

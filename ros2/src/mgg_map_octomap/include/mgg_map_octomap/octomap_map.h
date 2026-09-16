@@ -68,6 +68,9 @@ class OctomapMap : public MapInterface {
   // ------------------------------------------------------ MapInterface
 
   double getResolution() const override;
+  bool getAxisAlignedXYCellCenter(
+      const Eigen::Vector2d& position,
+      Eigen::Vector2d& center) const override;
   bool getStatus() const override;
 
   VoxelStatus getVoxelStatus(const Eigen::Vector3d& position) const override;

@@ -1250,21 +1250,43 @@ mgg::GridProjectionStatus PlannerNode::objectiveFootprintTerrainStatus(
     return mgg::GridProjectionStatus::kBodyUnknown;
   }
 
-  // A square around the footprint's circumscribed circle contains the body at
-  // every yaw. Half a voxel diagonal of padding includes voxels touched at its
-  // boundary despite the sampling lattice's phase relative to the map grid.
-  // Bound the floating-point ratio before converting it to an integer.
-  const double extent = radius + std::sqrt(0.5) * resolution;
-  const double intervals_d = std::ceil(2.0 * extent / resolution);
+  // Enumerate the map's own XY cells and retain exactly those whose closed
+  // AABB touches the physical circumscribed circle. Sampling ray centres over
+  // an already padded circle expands the footprint twice: once in the ray
+  // locations and again when a ray returns the containing cell's surface.
+  const Eigen::Vector2d body_center =
+      driving_pose.head<2>() + robot_params_.center_offset.head<2>();
+  Eigen::Vector2d containing_center;
+  if (!body_center.allFinite() ||
+      !map_->getAxisAlignedXYCellCenter(
+          body_center - Eigen::Vector2d::Constant(radius),
+          containing_center) ||
+      !containing_center.allFinite()) {
+    record_failure("footprint cell grid unavailable");
+    return mgg::GridProjectionStatus::kBodyUnknown;
+  }
+  const double half_cell = 0.5 * resolution;
+  const double intervals_d = std::ceil(2.0 * radius / resolution) + 4.0;
   constexpr int kMaxFootprintSamples = 4096;
   constexpr int kMaxIntervals = 63;
-  if (!std::isfinite(extent) || !std::isfinite(intervals_d) ||
+  if (!std::isfinite(half_cell) ||
+      !std::isfinite(intervals_d) ||
       intervals_d < 1.0 || intervals_d > kMaxIntervals) {
     record_failure("footprint sampling bound exceeded");
     return mgg::GridProjectionStatus::kBodyUnknown;
   }
   const int intervals = static_cast<int>(intervals_d);
-  const double spacing = 2.0 * extent / static_cast<double>(intervals);
+  const Eigen::Vector2d first_center =
+      containing_center - Eigen::Vector2d::Constant(resolution);
+  if (!first_center.allFinite() ||
+      ((body_center - Eigen::Vector2d::Constant(radius) - containing_center)
+               .cwiseAbs()
+               .array() >
+           half_cell + 1e-6)
+          .any()) {
+    record_failure("invalid footprint cell grid");
+    return mgg::GridProjectionStatus::kBodyUnknown;
+  }
   int samples = 0;
   const double nominal_ground_z =
       driving_pose.z() - planning_params_.max_ground_height;
@@ -1273,11 +1295,11 @@ mgg::GridProjectionStatus PlannerNode::objectiveFootprintTerrainStatus(
   // traversable and its legacy API also returns Free when ray setup fails.
   // Validate the entire bounded query volume once through the box API first;
   // Unknown here means invalid geometry or an exceeded map work bound.
+  const double query_extent = radius + std::sqrt(0.5) * resolution;
   const Eigen::Vector3d query_center(
-      driving_pose.x() + robot_params_.center_offset.x(),
-      driving_pose.y() + robot_params_.center_offset.y(),
+      body_center.x(), body_center.y(),
       driving_pose.z() - 0.5 * ground_->max_projection_length);
-  const Eigen::Vector3d query_size(2.0 * extent, 2.0 * extent,
+  const Eigen::Vector3d query_size(2.0 * query_extent, 2.0 * query_extent,
                                    ground_->max_projection_length);
   if (map_->getBoxStatus(query_center, query_size, false) ==
       mgg::VoxelStatus::kUnknown) {
@@ -1286,22 +1308,25 @@ mgg::GridProjectionStatus PlannerNode::objectiveFootprintTerrainStatus(
   }
   for (int ix = 0; ix <= intervals; ++ix) {
     for (int iy = 0; iy <= intervals; ++iy) {
-      const double dx = -extent + ix * spacing;
-      const double dy = -extent + iy * spacing;
-      // The yaw-independent footprint is the circumscribed circle.  The
-      // surrounding square is only a convenient sampling lattice; its
-      // corners lie up to sqrt(2) farther from the robot and must not turn a
-      // nearby kerb into terrain beneath the body.
-      if (std::hypot(dx, dy) > extent + 1e-9) continue;
+      const Eigen::Vector2d cell_center =
+          first_center + resolution * Eigen::Vector2d(ix, iy);
+      if (!cell_center.allFinite()) {
+        record_failure("invalid footprint cell centre");
+        return mgg::GridProjectionStatus::kBodyUnknown;
+      }
+      // Squared distance from the circle centre to this closed cell AABB.
+      // `<=` deliberately includes both cells at an exact shared boundary.
+      const Eigen::Vector2d outside =
+          ((body_center - cell_center).cwiseAbs() -
+           Eigen::Vector2d::Constant(half_cell))
+              .cwiseMax(0.0);
+      if (outside.squaredNorm() > radius * radius + 1e-12) continue;
       if (++samples > kMaxFootprintSamples)
       {
         record_failure("footprint sample limit exceeded");
         return mgg::GridProjectionStatus::kBodyUnknown;
       }
-      Eigen::Vector3d start =
-          driving_pose +
-          Eigen::Vector3d(robot_params_.center_offset.x() + dx,
-                          robot_params_.center_offset.y() + dy, 0.0);
+      Eigen::Vector3d start(cell_center.x(), cell_center.y(), driving_pose.z());
       const Eigen::Vector3d end =
           start - Eigen::Vector3d(0.0, 0.0, ground_->max_projection_length);
       Eigen::Vector3d hit;

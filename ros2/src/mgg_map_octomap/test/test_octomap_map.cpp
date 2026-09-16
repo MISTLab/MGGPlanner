@@ -448,6 +448,19 @@ TEST(OctomapMap, GroundRayUsesMeasuredMaximumWithinCoarseVoxel) {
   EXPECT_EQ(measured.measuredSurfaceCount(), 1u);
 }
 
+TEST(OctomapMap, ReportsItsAxisAlignedCellCentreAtNegativeCoordinates) {
+  OctomapConfig cfg;
+  cfg.resolution = 0.15;
+  OctomapMap map(cfg);
+  Eigen::Vector2d center;
+  ASSERT_TRUE(map.getAxisAlignedXYCellCenter({-0.01, -0.08}, center));
+  EXPECT_NEAR(center.x(), -0.075, 1e-6);
+  EXPECT_NEAR(center.y(), -0.075, 1e-6);
+  EXPECT_FALSE(map.getAxisAlignedXYCellCenter(
+      {std::numeric_limits<double>::quiet_NaN(), 0.0}, center));
+  EXPECT_FALSE(map.getAxisAlignedXYCellCenter({1e300, 0.0}, center));
+}
+
 TEST(OctomapMap, MeasuredSurfaceExcludesClippedFarEndpointsAndClears) {
   OctomapConfig cfg;
   cfg.resolution = 0.15;

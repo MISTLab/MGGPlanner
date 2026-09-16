@@ -1401,6 +1401,57 @@ TEST(PlannerObjective, ObservedGroundVetoesKnownFootprintTerrainHazards) {
       *shallow, driving_pose, Eigen::Vector3d(10.0, 10.0, 0.15)));
 }
 
+TEST(PlannerObjective, FootprintQueriesEachIntersectingMapCellExactlyOnce) {
+  using Peer = mgg_ros::PlannerNodeTestPeer;
+  const auto make = [] {
+    rclcpp::NodeOptions options;
+    options.parameter_overrides(
+        {rclcpp::Parameter("use_sim_time", true),
+         rclcpp::Parameter("map.resolution", 0.15),
+         rclcpp::Parameter("objective_body_evidence_policy", "observed_ground")});
+    auto node = std::make_shared<mgg_ros::PlannerNode>(options);
+    Peer::configureBackboneTest(*node);
+    return node;
+  };
+  const Eigen::Vector3d scout_body(0.662, 0.630, 0.15);
+  const Eigen::Vector3d home(-0.01, -0.08, 0.30);
+
+  auto outside = make();
+  Peer::observeGroundRectangle(*outside, -0.5, 0.5, -0.5, 0.5);
+  // The old radius-plus-half-diagonal ray lattice selected the cell holding
+  // this Bistro curb even though that cell does not touch the physical circle.
+  Peer::addMeasuredSurface(*outside, -0.15, -0.75, 0.145);
+  EXPECT_TRUE(Peer::footprintTerrainSupported(*outside, home, scout_body));
+
+  auto touching = make();
+  Peer::observeGroundRectangle(*touching, -0.5, 0.5, -0.5, 0.5);
+  // This cell's closed AABB intersects the physical footprint and must retain
+  // the known-terrain veto.
+  Peer::addMeasuredSurface(*touching, -0.15, -0.45, 0.145);
+  EXPECT_FALSE(Peer::footprintTerrainSupported(*touching, home, scout_body));
+
+  auto tangent = make();
+  Peer::observeGroundRectangle(*tangent, -0.3, 0.3, -0.3, 0.3);
+  // Radius zero at the x=0/y=0 grid boundary touches all adjoining closed
+  // cells. A hazard in one of those cells cannot disappear by grid phase.
+  Peer::addMeasuredSurface(*tangent, 0.01, 0.01, 0.145);
+  EXPECT_FALSE(Peer::footprintTerrainSupported(
+      *tangent, Eigen::Vector3d(0.0, 0.0, 0.30),
+      Eigen::Vector3d(0.0, 0.0, 0.15)));
+
+  const Eigen::Vector3d tangent_body(0.30, 0.0, 0.15);
+  for (const double tangent_x : {-0.525, -0.075}) {
+    auto nonzero_tangent = make();
+    Peer::observeGroundRectangle(*nonzero_tangent, -0.7, 0.1, -0.7, 0.1);
+    // At the negative-coordinate grid boundary, cells centred on either side
+    // touch the nonzero-radius circle at exactly one edge.
+    Peer::addMeasuredSurface(*nonzero_tangent, tangent_x, -0.30, 0.145);
+    EXPECT_FALSE(Peer::footprintTerrainSupported(
+        *nonzero_tangent, Eigen::Vector3d(-0.30, -0.30, 0.30),
+        tangent_body));
+  }
+}
+
 TEST(PlannerBackbone, CapturesHomeBeforeMotionAndConnectsOnlyMappedTerrain) {
   rclcpp::NodeOptions options;
   options.parameter_overrides(

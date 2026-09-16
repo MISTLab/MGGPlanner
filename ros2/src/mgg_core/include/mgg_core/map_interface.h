@@ -43,6 +43,15 @@ class MapInterface {
   /// Edge length of one voxel, in metres.
   virtual double getResolution() const = 0;
 
+  /// Centre of the uniform, axis-aligned XY cell containing `position`.
+  /// Backends without this grid contract leave the query unsupported.
+  virtual bool getAxisAlignedXYCellCenter(
+      const Eigen::Vector2d& position, Eigen::Vector2d& center) const {
+    (void)position;
+    (void)center;
+    return false;
+  }
+
   /// Whether the map has received enough data to be queried meaningfully.
   virtual bool getStatus() const = 0;
 
