@@ -64,9 +64,10 @@ GridGraphResult buildGridGraph(GraphManager& graph, const StateVec& state,
         const double z_world = z_val + state.z();
 
         const Eigen::Vector3d cell(x_val, y_val, z_world);
-        if (ctx.map->getBoxStatus(cell + ctx.robot->center_offset,
-                                  ctx.robot_box_size,
-                                  true) != VoxelStatus::kFree) {
+        const VoxelStatus body_status = ctx.map->getBoxStatus(
+            cell + ctx.robot->center_offset, ctx.robot_box_size,
+            !ctx.allow_unknown_lattice_body);
+        if (body_status != VoxelStatus::kFree) {
           continue;
         }
         ++result.free_cells;

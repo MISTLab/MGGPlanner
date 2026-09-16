@@ -1044,6 +1044,11 @@ std::string PlannerNode::buildLocalGraph(bool strict_projected_endpoints) {
 
   mgg::ExpandContext ctx = makeContext();
   ctx.strict_projected_endpoint = strict_projected_endpoints;
+  // This policy is constructor-qualified to simulated ground robots. Offer
+  // sparse MOLA lattice cells to the existing ground and edge checks even
+  // when their body volume is not fully ray-observed; known occupied cells
+  // still fail the prefilter. Hardware retains the strict default.
+  ctx.allow_unknown_lattice_body = observed_ground_body_evidence_;
   if (observed_ground_body_evidence_ &&
       robot_params_.type == mgg::RobotType::kGroundRobot) {
     // Explore bypasses explicit-objective grid refinement, so apply the same

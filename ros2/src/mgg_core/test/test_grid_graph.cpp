@@ -126,6 +126,81 @@ class OccupiedProjectionMismatchSpace : public ProjectionMismatchSpace {
   }
 };
 
+/// A sparse sensor map has known ground at the candidate but does not prove
+/// the whole body volume free. The relaxed query still preserves a known
+/// obstacle, matching OctomapMap's stop-at-unknown contract.
+class SparseBodySpace : public OpenSpace {
+ public:
+  SparseBodySpace(bool has_ground, bool occupied_candidate = false,
+                  bool invalid_candidate = false)
+      : has_ground_(has_ground),
+        occupied_candidate_(occupied_candidate),
+        invalid_candidate_(invalid_candidate) {}
+
+  VoxelStatus getVoxelStatus(const Eigen::Vector3d& p) const override {
+    return has_ground_ && p.z() <= 0.0 ? VoxelStatus::kOccupied
+                                       : VoxelStatus::kFree;
+  }
+
+  VoxelStatus getBoxStatus(const Eigen::Vector3d& center,
+                           const Eigen::Vector3d&,
+                           bool stop_at_unknown) const override {
+    if (center.x() < 0.25) return VoxelStatus::kFree;
+    if (occupied_candidate_) return VoxelStatus::kOccupied;
+    if (invalid_candidate_) return VoxelStatus::kUnknown;
+    return stop_at_unknown ? VoxelStatus::kUnknown : VoxelStatus::kFree;
+  }
+
+ private:
+  bool has_ground_;
+  bool occupied_candidate_;
+  bool invalid_candidate_;
+};
+
+struct SparseGroundFixture {
+  explicit SparseGroundFixture(bool has_ground, bool occupied_candidate = false,
+                               bool invalid_candidate = false)
+      : map(has_ground, occupied_candidate, invalid_candidate),
+        ground(map, planning) {
+    robot.type = RobotType::kGroundRobot;
+    robot.size = Eigen::Vector3d(0.4, 0.4, 0.4);
+    planning.max_ground_height = 0.5;
+    planning.max_step_height = 0.2;
+    planning.max_inclination = 0.6;
+    planning.edge_length_min = 0.1;
+    planning.edge_length_max = 2.0;
+    planning.edge_overshoot = 0.0;
+    planning.nearest_range = 1.1;
+    planning.nearest_range_min = 0.1;
+    planning.nearest_range_max = 100.0;
+    planning.nearest_range_z = 100.0;
+    planning.num_vertices_max = 20;
+    planning.num_edges_max = 40;
+    planning.num_loops_max = 20;
+    ctx.map = &map;
+    ctx.planning = &planning;
+    ctx.robot = &robot;
+    ctx.ground = &ground;
+    ctx.robot_box_size = robot.getPlanningSize();
+    graph.addVertex(new Vertex(0, StateVec(0.0, 0.0, 0.5, 0.0)));
+  }
+
+  GridGraphParams grid() const {
+    GridGraphParams value;
+    value.min_val = Eigen::Vector3d(0.0, 0.0, 0.0);
+    value.max_val = Eigen::Vector3d(0.5, 0.0, 0.0);
+    value.resolution = Eigen::Vector3d(0.5, 0.5, 0.5);
+    return value;
+  }
+
+  SparseBodySpace map;
+  RobotParams robot;
+  PlanningParams planning;
+  mgg::GroundProjection ground;
+  ExpandContext ctx;
+  GraphManager graph;
+};
+
 struct Fixture {
   Fixture() {
     robot.type = RobotType::kAerialRobot;  // no ground projection needed
@@ -176,6 +251,68 @@ TEST(GridGraph, SweepsTheLatticeAndGrowsTheGraph) {
   EXPECT_EQ(r.free_cells, 25);
   EXPECT_GT(r.vertices_added, 0);
   EXPECT_GT(f.graph.getNumVertices(), 1);
+}
+
+TEST(GridGraph, StrictDefaultRejectsUnknownLatticeBody) {
+  SparseGroundFixture fixture(/*has_ground=*/true);
+  const GridGraphResult result = buildGridGraph(
+      fixture.graph, StateVec(0.0, 0.0, 0.5, 0.0), fixture.grid(),
+      fixture.ctx, 0.0);
+
+  EXPECT_EQ(result.free_cells, 1);
+  EXPECT_EQ(result.vertices_added, 0);
+  EXPECT_EQ(fixture.graph.getNumVertices(), 1);
+}
+
+TEST(GridGraph, QualifiedPolicyAdmitsUnknownBodyWithMeasuredGround) {
+  SparseGroundFixture fixture(/*has_ground=*/true);
+  fixture.ctx.allow_unknown_lattice_body = true;
+  const GridGraphResult result = buildGridGraph(
+      fixture.graph, StateVec(0.0, 0.0, 0.5, 0.0), fixture.grid(),
+      fixture.ctx, 0.0);
+
+  EXPECT_EQ(result.free_cells, 2);
+  EXPECT_EQ(result.vertices_added, 1);
+  StateVec candidate(0.5, 0.0, 0.5, 0.0);
+  Vertex* found = nullptr;
+  EXPECT_TRUE(fixture.graph.getNearestVertexInRange(&candidate, 0.11, &found));
+}
+
+TEST(GridGraph, QualifiedPolicyStillRequiresMeasuredGround) {
+  SparseGroundFixture fixture(/*has_ground=*/false);
+  fixture.ctx.allow_unknown_lattice_body = true;
+  const GridGraphResult result = buildGridGraph(
+      fixture.graph, StateVec(0.0, 0.0, 0.5, 0.0), fixture.grid(),
+      fixture.ctx, 0.0);
+
+  EXPECT_EQ(result.free_cells, 2);
+  EXPECT_EQ(result.no_ground, 1);
+  EXPECT_EQ(result.vertices_added, 0);
+}
+
+TEST(GridGraph, QualifiedPolicyStillRejectsKnownOccupiedBody) {
+  SparseGroundFixture fixture(/*has_ground=*/true,
+                              /*occupied_candidate=*/true);
+  fixture.ctx.allow_unknown_lattice_body = true;
+  const GridGraphResult result = buildGridGraph(
+      fixture.graph, StateVec(0.0, 0.0, 0.5, 0.0), fixture.grid(),
+      fixture.ctx, 0.0);
+
+  EXPECT_EQ(result.free_cells, 1);
+  EXPECT_EQ(result.vertices_added, 0);
+}
+
+TEST(GridGraph, QualifiedPolicyRejectsInvalidUnknownBodyQuery) {
+  SparseGroundFixture fixture(/*has_ground=*/true,
+                              /*occupied_candidate=*/false,
+                              /*invalid_candidate=*/true);
+  fixture.ctx.allow_unknown_lattice_body = true;
+  const GridGraphResult result = buildGridGraph(
+      fixture.graph, StateVec(0.0, 0.0, 0.5, 0.0), fixture.grid(),
+      fixture.ctx, 0.0);
+
+  EXPECT_EQ(result.free_cells, 1);
+  EXPECT_EQ(result.vertices_added, 0);
 }
 
 TEST(GridGraph, HangingRootLimitOverridesLongOrdinaryEdgeLimit) {

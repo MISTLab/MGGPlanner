@@ -54,6 +54,12 @@ struct ExpandContext {
   /// sensor's near-field ground blind spot. The edge is only topology here;
   /// explicit objectives revalidate it with strict body/unknown checks.
   double hanging_root_edge_length_max = 0.0;
+  /// Qualified simulation exploration may offer a lattice candidate whose
+  /// body volume is partly unobserved. Known occupied volume still rejects
+  /// the candidate, and ground projection plus the edge policy remain
+  /// mandatory before it can enter the graph. False keeps the hardware and
+  /// legacy strict-volume prefilter.
+  bool allow_unknown_lattice_body = false;
   /// Explicit-objective graph builds require a ground-projected candidate's
   /// final body box to be observed free. Explore leaves this false to retain
   /// its legacy frontier policy; explicit refinement still validates the full
