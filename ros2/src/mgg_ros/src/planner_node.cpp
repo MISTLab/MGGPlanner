@@ -269,15 +269,15 @@ PlannerNode::PlannerNode(const rclcpp::NodeOptions& options)
   const std::string body_evidence_policy = declareOrGet<std::string>(
       this, "objective_body_evidence_policy", "strict_volume");
   if (body_evidence_policy == "observed_ground") {
-    if (map_backend_ != "cloud_octomap" ||
+    if ((map_backend_ != "cloud_octomap" && map_backend_ != "mola_snapshot") ||
         !get_parameter("use_sim_time").as_bool() ||
         robot_params_.type != mgg::RobotType::kGroundRobot) {
       throw std::invalid_argument(
           "objective_body_evidence_policy=observed_ground requires a "
-          "simulated ground robot using map.backend=cloud_octomap");
+          "simulated ground robot using a qualified map backend");
     }
     observed_ground_body_evidence_ = true;
-    cloud_map_->setTrackMeasuredSurfaceZ(true);
+    if (cloud_map_ != nullptr) cloud_map_->setTrackMeasuredSurfaceZ(true);
   } else if (body_evidence_policy != "strict_volume") {
     throw std::invalid_argument(
         "objective_body_evidence_policy must be strict_volume or "
@@ -286,13 +286,14 @@ PlannerNode::PlannerNode(const rclcpp::NodeOptions& options)
   const std::string ground_evidence_policy = declareOrGet<std::string>(
       this, "objective_ground_evidence_policy", "observed_ground");
   if (ground_evidence_policy == "provisional_unknown") {
-    if (!observed_ground_body_evidence_ || map_backend_ != "cloud_octomap" ||
+    if (!observed_ground_body_evidence_ ||
+        (map_backend_ != "cloud_octomap" && map_backend_ != "mola_snapshot") ||
         !get_parameter("use_sim_time").as_bool() ||
         robot_params_.type != mgg::RobotType::kGroundRobot) {
       throw std::invalid_argument(
           "objective_ground_evidence_policy=provisional_unknown requires "
           "objective_body_evidence_policy=observed_ground on a simulated "
-          "ground robot using map.backend=cloud_octomap");
+          "ground robot using a qualified map backend");
     }
     provisional_unknown_ground_ = true;
   } else if (ground_evidence_policy != "observed_ground") {
@@ -2239,6 +2240,8 @@ bool PlannerNode::queryIndexedMap(mgg::FeasiblePath& path,
   request->body_size.x = component_body.x();
   request->body_size.y = component_body.y();
   request->body_size.z = component_body.z();
+  request->max_step_m = context.max_step_height;
+  request->max_drop_m = context.max_step_height;
   request->stop_at_unknown = true;
 
   std::vector<mgg::StateVec> route;
@@ -2798,7 +2801,8 @@ void PlannerNode::onValidateObjectiveRoute(
     response->status = Response::INVALID;
     response->reason = reason;
   };
-  if (!provisional_unknown_ground_ || map_backend_ != "cloud_octomap" ||
+  if (!provisional_unknown_ground_ ||
+      (map_backend_ != "cloud_octomap" && map_backend_ != "mola_snapshot") ||
       !map_ || !map_->getStatus() || !have_odometry_) {
     unavailable("provisional route validation is unavailable");
     return;

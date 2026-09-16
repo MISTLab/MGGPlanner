@@ -5,6 +5,8 @@ string geometry_revision
 builtin_interfaces/Time source_stamp
 geometry_msgs/Point[] samples
 geometry_msgs/Vector3 body_size
+float64 max_step_m
+float64 max_drop_m
 bool stop_at_unknown
 ---
 uint8 OK=0

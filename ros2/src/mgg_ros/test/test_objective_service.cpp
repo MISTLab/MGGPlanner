@@ -959,7 +959,7 @@ TEST(PlannerConfiguration, MolaBackendRequiresExactRouteValidator) {
       std::invalid_argument);
 }
 
-TEST(PlannerConfiguration, ObservedGroundPolicyIsExplicitAndSimulationCloudOnly) {
+TEST(PlannerConfiguration, ObservedGroundPolicyIsExplicitAndSimulationOnly) {
   for (const std::string policy : {"unknown", "ObservedGround"}) {
     rclcpp::NodeOptions options;
     options.parameter_overrides(
@@ -982,9 +982,8 @@ TEST(PlannerConfiguration, ObservedGroundPolicyIsExplicitAndSimulationCloudOnly)
        rclcpp::Parameter("map.backend", "mola_snapshot"),
        rclcpp::Parameter("indexed_map_query_service", "/query"),
        rclcpp::Parameter("map.mola.peer_root", "/tmp")});
-  EXPECT_THROW(
-      { auto planner = std::make_shared<mgg_ros::PlannerNode>(mola); },
-      std::invalid_argument);
+  EXPECT_NO_THROW(
+      { auto planner = std::make_shared<mgg_ros::PlannerNode>(mola); });
 }
 
 TEST(PlannerConfiguration, ProvisionalGroundRequiresObservedSimulationCloud) {
@@ -3368,11 +3367,14 @@ TEST(IndexedObjectiveService, BatchedQueryIsBoundedAndUsesComponentFrame) {
   std::atomic<double> received_body_x{0.0};
   std::atomic<double> received_body_y{0.0};
   std::atomic<double> received_body_z{0.0};
+  std::atomic<double> received_max_step{0.0};
+  std::atomic<double> received_max_drop{0.0};
   std::vector<geometry_msgs::msg::Point> received;
   auto service = server->create_service<Query>(
       "/robot_1/mapping/query_batch",
       [&delay, &response_status, &ground_offset, &ground_from_sample,
-       &received_body_x, &received_body_y, &received_body_z, &received](
+       &received_body_x, &received_body_y, &received_body_z,
+       &received_max_step, &received_max_drop, &received](
           const Query::Request::SharedPtr request,
           Query::Response::SharedPtr response) {
         received = request->samples;
@@ -3386,6 +3388,8 @@ TEST(IndexedObjectiveService, BatchedQueryIsBoundedAndUsesComponentFrame) {
         received_body_x = request->body_size.x;
         received_body_y = request->body_size.y;
         received_body_z = request->body_size.z;
+        received_max_step = request->max_step_m;
+        received_max_drop = request->max_drop_m;
         response->occupancy.assign(n, Query::Response::FREE);
         response->ground_z.reserve(n);
         for (const auto& sample : request->samples) {
@@ -3434,6 +3438,8 @@ TEST(IndexedObjectiveService, BatchedQueryIsBoundedAndUsesComponentFrame) {
   mgg_ros::PlannerNodeTestPeer::setIndexedTerrainLimits(*planner, 0.10, 0.52);
   EXPECT_TRUE(mgg_ros::PlannerNodeTestPeer::query(*planner, path));
   EXPECT_TRUE(path.indexed_map_validated);
+  EXPECT_NEAR(received_max_step.load(), 0.10, 1e-9);
+  EXPECT_NEAR(received_max_drop.load(), 0.10, 1e-9);
   EXPECT_GE(received.size(), 2u);
   if (received.size() >= 2) {
     EXPECT_NEAR(received.front().x, 10.0, 1e-6);
