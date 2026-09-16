@@ -255,6 +255,7 @@ bool loadPlanningParams(const ParamLoader& p, const std::string& ns,
   p.get(ns + "/max_ground_height", out.max_ground_height);
   p.get(ns + "/robot_height", out.robot_height);
   p.get(ns + "/max_inclination", out.max_inclination);
+  p.get(ns + "/max_step_height", out.max_step_height);
   p.get(ns + "/exp_sensor_list", out.exp_sensor_list);
   p.get(ns + "/no_gain_zones_list", out.no_gain_zones_list);
   p.get(ns + "/exp_gain_voxel_size", out.exp_gain_voxel_size);

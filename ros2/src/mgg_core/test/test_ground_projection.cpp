@@ -177,7 +177,11 @@ TEST(GroundProjection, HangingIsToleratedWhenTheCallerAllowsIt) {
   const auto s = gp.getProjectedEdgeStatus({3.0, 0.0, 0.5}, {7.0, 0.0, 0.5},
                                            {0.4, 0.4, 0.4}, true, path,
                                            /*is_hanging=*/true);
-  EXPECT_NE(s, ProjectedEdgeStatus::kHanging);
+  EXPECT_EQ(s, ProjectedEdgeStatus::kAdmissible);
+  ASSERT_FALSE(path.empty());
+  for (const auto& point : path) {
+    EXPECT_LT(point.z(), 0.8) << "Missing ground must not become a metre-high step";
+  }
 }
 
 // REGRESSION for the erase(end()) fix: a short edge whose last sample nearly

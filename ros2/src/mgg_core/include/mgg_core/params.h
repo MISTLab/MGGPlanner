@@ -160,6 +160,7 @@ struct PlanningParams {
   double max_ground_height = 1.2;
   double robot_height = 1.0;
   double max_inclination = 0.52;
+  double max_step_height = 0.0;
 
   // Free-space augmentation (deprecated upstream).
   double augment_free_voxels_time = 5.0;

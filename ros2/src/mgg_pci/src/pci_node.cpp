@@ -49,6 +49,8 @@ PciNode::PciNode(const rclcpp::NodeOptions& options)
       sub_opts);
 
   // Latched: the path is a latest-value topic and a follower may start later.
+  status_pub_ = create_publisher<std_msgs::msg::String>(
+      "status", rclcpp::QoS(1).transient_local());
   path_pub_ = create_publisher<nav_msgs::msg::Path>(
       "command_path", rclcpp::QoS(1).transient_local());
 
@@ -90,6 +92,7 @@ bool PciNode::executeBootstrap() {
 
   has_bootstrapped_ = true;
   publishPath(path);
+  publishStatus("exploring");
   goal_pose_ = path.back();
   path_in_progress_ = true;
   last_progress_pos_ = current_pose_.position;
@@ -128,6 +131,7 @@ void PciNode::onOdometry(nav_msgs::msg::Odometry::ConstSharedPtr msg) {
                 "goal reached (dist=%.2f m <= %.2f m); requesting next plan",
                 dist_to_goal, reach_distance_);
     path_in_progress_ = false;
+    stalled_plans_ = 0;
     lock.unlock();
     planAndPublish();
   }
@@ -149,6 +153,7 @@ bool PciNode::requestPlan(std::vector<geometry_msgs::msg::Pose>& path,
   const auto status = future.wait_for(
       std::chrono::duration<double>(service_timeout_sec_));
   if (status != std::future_status::ready) {
+    planner_client_->remove_pending_request(future);
     error = "planner did not answer within " +
             std::to_string(service_timeout_sec_) +
             " s (is the executor multi-threaded?)";
@@ -156,8 +161,16 @@ bool PciNode::requestPlan(std::vector<geometry_msgs::msg::Pose>& path,
   }
 
   const auto response = future.get();
+  plan_status_ = response->status;
   path = response->path;
   return true;
+}
+
+void PciNode::publishStatus(const std::string& state) {
+  std_msgs::msg::String msg;
+  msg.data = "{\"state\":\"" + state + "\",\"stamp_ns\":" +
+             std::to_string(now().nanoseconds()) + "}";
+  status_pub_->publish(msg);
 }
 
 void PciNode::publishPath(const std::vector<geometry_msgs::msg::Pose>& path) {
@@ -177,9 +190,11 @@ void PciNode::planAndPublish() {
   if (exploration_completed_) {
     return;
   }
+  uint64_t generation;
   {
     std::lock_guard<std::mutex> lock(mutex_);
-    if (planning_in_progress_) return;
+    if (planning_in_progress_ || !running_) return;
+    generation = generation_;
     planning_in_progress_ = true;
   }
 
@@ -189,18 +204,25 @@ void PciNode::planAndPublish() {
 
   std::lock_guard<std::mutex> lock(mutex_);
   planning_in_progress_ = false;
+  if (!running_ || generation != generation_) return;
 
   if (!ok) {
-    if (!has_bootstrapped_) {
+    if (!has_bootstrapped_ && bootstrap_distance_ > 0.0) {
       executeBootstrap();
       return;
+    }
+    if (++consecutive_empty_plans_ >= max_empty_plans_before_stop_) {
+      running_ = false;
+      path_in_progress_ = false;
+      publishPath({});
+      publishStatus("blocked");
     }
     RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 5000, "%s", error.c_str());
     return;
   }
 
   if (path.empty()) {
-    if (!has_bootstrapped_) {
+    if (!has_bootstrapped_ && bootstrap_distance_ > 0.0) {
       // First attempt on standing start without mapped ground: bootstrap forward
       executeBootstrap();
       return;
@@ -212,8 +234,9 @@ void PciNode::planAndPublish() {
       running_ = false;
       path_in_progress_ = false;
       publishPath({});
+      publishStatus(plan_status_ == -3 ? "complete" : "blocked");
       RCLCPP_INFO(get_logger(),
-                  "*** EXPLORATION COMPLETED: Environment fully explored (no remaining frontiers) ***");
+                  "Exploration stopped: no reachable plan remains");
       return;
     }
 
@@ -227,6 +250,7 @@ void PciNode::planAndPublish() {
   consecutive_empty_plans_ = 0;
   has_bootstrapped_ = true;
   publishPath(path);
+  publishStatus("exploring");
   goal_pose_ = path.back();
   path_in_progress_ = true;
   last_progress_pos_ = current_pose_.position;
@@ -248,11 +272,18 @@ void PciNode::tick() {
   // Path is active: check if stuck or timed out
   if (last_progress_time_.nanoseconds() > 0) {
     const double stuck_duration = (now() - last_progress_time_).seconds();
-    if (stuck_duration > stuck_timeout_sec_) {
+    if (stuck_duration > stuck_timeout_sec_ ||
+        (now() - path_start_time_).seconds() > 6.0 * stuck_timeout_sec_) {
       RCLCPP_WARN(get_logger(),
                   "robot made no progress for %.1f s (> %.1f s); replanning",
                   stuck_duration, stuck_timeout_sec_);
       path_in_progress_ = false;
+      if (++stalled_plans_ >= 3) {
+        running_ = false;
+        publishPath({});
+        publishStatus("blocked");
+        return;
+      }
       lock.unlock();
       planAndPublish();
     }
@@ -265,6 +296,9 @@ void PciNode::onTrigger(
   {
     std::lock_guard<std::mutex> lock(mutex_);
     running_ = true;
+    ++generation_;
+    stalled_plans_ = 0;
+    publishStatus("starting");
     exploration_completed_ = false;
     consecutive_empty_plans_ = 0;
     path_in_progress_ = false;
@@ -272,7 +306,7 @@ void PciNode::onTrigger(
   planAndPublish();
 
   std::lock_guard<std::mutex> lock(mutex_);
-  response->success = path_in_progress_;
+  response->success = running_ || exploration_completed_;
   response->message = path_in_progress_
                           ? "started autonomous exploration"
                           : "failed to start path";
@@ -284,9 +318,11 @@ void PciNode::onStop(const std::shared_ptr<std_srvs::srv::Trigger::Request>,
   {
     std::lock_guard<std::mutex> lock(mutex_);
     running_ = false;
+    ++generation_;
     path_in_progress_ = false;
   }
   publishPath({});
+  publishStatus("stopped");
   response->success = true;
   response->message = "stopped";
   RCLCPP_INFO(get_logger(), "stopped");

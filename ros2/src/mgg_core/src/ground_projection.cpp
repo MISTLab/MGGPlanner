@@ -34,7 +34,10 @@ double GroundProjection::projectSample(Eigen::Vector3d& sample,
         start - Eigen::Vector3d(0.0, 0.0, max_projection_length);
 
     Eigen::Vector3d end_voxel;
-    const VoxelStatus vs = map_.getRayStatus(start, end, true, end_voxel);
+    // Ground rays may cross unobserved air above the lidar. Ordinary body and edge
+    // collision checks still run; only known occupied ground can support a
+    // projected point.
+    const VoxelStatus vs = map_.getRayStatus(start, end, false, end_voxel);
 
     if (vs == VoxelStatus::kOccupied) {
       const double ray_len = std::abs(sample_z - end_voxel(2));
@@ -68,7 +71,7 @@ ProjectedEdgeStatus GroundProjection::getProjectedEdgeStatus(
   const Eigen::Vector3d ray = end - start;
   const double edge_incl =
       std::atan2(std::abs(ray(2)), std::abs(ray.head(2).norm()));
-  if (edge_incl > max_inclination) return ProjectedEdgeStatus::kSteep;
+  if (std::abs(ray(2)) > params_.max_step_height + 1e-6 && edge_incl > max_inclination) return ProjectedEdgeStatus::kSteep;
 
   const double ray_len = ray.norm();
   if (ray_len < 1e-12) return ProjectedEdgeStatus::kAdmissible;
@@ -88,6 +91,10 @@ ProjectedEdgeStatus GroundProjection::getProjectedEdgeStatus(
           !is_hanging) {
         return ProjectedEdgeStatus::kHanging;
       }
+      if (vs != VoxelStatus::kOccupied || ground_height < 0.0) {
+        projected_edge.push_back(edge_point);
+        continue;
+      }
       Eigen::Vector3d projected = edge_point;
       projected(2) -= (ground_height - params_.max_ground_height);
       projected_edge.push_back(projected);
@@ -105,7 +112,8 @@ ProjectedEdgeStatus GroundProjection::getProjectedEdgeStatus(
     if ((vs == VoxelStatus::kUnknown || start_ground < 0.0) && !is_hanging) {
       return ProjectedEdgeStatus::kHanging;
     }
-    start_m(2) -= (start_ground - params_.max_ground_height);
+    if (vs == VoxelStatus::kOccupied && start_ground >= 0.0)
+      start_m(2) -= (start_ground - params_.max_ground_height);
     projected_edge.push_back(start_m);
   }
 
@@ -116,7 +124,8 @@ ProjectedEdgeStatus GroundProjection::getProjectedEdgeStatus(
   if ((vs == VoxelStatus::kUnknown || ground_height < 0.0) && !is_hanging) {
     return ProjectedEdgeStatus::kHanging;
   }
-  end_m(2) -= (ground_height - params_.max_ground_height);
+  if (vs == VoxelStatus::kOccupied && ground_height >= 0.0)
+    end_m(2) -= (ground_height - params_.max_ground_height);
   projected_edge.push_back(end_m);
 
 
@@ -125,7 +134,8 @@ ProjectedEdgeStatus GroundProjection::getProjectedEdgeStatus(
     const Eigen::Vector3d segment = projected_edge[i] - projected_edge[i - 1];
     const double theta =
         std::atan2(std::abs(segment(2)), std::abs(segment.head(2).norm()));
-    if (std::abs(theta) > max_inclination) return ProjectedEdgeStatus::kSteep;
+    if (std::abs(segment(2)) > params_.max_step_height + 1e-6 &&
+        std::abs(theta) > max_inclination) return ProjectedEdgeStatus::kSteep;
   }
 
   for (size_t i = 1; i < projected_edge.size(); ++i) {

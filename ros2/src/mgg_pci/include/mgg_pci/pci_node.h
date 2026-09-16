@@ -24,6 +24,7 @@
 #include <nav_msgs/msg/odometry.hpp>
 #include <nav_msgs/msg/path.hpp>
 #include <rclcpp/rclcpp.hpp>
+#include <std_msgs/msg/string.hpp>
 #include <std_srvs/srv/trigger.hpp>
 
 #include <mgg_msgs/srv/planner_srv.hpp>
@@ -47,6 +48,7 @@ class PciNode : public rclcpp::Node {
   bool requestPlan(std::vector<geometry_msgs::msg::Pose>& path,
                    std::string& error);
 
+  void publishStatus(const std::string& state);
   void publishPath(const std::vector<geometry_msgs::msg::Pose>& path);
   void planAndPublish();
   bool executeBootstrap();
@@ -60,6 +62,10 @@ class PciNode : public rclcpp::Node {
   rclcpp::CallbackGroup::SharedPtr callback_group_;
 
   std::mutex mutex_;
+  rclcpp::Publisher<std_msgs::msg::String>::SharedPtr status_pub_;
+  int plan_status_ = -1;
+  int stalled_plans_ = 0;
+  uint64_t generation_ = 0;
   bool running_ = false;
   bool have_odometry_ = false;
   bool planning_in_progress_ = false;

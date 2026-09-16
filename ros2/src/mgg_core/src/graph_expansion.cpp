@@ -162,7 +162,8 @@ void expandGraph(GraphManager& graph, Vertex& new_vertex,
   // be a behaviour change on a path this port cannot yet exercise end to end.
   for (size_t i = 1; i < projected_edge.size(); ++i) {
     const Eigen::Vector3d segment = projected_edge[i] - projected_edge[i - 1];
-    if (std::atan2(std::abs(segment(2)), segment.head(2).norm()) >
+    if (std::abs(segment(2)) > ctx.planning->max_step_height + 1e-6 &&
+        std::atan2(std::abs(segment(2)), segment.head(2).norm()) >
         ctx.planning->max_inclination) {
       admissible_edge = false;
     }

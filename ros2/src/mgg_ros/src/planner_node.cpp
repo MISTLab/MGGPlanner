@@ -391,6 +391,9 @@ std::string PlannerNode::buildLocalGraph() {
       root_state[2] = pos[2] - (ground_height - planning_params_.max_ground_height);
     } else {
       root_hanging = true;
+      // Odometry locates the base, whereas graph states locate the raised
+      // collision box. Preserve this offset even inside the sensor blind spot.
+      root_state[2] += planning_params_.max_ground_height - robot_params_.size[2] / 2.0;
     }
   }
   auto* root = new mgg::Vertex(0, root_state);
@@ -684,13 +687,14 @@ void PlannerNode::onPlanRequest(
   robot_params_.bound_mode =
       static_cast<mgg::BoundModeType>(request->bound_mode);
 
+  best_path_.clear();
   const std::string summary = buildLocalGraph();
   robot_params_.bound_mode = previous;
 
   response->planning_bound_mode = request->bound_mode;
-  response->status = best_path_.empty()
-                         ? mgg_msgs::srv::PlannerSrv::Response::HOMING
-                         : mgg_msgs::srv::PlannerSrv::Response::FORWARD;
+  response->status = !have_odometry_ || !map_->getStatus() ? -1
+      : best_path_.empty() ? (local_graph_->getNumVertices() <= 1 ? -2 : -3)
+      : mgg_msgs::srv::PlannerSrv::Response::FORWARD;
   for (const mgg::StateVec& s : best_path_) {
     response->path.push_back(toPoseMsg(s));
   }

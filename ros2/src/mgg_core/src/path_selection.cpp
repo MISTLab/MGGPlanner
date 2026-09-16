@@ -44,7 +44,7 @@ PathSelectionResult selectBestPath(GraphManager& graph,
             path[ind]->state.head(3) - path[ind - 1]->state.head(3);
         // Only descents are checked: driving down a steep slope is what the
         // robot cannot recover from.
-        if ((path[ind]->state(2) - path[ind - 1]->state(2)) < -map_resolution) {
+        if ((path[ind]->state(2) - path[ind - 1]->state(2)) < -std::max(map_resolution, planning.max_step_height)) {
           const double stored =
               inclinations.get(path[ind]->id, path[ind - 1]->id);
           const double geometric =
