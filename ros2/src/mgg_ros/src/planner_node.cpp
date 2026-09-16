@@ -1331,7 +1331,7 @@ mgg::GridProjectionStatus PlannerNode::objectiveFootprintTerrainStatus(
             record_failure(detail);
           }
         }
-        return ray == mgg::VoxelStatus::kUnknown
+        return ray == mgg::VoxelStatus::kUnknown || !hit.allFinite()
                    ? mgg::GridProjectionStatus::kBodyUnknown
                    : mgg::GridProjectionStatus::kNoGround;
       }
@@ -2099,6 +2099,15 @@ mgg::FeasiblePath PlannerNode::refineCorridor(
                                const mgg::StateVec& b) {
     return (a.head<3>() - b.head<3>()).cwiseAbs().maxCoeff() <= 1e-6;
   };
+  const auto isPhysicalCurrent =
+      [this, &current_anchor](const mgg::StateVec& state) {
+        return (state.head<2>() - current_anchor.head<2>())
+                       .cwiseAbs().maxCoeff() <= 1e-6 &&
+               (std::abs(state.z() - current_state_.z()) <= 1e-6 ||
+                std::abs(state.z() - current_anchor.z()) <=
+                    planning_params_.max_step_height + map_->getResolution() +
+                        1e-6);
+      };
   const auto geofenceContains = [this, &body](const Eigen::Vector3d& center) {
     if (!planning_params_.geofence_checking_enable) return true;
     if (!geofence_) return false;
@@ -2119,10 +2128,11 @@ mgg::FeasiblePath PlannerNode::refineCorridor(
   };
   const auto project = [this, body, center_offset, current_anchor, home_anchor,
                         have_connected_home_anchor, request_targets_home_anchor,
-                        &corridor, &samePosition,
+                        &corridor, &samePosition, &isPhysicalCurrent,
                         &geofenceContains,
                         &footprintTerrainStatus](mgg::StateVec& state) {
     bool physical_anchor_fallback = false;
+    const bool physical_current = isPhysicalCurrent(state);
     if (robot_params_.type == mgg::RobotType::kGroundRobot) {
       const bool exact_explicit_goal =
           (corridor.request.objective == mgg::ObjectiveKind::kNavigate ||
@@ -2170,9 +2180,20 @@ mgg::FeasiblePath PlannerNode::refineCorridor(
       }
     }
     const Eigen::Vector3d center = state.head<3>() + center_offset;
-    if (!physical_anchor_fallback && footprintTerrainStatus(state.head<3>()) !=
-        mgg::GridProjectionStatus::kSupported) {
-      return mgg::GridProjectionStatus::kNoGround;
+    // Odometry proves that the robot already occupies this one exact pose.
+    // Permit it to seed a route even when a conservative terrain footprint
+    // query rejects the stationary pose. Body occupancy and geofence checks
+    // below, and the complete outgoing edge checks, remain mandatory.
+    if (!physical_anchor_fallback) {
+      const mgg::GridProjectionStatus footprint_status =
+          footprintTerrainStatus(state.head<3>());
+      if (footprint_status != mgg::GridProjectionStatus::kSupported &&
+          !(physical_current &&
+            footprint_status == mgg::GridProjectionStatus::kNoGround)) {
+        return footprint_status == mgg::GridProjectionStatus::kBodyUnknown
+                   ? footprint_status
+                   : mgg::GridProjectionStatus::kNoGround;
+      }
     }
     const mgg::VoxelStatus body_status = objectiveBodyStatus(center, body);
     if (body_status == mgg::VoxelStatus::kOccupied) {
@@ -2189,11 +2210,14 @@ mgg::FeasiblePath PlannerNode::refineCorridor(
   const auto traverse =
       [this, body, center_offset, current_anchor, home_anchor,
        have_connected_home_anchor, &samePosition,
+       &isPhysicalCurrent,
        &geofenceAllows,
        &footprintTerrainStatus](const mgg::StateVec& a,
                                 const mgg::StateVec& b,
                         std::vector<mgg::StateVec>& checked) {
         checked.clear();
+        const bool a_physical_current = isPhysicalCurrent(a);
+        const bool b_physical_current = isPhysicalCurrent(b);
         const bool a_provenance =
             samePosition(a, current_anchor) ||
             (have_connected_home_anchor && samePosition(a, home_anchor));
@@ -2271,9 +2295,17 @@ mgg::FeasiblePath PlannerNode::refineCorridor(
           }
         }
         checked.reserve(projected.size());
-        for (const Eigen::Vector3d& driving_pose : projected) {
-          if (footprintTerrainStatus(driving_pose) !=
-              mgg::GridProjectionStatus::kSupported) {
+        for (std::size_t projected_index = 0;
+             projected_index < projected.size(); ++projected_index) {
+          const Eigen::Vector3d& driving_pose = projected[projected_index];
+          const bool physical_endpoint =
+              (projected_index == 0 && a_physical_current) ||
+              (projected_index + 1 == projected.size() && b_physical_current);
+          const mgg::GridProjectionStatus footprint_status =
+              footprintTerrainStatus(driving_pose);
+          if (footprint_status != mgg::GridProjectionStatus::kSupported &&
+              !(physical_endpoint &&
+                footprint_status == mgg::GridProjectionStatus::kNoGround)) {
             checked.clear();
             return false;
           }

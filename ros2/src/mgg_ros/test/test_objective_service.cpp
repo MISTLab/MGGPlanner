@@ -1282,6 +1282,67 @@ TEST(PlannerObjective, ObservedGroundBlindStartConnectorRetainsDistanceBound) {
   EXPECT_EQ(refused.status, mgg::PlanningStatus::kBlocked);
 }
 
+TEST(PlannerObjective, PhysicalCurrentMayEscapeRejectedTerrainButCannotCrossIt) {
+  using Peer = mgg_ros::PlannerNodeTestPeer;
+  const auto make = [] {
+    rclcpp::NodeOptions options;
+    options.parameter_overrides(
+        {rclcpp::Parameter("use_sim_time", true),
+         rclcpp::Parameter("map.resolution", 0.05),
+         rclcpp::Parameter("objective_body_evidence_policy", "observed_ground")});
+    auto node = std::make_shared<mgg_ros::PlannerNode>(options);
+    Peer::configureBackboneTest(*node);
+    Peer::setPlanningBody(*node, Eigen::Vector3d(0.40, 0.20, 0.15));
+    Peer::acceptOdometry(*node, 0.0, 0.0, 0.075);
+    Peer::observeGroundRectangle(*node, -1.5, 1.5, -1.0, 1.0);
+    Peer::observeFreeBodyBox(*node, Eigen::Vector3d(0.0, 0.0, 0.40),
+                            Eigen::Vector3d(3.2, 2.2, 0.20));
+    // Pin the centre ray and forward connector to the flat floor explicitly.
+    // The rectangle helper's repeated 0.1 additions can represent y=0 just
+    // below a voxel boundary, making projection fall back to the rear probe
+    // that this fixture intentionally raises.
+    for (double x = 0.0; x <= 1.0 + 1e-9; x += 0.05) {
+      Peer::addMeasuredSurface(*node, x, 0.0, 0.0);
+    }
+    // A raised terrain return lies under the rear edge of the stationary
+    // footprint, while the forward edge immediately leaves it behind.
+    Peer::addMeasuredSurface(*node, -0.24, 0.0, 0.125);
+    Peer::finishMapRevision(*node);
+    return node;
+  };
+  const auto corridor = [](double x, double y = 0.0) {
+    mgg::RouteCorridor route;
+    route.status = mgg::PlanningStatus::kSucceeded;
+    route.request.objective = mgg::ObjectiveKind::kNavigate;
+    route.request.goal.pose = mgg::StateVec(x, y, 0.075, 0.0);
+    return route;
+  };
+
+  auto away = make();
+  ASSERT_FALSE(Peer::footprintTerrainSupported(
+      *away, Eigen::Vector3d(0.0, 0.0, 0.30),
+      Eigen::Vector3d(0.40, 0.20, 0.15)));
+  const mgg::FeasiblePath escaped = Peer::refine(*away, corridor(1.0));
+  ASSERT_EQ(escaped.status, mgg::PlanningStatus::kSucceeded) << escaped.reason;
+  EXPECT_NEAR(escaped.poses.back().x(), 1.0, 1e-9);
+
+  auto across = make();
+  for (double y = -1.0; y <= 1.0 + 1e-9; y += 0.05) {
+    Peer::addMeasuredSurface(*across, -0.30, y, 0.125);
+  }
+  const mgg::FeasiblePath refused_crossing =
+      Peer::refine(*across, corridor(-1.0));
+  EXPECT_EQ(refused_crossing.status, mgg::PlanningStatus::kBlocked)
+      << refused_crossing.reason;
+
+  auto endpoint = make();
+  Peer::addMeasuredSurface(*endpoint, 0.80, 0.0, 0.125);
+  const mgg::FeasiblePath refused_endpoint =
+      Peer::refine(*endpoint, corridor(0.80));
+  EXPECT_EQ(refused_endpoint.status, mgg::PlanningStatus::kBlocked)
+      << refused_endpoint.reason;
+}
+
 TEST(PlannerObjective, ObservedGroundVetoesKnownFootprintTerrainHazards) {
   using Peer = mgg_ros::PlannerNodeTestPeer;
   const auto make = [] {
