@@ -40,6 +40,71 @@ std::string boundedObjectiveFailure(const std::string& reason) {
          compact.substr(compact.size() - kTail);
 }
 
+bool hasSkippableHomeWaypointRejection(
+    const mgg::RouteCorridor& corridor, const std::string& reason) {
+  constexpr char kPrefix[] = "route corridor waypoint[";
+  constexpr char kSuffix[] = "] rejected:";
+  if (corridor.status != mgg::PlanningStatus::kSucceeded ||
+      corridor.request.objective != mgg::ObjectiveKind::kReturnHome ||
+      corridor.poses.empty() ||
+      reason.compare(0, sizeof(kPrefix) - 1, kPrefix) != 0) {
+    return false;
+  }
+  if (!corridor.request.goal.pose.allFinite() ||
+      std::any_of(corridor.poses.begin(), corridor.poses.end(),
+                  [](const mgg::StateVec& pose) { return !pose.allFinite(); })) {
+    return false;
+  }
+  std::size_t cursor = sizeof(kPrefix) - 1;
+  std::size_t index = 0;
+  const std::size_t digits_begin = cursor;
+  while (cursor < reason.size() && reason[cursor] >= '0' &&
+         reason[cursor] <= '9') {
+    const std::size_t digit = static_cast<std::size_t>(reason[cursor] - '0');
+    if (index > (std::numeric_limits<std::size_t>::max() - digit) / 10u) {
+      return false;
+    }
+    index = index * 10u + digit;
+    ++cursor;
+  }
+  if (cursor == digits_begin ||
+      reason.compare(cursor, sizeof(kSuffix) - 1, kSuffix) != 0 ||
+      index >= corridor.poses.size()) {
+    return false;
+  }
+  cursor += sizeof(kSuffix) - 1;
+  while (cursor < reason.size() && reason[cursor] == ' ') ++cursor;
+  const auto has_projection_class = [&reason, cursor](const char* value) {
+    return reason.compare(cursor, std::char_traits<char>::length(value), value) ==
+           0;
+  };
+  if (!has_projection_class("no mapped ground support") &&
+      !has_projection_class("body intersects occupied space") &&
+      !has_projection_class("body includes unknown space") &&
+      !has_projection_class("geofence violation")) {
+    return false;
+  }
+  // A partial corridor stores its exact local proxy as the last pose. It is a
+  // mandatory endpoint, while all earlier graph poses are refinement hints.
+  return !corridor.partial || index + 1u < corridor.poses.size();
+}
+
+mgg::RouteCorridor homeLocalEndpointCorridor(
+    const mgg::RouteCorridor& corridor) {
+  mgg::RouteCorridor endpoint = corridor;
+  if (endpoint.partial && !endpoint.poses.empty()) {
+    const mgg::StateVec local_proxy = endpoint.poses.back();
+    endpoint.poses.clear();
+    endpoint.poses.push_back(local_proxy);
+  } else {
+    // A full corridor's endpoint remains request-owned. Clearing a matching
+    // final graph pose makes the grid planner project and validate that exact
+    // Home goal again before searching.
+    endpoint.poses.clear();
+  }
+  return endpoint;
+}
+
 bool objectiveGridWindowFits(const mgg::RouteCorridor& corridor,
                              const mgg::StateVec& current,
                              double resolution, double margin,
@@ -3282,6 +3347,25 @@ void PlannerNode::onObjectiveRequest(
       path = std::move(fallback);
     }
   }
+  if (path.status != mgg::PlanningStatus::kSucceeded &&
+      hasSkippableHomeWaypointRejection(primary, path.reason)) {
+    const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - objective_refinement_started);
+    if (elapsed < objective_grid_limits_.timeout) {
+      mgg::RouteCorridor endpoint = homeLocalEndpointCorridor(primary);
+      mgg::GridRefinementLimits remaining = objective_grid_limits_;
+      remaining.timeout -= elapsed;
+      mgg::FeasiblePath fallback = refineCorridor(endpoint, &remaining);
+      if (fallback.status != mgg::PlanningStatus::kSucceeded) {
+        fallback.reason =
+            "Home graph corridor: " +
+            boundedObjectiveFailure(primary_failure_reason) +
+            " [local endpoint fallback: " +
+            boundedObjectiveFailure(fallback.reason) + "]";
+      }
+      path = std::move(fallback);
+    }
+  }
   const IndexedQueryContext query_context = indexedQueryContext();
   map_read = mgg::MolaMap::ReadLease{};
   lock.unlock();
@@ -3464,7 +3548,28 @@ void PlannerNode::onRefineObjectiveRoute(
                                     local_poses.back(), ""}
                               : cached_home_route_->exact_goal;
   corridor.poses = std::move(local_poses);
+  const auto objective_refinement_started = std::chrono::steady_clock::now();
   mgg::FeasiblePath path = refineCorridor(corridor, &objective_grid_limits_);
+  const std::string primary_failure_reason = path.reason;
+  if (path.status != mgg::PlanningStatus::kSucceeded &&
+      hasSkippableHomeWaypointRejection(corridor, path.reason)) {
+    const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - objective_refinement_started);
+    if (elapsed < objective_grid_limits_.timeout) {
+      mgg::RouteCorridor endpoint = homeLocalEndpointCorridor(corridor);
+      mgg::GridRefinementLimits remaining = objective_grid_limits_;
+      remaining.timeout -= elapsed;
+      mgg::FeasiblePath fallback = refineCorridor(endpoint, &remaining);
+      if (fallback.status != mgg::PlanningStatus::kSucceeded) {
+        fallback.reason =
+            "Home graph corridor: " +
+            boundedObjectiveFailure(primary_failure_reason) +
+            " [local endpoint fallback: " +
+            boundedObjectiveFailure(fallback.reason) + "]";
+      }
+      path = std::move(fallback);
+    }
+  }
   const IndexedQueryContext query_context = indexedQueryContext();
   map_read = mgg::MolaMap::ReadLease{};
   lock.unlock();
