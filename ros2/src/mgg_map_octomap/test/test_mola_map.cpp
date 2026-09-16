@@ -14,6 +14,7 @@
 #include <fstream>
 #include <functional>
 #include <iomanip>
+#include <iterator>
 #include <limits>
 #include <sstream>
 #include <string>
@@ -72,6 +73,12 @@ void f64(std::string& bytes, double value) {
   std::uint64_t raw = 0;
   std::memcpy(&raw, &value, sizeof(raw));
   u64(bytes, raw);
+}
+
+std::string readFile(const std::filesystem::path& path) {
+  std::ifstream input(path, std::ios::binary);
+  return std::string(std::istreambuf_iterator<char>(input),
+                     std::istreambuf_iterator<char>());
 }
 
 void write(const std::filesystem::path& path, const std::string& bytes) {
@@ -453,6 +460,46 @@ TEST(MolaMap, SmallAuthorityTiltIsTolerated) {
   EXPECT_GT(mgg::authorityTiltRad(component_from_navigation.linear()), 0.004);
   EXPECT_LT(mgg::authorityTiltRad(component_from_navigation.linear()),
             mgg::kMaxAuthorityTiltRad);
+}
+
+TEST(MolaMap, IndexRacingBehindTheSnapshotResolvesWithinTheLoadBudget) {
+  // The worker writes snapshot.json before mola/index.json. A request that
+  // lands between the two must wait for the index rather than fail the plan.
+  Publication publication;
+  publication.publish(0, {{5, 0, 0}}, freeBlock());
+  const std::string stale_index = readFile(publication.root / "mola" / "index.json");
+  const auto request = publication.publish(1, {{8, 0, 0}}, freeBlock());
+  const std::string fresh_index = readFile(publication.root / "mola" / "index.json");
+  write(publication.root / "mola" / "index.json", stale_index);
+
+  MolaMapConfig settings = config(publication);
+  settings.max_load_time = std::chrono::milliseconds(1500);
+  MolaMap provider(settings);
+  provider.requestSnapshot(request);
+  std::this_thread::sleep_for(std::chrono::milliseconds(300));
+  EXPECT_FALSE(provider.getStatus());
+  EXPECT_TRUE(provider.lastError().empty()) << provider.lastError();
+  write(publication.root / "mola" / "index.json", fresh_index);
+  ASSERT_TRUE(waitFor([&]() { return provider.getStatus(); }))
+      << provider.lastError();
+  EXPECT_EQ(provider.getVoxelStatus({1.7, 0.1, 0.1}), VoxelStatus::kOccupied);
+}
+
+TEST(MolaMap, PersistentIndexMismatchStillFailsAtTheLoadDeadline) {
+  Publication publication;
+  publication.publish(0, {{5, 0, 0}}, freeBlock());
+  const std::string stale_index = readFile(publication.root / "mola" / "index.json");
+  const auto request = publication.publish(1, {{8, 0, 0}}, freeBlock());
+  write(publication.root / "mola" / "index.json", stale_index);
+
+  MolaMapConfig settings = config(publication);
+  settings.max_load_time = std::chrono::milliseconds(400);
+  MolaMap provider(settings);
+  provider.requestSnapshot(request);
+  ASSERT_TRUE(waitFor([&]() { return !provider.lastError().empty(); }));
+  EXPECT_FALSE(provider.getStatus());
+  EXPECT_NE(provider.lastError().find("not coherent"), std::string::npos)
+      << provider.lastError();
 }
 
 TEST(MolaMap, CorrectedSnapshotAtomicallyRetractsOldGeometry) {

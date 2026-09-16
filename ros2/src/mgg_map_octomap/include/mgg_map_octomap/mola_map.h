@@ -174,6 +174,9 @@ class MolaMap : public MapInterface {
   void endReadLease(const std::shared_ptr<const Snapshot>& snapshot) const;
   void workerLoop();
   std::shared_ptr<const Snapshot> load(const PendingRequest& pending) const;
+  /// One read of the peer directory against a fixed deadline.
+  std::shared_ptr<const Snapshot> loadOnce(const PendingRequest& pending,
+                                           std::chrono::steady_clock::time_point deadline) const;
   void failIfLatest(std::uint64_t generation, const std::string& error);
 
   MolaMapConfig config_;
