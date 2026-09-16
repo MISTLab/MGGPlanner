@@ -43,6 +43,7 @@ add_library(${PROJECT_NAME}
   src/gain.cpp
   src/trajectory.cpp
   src/path_selection.cpp
+  src/planning_stages.cpp
   src/log.cpp)
 target_include_directories(${PROJECT_NAME} PUBLIC
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
@@ -86,6 +87,8 @@ if(BUILD_TESTING)
   target_link_libraries(test_trajectory ${PROJECT_NAME})
   ament_add_gtest(test_path_selection test/test_path_selection.cpp)
   target_link_libraries(test_path_selection ${PROJECT_NAME})
+  ament_add_gtest(test_planning_stages test/test_planning_stages.cpp)
+  target_link_libraries(test_planning_stages ${PROJECT_NAME})
 endif()
 
 ament_package()
