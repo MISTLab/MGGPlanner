@@ -61,15 +61,17 @@ TEST(PlanningStages, FarNavigateUsesPersistentPrefixForExactCompletion) {
   ASSERT_EQ(route.status, PlanningStatus::kSucceeded) << route.reason;
   ASSERT_FALSE(route.partial);
   ASSERT_EQ(route.poses.size(), 4u);
-  EXPECT_DOUBLE_EQ(route.poses.back().x(), 3.0);
-  // The prefix remains topology only. The grid stage must append and reach
-  // the exact operator goal before this request can succeed.
+  EXPECT_DOUBLE_EQ(route.poses[2].x(), 2.0);
+  EXPECT_DOUBLE_EQ(route.poses.back().x(), 30.0);
+  EXPECT_DOUBLE_EQ(route.poses.back().y(), 4.0);
+  // The final edge is an optimistic global connector. Rolling grid refinement
+  // validates it in bounded local windows without changing the destination.
   EXPECT_DOUBLE_EQ(route.request.goal.pose.x(), 30.0);
   EXPECT_DOUBLE_EQ(route.request.goal.pose.y(), 4.0);
   EXPECT_DOUBLE_EQ(route.request.goal.pose[3], 1.2);
 }
 
-TEST(PlanningStages, FarNavigateWithoutHelpfulPrefixRequestsDirectGridCompletion) {
+TEST(PlanningStages, FarNavigateWithoutHelpfulPrefixKeepsTentativeGraphRoute) {
   Chain chain;
   TopologicalGoalPlanner planner("component-a", 12, 34, 0.25, 1.0);
   auto far = request(ObjectiveKind::kNavigate);
@@ -77,7 +79,9 @@ TEST(PlanningStages, FarNavigateWithoutHelpfulPrefixRequestsDirectGridCompletion
   const auto route = planner.plan(chain.graph, StateVec::Zero(), far);
   EXPECT_EQ(route.status, PlanningStatus::kSucceeded) << route.reason;
   EXPECT_FALSE(route.partial);
-  EXPECT_TRUE(route.poses.empty());
+  ASSERT_EQ(route.poses.size(), 2u);
+  EXPECT_DOUBLE_EQ(route.poses.front().x(), 0.0);
+  EXPECT_DOUBLE_EQ(route.poses.back().x(), -30.0);
 }
 
 TEST(PlanningStages, PartialProgressMustMeetTheConfiguredMinimum) {
@@ -88,7 +92,9 @@ TEST(PlanningStages, PartialProgressMustMeetTheConfiguredMinimum) {
   const auto route = planner.plan(chain.graph, StateVec::Zero(), far);
   EXPECT_EQ(route.status, PlanningStatus::kSucceeded) << route.reason;
   EXPECT_FALSE(route.partial);
-  EXPECT_TRUE(route.poses.empty());
+  ASSERT_EQ(route.poses.size(), 2u);
+  EXPECT_DOUBLE_EQ(route.poses.front().x(), 0.0);
+  EXPECT_DOUBLE_EQ(route.poses.back().x(), 30.0);
 }
 
 TEST(PlanningStages, DisconnectedCloserProxyIsNotSelected) {
@@ -102,7 +108,30 @@ TEST(PlanningStages, DisconnectedCloserProxyIsNotSelected) {
   ASSERT_EQ(route.status, PlanningStatus::kSucceeded) << route.reason;
   ASSERT_FALSE(route.partial);
   ASSERT_FALSE(route.poses.empty());
-  EXPECT_DOUBLE_EQ(route.poses.back().x(), 3.0);
+  ASSERT_EQ(route.poses.size(), 5u);
+  EXPECT_DOUBLE_EQ(route.poses[3].x(), 3.0);
+  EXPECT_DOUBLE_EQ(route.poses.back().x(), 30.0);
+}
+
+TEST(PlanningStages, TentativeConnectorMinimizesGraphPlusUnknownCost) {
+  GraphManager graph;
+  auto* source = new Vertex(0, StateVec(0.0, 0.0, 0.0, 0.0));
+  auto* cheap = new Vertex(1, StateVec(4.0, 0.0, 0.0, 0.0));
+  auto* expensive = new Vertex(2, StateVec(9.0, 0.0, 0.0, 0.0));
+  graph.addVertex(source);
+  graph.addVertex(cheap);
+  graph.addVertex(expensive);
+  graph.addEdge(source, cheap, 4.0);
+  graph.addEdge(source, expensive, 20.0);
+  TopologicalGoalPlanner planner("component-a", 12, 34, 0.25, 1.0);
+  auto far = request(ObjectiveKind::kNavigate);
+  far.goal.pose = StateVec(10.0, 0.0, 0.0, 0.0);
+
+  const auto route = planner.plan(graph, StateVec::Zero(), far);
+  ASSERT_EQ(route.status, PlanningStatus::kSucceeded) << route.reason;
+  ASSERT_EQ(route.poses.size(), 3u);
+  EXPECT_DOUBLE_EQ(route.poses[1].x(), 4.0);
+  EXPECT_DOUBLE_EQ(route.poses.back().x(), 10.0);
 }
 
 TEST(PlanningStages, StaleMapOrGraphSnapshotIsRejected) {

@@ -216,18 +216,21 @@ class PlannerNode : public rclcpp::Node {
 
   mgg::StateVec current_state_ = mgg::StateVec::Zero();
   bool have_odometry_ = false;
-  struct CachedHomeRoute {
+  struct CachedObjectiveRoute {
     std::string id;
     std::string mission_id;
     std::string component_id;
+    mgg::ObjectiveKind objective = mgg::ObjectiveKind::kNavigate;
+    std::uint64_t graph_revision = 0;
     mgg::PlanningGoal exact_goal;
     std::vector<mgg::StateVec> global_poses;
     std::size_t next_index = 0;
     mgg::StateVec expected_endpoint = mgg::StateVec::Zero();
   };
-  std::unique_ptr<CachedHomeRoute> cached_home_route_;
+  std::unique_ptr<CachedObjectiveRoute> cached_objective_route_;
   std::string route_instance_id_;
   std::uint64_t route_sequence_ = 0;
+  std::uint64_t objective_request_generation_ = 0;
   /// First finite navigation pose.  This is the mission home landmark and is
   /// latched before mapping or commanded motion can move the current pose.
   mgg::StateVec initial_state_ = mgg::StateVec::Zero();

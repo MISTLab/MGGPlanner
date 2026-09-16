@@ -54,7 +54,10 @@ RouteCorridor TopologicalGoalPlanner::plan(
     if (request.objective == ObjectiveKind::kNavigate) {
       result.status = PlanningStatus::kSucceeded;
       result.reason.clear();
-      return result;  // bounded grid stage must solve current->exact goal
+      // Bootstrap an unvalidated global corridor from the live pose. The
+      // rolling grid stage exposes and checks only its bounded first window.
+      result.poses = {current, goal};
+      return result;
     }
     char reason[192];
     std::snprintf(reason, sizeof(reason),
@@ -70,6 +73,7 @@ RouteCorridor TopologicalGoalPlanner::plan(
     if (request.objective == ObjectiveKind::kNavigate) {
       result.status = PlanningStatus::kSucceeded;
       result.reason.clear();
+      result.poses = {current, goal};
       return result;
     }
     result.reason = "could not solve the topological graph";
@@ -92,7 +96,11 @@ RouteCorridor TopologicalGoalPlanner::plan(
     // search directly from current to the exact request-owned goal.
     const double initial_remaining =
         (goal.head<2>() - current.head<2>()).norm();
-    struct RankedSeed { Vertex* vertex; double remaining; double cost; };
+    struct RankedSeed {
+      Vertex* vertex;
+      double remaining;
+      double graph_cost;
+    };
     std::vector<RankedSeed> eligible;
     eligible.reserve(graph.vertices_map_.size());
     for (const auto& entry : graph.vertices_map_) {
@@ -111,8 +119,10 @@ RouteCorridor TopologicalGoalPlanner::plan(
     }
     std::sort(eligible.begin(), eligible.end(),
               [](const RankedSeed& a, const RankedSeed& b) {
-                return std::tie(a.remaining, a.cost, a.vertex->id) <
-                       std::tie(b.remaining, b.cost, b.vertex->id);
+                const double a_total = a.graph_cost + a.remaining;
+                const double b_total = b.graph_cost + b.remaining;
+                return std::tie(a_total, a.remaining, a.vertex->id) <
+                       std::tie(b_total, b.remaining, b.vertex->id);
               });
     for (const RankedSeed& candidate : eligible) {
       std::vector<StateVec> candidate_path;
@@ -123,6 +133,22 @@ RouteCorridor TopologicalGoalPlanner::plan(
         result.poses = std::move(candidate_path);
         break;
       }
+    }
+    if (result.poses.empty()) {
+      // Even when no existing vertex advances toward the goal, anchor the
+      // tentative connector at the current graph vertex.  This keeps an
+      // arbitrary distant Navigate in the persistent-route hierarchy instead
+      // of handing the complete distance to the bounded local grid.
+      result.poses.push_back(source->state);
+    }
+    // The persistent graph is the global route authority.  Its best reachable
+    // vertex is followed by an optimistic connector to the request-owned goal;
+    // rolling local refinement will validate this connector as the robot
+    // approaches it.  Keeping the exact goal here prevents a nearby graph
+    // vertex from being mistaken for successful Navigate completion.
+    if (!result.poses.empty() &&
+        !result.poses.back().head<3>().isApprox(goal.head<3>())) {
+      result.poses.push_back(goal);
     }
     result.status = PlanningStatus::kSucceeded;
     result.partial = false;
@@ -136,7 +162,8 @@ RouteCorridor TopologicalGoalPlanner::plan(
     if (request.objective == ObjectiveKind::kNavigate) {
       result.status = PlanningStatus::kSucceeded;
       result.reason.clear();
-      return result;  // disconnected topology cannot suppress map A*
+      result.poses = {current, goal};
+      return result;
     }
     result.reason = "goal is in a disconnected graph component";
     return result;

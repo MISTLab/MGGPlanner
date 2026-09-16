@@ -958,6 +958,17 @@ class PlannerNodeTestPeer {
     return static_cast<bool>(node.indexed_map_client_);
   }
 
+  static std::string cachedObjectiveRouteId(PlannerNode& node) {
+    const std::lock_guard<std::recursive_mutex> lock(node.planner_mutex_);
+    return node.cached_objective_route_ ? node.cached_objective_route_->id : "";
+  }
+
+  static mgg_msgs::msg::MappingSnapshot mappingSnapshot(
+      PlannerNode& node) {
+    const std::lock_guard<std::recursive_mutex> lock(node.planner_mutex_);
+    return node.mapping_snapshot_;
+  }
+
   static void setIndexedTerrainLimits(PlannerNode& node, double step,
                                       double inclination) {
     const std::lock_guard<std::recursive_mutex> lock(node.planner_mutex_);
@@ -1141,10 +1152,53 @@ TEST(PlannerObjective, ProvisionalUnknownGroundReachesDistantExactGoals) {
     ASSERT_EQ(response->status,
               mgg_msgs::srv::PlanObjective::Response::SUCCEEDED)
         << distance << "m: " << response->reason;
+    EXPECT_TRUE(response->partial);
+    EXPECT_FALSE(response->route_id.empty());
     ASSERT_FALSE(response->path.empty());
-    EXPECT_NEAR(response->path.back().position.x, distance, 1e-9);
-    EXPECT_NEAR(response->path.back().orientation.z, std::sin(0.35), 1e-9);
+    EXPECT_LE(response->path.back().position.x, 8.0 + 1e-9);
+    ASSERT_FALSE(response->global_path.empty());
+    EXPECT_NEAR(response->global_path.back().position.x, distance, 1e-9);
+    EXPECT_NEAR(response->global_path.back().orientation.z, std::sin(0.35),
+                1e-9);
   }
+}
+
+TEST(PlannerObjective,
+     UnsupportedFarNavigateKeepsFirstHorizonOnDrivingPlane) {
+  using Peer = mgg_ros::PlannerNodeTestPeer;
+  rclcpp::NodeOptions options;
+  options.parameter_overrides(
+      {rclcpp::Parameter("use_sim_time", true),
+       rclcpp::Parameter("map.resolution", 0.15),
+       rclcpp::Parameter("objective_route_horizon_m", 8.0),
+       rclcpp::Parameter("objective_body_evidence_policy", "observed_ground"),
+       rclcpp::Parameter("objective_ground_evidence_policy",
+                         "provisional_unknown")});
+  auto node = std::make_shared<mgg_ros::PlannerNode>(options);
+  Peer::configureBackboneTest(*node);
+  Peer::setPlanningBody(*node, Eigen::Vector3d(1.023, 0.778, 0.40));
+  Peer::setMaxGroundHeight(*node, 0.475);
+  Peer::acceptOdometry(*node, 0.0, 0.0, 0.20);
+  Peer::observeGroundRectangle(*node, -0.6, 0.6, -0.5, 0.5);
+  Peer::finishMapRevision(*node);
+
+  const auto response = Peer::requestObjective(
+      *node, mgg::ObjectiveKind::kNavigate,
+      // Deliberately use a UI/base height unrelated to the graph's driving
+      // convention. Terrain at this distant endpoint is still unknown.
+      mgg::StateVec(12.0, 0.0, 0.0, 0.7));
+  ASSERT_EQ(response->status,
+            mgg_msgs::srv::PlanObjective::Response::SUCCEEDED)
+      << response->reason;
+  ASSERT_TRUE(response->partial);
+  ASSERT_FALSE(response->path.empty());
+  EXPECT_NEAR(response->path.back().position.x, 8.0, 1e-6);
+  EXPECT_NEAR(response->path.back().position.z, 0.20, 1e-6);
+  ASSERT_FALSE(response->global_path.empty());
+  EXPECT_NEAR(response->global_path.back().position.x, 12.0, 1e-9);
+  EXPECT_NEAR(response->global_path.back().position.z, 0.0, 1e-9);
+  EXPECT_NEAR(response->global_path.back().orientation.z, std::sin(0.35),
+              1e-9);
 }
 
 TEST(PlannerObjective, ExplicitObjectiveUsesBoundedWiderDetourWindow) {
@@ -1195,9 +1249,9 @@ TEST(PlannerObjective, ExplicitObjectiveUsesBoundedWiderDetourWindow) {
   ASSERT_NE(response, nullptr);
   ASSERT_EQ(response->status, Service::Response::SUCCEEDED)
       << response->reason;
+  EXPECT_TRUE(response->partial);
   ASSERT_FALSE(response->path.empty());
-  EXPECT_NEAR(response->path.back().position.x, goal.x(), 1e-6);
-  EXPECT_NEAR(response->path.back().position.y, goal.y(), 1e-6);
+  EXPECT_LE(response->path.back().position.x, 8.0 + 1e-6);
   EXPECT_NEAR(response->path.back().orientation.z, std::sin(0.35), 1e-9);
   EXPECT_NEAR(response->path.back().orientation.w, std::cos(0.35), 1e-9);
   EXPECT_TRUE(std::any_of(response->path.begin(), response->path.end(),
@@ -1360,7 +1414,7 @@ TEST(PlannerObjective, LongHomeKeepsGlobalRouteAndRefinesBoundedWindows) {
   auto rejected = Peer::refineObjectiveRoute(*node, early);
   EXPECT_EQ(rejected->status,
             mgg_msgs::srv::RefineObjectiveRoute::Response::BLOCKED);
-  EXPECT_NE(rejected->reason.find("outside the completed Home route window"),
+  EXPECT_NE(rejected->reason.find("outside the completed objective route window"),
             std::string::npos);
 
   bool complete = false;
@@ -1546,7 +1600,7 @@ TEST(PlannerObjective, OccupiedFinalHomeRemainsBlockedAfterGraphHintFallback) {
             mgg_msgs::srv::PlanObjective::Response::BLOCKED);
   EXPECT_TRUE(response->path.empty());
   EXPECT_NE(response->reason.find("exact goal rejected"), std::string::npos);
-  EXPECT_NE(response->reason.find("local endpoint fallback"),
+  EXPECT_NE(response->reason.find("direct fallback"),
             std::string::npos);
 }
 
@@ -2462,7 +2516,7 @@ TEST(PlannerBackbone, ExplicitGroundFailureIdentifiesCurrentOrGoal) {
       << response->reason;
 }
 
-TEST(PlannerObjective, NavigateCompletesThirtyMetreKnownRoadExactly) {
+TEST(PlannerObjective, NavigateReturnsBoundedWindowForThirtyMetreKnownRoad) {
   rclcpp::NodeOptions options;
   options.parameter_overrides(
       {rclcpp::Parameter("map.resolution", 0.05)});
@@ -2476,10 +2530,89 @@ TEST(PlannerObjective, NavigateCompletesThirtyMetreKnownRoadExactly) {
   ASSERT_NE(response, nullptr);
   ASSERT_EQ(response->status, Service::Response::SUCCEEDED)
       << response->reason;
-  EXPECT_FALSE(response->partial);
+  EXPECT_TRUE(response->partial);
+  EXPECT_FALSE(response->route_id.empty());
+  ASSERT_FALSE(response->global_path.empty());
   ASSERT_FALSE(response->path.empty());
-  EXPECT_NEAR(response->path.back().position.x, exact_goal.x(), 1e-3);
-  EXPECT_NEAR(response->path.back().position.y, exact_goal.y(), 1e-3);
+  EXPECT_LE(response->path.back().position.x, 8.0 + 1e-3);
+  EXPECT_NEAR(response->global_path.back().position.x, exact_goal.x(), 1e-3);
+  EXPECT_NEAR(response->global_path.back().position.y, exact_goal.y(), 1e-3);
+}
+
+TEST(PlannerObjective, RollingNavigateKeepsFixedGoalAcrossGraphGrowth) {
+  using Peer = mgg_ros::PlannerNodeTestPeer;
+  rclcpp::NodeOptions options;
+  options.parameter_overrides(
+      {rclcpp::Parameter("map.resolution", 0.05),
+       rclcpp::Parameter("objective_route_horizon_m", 3.0)});
+  auto planner = std::make_shared<mgg_ros::PlannerNode>(options);
+  Peer::configureLongKnownRoad(*planner);
+
+  const mgg::StateVec exact_goal(12.0, 0.0, 0.075, 0.8);
+  auto response = Peer::requestObjective(
+      *planner, mgg::ObjectiveKind::kNavigate, exact_goal);
+  ASSERT_EQ(response->status, Service::Response::SUCCEEDED)
+      << response->reason;
+  ASSERT_TRUE(response->partial);
+  ASSERT_FALSE(response->route_id.empty());
+  ASSERT_FALSE(response->global_path.empty());
+  EXPECT_NEAR(response->global_path.back().position.x, exact_goal.x(), 1e-9);
+  EXPECT_NEAR(response->global_path.back().orientation.z, std::sin(0.4), 1e-9);
+  const std::string route_id = response->route_id;
+  const std::uint64_t captured_graph_revision = response->graph_revision;
+
+  auto premature =
+      std::make_shared<mgg_msgs::srv::RefineObjectiveRoute::Request>();
+  premature->route_id = route_id;
+  premature->component_id = response->component_id;
+  premature->graph_revision = captured_graph_revision;
+  EXPECT_EQ(Peer::refineObjectiveRoute(*planner, premature)->status,
+            mgg_msgs::srv::RefineObjectiveRoute::Response::BLOCKED);
+
+  bool complete = false;
+  for (int chunk = 0; chunk < 8 && !complete; ++chunk) {
+    ASSERT_FALSE(response->path.empty());
+    const auto endpoint = response->path.back().position;
+    // Normal odometry updates may grow the live graph, but the token remains
+    // bound to the immutable graph route captured by the first request.
+    Peer::acceptOdometry(*planner, endpoint.x, endpoint.y, endpoint.z);
+    auto request =
+        std::make_shared<mgg_msgs::srv::RefineObjectiveRoute::Request>();
+    request->route_id = route_id;
+    request->component_id = response->component_id;
+    request->graph_revision = captured_graph_revision;
+    const auto next = Peer::refineObjectiveRoute(*planner, request);
+    ASSERT_EQ(next->status,
+              mgg_msgs::srv::RefineObjectiveRoute::Response::SUCCEEDED)
+        << next->reason;
+    complete = !next->partial;
+    response->path = next->path;
+    response->partial = next->partial;
+  }
+  ASSERT_TRUE(complete);
+  ASSERT_FALSE(response->path.empty());
+  EXPECT_NEAR(response->path.back().position.x, exact_goal.x(), 1e-9);
+  EXPECT_NEAR(response->path.back().orientation.z, std::sin(0.4), 1e-9);
+}
+
+TEST(PlannerObjective, RollingNavigateDoesNotValidateBeyondCurrentHorizon) {
+  using Peer = mgg_ros::PlannerNodeTestPeer;
+  rclcpp::NodeOptions options;
+  options.parameter_overrides(
+      {rclcpp::Parameter("map.resolution", 0.05),
+       rclcpp::Parameter("objective_route_horizon_m", 3.0)});
+  auto planner = std::make_shared<mgg_ros::PlannerNode>(options);
+  Peer::configureLongKnownRoad(*planner);
+  Peer::addGridObstacle(*planner, 0.325, true, 10.0);
+
+  const auto response = Peer::requestObjective(
+      *planner, mgg::ObjectiveKind::kNavigate,
+      mgg::StateVec(12.0, 0.0, 0.075, 0.0));
+  ASSERT_EQ(response->status, Service::Response::SUCCEEDED)
+      << response->reason;
+  EXPECT_TRUE(response->partial);
+  ASSERT_FALSE(response->path.empty());
+  EXPECT_LE(response->path.back().position.x, 3.0 + 1e-3);
 }
 
 TEST(PlannerObjective, NavigateResolvesStaleStartHeightAcrossLongShallowRamp) {
@@ -2888,6 +3021,116 @@ TEST(PlannerObjective, SnapshotRefreshCannotStarveIndexedResponse) {
       EXPECT_TRUE(response->indexed_map_validated) << response->reason;
     }
   }
+
+  executor.cancel();
+  spinner.join();
+}
+
+TEST(PlannerObjective, OlderIndexedRequestCannotReplaceNewerRouteCache) {
+  using Query = mgg_msgs::srv::QueryMapBatch;
+  using Peer = mgg_ros::PlannerNodeTestPeer;
+  rclcpp::NodeOptions options;
+  options.parameter_overrides(
+      {rclcpp::Parameter("map.resolution", 0.05),
+       rclcpp::Parameter("objective_route_horizon_m", 3.0),
+       rclcpp::Parameter("indexed_map_query_timeout_s", 1.0),
+       rclcpp::Parameter("indexed_map_query_service",
+                         "/supersession/query_batch")});
+  auto planner = std::make_shared<mgg_ros::PlannerNode>(options);
+  Peer::configureLongKnownRoad(*planner);
+  Peer::setFreshMappingComponent(*planner, "shared-component");
+  auto io = std::make_shared<rclcpp::Node>("supersession_io");
+  std::string newer_route_id;
+  std::atomic<int> query_count{0};
+  auto query_group = io->create_callback_group(
+      rclcpp::CallbackGroupType::Reentrant);
+  auto query_service = io->create_service<Query>(
+      "/supersession/query_batch",
+      [planner, &newer_route_id,
+       &query_count](const Query::Request::SharedPtr request,
+                     Query::Response::SharedPtr response) {
+        // The first objective has released planner_mutex_ while awaiting this
+        // reply. Complete a newer rolling objective (its nested query is
+        // served by the executor's third thread), then let the older request
+        // resume and prove it cannot overwrite the newer cache.
+        if (query_count.fetch_add(1) == 0) {
+          const auto newer = Peer::requestMappedObjective(
+              *planner, mgg::ObjectiveKind::kNavigate,
+              mgg::StateVec(15.0, 0.0, 0.075, 0.2));
+          if (newer->status == Service::Response::SUCCEEDED) {
+            newer_route_id = newer->route_id;
+          }
+        }
+        response->status = Query::Response::OK;
+        response->component_id = request->component_id;
+        response->epoch = request->epoch;
+        response->graph_revision = request->graph_revision;
+        response->geometry_revision = request->geometry_revision;
+        const auto n = request->samples.size();
+        response->occupancy.assign(n, Query::Response::FREE);
+        response->ground_z.assign(n, 0.0);
+        response->roughness.assign(n, 0.0);
+        response->clearance.assign(n, 100.0);
+        response->step.assign(n, false);
+        response->drop.assign(n, false);
+      },
+      rclcpp::ServicesQoS(), query_group);
+  auto client = io->create_client<Service>("plan_objective");
+  rclcpp::executors::MultiThreadedExecutor executor(
+      rclcpp::ExecutorOptions{}, 3);
+  executor.add_node(planner);
+  executor.add_node(io);
+  std::thread spinner([&executor]() { executor.spin(); });
+  const bool objective_ready = client->wait_for_service(3s);
+  const auto deadline = std::chrono::steady_clock::now() + 3s;
+  while (!Peer::queryReady(*planner) &&
+         std::chrono::steady_clock::now() < deadline) {
+    std::this_thread::sleep_for(10ms);
+  }
+  const bool query_ready = Peer::queryReady(*planner);
+  EXPECT_TRUE(objective_ready);
+  EXPECT_TRUE(query_ready);
+  if (!objective_ready || !query_ready) {
+    executor.cancel();
+    spinner.join();
+    return;
+  }
+
+  auto request = std::make_shared<Service::Request>();
+  request->objective = Service::Request::NAVIGATE;
+  const auto snapshot = Peer::mappingSnapshot(*planner);
+  request->component_id = snapshot.component_id;
+  request->map_epoch = snapshot.epoch;
+  request->mapping_graph_revision = snapshot.graph_revision;
+  request->geometry_revision = snapshot.geometry_revision;
+  request->map_source_stamp = snapshot.source_stamp;
+  request->goal.position.x = 12.0;
+  request->goal.position.z = 0.075;
+  request->goal.orientation.w = 1.0;
+  auto future = client->async_send_request(request);
+  const bool completed = future.wait_for(3s) == std::future_status::ready;
+  EXPECT_TRUE(completed);
+  if (!completed) {
+    executor.cancel();
+    spinner.join();
+    return;
+  }
+  const auto older = future.get();
+  EXPECT_NE(older, nullptr);
+  if (!older) {
+    executor.cancel();
+    spinner.join();
+    return;
+  }
+  EXPECT_EQ(older->status, Service::Response::BLOCKED) << older->reason;
+  EXPECT_NE(older->reason.find("superseded"), std::string::npos);
+  EXPECT_FALSE(newer_route_id.empty());
+  if (newer_route_id.empty()) {
+    executor.cancel();
+    spinner.join();
+    return;
+  }
+  EXPECT_EQ(Peer::cachedObjectiveRouteId(*planner), newer_route_id);
 
   executor.cancel();
   spinner.join();
