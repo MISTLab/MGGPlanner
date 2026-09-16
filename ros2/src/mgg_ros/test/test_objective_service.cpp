@@ -60,6 +60,13 @@ class PlannerNodeTestPeer {
     const std::lock_guard<std::recursive_mutex> lock(node.planner_mutex_);
     node.planning_params_.max_ground_height = height;
   }
+  static std::string rebuildLocalGraph(PlannerNode& node) {
+    const std::lock_guard<std::recursive_mutex> lock(node.planner_mutex_);
+    return node.buildLocalGraph();
+  }
+  static std::size_t localVertices(const PlannerNode& node) {
+    return node.local_graph_->getNumVertices();
+  }
   static void observeShallowRamp(PlannerNode& node) {
     const std::lock_guard<std::recursive_mutex> lock(node.planner_mutex_);
     for (double x = -0.3; x <= 0.3 + 1e-9; x += 0.05) {
@@ -840,6 +847,37 @@ TEST(PlannerObjective, ProvisionalUnknownGroundReachesDistantExactGoals) {
     ASSERT_FALSE(response->path.empty());
     EXPECT_NEAR(response->path.back().position.x, distance, 1e-9);
     EXPECT_NEAR(response->path.back().orientation.z, std::sin(0.35), 1e-9);
+  }
+}
+
+TEST(PlannerExplore, FullSizeGroundRobotsExpandAtProjectedDrivingHeight) {
+  using Peer = mgg_ros::PlannerNodeTestPeer;
+  for (const auto& body : {
+           Eigen::Vector3d(1.023, 0.778, 0.40),  // Bunker
+           Eigen::Vector3d(0.85, 0.55, 0.35),   // Spot
+       }) {
+    rclcpp::NodeOptions options;
+    options.parameter_overrides({
+        rclcpp::Parameter("use_sim_time", true),
+        rclcpp::Parameter("map.resolution", 0.15),
+        rclcpp::Parameter("objective_body_evidence_policy", "observed_ground"),
+        rclcpp::Parameter("objective_ground_evidence_policy", "provisional_unknown")});
+    auto node = std::make_shared<mgg_ros::PlannerNode>(options);
+    Peer::configureExploreServiceScene(*node, true);
+    Peer::observeGroundRectangle(*node, -0.6, 1.3, -0.6, 0.6);
+    Peer::observeFreeBodyBox(*node, Eigen::Vector3d(0.35, 0.0, 0.65),
+                            Eigen::Vector3d(2.2, 1.2, 0.60));
+    Peer::setPlanningBody(*node, body);
+    Peer::setMaxGroundHeight(*node, 0.475);
+    Peer::acceptOdometry(*node, 0.0, 0.0, body.z() / 2.0);
+    const std::string summary = Peer::rebuildLocalGraph(*node);
+    EXPECT_GT(Peer::localVertices(*node), 1u) << body.transpose() << ": " << summary;
+    const auto response = Peer::requestObjective(
+        *node, mgg::ObjectiveKind::kExplore, mgg::StateVec::Zero());
+    EXPECT_EQ(response->status,
+              mgg_msgs::srv::PlanObjective::Response::SUCCEEDED)
+        << body.transpose() << ": " << response->reason;
+    EXPECT_GE(response->path.size(), 2u);
   }
 }
 

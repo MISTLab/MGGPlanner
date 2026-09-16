@@ -843,7 +843,7 @@ std::string PlannerNode::buildLocalGraph(bool strict_projected_endpoints) {
   }
   const auto t_global = Clock::now();
   const mgg::GridGraphResult r = buildGridGraph(
-      *local_graph_, current_state_, grid_params_, ctx, current_state_[3]);
+      *local_graph_, root_state, grid_params_, ctx, current_state_[3]);
   ++local_graph_revision_;
   local_graph_map_revision_ = map_revision_;
 
