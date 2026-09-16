@@ -118,6 +118,11 @@ class PlannerNode : public rclcpp::Node {
   void updateGlobalGraph();
   void stageGlobalBreadcrumbs(const mgg::StateVec& state);
   bool projectStateToDrivingHeight(mgg::StateVec& state) const;
+  mgg::StateVec physicalAnchorAtDrivingHeight(
+      const mgg::StateVec& base_pose) const;
+  bool validateObjectiveStartSupport(
+      const mgg::StateVec& anchor, const mgg::StateVec& supported,
+      std::vector<mgg::StateVec>& checked) const;
 
   mgg::ExpandContext makeContext();
   mgg::GainContext makeGainContext();
@@ -135,6 +140,7 @@ class PlannerNode : public rclcpp::Node {
   mgg::GridGraphParams grid_params_;
   mgg::GridRefinementLimits grid_refinement_limits_;
   double partial_route_min_progress_m_ = 1.0;
+  double objective_start_support_max_distance_m_ = 3.0;
   mgg::BoundedSpaceParams global_space_;
   std::vector<mgg::BoundedSpaceParams> no_gain_zones_;
   std::unordered_map<std::string, mgg::SensorParams> sensors_;

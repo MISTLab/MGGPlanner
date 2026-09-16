@@ -92,7 +92,13 @@ void expandGraph(GraphManager& graph, Vertex& new_vertex,
                             new_state[2] - origin[2]);
   double direction_norm = direction.norm();
 
-  if (direction_norm > ctx.planning->edge_length_max) {
+  const bool bounded_hanging_root =
+      nearest_vertex->id == 0 && nearest_vertex->is_hanging &&
+      std::isfinite(ctx.hanging_root_edge_length_max) &&
+      ctx.hanging_root_edge_length_max > ctx.planning->edge_length_max &&
+      direction_norm <= ctx.hanging_root_edge_length_max;
+  if (direction_norm > ctx.planning->edge_length_max &&
+      !bounded_hanging_root) {
     direction = ctx.planning->edge_length_max * direction.normalized();
   } else if (!allow_short_edge &&
              direction_norm <= ctx.planning->edge_length_min) {

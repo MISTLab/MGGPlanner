@@ -4,6 +4,7 @@
 #include <future>
 #include <memory>
 #include <sstream>
+#include <stdexcept>
 #include <thread>
 
 #include <gtest/gtest.h>
@@ -290,6 +291,93 @@ class PlannerNodeTestPeer {
     node.local_graph_map_revision_ = node.map_revision_;
   }
 
+  static void configureBlindStartScene(PlannerNode& node,
+                                       double supported_ground_z = 0.0) {
+    configureBackboneTest(node);
+    acceptOdometry(node, 0.0, 0.0, 0.075);
+    const std::lock_guard<std::recursive_mutex> lock(node.planner_mutex_);
+    node.objective_start_support_max_distance_m_ = 3.0;
+    node.grid_refinement_limits_.detour_margin_m = 0.0;
+    node.grid_refinement_limits_.timeout = std::chrono::milliseconds(1000);
+    // Observed free body corridor, while the floor beneath the first metre is
+    // deliberately absent to model the VLP16 near-field ground blind spot.
+    // Body clearance is explicitly observed; only the floor beneath the first
+    // metre remains absent to model the VLP16 near-field ground blind spot.
+    node.map_->augmentFreeBox(Eigen::Vector3d(0.675, 0.0, 0.50),
+                              Eigen::Vector3d(1.65, 0.8, 0.55));
+    for (int repeat = 0; repeat < 20; ++repeat) {
+      for (double x = 1.0; x <= 1.5; x += 0.05) {
+        for (const double y : {-0.20, 0.0, 0.20}) {
+          node.map_->tree()->updateNode(
+              octomap::point3d(static_cast<float>(x), static_cast<float>(y),
+                               static_cast<float>(supported_ground_z + 0.025)),
+              true);
+        }
+      }
+    }
+    node.map_->augmentFreeBox(Eigen::Vector3d(0.675, 0.0, 0.50),
+                              Eigen::Vector3d(1.65, 0.8, 0.55));
+    ++node.map_revision_;
+    node.local_graph_->reset();
+    auto* root = new mgg::Vertex(
+        0, node.physicalAnchorAtDrivingHeight(node.current_state_));
+    root->is_hanging = true;
+    root->robot_id = static_cast<int>(node.planning_params_.robot_id);
+    node.local_graph_->addVertex(root);
+    mgg::StateVec supported(1.20, 0.0, supported_ground_z + 0.075, 0.0);
+    if (!node.projectStateToDrivingHeight(supported)) {
+      throw std::runtime_error("blind-start fixture failed to project support");
+    }
+    auto* destination = new mgg::Vertex(1, supported);
+    destination->robot_id = root->robot_id;
+    node.local_graph_->addVertex(destination);
+    node.local_graph_->addEdge(root, destination,
+                               (supported - root->state).norm());
+    node.local_graph_revision_ = 41;
+    node.local_graph_map_revision_ = node.map_revision_;
+  }
+
+  static void addBlindStartKnownFloor(PlannerNode& node, double x,
+                                      double ground_z) {
+    const std::lock_guard<std::recursive_mutex> lock(node.planner_mutex_);
+    for (int repeat = 0; repeat < 20; ++repeat) {
+      for (double dx = -0.15; dx <= 0.15; dx += 0.05) {
+        for (double y = -0.20; y <= 0.20; y += 0.05) {
+          node.map_->tree()->updateNode(
+              octomap::point3d(static_cast<float>(x + dx),
+                               static_cast<float>(y),
+                               static_cast<float>(ground_z + 0.025)),
+              true);
+        }
+      }
+    }
+    ++node.map_revision_;
+    node.local_graph_map_revision_ = node.map_revision_;
+  }
+
+  static void syncLocalGraphMapRevision(PlannerNode& node) {
+    const std::lock_guard<std::recursive_mutex> lock(node.planner_mutex_);
+    node.local_graph_map_revision_ = node.map_revision_;
+  }
+
+  static std::string rebuildBlindStartLocalGraph(PlannerNode& node) {
+    const std::lock_guard<std::recursive_mutex> lock(node.planner_mutex_);
+    node.planning_params_.edge_length_min = 0.05;
+    node.planning_params_.edge_length_max = 0.50;
+    node.planning_params_.edge_overshoot = 0.0;
+    node.planning_params_.num_vertices_max = 80;
+    node.planning_params_.num_edges_max = 160;
+    node.planning_params_.num_loops_max = 200;
+    node.grid_params_.min_val = Eigen::Vector3d(0.0, 0.0, 0.0);
+    node.grid_params_.max_val = Eigen::Vector3d(1.5, 0.0, 0.30);
+    node.grid_params_.resolution = Eigen::Vector3d(0.25, 0.50, 0.30);
+    node.global_space_.setBound(Eigen::Vector3d(-3.0, -3.0, -1.0),
+                                Eigen::Vector3d(3.0, 3.0, 2.0));
+    node.global_space_.min_extension.setZero();
+    node.global_space_.max_extension.setZero();
+    return node.buildLocalGraph();
+  }
+
   static std::shared_ptr<mgg_msgs::srv::PlanObjective::Response>
   requestBoundNavigate(PlannerNode& node, const mgg::StateVec& goal) {
     auto request = std::make_shared<mgg_msgs::srv::PlanObjective::Request>();
@@ -396,7 +484,8 @@ class PlannerNodeTestPeer {
 
   static std::shared_ptr<mgg_msgs::srv::PlanObjective::Response>
   requestObjective(PlannerNode& node, mgg::ObjectiveKind objective,
-                   const mgg::StateVec& goal) {
+                   const mgg::StateVec& goal,
+                   const std::string& landmark_id = "") {
     auto request = std::make_shared<mgg_msgs::srv::PlanObjective::Request>();
     request->objective = static_cast<std::uint8_t>(objective);
     request->component_id = node.component_id_;
@@ -405,6 +494,7 @@ class PlannerNodeTestPeer {
     request->goal.position.z = goal.z();
     request->goal.orientation.z = std::sin(goal[3] / 2.0);
     request->goal.orientation.w = std::cos(goal[3] / 2.0);
+    request->goal_landmark_id = landmark_id;
     auto response =
         std::make_shared<mgg_msgs::srv::PlanObjective::Response>();
     node.onObjectiveRequest(request, response);
@@ -651,6 +741,99 @@ TEST(PlannerObjective, FarNavigateReturnsCheckedPartialProxy) {
   EXPECT_LT(response->path.back().position.x, exact_goal.x());
   EXPECT_EQ(response->graph_revision, 7u);
   EXPECT_GT(response->map_revision, 0u);
+}
+
+TEST(PlannerObjective, FlatBlindStartConnectsWithoutMovingPhysicalAnchor) {
+  rclcpp::NodeOptions options;
+  options.parameter_overrides(
+      {rclcpp::Parameter("map.resolution", 0.05)});
+  auto planner = std::make_shared<mgg_ros::PlannerNode>(options);
+  using Peer = mgg_ros::PlannerNodeTestPeer;
+  Peer::configureBlindStartScene(*planner);
+  const auto response = Peer::requestBoundNavigate(
+      *planner, mgg::StateVec(1.20, 0.0, 0.075, 0.0));
+  ASSERT_NE(response, nullptr);
+  ASSERT_EQ(response->status, Service::Response::SUCCEEDED)
+      << response->reason;
+  ASSERT_GE(response->path.size(), 2u);
+  EXPECT_NEAR(response->path.front().position.x, 0.0, 1e-9);
+  EXPECT_NEAR(response->path.front().position.z, 0.075, 1e-9);
+  EXPECT_NEAR(response->path.back().position.x, 1.20, 0.06);
+}
+
+TEST(PlannerObjective, BlindStartBuilderReachesSupportPastOrdinaryEdgeLimit) {
+  rclcpp::NodeOptions options;
+  options.parameter_overrides(
+      {rclcpp::Parameter("map.resolution", 0.05)});
+  auto planner = std::make_shared<mgg_ros::PlannerNode>(options);
+  using Peer = mgg_ros::PlannerNodeTestPeer;
+  Peer::configureBlindStartScene(*planner);
+  const std::string summary = Peer::rebuildBlindStartLocalGraph(*planner);
+  SCOPED_TRACE(summary);
+  EXPECT_GT(Peer::localGraphRevision(*planner), 41u);
+  const auto response = Peer::requestBoundNavigate(
+      *planner, mgg::StateVec(1.20, 0.0, 0.075, 0.0));
+  ASSERT_NE(response, nullptr);
+  EXPECT_EQ(response->status, Service::Response::SUCCEEDED)
+      << response->reason;
+}
+
+TEST(PlannerObjective, BlindStartRefusesWallUnknownStepAndObservedDrop) {
+  rclcpp::NodeOptions options;
+  options.parameter_overrides(
+      {rclcpp::Parameter("map.resolution", 0.05)});
+  using Peer = mgg_ros::PlannerNodeTestPeer;
+  const auto goal = mgg::StateVec(1.20, 0.0, 0.075, 0.0);
+
+  auto wall = std::make_shared<mgg_ros::PlannerNode>(options);
+  Peer::configureBlindStartScene(*wall);
+  Peer::addGridObstacle(*wall, 0.325, true, 0.60);
+  Peer::syncLocalGraphMapRevision(*wall);
+  EXPECT_EQ(Peer::requestBoundNavigate(*wall, goal)->status,
+            Service::Response::BLOCKED);
+
+  auto unknown = std::make_shared<mgg_ros::PlannerNode>(options);
+  Peer::configureBlindStartScene(*unknown);
+  ASSERT_TRUE(Peer::makeGridVoxelUnknown(*unknown, 0.60, 0.025, 0.325));
+  Peer::syncLocalGraphMapRevision(*unknown);
+  EXPECT_EQ(Peer::requestBoundNavigate(*unknown, goal)->status,
+            Service::Response::BLOCKED);
+
+  auto step = std::make_shared<mgg_ros::PlannerNode>(options);
+  Peer::configureBlindStartScene(*step, 0.15);
+  EXPECT_EQ(Peer::requestBoundNavigate(
+                *step, mgg::StateVec(1.20, 0.0, 0.225, 0.0))
+                ->status,
+            Service::Response::BLOCKED);
+
+  auto drop = std::make_shared<mgg_ros::PlannerNode>(options);
+  Peer::configureBlindStartScene(*drop);
+  Peer::addBlindStartKnownFloor(*drop, 0.60, -0.15);
+  EXPECT_EQ(Peer::requestBoundNavigate(*drop, goal)->status,
+            Service::Response::BLOCKED);
+}
+
+TEST(PlannerObjective, BlindStartHomeReturnsToLatchedPhysicalAnchor) {
+  rclcpp::NodeOptions options;
+  options.parameter_overrides(
+      {rclcpp::Parameter("map.resolution", 0.05)});
+  auto planner = std::make_shared<mgg_ros::PlannerNode>(options);
+  using Peer = mgg_ros::PlannerNodeTestPeer;
+  Peer::configureBlindStartScene(*planner);
+  Peer::acceptOdometry(*planner, 1.20, 0.0, 0.075);
+  ASSERT_TRUE(Peer::initialAnchorSupported(*planner));
+  const auto response = Peer::requestObjective(
+      *planner, mgg::ObjectiveKind::kReturnHome,
+      mgg::StateVec(0.0055, 0.0, 0.075, 0.6), "kf-home");
+  ASSERT_NE(response, nullptr);
+  ASSERT_EQ(response->status, Service::Response::SUCCEEDED)
+      << response->reason;
+  ASSERT_GE(response->path.size(), 2u);
+  EXPECT_NEAR(response->path.front().position.x, 1.20, 0.06);
+  EXPECT_NEAR(response->path.back().position.x, 0.0, 1e-9);
+  EXPECT_NEAR(response->path.back().position.y, 0.0, 1e-9);
+  EXPECT_NEAR(response->path.back().position.z, 0.075, 1e-9);
+  EXPECT_NEAR(response->path.back().orientation.z, std::sin(0.3), 1e-6);
 }
 
 TEST(PlannerObjective, SnapshotRefreshCannotStarveIndexedResponse) {

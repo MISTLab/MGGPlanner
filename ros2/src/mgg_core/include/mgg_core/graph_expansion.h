@@ -47,6 +47,10 @@ struct ExpandContext {
   int robot_id = 0;
   /// Planning footprint, i.e. robot->getPlanningSize().
   Eigen::Vector3d robot_box_size = Eigen::Vector3d::Zero();
+  /// A hanging root may make one longer candidate connection across a
+  /// sensor's near-field ground blind spot. The edge is only topology here;
+  /// explicit objectives revalidate it with strict body/unknown checks.
+  double hanging_root_edge_length_max = 0.0;
 };
 
 /// Attaches `new_vertex` to `graph`: finds the nearest existing vertex, checks

@@ -67,6 +67,13 @@ PlannerNode::PlannerNode(const rclcpp::NodeOptions& options)
       std::isfinite(requested_partial_progress)
           ? std::clamp(requested_partial_progress, 0.10, 5.0)
           : 1.0;
+  const double requested_start_support = declareOrGet<double>(
+      this, "objective_start_support_max_distance_m",
+      objective_start_support_max_distance_m_);
+  objective_start_support_max_distance_m_ =
+      std::isfinite(requested_start_support)
+          ? std::clamp(requested_start_support, 0.0, 5.0)
+          : 3.0;
   geofence_ = std::make_unique<mgg::GeofenceManager>();
   local_graph_ = std::make_shared<mgg::GraphManager>();
   global_graph_ = std::make_shared<mgg::GraphManager>();
@@ -314,6 +321,8 @@ mgg::ExpandContext PlannerNode::makeContext() {
   ctx.projected_graph = nullptr;  // visualisation only; not built here
   ctx.robot_id = static_cast<int>(planning_params_.robot_id);
   ctx.robot_box_size = robot_params_.getPlanningSize();
+  ctx.hanging_root_edge_length_max =
+      objective_start_support_max_distance_m_;
   return ctx;
 }
 
@@ -853,6 +862,90 @@ bool PlannerNode::projectStateToDrivingHeight(mgg::StateVec& state) const {
   return true;
 }
 
+mgg::StateVec PlannerNode::physicalAnchorAtDrivingHeight(
+    const mgg::StateVec& base_pose) const {
+  mgg::StateVec anchor = base_pose;
+  if (robot_params_.type == mgg::RobotType::kGroundRobot) {
+    anchor[2] += planning_params_.max_ground_height -
+                 robot_params_.size[2] / 2.0;
+  }
+  return anchor;
+}
+
+bool PlannerNode::validateObjectiveStartSupport(
+    const mgg::StateVec& anchor, const mgg::StateVec& supported,
+    std::vector<mgg::StateVec>& checked) const {
+  checked.clear();
+  if (robot_params_.type != mgg::RobotType::kGroundRobot || !ground_ ||
+      !anchor.allFinite() || !supported.allFinite() ||
+      !std::isfinite(objective_start_support_max_distance_m_) ||
+      objective_start_support_max_distance_m_ <= 0.0) {
+    return false;
+  }
+  const double distance =
+      (supported.head<3>() - anchor.head<3>()).norm();
+  if (!std::isfinite(distance) || distance <= 1e-9 ||
+      distance > objective_start_support_max_distance_m_ + 1e-9) {
+    return false;
+  }
+
+  // Missing ground may bridge one physical anchor to a mapped endpoint, but
+  // it never makes occupancy free: the full swept body remains a strict,
+  // unknown-rejecting query.
+  std::vector<Eigen::Vector3d> projected;
+  const Eigen::Vector3d body = robot_params_.getPlanningSize();
+  if (ground_->getProjectedEdgeStatus(
+          anchor.head<3>(), supported.head<3>(), body,
+          /*stop_at_unknown_voxel=*/false, projected,
+          /*is_hanging=*/true) != mgg::ProjectedEdgeStatus::kAdmissible ||
+      projected.size() < 2) {
+    return false;
+  }
+
+  const Eigen::Vector3d center_offset = robot_params_.center_offset;
+  checked.reserve(projected.size());
+  for (const Eigen::Vector3d& point : projected) {
+    // A hanging connector has no mapped terrain with which to justify a
+    // gradual elevation change. Any observed floor outside the platform step
+    // cap therefore refuses the connector, even when the end-to-end chord
+    // would make that change look like a shallow ramp.
+    if (std::abs(point.z() - anchor.z()) >
+        planning_params_.max_step_height + 1e-6) {
+      checked.clear();
+      return false;
+    }
+    mgg::StateVec pose = mgg::StateVec::Zero();
+    pose.head<3>() = point;
+    checked.push_back(pose);
+  }
+  if ((checked.front().head<3>() - anchor.head<3>()).cwiseAbs().maxCoeff() >
+          1e-6 ||
+      (checked.back().head<3>() - supported.head<3>())
+              .cwiseAbs()
+              .maxCoeff() > 1e-6) {
+    checked.clear();
+    return false;
+  }
+  for (std::size_t i = 1; i < checked.size(); ++i) {
+    const Eigen::Vector3d from = checked[i - 1].head<3>() + center_offset;
+    const Eigen::Vector3d to = checked[i].head<3>() + center_offset;
+    if (planning_params_.geofence_checking_enable &&
+        (!geofence_ ||
+         geofence_->getPathStatus(from.head<2>(), to.head<2>(),
+                                  body.head<2>()) ==
+             mgg::GeofenceManager::CoordinateStatus::kViolated)) {
+      checked.clear();
+      return false;
+    }
+    if (map_->getStrictPathStatus(from, to, body) !=
+        mgg::VoxelStatus::kFree) {
+      checked.clear();
+      return false;
+    }
+  }
+  return true;
+}
+
 void PlannerNode::updateGlobalGraph() {
   if (!have_odometry_ || !have_initial_state_) return;
 
@@ -890,18 +983,11 @@ void PlannerNode::updateGlobalGraph() {
   global_backbone_blocked_on_map_ = false;
 
   if (!initial_anchor_supported_) {
-    mgg::StateVec supported_root = initial_state_;
-    if (!projectStateToDrivingHeight(supported_root)) {
-      global_backbone_blocked_on_map_ = true;
-      global_backbone_blocked_map_revision_ = map_revision_;
-      return;
-    }
     auto root_it = global_graph_->vertices_map_.find(0);
     auto* root = root_it == global_graph_->vertices_map_.end()
                      ? nullptr
                      : root_it->second;
-    if (root == nullptr ||
-        !global_graph_->updateVertexState(0, supported_root)) {
+    if (root == nullptr) {
       global_backbone_history_lost_ = true;
       global_backbone_history_lost_reason_ =
           "initial graph vertex is unavailable";
@@ -909,13 +995,75 @@ void PlannerNode::updateGlobalGraph() {
                    global_backbone_history_lost_reason_.c_str());
       return;
     }
-    root->is_hanging = false;
-    initial_anchor_supported_ = true;
-    ++graph_revision_;
-    RCLCPP_INFO(get_logger(),
-                "global graph initial anchor support observed at "
-                "(%.2f, %.2f, %.2f)",
-                supported_root[0], supported_root[1], supported_root[2]);
+    mgg::StateVec supported_root = initial_state_;
+    if (projectStateToDrivingHeight(supported_root)) {
+      if (!global_graph_->updateVertexState(0, supported_root)) {
+        global_backbone_history_lost_ = true;
+        global_backbone_history_lost_reason_ =
+            "initial graph vertex is unavailable";
+        RCLCPP_ERROR(get_logger(), "global trajectory history lost: %s",
+                     global_backbone_history_lost_reason_.c_str());
+        return;
+      }
+      root->is_hanging = false;
+      initial_anchor_supported_ = true;
+      ++graph_revision_;
+      RCLCPP_INFO(get_logger(),
+                  "global graph initial anchor support observed at "
+                  "(%.2f, %.2f, %.2f)",
+                  supported_root[0], supported_root[1], supported_root[2]);
+    } else {
+      // The fixed home coordinate must never move to a distant floor hit.
+      // Once odometry proves that the robot physically left that coordinate,
+      // a bounded connector may attach the retained anchor to the first
+      // mapped-supported breadcrumb. The connector still rejects occupied or
+      // unknown body volume and measured steps/drops.
+      std::size_t selected = pending_global_breadcrumbs_.size();
+      mgg::StateVec bridge_end = mgg::StateVec::Zero();
+      std::vector<mgg::StateVec> bridge;
+      for (std::size_t i = 0; i < pending_global_breadcrumbs_.size(); ++i) {
+        mgg::StateVec candidate = pending_global_breadcrumbs_[i].state;
+        if (!projectStateToDrivingHeight(candidate)) continue;
+        std::vector<mgg::StateVec> checked;
+        if (validateObjectiveStartSupport(root->state, candidate, checked)) {
+          selected = i;
+          bridge_end = candidate;
+          bridge = std::move(checked);
+          break;
+        }
+      }
+      if (selected == pending_global_breadcrumbs_.size()) {
+        global_backbone_blocked_on_map_ = true;
+        global_backbone_blocked_map_revision_ = map_revision_;
+        return;
+      }
+      double bridge_length = 0.0;
+      for (std::size_t i = 1; i < bridge.size(); ++i) {
+        bridge_length +=
+            (bridge[i].head<3>() - bridge[i - 1].head<3>()).norm();
+      }
+      auto* v = new mgg::Vertex(global_graph_->generateVertexID(), bridge_end);
+      v->robot_id = static_cast<int>(planning_params_.robot_id);
+      v->parent = root;
+      v->distance = bridge_length;
+      root->children.push_back(v);
+      global_graph_->addVertex(v);
+      global_graph_->addEdge(v, root, bridge_length);
+      last_own_global_vertex_id_ = v->id;
+      root->is_hanging = false;
+      initial_anchor_supported_ = true;
+      for (std::size_t i = 0; i <= selected; ++i) {
+        pending_global_length_m_ = std::max(
+            0.0, pending_global_length_m_ -
+                     pending_global_breadcrumbs_.front().path_length);
+        pending_global_breadcrumbs_.pop_front();
+      }
+      ++graph_revision_;
+      RCLCPP_INFO(get_logger(),
+                  "global graph retained physical home anchor and connected "
+                  "it to mapped support at (%.2f, %.2f, %.2f)",
+                  bridge_end[0], bridge_end[1], bridge_end[2]);
+    }
   }
 
   const mgg::ExpandContext ctx = makeContext();
@@ -1416,6 +1564,29 @@ mgg::FeasiblePath PlannerNode::refineCorridor(
 
   const Eigen::Vector3d body = robot_params_.getPlanningSize();
   const Eigen::Vector3d center_offset = robot_params_.center_offset;
+  const mgg::StateVec current_anchor =
+      physicalAnchorAtDrivingHeight(current_state_);
+  const mgg::Vertex* home_vertex = global_graph_->getVertex(0);
+  const bool have_connected_home_anchor =
+      initial_anchor_supported_ && home_vertex != nullptr;
+  const mgg::StateVec home_anchor =
+      have_connected_home_anchor ? home_vertex->state : mgg::StateVec::Zero();
+  const double home_association_tolerance =
+      std::clamp(2.0 * map_->getResolution(), 0.01, 0.25);
+  const double requested_home_delta =
+      (corridor.request.goal.pose.head<3>() - initial_state_.head<3>())
+          .cwiseAbs()
+          .maxCoeff();
+  const bool request_targets_home_anchor =
+      corridor.request.objective == mgg::ObjectiveKind::kReturnHome &&
+      have_connected_home_anchor &&
+      (requested_home_delta <= 1e-3 ||
+       (!corridor.request.goal.landmark_id.empty() &&
+        requested_home_delta <= home_association_tolerance));
+  const auto samePosition = [](const mgg::StateVec& a,
+                               const mgg::StateVec& b) {
+    return (a.head<3>() - b.head<3>()).cwiseAbs().maxCoeff() <= 1e-6;
+  };
   const auto geofenceContains = [this, &body](const Eigen::Vector3d& center) {
     if (!planning_params_.geofence_checking_enable) return true;
     if (!geofence_) return false;
@@ -1434,11 +1605,39 @@ mgg::FeasiblePath PlannerNode::refineCorridor(
                from.head<2>(), to.head<2>(), body.head<2>()) !=
            mgg::GeofenceManager::CoordinateStatus::kViolated;
   };
-  const auto project = [this, body, center_offset,
+  const auto project = [this, body, center_offset, current_anchor, home_anchor,
+                        have_connected_home_anchor, request_targets_home_anchor,
+                        &corridor, &samePosition,
                         &geofenceContains](mgg::StateVec& state) {
     if (robot_params_.type == mgg::RobotType::kGroundRobot) {
       if (!ground_ || !projectStateToDrivingHeight(state)) {
-        return mgg::GridProjectionStatus::kNoGround;
+        // Only two unsupported coordinates carry physical provenance: the
+        // robot's current footprint and the retained initial Home anchor after
+        // that anchor gained a checked connection. Arbitrary unsupported
+        // goals and intermediate grid cells still fail closed.
+        if (samePosition(state, current_state_) ||
+            samePosition(state, current_anchor)) {
+          state = current_anchor;
+        } else if (have_connected_home_anchor &&
+                   (samePosition(state, initial_state_) ||
+                    samePosition(state, home_anchor) ||
+                    (request_targets_home_anchor &&
+                     samePosition(state, corridor.request.goal.pose)))) {
+          state = home_anchor;
+        } else {
+          return mgg::GridProjectionStatus::kNoGround;
+        }
+        const Eigen::Vector3d anchor_center =
+            state.head<3>() + center_offset;
+        if (map_->getBoxStatus(anchor_center, body,
+                               /*stop_at_unknown_voxel=*/false) ==
+            mgg::VoxelStatus::kOccupied) {
+          return mgg::GridProjectionStatus::kBodyOccupied;
+        }
+        if (!geofenceContains(anchor_center)) {
+          return mgg::GridProjectionStatus::kGeofenceViolation;
+        }
+        return mgg::GridProjectionStatus::kSupported;
       }
     }
     const Eigen::Vector3d center = state.head<3>() + center_offset;
@@ -1455,10 +1654,49 @@ mgg::FeasiblePath PlannerNode::refineCorridor(
     return mgg::GridProjectionStatus::kSupported;
   };
   const auto traverse =
-      [this, body, center_offset,
+      [this, body, center_offset, current_anchor, home_anchor,
+       have_connected_home_anchor, &samePosition,
        &geofenceAllows](const mgg::StateVec& a, const mgg::StateVec& b,
                         std::vector<mgg::StateVec>& checked) {
         checked.clear();
+        const bool a_provenance =
+            samePosition(a, current_anchor) ||
+            (have_connected_home_anchor && samePosition(a, home_anchor));
+        const bool b_provenance =
+            samePosition(b, current_anchor) ||
+            (have_connected_home_anchor && samePosition(b, home_anchor));
+        mgg::StateVec projected_a = a;
+        mgg::StateVec projected_b = b;
+        const bool a_anchor =
+            a_provenance && !projectStateToDrivingHeight(projected_a);
+        const bool b_anchor =
+            b_provenance && !projectStateToDrivingHeight(projected_b);
+        if (robot_params_.type == mgg::RobotType::kGroundRobot &&
+            (a_anchor || b_anchor)) {
+          if (a_anchor && b_anchor) {
+            if (!samePosition(a, b)) return false;
+            const Eigen::Vector3d center = a.head<3>() + center_offset;
+            if (!geofenceAllows(center, center) ||
+                map_->getBoxStatus(center, body,
+                                   /*stop_at_unknown_voxel=*/false) ==
+                    mgg::VoxelStatus::kOccupied) {
+              return false;
+            }
+            checked = {a, b};
+            return true;
+          }
+          const mgg::StateVec& anchor = a_anchor ? a : b;
+          const mgg::StateVec& mapped = a_anchor ? b : a;
+          mgg::StateVec projected_mapped = mapped;
+          if (!projectStateToDrivingHeight(projected_mapped) ||
+              !samePosition(projected_mapped, mapped) ||
+              !validateObjectiveStartSupport(anchor, mapped, checked)) {
+            checked.clear();
+            return false;
+          }
+          if (b_anchor) std::reverse(checked.begin(), checked.end());
+          return true;
+        }
         const Eigen::Vector3d body_from = a.head<3>() + center_offset;
         const Eigen::Vector3d body_to = b.head<3>() + center_offset;
         if (!geofenceAllows(body_from, body_to)) return false;
@@ -1628,17 +1866,48 @@ void PlannerNode::onObjectiveRequest(
                                                             : *local_graph_;
       mgg::StateVec graph_current = current_state_;
       mgg::PlanningRequest graph_request = core;
-      if (!projectStateToDrivingHeight(graph_current)) {
+      const bool current_has_mapped_support =
+          projectStateToDrivingHeight(graph_current);
+      if (!current_has_mapped_support) {
+        // Odometry is physical provenance for this exact footprint. It may
+        // seed topology at the configured driving height, but refinement must
+        // still find and strictly validate a bounded connector to mapped
+        // support before any motion path can be returned.
+        graph_current = physicalAnchorAtDrivingHeight(current_state_);
+      }
+      bool home_goal_supported = true;
+      if (core.objective == mgg::ObjectiveKind::kReturnHome &&
+          !projectStateToDrivingHeight(graph_request.goal.pose)) {
+        home_goal_supported = false;
+        const mgg::Vertex* root = global_graph_->getVertex(0);
+        const double home_delta =
+            have_initial_state_
+                ? (core.goal.pose.head<3>() - initial_state_.head<3>())
+                      .cwiseAbs()
+                      .maxCoeff()
+                : std::numeric_limits<double>::infinity();
+        const double home_association_tolerance =
+            std::clamp(2.0 * map_->getResolution(), 0.01, 0.25);
+        const bool requests_physical_home =
+            have_initial_state_ && root != nullptr &&
+            (home_delta <= 1e-3 ||
+             (!core.goal.landmark_id.empty() &&
+              home_delta <= home_association_tolerance));
+        if (initial_anchor_supported_ && requests_physical_home) {
+          graph_request.goal.pose = root->state;
+          home_goal_supported = true;
+        }
+      }
+      if (!home_goal_supported && !current_has_mapped_support) {
         corridor.request = core;
         corridor.status = mgg::PlanningStatus::kUnreachable;
         char reason[192];
         std::snprintf(reason, sizeof(reason),
                       "current pose rejected: no mapped ground support at "
                       "(%.2f, %.2f, %.2f)",
-                      graph_current.x(), graph_current.y(), graph_current.z());
+                      current_state_.x(), current_state_.y(), current_state_.z());
         corridor.reason = reason;
-      } else if (core.objective == mgg::ObjectiveKind::kReturnHome &&
-                 !projectStateToDrivingHeight(graph_request.goal.pose)) {
+      } else if (!home_goal_supported) {
         corridor.request = core;
         corridor.status = mgg::PlanningStatus::kUnreachable;
         char reason[192];
