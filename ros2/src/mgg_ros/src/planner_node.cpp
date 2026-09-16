@@ -1529,55 +1529,29 @@ mgg::GridProjectionStatus PlannerNode::objectiveFootprintTerrainStatus(
     return mgg::GridProjectionStatus::kBodyUnknown;
   }
 
-  // Enumerate the map's own XY cells and retain exactly those whose closed
-  // AABB touches the physical circumscribed circle. Sampling ray centres over
-  // an already padded circle expands the footprint twice: once in the ray
-  // locations and again when a ray returns the containing cell's surface.
+  // Enumerate the map's own XY cells. MOLA can rotate its component grid
+  // relative to navigation coordinates, so the backend returns the complete
+  // transformed set rather than only one lattice phase.
   const Eigen::Vector2d body_center =
       driving_pose.head<2>() + robot_params_.center_offset.head<2>();
-  Eigen::Vector2d containing_center;
-  if (!body_center.allFinite() ||
-      !map_->getAxisAlignedXYCellCenter(
-          body_center - Eigen::Vector2d::Constant(radius),
-          containing_center) ||
-      !containing_center.allFinite()) {
-    record_failure("footprint cell grid unavailable");
-    return mgg::GridProjectionStatus::kBodyUnknown;
-  }
-  const double half_cell = 0.5 * resolution;
-  const double intervals_d = std::ceil(2.0 * radius / resolution) + 4.0;
   constexpr int kMaxFootprintSamples = 4096;
-  constexpr int kMaxIntervals = 63;
-  if (!std::isfinite(half_cell) ||
-      !std::isfinite(intervals_d) ||
-      intervals_d < 1.0 || intervals_d > kMaxIntervals) {
-    record_failure("footprint sampling bound exceeded");
+  std::vector<mgg::XYCellCenter> footprint_cells;
+  if (!map_->getCircleIntersectingXYCellCenters(
+          body_center, radius, kMaxFootprintSamples, footprint_cells)) {
+    record_failure("footprint cell grid unavailable or exceeds its bound");
     return mgg::GridProjectionStatus::kBodyUnknown;
   }
-  const int intervals = static_cast<int>(intervals_d);
-  const Eigen::Vector2d first_center =
-      containing_center - Eigen::Vector2d::Constant(resolution);
-  if (!first_center.allFinite() ||
-      ((body_center - Eigen::Vector2d::Constant(radius) - containing_center)
-               .cwiseAbs()
-               .array() >
-           half_cell + 1e-6)
-          .any()) {
-    record_failure("invalid footprint cell grid");
-    return mgg::GridProjectionStatus::kBodyUnknown;
-  }
-  int samples = 0;
+  const int samples = static_cast<int>(footprint_cells.size());
   const double nominal_ground_z =
       driving_pose.z() - planning_params_.max_ground_height;
   struct FootprintGroundHit {
     double z;
-    int grid_index;
+    std::int64_t grid_x;
+    std::int64_t grid_y;
     bool connected;
   };
-  const int grid_width = intervals + 1;
   std::vector<FootprintGroundHit> ground_hits;
-  ground_hits.reserve(std::min(kMaxFootprintSamples,
-                               grid_width * grid_width));
+  ground_hits.reserve(footprint_cells.size());
   bool needs_connected_support = false;
   double first_unsupported_delta = 0.0;
 
@@ -1596,26 +1570,10 @@ mgg::GridProjectionStatus PlannerNode::objectiveFootprintTerrainStatus(
     record_failure("footprint query unavailable");
     return mgg::GridProjectionStatus::kBodyUnknown;
   }
-  for (int ix = 0; ix <= intervals; ++ix) {
-    for (int iy = 0; iy <= intervals; ++iy) {
-      const Eigen::Vector2d cell_center =
-          first_center + resolution * Eigen::Vector2d(ix, iy);
-      if (!cell_center.allFinite()) {
-        record_failure("invalid footprint cell centre");
-        return mgg::GridProjectionStatus::kBodyUnknown;
-      }
-      // Squared distance from the circle centre to this closed cell AABB.
-      // `<=` deliberately includes both cells at an exact shared boundary.
-      const Eigen::Vector2d outside =
-          ((body_center - cell_center).cwiseAbs() -
-           Eigen::Vector2d::Constant(half_cell))
-              .cwiseMax(0.0);
-      if (outside.squaredNorm() > radius * radius + 1e-12) continue;
-      if (++samples > kMaxFootprintSamples)
-      {
-        record_failure("footprint sample limit exceeded");
-        return mgg::GridProjectionStatus::kBodyUnknown;
-      }
+  for (std::size_t cell_index = 0; cell_index < footprint_cells.size();
+       ++cell_index) {
+      const mgg::XYCellCenter& cell = footprint_cells[cell_index];
+      const Eigen::Vector2d& cell_center = cell.center;
       Eigen::Vector3d start(cell_center.x(), cell_center.y(), driving_pose.z());
       const Eigen::Vector3d end =
           start - Eigen::Vector3d(0.0, 0.0, ground_->max_projection_length);
@@ -1642,9 +1600,8 @@ mgg::GridProjectionStatus PlannerNode::objectiveFootprintTerrainStatus(
         first_unsupported_delta = delta;
         needs_connected_support = true;
       }
-      const int grid_index = ix * grid_width + iy;
-      ground_hits.push_back({hit.z(), grid_index, center_compatible});
-    }
+      ground_hits.push_back(
+          {hit.z(), cell.grid_x, cell.grid_y, center_compatible});
   }
   // Preserve the original all-to-centre check as the common fast path.  If a
   // footprint spans more than one individually traversable rise, accept it
@@ -1657,32 +1614,27 @@ mgg::GridProjectionStatus PlannerNode::objectiveFootprintTerrainStatus(
       record_failure("invalid footprint query configuration");
       return mgg::GridProjectionStatus::kBodyUnknown;
     }
-    std::vector<int> ground_hit_at(grid_width * grid_width, -1);
+    std::map<std::pair<std::int64_t, std::int64_t>, std::size_t> ground_hit_at;
     for (std::size_t i = 0; i < ground_hits.size(); ++i) {
-      ground_hit_at[ground_hits[i].grid_index] = static_cast<int>(i);
+      ground_hit_at.emplace(
+          std::make_pair(ground_hits[i].grid_x, ground_hits[i].grid_y), i);
     }
     std::vector<std::size_t> pending;
     pending.reserve(ground_hits.size());
     for (std::size_t i = 0; i < ground_hits.size(); ++i) {
       if (ground_hits[i].connected) pending.push_back(i);
     }
-    constexpr int kDx[] = {-1, 1, 0, 0};
-    constexpr int kDy[] = {0, 0, -1, 1};
+    constexpr std::int64_t kDx[] = {-1, 1, 0, 0};
+    constexpr std::int64_t kDy[] = {0, 0, -1, 1};
     for (std::size_t head = 0; head < pending.size(); ++head) {
       const FootprintGroundHit& current = ground_hits[pending[head]];
-      const int ix = current.grid_index / grid_width;
-      const int iy = current.grid_index % grid_width;
       for (int direction = 0; direction < 4; ++direction) {
-        const int nx = ix + kDx[direction];
-        const int ny = iy + kDy[direction];
-        if (nx < 0 || nx >= grid_width || ny < 0 || ny >= grid_width) {
-          continue;
-        }
-        const int neighbour_index = ground_hit_at[nx * grid_width + ny];
-        if (neighbour_index < 0 ||
-            ground_hits[neighbour_index].connected) {
-          continue;
-        }
+        const auto found = ground_hit_at.find(std::make_pair(
+            current.grid_x + kDx[direction],
+            current.grid_y + kDy[direction]));
+        if (found == ground_hit_at.end()) continue;
+        const std::size_t neighbour_index = found->second;
+        if (ground_hits[neighbour_index].connected) continue;
         const double dz =
             std::abs(ground_hits[neighbour_index].z - current.z);
         const double inclination = std::atan2(dz, resolution);
@@ -1691,7 +1643,7 @@ mgg::GridProjectionStatus PlannerNode::objectiveFootprintTerrainStatus(
           continue;
         }
         ground_hits[neighbour_index].connected = true;
-        pending.push_back(static_cast<std::size_t>(neighbour_index));
+        pending.push_back(neighbour_index);
       }
     }
     if (std::any_of(ground_hits.begin(), ground_hits.end(),
@@ -2149,6 +2101,10 @@ PlannerNode::IndexedQueryContext PlannerNode::indexedQueryContext() const {
   context.max_inclination = planning_params_.max_inclination;
   context.graph_to_base =
       planning_params_.max_ground_height - robot_params_.size.z() / 2.0;
+  context.max_provisional_ground_prefix =
+      objective_start_support_max_distance_m_;
+  context.observed_ground_body_evidence = observed_ground_body_evidence_;
+  context.provisional_unknown_ground = provisional_unknown_ground_;
   context.have_mapping_snapshot = have_mapping_snapshot_;
   context.mapping_snapshot = mapping_snapshot_;
   context.mapping_snapshot_received = mapping_snapshot_received_;
@@ -2242,7 +2198,7 @@ bool PlannerNode::queryIndexedMap(mgg::FeasiblePath& path,
   request->body_size.z = component_body.z();
   request->max_step_m = context.max_step_height;
   request->max_drop_m = context.max_step_height;
-  request->stop_at_unknown = true;
+  request->stop_at_unknown = !context.observed_ground_body_evidence;
 
   std::vector<mgg::StateVec> route;
   route.reserve(path.poses.size() + 1);
@@ -2327,23 +2283,80 @@ bool PlannerNode::queryIndexedMap(mgg::FeasiblePath& path,
     return fail(mgg::PlanningStatus::kBlocked,
                 "indexed map query returned malformed result arrays");
   }
+  bool have_measured_terrain = false;
+  double provisional_prefix_distance = 0.0;
   for (std::size_t i = 0; i < count; ++i) {
-    if (response->occupancy[i] !=
-        mgg_msgs::srv::QueryMapBatch::Response::FREE) {
+    if (i > 0) {
+      const Eigen::Vector3d previous(request->samples[i - 1].x,
+                                     request->samples[i - 1].y,
+                                     request->samples[i - 1].z);
+      const Eigen::Vector3d current(request->samples[i].x,
+                                    request->samples[i].y,
+                                    request->samples[i].z);
+      provisional_prefix_distance += (current - previous).norm();
+    }
+    const bool occupied = response->occupancy[i] ==
+                          mgg_msgs::srv::QueryMapBatch::Response::OCCUPIED;
+    const bool unknown = response->occupancy[i] ==
+                         mgg_msgs::srv::QueryMapBatch::Response::UNKNOWN;
+    const bool occupancy_supported =
+        response->occupancy[i] ==
+            mgg_msgs::srv::QueryMapBatch::Response::FREE ||
+        (context.observed_ground_body_evidence && unknown);
+    const bool finite_ground = std::isfinite(response->ground_z[i]);
+    const bool finite_roughness = std::isfinite(response->roughness[i]);
+    const bool provisional_missing_terrain =
+        context.provisional_unknown_ground && !have_measured_terrain &&
+        std::isnan(response->ground_z[i]) &&
+        std::isnan(response->roughness[i]) &&
+        std::isfinite(context.max_provisional_ground_prefix) &&
+        context.max_provisional_ground_prefix > 0.0 &&
+        std::isfinite(provisional_prefix_distance) &&
+        provisional_prefix_distance <=
+            context.max_provisional_ground_prefix + 1e-9;
+    const bool unknown_clearance_allowed =
+        context.observed_ground_body_evidence &&
+        (unknown || provisional_missing_terrain) &&
+        std::isnan(response->clearance[i]);
+    if (occupied || !occupancy_supported) {
       return fail(mgg::PlanningStatus::kBlocked,
                   "indexed map route is occupied or unknown");
     }
     if (context.robot_type != mgg::RobotType::kAerialRobot &&
-        (!std::isfinite(response->ground_z[i]) ||
-         !std::isfinite(response->roughness[i]) ||
-         response->roughness[i] > indexed_map_max_roughness_m_ ||
-         !std::isfinite(response->clearance[i]) ||
-        response->clearance[i] < component_body.z() || response->step[i] ||
+        ((!std::isfinite(response->clearance[i]) &&
+          !unknown_clearance_allowed) ||
+         (std::isfinite(response->clearance[i]) &&
+          response->clearance[i] < component_body.z()) || response->step[i] ||
          response->drop[i])) {
       return fail(mgg::PlanningStatus::kBlocked,
                   "indexed map terrain or clearance is unsupported");
     }
     if (context.robot_type != mgg::RobotType::kAerialRobot) {
+      if (context.provisional_unknown_ground && !have_measured_terrain &&
+          (!std::isfinite(context.max_provisional_ground_prefix) ||
+           context.max_provisional_ground_prefix <= 0.0 ||
+           !std::isfinite(provisional_prefix_distance) ||
+           provisional_prefix_distance >
+               context.max_provisional_ground_prefix + 1e-9)) {
+        return fail(mgg::PlanningStatus::kBlocked,
+                    "indexed map provisional terrain prefix exceeds its bound");
+      }
+      if (!finite_ground || !finite_roughness) {
+        // The qualified provisional policy may leave only the checked
+        // physical-start connector without measured terrain. It must be one
+        // contiguous prefix and both terrain fields must consistently report
+        // no evidence. A measured-supported sample closes this exception.
+        if (!provisional_missing_terrain) {
+          return fail(mgg::PlanningStatus::kBlocked,
+                      "indexed map terrain or clearance is unsupported");
+        }
+        continue;
+      }
+      have_measured_terrain = true;
+      if (response->roughness[i] > indexed_map_max_roughness_m_) {
+        return fail(mgg::PlanningStatus::kBlocked,
+                    "indexed map terrain or clearance is unsupported");
+      }
       if (expected_ground_z.size() != count ||
           std::abs(expected_ground_z[i] - response->ground_z[i]) >
           indexed_map_ground_tolerance_m_ + 1e-9) {
@@ -2363,6 +2376,11 @@ bool PlannerNode::queryIndexedMap(mgg::FeasiblePath& path,
         }
       }
     }
+  }
+  if (context.robot_type != mgg::RobotType::kAerialRobot &&
+      !have_measured_terrain) {
+    return fail(mgg::PlanningStatus::kBlocked,
+                "indexed map route has no measured terrain support");
   }
   {
     const std::lock_guard<std::recursive_mutex> lock(planner_mutex_);

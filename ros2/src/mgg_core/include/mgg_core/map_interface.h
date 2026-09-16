@@ -27,6 +27,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <limits>
 #include <utility>
 #include <vector>
 
@@ -35,6 +36,12 @@
 #include "mgg_core/types.h"
 
 namespace mgg {
+
+struct XYCellCenter {
+  Eigen::Vector2d center = Eigen::Vector2d::Zero();
+  std::int64_t grid_x = 0;
+  std::int64_t grid_y = 0;
+};
 
 class MapInterface {
  public:
@@ -50,6 +57,76 @@ class MapInterface {
     (void)position;
     (void)center;
     return false;
+  }
+
+  /// Centres of every XY map cell whose closed square intersects a circle.
+  /// The result is expressed in the caller's frame and is bounded by
+  /// `maximum_cells`. Backends whose voxel grid is rotated relative to that
+  /// frame override this method and transform the complete cell set.
+  virtual bool getCircleIntersectingXYCellCenters(
+      const Eigen::Vector2d& circle_center, double radius,
+      std::size_t maximum_cells,
+      std::vector<XYCellCenter>& centers) const {
+    centers.clear();
+    const double resolution = getResolution();
+    if (!circle_center.allFinite() || !std::isfinite(radius) || radius < 0.0 ||
+        !std::isfinite(resolution) || resolution <= 0.0 ||
+        maximum_cells == 0) {
+      return false;
+    }
+    Eigen::Vector2d containing_center;
+    if (!getAxisAlignedXYCellCenter(
+            circle_center - Eigen::Vector2d::Constant(radius),
+            containing_center) ||
+        !containing_center.allFinite()) {
+      return false;
+    }
+    const double half_cell = 0.5 * resolution;
+    const double intervals_d = std::ceil(2.0 * radius / resolution) + 4.0;
+    constexpr std::size_t kMaxVisitedCells = 4096;
+    constexpr double kMaxIntervals = 63.0;
+    if (!std::isfinite(intervals_d) || intervals_d < 1.0 ||
+        intervals_d > kMaxIntervals ||
+        intervals_d > static_cast<double>(maximum_cells)) {
+      return false;
+    }
+    const std::size_t intervals = static_cast<std::size_t>(intervals_d);
+    const std::size_t side = intervals + 1;
+    // Bound visited cells as well as output cells. This method runs inside a
+    // planner callback, so a huge but finite radius must fail before looping.
+    const std::size_t visited_limit =
+        std::min(maximum_cells, kMaxVisitedCells);
+    if (side > visited_limit / side) return false;
+    const Eigen::Vector2d first_center =
+        containing_center - Eigen::Vector2d::Constant(resolution);
+    if (!first_center.allFinite() ||
+        ((circle_center - Eigen::Vector2d::Constant(radius) -
+          containing_center)
+                 .cwiseAbs()
+                 .array() >
+             half_cell + 1e-6)
+            .any()) {
+      return false;
+    }
+    for (std::size_t ix = 0; ix <= intervals; ++ix) {
+      for (std::size_t iy = 0; iy <= intervals; ++iy) {
+        const Eigen::Vector2d cell_center =
+            first_center + resolution * Eigen::Vector2d(ix, iy);
+        const Eigen::Vector2d outside =
+            ((circle_center - cell_center).cwiseAbs() -
+             Eigen::Vector2d::Constant(half_cell))
+                .cwiseMax(0.0);
+        if (outside.squaredNorm() > radius * radius + 1e-12) continue;
+        if (centers.size() >= maximum_cells) {
+          centers.clear();
+          return false;
+        }
+        centers.push_back(
+            {cell_center, static_cast<std::int64_t>(ix),
+             static_cast<std::int64_t>(iy)});
+      }
+    }
+    return !centers.empty();
   }
 
   /// Whether the map has received enough data to be queried meaningfully.

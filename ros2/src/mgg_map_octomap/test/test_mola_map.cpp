@@ -22,6 +22,7 @@
 #include <unistd.h>
 
 #include "mgg_core/graph_manager.h"
+#include "mgg_core/ground_projection.h"
 #include "mgg_core/grid_graph.h"
 #include "mgg_map_octomap/mola_map.h"
 
@@ -104,7 +105,8 @@ class Publication {
                               Eigen::Isometry3d transform =
                                   Eigen::Isometry3d::Identity(),
                               std::string artifact_snapshot_id = {},
-                              std::string artifact_source_digest = {}) {
+                              std::string artifact_source_digest = {},
+                              double surface_fraction = 0.5) {
     std::sort(occupied.begin(), occupied.end(), less);
     std::sort(free.begin(), free.end(), less);
     free.erase(std::remove_if(free.begin(), free.end(), [&](const Voxel& value) {
@@ -177,7 +179,8 @@ class Publication {
       i64(grid, voxel.x); i64(grid, voxel.y); i64(grid, voxel.z);
     }
     for (const auto& voxel : occupied) {
-      i64(grid, voxel.x); i64(grid, voxel.y); f64(grid, (voxel.z + 0.5) * 0.2);
+      i64(grid, voxel.x); i64(grid, voxel.y);
+      f64(grid, (voxel.z + surface_fraction) * 0.2);
     }
     const std::string grid_digest = sha256(grid);
     json index{{"version", 1},
@@ -441,6 +444,154 @@ TEST(MolaMap, DrivesCoreGridConstructionThroughMapInterface) {
   EXPECT_EQ(result.status, mgg::GridGraphStatus::kOk);
   EXPECT_GT(result.free_cells, 0);
   EXPECT_GT(result.vertices_added, 0);
+}
+
+TEST(MolaMap, PreservesMeasuredGroundAndRotatedFootprintCells) {
+  Publication publication;
+  Eigen::Isometry3d component_from_navigation = Eigen::Isometry3d::Identity();
+  component_from_navigation.linear() =
+      Eigen::AngleAxisd(0.37, Eigen::Vector3d::UnitZ()).toRotationMatrix();
+  component_from_navigation.translation() = Eigen::Vector3d(0.43, -0.27, -0.13);
+  const auto request = publication.publish(
+      0, {{0, 0, 0}}, {}, true, component_from_navigation, {}, {}, 0.1);
+  MolaMap provider(config(publication));
+  provider.requestSnapshot(request);
+  ASSERT_TRUE(waitFor([&]() { return provider.getStatus(); }))
+      << provider.lastError();
+
+  const Eigen::Vector3d component_start(0.1, 0.1, 0.8);
+  const Eigen::Vector3d component_end(0.1, 0.1, -0.8);
+  Eigen::Vector3d navigation_hit;
+  ASSERT_EQ(provider.getGroundRayStatus(
+                component_from_navigation.inverse() * component_start,
+                component_from_navigation.inverse() * component_end, false,
+                navigation_hit),
+            VoxelStatus::kOccupied);
+  const Eigen::Vector3d component_hit =
+      component_from_navigation * navigation_hit;
+  EXPECT_NEAR(component_hit.z(), 0.02, 1e-6);
+
+  const Eigen::Vector2d component_circle(0.13, -0.08);
+  const Eigen::Vector3d navigation_circle_3 =
+      component_from_navigation.inverse() *
+      Eigen::Vector3d(component_circle.x(), component_circle.y(), 0.0);
+  std::vector<mgg::XYCellCenter> navigation_cells;
+  ASSERT_TRUE(provider.getCircleIntersectingXYCellCenters(
+      navigation_circle_3.head<2>(), 0.46, 128, navigation_cells));
+  EXPECT_GT(navigation_cells.size(), 4u);
+  for (const mgg::XYCellCenter& navigation_cell : navigation_cells) {
+    const Eigen::Vector3d component_cell = component_from_navigation *
+        Eigen::Vector3d(navigation_cell.center.x(), navigation_cell.center.y(),
+                        navigation_circle_3.z());
+    EXPECT_NEAR(std::remainder(component_cell.x() - 0.1, 0.2), 0.0, 1e-6);
+    EXPECT_NEAR(std::remainder(component_cell.y() - 0.1, 0.2), 0.0, 1e-6);
+  }
+
+  std::vector<mgg::XYCellCenter> bounded;
+  EXPECT_FALSE(provider.getCircleIntersectingXYCellCenters(
+      navigation_circle_3.head<2>(), 0.46, 1, bounded));
+  EXPECT_TRUE(bounded.empty());
+  EXPECT_FALSE(provider.getCircleIntersectingXYCellCenters(
+      navigation_circle_3.head<2>(), 1e6, 4096, bounded));
+  EXPECT_TRUE(bounded.empty());
+}
+
+TEST(MolaMap, SparseMeasuredRayCorridorGrowsFootprintValidatedGroundGraph) {
+  Publication publication;
+  std::vector<Voxel> floor;
+  std::vector<Voxel> free;
+  for (std::int64_t x = -8; x <= 8; ++x) {
+    // Model one narrow group of measured floor returns and its ray-carved
+    // body corridor rather than a fully observed floor/body volume.
+    floor.push_back({x, 0, 0});
+    for (std::int64_t y = -3; y <= 3; ++y) {
+      for (std::int64_t z = 1; z <= 4; ++z) free.push_back({x, y, z});
+    }
+  }
+  Eigen::Isometry3d component_from_navigation = Eigen::Isometry3d::Identity();
+  component_from_navigation.linear() =
+      Eigen::AngleAxisd(-0.31, Eigen::Vector3d::UnitZ()).toRotationMatrix();
+  component_from_navigation.translation() = Eigen::Vector3d(0.31, -0.22, -0.11);
+  const auto request = publication.publish(
+      0, floor, free, true, component_from_navigation, {}, {}, 0.1);
+  MolaMap provider(config(publication));
+  provider.requestSnapshot(request);
+  ASSERT_TRUE(waitFor([&]() { return provider.getStatus(); }))
+      << provider.lastError();
+
+  mgg::RobotParams robot;
+  robot.type = mgg::RobotType::kGroundRobot;
+  robot.size = Eigen::Vector3d(1.023, 0.778, 0.40);
+  robot.bound_mode = mgg::BoundModeType::kExactBound;
+  mgg::PlanningParams planning;
+  planning.max_ground_height = 0.475;
+  planning.max_step_height = 0.15;
+  planning.max_inclination = 0.52;
+  planning.edge_length_min = 0.05;
+  planning.edge_length_max = 0.8;
+  planning.edge_overshoot = 0.0;
+  planning.nearest_range = 0.5;
+  planning.nearest_range_min = 0.05;
+  planning.nearest_range_max = 2.0;
+  planning.nearest_range_z = 1.0;
+  planning.num_vertices_max = 100;
+  planning.num_edges_max = 1000;
+  planning.num_loops_max = 1000;
+  mgg::GroundProjection ground(provider, planning);
+  mgg::ExpandContext context;
+  context.map = &provider;
+  context.robot = &robot;
+  context.planning = &planning;
+  context.ground = &ground;
+  context.robot_box_size = robot.getPlanningSize();
+  context.projected_edge_admissible =
+      [&](const std::vector<Eigen::Vector3d>& edge) {
+        const double radius = 0.5 * context.robot_box_size.head<2>().norm();
+        for (const Eigen::Vector3d& point : edge) {
+          std::vector<mgg::XYCellCenter> footprint;
+          if (!provider.getCircleIntersectingXYCellCenters(
+                  point.head<2>(), radius, 4096, footprint)) {
+            return false;
+          }
+          for (const mgg::XYCellCenter& cell : footprint) {
+            Eigen::Vector3d hit;
+            const VoxelStatus status = provider.getGroundRayStatus(
+                {cell.center.x(), cell.center.y(), point.z()},
+                {cell.center.x(), cell.center.y(), point.z() - 1.0}, false,
+                hit);
+            if (status == VoxelStatus::kUnknown ||
+                (status == VoxelStatus::kOccupied &&
+                 (!hit.allFinite() ||
+                 std::abs(hit.z() - (point.z() - planning.max_ground_height)) >
+                     planning.max_step_height + 1e-6))) {
+              return false;
+            }
+          }
+        }
+        return true;
+      };
+  const Eigen::Vector3d component_root(0.1, 0.1, 0.495);
+  const Eigen::Vector3d navigation_root =
+      component_from_navigation.inverse() * component_root;
+  mgg::GraphManager graph;
+  graph.addVertex(new mgg::Vertex(
+      0, mgg::StateVec(navigation_root.x(), navigation_root.y(),
+                       navigation_root.z(), 0.0)));
+  mgg::GridGraphParams grid;
+  grid.min_val = {-0.4, -0.4, 0.0};
+  grid.max_val = {0.4, 0.4, 0.0};
+  grid.resolution = {0.2, 0.2, 0.2};
+  const auto result = mgg::buildGridGraph(
+      graph,
+      mgg::StateVec(navigation_root.x(), navigation_root.y(),
+                    navigation_root.z(), 0.0),
+      grid, context, 0.0);
+  EXPECT_EQ(result.status, mgg::GridGraphStatus::kOk);
+  EXPECT_GT(result.free_cells, 0);
+  EXPECT_GT(result.edge_status[0], 0);
+  EXPECT_GT(result.vertices_added, 0)
+      << "free=" << result.free_cells << " no_ground=" << result.no_ground
+      << " edge_ok=" << result.edge_status[0];
 }
 
 }  // namespace

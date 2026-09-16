@@ -81,6 +81,10 @@ class MolaMap : public MapInterface {
   std::uint64_t activeGeneration() const;
 
   double getResolution() const override;
+  bool getCircleIntersectingXYCellCenters(
+      const Eigen::Vector2d& circle_center, double radius,
+      std::size_t maximum_cells,
+      std::vector<XYCellCenter>& centers) const override;
   bool getStatus() const override;
   VoxelStatus getVoxelStatus(const Eigen::Vector3d& position) const override;
   VoxelStatus getRayStatus(const Eigen::Vector3d& view_point,
@@ -90,6 +94,10 @@ class MolaMap : public MapInterface {
                            const Eigen::Vector3d& voxel_to_test,
                            bool stop_at_unknown_voxel,
                            Eigen::Vector3d& end_voxel) const override;
+  VoxelStatus getGroundRayStatus(
+      const Eigen::Vector3d& view_point,
+      const Eigen::Vector3d& voxel_to_test, bool stop_at_unknown_voxel,
+      Eigen::Vector3d& end_voxel) const override;
   VoxelStatus getBoxStatus(const Eigen::Vector3d& center,
                            const Eigen::Vector3d& size,
                            bool stop_at_unknown_voxel) const override;

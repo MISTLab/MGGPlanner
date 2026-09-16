@@ -84,6 +84,10 @@ class PlannerNodeTestPeer {
     const std::lock_guard<std::recursive_mutex> lock(node.planner_mutex_);
     node.provisional_unknown_ground_ = enabled;
   }
+  static void setObservedGroundBodyEvidence(PlannerNode& node, bool enabled) {
+    const std::lock_guard<std::recursive_mutex> lock(node.planner_mutex_);
+    node.observed_ground_body_evidence_ = enabled;
+  }
   static void setObjectiveGridWindow(PlannerNode& node, double margin,
                                      double maximum_margin,
                                      std::size_t max_cells = 32768) {
@@ -3369,12 +3373,24 @@ TEST(IndexedObjectiveService, BatchedQueryIsBoundedAndUsesComponentFrame) {
   std::atomic<double> received_body_z{0.0};
   std::atomic<double> received_max_step{0.0};
   std::atomic<double> received_max_drop{0.0};
+  std::atomic<std::uint8_t> sample_occupancy{Query::Response::FREE};
+  std::atomic<double> sample_clearance{100.0};
+  std::atomic<std::size_t> blind_ground_prefix{0};
+  std::atomic<std::size_t> blind_clearance_prefix{0};
+  std::atomic<std::size_t> blind_ground_sample{
+      std::numeric_limits<std::size_t>::max()};
+  std::atomic<std::size_t> step_sample{std::numeric_limits<std::size_t>::max()};
+  std::atomic<std::size_t> drop_sample{std::numeric_limits<std::size_t>::max()};
+  std::atomic<bool> received_stop_at_unknown{true};
   std::vector<geometry_msgs::msg::Point> received;
   auto service = server->create_service<Query>(
       "/robot_1/mapping/query_batch",
       [&delay, &response_status, &ground_offset, &ground_from_sample,
        &received_body_x, &received_body_y, &received_body_z,
-       &received_max_step, &received_max_drop, &received](
+       &received_max_step, &received_max_drop, &sample_occupancy,
+       &sample_clearance, &blind_ground_prefix, &blind_clearance_prefix,
+       &blind_ground_sample, &step_sample, &drop_sample,
+       &received_stop_at_unknown, &received](
           const Query::Request::SharedPtr request,
           Query::Response::SharedPtr response) {
         received = request->samples;
@@ -3390,16 +3406,34 @@ TEST(IndexedObjectiveService, BatchedQueryIsBoundedAndUsesComponentFrame) {
         received_body_z = request->body_size.z;
         received_max_step = request->max_step_m;
         received_max_drop = request->max_drop_m;
-        response->occupancy.assign(n, Query::Response::FREE);
+        received_stop_at_unknown = request->stop_at_unknown;
+        response->occupancy.assign(n, sample_occupancy.load());
         response->ground_z.reserve(n);
-        for (const auto& sample : request->samples) {
+        for (std::size_t i = 0; i < n; ++i) {
+          const auto& sample = request->samples[i];
           response->ground_z.push_back(
-              sample.z - ground_from_sample.load() + ground_offset.load());
+              (i < blind_ground_prefix.load() || i == blind_ground_sample.load())
+              ? std::numeric_limits<double>::quiet_NaN()
+              : sample.z - ground_from_sample.load() + ground_offset.load());
         }
         response->roughness.assign(n, 0.0);
-        response->clearance.assign(n, 100.0);
+        for (std::size_t i = 0; i < std::min(n, blind_ground_prefix.load()); ++i) {
+          response->roughness[i] = std::numeric_limits<double>::quiet_NaN();
+        }
+        if (blind_ground_sample.load() < n) {
+          response->roughness[blind_ground_sample.load()] =
+              std::numeric_limits<double>::quiet_NaN();
+        }
+        response->clearance.assign(n, sample_clearance.load());
+        for (std::size_t i = 0;
+             i < std::min(n, blind_clearance_prefix.load()); ++i) {
+          response->clearance[i] =
+              std::numeric_limits<double>::quiet_NaN();
+        }
         response->step.assign(n, false);
         response->drop.assign(n, false);
+        if (step_sample.load() < n) response->step[step_sample.load()] = true;
+        if (drop_sample.load() < n) response->drop[drop_sample.load()] = true;
       });
   rclcpp::executors::MultiThreadedExecutor executor(
       rclcpp::ExecutorOptions{}, 3);
@@ -3438,6 +3472,7 @@ TEST(IndexedObjectiveService, BatchedQueryIsBoundedAndUsesComponentFrame) {
   mgg_ros::PlannerNodeTestPeer::setIndexedTerrainLimits(*planner, 0.10, 0.52);
   EXPECT_TRUE(mgg_ros::PlannerNodeTestPeer::query(*planner, path));
   EXPECT_TRUE(path.indexed_map_validated);
+  EXPECT_TRUE(received_stop_at_unknown.load());
   EXPECT_NEAR(received_max_step.load(), 0.10, 1e-9);
   EXPECT_NEAR(received_max_drop.load(), 0.10, 1e-9);
   EXPECT_GE(received.size(), 2u);
@@ -3446,6 +3481,95 @@ TEST(IndexedObjectiveService, BatchedQueryIsBoundedAndUsesComponentFrame) {
     EXPECT_NEAR(received.back().x, 11.0, 1e-6);
     EXPECT_NEAR(received.front().z, 0.225, 1e-6);
   }
+
+  // Strict hardware policy still rejects unknown body occupancy and missing
+  // overhead clearance even when the exact terrain arrays are complete.
+  sample_occupancy = Query::Response::UNKNOWN;
+  sample_clearance = std::numeric_limits<double>::quiet_NaN();
+  EXPECT_FALSE(mgg_ros::PlannerNodeTestPeer::query(*planner, path));
+  EXPECT_TRUE(received_stop_at_unknown.load());
+  EXPECT_FALSE(path.indexed_map_validated);
+
+  // The qualified simulation policy admits that same sparse body evidence,
+  // while the exact query still owns ground, roughness, known clearance,
+  // step/drop and occupied-cell vetoes before dispatch.
+  mgg_ros::PlannerNodeTestPeer::setObservedGroundBodyEvidence(*planner, true);
+  path.status = mgg::PlanningStatus::kSucceeded;
+  path.poses.push_back(mgg::StateVec(1.0, 0.0, 0.0, 0.0));
+  EXPECT_TRUE(mgg_ros::PlannerNodeTestPeer::query(*planner, path));
+  EXPECT_FALSE(received_stop_at_unknown.load());
+  EXPECT_TRUE(path.indexed_map_validated);
+
+  // Body-only relaxation never relaxes terrain evidence by itself.
+  blind_ground_prefix = std::numeric_limits<std::size_t>::max();
+  path.status = mgg::PlanningStatus::kSucceeded;
+  path.poses.push_back(mgg::StateVec(1.0, 0.0, 0.0, 0.0));
+  EXPECT_FALSE(mgg_ros::PlannerNodeTestPeer::query(*planner, path));
+  EXPECT_FALSE(path.indexed_map_validated);
+
+  // The separately qualified provisional policy admits only the leading
+  // sensor-blind connector. At least one later sample must retain exact
+  // measured terrain support.
+  mgg_ros::PlannerNodeTestPeer::setProvisionalUnknownGround(*planner, true);
+  sample_occupancy = Query::Response::FREE;
+  sample_clearance = 100.0;
+  blind_ground_prefix = 2;
+  blind_clearance_prefix = 2;
+  path.status = mgg::PlanningStatus::kSucceeded;
+  path.poses.push_back(mgg::StateVec(1.0, 0.0, 0.0, 0.0));
+  EXPECT_TRUE(mgg_ros::PlannerNodeTestPeer::query(*planner, path));
+  EXPECT_TRUE(path.indexed_map_validated);
+
+  step_sample = 1;
+  path.status = mgg::PlanningStatus::kSucceeded;
+  path.poses.push_back(mgg::StateVec(1.0, 0.0, 0.0, 0.0));
+  EXPECT_FALSE(mgg_ros::PlannerNodeTestPeer::query(*planner, path));
+  step_sample = std::numeric_limits<std::size_t>::max();
+
+  blind_ground_prefix = std::numeric_limits<std::size_t>::max();
+  path.status = mgg::PlanningStatus::kSucceeded;
+  path.poses.push_back(mgg::StateVec(1.0, 0.0, 0.0, 0.0));
+  EXPECT_FALSE(mgg_ros::PlannerNodeTestPeer::query(*planner, path));
+
+  blind_ground_prefix = 2;
+  drop_sample = 1;
+  path.status = mgg::PlanningStatus::kSucceeded;
+  path.poses.push_back(mgg::StateVec(1.0, 0.0, 0.0, 0.0));
+  EXPECT_FALSE(mgg_ros::PlannerNodeTestPeer::query(*planner, path));
+  drop_sample = std::numeric_limits<std::size_t>::max();
+  blind_ground_prefix = 0;
+  blind_clearance_prefix = 0;
+
+  blind_ground_sample = 2;
+  path.status = mgg::PlanningStatus::kSucceeded;
+  path.poses.push_back(mgg::StateVec(1.0, 0.0, 0.0, 0.0));
+  EXPECT_FALSE(mgg_ros::PlannerNodeTestPeer::query(*planner, path));
+  blind_ground_sample = std::numeric_limits<std::size_t>::max();
+
+  // The same distance bound as the native physical-start connector prevents
+  // a distant observation from licensing an arbitrarily long blind prefix.
+  blind_ground_prefix = 12;
+  blind_clearance_prefix = 12;
+  path.status = mgg::PlanningStatus::kSucceeded;
+  path.poses.push_back(mgg::StateVec(4.0, 0.0, 0.0, 0.0));
+  EXPECT_FALSE(mgg_ros::PlannerNodeTestPeer::query(*planner, path));
+  blind_ground_prefix = 0;
+  blind_clearance_prefix = 0;
+
+  sample_occupancy = Query::Response::OCCUPIED;
+  EXPECT_FALSE(mgg_ros::PlannerNodeTestPeer::query(*planner, path));
+  EXPECT_FALSE(path.indexed_map_validated);
+  sample_occupancy = Query::Response::UNKNOWN;
+  sample_clearance = 0.01;
+  path.status = mgg::PlanningStatus::kSucceeded;
+  path.poses.push_back(mgg::StateVec(1.0, 0.0, 0.0, 0.0));
+  EXPECT_FALSE(mgg_ros::PlannerNodeTestPeer::query(*planner, path));
+  EXPECT_FALSE(path.indexed_map_validated);
+
+  sample_occupancy = Query::Response::FREE;
+  sample_clearance = 100.0;
+  path.status = mgg::PlanningStatus::kSucceeded;
+  path.poses.push_back(mgg::StateVec(1.0, 0.0, 0.0, 0.0));
 
   ground_offset = 0.101;
   EXPECT_FALSE(mgg_ros::PlannerNodeTestPeer::query(*planner, path));

@@ -58,6 +58,10 @@ class OctomapMap : public MapInterface {
   void insertPointCloud(const std::vector<Eigen::Vector3d>& points,
                         const Eigen::Vector3d& sensor_origin);
   void setTrackMeasuredSurfaceZ(bool enabled);
+  /// Attach an exact measured height to an occupied endpoint voxel. Used by
+  /// immutable planner-grid loaders that already validated point provenance.
+  bool setMeasuredSurfaceZ(const Eigen::Vector3d& occupied_position,
+                           double surface_z);
   std::size_t measuredSurfaceCount() const {
     return measured_surface_max_z_.size();
   }

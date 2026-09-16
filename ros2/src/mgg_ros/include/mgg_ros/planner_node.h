@@ -104,6 +104,9 @@ class PlannerNode : public rclcpp::Node {
     double max_step_height = 0.0;
     double max_inclination = 0.0;
     double graph_to_base = 0.0;
+    double max_provisional_ground_prefix = 0.0;
+    bool observed_ground_body_evidence = false;
+    bool provisional_unknown_ground = false;
     bool have_mapping_snapshot = false;
     mgg_msgs::msg::MappingSnapshot mapping_snapshot;
     std::chrono::steady_clock::time_point mapping_snapshot_received;

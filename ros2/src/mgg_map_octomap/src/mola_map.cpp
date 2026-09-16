@@ -630,6 +630,13 @@ std::shared_ptr<const MolaMap::Snapshot> MolaMap::load(
       ++free_index;
     if (((occupied_index + free_index) & 4095u) == 0) checkDeadline(deadline);
   }
+  struct SurfaceRecord {
+    std::int64_t x;
+    std::int64_t y;
+    double z;
+  };
+  std::vector<SurfaceRecord> surfaces;
+  surfaces.reserve(surface_count);
   std::array<std::int64_t, 2> prior_xy{};
   double prior_z = 0.0;
   bool have_prior = false;
@@ -652,6 +659,7 @@ std::shared_ptr<const MolaMap::Snapshot> MolaMap::load(
     prior_xy = {x, y};
     prior_z = z;
     have_prior = true;
+    surfaces.push_back({x, y, z});
     if ((i & 4095u) == 0) checkDeadline(deadline);
   }
 
@@ -686,6 +694,19 @@ std::shared_ptr<const MolaMap::Snapshot> MolaMap::load(
     };
     install(free, false);
     install(occupied, true);
+    for (std::size_t i = 0; i < surfaces.size(); ++i) {
+      const auto& surface = surfaces[i];
+      const double voxel_z = std::floor(surface.z / resolution);
+      const Eigen::Vector3d occupied_center = resolution *
+          (Eigen::Vector3d(static_cast<double>(surface.x),
+                           static_cast<double>(surface.y), voxel_z) +
+           Eigen::Vector3d::Constant(0.5));
+      if (!map->setMeasuredSurfaceZ(occupied_center, surface.z)) {
+        throw std::runtime_error(
+            "MOLA measured surface could not bind to occupied endpoint");
+      }
+      if ((i & 4095u) == 0) checkDeadline(deadline);
+    }
     // Maximum-depth leaves are queried directly; a full inner-occupancy pass
     // is unnecessary and would be one long OctoMap call that cannot observe
     // the load deadline. Lazy insertion keeps every loop interruptible.
@@ -725,6 +746,50 @@ std::shared_ptr<const MolaMap::Snapshot> MolaMap::current() const {
 }
 
 double MolaMap::getResolution() const { return config_.resolution; }
+
+bool MolaMap::getCircleIntersectingXYCellCenters(
+    const Eigen::Vector2d& circle_center, const double radius,
+    const std::size_t maximum_cells,
+    std::vector<XYCellCenter>& centers) const {
+  centers.clear();
+  const auto snapshot = current();
+  if (snapshot == nullptr || !circle_center.allFinite() ||
+      !std::isfinite(radius) || radius < 0.0 || maximum_cells == 0) {
+    return false;
+  }
+  const auto& transform = snapshot->request.component_from_navigation;
+  // A circle remains a circle under the yaw and translation used between the
+  // navigation and MOLA component frames. Tilt would turn the XY footprint
+  // into an ellipse and cannot satisfy this ground-query contract.
+  const Eigen::Vector3d component_up =
+      transform.linear() * Eigen::Vector3d::UnitZ();
+  if (!component_up.isApprox(Eigen::Vector3d::UnitZ(), 1e-6)) return false;
+  const Eigen::Vector3d navigation_reference(circle_center.x(),
+                                              circle_center.y(), 0.0);
+  const Eigen::Vector3d component_reference =
+      transform * navigation_reference;
+  std::vector<XYCellCenter> component_centers;
+  if (!snapshot->map->getCircleIntersectingXYCellCenters(
+          component_reference.head<2>(), radius, maximum_cells,
+          component_centers)) {
+    return false;
+  }
+  centers.reserve(component_centers.size());
+  const Eigen::Isometry3d navigation_from_component = transform.inverse();
+  for (const XYCellCenter& component_cell : component_centers) {
+    const Eigen::Vector3d navigation = navigation_from_component *
+        Eigen::Vector3d(component_cell.center.x(), component_cell.center.y(),
+                        component_reference.z());
+    if (!navigation.allFinite() || centers.size() >= maximum_cells) {
+      centers.clear();
+      return false;
+    }
+    centers.push_back(
+        {navigation.head<2>(), component_cell.grid_x, component_cell.grid_y});
+  }
+  return !centers.empty();
+}
+
 bool MolaMap::getStatus() const { return current() != nullptr; }
 
 VoxelStatus MolaMap::getVoxelStatus(const Eigen::Vector3d& position) const {
@@ -766,6 +831,31 @@ VoxelStatus MolaMap::getRayStatus(const Eigen::Vector3d& view_point,
   const auto status = snapshot->map->getRayStatus(
       component_start, component_target, stop_at_unknown_voxel, component_end);
   end_voxel = snapshot->request.component_from_navigation.inverse() * component_end;
+  return status;
+}
+
+VoxelStatus MolaMap::getGroundRayStatus(
+    const Eigen::Vector3d& view_point,
+    const Eigen::Vector3d& voxel_to_test,
+    const bool stop_at_unknown_voxel, Eigen::Vector3d& end_voxel) const {
+  const auto snapshot = current();
+  if (snapshot == nullptr) {
+    end_voxel = view_point;
+    return VoxelStatus::kUnknown;
+  }
+  const auto& transform = snapshot->request.component_from_navigation;
+  const Eigen::Vector3d component_start = transform * view_point;
+  const Eigen::Vector3d component_target = transform * voxel_to_test;
+  if (!canRepresent(*snapshot->map, component_start) ||
+      !canRepresent(*snapshot->map, component_target)) {
+    end_voxel = view_point;
+    return VoxelStatus::kUnknown;
+  }
+  Eigen::Vector3d component_end;
+  const VoxelStatus status = snapshot->map->getGroundRayStatus(
+      component_start, component_target, stop_at_unknown_voxel,
+      component_end);
+  end_voxel = transform.inverse() * component_end;
   return status;
 }
 

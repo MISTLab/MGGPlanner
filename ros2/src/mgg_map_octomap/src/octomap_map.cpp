@@ -95,6 +95,24 @@ void OctomapMap::setTrackMeasuredSurfaceZ(bool enabled) {
   if (!enabled) measured_surface_max_z_.clear();
 }
 
+bool OctomapMap::setMeasuredSurfaceZ(
+    const Eigen::Vector3d& occupied_position, const double surface_z) {
+  if (!occupied_position.allFinite() || !std::isfinite(surface_z)) return false;
+  octomap::OcTreeKey key;
+  if (!tree_->coordToKeyChecked(toOct(occupied_position), key)) return false;
+  const octomap::OcTreeNode* node = tree_->search(key);
+  if (node == nullptr || !tree_->isNodeOccupied(node)) return false;
+  track_measured_surface_z_ = true;
+  const SurfaceKey surface_key{key[0], key[1], key[2]};
+  const auto found = measured_surface_max_z_.find(surface_key);
+  if (found == measured_surface_max_z_.end()) {
+    measured_surface_max_z_.emplace(surface_key, surface_z);
+  } else {
+    found->second = std::max(found->second, surface_z);
+  }
+  return true;
+}
+
 double OctomapMap::getResolution() const { return tree_->getResolution(); }
 
 bool OctomapMap::getAxisAlignedXYCellCenter(
