@@ -1,7 +1,9 @@
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cmath>
+#include <map>
 #include <set>
 #include <thread>
 #include <utility>
@@ -297,6 +299,68 @@ TEST(GridRefinement, FindsObservedDetourAroundBlockedChord) {
     left_chord = left_chord || std::abs(pose.y()) > 0.5;
   }
   EXPECT_TRUE(left_chord);
+}
+
+TEST(GridRefinement, MemoizesRepeatedDirectedTerrainChecksDuringDetour) {
+  std::map<std::array<double, 8>, std::size_t> calls;
+  auto checked = sampledTraversal({Eigen::Vector2d(1.0, 0.0)});
+  auto counted = [&calls, checked](const StateVec& from, const StateVec& to,
+                                  std::vector<StateVec>& path) mutable {
+    std::array<double, 8> key{};
+    for (Eigen::Index i = 0; i < 4; ++i) {
+      key[static_cast<std::size_t>(i)] = from[i];
+      key[static_cast<std::size_t>(i + 4)] = to[i];
+    }
+    ++calls[key];
+    return checked(from, to, path);
+  };
+  BoundedGridPlanner planner(StateVec::Zero(), limits(), flatProjection(),
+                             counted);
+
+  const FeasiblePath path = planner.refine(routeTo(2.0, 0.0));
+
+  ASSERT_EQ(path.status, PlanningStatus::kSucceeded) << path.reason;
+  EXPECT_NEAR(path.poses.back().x(), 2.0, 1e-9);
+  ASSERT_FALSE(calls.empty());
+  EXPECT_TRUE(std::all_of(calls.begin(), calls.end(), [](const auto& call) {
+    return call.second == 1u;
+  }));
+}
+
+TEST(GridRefinement, TraversalMemoizationPreservesDirection) {
+  GridRefinementLimits bounded = limits();
+  bounded.max_expansions = 1;
+  std::size_t exact_forward_calls = 0;
+  std::size_t exact_reverse_calls = 0;
+  auto directional = [&exact_forward_calls, &exact_reverse_calls](
+                         const StateVec& from, const StateVec& to,
+                         std::vector<StateVec>& checked) {
+    if (std::abs(from.x()) < 1e-9 && std::abs(to.x() - 1.0) < 1e-9 &&
+        std::abs(from.y()) < 1e-9 && std::abs(to.y()) < 1e-9) {
+      ++exact_forward_calls;
+    }
+    if (std::abs(from.x() - 1.0) < 1e-9 && std::abs(to.x()) < 1e-9 &&
+        std::abs(from.y()) < 1e-9 && std::abs(to.y()) < 1e-9) {
+      ++exact_reverse_calls;
+    }
+    if (from.x() < to.x()) {
+      checked = {from, to};
+      return true;
+    }
+    checked.clear();
+    return false;
+  };
+  RouteCorridor route = routeTo(0.0, 0.0);
+  route.poses = {StateVec(1.0, 0.0, 0.0, 0.0),
+                 StateVec(0.0, 0.0, 0.0, 0.0)};
+  BoundedGridPlanner planner(StateVec::Zero(), bounded, flatProjection(),
+                             directional);
+
+  const FeasiblePath path = planner.refine(route);
+
+  EXPECT_EQ(path.status, PlanningStatus::kBlocked);
+  EXPECT_EQ(exact_forward_calls, 1u);
+  EXPECT_GE(exact_reverse_calls, 1u);
 }
 
 TEST(GridRefinement, GoalBiasedSearchBoundsMapQueriesOnWideDetourGrid) {

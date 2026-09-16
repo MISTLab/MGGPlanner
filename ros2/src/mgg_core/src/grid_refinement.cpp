@@ -1,6 +1,7 @@
 #include "mgg_core/grid_refinement.h"
 
 #include <algorithm>
+#include <array>
 #include <climits>
 #include <cmath>
 #include <cstdio>
@@ -39,6 +40,40 @@ struct LaterEntry {
     return a.sequence > b.sequence;
   }
 };
+
+struct DirectedEdgeKey {
+  std::array<double, 8> values{};
+
+  bool operator==(const DirectedEdgeKey& other) const {
+    return values == other.values;
+  }
+};
+
+struct DirectedEdgeHash {
+  std::size_t operator()(const DirectedEdgeKey& key) const {
+    std::size_t seed = 0;
+    for (const double value : key.values) {
+      const std::size_t item = std::hash<double>{}(value);
+      seed ^= item + 0x9e3779b9u + (seed << 6u) + (seed >> 2u);
+    }
+    return seed;
+  }
+};
+
+struct TraversalResult {
+  bool accepted = false;
+  std::vector<StateVec> checked;
+  double length = 0.0;
+};
+
+DirectedEdgeKey directedEdgeKey(const StateVec& from, const StateVec& to) {
+  DirectedEdgeKey key;
+  for (Eigen::Index i = 0; i < 4; ++i) {
+    key.values[static_cast<std::size_t>(i)] = from[i];
+    key.values[static_cast<std::size_t>(i + 4)] = to[i];
+  }
+  return key;
+}
 
 void copyRequest(const RouteCorridor& corridor, FeasiblePath& path) {
   path.status = corridor.status;
@@ -125,6 +160,8 @@ FeasiblePath BoundedGridPlanner::refine(const RouteCorridor& corridor) {
   std::size_t traversal_attempts = 0;
   std::size_t traversal_rejections = 0;
   std::size_t expansions = 0;
+  std::unordered_map<DirectedEdgeKey, TraversalResult, DirectedEdgeHash>
+      traversal_cache;
   const auto fail = [&](const std::string& reason) {
     result.status = PlanningStatus::kBlocked;
     result.poses.clear();
@@ -255,23 +292,46 @@ FeasiblePath BoundedGridPlanner::refine(const RouteCorridor& corridor) {
   }
 
   std::size_t sequence = 0;
+  // refine() runs against one immutable planner/map snapshot. Memoize exact
+  // directed states so reverse traversals and yaw-qualified endpoints retain
+  // their own terrain and swept-body evidence.
+  const std::size_t cache_basis =
+      std::min(limits_.max_cells, limits_.max_expansions);
+  const std::size_t traversal_cache_limit =
+      cache_basis > std::numeric_limits<std::size_t>::max() / 16u
+          ? std::numeric_limits<std::size_t>::max()
+          : cache_basis * 16u;
   const auto traverse = [this, &interrupted, &traversal_attempts,
-                         &traversal_rejections](const StateVec& a,
+                         &traversal_rejections, &traversal_cache,
+                         traversal_cache_limit](const StateVec& a,
                                const StateVec& b,
                                std::vector<StateVec>* checked,
                                double* length,
                                std::string& interruption_reason) {
     if (interrupted(interruption_reason)) return false;
+    const DirectedEdgeKey key = directedEdgeKey(a, b);
+    const auto cached = traversal_cache.find(key);
+    if (cached != traversal_cache.end()) {
+      if (length != nullptr) *length = cached->second.length;
+      if (checked != nullptr) *checked = cached->second.checked;
+      return cached->second.accepted;
+    }
     std::vector<StateVec> local;
     ++traversal_attempts;
     const bool accepted = traversable_(a, b, local);
     if (interrupted(interruption_reason)) return false;
     if (!accepted) {
       ++traversal_rejections;
+      if (traversal_cache.size() < traversal_cache_limit) {
+        traversal_cache.emplace(key, TraversalResult{});
+      }
       return false;
     }
     if (local.size() < 2 || !samePosition(local.front(), a) ||
         !samePosition(local.back(), b)) {
+      if (traversal_cache.size() < traversal_cache_limit) {
+        traversal_cache.emplace(key, TraversalResult{});
+      }
       return false;
     }
     for (const StateVec& pose : local) {
@@ -280,9 +340,18 @@ FeasiblePath BoundedGridPlanner::refine(const RouteCorridor& corridor) {
     local.front()[3] = a[3];
     local.back()[3] = b[3];
     const double checked_length = pathLength(local, a, b);
-    if (!std::isfinite(checked_length) || checked_length <= 0.0) return false;
+    if (!std::isfinite(checked_length) || checked_length <= 0.0) {
+      if (traversal_cache.size() < traversal_cache_limit) {
+        traversal_cache.emplace(key, TraversalResult{});
+      }
+      return false;
+    }
     if (length != nullptr) *length = checked_length;
-    if (checked != nullptr) *checked = std::move(local);
+    if (checked != nullptr) *checked = local;
+    if (traversal_cache.size() < traversal_cache_limit) {
+      traversal_cache.emplace(
+          key, TraversalResult{true, std::move(local), checked_length});
+    }
     return true;
   };
   for (std::size_t segment = 1; segment < waypoints.size(); ++segment) {
