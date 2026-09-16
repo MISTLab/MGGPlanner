@@ -123,6 +123,11 @@ class PlannerNode : public rclcpp::Node {
   /// ROS clock: these marks must expire even when /clock stops.
   static double steadyNowSeconds();
   mgg::BlockedCorridorView blockedCorridorView() const;
+  /// Marks one topological segment blocked against the live map revision.
+  void blockCorridorSegment(const mgg::StateVec& from, const mgg::StateVec& to);
+  /// Marks the cached route's segment closest to a hazard the controller or
+  /// the route validator reported. Bounded by the cached route length.
+  void blockCachedRouteNear(const Eigen::Vector3d& hazard);
   void convertPathToNavigationBase(mgg::FeasiblePath& path) const;
   struct IndexedQueryContext {
     mgg::StateVec route_start = mgg::StateVec::Zero();

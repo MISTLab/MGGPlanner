@@ -1007,6 +1007,30 @@ class PlannerNodeTestPeer {
       const PlannerNode& node, mgg::ObjectiveKind objective) {
     return node.objectiveIndexedQueryFlags(objective);
   }
+  static std::size_t blockedCorridorCount(const PlannerNode& node) {
+    return node.blocked_corridors_.activeCount(
+        node.map_revision_, PlannerNode::steadyNowSeconds());
+  }
+  static bool corridorIsBlocked(const PlannerNode& node,
+                                const mgg::StateVec& from,
+                                const mgg::StateVec& to) {
+    return node.blocked_corridors_.isBlocked(
+        from, to, node.map_revision_, PlannerNode::steadyNowSeconds());
+  }
+  static void clearBlockedCorridors(PlannerNode& node) {
+    const std::lock_guard<std::recursive_mutex> lock(node.planner_mutex_);
+    node.blocked_corridors_.clear();
+  }
+  static void setBlockedCorridorLimits(PlannerNode& node, double ttl_s,
+                                       std::uint64_t revision_window,
+                                       std::size_t max_entries = 64) {
+    const std::lock_guard<std::recursive_mutex> lock(node.planner_mutex_);
+    mgg::BlockedCorridorLimits limits;
+    limits.ttl_s = ttl_s;
+    limits.revision_window = revision_window;
+    limits.max_entries = max_entries;
+    node.blocked_corridors_.setLimits(limits);
+  }
   static void setRouteHorizon(PlannerNode& node, double horizon,
                               double tolerance) {
     const std::lock_guard<std::recursive_mutex> lock(node.planner_mutex_);
@@ -1050,6 +1074,30 @@ class PlannerNodeTestPeer {
     node.have_explore_selection_ = true;
     node.local_graph_revision_ = 23;
     node.local_graph_map_revision_ = node.map_revision_;
+  }
+  static void setGlobalTopology(PlannerNode& node,
+                                const std::vector<mgg::StateVec>& vertices,
+                                const std::vector<std::pair<int, int>>& edges) {
+    const std::lock_guard<std::recursive_mutex> lock(node.planner_mutex_);
+    buildTopology(*node.global_graph_, vertices, edges);
+    node.last_own_global_vertex_id_ = static_cast<int>(vertices.size()) - 1;
+    ++node.graph_revision_;
+  }
+  static void installCachedRoute(PlannerNode& node,
+                                 const std::vector<mgg::StateVec>& global,
+                                 const std::string& mission,
+                                 const std::string& component) {
+    const std::lock_guard<std::recursive_mutex> lock(node.planner_mutex_);
+    node.cached_objective_route_ =
+        std::make_unique<PlannerNode::CachedObjectiveRoute>();
+    node.cached_objective_route_->id = "test-route-1";
+    node.cached_objective_route_->mission_id = mission;
+    node.cached_objective_route_->component_id = component;
+    node.cached_objective_route_->objective = mgg::ObjectiveKind::kReturnHome;
+    node.cached_objective_route_->graph_revision = node.graph_revision_;
+    node.cached_objective_route_->global_poses = global;
+    node.cached_objective_route_->next_index = 1;
+    node.cached_objective_route_->expected_endpoint = global.front();
   }
   static std::shared_ptr<mgg_msgs::srv::PlanObjective::Response>
   requestPinnedExplore(PlannerNode& node) {
@@ -1875,6 +1923,153 @@ TEST(PlannerExplore, WithoutASelectedTargetExploreIsUnreachable) {
   EXPECT_EQ(response->status,
             mgg_msgs::srv::PlanObjective::Response::UNREACHABLE);
   EXPECT_TRUE(response->path.empty());
+}
+
+// A local diamond: the short upper leg is the default corridor, the longer
+// lower leg is the alternative a blocked mark must expose.
+std::vector<mgg::StateVec> diamondLattice() {
+  return {mgg::StateVec(0.0, 0.0, 0.30, 0.0),
+          mgg::StateVec(0.50, 0.20, 0.30, 0.0),
+          mgg::StateVec(0.50, -0.60, 0.30, 0.0),
+          mgg::StateVec(1.00, 0.0, 0.30, 0.0)};
+}
+
+TEST(PlannerExplore, BlockedExploreCorridorSelectsTheAlternativeRoute) {
+  using Peer = mgg_ros::PlannerNodeTestPeer;
+  rclcpp::NodeOptions options;
+  options.parameter_overrides({rclcpp::Parameter("map.resolution", 0.05)});
+  const std::vector<std::pair<int, int>> edges{{0, 1}, {1, 3}, {0, 2}, {2, 3}};
+  const std::vector<mgg::StateVec> lattice = diamondLattice();
+
+  auto clear = std::make_shared<mgg_ros::PlannerNode>(options);
+  Peer::configureGridServiceScene(*clear);
+  Peer::acceptOdometry(*clear, 0.0, 0.0, 0.075);
+  Peer::setObjectiveGridWindow(*clear, 0.25, 0.25);
+  Peer::setExploreSelection(*clear, lattice, edges, 3);
+  const auto unobstructed = Peer::requestPinnedExplore(*clear);
+  ASSERT_EQ(unobstructed->status,
+            mgg_msgs::srv::PlanObjective::Response::SUCCEEDED)
+      << unobstructed->reason;
+  ASSERT_GE(unobstructed->global_path.size(), 3u);
+  EXPECT_GT(unobstructed->global_path[1].position.y, 0.0);
+  EXPECT_EQ(Peer::blockedCorridorCount(*clear), 0u);
+
+  auto obstructed = std::make_shared<mgg_ros::PlannerNode>(options);
+  Peer::configureGridServiceScene(*obstructed);
+  Peer::acceptOdometry(*obstructed, 0.0, 0.0, 0.075);
+  Peer::setObjectiveGridWindow(*obstructed, 0.25, 0.25);
+  // An obstacle standing on the upper vertex itself, so the corridor cannot be
+  // repaired by a local detour and the topological stage has to be asked again.
+  Peer::addBlockingWallSpan(*obstructed, 0.50, 0.05, 0.40);
+  Peer::setExploreSelection(*obstructed, lattice, edges, 3);
+  const auto rerouted = Peer::requestPinnedExplore(*obstructed);
+  ASSERT_EQ(rerouted->status,
+            mgg_msgs::srv::PlanObjective::Response::SUCCEEDED)
+      << rerouted->reason;
+  ASSERT_GE(rerouted->global_path.size(), 3u);
+  EXPECT_LT(rerouted->global_path[1].position.y, 0.0);
+  EXPECT_TRUE(Peer::corridorIsBlocked(*obstructed, lattice[0], lattice[1]));
+  EXPECT_FALSE(Peer::corridorIsBlocked(*obstructed, lattice[0], lattice[2]));
+  // The selector's target is unchanged: only the corridor to it moved.
+  EXPECT_NEAR(Peer::exploreTarget(*obstructed).x(), 1.00, 1e-9);
+}
+
+TEST(PlannerObjective, BlockedHomeCorridorSelectsTheAlternativeRoute) {
+  using Peer = mgg_ros::PlannerNodeTestPeer;
+  rclcpp::NodeOptions options;
+  options.parameter_overrides({rclcpp::Parameter("map.resolution", 0.05)});
+  const std::vector<std::pair<int, int>> edges{{0, 1}, {1, 3}, {0, 2}, {2, 3}};
+  const std::vector<mgg::StateVec> graph = diamondLattice();
+  const mgg::StateVec home(0.0, 0.0, 0.075, 0.0);
+
+  auto obstructed = std::make_shared<mgg_ros::PlannerNode>(options);
+  Peer::configureGridServiceScene(*obstructed);
+  Peer::acceptOdometry(*obstructed, 1.00, 0.0, 0.075);
+  Peer::setObjectiveGridWindow(*obstructed, 0.25, 0.25);
+  Peer::addBlockingWallSpan(*obstructed, 0.50, 0.05, 0.40);
+  Peer::setGlobalTopology(*obstructed, graph, edges);
+  const auto rerouted =
+      Peer::requestObjective(*obstructed, mgg::ObjectiveKind::kReturnHome, home);
+  ASSERT_EQ(rerouted->status,
+            mgg_msgs::srv::PlanObjective::Response::SUCCEEDED)
+      << rerouted->reason;
+  ASSERT_GE(rerouted->global_path.size(), 3u);
+  EXPECT_LT(rerouted->global_path[1].position.y, 0.0);
+  EXPECT_TRUE(Peer::corridorIsBlocked(*obstructed, graph[3], graph[1]));
+}
+
+TEST(PlannerObjective, BlockedMarksExpireAndDoNotOutliveTheirMapRevision) {
+  using Peer = mgg_ros::PlannerNodeTestPeer;
+  rclcpp::NodeOptions options;
+  options.parameter_overrides({rclcpp::Parameter("map.resolution", 0.05)});
+  const std::vector<std::pair<int, int>> edges{{0, 1}, {1, 3}, {0, 2}, {2, 3}};
+  const std::vector<mgg::StateVec> graph = diamondLattice();
+  const mgg::StateVec home(0.0, 0.0, 0.075, 0.0);
+
+  auto node = std::make_shared<mgg_ros::PlannerNode>(options);
+  Peer::configureGridServiceScene(*node);
+  Peer::acceptOdometry(*node, 1.00, 0.0, 0.075);
+  Peer::setObjectiveGridWindow(*node, 0.25, 0.25);
+  Peer::addBlockingWallSpan(*node, 0.50, 0.05, 0.40);
+  Peer::setGlobalTopology(*node, graph, edges);
+  // One new map revision is material here, so the mark cannot survive the
+  // measurement that might have changed the verdict behind it.
+  Peer::setBlockedCorridorLimits(*node, /*ttl_s=*/60.0,
+                                 /*revision_window=*/1);
+  ASSERT_EQ(Peer::requestObjective(*node, mgg::ObjectiveKind::kReturnHome, home)
+                ->status,
+            mgg_msgs::srv::PlanObjective::Response::SUCCEEDED);
+  EXPECT_TRUE(Peer::corridorIsBlocked(*node, graph[3], graph[1]));
+  Peer::finishMapRevision(*node);
+  EXPECT_FALSE(Peer::corridorIsBlocked(*node, graph[3], graph[1]));
+  EXPECT_EQ(Peer::blockedCorridorCount(*node), 0u);
+}
+
+TEST(PlannerObjective, InvalidRemainingRouteBlocksTheCachedCorridor) {
+  using Peer = mgg_ros::PlannerNodeTestPeer;
+  using Service = mgg_msgs::srv::ValidateObjectiveRoute;
+  rclcpp::NodeOptions options;
+  options.parameter_overrides(
+      {rclcpp::Parameter("use_sim_time", true),
+       rclcpp::Parameter("mission_id", "mission-test"),
+       rclcpp::Parameter("map.resolution", 0.15),
+       rclcpp::Parameter("objective_body_evidence_policy", "observed_ground"),
+       rclcpp::Parameter("objective_ground_evidence_policy",
+                         "provisional_unknown")});
+  auto node = std::make_shared<mgg_ros::PlannerNode>(options);
+  Peer::configureBackboneTest(*node);
+  Peer::acceptOdometry(*node, 0.0, 0.0, 0.075);
+  Peer::observeGroundRectangle(*node, -0.3, 0.3, 8.0, 8.3);
+  Peer::finishMapRevision(*node);
+  // The corridor the controller is executing, in graph driving heights.
+  const std::vector<mgg::StateVec> route{mgg::StateVec(0.0, 0.0, 0.30, 0.0),
+                                         mgg::StateVec(2.0, 0.0, 0.30, 0.0),
+                                         mgg::StateVec(4.0, 0.0, 0.30, 0.0)};
+  Peer::installCachedRoute(*node, route, "mission-test", "world");
+
+  auto request = std::make_shared<Service::Request>();
+  request->mission_id = "mission-test";
+  request->component_id = "world";
+  request->frame_id = "world";
+  request->lookahead_m = 3.0;
+  for (const double x : {0.0, 1.0, 2.0, 3.0, 4.0}) {
+    geometry_msgs::msg::Pose pose;
+    pose.position.x = x;
+    pose.position.z = 0.075;
+    pose.orientation.w = 1.0;
+    request->path.push_back(pose);
+  }
+  EXPECT_EQ(Peer::validateRoute(*node, request)->status,
+            Service::Response::VALID);
+  EXPECT_EQ(Peer::blockedCorridorCount(*node), 0u);
+
+  // A hazard the controller now reports at 2 m lies on the first corridor
+  // segment, so that segment is what gets marked.
+  Peer::addMeasuredSurface(*node, 2.0, 0.0, 0.125);
+  EXPECT_EQ(Peer::validateRoute(*node, request)->status,
+            Service::Response::INVALID);
+  EXPECT_TRUE(Peer::corridorIsBlocked(*node, route[0], route[1]));
+  EXPECT_FALSE(Peer::corridorIsBlocked(*node, route[1], route[2]));
 }
 
 TEST(PlannerObjective, ExploreKeepsSoleAccessToValidatedPrefixTruncation) {

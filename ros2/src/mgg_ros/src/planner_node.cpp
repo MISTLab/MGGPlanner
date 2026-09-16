@@ -3294,6 +3294,15 @@ void PlannerNode::onValidateObjectiveRoute(
     response->status = Response::INVALID;
     response->reason = reason;
   };
+  // A controller reports an execution-blocking hazard by submitting its
+  // remaining route here. An INVALID verdict therefore also marks the cached
+  // topological corridor nearest the hazard, so the next objective request
+  // selects a different corridor rather than the one the robot cannot follow.
+  const auto invalid_at = [this, &invalid](const std::string& reason,
+                                          const Eigen::Vector3d& hazard) {
+    invalid(reason);
+    blockCachedRouteNear(hazard);
+  };
   if (!provisional_unknown_ground_ ||
       (map_backend_ != "cloud_octomap" && map_backend_ != "mola_snapshot") ||
       !map_ || !map_->getStatus() || !have_odometry_) {
@@ -3451,7 +3460,7 @@ void PlannerNode::onValidateObjectiveRoute(
     if (box == mgg::VoxelStatus::kOccupied || geofence_invalid ||
         (footprint_status == mgg::GridProjectionStatus::kNoGround &&
          !physical_current)) {
-      invalid("stationary route intersects a known hazard");
+      invalid_at("stationary route intersects a known hazard", pose);
     } else if (footprint_status == mgg::GridProjectionStatus::kBodyUnknown ||
                box == mgg::VoxelStatus::kUnknown) {
       unavailable("stationary route query was unavailable");
@@ -3514,7 +3523,8 @@ void PlannerNode::onValidateObjectiveRoute(
       return;
     }
     if (terrain != mgg::ProjectedEdgeStatus::kAdmissible || projected.size() < 2) {
-      invalid("remaining route intersects known terrain");
+      invalid_at("remaining route intersects known terrain",
+                 ahead[segment].head<3>());
       return;
     }
     if (provisional_unknown_ground_ && !qualified_mola_body_envelope) {
@@ -3544,14 +3554,15 @@ void PlannerNode::onValidateObjectiveRoute(
       const Eigen::Vector3d center = pose + center_offset;
       const mgg::VoxelStatus box = point_body_status(center);
       if (box == mgg::VoxelStatus::kOccupied) {
-        invalid("remaining route intersects known occupied space");
+        invalid_at("remaining route intersects known occupied space", pose);
         return;
       }
       const auto footprint_status =
           objectiveFootprintTerrainStatus(pose, footprint);
       if (footprint_status == mgg::GridProjectionStatus::kNoGround &&
           !physical_current) {
-        invalid("remaining route footprint intersects known terrain");
+        invalid_at("remaining route footprint intersects known terrain",
+                   pose);
         return;
       }
       if (box == mgg::VoxelStatus::kUnknown ||
@@ -3563,13 +3574,13 @@ void PlannerNode::onValidateObjectiveRoute(
           (!geofence_ ||
            geofence_->getBoxStatus(center.head<2>(), body.head<2>()) ==
                mgg::GeofenceManager::CoordinateStatus::kViolated)) {
-        invalid("remaining route violates the geofence");
+        invalid_at("remaining route violates the geofence", pose);
         return;
       }
       if (have_previous &&
           std::abs(pose.z() - previous.z()) >
               planning_params_.max_step_height + 1e-6) {
-        invalid("remaining route exceeds the platform step limit");
+        invalid_at("remaining route exceeds the platform step limit", pose);
         return;
       }
       previous = pose;
@@ -3583,7 +3594,7 @@ void PlannerNode::onValidateObjectiveRoute(
            geofence_->getPathStatus(from.head<2>(), to.head<2>(),
                                     body.head<2>()) ==
                mgg::GeofenceManager::CoordinateStatus::kViolated)) {
-        invalid("remaining route crosses the geofence");
+        invalid_at("remaining route crosses the geofence", from);
         return;
       }
       const mgg::VoxelStatus swept = objectiveSweptBodyStatus(from, to, body);
@@ -3592,7 +3603,8 @@ void PlannerNode::onValidateObjectiveRoute(
         return;
       }
       if (swept == mgg::VoxelStatus::kOccupied) {
-        invalid("remaining route sweep intersects known occupied space");
+        invalid_at("remaining route sweep intersects known occupied space",
+                   from);
         return;
       }
       if (std::chrono::steady_clock::now() > validation_deadline) {
@@ -3638,6 +3650,35 @@ mgg::BlockedCorridorView PlannerNode::blockedCorridorView() const {
   view.map_revision = map_revision_;
   view.now_s = steadyNowSeconds();
   return view;
+}
+
+void PlannerNode::blockCorridorSegment(const mgg::StateVec& from,
+                                       const mgg::StateVec& to) {
+  blocked_corridors_.block(from, to, map_revision_, steadyNowSeconds());
+}
+
+void PlannerNode::blockCachedRouteNear(const Eigen::Vector3d& hazard) {
+  if (!cached_objective_route_ || !hazard.allFinite()) return;
+  const std::vector<mgg::StateVec>& route = cached_objective_route_->global_poses;
+  if (route.size() < 2) return;
+  std::size_t best = 0;
+  double best_distance = std::numeric_limits<double>::infinity();
+  for (std::size_t i = 1; i < route.size(); ++i) {
+    const Eigen::Vector2d a = route[i - 1].head<2>();
+    const Eigen::Vector2d delta = route[i].head<2>() - a;
+    const double denom = delta.squaredNorm();
+    const double t = denom > 1e-12
+                         ? std::clamp((hazard.head<2>() - a).dot(delta) / denom,
+                                      0.0, 1.0)
+                         : 0.0;
+    const double distance = (hazard.head<2>() - (a + t * delta)).norm();
+    if (distance < best_distance) {
+      best_distance = distance;
+      best = i;
+    }
+  }
+  if (!std::isfinite(best_distance)) return;
+  blockCorridorSegment(route[best - 1], route[best]);
 }
 
 bool PlannerNode::sliceObjectiveRouteWindow(
@@ -3994,8 +4035,75 @@ void PlannerNode::onObjectiveRequest(
     primary.partial = false;
     primary.reason.clear();
   }
+  // A corridor that came from the topological stage can be marked blocked and
+  // replaced. A direct search has no corridor to mark.
+  const bool topological_corridor_primary =
+      topological_retry.valid && !direct_primary &&
+      corridor.status == mgg::PlanningStatus::kSucceeded &&
+      !corridor.poses.empty();
   const auto objective_refinement_started = std::chrono::steady_clock::now();
   mgg::FeasiblePath path = refineCorridor(primary, objective_limits);
+  if (topological_corridor_primary &&
+      path.status != mgg::PlanningStatus::kSucceeded) {
+    // Blocked-corridor feedback. Mark the corridor segment the bounded grid
+    // stage rejected, then ask the topological stage once for an alternative
+    // route inside the same deadline. Shared by Explore, Navigate and Home.
+    const std::size_t from_index = path.blocked_from_index;
+    std::size_t to_index = path.blocked_to_index;
+    if (!global_objective_path.empty() &&
+        to_index >= global_objective_path.size()) {
+      to_index = global_objective_path.size() - 1u;
+    }
+    if (path.blocked_segment_identified &&
+        from_index != mgg::kNoCorridorIndex &&
+        from_index < global_objective_path.size() &&
+        to_index < global_objective_path.size() && from_index != to_index) {
+      blockCorridorSegment(global_objective_path[from_index],
+                           global_objective_path[to_index]);
+      const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+          std::chrono::steady_clock::now() - objective_refinement_started);
+      if (elapsed < objective_grid_limits_.timeout) {
+        mgg::TopologicalGoalPlanner alternative_planner(
+            core.component_id, core.graph_revision, core.map_revision,
+            topological_retry.goal_tolerance,
+            topological_retry.minimum_partial_progress);
+        mgg::RouteCorridor alternative = alternative_planner.plan(
+            *topological_retry.graph, topological_retry.current,
+            topological_retry.request, blockedCorridorView());
+        alternative.request = core;
+        const auto sameRoute = [](const std::vector<mgg::StateVec>& a,
+                                  const std::vector<mgg::StateVec>& b) {
+          if (a.size() != b.size()) return false;
+          for (std::size_t i = 0; i < a.size(); ++i) {
+            if ((a[i].head<3>() - b[i].head<3>()).cwiseAbs().maxCoeff() >
+                1e-9) {
+              return false;
+            }
+          }
+          return true;
+        };
+        if (alternative.status == mgg::PlanningStatus::kSucceeded &&
+            !alternative.poses.empty() &&
+            !sameRoute(alternative.poses, global_objective_path)) {
+          std::vector<mgg::StateVec> alternative_global;
+          std::unique_ptr<CachedObjectiveRoute> alternative_pending;
+          if (sliceObjectiveRouteWindow(core, alternative, alternative_global,
+                                        alternative_pending)) {
+            mgg::GridRefinementLimits remaining = objective_grid_limits_;
+            remaining.timeout -= elapsed;
+            mgg::FeasiblePath rerouted = refineCorridor(alternative, &remaining);
+            if (rerouted.status == mgg::PlanningStatus::kSucceeded) {
+              path = std::move(rerouted);
+              corridor = std::move(alternative);
+              primary = corridor;
+              global_objective_path = std::move(alternative_global);
+              pending_objective_route = std::move(alternative_pending);
+            }
+          }
+        }
+      }
+    }
+  }
   const std::string primary_failure_reason = path.reason;
   if (objective_graph_primary &&
       path.status != mgg::PlanningStatus::kSucceeded) {
@@ -4252,6 +4360,28 @@ void PlannerNode::onRefineObjectiveRoute(
   corridor.poses = std::move(local_poses);
   const auto objective_refinement_started = std::chrono::steady_clock::now();
   mgg::FeasiblePath path = refineCorridor(corridor, &objective_grid_limits_);
+  if (path.status != mgg::PlanningStatus::kSucceeded &&
+      path.blocked_segment_identified) {
+    // Blocked-corridor feedback for a continuation. Section pose j is global
+    // pose begin + j, including the interpolated horizon endpoint, which
+    // stands in for the global pose it was heading towards.
+    const std::vector<mgg::StateVec>& route =
+        cached_objective_route_->global_poses;
+    const std::size_t from_index =
+        path.blocked_from_index == mgg::kNoCorridorIndex
+            ? (begin == 0 ? mgg::kNoCorridorIndex : begin - 1u)
+            : begin + path.blocked_from_index;
+    std::size_t to_index = begin + path.blocked_to_index;
+    if (path.blocked_to_index != mgg::kNoCorridorIndex && !route.empty() &&
+        to_index >= route.size()) {
+      to_index = route.size() - 1u;
+    }
+    if (from_index != mgg::kNoCorridorIndex && from_index < route.size() &&
+        path.blocked_to_index != mgg::kNoCorridorIndex &&
+        to_index < route.size() && from_index != to_index) {
+      blockCorridorSegment(route[from_index], route[to_index]);
+    }
+  }
   const std::string primary_failure_reason = path.reason;
   if (path.status != mgg::PlanningStatus::kSucceeded) {
     const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
