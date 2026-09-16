@@ -1264,8 +1264,14 @@ TEST(PlannerObjective, ObservedGroundBlindStartConnectorRetainsDistanceBound) {
   // The kerb top remains below the raised body box, isolating the terrain
   // footprint veto from the ordinary occupied-body check.
   Peer::addMeasuredSurface(*curb, 1.25, 0.10, 0.125);
-  EXPECT_EQ(Peer::refine(*curb, corridor(2.5)).status,
-            mgg::PlanningStatus::kBlocked);
+  const mgg::FeasiblePath curb_refused = Peer::refine(*curb, corridor(2.5));
+  EXPECT_EQ(curb_refused.status, mgg::PlanningStatus::kBlocked);
+  EXPECT_NE(curb_refused.reason.find("first footprint rejection: known rise"),
+            std::string::npos)
+      << curb_refused.reason;
+  EXPECT_NE(curb_refused.reason.find("exceeds step limit 0.100 m"),
+            std::string::npos)
+      << curb_refused.reason;
 
   auto beyond = make(3.25);
   const mgg::FeasiblePath refused = Peer::refine(*beyond, corridor(3.25));

@@ -1220,6 +1220,11 @@ bool PlannerNode::objectiveFootprintTerrainSupported(
 mgg::GridProjectionStatus PlannerNode::objectiveFootprintTerrainStatus(
     const Eigen::Vector3d& driving_pose,
     const Eigen::Vector3d& body) const {
+  const auto record_failure = [this](const std::string& detail) {
+    if (objective_footprint_failure_.empty()) {
+      objective_footprint_failure_ = detail;
+    }
+  };
   // This extra terrain contract is intentionally limited to simulation's
   // observed-ground policy. Explicit objectives and Explore both use it;
   // strict-volume hardware planning retains its existing semantics.
@@ -1234,12 +1239,14 @@ mgg::GridProjectionStatus PlannerNode::objectiveFootprintTerrainStatus(
       planning_params_.max_step_height < 0.0 || !ground_ ||
       !std::isfinite(ground_->max_projection_length) ||
       ground_->max_projection_length <= 0.0) {
+    record_failure("invalid footprint query configuration");
     return mgg::GridProjectionStatus::kBodyUnknown;
   }
   const double resolution = map_->getResolution();
   const double radius = 0.5 * body.head<2>().norm();
   if (!std::isfinite(resolution) || resolution <= 0.0 ||
       !std::isfinite(radius)) {
+    record_failure("invalid footprint resolution or radius");
     return mgg::GridProjectionStatus::kBodyUnknown;
   }
 
@@ -1253,6 +1260,7 @@ mgg::GridProjectionStatus PlannerNode::objectiveFootprintTerrainStatus(
   constexpr int kMaxIntervals = 63;
   if (!std::isfinite(extent) || !std::isfinite(intervals_d) ||
       intervals_d < 1.0 || intervals_d > kMaxIntervals) {
+    record_failure("footprint sampling bound exceeded");
     return mgg::GridProjectionStatus::kBodyUnknown;
   }
   const int intervals = static_cast<int>(intervals_d);
@@ -1273,6 +1281,7 @@ mgg::GridProjectionStatus PlannerNode::objectiveFootprintTerrainStatus(
                                    ground_->max_projection_length);
   if (map_->getBoxStatus(query_center, query_size, false) ==
       mgg::VoxelStatus::kUnknown) {
+    record_failure("footprint query unavailable");
     return mgg::GridProjectionStatus::kBodyUnknown;
   }
   for (int ix = 0; ix <= intervals; ++ix) {
@@ -1285,7 +1294,10 @@ mgg::GridProjectionStatus PlannerNode::objectiveFootprintTerrainStatus(
       // nearby kerb into terrain beneath the body.
       if (std::hypot(dx, dy) > extent + 1e-9) continue;
       if (++samples > kMaxFootprintSamples)
+      {
+        record_failure("footprint sample limit exceeded");
         return mgg::GridProjectionStatus::kBodyUnknown;
+      }
       Eigen::Vector3d start =
           driving_pose +
           Eigen::Vector3d(robot_params_.center_offset.x() + dx,
@@ -1304,6 +1316,21 @@ mgg::GridProjectionStatus PlannerNode::objectiveFootprintTerrainStatus(
            (!hit.allFinite() ||
             std::abs(hit.z() - nominal_ground_z) >
                 planning_params_.max_step_height + 1e-6))) {
+        if (objective_footprint_failure_.empty()) {
+          if (ray == mgg::VoxelStatus::kUnknown) {
+            record_failure("footprint ray unavailable");
+          } else if (!hit.allFinite()) {
+            record_failure("non-finite footprint ground hit");
+          } else {
+            const double delta = hit.z() - nominal_ground_z;
+            char detail[160];
+            std::snprintf(detail, sizeof(detail),
+                          "known %s %.3f m exceeds step limit %.3f m",
+                          delta > 0.0 ? "rise" : "drop", std::abs(delta),
+                          planning_params_.max_step_height);
+            record_failure(detail);
+          }
+        }
         return ray == mgg::VoxelStatus::kUnknown
                    ? mgg::GridProjectionStatus::kBodyUnknown
                    : mgg::GridProjectionStatus::kNoGround;
@@ -1999,6 +2026,7 @@ mgg::FeasiblePath PlannerNode::refineCorridor(
   result.partial = corridor.partial;
   result.reason = corridor.reason;
   objective_start_support_failure_.clear();
+  objective_footprint_failure_.clear();
   if (corridor.status != mgg::PlanningStatus::kSucceeded) return result;
 
   result.poses = corridor.poses;
@@ -2293,6 +2321,11 @@ mgg::FeasiblePath PlannerNode::refineCorridor(
       !objective_start_support_failure_.empty()) {
     result.reason += " [start connector: " +
                      objective_start_support_failure_ + "]";
+  }
+  if (result.status != mgg::PlanningStatus::kSucceeded &&
+      !objective_footprint_failure_.empty()) {
+    result.reason += " [first footprint rejection: " +
+                     objective_footprint_failure_ + "]";
   }
   if (result.status != mgg::PlanningStatus::kSucceeded) return result;
   convertPathToNavigationBase(result);
