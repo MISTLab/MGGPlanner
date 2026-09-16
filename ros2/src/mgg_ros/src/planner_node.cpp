@@ -1279,6 +1279,11 @@ mgg::GridProjectionStatus PlannerNode::objectiveFootprintTerrainStatus(
     for (int iy = 0; iy <= intervals; ++iy) {
       const double dx = -extent + ix * spacing;
       const double dy = -extent + iy * spacing;
+      // The yaw-independent footprint is the circumscribed circle.  The
+      // surrounding square is only a convenient sampling lattice; its
+      // corners lie up to sqrt(2) farther from the robot and must not turn a
+      // nearby kerb into terrain beneath the body.
+      if (std::hypot(dx, dy) > extent + 1e-9) continue;
       if (++samples > kMaxFootprintSamples)
         return mgg::GridProjectionStatus::kBodyUnknown;
       Eigen::Vector3d start =

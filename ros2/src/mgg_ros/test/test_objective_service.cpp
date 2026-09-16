@@ -1293,10 +1293,19 @@ TEST(PlannerObjective, ObservedGroundVetoesKnownFootprintTerrainHazards) {
 
   // This obstacle is outside the narrow body's centreline but under a corner
   // of the body at some yaw. The circumscribed footprint must see it.
-  Peer::addMeasuredSurface(*flat, 0.20, 0.10, 0.125);
+  Peer::addMeasuredSurface(*flat, 0.18, 0.08, 0.125);
   EXPECT_FALSE(Peer::footprintTerrainSupported(*flat, driving_pose, body));
   EXPECT_FALSE(Peer::terrainPathSupported(
       *flat, {driving_pose, Eigen::Vector3d(0.10, 0.0, 0.30)}));
+
+  auto square_corner = make();
+  Peer::observeGroundRectangle(*square_corner, -0.3, 0.3, -0.3, 0.3);
+  // The sampling lattice encloses the circumscribed footprint circle.  A
+  // kerb in a lattice corner is farther from the robot than that circle and
+  // cannot veto an otherwise supported pose.
+  Peer::addMeasuredSurface(*square_corner, 0.25, 0.25, 0.125);
+  EXPECT_TRUE(Peer::footprintTerrainSupported(*square_corner, driving_pose,
+                                              body));
 
   auto missing_corner = make();
   Peer::observeGroundRectangle(*missing_corner, -0.05, 0.05, -0.05, 0.05);
