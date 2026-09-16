@@ -60,6 +60,10 @@ class PlannerNodeTestPeer {
     const std::lock_guard<std::recursive_mutex> lock(node.planner_mutex_);
     node.planning_params_.max_ground_height = height;
   }
+  static void setProvisionalUnknownGround(PlannerNode& node, bool enabled) {
+    const std::lock_guard<std::recursive_mutex> lock(node.planner_mutex_);
+    node.provisional_unknown_ground_ = enabled;
+  }
   static std::string rebuildLocalGraph(PlannerNode& node) {
     const std::lock_guard<std::recursive_mutex> lock(node.planner_mutex_);
     return node.buildLocalGraph();
@@ -2108,7 +2112,10 @@ TEST_F(ObjectiveService, NewObstacleBlocksExplicitHomeThroughActualService) {
 
 TEST_F(ObjectiveService, GridHomeDetoursOnObservedGroundAndBlocksWall) {
   using Peer = mgg_ros::PlannerNodeTestPeer;
-  Peer::configureGridServiceScene(*planner);
+  // Home must use the explicit-objective envelope.  The legacy generic
+  // margin is deliberately too narrow to get around the observed blocker.
+  Peer::configureGridServiceScene(*planner, 0.0, 0.0);
+  Peer::setProvisionalUnknownGround(*planner, true);
   for (const double x : {0.0, 0.6, 1.2}) {
     Peer::acceptOdometry(*planner, x, 0.0, 0.075);
   }
@@ -2150,6 +2157,10 @@ TEST_F(ObjectiveService, GridHomeDetoursOnObservedGroundAndBlocksWall) {
   ASSERT_NE(response, nullptr);
   EXPECT_EQ(response->status, Service::Response::BLOCKED) << response->reason;
   EXPECT_TRUE(response->path.empty());
+  EXPECT_EQ(response->reason.find("primary direct:"), 0u) << response->reason;
+  EXPECT_NE(response->reason.find("[breadcrumb fallback:"), std::string::npos)
+      << response->reason;
+
 }
 
 TEST_F(ObjectiveService, GridBodyOffsetPreservesHeightAndChecksRaisedObstacle) {

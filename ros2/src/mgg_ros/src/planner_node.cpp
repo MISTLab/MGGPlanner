@@ -2785,7 +2785,8 @@ void PlannerNode::onObjectiveRequest(
   }
 
   const mgg::GridRefinementLimits* objective_limits =
-      core.objective == mgg::ObjectiveKind::kNavigate
+      (core.objective == mgg::ObjectiveKind::kNavigate ||
+       core.objective == mgg::ObjectiveKind::kReturnHome)
           ? &objective_grid_limits_
           : nullptr;
   mgg::RouteCorridor primary = corridor;
@@ -2807,6 +2808,7 @@ void PlannerNode::onObjectiveRequest(
   }
   const auto objective_refinement_started = std::chrono::steady_clock::now();
   mgg::FeasiblePath path = refineCorridor(primary, objective_limits);
+  const std::string primary_failure_reason = path.reason;
   if (direct_primary && corridor.status == mgg::PlanningStatus::kSucceeded &&
       !corridor.poses.empty() &&
       path.status != mgg::PlanningStatus::kSucceeded) {
@@ -2815,7 +2817,29 @@ void PlannerNode::onObjectiveRequest(
     if (elapsed < objective_grid_limits_.timeout) {
       mgg::GridRefinementLimits remaining = objective_grid_limits_;
       remaining.timeout -= elapsed;
-      path = refineCorridor(corridor, &remaining);
+      mgg::FeasiblePath fallback = refineCorridor(corridor, &remaining);
+      if (fallback.status != mgg::PlanningStatus::kSucceeded) {
+        constexpr std::size_t kFailurePartLimit = 220;
+        const auto bounded = [](const std::string& reason) {
+          constexpr std::size_t kLimit = kFailurePartLimit;
+          std::string compact = reason;
+          const std::size_t grid = compact.find(" [grid evidence:");
+          const std::size_t footprint =
+              compact.find(" [first footprint rejection:");
+          if (grid != std::string::npos && footprint != std::string::npos &&
+              grid < footprint) {
+            compact = compact.substr(0, grid) + compact.substr(footprint);
+          }
+          if (compact.size() <= kLimit) return compact;
+          constexpr std::size_t kTail = 100;
+          return compact.substr(0, kLimit - kTail - 3) + "..." +
+                 compact.substr(compact.size() - kTail);
+        };
+        fallback.reason = "primary direct: " + bounded(primary_failure_reason) +
+                          " [breadcrumb fallback: " +
+                          bounded(fallback.reason) + "]";
+      }
+      path = std::move(fallback);
     }
   }
   const IndexedQueryContext query_context = indexedQueryContext();
