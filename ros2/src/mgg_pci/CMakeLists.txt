@@ -17,6 +17,7 @@ find_package(ament_cmake REQUIRED)
 find_package(mgg_msgs REQUIRED)
 find_package(rclcpp REQUIRED)
 find_package(nav_msgs REQUIRED)
+find_package(nlohmann_json REQUIRED)
 find_package(geometry_msgs REQUIRED)
 find_package(std_srvs REQUIRED)
 find_package(std_msgs REQUIRED)
@@ -27,6 +28,7 @@ target_include_directories(${PROJECT_NAME} PUBLIC
   $<INSTALL_INTERFACE:include>)
 ament_target_dependencies(${PROJECT_NAME}
   rclcpp nav_msgs geometry_msgs std_srvs std_msgs mgg_msgs)
+target_link_libraries(${PROJECT_NAME} nlohmann_json::nlohmann_json)
 
 add_executable(mgg_pci_node src/pci_main.cpp)
 target_link_libraries(mgg_pci_node ${PROJECT_NAME})
@@ -38,14 +40,17 @@ install(TARGETS ${PROJECT_NAME} EXPORT export_${PROJECT_NAME}
   ARCHIVE DESTINATION lib LIBRARY DESTINATION lib RUNTIME DESTINATION bin)
 
 ament_export_targets(export_${PROJECT_NAME} HAS_LIBRARY_TARGET)
-ament_export_dependencies(mgg_msgs rclcpp nav_msgs geometry_msgs std_srvs std_msgs)
+ament_export_dependencies(
+  mgg_msgs rclcpp nav_msgs geometry_msgs std_srvs std_msgs nlohmann_json)
 ament_export_include_directories(include)
 
 if(BUILD_TESTING)
   find_package(ament_cmake_gtest REQUIRED)
   ament_add_gtest(test_pci_deadlock test/test_pci_deadlock.cpp TIMEOUT 120)
   target_link_libraries(test_pci_deadlock ${PROJECT_NAME})
-  ament_target_dependencies(test_pci_deadlock rclcpp std_srvs nav_msgs mgg_msgs)
+  ament_target_dependencies(test_pci_deadlock
+    rclcpp std_srvs std_msgs nav_msgs mgg_msgs)
+  target_link_libraries(test_pci_deadlock nlohmann_json::nlohmann_json)
 endif()
 
 ament_package()

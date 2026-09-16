@@ -1,7 +1,11 @@
 #include "mgg_pci/pci_node.h"
 
 #include <chrono>
+#include <iomanip>
 #include <limits>
+#include <sstream>
+
+#include <nlohmann/json.hpp>
 
 namespace mgg_pci {
 
@@ -11,6 +15,27 @@ double boundedRetryDelaySeconds(int attempt, double initial, double maximum) {
     delay = std::min(maximum, delay * 2.0);
   }
   return delay;
+}
+
+std::string retryStatusReason(const std::string& reason, double delay_seconds) {
+  // Leave room for the operationally important retry suffix. Any partial
+  // trailing UTF-8 code point is replaced safely when the status is encoded.
+  std::ostringstream detail;
+  detail << reason.substr(0, 192) << "; retrying automatically in " << std::fixed
+         << std::setprecision(1) << delay_seconds << " s";
+  return detail.str();
+}
+
+std::string statusJson(const std::string& state, std::int64_t stamp_ns,
+                       const std::string& reason) {
+  nlohmann::json result = {
+      {"state", state.substr(0, 32)},
+      {"stamp_ns", stamp_ns},
+  };
+  if (!reason.empty()) {
+    result["reason"] = reason.substr(0, 256);
+  }
+  return result.dump(-1, ' ', false, nlohmann::json::error_handler_t::replace);
 }
 
 PciNode::PciNode(const rclcpp::NodeOptions& options)
@@ -197,10 +222,10 @@ bool PciNode::requestPlan(std::vector<geometry_msgs::msg::Pose>& path,
   return true;
 }
 
-void PciNode::publishStatus(const std::string& state) {
+void PciNode::publishStatus(const std::string& state,
+                            const std::string& reason) {
   std_msgs::msg::String msg;
-  msg.data = "{\"state\":\"" + state + "\",\"stamp_ns\":" +
-             std::to_string(now().nanoseconds()) + "}";
+  msg.data = statusJson(state, now().nanoseconds(), reason);
   status_pub_->publish(msg);
 }
 
@@ -235,7 +260,7 @@ void PciNode::deferExternalRetry(const std::string& reason) {
   path_in_progress_ = false;
   waiting_for_plan_ = true;
   retry_not_before_ = now() + rclcpp::Duration::from_seconds(delay);
-  publishStatus("waiting");
+  publishStatus("waiting", retryStatusReason(reason, delay));
   RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 5000,
                        "%s; retrying in %.1f s", reason.c_str(), delay);
 }

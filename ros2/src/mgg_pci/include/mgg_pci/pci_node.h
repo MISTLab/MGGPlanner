@@ -19,6 +19,7 @@
 #define MGG_PCI_PCI_NODE_H_
 
 #include <algorithm>
+#include <cstdint>
 #include <memory>
 #include <string>
 
@@ -33,6 +34,9 @@
 namespace mgg_pci {
 
 double boundedRetryDelaySeconds(int attempt, double initial, double maximum);
+std::string retryStatusReason(const std::string& reason, double delay_seconds);
+std::string statusJson(const std::string& state, std::int64_t stamp_ns,
+                       const std::string& reason = "");
 
 class StallBudget {
  public:
@@ -65,7 +69,8 @@ class PciNode : public rclcpp::Node {
   bool requestPlan(std::vector<geometry_msgs::msg::Pose>& path,
                    std::string& error);
 
-  void publishStatus(const std::string& state);
+  void publishStatus(const std::string& state,
+                     const std::string& reason = "");
   void publishPath(const std::vector<geometry_msgs::msg::Pose>& path);
   bool pathEndpointMakesExternalProgress(
       const std::vector<geometry_msgs::msg::Pose>& path) const;

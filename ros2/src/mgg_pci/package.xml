@@ -19,6 +19,7 @@
   <depend>mgg_msgs</depend>
   <depend>rclcpp</depend>
   <depend>nav_msgs</depend>
+  <depend>nlohmann_json</depend>
   <depend>geometry_msgs</depend>
   <depend>std_srvs</depend>
   <depend>std_msgs</depend>

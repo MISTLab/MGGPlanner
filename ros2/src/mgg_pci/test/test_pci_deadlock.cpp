@@ -6,9 +6,11 @@
 // exercises the shape directly rather than asserting it in a comment: the same
 // code deadlocks on one executor and succeeds on the other.
 
-#include <chrono>
 #include <atomic>
+#include <chrono>
 #include <memory>
+#include <mutex>
+#include <string>
 #include <thread>
 #include <utility>
 #include <vector>
@@ -16,7 +18,9 @@
 #include <gtest/gtest.h>
 #include <mgg_msgs/srv/planner_srv.hpp>
 #include <nav_msgs/msg/odometry.hpp>
+#include <nlohmann/json.hpp>
 #include <rclcpp/rclcpp.hpp>
+#include <std_msgs/msg/string.hpp>
 #include <std_srvs/srv/trigger.hpp>
 
 #include "mgg_pci/pci_node.h"
@@ -136,6 +140,24 @@ TEST(PciRetry, EmptyPlanDelayUsesBoundedExponentialBackoff) {
   EXPECT_DOUBLE_EQ(mgg_pci::boundedRetryDelaySeconds(40, 1.0, 10.0), 10.0);
 }
 
+TEST(PciStatus, ReasonIsBoundedAndJsonEscaped) {
+  const auto controls = nlohmann::json::parse(
+      mgg_pci::statusJson("waiting", 42, "bad \"reason\"\n"));
+  EXPECT_EQ(controls["state"], "waiting");
+  EXPECT_EQ(controls["stamp_ns"], 42);
+  EXPECT_EQ(controls["reason"], "bad \"reason\"\n");
+
+  // The first byte of this two-byte UTF-8 code point lands exactly at the
+  // reason limit. The replacement policy must still produce valid JSON text.
+  const auto bounded = mgg_pci::statusJson(
+      "waiting", 42, std::string(255, 'x') + "\xc3\xa9" + std::string(1024, 'x'));
+  EXPECT_TRUE(nlohmann::json::accept(bounded));
+  EXPECT_LT(bounded.size(), 350u);
+
+  const auto retry = mgg_pci::retryStatusReason(std::string(1024, 'x'), 10.0);
+  EXPECT_EQ(retry.find("retrying automatically in 10.0 s"), 194u);
+}
+
 class FakePlanner : public rclcpp::Node {
  public:
   FakePlanner(const std::string& ns,
@@ -186,10 +208,28 @@ struct ExternalExecutionRig {
             "pci_test_caller",
             rclcpp::NodeOptions().arguments(
                 {"--ros-args", "-r", "__ns:=" + ns}))) {
+    status_subscription = caller->create_subscription<std_msgs::msg::String>(
+        "status", rclcpp::QoS(1).transient_local(),
+        [this](std_msgs::msg::String::ConstSharedPtr message) {
+          std::lock_guard<std::mutex> lock(status_mutex);
+          last_status = message->data;
+        });
     executor.add_node(planner);
     executor.add_node(pci);
     executor.add_node(caller);
     spinner = std::thread([this]() { executor.spin(); });
+  }
+
+  bool waitForStatus(const std::string& fragment) {
+    const auto deadline = std::chrono::steady_clock::now() + 2s;
+    while (std::chrono::steady_clock::now() < deadline) {
+      {
+        std::lock_guard<std::mutex> lock(status_mutex);
+        if (last_status.find(fragment) != std::string::npos) return true;
+      }
+      std::this_thread::sleep_for(10ms);
+    }
+    return false;
   }
 
   ~ExternalExecutionRig() {
@@ -222,6 +262,9 @@ struct ExternalExecutionRig {
   std::shared_ptr<FakePlanner> planner;
   std::shared_ptr<mgg_pci::PciNode> pci;
   std::shared_ptr<rclcpp::Node> caller;
+  rclcpp::Subscription<std_msgs::msg::String>::SharedPtr status_subscription;
+  std::mutex status_mutex;
+  std::string last_status;
   rclcpp::executors::MultiThreadedExecutor executor;
   std::thread spinner;
 };
@@ -234,6 +277,9 @@ TEST(PciExternalExecution, NearEndpointWaitsForExplicitReplan) {
   ASSERT_NE(started, nullptr);
   EXPECT_TRUE(started->success);
   EXPECT_NE(started->message.find("waiting for a path"), std::string::npos);
+  EXPECT_TRUE(rig.waitForStatus(
+      "\"reason\":\"planner path makes no progress beyond the controller "
+      "goal tolerance; retrying automatically in 1.0 s\""));
   EXPECT_EQ(rig.planner->calls(), 1);
 
   std::this_thread::sleep_for(150ms);
@@ -278,6 +324,9 @@ TEST(PciExternalExecution, RepeatedEmptyPlansRemainWaitingUntilManualStop) {
     EXPECT_NE(response->message.find("waiting for a path"), std::string::npos);
   }
   EXPECT_EQ(rig.planner->calls(), 4);
+  EXPECT_TRUE(rig.waitForStatus(
+      "\"reason\":\"planner returned no path; retrying automatically in "
+      "8.0 s\""));
 
   const auto stopped = rig.call("pci_stop");
   ASSERT_NE(stopped, nullptr);
