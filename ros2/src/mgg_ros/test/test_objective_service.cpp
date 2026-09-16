@@ -67,6 +67,13 @@ class PlannerNodeTestPeer {
   static std::size_t localVertices(const PlannerNode& node) {
     return node.local_graph_->getNumVertices();
   }
+  static bool retainTerrainSafeExplorationPath(
+      const std::vector<mgg::StateVec>& lattice,
+      const std::function<bool(const std::vector<Eigen::Vector3d>&)>& supported,
+      std::vector<mgg::StateVec>& candidate) {
+    return PlannerNode::retainTerrainSafeExplorationPath(lattice, supported,
+                                                         candidate);
+  }
   static void observeShallowRamp(PlannerNode& node) {
     const std::lock_guard<std::recursive_mutex> lock(node.planner_mutex_);
     for (double x = -0.3; x <= 0.3 + 1e-9; x += 0.05) {
@@ -158,6 +165,20 @@ class PlannerNodeTestPeer {
         for (double y = ymin; y <= ymax + 1e-9; y += 0.10) {
           node.cloud_map_->insertPointCloud({Eigen::Vector3d(x, y, 0.0)},
                                       Eigen::Vector3d(x, y, 1.5));
+        }
+      }
+    }
+  }
+
+  static void observeGroundRectangleAt(PlannerNode& node, double xmin,
+                                       double xmax, double ymin, double ymax,
+                                       double z) {
+    const std::lock_guard<std::recursive_mutex> lock(node.planner_mutex_);
+    for (int repeat = 0; repeat < 6; ++repeat) {
+      for (double x = xmin; x <= xmax + 1e-9; x += 0.10) {
+        for (double y = ymin; y <= ymax + 1e-9; y += 0.10) {
+          node.cloud_map_->insertPointCloud({Eigen::Vector3d(x, y, z)},
+                                            Eigen::Vector3d(x, y, 1.5));
         }
       }
     }
@@ -594,7 +615,8 @@ class PlannerNodeTestPeer {
   static std::shared_ptr<mgg_msgs::srv::PlanObjective::Response>
   requestObjective(PlannerNode& node, mgg::ObjectiveKind objective,
                    const mgg::StateVec& goal,
-                   const std::string& landmark_id = "") {
+                   const std::string& landmark_id = "",
+                   std::uint64_t graph_revision = 0) {
     auto request = std::make_shared<mgg_msgs::srv::PlanObjective::Request>();
     request->objective = static_cast<std::uint8_t>(objective);
     request->component_id = node.component_id_;
@@ -604,6 +626,7 @@ class PlannerNodeTestPeer {
     request->goal.orientation.z = std::sin(goal[3] / 2.0);
     request->goal.orientation.w = std::cos(goal[3] / 2.0);
     request->goal_landmark_id = landmark_id;
+    request->graph_revision = graph_revision;
     auto response =
         std::make_shared<mgg_msgs::srv::PlanObjective::Response>();
     node.onObjectiveRequest(request, response);
@@ -850,6 +873,53 @@ TEST(PlannerObjective, ProvisionalUnknownGroundReachesDistantExactGoals) {
   }
 }
 
+TEST(PlannerObjective, ProvisionalUnknownGroundReturnsToPhysicalHomeWithoutFloorHits) {
+  using Peer = mgg_ros::PlannerNodeTestPeer;
+  rclcpp::NodeOptions options;
+  options.parameter_overrides(
+      {rclcpp::Parameter("use_sim_time", true),
+       rclcpp::Parameter("map.resolution", 0.15),
+       rclcpp::Parameter("objective_body_evidence_policy", "observed_ground"),
+       rclcpp::Parameter("objective_ground_evidence_policy", "provisional_unknown")});
+  auto node = std::make_shared<mgg_ros::PlannerNode>(options);
+  Peer::configureBackboneTest(*node);
+  Peer::acceptOdometry(*node, 0.0, 0.0, 0.20);
+  Peer::acceptOdometry(*node, 1.2, 0.0, 0.20);
+  // Make the map available without inventing support at either physical
+  // endpoint; both coordinates retain odometric provenance.
+  Peer::observeGroundRectangle(*node, 8.0, 8.3, 8.0, 8.3);
+  Peer::finishMapRevision(*node);
+  ASSERT_FALSE(Peer::initialAnchorSupported(*node));
+  const auto response = Peer::requestObjective(
+      *node, mgg::ObjectiveKind::kReturnHome,
+      mgg::StateVec(0.0, 0.0, 0.20, 0.4), "kf-home");
+  ASSERT_EQ(response->status,
+            mgg_msgs::srv::PlanObjective::Response::SUCCEEDED)
+      << response->reason;
+  ASSERT_GE(response->path.size(), 2u);
+  EXPECT_NEAR(response->path.back().position.x, 0.0, 1e-9);
+}
+
+TEST(PlannerObjective, ProvisionalHomeNeverOverridesAStaleRevision) {
+  using Peer = mgg_ros::PlannerNodeTestPeer;
+  rclcpp::NodeOptions options;
+  options.parameter_overrides(
+      {rclcpp::Parameter("use_sim_time", true),
+       rclcpp::Parameter("map.resolution", 0.15),
+       rclcpp::Parameter("objective_body_evidence_policy", "observed_ground"),
+       rclcpp::Parameter("objective_ground_evidence_policy", "provisional_unknown")});
+  auto node = std::make_shared<mgg_ros::PlannerNode>(options);
+  Peer::configureBackboneTest(*node);
+  Peer::acceptOdometry(*node, 0.0, 0.0, 0.20);
+  Peer::observeGroundRectangle(*node, 8.0, 8.3, 8.0, 8.3);
+  Peer::finishMapRevision(*node);
+  const auto response = Peer::requestObjective(
+      *node, mgg::ObjectiveKind::kReturnHome,
+      mgg::StateVec(0.0, 0.0, 0.20, 0.0), "kf-home", 999);
+  EXPECT_EQ(response->status,
+            mgg_msgs::srv::PlanObjective::Response::STALE_REVISION);
+}
+
 TEST(PlannerExplore, FullSizeGroundRobotsExpandAtProjectedDrivingHeight) {
   using Peer = mgg_ros::PlannerNodeTestPeer;
   for (const auto& body : {
@@ -878,6 +948,56 @@ TEST(PlannerExplore, FullSizeGroundRobotsExpandAtProjectedDrivingHeight) {
               mgg_msgs::srv::PlanObjective::Response::SUCCEEDED)
         << body.transpose() << ": " << response->reason;
     EXPECT_GE(response->path.size(), 2u);
+  }
+}
+
+TEST(PlannerExplore, QuantizedFloorHeightStillConnectsPhysicalRoot) {
+  using Peer = mgg_ros::PlannerNodeTestPeer;
+  rclcpp::NodeOptions options;
+  options.parameter_overrides(
+      {rclcpp::Parameter("use_sim_time", true),
+       rclcpp::Parameter("map.resolution", 0.15),
+       rclcpp::Parameter("objective_body_evidence_policy", "observed_ground"),
+       rclcpp::Parameter("objective_ground_evidence_policy", "provisional_unknown")});
+  auto node = std::make_shared<mgg_ros::PlannerNode>(options);
+  Peer::configureExploreServiceScene(*node, false);
+  Peer::setPlanningBody(*node, Eigen::Vector3d(1.023, 0.778, 0.40));
+  Peer::setMaxGroundHeight(*node, 0.475);
+  Peer::acceptOdometry(*node, 0.0, 0.0, 0.20);
+  // The first mapped road begins outside the under-body blind spot and its
+  // quantized surface is not exactly the odometric driving plane.
+  Peer::observeGroundRectangleAt(*node, 0.30, 1.30, -0.60, 0.60, 0.04);
+  Peer::observeFreeBodyBox(*node, Eigen::Vector3d(0.65, 0.0, 0.70),
+                          Eigen::Vector3d(2.0, 1.2, 0.60));
+  const auto response = Peer::requestObjective(
+      *node, mgg::ObjectiveKind::kExplore, mgg::StateVec::Zero());
+  ASSERT_EQ(response->status,
+            mgg_msgs::srv::PlanObjective::Response::SUCCEEDED)
+      << response->reason;
+  EXPECT_GE(response->path.size(), 2u);
+}
+
+TEST(PlannerExplore, InvalidSmoothedPathRestoresExactValidatedLattice) {
+  using Peer = mgg_ros::PlannerNodeTestPeer;
+  const std::vector<mgg::StateVec> lattice{
+      mgg::StateVec(0.0, 0.0, 0.4, 0.0),
+      mgg::StateVec(0.0, 1.0, 0.4, M_PI_2),
+      mgg::StateVec(1.0, 1.0, 0.4, 0.0)};
+  std::vector<mgg::StateVec> smoothed{
+      lattice.front(), mgg::StateVec(1.0, 1.0, 0.4, M_PI_4)};
+  bool examined_shortcut = false;
+  const bool accepted = Peer::retainTerrainSafeExplorationPath(
+      lattice,
+      [&examined_shortcut](const std::vector<Eigen::Vector3d>& candidate) {
+        examined_shortcut = true;
+        return candidate.size() != 2;  // the diagonal shortcut is hazardous
+      },
+      smoothed);
+  EXPECT_FALSE(accepted);
+  EXPECT_TRUE(examined_shortcut);
+  ASSERT_EQ(smoothed.size(), lattice.size());
+  for (std::size_t i = 0; i < lattice.size(); ++i) {
+    EXPECT_TRUE(smoothed[i].isApprox(lattice[i], 0.0));
   }
 }
 

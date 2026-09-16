@@ -387,7 +387,11 @@ FeasiblePath BoundedGridPlanner::refine(const RouteCorridor& corridor) {
     cells[source].state = from;
     cells[source].cost = 0.0;
     std::priority_queue<QueueEntry, std::vector<QueueEntry>, LaterEntry> open;
-    open.push({(to.head<2>() - from.head<2>()).norm(), 0.0, source,
+    // Every expanded edge invokes terrain and swept-body map queries. Bias the
+    // queue toward the goal to trade shortest-path optimality for substantially
+    // less map work on wide, mostly traversable objective grids.
+    constexpr double kHeuristicWeight = 1.5;
+    open.push({kHeuristicWeight * (to.head<2>() - from.head<2>()).norm(), 0.0, source,
                sequence++});
 
     constexpr int kDx[8] = {1, 0, -1, 0, 1, -1, -1, 1};
@@ -460,7 +464,8 @@ FeasiblePath BoundedGridPlanner::refine(const RouteCorridor& corridor) {
         cells[next].parent = entry.index;
         const double heuristic =
             (to.head<2>() - cells[next].state.head<2>()).norm();
-        open.push({candidate + heuristic, candidate, next, sequence++});
+        open.push({candidate + kHeuristicWeight * heuristic, candidate, next,
+                   sequence++});
         admitted_neighbor = true;
       }
 
@@ -511,7 +516,8 @@ FeasiblePath BoundedGridPlanner::refine(const RouteCorridor& corridor) {
           cells[candidate.cell].parent = source;
           const double heuristic =
               (to.head<2>() - cells[candidate.cell].state.head<2>()).norm();
-          open.push({edge + heuristic, edge, candidate.cell, sequence++});
+          open.push({edge + kHeuristicWeight * heuristic, edge,
+                     candidate.cell, sequence++});
         }
       }
     }

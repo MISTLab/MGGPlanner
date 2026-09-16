@@ -18,10 +18,12 @@
 #include <cstddef>
 #include <cstdint>
 #include <deque>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <string>
 #include <unordered_map>
+#include <vector>
 
 #include <nav_msgs/msg/odometry.hpp>
 #include <nav_msgs/msg/path.hpp>
@@ -141,6 +143,11 @@ class PlannerNode : public rclcpp::Node {
       const Eigen::Vector3d& body) const;
   bool objectiveTerrainPathSupported(
       const std::vector<Eigen::Vector3d>& driving_path) const;
+  static bool retainTerrainSafeExplorationPath(
+      const std::vector<mgg::StateVec>& selected_lattice_path,
+      const std::function<bool(const std::vector<Eigen::Vector3d>&)>&
+          terrain_supported,
+      std::vector<mgg::StateVec>& candidate);
   void refreshMolaRevision();
   void onValidateObjectiveRoute(
       const std::shared_ptr<mgg_msgs::srv::ValidateObjectiveRoute::Request>& request,

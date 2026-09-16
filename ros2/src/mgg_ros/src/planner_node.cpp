@@ -889,6 +889,7 @@ std::string PlannerNode::buildLocalGraph(bool strict_projected_endpoints) {
   for (const mgg::Vertex* v : sel.best_path) {
     if (v != nullptr) best_path_.push_back(v->state);
   }
+  const std::vector<mgg::StateVec> selected_lattice_path = best_path_;
 
 
   // What comes out of the graph is a walk along lattice edges: it steps
@@ -955,15 +956,18 @@ std::string PlannerNode::buildLocalGraph(bool strict_projected_endpoints) {
     best_path_ = rebuilt;
   }
   if (observed_ground_body_evidence_ && !best_path_.empty()) {
-    std::vector<Eigen::Vector3d> driving;
-    driving.reserve(best_path_.size());
-    for (const mgg::StateVec& state : best_path_) {
-      driving.push_back(state.head<3>());
+    // Shortcutting and interpolation happen after graph admission. If either
+    // operation crosses incompatible terrain, retain the selected lattice
+    // route whose individual edges were already checked during expansion.
+    if (!retainTerrainSafeExplorationPath(
+            selected_lattice_path,
+            [this](const std::vector<Eigen::Vector3d>& path) {
+              return objectiveTerrainPathSupported(path);
+            },
+            best_path_)) {
+      path_shortcut_corners_ = path_shortcut_from_;
+      path_shortcut_to_ = path_shortcut_from_;
     }
-    // Shortcutting and interpolation happen after graph admission. Refuse a
-    // selected path if either operation placed it across known incompatible
-    // terrain; the next cycle may select another frontier.
-    if (!objectiveTerrainPathSupported(driving)) best_path_.clear();
   }
   if (best_path_.size() >= 2) {
     // Remember where this path is heading, so the next cycle penalises
@@ -1317,8 +1321,17 @@ bool PlannerNode::objectiveTerrainPathSupported(
   const double xy_diagonal = footprint_body.head<2>().norm();
   swept_body.x() = xy_diagonal;
   swept_body.y() = xy_diagonal;
+  const Eigen::Vector3d physical_anchor =
+      physicalAnchorAtDrivingHeight(current_state_).head<3>();
   for (std::size_t i = 0; i < driving_path.size(); ++i) {
-    if (!objectiveFootprintTerrainSupported(driving_path[i], footprint_body)) {
+    const bool physical_start =
+        i == 0 &&
+        (driving_path[i].head<2>() - physical_anchor.head<2>())
+                .cwiseAbs().maxCoeff() <= 1e-6 &&
+        std::abs(driving_path[i].z() - physical_anchor.z()) <=
+            planning_params_.max_step_height + map_->getResolution() + 1e-6;
+    if (!physical_start &&
+        !objectiveFootprintTerrainSupported(driving_path[i], footprint_body)) {
       return false;
     }
     if (i == 0) continue;
@@ -1336,6 +1349,21 @@ bool PlannerNode::objectiveTerrainPathSupported(
     }
   }
   return true;
+}
+
+bool PlannerNode::retainTerrainSafeExplorationPath(
+    const std::vector<mgg::StateVec>& selected_lattice_path,
+    const std::function<bool(const std::vector<Eigen::Vector3d>&)>&
+        terrain_supported,
+    std::vector<mgg::StateVec>& candidate) {
+  std::vector<Eigen::Vector3d> driving;
+  driving.reserve(candidate.size());
+  for (const mgg::StateVec& state : candidate) {
+    driving.push_back(state.head<3>());
+  }
+  if (terrain_supported && terrain_supported(driving)) return true;
+  candidate = selected_lattice_path;
+  return false;
 }
 
 void PlannerNode::updateGlobalGraph() {
@@ -2061,6 +2089,7 @@ mgg::FeasiblePath PlannerNode::refineCorridor(
                         &corridor, &samePosition,
                         &geofenceContains,
                         &footprintTerrainStatus](mgg::StateVec& state) {
+    bool physical_anchor_fallback = false;
     if (robot_params_.type == mgg::RobotType::kGroundRobot) {
       const bool exact_explicit_goal =
           (corridor.request.objective == mgg::ObjectiveKind::kNavigate ||
@@ -2075,6 +2104,7 @@ mgg::FeasiblePath PlannerNode::refineCorridor(
           // known terrain encountered by traversal is still projected and
           // checked against step, footprint, occupancy, and geofence limits.
           state[2] = current_anchor[2];
+          physical_anchor_fallback = samePosition(state, current_anchor);
         } else {
         // Only two unsupported coordinates carry physical provenance: the
         // robot's current footprint and the retained initial Home anchor after
@@ -2107,7 +2137,7 @@ mgg::FeasiblePath PlannerNode::refineCorridor(
       }
     }
     const Eigen::Vector3d center = state.head<3>() + center_offset;
-    if (footprintTerrainStatus(state.head<3>()) !=
+    if (!physical_anchor_fallback && footprintTerrainStatus(state.head<3>()) !=
         mgg::GridProjectionStatus::kSupported) {
       return mgg::GridProjectionStatus::kNoGround;
     }
@@ -2549,6 +2579,8 @@ void PlannerNode::onObjectiveRequest(
   core.map_source_stamp_nanosec = request->map_source_stamp.nanosec;
   mgg::RouteCorridor corridor;
   corridor.request = core;
+  bool explicit_objective_planned = false;
+  bool provisional_physical_home = false;
   const bool local_objective = core.objective == mgg::ObjectiveKind::kExplore;
   const std::uint64_t active_graph_revision =
       local_objective ? local_graph_revision_ : graph_revision_;
@@ -2664,7 +2696,10 @@ void PlannerNode::onObjectiveRequest(
             (home_delta <= 1e-3 ||
              (!core.goal.landmark_id.empty() &&
               home_delta <= home_association_tolerance));
-        if (initial_anchor_supported_ && requests_physical_home) {
+        provisional_physical_home =
+            provisional_unknown_ground_ && requests_physical_home;
+        if ((initial_anchor_supported_ || provisional_unknown_ground_) &&
+            requests_physical_home) {
           graph_request.goal.pose = root->state;
           home_goal_supported = true;
         }
@@ -2701,6 +2736,7 @@ void PlannerNode::onObjectiveRequest(
             core.objective == mgg::ObjectiveKind::kNavigate
                 ? partial_route_min_progress_m_
                 : 0.0);
+        explicit_objective_planned = true;
         corridor =
             objective_planner.plan(graph, graph_current, graph_request);
         // Graph lookup uses driving height, while refinement and the response
@@ -2714,22 +2750,45 @@ void PlannerNode::onObjectiveRequest(
       core.objective == mgg::ObjectiveKind::kNavigate
           ? &objective_grid_limits_
           : nullptr;
+  mgg::RouteCorridor primary = corridor;
+  if (explicit_objective_planned &&
+      core.objective == mgg::ObjectiveKind::kNavigate &&
+      (corridor.status == mgg::PlanningStatus::kSucceeded ||
+       corridor.status == mgg::PlanningStatus::kUnreachable)) {
+    // The operator's exact goal is the primary corridor. A stale or sparse
+    // breadcrumb graph must not consume the entire bounded grid budget trying
+    // to repair one of its segments before the direct, unknown-permissive
+    // route is considered.
+    primary.status = mgg::PlanningStatus::kSucceeded;
+    primary.poses.clear();
+    primary.partial = false;
+    primary.reason.clear();
+  }
   const auto objective_refinement_started = std::chrono::steady_clock::now();
-  mgg::FeasiblePath path = refineCorridor(corridor, objective_limits);
-  if (core.objective == mgg::ObjectiveKind::kNavigate &&
-      path.status != mgg::PlanningStatus::kSucceeded &&
-      !corridor.poses.empty()) {
+  mgg::FeasiblePath path = refineCorridor(primary, objective_limits);
+  if (((core.objective == mgg::ObjectiveKind::kNavigate &&
+        corridor.status == mgg::PlanningStatus::kSucceeded &&
+       !corridor.poses.empty()) ||
+       (core.objective == mgg::ObjectiveKind::kReturnHome &&
+        explicit_objective_planned && provisional_physical_home &&
+        (corridor.status == mgg::PlanningStatus::kSucceeded ||
+         corridor.status == mgg::PlanningStatus::kUnreachable))) &&
+      path.status != mgg::PlanningStatus::kSucceeded) {
     const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::steady_clock::now() - objective_refinement_started);
     if (elapsed < objective_grid_limits_.timeout) {
-      mgg::RouteCorridor direct = corridor;
-      direct.status = mgg::PlanningStatus::kSucceeded;
-      direct.poses.clear();
-      direct.partial = false;
-      direct.reason.clear();
       mgg::GridRefinementLimits remaining = objective_grid_limits_;
       remaining.timeout -= elapsed;
-      path = refineCorridor(direct, &remaining);
+      if (core.objective == mgg::ObjectiveKind::kNavigate) {
+        path = refineCorridor(corridor, &remaining);
+      } else {
+        mgg::RouteCorridor direct = corridor;
+        direct.status = mgg::PlanningStatus::kSucceeded;
+        direct.poses.clear();
+        direct.partial = false;
+        direct.reason.clear();
+        path = refineCorridor(direct, &remaining);
+      }
     }
   }
   const IndexedQueryContext query_context = indexedQueryContext();

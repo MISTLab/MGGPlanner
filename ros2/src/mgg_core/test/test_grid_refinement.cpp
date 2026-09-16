@@ -299,6 +299,29 @@ TEST(GridRefinement, FindsObservedDetourAroundBlockedChord) {
   EXPECT_TRUE(left_chord);
 }
 
+TEST(GridRefinement, GoalBiasedSearchBoundsMapQueriesOnWideDetourGrid) {
+  GridRefinementLimits bounded = limits();
+  bounded.resolution_m = 0.25;
+  bounded.detour_margin_m = 4.0;
+  bounded.max_cells = 8192;
+  bounded.max_expansions = 2048;
+  bounded.timeout = std::chrono::milliseconds(500);
+  std::size_t traversals = 0;
+  auto checked = sampledTraversal({Eigen::Vector2d(10.0, 0.0)});
+  auto counted = [&traversals, checked](const StateVec& from,
+                                       const StateVec& to,
+                                       std::vector<StateVec>& path) mutable {
+    ++traversals;
+    return checked(from, to, path);
+  };
+  BoundedGridPlanner planner(StateVec::Zero(), bounded, flatProjection(),
+                             counted);
+  const FeasiblePath path = planner.refine(routeTo(20.0, 0.0));
+  ASSERT_EQ(path.status, PlanningStatus::kSucceeded) << path.reason;
+  EXPECT_LT(traversals, 1500u);
+  EXPECT_NEAR(path.poses.back().x(), 20.0, 1e-9);
+}
+
 TEST(GridRefinement, UnknownCellsCannotFormADetour) {
   const std::set<std::pair<int, int>> known{{0, 0}, {1, 0}, {2, 0}};
   auto project = [known](StateVec& state) {
