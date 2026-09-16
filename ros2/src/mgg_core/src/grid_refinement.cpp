@@ -162,7 +162,9 @@ FeasiblePath BoundedGridPlanner::refine(const RouteCorridor& corridor) {
   }
   if (!current_.allFinite() || !std::isfinite(limits_.resolution_m) ||
       !std::isfinite(limits_.detour_margin_m) ||
+      !std::isfinite(limits_.start_connector_max_distance_m) ||
       limits_.resolution_m <= 0.0 || limits_.detour_margin_m < 0.0 ||
+      limits_.start_connector_max_distance_m < 0.0 ||
       limits_.max_cells == 0 || limits_.max_expansions == 0 || !project_ ||
       !traversable_ || limits_.timeout.count() <= 0) {
     return fail("grid refinement configuration or current pose is invalid");
@@ -412,6 +414,7 @@ FeasiblePath BoundedGridPlanner::refine(const RouteCorridor& corridor) {
       if (!interruption_reason.empty()) return fail(interruption_reason);
 
       const auto [active_x, active_y] = xy(entry.index);
+      bool admitted_neighbor = false;
       for (int direction = 0; direction < 8; ++direction) {
         if (interrupted(interruption_reason)) return fail(interruption_reason);
         const long next_x = static_cast<long>(active_x) + kDx[direction];
@@ -458,6 +461,58 @@ FeasiblePath BoundedGridPlanner::refine(const RouteCorridor& corridor) {
         const double heuristic =
             (to.head<2>() - cells[next].state.head<2>()).norm();
         open.push({candidate + heuristic, candidate, next, sequence++});
+        admitted_neighbor = true;
+      }
+
+      // A physical start may sit in a camera/lidar ground blind spot. If none
+      // of its adjacent cells can be admitted, look for the nearest supported
+      // lattice cell within the explicitly bounded connector distance. The
+      // caller's traversal predicate still checks the complete swept body,
+      // terrain step and geofence; this search grants no unknown-space waiver.
+      if (entry.index == source && segment == 1 && !admitted_neighbor &&
+          limits_.start_connector_max_distance_m > resolution) {
+        struct Candidate {
+          double distance;
+          std::size_t cell;
+        };
+        std::vector<Candidate> candidates;
+        const double maximum = limits_.start_connector_max_distance_m;
+        for (std::size_t cell = 0; cell < cell_count; ++cell) {
+          if ((cell & 255u) == 0u && interrupted(interruption_reason))
+            return fail(interruption_reason);
+          if (cell == source) continue;
+          const auto [candidate_x, candidate_y] = xy(cell);
+          const double dx =
+              (static_cast<double>(candidate_x) - start_x) * resolution;
+          const double dy =
+              (static_cast<double>(candidate_y) - start_y) * resolution;
+          const double distance = std::hypot(dx, dy);
+          if (distance > resolution + 1e-9 && distance <= maximum + 1e-9)
+            candidates.push_back({distance, cell});
+        }
+        std::sort(candidates.begin(), candidates.end(),
+                  [](const Candidate& a, const Candidate& b) {
+                    return a.distance < b.distance ||
+                           (a.distance == b.distance && a.cell < b.cell);
+                  });
+        if (interrupted(interruption_reason)) return fail(interruption_reason);
+        for (const Candidate& candidate : candidates) {
+          if (!ensureCell(candidate.cell, active.state.z(), interruption_reason)) {
+            if (!interruption_reason.empty()) return fail(interruption_reason);
+            continue;
+          }
+          double edge = 0.0;
+          if (!traverse(active.state, cells[candidate.cell].state, nullptr, &edge,
+                        interruption_reason)) {
+            if (!interruption_reason.empty()) return fail(interruption_reason);
+            continue;
+          }
+          cells[candidate.cell].cost = edge;
+          cells[candidate.cell].parent = source;
+          const double heuristic =
+              (to.head<2>() - cells[candidate.cell].state.head<2>()).norm();
+          open.push({edge + heuristic, edge, candidate.cell, sequence++});
+        }
       }
     }
     if (reached == kNoParent) {

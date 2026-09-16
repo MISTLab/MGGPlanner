@@ -67,6 +67,70 @@ auto sampledTraversal(std::vector<Eigen::Vector2d> obstacles) {
   };
 }
 
+TEST(GridRefinement, BoundedStartConnectorReachesFirstObservedRoadCell) {
+  GridRefinementLimits bounded = limits();
+  bounded.resolution_m = 0.25;
+  bounded.detour_margin_m = 1.5;
+  bounded.start_connector_max_distance_m = 1.5;
+  auto project = [](StateVec& state) {
+    if (std::abs(state.x()) < 1e-9 || state.x() >= 1.0) {
+      state.z() = 0.0;
+      return GridProjectionStatus::kSupported;
+    }
+    return GridProjectionStatus::kNoGround;
+  };
+  BoundedGridPlanner planner(StateVec::Zero(), bounded, project,
+                             sampledTraversal({}));
+  const FeasiblePath result = planner.refine(routeTo(3.0, 0.0));
+  EXPECT_EQ(result.status, PlanningStatus::kSucceeded) << result.reason;
+  ASSERT_GE(result.poses.size(), 2u);
+  EXPECT_NEAR(result.poses.back().x(), 3.0, 1e-9);
+}
+
+TEST(GridRefinement, BoundedStartConnectorDoesNotCrossBlockedSweep) {
+  GridRefinementLimits bounded = limits();
+  bounded.resolution_m = 0.25;
+  bounded.detour_margin_m = 1.5;
+  bounded.start_connector_max_distance_m = 1.5;
+  auto project = [](StateVec& state) {
+    return std::abs(state.x()) < 1e-9 || state.x() >= 1.0
+               ? GridProjectionStatus::kSupported
+               : GridProjectionStatus::kNoGround;
+  };
+  auto blocked_from_start = [](const StateVec& from, const StateVec& to,
+                               std::vector<StateVec>& checked) {
+    if (from.head<2>().norm() < 1e-9) return false;
+    checked = {from, to};
+    return true;
+  };
+  BoundedGridPlanner planner(StateVec::Zero(), bounded, project,
+                             blocked_from_start);
+  const FeasiblePath result = planner.refine(routeTo(3.0, 0.0));
+  EXPECT_EQ(result.status, PlanningStatus::kBlocked);
+}
+
+TEST(GridRefinement, BoundedStartConnectorRequiresKnownSupportedEndpoint) {
+  GridRefinementLimits bounded = limits();
+  bounded.resolution_m = 0.25;
+  bounded.detour_margin_m = 1.5;
+  bounded.start_connector_max_distance_m = 1.5;
+  auto project = [](StateVec& state) {
+    return std::abs(state.x()) < 1e-9 || state.x() >= 3.0
+               ? GridProjectionStatus::kSupported
+               : GridProjectionStatus::kBodyUnknown;
+  };
+  auto short_only = [](const StateVec& from, const StateVec& to,
+                       std::vector<StateVec>& checked) {
+    if ((to.head<2>() - from.head<2>()).norm() > 0.3) return false;
+    checked = {from, to};
+    return true;
+  };
+  BoundedGridPlanner planner(StateVec::Zero(), bounded, project, short_only);
+  const FeasiblePath result = planner.refine(routeTo(3.0, 0.0));
+  EXPECT_EQ(result.status, PlanningStatus::kBlocked);
+  EXPECT_NE(result.reason.find("unknown="), std::string::npos);
+}
+
 TEST(GridRefinement, ReturnsTheCheckedTerrainPolyline) {
   auto traverse = [](const StateVec& from, const StateVec& to,
                      std::vector<StateVec>& checked) {

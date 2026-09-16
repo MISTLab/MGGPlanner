@@ -14,6 +14,7 @@ namespace mgg {
 struct GridRefinementLimits {
   double resolution_m = 0.25;
   double detour_margin_m = 1.0;
+  double start_connector_max_distance_m = 0.0;
   std::size_t max_cells = 4096;
   std::size_t max_expansions = 2048;
   std::chrono::milliseconds timeout{50};

@@ -130,6 +130,8 @@ PlannerNode::PlannerNode(const rclcpp::NodeOptions& options)
       std::isfinite(requested_start_support)
           ? std::clamp(requested_start_support, 0.0, 5.0)
           : 3.0;
+  objective_grid_limits_.start_connector_max_distance_m =
+      objective_start_support_max_distance_m_;
   geofence_ = std::make_unique<mgg::GeofenceManager>();
   local_graph_ = std::make_shared<mgg::GraphManager>();
   global_graph_ = std::make_shared<mgg::GraphManager>();
@@ -983,12 +985,16 @@ bool PlannerNode::validateObjectiveStartSupport(
       !anchor.allFinite() || !supported.allFinite() ||
       !std::isfinite(objective_start_support_max_distance_m_) ||
       objective_start_support_max_distance_m_ <= 0.0) {
+    if (objective_start_support_failure_.empty())
+      objective_start_support_failure_ = "connector configuration or state invalid";
     return false;
   }
   const double distance =
       (supported.head<3>() - anchor.head<3>()).norm();
   if (!std::isfinite(distance) || distance <= 1e-9 ||
       distance > objective_start_support_max_distance_m_ + 1e-9) {
+    if (objective_start_support_failure_.empty())
+      objective_start_support_failure_ = "connector exceeds bounded distance";
     return false;
   }
 
@@ -1002,6 +1008,9 @@ bool PlannerNode::validateObjectiveStartSupport(
           /*stop_at_unknown_voxel=*/false, projected,
           /*is_hanging=*/true) != mgg::ProjectedEdgeStatus::kAdmissible ||
       projected.size() < 2) {
+    if (objective_start_support_failure_.empty() ||
+        objective_start_support_failure_ == "connector exceeds bounded distance")
+      objective_start_support_failure_ = "projected connector inadmissible";
     return false;
   }
 
@@ -1015,6 +1024,9 @@ bool PlannerNode::validateObjectiveStartSupport(
     if (std::abs(point.z() - anchor.z()) >
         planning_params_.max_step_height + 1e-6) {
       checked.clear();
+      if (objective_start_support_failure_.empty() ||
+          objective_start_support_failure_ == "connector exceeds bounded distance")
+        objective_start_support_failure_ = "connector height delta exceeds step cap";
       return false;
     }
     mgg::StateVec pose = mgg::StateVec::Zero();
@@ -1027,6 +1039,9 @@ bool PlannerNode::validateObjectiveStartSupport(
               .cwiseAbs()
               .maxCoeff() > 1e-6) {
     checked.clear();
+    if (objective_start_support_failure_.empty() ||
+        objective_start_support_failure_ == "connector exceeds bounded distance")
+      objective_start_support_failure_ = "projected connector changed an endpoint";
     return false;
   }
   for (std::size_t i = 1; i < checked.size(); ++i) {
@@ -1040,8 +1055,41 @@ bool PlannerNode::validateObjectiveStartSupport(
       checked.clear();
       return false;
     }
-    if (map_->getStrictPathStatus(from, to, body) !=
-        mgg::VoxelStatus::kFree) {
+    const mgg::VoxelStatus swept = map_->getStrictPathStatus(from, to, body);
+    if (swept != mgg::VoxelStatus::kFree) {
+      const bool collect_detail =
+          objective_start_support_failure_.empty() ||
+          objective_start_support_failure_ ==
+              "connector exceeds bounded distance";
+      if (collect_detail) {
+        const double resolution = map_->getResolution();
+        const double length = (to - from).norm();
+        Eigen::Vector3d first = 0.5 * (from + to);
+        if (std::isfinite(resolution) && resolution > 0.0 &&
+            std::isfinite(length)) {
+          const std::size_t steps = static_cast<std::size_t>(
+              std::max(1.0, std::ceil(length / resolution)));
+          const Eigen::Vector3d step =
+              (to - from) / static_cast<double>(steps);
+          const Eigen::Vector3d swept_size = body + step.cwiseAbs();
+          for (std::size_t sample = 0; sample < steps; ++sample) {
+            const Eigen::Vector3d point =
+                from + (static_cast<double>(sample) + 0.5) * step;
+            if (map_->getStrictBoxStatus(point, swept_size) !=
+                mgg::VoxelStatus::kFree) {
+              first = point;
+              break;
+            }
+          }
+        }
+        char detail[160];
+        std::snprintf(
+            detail, sizeof(detail),
+            "strict swept body %s near (%.2f, %.2f, %.2f)",
+            swept == mgg::VoxelStatus::kOccupied ? "occupied" : "unknown",
+            first.x(), first.y(), first.z());
+        objective_start_support_failure_ = detail;
+      }
       checked.clear();
       return false;
     }
@@ -1676,6 +1724,7 @@ mgg::FeasiblePath PlannerNode::refineCorridor(
   result.map_source_stamp_nanosec = corridor.request.map_source_stamp_nanosec;
   result.partial = corridor.partial;
   result.reason = corridor.reason;
+  objective_start_support_failure_.clear();
   if (corridor.status != mgg::PlanningStatus::kSucceeded) return result;
 
   result.poses = corridor.poses;
@@ -1885,6 +1934,11 @@ mgg::FeasiblePath PlannerNode::refineCorridor(
   mgg::BoundedGridPlanner grid_planner(current_state_, active_limits, project,
                                        traverse);
   result = grid_planner.refine(corridor);
+  if (result.status != mgg::PlanningStatus::kSucceeded &&
+      !objective_start_support_failure_.empty()) {
+    result.reason += " [start connector: " +
+                     objective_start_support_failure_ + "]";
+  }
   if (result.status != mgg::PlanningStatus::kSucceeded) return result;
   convertPathToNavigationBase(result);
   return result;

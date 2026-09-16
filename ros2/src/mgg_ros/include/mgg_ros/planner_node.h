@@ -151,6 +151,7 @@ class PlannerNode : public rclcpp::Node {
   mgg::GridRefinementLimits objective_grid_limits_;
   double partial_route_min_progress_m_ = 1.0;
   double objective_start_support_max_distance_m_ = 3.0;
+  mutable std::string objective_start_support_failure_;
   mgg::BoundedSpaceParams global_space_;
   std::vector<mgg::BoundedSpaceParams> no_gain_zones_;
   std::unordered_map<std::string, mgg::SensorParams> sensors_;
