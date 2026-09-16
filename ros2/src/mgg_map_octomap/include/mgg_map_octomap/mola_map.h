@@ -48,22 +48,37 @@ struct MolaSnapshotRequest {
 /// validation and tree construction on one worker; planner callbacks never
 /// decode a grid. The active immutable tree is replaced atomically.
 class MolaMap : public MapInterface {
+ private:
+  struct Snapshot;
+
  public:
-  /// Keeps one immutable active snapshot installed for a bounded group of
-  /// MapInterface calls. Publication can continue decoding off-thread, but
-  /// commits wait until the lease is released.
+  /// Keeps one exact immutable snapshot for a bounded group of MapInterface
+  /// calls. Publication is excluded by default; allowPublication() lets a
+  /// worker commit while this transaction retains its admitted snapshot.
   class ReadLease {
    public:
     ReadLease() = default;
-    ReadLease(ReadLease&&) = default;
-    ReadLease& operator=(ReadLease&&) = default;
+    ReadLease(ReadLease&& other) noexcept;
+    ReadLease& operator=(ReadLease&& other) noexcept;
+    ~ReadLease();
 
     ReadLease(const ReadLease&) = delete;
     ReadLease& operator=(const ReadLease&) = delete;
 
+    /// Permit snapshot publication while retaining this transaction's exact
+    /// immutable snapshot. The lease remains thread-affine.
+    void allowPublication();
+    /// Re-establish publication exclusion before completing the transaction.
+    void reacquirePublication();
+
    private:
     friend class MolaMap;
-    explicit ReadLease(std::recursive_mutex& mutex) : lock_(mutex) {}
+    explicit ReadLease(const MolaMap& owner);
+    void release() noexcept;
+
+    const MolaMap* owner_ = nullptr;
+    std::shared_ptr<const Snapshot> snapshot_;
+    std::thread::id owner_thread_;
     std::unique_lock<std::recursive_mutex> lock_;
   };
 
@@ -144,10 +159,16 @@ class MolaMap : public MapInterface {
   void setRobotRadius(double robot_radius) override;
 
  private:
-  struct Snapshot;
   struct PendingRequest;
+  struct ThreadPin {
+    const MolaMap* owner = nullptr;
+    std::shared_ptr<const Snapshot> snapshot;
+    std::size_t depth = 0;
+  };
 
   std::shared_ptr<const Snapshot> current() const;
+  std::shared_ptr<const Snapshot> beginReadLease() const;
+  void endReadLease(const std::shared_ptr<const Snapshot>& snapshot) const;
   void workerLoop();
   std::shared_ptr<const Snapshot> load(const PendingRequest& pending) const;
   void failIfLatest(std::uint64_t generation, const std::string& error);
@@ -165,6 +186,7 @@ class MolaMap : public MapInterface {
   mutable std::recursive_mutex publication_mutex_;
   mutable std::shared_ptr<const Snapshot> active_;
   mutable std::atomic<std::uint64_t> active_generation_{0};
+  static thread_local std::vector<ThreadPin> thread_pins_;
 };
 
 }  // namespace mgg

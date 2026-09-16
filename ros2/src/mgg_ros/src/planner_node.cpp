@@ -2053,15 +2053,14 @@ void PlannerNode::onPlanRequest(
   const bool allow_explore_height_refinement =
       map_backend_ == "mola_snapshot" && provisional_unknown_ground_ &&
       observed_ground_body_evidence_;
-  map_read = mgg::MolaMap::ReadLease{};
+  map_read.allowPublication();
   lock.unlock();
   if (feasible.status == mgg::PlanningStatus::kSucceeded) {
     queryIndexedMap(feasible, query_context,
                     allow_explore_height_refinement);
   }
   lock.lock();
-  map_read = mola_map_ != nullptr ? mola_map_->acquireReadLease()
-                                  : mgg::MolaMap::ReadLease{};
+  map_read.reacquirePublication();
   const bool mola_ready = mola_map_ == nullptr || mola_map_->getStatus();
   refreshMolaRevision();
   if (mola_map_ != nullptr &&
@@ -3674,14 +3673,14 @@ void PlannerNode::onObjectiveRequest(
       core.objective == mgg::ObjectiveKind::kExplore &&
       map_backend_ == "mola_snapshot" && provisional_unknown_ground_ &&
       observed_ground_body_evidence_;
-  map_read = mgg::MolaMap::ReadLease{};
+  map_read.allowPublication();
   lock.unlock();
   if (path.status == mgg::PlanningStatus::kSucceeded) {
     queryIndexedMap(path, query_context, allow_explore_height_refinement);
   }
   if (mola_map_ != nullptr) {
     lock.lock();
-    map_read = mola_map_->acquireReadLease();
+    map_read.reacquirePublication();
     const bool mola_ready = mola_map_->getStatus();
     refreshMolaRevision();
     if (path.status == mgg::PlanningStatus::kSucceeded &&
@@ -3876,13 +3875,13 @@ void PlannerNode::onRefineObjectiveRoute(
       path = std::move(fallback);
     }
   }
-  map_read = mgg::MolaMap::ReadLease{};
+  map_read.allowPublication();
   lock.unlock();
   if (path.status == mgg::PlanningStatus::kSucceeded)
     queryIndexedMap(path, query_context);
   lock.lock();
   if (mola_map_ != nullptr) {
-    map_read = mola_map_->acquireReadLease();
+    map_read.reacquirePublication();
     const bool mola_ready = mola_map_->getStatus();
     refreshMolaRevision();
     if (path.status == mgg::PlanningStatus::kSucceeded &&

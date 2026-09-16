@@ -354,6 +354,144 @@ TEST(MolaMap, ReadLeaseKeepsOneSnapshotAcrossAQueryTransaction) {
             VoxelStatus::kOccupied);
 }
 
+TEST(MolaMap, ReadLeasePinsAdmittedSnapshotAcrossTtlAndPublicationWindow) {
+  Publication publication;
+  auto map_config = config(publication);
+  map_config.snapshot_ttl_sec = 0.05;
+  MolaMap provider(map_config);
+  const auto request = publication.publish(0, {{5, 0, 0}}, freeBlock());
+  provider.requestSnapshot(request);
+  ASSERT_TRUE(waitFor([&]() { return provider.getStatus(); }))
+      << provider.lastError();
+  const auto loaded_generation = provider.activeGeneration();
+
+  {
+    auto lease = provider.acquireReadLease();
+    // Exercise the same RHS-before-move-assignment ordering used by planner
+    // callback lease replacement. The nested acquisition inherits one pin.
+    lease = provider.acquireReadLease();
+    std::this_thread::sleep_for(std::chrono::milliseconds(80));
+    EXPECT_TRUE(provider.getStatus());
+    EXPECT_EQ(provider.getVoxelStatus({1.1, 0.1, 0.1}),
+              VoxelStatus::kOccupied);
+    {
+      auto nested = provider.acquireReadLease();
+      EXPECT_TRUE(provider.getStatus());
+    }
+
+    lease.allowPublication();
+    std::atomic<bool> other_status{true};
+    std::thread other([&]() {
+      auto other_lease = provider.acquireReadLease();
+      other_status.store(provider.getStatus(), std::memory_order_release);
+    });
+    other.join();
+    EXPECT_FALSE(other_status.load(std::memory_order_acquire));
+    EXPECT_EQ(provider.activeGeneration(), loaded_generation);
+    EXPECT_TRUE(provider.getStatus());
+    lease.reacquirePublication();
+  }
+
+  EXPECT_FALSE(provider.getStatus());
+  EXPECT_GT(provider.activeGeneration(), loaded_generation);
+}
+
+TEST(MolaMap, ExpiredSnapshotCannotBePinnedAtLeaseAdmission) {
+  Publication publication;
+  auto map_config = config(publication);
+  map_config.snapshot_ttl_sec = 0.05;
+  MolaMap provider(map_config);
+  const auto request = publication.publish(0, {{5, 0, 0}}, freeBlock());
+  provider.requestSnapshot(request);
+  ASSERT_TRUE(waitFor([&]() { return provider.getStatus(); }))
+      << provider.lastError();
+  const auto loaded_generation = provider.activeGeneration();
+  std::this_thread::sleep_for(std::chrono::milliseconds(80));
+
+  {
+    auto stale = provider.acquireReadLease();
+    EXPECT_FALSE(provider.getStatus());
+    EXPECT_EQ(provider.getVoxelStatus({1.1, 0.1, 0.1}),
+              VoxelStatus::kUnknown);
+  }
+  EXPECT_GT(provider.activeGeneration(), loaded_generation);
+}
+
+TEST(MolaMap, HeartbeatRefreshReplacesExpiredActiveBesideOlderPin) {
+  Publication publication;
+  auto map_config = config(publication);
+  map_config.snapshot_ttl_sec = 0.05;
+  MolaMap provider(map_config);
+  const auto request = publication.publish(0, {{5, 0, 0}}, freeBlock());
+  provider.requestSnapshot(request);
+  ASSERT_TRUE(waitFor([&]() { return provider.getStatus(); }))
+      << provider.lastError();
+  const auto loaded_generation = provider.activeGeneration();
+  auto status_on_other_thread = [&]() {
+    std::atomic<bool> status{false};
+    std::thread other([&]() {
+      auto lease = provider.acquireReadLease();
+      status.store(provider.getStatus(), std::memory_order_release);
+    });
+    other.join();
+    return status.load(std::memory_order_acquire);
+  };
+
+  {
+    auto lease = provider.acquireReadLease();
+    lease.allowPublication();
+    std::this_thread::sleep_for(std::chrono::milliseconds(80));
+    EXPECT_FALSE(status_on_other_thread());
+    EXPECT_EQ(provider.activeGeneration(), loaded_generation);
+
+    provider.requestSnapshot(request);
+    ASSERT_TRUE(waitFor(status_on_other_thread)) << provider.lastError();
+    EXPECT_EQ(provider.activeGeneration(), loaded_generation);
+    // The transaction remains on its admitted immutable object even though a
+    // coherent, freshly validated replacement is now active for new readers.
+    EXPECT_EQ(provider.getVoxelStatus({1.1, 0.1, 0.1}),
+              VoxelStatus::kOccupied);
+    lease.reacquirePublication();
+  }
+
+  EXPECT_TRUE(provider.getStatus());
+  EXPECT_EQ(provider.activeGeneration(), loaded_generation);
+}
+
+TEST(MolaMap, CorrectionDuringPublicationWindowInvalidatesGenerationNotPin) {
+  Publication publication;
+  MolaMap provider(config(publication));
+  const auto first = publication.publish(0, {{5, 0, 0}}, freeBlock());
+  provider.requestSnapshot(first);
+  ASSERT_TRUE(waitFor([&]() { return provider.getStatus(); }))
+      << provider.lastError();
+  const auto loaded_generation = provider.activeGeneration();
+  const auto second = publication.publish(1, {{8, 0, 0}}, freeBlock());
+
+  {
+    auto lease = provider.acquireReadLease();
+    lease.allowPublication();
+    provider.requestSnapshot(second);
+    EXPECT_GT(provider.activeGeneration(), loaded_generation);
+    EXPECT_TRUE(provider.getStatus());
+    EXPECT_EQ(provider.getVoxelStatus({1.1, 0.1, 0.1}),
+              VoxelStatus::kOccupied);
+    {
+      auto nested = provider.acquireReadLease();
+      EXPECT_EQ(provider.getVoxelStatus({1.1, 0.1, 0.1}),
+                VoxelStatus::kOccupied);
+    }
+    lease.reacquirePublication();
+  }
+
+  ASSERT_TRUE(waitFor([&]() {
+    return provider.getStatus() &&
+           provider.getVoxelStatus({1.1, 0.1, 0.1}) == VoxelStatus::kFree;
+  })) << provider.lastError();
+  EXPECT_EQ(provider.getVoxelStatus({1.7, 0.1, 0.1}),
+            VoxelStatus::kOccupied);
+}
+
 TEST(MolaMap, RejectsFreeCellsWithoutQualifiedRayEvidence) {
   Publication publication;
   MolaMap provider(config(publication));

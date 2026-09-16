@@ -240,6 +240,7 @@ struct MolaMap::Snapshot {
   std::shared_ptr<OctomapMap> map;
   std::string artifact_digest;
   Clock::time_point validated_at;
+  mutable std::atomic<std::size_t> reader_pins{0};
 };
 
 struct MolaMap::PendingRequest {
@@ -247,6 +248,68 @@ struct MolaMap::PendingRequest {
   std::uint64_t generation = 0;
   Clock::time_point received_at;
 };
+
+thread_local std::vector<MolaMap::ThreadPin> MolaMap::thread_pins_;
+
+MolaMap::ReadLease::ReadLease(const MolaMap& owner)
+    : owner_(&owner),
+      owner_thread_(std::this_thread::get_id()),
+      lock_(owner.publication_mutex_) {
+  snapshot_ = owner.beginReadLease();
+}
+
+MolaMap::ReadLease::ReadLease(ReadLease&& other) noexcept
+    : owner_(other.owner_),
+      snapshot_(std::move(other.snapshot_)),
+      owner_thread_(other.owner_thread_),
+      lock_(std::move(other.lock_)) {
+  if (owner_ != nullptr && owner_thread_ != std::this_thread::get_id())
+    std::terminate();
+  other.owner_ = nullptr;
+  other.owner_thread_ = std::thread::id{};
+}
+
+MolaMap::ReadLease& MolaMap::ReadLease::operator=(ReadLease&& other) noexcept {
+  if (this == &other) return *this;
+  if (other.owner_ != nullptr &&
+      other.owner_thread_ != std::this_thread::get_id())
+    std::terminate();
+  release();
+  owner_ = other.owner_;
+  snapshot_ = std::move(other.snapshot_);
+  owner_thread_ = other.owner_thread_;
+  lock_ = std::move(other.lock_);
+  other.owner_ = nullptr;
+  other.owner_thread_ = std::thread::id{};
+  return *this;
+}
+
+MolaMap::ReadLease::~ReadLease() { release(); }
+
+void MolaMap::ReadLease::allowPublication() {
+  if (owner_ == nullptr || !lock_.owns_lock()) return;
+  if (owner_thread_ != std::this_thread::get_id())
+    throw std::logic_error("MOLA read lease used from another thread");
+  lock_.unlock();
+}
+
+void MolaMap::ReadLease::reacquirePublication() {
+  if (owner_ == nullptr || lock_.owns_lock()) return;
+  if (owner_thread_ != std::this_thread::get_id())
+    throw std::logic_error("MOLA read lease used from another thread");
+  lock_.lock();
+}
+
+void MolaMap::ReadLease::release() noexcept {
+  if (owner_ == nullptr) return;
+  if (owner_thread_ != std::this_thread::get_id()) std::terminate();
+  if (!lock_.owns_lock()) lock_.lock();
+  owner_->endReadLease(snapshot_);
+  lock_.unlock();
+  owner_ = nullptr;
+  snapshot_.reset();
+  owner_thread_ = std::thread::id{};
+}
 
 MolaMap::MolaMap(MolaMapConfig config) : config_(std::move(config)) {
   if (config_.peer_root.empty() || !std::filesystem::path(config_.peer_root).is_absolute() ||
@@ -314,7 +377,41 @@ void MolaMap::requestSnapshot(const MolaSnapshotRequest& request) {
 }
 
 MolaMap::ReadLease MolaMap::acquireReadLease() const {
-  return ReadLease(publication_mutex_);
+  return ReadLease(*this);
+}
+
+std::shared_ptr<const MolaMap::Snapshot> MolaMap::beginReadLease() const {
+  for (auto& pin : thread_pins_) {
+    if (pin.owner != this) continue;
+    ++pin.depth;
+    if (pin.snapshot != nullptr)
+      pin.snapshot->reader_pins.fetch_add(1, std::memory_order_relaxed);
+    return pin.snapshot;
+  }
+  const auto snapshot = current();
+  thread_pins_.push_back(ThreadPin{this, snapshot, 1});
+  if (snapshot != nullptr)
+    snapshot->reader_pins.fetch_add(1, std::memory_order_relaxed);
+  return snapshot;
+}
+
+void MolaMap::endReadLease(
+    const std::shared_ptr<const Snapshot>& snapshot) const {
+  for (auto pin = thread_pins_.begin(); pin != thread_pins_.end(); ++pin) {
+    if (pin->owner != this) continue;
+    if (pin->depth == 0 || pin->snapshot != snapshot) std::terminate();
+    if (snapshot != nullptr &&
+        snapshot->reader_pins.fetch_sub(1, std::memory_order_acq_rel) == 0)
+      std::terminate();
+    if (--pin->depth != 0) return;
+    thread_pins_.erase(pin);
+    // If this was the final pin of an expired active snapshot, restore the
+    // ordinary expiry behavior now. A coherent heartbeat may already have
+    // installed a fresh replacement, in which case current() preserves it.
+    (void)current();
+    return;
+  }
+  std::terminate();
 }
 
 std::string MolaMap::lastError() const {
@@ -728,6 +825,9 @@ std::shared_ptr<const MolaMap::Snapshot> MolaMap::load(
 }
 
 std::shared_ptr<const MolaMap::Snapshot> MolaMap::current() const {
+  for (const auto& pin : thread_pins_) {
+    if (pin.owner == this) return pin.snapshot;
+  }
   auto value = std::atomic_load(&active_);
   if (value == nullptr) return nullptr;
   if (std::chrono::duration<double>(Clock::now() - value->validated_at).count() >
@@ -737,6 +837,12 @@ std::shared_ptr<const MolaMap::Snapshot> MolaMap::current() const {
     if (value != nullptr &&
         std::chrono::duration<double>(Clock::now() - value->validated_at).count() >
             config_.snapshot_ttl_sec) {
+      // A transaction admitted while this exact snapshot was fresh may finish
+      // on it, but another thread may neither use nor expire that transaction's
+      // snapshot. The final pin release performs ordinary expiry if no coherent
+      // heartbeat has installed a refreshed replacement.
+      if (value->reader_pins.load(std::memory_order_acquire) != 0)
+        return nullptr;
       std::atomic_store(&active_, std::shared_ptr<const Snapshot>());
       active_generation_.fetch_add(1, std::memory_order_release);
       return nullptr;
