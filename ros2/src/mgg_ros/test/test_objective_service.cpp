@@ -408,6 +408,32 @@ class PlannerNodeTestPeer {
     ++node.map_revision_;
   }
 
+  static void configureKnownRampThenUnknown(PlannerNode& node) {
+    configureBackboneTest(node);
+    acceptOdometry(node, 0.0, 0.0, 0.075);
+    const std::lock_guard<std::recursive_mutex> lock(node.planner_mutex_);
+    node.objective_grid_limits_.resolution_m = 0.20;
+    node.objective_grid_limits_.detour_margin_m = 0.50;
+    node.objective_grid_max_margin_m_ = 0.50;
+    node.objective_grid_limits_.max_cells = 4096;
+    node.objective_grid_limits_.max_expansions = 4096;
+    node.objective_grid_limits_.timeout = std::chrono::milliseconds(1000);
+    std::vector<Eigen::Vector3d> floor;
+    for (int x = -4; x <= 40; ++x) {
+      const double world_x = x * 0.05 + 0.025;
+      const double ground_z =
+          world_x <= 1.50 ? std::max(0.0, 0.08 * world_x) : 0.12;
+      for (int y = -12; y <= 12; ++y) {
+        floor.emplace_back(world_x, y * 0.05 + 0.025, ground_z + 0.025);
+      }
+    }
+    for (int repeat = 0; repeat < 6; ++repeat) {
+      node.cloud_map_->insertPointCloud(floor,
+                                        Eigen::Vector3d(1.0, 0.0, 1.5));
+    }
+    ++node.map_revision_;
+  }
+
   static void configureNavigateGraphCorridor(
       PlannerNode& node, const std::vector<mgg::StateVec>& poses) {
     configureGridServiceScene(node, 0.0, 1.0);
@@ -1963,6 +1989,56 @@ TEST(PlannerObjective, NavigateResolvesStaleStartHeightAcrossLongShallowRamp) {
   EXPECT_NEAR(response->path.back().position.z, 0.4025, 0.03);
   EXPECT_NEAR(response->path.back().orientation.z, std::sin(0.2), 1e-6);
   EXPECT_NEAR(response->path.back().orientation.w, std::cos(0.2), 1e-6);
+}
+
+TEST(PlannerObjective, ProvisionalUnknownContinuesFromLastKnownRampHeight) {
+  rclcpp::NodeOptions options;
+  options.parameter_overrides(
+      {rclcpp::Parameter("map.resolution", 0.05),
+       rclcpp::Parameter("mission_id", "ramp-unknown-test"),
+       rclcpp::Parameter("objective_ground_evidence_policy",
+                         "provisional_unknown"),
+       rclcpp::Parameter("objective_body_evidence_policy", "observed_ground"),
+       rclcpp::Parameter("objective_grid_timeout_ms", 2000),
+       rclcpp::Parameter("use_sim_time", true)});
+  auto planner = std::make_shared<mgg_ros::PlannerNode>(options);
+  using Peer = mgg_ros::PlannerNodeTestPeer;
+  Peer::configureKnownRampThenUnknown(*planner);
+
+  // The known road climbs gradually to a 12 cm plateau and observations end
+  // at x=2 m. The remaining unknown suffix must inherit that locally reached
+  // driving plane instead of snapping back to the initial height.
+  const mgg::StateVec goal(3.5, 0.0, 0.075, 0.6);
+  const auto response = Peer::requestBoundNavigate(*planner, goal);
+
+  ASSERT_NE(response, nullptr);
+  ASSERT_EQ(response->status, Service::Response::SUCCEEDED)
+      << response->reason;
+  ASSERT_FALSE(response->path.empty());
+  EXPECT_NEAR(response->path.back().position.x, goal.x(), 1e-3);
+  EXPECT_NEAR(response->path.back().position.y, goal.y(), 1e-3);
+  EXPECT_NEAR(response->path.back().position.z, 0.20, 0.03);
+  EXPECT_NEAR(response->path.back().orientation.z, std::sin(0.3), 1e-6);
+  EXPECT_NEAR(response->path.back().orientation.w, std::cos(0.3), 1e-6);
+  for (std::size_t i = 1; i < response->path.size(); ++i) {
+    EXPECT_LE(response->path[i].position.z, 0.25 + 1e-6);
+    EXPECT_LE(std::abs(response->path[i].position.z -
+                       response->path[i - 1].position.z),
+              0.10 + 1e-6);
+  }
+
+  auto validation =
+      std::make_shared<mgg_msgs::srv::ValidateObjectiveRoute::Request>();
+  validation->mission_id = "ramp-unknown-test";
+  validation->component_id = "world";
+  validation->frame_id = "world";
+  validation->lookahead_m = 5.0;
+  validation->path = response->path;
+  const auto validated = Peer::validateRoute(*planner, validation);
+  ASSERT_NE(validated, nullptr);
+  EXPECT_EQ(validated->status,
+            mgg_msgs::srv::ValidateObjectiveRoute::Response::VALID)
+      << validated->reason;
 }
 
 TEST(PlannerObjective, NavigateHeightResolutionCannotTeleportOntoCeiling) {

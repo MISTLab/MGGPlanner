@@ -29,6 +29,9 @@ enum class GridProjectionStatus {
   kBodyOccupied,
   kBodyUnknown,
   kGeofenceViolation,
+  // The pose passed all known-hazard checks, but its Z is inherited from the
+  // adjacent checked state because this XY has no measured ground.
+  kProvisionalUnknown,
 };
 
 /// Projects a pose onto supported terrain and verifies that the robot's full

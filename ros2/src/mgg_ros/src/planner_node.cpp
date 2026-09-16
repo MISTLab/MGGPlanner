@@ -2370,6 +2370,7 @@ mgg::FeasiblePath PlannerNode::refineCorridor(
                         &geofenceContains,
                         &footprintTerrainStatus](mgg::StateVec& state) {
     bool physical_anchor_fallback = false;
+    bool provisional_unknown_height = false;
     const bool physical_current = isPhysicalCurrent(state);
     const bool at_physical_current_xy =
         (state.head<2>() - current_anchor.head<2>())
@@ -2393,11 +2394,17 @@ mgg::FeasiblePath PlannerNode::refineCorridor(
                : projectStateToDrivingHeight(state, exact_explicit_goal));
       if (!height_projected) {
         if (provisional_unknown_ground_) {
-          // Unknown terrain carries no height evidence. Continue from the
-          // physical robot's current driving plane without modifying XY/yaw;
-          // known terrain encountered by traversal is still projected and
-          // checked against step, footprint, occupancy, and geofence limits.
-          state[2] = current_anchor[2];
+          // Unknown terrain carries no height evidence. Grid cells inherit
+          // their parent's already checked driving plane; resetting every
+          // cell to the robot's initial plane creates a false step after a
+          // gradual known climb. The physical pose still uses odometry as its
+          // anchor when ground is hidden beneath the body.
+          if (at_physical_current_xy ||
+              corridor.request.objective != mgg::ObjectiveKind::kNavigate) {
+            state[2] = current_anchor[2];
+          } else {
+            provisional_unknown_height = true;
+          }
           physical_anchor_fallback = samePosition(state, current_anchor);
         } else {
         // Only two unsupported coordinates carry physical provenance: the
@@ -2456,14 +2463,16 @@ mgg::FeasiblePath PlannerNode::refineCorridor(
     if (!geofenceContains(center)) {
       return mgg::GridProjectionStatus::kGeofenceViolation;
     }
-    return mgg::GridProjectionStatus::kSupported;
+    return provisional_unknown_height
+               ? mgg::GridProjectionStatus::kProvisionalUnknown
+               : mgg::GridProjectionStatus::kSupported;
   };
   const auto traverse =
       [this, body, center_offset, current_anchor, home_anchor,
        have_connected_home_anchor, &samePosition,
        &isPhysicalCurrent,
        &geofenceAllows,
-       &footprintTerrainStatus](const mgg::StateVec& a,
+       &footprintTerrainStatus, &corridor](const mgg::StateVec& a,
                                 const mgg::StateVec& b,
                         std::vector<mgg::StateVec>& checked) {
         checked.clear();
@@ -2535,14 +2544,19 @@ mgg::FeasiblePath PlannerNode::refineCorridor(
           return false;
         }
         if (provisional_unknown_ground_) {
+          double inherited_z = a.z();
           for (Eigen::Vector3d& driving_pose : projected) {
             mgg::StateVec supported = mgg::StateVec::Zero();
             supported.head<3>() = driving_pose;
             if (projectStateToDrivingHeight(supported, true)) {
               driving_pose = supported.head<3>();
-            } else {
+            } else if (corridor.request.objective !=
+                       mgg::ObjectiveKind::kNavigate) {
               driving_pose.z() = current_anchor.z();
+            } else {
+              driving_pose.z() = inherited_z;
             }
+            inherited_z = driving_pose.z();
           }
         }
         checked.reserve(projected.size());
@@ -2769,10 +2783,6 @@ void PlannerNode::onValidateObjectiveRoute(
   body.x() = diagonal;
   body.y() = diagonal;
   const Eigen::Vector3d center_offset = robot_params_.center_offset;
-  const double provisional_z = physicalAnchorAtDrivingHeight(current_state_).z();
-  for (mgg::StateVec& state : ahead) {
-    if (!projectStateToDrivingHeight(state, true)) state.z() = provisional_z;
-  }
   if (ahead.size() < 2) {
     const Eigen::Vector3d pose = ahead.front().head<3>();
     const auto footprint_status =
@@ -2810,14 +2820,16 @@ void PlannerNode::onValidateObjectiveRoute(
       return;
     }
     if (provisional_unknown_ground_) {
+      double inherited_z = ahead[segment - 1].z();
       for (Eigen::Vector3d& pose : projected) {
         mgg::StateVec supported = mgg::StateVec::Zero();
         supported.head<3>() = pose;
         if (projectStateToDrivingHeight(supported, true)) {
           pose = supported.head<3>();
         } else {
-          pose.z() = provisional_z;
+          pose.z() = inherited_z;
         }
+        inherited_z = pose.z();
       }
     }
     Eigen::Vector3d previous;

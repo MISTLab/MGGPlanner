@@ -133,6 +133,50 @@ TEST(GridRefinement, BoundedStartConnectorRequiresKnownSupportedEndpoint) {
   EXPECT_NE(result.reason.find("unknown="), std::string::npos);
 }
 
+TEST(GridRefinement, RejectsUnrepresentableStartConnectorRadius) {
+  GridRefinementLimits bounded = limits();
+  bounded.start_connector_max_distance_m = 1e300;
+  auto project = [](StateVec& state) {
+    if (state.head<2>().norm() < 1e-9 ||
+        (state.head<2>() - Eigen::Vector2d(3.0, 0.0)).norm() < 1e-9) {
+      state.z() = 0.0;
+      return GridProjectionStatus::kSupported;
+    }
+    return GridProjectionStatus::kNoGround;
+  };
+  auto blocked = [](const StateVec&, const StateVec&,
+                    std::vector<StateVec>&) { return false; };
+  BoundedGridPlanner planner(StateVec::Zero(), bounded, project, blocked);
+
+  const FeasiblePath result = planner.refine(routeTo(3.0, 0.0));
+  EXPECT_EQ(result.status, PlanningStatus::kBlocked);
+  EXPECT_NE(result.reason.find("start connector bounds are invalid"),
+            std::string::npos);
+}
+
+TEST(GridRefinement, StartConnectorCandidateWorkUsesSharedCellBudget) {
+  GridRefinementLimits bounded = limits();
+  bounded.detour_margin_m = 100.0;
+  bounded.start_connector_max_distance_m = 50.0;
+  bounded.max_cells = 32;
+  bounded.max_expansions = 32;
+  std::size_t projections = 0;
+  auto project = [&projections](StateVec& state) {
+    ++projections;
+    state.z() = 0.0;
+    return GridProjectionStatus::kSupported;
+  };
+  auto blocked = [](const StateVec&, const StateVec&,
+                    std::vector<StateVec>&) { return false; };
+  BoundedGridPlanner planner(StateVec::Zero(), bounded, project, blocked);
+
+  const FeasiblePath result = planner.refine(routeTo(3.0, 0.0));
+  EXPECT_EQ(result.status, PlanningStatus::kBlocked);
+  EXPECT_EQ(result.reason.find("deadline"), std::string::npos);
+  // Current, corridor and exact-goal projections are outside the cell store.
+  EXPECT_LE(projections, bounded.max_cells + 3u);
+}
+
 TEST(GridRefinement, ReturnsTheCheckedTerrainPolyline) {
   auto traverse = [](const StateVec& from, const StateVec& to,
                      std::vector<StateVec>& checked) {
@@ -191,6 +235,129 @@ TEST(GridRefinement, PartialRouteStopsAtProxyAndRetainsExactGoal) {
   EXPECT_NEAR(path.poses.back()[3], 0.25, 1e-9);
   EXPECT_DOUBLE_EQ(route.request.goal.pose.x(), 30.0);
   EXPECT_DOUBLE_EQ(route.request.goal.pose.y(), 4.0);
+}
+
+TEST(GridRefinement, ProvisionalCellsRetainDistinctParentHeights) {
+  RouteCorridor route = routeTo(2.0, 0.0);
+  route.request.objective = mgg::ObjectiveKind::kNavigate;
+  route.poses.clear();
+  auto project = [](StateVec& state) {
+    if (state.x() < 0.5 && state.y() > 0.5) {
+      state.z() = 1.0;
+      return GridProjectionStatus::kSupported;
+    }
+    if (state.x() >= 0.5) {
+      state[3] = -1.2;
+      return GridProjectionStatus::kProvisionalUnknown;
+    }
+    state.z() = 0.0;
+    return GridProjectionStatus::kSupported;
+  };
+  auto traverse = [](const StateVec& from, const StateVec& to,
+                     std::vector<StateVec>& checked) {
+    const double xy = (to.head<2>() - from.head<2>()).norm();
+    if (xy > std::sqrt(2.0) + 1e-9) return false;
+    // The lower approach reaches (1, 0) first but cannot connect the raised
+    // provisional destination. The upper approach must retain a distinct
+    // height-qualified state for that same XY cell.
+    if (to.x() > 1.5 && to.z() < 0.5) return false;
+    const bool initial_known_ramp = from.head<2>().norm() < 1e-9 &&
+                                    to.x() < 0.5 && to.y() > 0.5;
+    if (!initial_known_ramp && std::abs(to.z() - from.z()) > 1e-9) {
+      return false;
+    }
+    checked = {from, to};
+    return true;
+  };
+  GridRefinementLimits bounded = limits();
+  bounded.detour_margin_m = 1.0;
+  BoundedGridPlanner planner(StateVec::Zero(), bounded, project, traverse);
+
+  const FeasiblePath path = planner.refine(route);
+  ASSERT_EQ(path.status, PlanningStatus::kSucceeded) << path.reason;
+  ASSERT_FALSE(path.poses.empty());
+  EXPECT_TRUE(std::any_of(path.poses.begin(), path.poses.end(),
+                          [](const StateVec& pose) {
+                            return pose.y() > 0.5 && pose.z() > 0.5;
+                          }));
+  EXPECT_NEAR(path.poses.back().x(), 2.0, 1e-9);
+  EXPECT_NEAR(path.poses.back().y(), 0.0, 1e-9);
+  EXPECT_NEAR(path.poses.back().z(), 1.0, 1e-9);
+  EXPECT_NEAR(path.poses.back()[3], 0.7, 1e-9);
+}
+
+TEST(GridRefinement, ProvisionalConnectorCannotMoveExactGoal) {
+  RouteCorridor route = routeTo(2.0, 0.0);
+  route.request.objective = mgg::ObjectiveKind::kNavigate;
+  route.poses.clear();
+  auto project = [](StateVec& state) {
+    if (state.x() < 0.5 && state.y() > 0.5) {
+      state.z() = 1.0;
+      return GridProjectionStatus::kSupported;
+    }
+    if (state.x() >= 0.5) {
+      // Only the high-parent retry attempts to move the requested XY.
+      // Such a projection must not be accepted as the exact endpoint.
+      if (state.x() > 1.5 && state.z() > 0.5) state.x() += 0.25;
+      return GridProjectionStatus::kProvisionalUnknown;
+    }
+    state.z() = 0.0;
+    return GridProjectionStatus::kSupported;
+  };
+  auto traverse = [](const StateVec& from, const StateVec& to,
+                     std::vector<StateVec>& checked) {
+    if ((to.head<2>() - from.head<2>()).norm() > std::sqrt(2.0) + 1e-9) {
+      return false;
+    }
+    if (to.x() > 1.5 && to.z() < 0.5) return false;
+    const bool initial_known_ramp = from.head<2>().norm() < 1e-9 &&
+                                    to.x() < 0.5 && to.y() > 0.5;
+    if (!initial_known_ramp && std::abs(to.z() - from.z()) > 1e-9) {
+      return false;
+    }
+    checked = {from, to};
+    return true;
+  };
+  GridRefinementLimits bounded = limits();
+  bounded.detour_margin_m = 1.0;
+  BoundedGridPlanner planner(StateVec::Zero(), bounded, project, traverse);
+
+  const FeasiblePath path = planner.refine(route);
+  EXPECT_EQ(path.status, PlanningStatus::kBlocked);
+  EXPECT_TRUE(path.poses.empty());
+}
+
+TEST(GridRefinement, ProvisionalEndpointRemainsInvalidForPartialNavigate) {
+  RouteCorridor route = routeTo(2.0, 0.0);
+  route.request.objective = mgg::ObjectiveKind::kNavigate;
+  route.partial = true;
+  auto project = [](StateVec& state) {
+    return state.head<2>().norm() < 1e-9
+               ? GridProjectionStatus::kSupported
+               : GridProjectionStatus::kProvisionalUnknown;
+  };
+  BoundedGridPlanner planner(StateVec::Zero(), limits(), project,
+                             sampledTraversal({}));
+
+  const FeasiblePath path = planner.refine(route);
+  EXPECT_EQ(path.status, PlanningStatus::kBlocked);
+  EXPECT_FALSE(path.partial);
+  EXPECT_TRUE(path.poses.empty());
+}
+
+TEST(GridRefinement, ProvisionalEndpointRemainsInvalidForReturnHome) {
+  auto project = [](StateVec& state) {
+    return state.head<2>().norm() < 1e-9
+               ? GridProjectionStatus::kSupported
+               : GridProjectionStatus::kProvisionalUnknown;
+  };
+  BoundedGridPlanner planner(StateVec::Zero(), limits(), project,
+                             sampledTraversal({}));
+
+  const FeasiblePath path = planner.refine(routeTo(2.0, 0.0));
+  EXPECT_EQ(path.status, PlanningStatus::kBlocked);
+  EXPECT_FALSE(path.partial);
+  EXPECT_TRUE(path.poses.empty());
 }
 
 TEST(GridRefinement, FailedPartialRouteCannotAdvertiseContinuation) {
@@ -384,6 +551,28 @@ TEST(GridRefinement, GoalBiasedSearchBoundsMapQueriesOnWideDetourGrid) {
   ASSERT_EQ(path.status, PlanningStatus::kSucceeded) << path.reason;
   EXPECT_LT(traversals, 1500u);
   EXPECT_NEAR(path.poses.back().x(), 20.0, 1e-9);
+}
+
+TEST(GridRefinement, SparseSearchReachesFarDiagonalBeyondDenseAreaLimit) {
+  GridRefinementLimits bounded = limits();
+  bounded.resolution_m = 0.5;
+  bounded.detour_margin_m = 2.0;
+  bounded.max_cells = 1024;
+  bounded.max_expansions = 1024;
+  bounded.timeout = std::chrono::milliseconds(500);
+  BoundedGridPlanner planner(
+      StateVec::Zero(), bounded, flatProjection(),
+      sampledTraversal({Eigen::Vector2d(25.0, 25.0)}));
+
+  const FeasiblePath path = planner.refine(routeTo(50.0, 50.0));
+
+  ASSERT_EQ(path.status, PlanningStatus::kSucceeded) << path.reason;
+  EXPECT_NEAR(path.poses.back().x(), 50.0, 1e-9);
+  EXPECT_NEAR(path.poses.back().y(), 50.0, 1e-9);
+  EXPECT_TRUE(std::any_of(path.poses.begin(), path.poses.end(),
+                          [](const StateVec& pose) {
+                            return std::abs(pose.x() - pose.y()) > 0.5;
+                          }));
 }
 
 TEST(GridRefinement, UnknownCellsCannotFormADetour) {

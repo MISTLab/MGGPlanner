@@ -4,10 +4,13 @@
 #include <array>
 #include <climits>
 #include <cmath>
+#include <cstdint>
 #include <cstdio>
+#include <cstring>
 #include <limits>
 #include <queue>
 #include <string>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -18,12 +21,40 @@ constexpr std::size_t kNoParent = std::numeric_limits<std::size_t>::max();
 
 struct Cell {
   StateVec state = StateVec::Zero();
+  std::size_t grid_index = 0;
   double cost = std::numeric_limits<double>::infinity();
   std::size_t parent = kNoParent;
   bool projection_tried = false;
   bool valid = false;
   bool closed = false;
 };
+
+struct CellKey {
+  std::size_t grid_index = 0;
+  std::uint64_t parent_height_bits = 0;
+
+  bool operator==(const CellKey& other) const {
+    return grid_index == other.grid_index &&
+           parent_height_bits == other.parent_height_bits;
+  }
+};
+
+struct CellKeyHash {
+  std::size_t operator()(const CellKey& key) const {
+    std::size_t seed = std::hash<std::size_t>{}(key.grid_index);
+    const std::size_t height =
+        std::hash<std::uint64_t>{}(key.parent_height_bits);
+    return seed ^ (height + 0x9e3779b9u + (seed << 6u) + (seed >> 2u));
+  }
+};
+
+std::uint64_t heightBits(double height) {
+  if (height == 0.0) height = 0.0;  // Canonicalize negative zero.
+  std::uint64_t bits = 0;
+  static_assert(sizeof(bits) == sizeof(height));
+  std::memcpy(&bits, &height, sizeof(bits));
+  return bits;
+}
 
 struct QueueEntry {
   double estimate = 0.0;
@@ -106,6 +137,8 @@ const char* projectionFailureClass(GridProjectionStatus status) {
       return "geofence violation";
     case GridProjectionStatus::kSupported:
       return "projector returned an invalid supported state";
+    case GridProjectionStatus::kProvisionalUnknown:
+      return "projector returned an invalid provisional state";
   }
   return "unknown projection failure";
 }
@@ -189,9 +222,16 @@ FeasiblePath BoundedGridPlanner::refine(const RouteCorridor& corridor) {
   };
   const auto project_state = [&](StateVec& state) {
     const GridProjectionStatus status = project_(state);
-    const std::size_t index = static_cast<std::size_t>(status);
+    const std::size_t index =
+        status == GridProjectionStatus::kProvisionalUnknown
+            ? 0
+            : static_cast<std::size_t>(status);
     if (index < 5) ++projection_counts[index];
     return status;
+  };
+  const auto projectionAccepted = [](GridProjectionStatus status) {
+    return status == GridProjectionStatus::kSupported ||
+           status == GridProjectionStatus::kProvisionalUnknown;
   };
   if (corridor.request.objective != ObjectiveKind::kNavigate &&
       corridor.request.objective != ObjectiveKind::kReturnHome) {
@@ -247,7 +287,11 @@ FeasiblePath BoundedGridPlanner::refine(const RouteCorridor& corridor) {
     }
     const GridProjectionStatus waypoint_status = project_state(waypoint);
     if (interrupted(interruption_reason)) return fail(interruption_reason);
-    if (waypoint_status != GridProjectionStatus::kSupported ||
+    const bool provisional_navigate_waypoint =
+        corridor.request.objective == ObjectiveKind::kNavigate &&
+        waypoint_status == GridProjectionStatus::kProvisionalUnknown;
+    if ((waypoint_status != GridProjectionStatus::kSupported &&
+         !provisional_navigate_waypoint) ||
         !waypoint.allFinite()) {
       return fail(projectionFailure(
           "route corridor waypoint[" + std::to_string(waypoint_index) + "]",
@@ -267,11 +311,31 @@ FeasiblePath BoundedGridPlanner::refine(const RouteCorridor& corridor) {
   if (!goal.allFinite()) {
     return fail("the exact goal has no supported collision-free grid state");
   }
-  const GridProjectionStatus goal_status = project_state(goal);
+  GridProjectionStatus goal_status = project_state(goal);
   if (interrupted(interruption_reason)) return fail(interruption_reason);
   goal[3] = requested_goal_yaw;
-  if (goal_status != GridProjectionStatus::kSupported || !goal.allFinite()) {
+  const bool provisional_navigate_goal =
+      !corridor.partial &&
+      corridor.request.objective == ObjectiveKind::kNavigate &&
+      goal_status == GridProjectionStatus::kProvisionalUnknown;
+  if ((goal_status != GridProjectionStatus::kSupported &&
+       !provisional_navigate_goal) ||
+      !goal.allFinite()) {
     return fail(projectionFailure("exact goal", goal_status, goal));
+  }
+  if (provisional_navigate_goal) {
+    // A ground goal from the UI carries navigation-base Z, while grid states
+    // use driving height. Bind an unsupported endpoint to the nearest checked
+    // corridor state before the direct attempt. A later A* connector may
+    // advance this same provisional plane from its adjacent checked parent.
+    goal.z() = waypoints.back().z();
+    goal_status = project_state(goal);
+    if (interrupted(interruption_reason)) return fail(interruption_reason);
+    goal[3] = requested_goal_yaw;
+    if (goal_status != GridProjectionStatus::kProvisionalUnknown ||
+        !goal.allFinite()) {
+      return fail("exact goal height changed while binding provisional terrain");
+    }
   }
   if (corridor.partial) {
     // The final corridor pose is the checked local proxy. The exact operator
@@ -357,6 +421,7 @@ FeasiblePath BoundedGridPlanner::refine(const RouteCorridor& corridor) {
   for (std::size_t segment = 1; segment < waypoints.size(); ++segment) {
     const StateVec& from = waypoints[segment - 1];
     const StateVec& to = waypoints[segment];
+    StateVec connected_to = to;
     if (interrupted(interruption_reason)) return fail(interruption_reason);
     std::vector<StateVec> direct_path;
     if (traverse(from, to, &direct_path, nullptr, interruption_reason)) {
@@ -367,10 +432,6 @@ FeasiblePath BoundedGridPlanner::refine(const RouteCorridor& corridor) {
     if (!interruption_reason.empty()) return fail(interruption_reason);
 
     const double resolution = limits_.resolution_m;
-    const long double cells_bound = static_cast<long double>(
-        std::min<std::size_t>(limits_.max_cells,
-                              static_cast<std::size_t>(
-                                  std::numeric_limits<long>::max())));
     const long double width_bound =
         std::ceil((std::abs(static_cast<long double>(to.x()) - from.x()) +
                    2.0L * limits_.detour_margin_m) /
@@ -382,7 +443,8 @@ FeasiblePath BoundedGridPlanner::refine(const RouteCorridor& corridor) {
                   limits_.resolution_m) +
         3.0L;
     if (!std::isfinite(width_bound) || !std::isfinite(height_bound) ||
-        width_bound > cells_bound || height_bound > cells_bound) {
+        width_bound >= static_cast<long double>(std::numeric_limits<long>::max()) ||
+        height_bound >= static_cast<long double>(std::numeric_limits<long>::max())) {
       return fail("grid refinement bounds are invalid or exceed the cell limit");
     }
     const double min_x = std::min(from.x(), to.x()) - limits_.detour_margin_m;
@@ -397,19 +459,18 @@ FeasiblePath BoundedGridPlanner::refine(const RouteCorridor& corridor) {
     const double ny_d = std::ceil((max_y - origin_y) / resolution) + 1.0;
     if (!std::isfinite(origin_x) || !std::isfinite(origin_y) ||
         !std::isfinite(nx_d) || !std::isfinite(ny_d) || nx_d < 1.0 ||
-        ny_d < 1.0 || nx_d > static_cast<double>(limits_.max_cells) ||
-        ny_d > static_cast<double>(limits_.max_cells) ||
+        ny_d < 1.0 ||
+        static_cast<long double>(nx_d) >=
+            static_cast<long double>(std::numeric_limits<long>::max()) ||
+        static_cast<long double>(ny_d) >=
+            static_cast<long double>(std::numeric_limits<long>::max()) ||
         left < 0.0 || down < 0.0 || left >= nx_d || down >= ny_d) {
       return fail("grid refinement bounds are invalid or exceed the cell limit");
     }
     const std::size_t nx = static_cast<std::size_t>(nx_d);
     const std::size_t ny = static_cast<std::size_t>(ny_d);
-    if (nx > limits_.max_cells / ny) {
-      return fail("grid refinement exceeds the cell limit");
-    }
-    const std::size_t cell_count = nx * ny;
-    if (cell_count > limits_.max_cells) {
-      return fail("grid refinement exceeds the cell limit");
+    if (nx > std::numeric_limits<std::size_t>::max() / ny) {
+      return fail("grid refinement bounds are invalid or exceed index range");
     }
     const std::size_t start_x = static_cast<std::size_t>(left);
     const std::size_t start_y = static_cast<std::size_t>(down);
@@ -417,7 +478,11 @@ FeasiblePath BoundedGridPlanner::refine(const RouteCorridor& corridor) {
       return fail("grid refinement could not represent the segment start");
     }
 
-    std::vector<Cell> cells(cell_count);
+    std::vector<Cell> cells;
+    cells.reserve(std::min(
+        {limits_.max_cells, limits_.max_expansions, std::size_t{4096}}));
+    std::unordered_map<CellKey, std::size_t, CellKeyHash> cell_lookup;
+    cell_lookup.reserve(cells.capacity());
     const auto index = [nx](std::size_t x, std::size_t y) {
       return y * nx + x;
     };
@@ -426,41 +491,74 @@ FeasiblePath BoundedGridPlanner::refine(const RouteCorridor& corridor) {
     };
     const auto ensureCell = [&](std::size_t cell, double parent_z,
                                 std::string& reason) {
-      Cell& value = cells[cell];
-      if (value.projection_tried) return value.valid;
+      if (!std::isfinite(parent_z)) return kNoParent;
+      const CellKey key{cell, heightBits(parent_z)};
+      const auto found = cell_lookup.find(key);
+      if (found != cell_lookup.end()) {
+        return cells[found->second].valid ? found->second : kNoParent;
+      }
+      if (cells.size() >= limits_.max_cells) {
+        reason = "grid refinement exceeded the cell limit";
+        return kNoParent;
+      }
+      const std::size_t node = cells.size();
+      cells.emplace_back();
+      cell_lookup.emplace(key, node);
+      Cell& value = cells.back();
+      value.grid_index = cell;
       value.projection_tried = true;
       const auto [x, y] = xy(cell);
       const double lattice_x = origin_x + static_cast<double>(x) * resolution;
       const double lattice_y = origin_y + static_cast<double>(y) * resolution;
       value.state = StateVec(lattice_x, lattice_y, parent_z, 0.0);
-      if (interrupted(reason)) return false;
+      if (interrupted(reason)) return kNoParent;
       const GridProjectionStatus projection_status = project_state(value.state);
-      if (interrupted(reason)) return false;
-      if (projection_status != GridProjectionStatus::kSupported ||
-          !value.state.allFinite()) {
-        return false;
+      if (interrupted(reason)) return kNoParent;
+      if (!projectionAccepted(projection_status) || !value.state.allFinite()) {
+        return kNoParent;
       }
       // Keep the discrete XY identity separate from a small support-probe
       // correction, but reject a projection that jumps into another cell.
       if (std::abs(value.state.x() - lattice_x) > 0.5 * resolution + 1e-9 ||
           std::abs(value.state.y() - lattice_y) > 0.5 * resolution + 1e-9) {
-        return false;
+        return kNoParent;
+      }
+      if (projection_status == GridProjectionStatus::kSupported) {
+        const CellKey canonical{cell, heightBits(value.state.z())};
+        if (!(canonical == key)) {
+          const auto canonical_found = cell_lookup.find(canonical);
+          if (canonical_found != cell_lookup.end()) {
+            const std::size_t canonical_node = canonical_found->second;
+            // Do not retain an alias for every incoming parent height. Each
+            // live node owns at most its input key and one known-height key,
+            // so lookup memory remains bounded by twice max_cells.
+            cell_lookup.erase(key);
+            cells.pop_back();
+            return cells[canonical_node].valid ? canonical_node : kNoParent;
+          }
+          cell_lookup.emplace(canonical, node);
+        }
       }
       value.valid = true;
-      return true;
+      return node;
     };
 
     const std::size_t source = index(start_x, start_y);
-    cells[source].projection_tried = true;
-    cells[source].valid = true;
-    cells[source].state = from;
-    cells[source].cost = 0.0;
+    const std::size_t source_node = cells.size();
+    cells.emplace_back();
+    cells.back().grid_index = source;
+    cell_lookup.emplace(CellKey{source, heightBits(from.z())}, source_node);
+    Cell& source_cell = cells.back();
+    source_cell.projection_tried = true;
+    source_cell.valid = true;
+    source_cell.state = from;
+    source_cell.cost = 0.0;
     std::priority_queue<QueueEntry, std::vector<QueueEntry>, LaterEntry> open;
     // Every expanded edge invokes terrain and swept-body map queries. Bias the
     // queue toward the goal to trade shortest-path optimality for substantially
     // less map work on wide, mostly traversable objective grids.
     constexpr double kHeuristicWeight = 1.5;
-    open.push({kHeuristicWeight * (to.head<2>() - from.head<2>()).norm(), 0.0, source,
+    open.push({kHeuristicWeight * (to.head<2>() - from.head<2>()).norm(), 0.0, source_node,
                sequence++});
 
     constexpr int kDx[8] = {1, 0, -1, 0, 1, -1, -1, 1};
@@ -470,23 +568,57 @@ FeasiblePath BoundedGridPlanner::refine(const RouteCorridor& corridor) {
       if (interrupted(interruption_reason)) return fail(interruption_reason);
       const QueueEntry entry = open.top();
       open.pop();
-      Cell& active = cells[entry.index];
+      Cell& active = cells.at(entry.index);
       if (active.closed || entry.cost > active.cost + 1e-12) continue;
       if (expansions >= limits_.max_expansions) {
         return fail("grid refinement exceeded the expansion limit");
       }
       ++expansions;
       active.closed = true;
+      const StateVec active_state = active.state;
+      const double active_cost = active.cost;
+      const std::size_t active_grid_index = active.grid_index;
 
-      if ((to.head<2>() - active.state.head<2>()).norm() <=
-              std::sqrt(2.0) * resolution + 1e-9 &&
-          traverse(active.state, to, nullptr, nullptr, interruption_reason)) {
-        reached = entry.index;
-        break;
+      if ((to.head<2>() - active_state.head<2>()).norm() <=
+          std::sqrt(2.0) * resolution + 1e-9) {
+        if (traverse(active_state, to, nullptr, nullptr,
+                     interruption_reason)) {
+          connected_to = to;
+          reached = entry.index;
+          break;
+        }
+        if (!interruption_reason.empty()) return fail(interruption_reason);
+
+        // A provisional target initially carries the request/start height,
+        // while the search may have reached it through a gradual mapped
+        // climb. Reproject a failed connector from this checked parent's
+        // driving plane. Known terrain still selects its measured surface;
+        // unknown terrain can only inherit the adjacent connected height.
+        StateVec inherited_to = to;
+        inherited_to.z() = active_state.z();
+        const Eigen::Vector2d requested_xy = inherited_to.head<2>();
+        const double requested_yaw = inherited_to[3];
+        const GridProjectionStatus inherited_status =
+            project_state(inherited_to);
+        if (interrupted(interruption_reason)) return fail(interruption_reason);
+        const bool exact_endpoint_preserved =
+            (inherited_to.head<2>() - requested_xy).norm() <= 1e-9;
+        inherited_to[3] = requested_yaw;
+        if (!corridor.partial && segment + 1 == waypoints.size() &&
+            corridor.request.objective == ObjectiveKind::kNavigate &&
+            goal_status == GridProjectionStatus::kProvisionalUnknown &&
+            inherited_status == GridProjectionStatus::kProvisionalUnknown &&
+            exact_endpoint_preserved && inherited_to.allFinite() &&
+            traverse(active_state, inherited_to, nullptr, nullptr,
+                     interruption_reason)) {
+          connected_to = inherited_to;
+          reached = entry.index;
+          break;
+        }
       }
       if (!interruption_reason.empty()) return fail(interruption_reason);
 
-      const auto [active_x, active_y] = xy(entry.index);
+      const auto [active_x, active_y] = xy(active_grid_index);
       bool admitted_neighbor = false;
       for (int direction = 0; direction < 8; ++direction) {
         if (interrupted(interruption_reason)) return fail(interruption_reason);
@@ -497,42 +629,46 @@ FeasiblePath BoundedGridPlanner::refine(const RouteCorridor& corridor) {
             next_y >= static_cast<long>(ny)) {
           continue;
         }
-        const std::size_t next =
+        const std::size_t next_grid =
             index(static_cast<std::size_t>(next_x),
                   static_cast<std::size_t>(next_y));
-        if (!ensureCell(next, active.state.z(), interruption_reason) ||
-            cells[next].closed) {
+        const std::size_t next =
+            ensureCell(next_grid, active_state.z(), interruption_reason);
+        if (next == kNoParent || cells.at(next).closed) {
           if (!interruption_reason.empty()) return fail(interruption_reason);
           continue;
         }
 
         if (kDx[direction] != 0 && kDy[direction] != 0) {
-          const std::size_t side_x =
+          const std::size_t side_x_grid =
               index(static_cast<std::size_t>(next_x), active_y);
-          const std::size_t side_y =
+          const std::size_t side_y_grid =
               index(active_x, static_cast<std::size_t>(next_y));
-          if (!ensureCell(side_x, active.state.z(), interruption_reason) ||
-              !ensureCell(side_y, active.state.z(), interruption_reason) ||
-              !traverse(active.state, cells[side_x].state, nullptr, nullptr,
+          const std::size_t side_x =
+              ensureCell(side_x_grid, active_state.z(), interruption_reason);
+          const std::size_t side_y =
+              ensureCell(side_y_grid, active_state.z(), interruption_reason);
+          if (side_x == kNoParent || side_y == kNoParent ||
+              !traverse(active_state, cells.at(side_x).state, nullptr, nullptr,
                         interruption_reason) ||
-              !traverse(active.state, cells[side_y].state, nullptr, nullptr,
+              !traverse(active_state, cells.at(side_y).state, nullptr, nullptr,
                         interruption_reason)) {
             if (!interruption_reason.empty()) return fail(interruption_reason);
             continue;
           }
         }
         double edge = 0.0;
-        if (!traverse(active.state, cells[next].state, nullptr, &edge,
+        if (!traverse(active_state, cells.at(next).state, nullptr, &edge,
                       interruption_reason)) {
           if (!interruption_reason.empty()) return fail(interruption_reason);
           continue;
         }
-        const double candidate = active.cost + edge;
-        if (candidate + 1e-12 >= cells[next].cost) continue;
-        cells[next].cost = candidate;
-        cells[next].parent = entry.index;
+        const double candidate = active_cost + edge;
+        if (candidate + 1e-12 >= cells.at(next).cost) continue;
+        cells.at(next).cost = candidate;
+        cells.at(next).parent = entry.index;
         const double heuristic =
-            (to.head<2>() - cells[next].state.head<2>()).norm();
+            (to.head<2>() - cells.at(next).state.head<2>()).norm();
         open.push({candidate + kHeuristicWeight * heuristic, candidate, next,
                    sequence++});
         admitted_neighbor = true;
@@ -543,50 +679,106 @@ FeasiblePath BoundedGridPlanner::refine(const RouteCorridor& corridor) {
       // lattice cell within the explicitly bounded connector distance. The
       // caller's traversal predicate still checks the complete swept body,
       // terrain step and geofence; this search grants no unknown-space waiver.
-      if (entry.index == source && segment == 1 && !admitted_neighbor &&
+      if (entry.index == source_node && segment == 1 && !admitted_neighbor &&
           limits_.start_connector_max_distance_m > resolution) {
         struct Candidate {
           double distance;
           std::size_t cell;
         };
-        std::vector<Candidate> candidates;
         const double maximum = limits_.start_connector_max_distance_m;
-        for (std::size_t cell = 0; cell < cell_count; ++cell) {
-          if ((cell & 255u) == 0u && interrupted(interruption_reason))
-            return fail(interruption_reason);
-          if (cell == source) continue;
-          const auto [candidate_x, candidate_y] = xy(cell);
-          const double dx =
-              (static_cast<double>(candidate_x) - start_x) * resolution;
-          const double dy =
-              (static_cast<double>(candidate_y) - start_y) * resolution;
-          const double distance = std::hypot(dx, dy);
-          if (distance > resolution + 1e-9 && distance <= maximum + 1e-9)
-            candidates.push_back({distance, cell});
+        const long double radius_bound =
+            std::ceil(static_cast<long double>(maximum) /
+                      static_cast<long double>(resolution));
+        if (!std::isfinite(radius_bound) ||
+            radius_bound >=
+                static_cast<long double>(std::numeric_limits<long>::max())) {
+          return fail("grid start connector bounds are invalid");
+        }
+        const long grid_radius = std::max(
+            {static_cast<long>(start_x),
+             static_cast<long>(nx - 1u - start_x),
+             static_cast<long>(start_y),
+             static_cast<long>(ny - 1u - start_y)});
+        const long radius =
+            std::min(static_cast<long>(radius_bound), grid_radius);
+        const std::size_t remaining_cells = limits_.max_cells - cells.size();
+        const std::size_t candidate_limit =
+            std::min(remaining_cells, limits_.max_expansions);
+        if (candidate_limit == 0u) {
+          return fail("grid refinement exceeded the cell limit");
+        }
+        const auto closer = [](const Candidate& a, const Candidate& b) {
+          return a.distance < b.distance ||
+                 (a.distance == b.distance && a.cell < b.cell);
+        };
+        // Keep only the nearest candidates that can fit in this request's
+        // existing cell/expansion budgets. The scan may inspect the clipped
+        // grid, but every iteration observes the cooperative deadline and its
+        // retained storage does not grow with the configured radius.
+        std::priority_queue<Candidate, std::vector<Candidate>,
+                            decltype(closer)>
+            nearest(closer);
+        for (long offset_y = -radius; offset_y <= radius; ++offset_y) {
+          for (long offset_x = -radius; offset_x <= radius; ++offset_x) {
+            if (interrupted(interruption_reason)) return fail(interruption_reason);
+            if (offset_x < -static_cast<long>(start_x) ||
+                offset_x > static_cast<long>(nx - 1u - start_x) ||
+                offset_y < -static_cast<long>(start_y) ||
+                offset_y > static_cast<long>(ny - 1u - start_y)) {
+              continue;
+            }
+            const long double dx =
+                static_cast<long double>(offset_x) * resolution;
+            const long double dy =
+                static_cast<long double>(offset_y) * resolution;
+            const long double distance = std::hypot(dx, dy);
+            if (!std::isfinite(distance) ||
+                distance <= static_cast<long double>(resolution) + 1e-9L ||
+                distance > static_cast<long double>(maximum) + 1e-9L) {
+              continue;
+            }
+            const std::size_t candidate_x = static_cast<std::size_t>(
+                static_cast<long>(start_x) + offset_x);
+            const std::size_t candidate_y = static_cast<std::size_t>(
+                static_cast<long>(start_y) + offset_y);
+            const Candidate candidate{
+                static_cast<double>(distance), index(candidate_x, candidate_y)};
+            if (nearest.size() < candidate_limit) {
+              nearest.push(candidate);
+            } else if (closer(candidate, nearest.top())) {
+              nearest.pop();
+              nearest.push(candidate);
+            }
+          }
+        }
+        std::vector<Candidate> candidates;
+        candidates.reserve(nearest.size());
+        while (!nearest.empty()) {
+          candidates.push_back(nearest.top());
+          nearest.pop();
         }
         std::sort(candidates.begin(), candidates.end(),
-                  [](const Candidate& a, const Candidate& b) {
-                    return a.distance < b.distance ||
-                           (a.distance == b.distance && a.cell < b.cell);
-                  });
+                  closer);
         if (interrupted(interruption_reason)) return fail(interruption_reason);
         for (const Candidate& candidate : candidates) {
-          if (!ensureCell(candidate.cell, active.state.z(), interruption_reason)) {
+          const std::size_t candidate_node = ensureCell(
+              candidate.cell, active_state.z(), interruption_reason);
+          if (candidate_node == kNoParent) {
             if (!interruption_reason.empty()) return fail(interruption_reason);
             continue;
           }
           double edge = 0.0;
-          if (!traverse(active.state, cells[candidate.cell].state, nullptr, &edge,
+          if (!traverse(active_state, cells.at(candidate_node).state, nullptr, &edge,
                         interruption_reason)) {
             if (!interruption_reason.empty()) return fail(interruption_reason);
             continue;
           }
-          cells[candidate.cell].cost = edge;
-          cells[candidate.cell].parent = source;
+          cells.at(candidate_node).cost = edge;
+          cells.at(candidate_node).parent = source_node;
           const double heuristic =
-              (to.head<2>() - cells[candidate.cell].state.head<2>()).norm();
+              (to.head<2>() - cells.at(candidate_node).state.head<2>()).norm();
           open.push({edge + kHeuristicWeight * heuristic, edge,
-                     candidate.cell, sequence++});
+                     candidate_node, sequence++});
         }
       }
     }
@@ -598,12 +790,12 @@ FeasiblePath BoundedGridPlanner::refine(const RouteCorridor& corridor) {
     }
 
     std::vector<StateVec> reversed;
-    for (std::size_t cell = reached; cell != source;) {
-      if (cell == kNoParent || cells[cell].parent == kNoParent) {
+    for (std::size_t cell = reached; cell != source_node;) {
+      if (cell == kNoParent || cells.at(cell).parent == kNoParent) {
         return fail("grid refinement produced an invalid parent chain");
       }
-      reversed.push_back(cells[cell].state);
-      cell = cells[cell].parent;
+      reversed.push_back(cells.at(cell).state);
+      cell = cells.at(cell).parent;
     }
     std::reverse(reversed.begin(), reversed.end());
     StateVec previous = from;
@@ -619,13 +811,14 @@ FeasiblePath BoundedGridPlanner::refine(const RouteCorridor& corridor) {
       previous = pose;
     }
     std::vector<StateVec> checked_goal;
-    if (!traverse(previous, to, &checked_goal, nullptr,
+    if (!traverse(previous, connected_to, &checked_goal, nullptr,
                   interruption_reason)) {
       if (!interruption_reason.empty()) return fail(interruption_reason);
       return fail("grid detour failed final goal-connector validation");
     }
     if (result.poses.empty()) result.poses.push_back(previous);
     appendCheckedPath(checked_goal, result.poses);
+    waypoints[segment] = connected_to;
   }
 
   for (std::size_t i = 1; i < result.poses.size(); ++i) {
