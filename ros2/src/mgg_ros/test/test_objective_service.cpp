@@ -359,6 +359,31 @@ class PlannerNodeTestPeer {
     acceptOdometry(node, 0.0, 0.0, 0.075);
   }
 
+  static void configureNavigateGraphCorridor(
+      PlannerNode& node, const std::vector<mgg::StateVec>& poses) {
+    configureGridServiceScene(node, 0.0, 1.0);
+    acceptOdometry(node, 0.0, 0.0, 0.075);
+    const std::lock_guard<std::recursive_mutex> lock(node.planner_mutex_);
+    node.objective_grid_limits_.resolution_m = 0.20;
+    node.objective_grid_limits_.detour_margin_m = 1.0;
+    node.objective_grid_limits_.max_cells = 2048;
+    node.objective_grid_limits_.max_expansions = 2048;
+    node.objective_grid_limits_.timeout = std::chrono::milliseconds(1000);
+    node.global_graph_->reset();
+    mgg::Vertex* previous = nullptr;
+    for (std::size_t index = 0; index < poses.size(); ++index) {
+      auto* vertex = new mgg::Vertex(static_cast<int>(index), poses[index]);
+      node.global_graph_->addVertex(vertex);
+      if (previous != nullptr) {
+        node.global_graph_->addEdge(
+            previous, vertex,
+            (vertex->state.head<3>() - previous->state.head<3>()).norm());
+      }
+      previous = vertex;
+    }
+    ++node.graph_revision_;
+  }
+
   static void addGridObstacle(PlannerNode& node, double z, bool wall,
                               double x = 0.9) {
     const std::lock_guard<std::recursive_mutex> lock(node.planner_mutex_);
@@ -1800,6 +1825,63 @@ TEST(PlannerObjective, NavigateCompletesThirtyMetreKnownRoadExactly) {
       << response->reason;
   EXPECT_FALSE(response->partial);
   ASSERT_FALSE(response->path.empty());
+  EXPECT_NEAR(response->path.back().position.x, exact_goal.x(), 1e-3);
+  EXPECT_NEAR(response->path.back().position.y, exact_goal.y(), 1e-3);
+}
+
+TEST(PlannerObjective, NavigateUsesHelpfulGraphBeforeUnknownExactSuffix) {
+  rclcpp::NodeOptions options;
+  options.parameter_overrides(
+      {rclcpp::Parameter("map.resolution", 0.05),
+       rclcpp::Parameter("objective_ground_evidence_policy",
+                         "provisional_unknown"),
+       rclcpp::Parameter("objective_body_evidence_policy", "observed_ground"),
+       rclcpp::Parameter("use_sim_time", true)});
+  auto planner = std::make_shared<mgg_ros::PlannerNode>(options);
+  using Peer = mgg_ros::PlannerNodeTestPeer;
+  Peer::configureNavigateGraphCorridor(
+      *planner, {mgg::StateVec(0.0, 0.0, 0.30, 0.0),
+                 mgg::StateVec(0.0, 0.60, 0.30, 0.0),
+                 mgg::StateVec(1.20, 0.60, 0.30, 0.0)});
+
+  const mgg::StateVec exact_goal(3.0, 0.0, 0.075, 0.8);
+  const auto response = Peer::requestBoundNavigate(*planner, exact_goal);
+
+  ASSERT_NE(response, nullptr);
+  ASSERT_EQ(response->status, Service::Response::SUCCEEDED)
+      << response->reason;
+  ASSERT_FALSE(response->path.empty());
+  EXPECT_TRUE(std::any_of(response->path.begin(), response->path.end(),
+                          [](const auto& pose) {
+                            return pose.position.y > 0.50;
+                          }));
+  EXPECT_NEAR(response->path.back().position.x, exact_goal.x(), 1e-3);
+  EXPECT_NEAR(response->path.back().position.y, exact_goal.y(), 1e-3);
+}
+
+TEST(PlannerObjective, NavigateFallsBackToDirectWhenGraphCorridorIsBlocked) {
+  rclcpp::NodeOptions options;
+  options.parameter_overrides(
+      {rclcpp::Parameter("map.resolution", 0.05)});
+  auto planner = std::make_shared<mgg_ros::PlannerNode>(options);
+  using Peer = mgg_ros::PlannerNodeTestPeer;
+  Peer::configureNavigateGraphCorridor(
+      *planner, {mgg::StateVec(0.0, 0.0, 0.30, 0.0),
+                 mgg::StateVec(0.60, 0.80, 0.30, 0.0),
+                 mgg::StateVec(1.20, 0.0, 0.30, 0.0)});
+  Peer::addOccupiedVoxel(*planner, 0.60, 0.80, 0.30);
+
+  const mgg::StateVec exact_goal(1.20, 0.0, 0.075, 0.0);
+  const auto response = Peer::requestBoundNavigate(*planner, exact_goal);
+
+  ASSERT_NE(response, nullptr);
+  ASSERT_EQ(response->status, Service::Response::SUCCEEDED)
+      << response->reason;
+  ASSERT_FALSE(response->path.empty());
+  EXPECT_TRUE(std::all_of(response->path.begin(), response->path.end(),
+                         [](const auto& pose) {
+                           return std::abs(pose.position.y) < 0.20;
+                         }));
   EXPECT_NEAR(response->path.back().position.x, exact_goal.x(), 1e-3);
   EXPECT_NEAR(response->path.back().position.y, exact_goal.y(), 1e-3);
 }

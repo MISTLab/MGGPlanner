@@ -21,6 +21,26 @@
 
 namespace mgg_ros {
 
+namespace {
+
+std::string boundedObjectiveFailure(const std::string& reason) {
+  constexpr std::size_t kLimit = 220;
+  constexpr std::size_t kTail = 100;
+  std::string compact = reason;
+  const std::size_t grid = compact.find(" [grid evidence:");
+  const std::size_t footprint =
+      compact.find(" [first footprint rejection:");
+  if (grid != std::string::npos && footprint != std::string::npos &&
+      grid < footprint) {
+    compact = compact.substr(0, grid) + compact.substr(footprint);
+  }
+  if (compact.size() <= kLimit) return compact;
+  return compact.substr(0, kLimit - kTail - 3) + "..." +
+         compact.substr(compact.size() - kTail);
+}
+
+}  // namespace
+
 PlannerNode::PlannerNode(const rclcpp::NodeOptions& options)
     : rclcpp::Node("mggplanner_node", options) {
   // Route mgg_core's warnings into the ROS log. The core deliberately does not
@@ -2931,9 +2951,15 @@ void PlannerNode::onObjectiveRequest(
           ? &objective_grid_limits_
           : nullptr;
   mgg::RouteCorridor primary = corridor;
+  const bool navigate_graph_primary =
+      explicit_objective_planned &&
+      core.objective == mgg::ObjectiveKind::kNavigate &&
+      corridor.status == mgg::PlanningStatus::kSucceeded &&
+      !corridor.poses.empty();
   const bool direct_primary =
       explicit_objective_planned &&
-      (core.objective == mgg::ObjectiveKind::kNavigate ||
+      ((core.objective == mgg::ObjectiveKind::kNavigate &&
+        !navigate_graph_primary) ||
        (provisional_physical_home &&
         corridor.status == mgg::PlanningStatus::kUnreachable &&
         corridor.poses.empty() &&
@@ -2942,9 +2968,9 @@ void PlannerNode::onObjectiveRequest(
       (corridor.status == mgg::PlanningStatus::kSucceeded ||
        corridor.status == mgg::PlanningStatus::kUnreachable);
   if (direct_primary) {
-    // Navigate's operator-owned exact goal is the primary corridor. ReturnHome
-    // follows the persistent trajectory graph whenever one exists; a physical
-    // Home with no usable graph retains the bounded provisional-ground escape.
+    // Navigate searches directly only when topology provides no usable graph
+    // corridor. ReturnHome follows its persistent graph whenever one exists;
+    // a physical Home without one retains the bounded provisional escape.
     primary.status = mgg::PlanningStatus::kSucceeded;
     primary.poses.clear();
     primary.partial = false;
@@ -2953,35 +2979,25 @@ void PlannerNode::onObjectiveRequest(
   const auto objective_refinement_started = std::chrono::steady_clock::now();
   mgg::FeasiblePath path = refineCorridor(primary, objective_limits);
   const std::string primary_failure_reason = path.reason;
-  if (direct_primary && corridor.status == mgg::PlanningStatus::kSucceeded &&
-      !corridor.poses.empty() &&
+  if (navigate_graph_primary &&
       path.status != mgg::PlanningStatus::kSucceeded) {
     const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::steady_clock::now() - objective_refinement_started);
     if (elapsed < objective_grid_limits_.timeout) {
+      mgg::RouteCorridor direct = corridor;
+      direct.status = mgg::PlanningStatus::kSucceeded;
+      direct.poses.clear();
+      direct.partial = false;
+      direct.reason.clear();
       mgg::GridRefinementLimits remaining = objective_grid_limits_;
       remaining.timeout -= elapsed;
-      mgg::FeasiblePath fallback = refineCorridor(corridor, &remaining);
+      mgg::FeasiblePath fallback = refineCorridor(direct, &remaining);
       if (fallback.status != mgg::PlanningStatus::kSucceeded) {
-        constexpr std::size_t kFailurePartLimit = 220;
-        const auto bounded = [](const std::string& reason) {
-          constexpr std::size_t kLimit = kFailurePartLimit;
-          std::string compact = reason;
-          const std::size_t grid = compact.find(" [grid evidence:");
-          const std::size_t footprint =
-              compact.find(" [first footprint rejection:");
-          if (grid != std::string::npos && footprint != std::string::npos &&
-              grid < footprint) {
-            compact = compact.substr(0, grid) + compact.substr(footprint);
-          }
-          if (compact.size() <= kLimit) return compact;
-          constexpr std::size_t kTail = 100;
-          return compact.substr(0, kLimit - kTail - 3) + "..." +
-                 compact.substr(compact.size() - kTail);
-        };
-        fallback.reason = "primary direct: " + bounded(primary_failure_reason) +
-                          " [breadcrumb fallback: " +
-                          bounded(fallback.reason) + "]";
+        fallback.reason =
+            "graph corridor: " +
+            boundedObjectiveFailure(primary_failure_reason) +
+            " [direct fallback: " +
+            boundedObjectiveFailure(fallback.reason) + "]";
       }
       path = std::move(fallback);
     }
