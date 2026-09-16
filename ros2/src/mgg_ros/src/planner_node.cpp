@@ -2050,10 +2050,14 @@ void PlannerNode::onPlanRequest(
                                        : mgg::PlanningStatus::kSucceeded;
   mgg::FeasiblePath feasible = refineCorridor(corridor);
   const IndexedQueryContext query_context = indexedQueryContext();
+  const bool allow_explore_height_refinement =
+      map_backend_ == "mola_snapshot" && provisional_unknown_ground_ &&
+      observed_ground_body_evidence_;
   map_read = mgg::MolaMap::ReadLease{};
   lock.unlock();
   if (feasible.status == mgg::PlanningStatus::kSucceeded) {
-    queryIndexedMap(feasible, query_context);
+    queryIndexedMap(feasible, query_context,
+                    allow_explore_height_refinement);
   }
   lock.lock();
   map_read = mola_map_ != nullptr ? mola_map_->acquireReadLease()
@@ -2132,7 +2136,8 @@ PlannerNode::IndexedQueryContext PlannerNode::indexedQueryContext() const {
 }
 
 bool PlannerNode::queryIndexedMap(mgg::FeasiblePath& path,
-                                  const IndexedQueryContext& context) {
+                                  const IndexedQueryContext& context,
+                                  bool allow_explore_height_refinement) {
   path.indexed_map_validated = false;
   if (!indexed_map_client_) return true;
   const auto fail = [&path](mgg::PlanningStatus status,
@@ -2143,6 +2148,13 @@ bool PlannerNode::queryIndexedMap(mgg::FeasiblePath& path,
     path.reason = reason;
     return false;
   };
+  const auto query_deadline = std::chrono::steady_clock::now() +
+      std::chrono::duration<double>(indexed_map_query_timeout_s_);
+  bool height_refinement_available =
+      allow_explore_height_refinement &&
+      context.observed_ground_body_evidence &&
+      context.provisional_unknown_ground &&
+      context.robot_type == mgg::RobotType::kGroundRobot;
   static const std::regex kDigest("^[0-9a-fA-F]{64}$");
   if (path.component_id.empty() ||
       !std::regex_match(path.geometry_revision, kDigest) ||
@@ -2183,137 +2195,129 @@ bool PlannerNode::queryIndexedMap(mgg::FeasiblePath& path,
     return fail(mgg::PlanningStatus::kBlocked,
                 "indexed map query service is unavailable");
   }
+  const auto mapping_authority_is_current = [this, &context]() {
+    const std::lock_guard<std::recursive_mutex> lock(planner_mutex_);
+    const auto& snapshot = context.mapping_snapshot;
+    return have_mapping_snapshot_ &&
+           mapping_snapshot_.component_id == snapshot.component_id &&
+           mapping_snapshot_.epoch == snapshot.epoch &&
+           mapping_snapshot_.graph_revision == snapshot.graph_revision &&
+           mapping_snapshot_.geometry_revision == snapshot.geometry_revision &&
+           mapping_snapshot_.source_stamp.sec == snapshot.source_stamp.sec &&
+           mapping_snapshot_.source_stamp.nanosec ==
+               snapshot.source_stamp.nanosec &&
+           component_from_navigation_.matrix().isApprox(
+               context.component_from_navigation.matrix(), 1e-9);
+  };
+  constexpr std::size_t kMaxIndexedMapSamples = 4096;
 
-  auto request = std::make_shared<mgg_msgs::srv::QueryMapBatch::Request>();
-  request->component_id = path.component_id;
-  request->epoch = path.map_epoch;
-  request->graph_revision = path.mapping_graph_revision;
-  request->geometry_revision = path.geometry_revision;
-  request->source_stamp.sec = path.map_source_stamp_sec;
-  request->source_stamp.nanosec = path.map_source_stamp_nanosec;
-  const Eigen::Vector3d body = context.body;
-  const Eigen::Vector3d component_body =
-      context.component_from_navigation.linear().cwiseAbs() * body;
-  const Eigen::Vector3d component_up =
-      context.component_from_navigation.linear() * Eigen::Vector3d::UnitZ();
-  if (!body.allFinite() || (body.array() <= 0.0).any() ||
-      !component_body.allFinite() || (component_body.array() <= 0.0).any() ||
-      !context.physical_size.allFinite() ||
-      (context.physical_size.array() <= 0.0).any() ||
-      !context.center_offset.allFinite() ||
-      context.center_offset.head<2>().norm() > 1e-9 ||
-      !component_up.allFinite() ||
-      (component_up - Eigen::Vector3d::UnitZ()).norm() > 1e-6 ||
-      !std::isfinite(indexed_map_ground_tolerance_m_) ||
-      !std::isfinite(context.max_step_height) ||
-      context.max_step_height < 0.0 ||
-      !std::isfinite(context.max_inclination) ||
-      context.max_inclination < 0.0 ||
+  while (true) {
+    if (path.poses.size() >= kMaxIndexedMapSamples) {
+      return fail(mgg::PlanningStatus::kBlocked,
+                  "indexed map query sample budget exceeded");
+    }
+    auto request = std::make_shared<mgg_msgs::srv::QueryMapBatch::Request>();
+    request->component_id = path.component_id;
+    request->epoch = path.map_epoch;
+    request->graph_revision = path.mapping_graph_revision;
+    request->geometry_revision = path.geometry_revision;
+    request->source_stamp.sec = path.map_source_stamp_sec;
+    request->source_stamp.nanosec = path.map_source_stamp_nanosec;
+    const Eigen::Vector3d body = context.body;
+    const Eigen::Vector3d component_body =
+        context.component_from_navigation.linear().cwiseAbs() * body;
+    const Eigen::Vector3d component_up =
+        context.component_from_navigation.linear() * Eigen::Vector3d::UnitZ();
+    if (!body.allFinite() || (body.array() <= 0.0).any() ||
+        !component_body.allFinite() || (component_body.array() <= 0.0).any() ||
+        !context.physical_size.allFinite() ||
+        (context.physical_size.array() <= 0.0).any() ||
+        !context.center_offset.allFinite() ||
+        context.center_offset.head<2>().norm() > 1e-9 ||
+        !component_up.allFinite() ||
+        (component_up - Eigen::Vector3d::UnitZ()).norm() > 1e-6 ||
+        !std::isfinite(indexed_map_ground_tolerance_m_) ||
+        !std::isfinite(context.max_step_height) ||
+        context.max_step_height < 0.0 ||
+        !std::isfinite(context.max_inclination) ||
+        context.max_inclination < 0.0 ||
       !std::isfinite(context.graph_to_base)) {
-    return fail(mgg::PlanningStatus::kBlocked,
-                "indexed map body, terrain limits, or gravity alignment is invalid");
-  }
-  request->body_size.x = component_body.x();
-  request->body_size.y = component_body.y();
-  request->body_size.z = component_body.z();
-  request->max_step_m = context.max_step_height;
-  request->max_drop_m = context.max_step_height;
-  request->stop_at_unknown = !context.observed_ground_body_evidence;
+      return fail(mgg::PlanningStatus::kBlocked,
+                  "indexed map body, terrain limits, or gravity alignment is "
+                  "invalid");
+    }
+    request->body_size.x = component_body.x();
+    request->body_size.y = component_body.y();
+    request->body_size.z = component_body.z();
+    request->max_step_m = context.max_step_height;
+    request->max_drop_m = context.max_step_height;
+    request->stop_at_unknown = !context.observed_ground_body_evidence;
 
-  std::vector<mgg::StateVec> route;
-  route.reserve(path.poses.size() + 1);
-  route.push_back(context.route_start);
-  route.insert(route.end(), path.poses.begin(), path.poses.end());
-  std::vector<double> expected_ground_z;
-  for (std::size_t segment = 1; segment < route.size(); ++segment) {
-    const Eigen::Vector3d a = route[segment - 1].head(3);
-    const Eigen::Vector3d b = route[segment].head(3);
-    const double distance = (b - a).norm();
-    const std::size_t steps = std::max<std::size_t>(
-        1, static_cast<std::size_t>(std::ceil(distance /
-                                              indexed_map_sample_spacing_m_)));
-    for (std::size_t i = segment == 1 ? 0 : 1; i <= steps; ++i) {
-      const Eigen::Vector3d base =
-          a + (b - a) * (static_cast<double>(i) / steps);
-      Eigen::Vector3d navigation = base + context.center_offset;
-      if (context.robot_type == mgg::RobotType::kGroundRobot) {
-        navigation.z() += context.graph_to_base;
+    std::vector<mgg::StateVec> route;
+    route.reserve(path.poses.size() + 1);
+    route.push_back(context.route_start);
+    route.insert(route.end(), path.poses.begin(), path.poses.end());
+    std::vector<double> expected_ground_z;
+    std::vector<mgg::StateVec> dense_base_states;
+    for (std::size_t segment = 1; segment < route.size(); ++segment) {
+      const mgg::StateVec& a = route[segment - 1];
+      const mgg::StateVec& b = route[segment];
+      const double distance = (b.head<3>() - a.head<3>()).norm();
+      const double scaled_steps = distance / indexed_map_sample_spacing_m_;
+      if (!std::isfinite(scaled_steps) ||
+          scaled_steps > static_cast<double>(kMaxIndexedMapSamples)) {
+        return fail(mgg::PlanningStatus::kBlocked,
+                    "indexed map query sample budget exceeded");
       }
-      const Eigen::Vector3d component =
-          context.component_from_navigation * navigation;
-      geometry_msgs::msg::Point sample;
-      sample.x = component.x();
-      sample.y = component.y();
-      sample.z = component.z();
-      request->samples.push_back(sample);
-      if (context.robot_type == mgg::RobotType::kGroundRobot) {
-        Eigen::Vector3d contact = base;
-        contact.x() += context.center_offset.x();
-        contact.y() += context.center_offset.y();
-        contact.z() -= context.physical_size.z() / 2.0;
-        expected_ground_z.push_back(
-            (context.component_from_navigation * contact).z());
+      const std::size_t steps = std::max<std::size_t>(
+          1, static_cast<std::size_t>(std::ceil(scaled_steps)));
+      const std::size_t first_step = segment == 1 ? 0 : 1;
+      const std::size_t additions = steps - first_step + 1;
+      if (additions > kMaxIndexedMapSamples ||
+          request->samples.size() > kMaxIndexedMapSamples - additions) {
+        return fail(mgg::PlanningStatus::kBlocked,
+                    "indexed map query sample budget exceeded");
+      }
+      const double yaw_delta =
+          std::atan2(std::sin(b[3] - a[3]), std::cos(b[3] - a[3]));
+      for (std::size_t i = first_step; i <= steps; ++i) {
+        const double fraction = static_cast<double>(i) / steps;
+        mgg::StateVec base = a + fraction * (b - a);
+        const double yaw = a[3] + fraction * yaw_delta;
+        base[3] = std::atan2(std::sin(yaw), std::cos(yaw));
+        Eigen::Vector3d navigation = base.head<3>() + context.center_offset;
+        if (context.robot_type == mgg::RobotType::kGroundRobot) {
+          navigation.z() += context.graph_to_base;
+        }
+        const Eigen::Vector3d component =
+            context.component_from_navigation * navigation;
+        geometry_msgs::msg::Point sample;
+        sample.x = component.x();
+        sample.y = component.y();
+        sample.z = component.z();
+        request->samples.push_back(sample);
+        dense_base_states.push_back(base);
+        if (context.robot_type == mgg::RobotType::kGroundRobot) {
+          Eigen::Vector3d contact = base.head<3>();
+          contact.x() += context.center_offset.x();
+          contact.y() += context.center_offset.y();
+          contact.z() -= context.physical_size.z() / 2.0;
+          expected_ground_z.push_back(
+              (context.component_from_navigation * contact).z());
+        }
       }
     }
-  }
-  if (request->samples.empty()) {
-    return fail(mgg::PlanningStatus::kBlocked,
-                "indexed map query has no route samples");
-  }
-
-  // The caller releases planner_mutex_ before this bounded wait. Snapshot and
-  // odometry callbacks therefore cannot occupy executor threads while blocked
-  // behind the planning callback. The exact authority is rechecked below.
-  auto future = indexed_map_client_->async_send_request(request);
-  if (future.wait_for(std::chrono::duration<double>(
-          indexed_map_query_timeout_s_)) != std::future_status::ready) {
-    indexed_map_client_->remove_pending_request(future);
-    return fail(mgg::PlanningStatus::kBlocked, "indexed map query timed out");
-  }
-  mgg_msgs::srv::QueryMapBatch::Response::SharedPtr response;
-  try {
-    response = future.get();
-  } catch (const std::exception& e) {
-    return fail(mgg::PlanningStatus::kBlocked,
-                std::string("indexed map query failed: ") + e.what());
-  }
-  if (!response) {
-    return fail(mgg::PlanningStatus::kBlocked,
-                "indexed map query returned no response");
-  }
-  if (response->status != mgg_msgs::srv::QueryMapBatch::Response::OK) {
-    return fail(
-        response->status == mgg_msgs::srv::QueryMapBatch::Response::STALE
-            ? mgg::PlanningStatus::kStaleRevision
-            : mgg::PlanningStatus::kBlocked,
-        response->detail.empty() ? "indexed map query rejected the snapshot"
-                                 : response->detail);
-  }
-  if (response->component_id != request->component_id ||
-      response->epoch != request->epoch ||
-      response->graph_revision != request->graph_revision ||
-      response->geometry_revision != request->geometry_revision) {
-    return fail(mgg::PlanningStatus::kStaleRevision,
-                "indexed map query returned a different snapshot");
-  }
-  const std::size_t count = request->samples.size();
-  if (response->occupancy.size() != count || response->ground_z.size() != count ||
-      response->roughness.size() != count || response->clearance.size() != count ||
-      response->step.size() != count || response->drop.size() != count) {
-    return fail(mgg::PlanningStatus::kBlocked,
-                "indexed map query returned malformed result arrays");
-  }
-  bool have_measured_terrain = false;
-  bool have_positive_progress_terrain = false;
-  bool used_provisional_missing_terrain = false;
-  bool provisional_gap_open = false;
-  bool have_previous_finite_ground = false;
-  double provisional_gap_distance = 0.0;
-  double route_xy_progress = 0.0;
-  double previous_finite_ground = 0.0;
-  Eigen::Vector2d previous_finite_xy = Eigen::Vector2d::Zero();
-  for (std::size_t i = 0; i < count; ++i) {
-    if (i > 0) {
+    if (request->samples.empty()) {
+      return fail(mgg::PlanningStatus::kBlocked,
+                  "indexed map query has no route samples");
+    }
+    if (dense_base_states.size() != request->samples.size()) {
+      return fail(mgg::PlanningStatus::kBlocked,
+                  "indexed map query route sampling is inconsistent");
+    }
+    std::vector<double> dense_route_distance(request->samples.size(), 0.0);
+    std::vector<double> dense_xy_progress(request->samples.size(), 0.0);
+    for (std::size_t i = 1; i < request->samples.size(); ++i) {
       const Eigen::Vector3d previous(request->samples[i - 1].x,
                                      request->samples[i - 1].y,
                                      request->samples[i - 1].z);
@@ -2321,172 +2325,322 @@ bool PlannerNode::queryIndexedMap(mgg::FeasiblePath& path,
                                     request->samples[i].y,
                                     request->samples[i].z);
       const Eigen::Vector3d delta = current - previous;
-      provisional_gap_distance += delta.norm();
-      route_xy_progress += delta.head<2>().norm();
+      dense_route_distance[i] = dense_route_distance[i - 1] + delta.norm();
+      dense_xy_progress[i] =
+          dense_xy_progress[i - 1] + delta.head<2>().norm();
     }
-    const bool occupied = response->occupancy[i] ==
-                          mgg_msgs::srv::QueryMapBatch::Response::OCCUPIED;
-    const bool unknown = response->occupancy[i] ==
-                         mgg_msgs::srv::QueryMapBatch::Response::UNKNOWN;
-    const bool occupancy_supported =
-        response->occupancy[i] ==
-            mgg_msgs::srv::QueryMapBatch::Response::FREE ||
-        (context.observed_ground_body_evidence && unknown);
-    const bool finite_ground = std::isfinite(response->ground_z[i]);
-    const bool finite_roughness = std::isfinite(response->roughness[i]);
-    const bool paired_missing_terrain =
-        std::isnan(response->ground_z[i]) &&
-        std::isnan(response->roughness[i]);
-    const bool provisional_gap_within_bound =
-        std::isfinite(context.max_provisional_ground_prefix) &&
-        context.max_provisional_ground_prefix > 0.0 &&
-        std::isfinite(provisional_gap_distance) &&
-        provisional_gap_distance <=
-            context.max_provisional_ground_prefix + 1e-9;
-    const bool provisional_missing_terrain =
-        context.provisional_unknown_ground && paired_missing_terrain &&
-        provisional_gap_within_bound;
-    const bool unknown_clearance_allowed =
-        context.observed_ground_body_evidence &&
-        (unknown || provisional_missing_terrain) &&
-        std::isnan(response->clearance[i]);
-    if (occupied || !occupancy_supported) {
-      return fail(mgg::PlanningStatus::kBlocked,
-                  "indexed map route is occupied or unknown");
+
+    // The caller releases planner_mutex_ before this bounded wait. Snapshot and
+    // odometry callbacks therefore cannot occupy executor threads while blocked
+    // behind the planning callback. The exact authority is rechecked below.
+    const auto remaining_query_time =
+        query_deadline - std::chrono::steady_clock::now();
+    if (remaining_query_time <= std::chrono::steady_clock::duration::zero()) {
+      return fail(mgg::PlanningStatus::kBlocked, "indexed map query timed out");
     }
-    const auto unsupported = [i](const char* detail) {
-      return std::string("indexed map terrain or clearance is unsupported at sample ") +
-             std::to_string(i) + ": " + detail;
-    };
-    if (context.robot_type != mgg::RobotType::kAerialRobot &&
-        !std::isfinite(response->clearance[i]) &&
-        !unknown_clearance_allowed) {
-      return fail(mgg::PlanningStatus::kBlocked,
-                  unsupported("clearance is unavailable"));
+    auto future = indexed_map_client_->async_send_request(request);
+    if (future.wait_for(remaining_query_time) != std::future_status::ready) {
+      indexed_map_client_->remove_pending_request(future);
+      return fail(mgg::PlanningStatus::kBlocked, "indexed map query timed out");
     }
-    if (context.robot_type != mgg::RobotType::kAerialRobot &&
-        std::isfinite(response->clearance[i]) &&
-        response->clearance[i] < component_body.z()) {
+    mgg_msgs::srv::QueryMapBatch::Response::SharedPtr response;
+    try {
+      response = future.get();
+    } catch (const std::exception& e) {
       return fail(mgg::PlanningStatus::kBlocked,
-                  unsupported("clearance is below body height"));
+                  std::string("indexed map query failed: ") + e.what());
     }
-    if (context.robot_type != mgg::RobotType::kAerialRobot &&
-        (response->step[i] || response->drop[i])) {
+    if (!response) {
       return fail(mgg::PlanningStatus::kBlocked,
-                  unsupported(response->step[i] ? "step reported"
-                                                : "drop reported"));
+                  "indexed map query returned no response");
+    }
+    if (response->status != mgg_msgs::srv::QueryMapBatch::Response::OK) {
+      return fail(
+          response->status == mgg_msgs::srv::QueryMapBatch::Response::STALE
+              ? mgg::PlanningStatus::kStaleRevision
+              : mgg::PlanningStatus::kBlocked,
+          response->detail.empty() ? "indexed map query rejected the snapshot"
+                                   : response->detail);
+    }
+    if (response->component_id != request->component_id ||
+        response->epoch != request->epoch ||
+        response->graph_revision != request->graph_revision ||
+        response->geometry_revision != request->geometry_revision) {
+      return fail(mgg::PlanningStatus::kStaleRevision,
+                  "indexed map query returned a different snapshot");
+    }
+    const std::size_t count = request->samples.size();
+    if (response->occupancy.size() != count || response->ground_z.size() != count ||
+        response->roughness.size() != count || response->clearance.size() != count ||
+        response->step.size() != count || response->drop.size() != count) {
+      return fail(mgg::PlanningStatus::kBlocked,
+                  "indexed map query returned malformed result arrays");
+    }
+    bool have_measured_terrain = false;
+    bool have_positive_progress_terrain = false;
+    bool used_provisional_missing_terrain = false;
+    bool provisional_gap_open = false;
+    bool have_previous_finite_ground = false;
+    bool needs_height_refinement = false;
+    double provisional_gap_distance = 0.0;
+    double route_xy_progress = 0.0;
+    double previous_finite_ground = 0.0;
+    Eigen::Vector2d previous_finite_xy = Eigen::Vector2d::Zero();
+    std::vector<double> refined_base_z(
+        count, std::numeric_limits<double>::quiet_NaN());
+    for (std::size_t i = 0; i < count; ++i) {
+      if (i > 0) {
+        const Eigen::Vector3d previous(request->samples[i - 1].x,
+                                       request->samples[i - 1].y,
+                                       request->samples[i - 1].z);
+        const Eigen::Vector3d current(request->samples[i].x,
+                                      request->samples[i].y,
+                                      request->samples[i].z);
+        const Eigen::Vector3d delta = current - previous;
+        provisional_gap_distance += delta.norm();
+        route_xy_progress += delta.head<2>().norm();
+      }
+      const bool occupied = response->occupancy[i] ==
+                            mgg_msgs::srv::QueryMapBatch::Response::OCCUPIED;
+      const bool unknown = response->occupancy[i] ==
+                           mgg_msgs::srv::QueryMapBatch::Response::UNKNOWN;
+      const bool occupancy_supported =
+          response->occupancy[i] ==
+              mgg_msgs::srv::QueryMapBatch::Response::FREE ||
+          (context.observed_ground_body_evidence && unknown);
+      const bool finite_ground = std::isfinite(response->ground_z[i]);
+      const bool finite_roughness = std::isfinite(response->roughness[i]);
+      const bool paired_missing_terrain =
+          std::isnan(response->ground_z[i]) &&
+          std::isnan(response->roughness[i]);
+      const bool provisional_gap_within_bound =
+          std::isfinite(context.max_provisional_ground_prefix) &&
+          context.max_provisional_ground_prefix > 0.0 &&
+          std::isfinite(provisional_gap_distance) &&
+          provisional_gap_distance <=
+              context.max_provisional_ground_prefix + 1e-9;
+      const bool provisional_missing_terrain =
+          context.provisional_unknown_ground && paired_missing_terrain &&
+          provisional_gap_within_bound;
+      const bool unknown_clearance_allowed =
+          context.observed_ground_body_evidence &&
+          (unknown || provisional_missing_terrain) &&
+          std::isnan(response->clearance[i]);
+      if (occupied || !occupancy_supported) {
+        return fail(mgg::PlanningStatus::kBlocked,
+                    "indexed map route is occupied or unknown");
+      }
+      const auto unsupported = [i](const char* detail) {
+            return std::string(
+                       "indexed map terrain or clearance is unsupported at "
+                       "sample ") +
+                   std::to_string(i) + ": " + detail;
+      };
+      if (context.robot_type != mgg::RobotType::kAerialRobot &&
+          !std::isfinite(response->clearance[i]) &&
+          !unknown_clearance_allowed) {
+        return fail(mgg::PlanningStatus::kBlocked,
+                    unsupported("clearance is unavailable"));
+      }
+      if (context.robot_type != mgg::RobotType::kAerialRobot &&
+          std::isfinite(response->clearance[i]) &&
+          response->clearance[i] < component_body.z()) {
+        return fail(mgg::PlanningStatus::kBlocked,
+                    unsupported("clearance is below body height"));
+      }
+      if (context.robot_type != mgg::RobotType::kAerialRobot &&
+          (response->step[i] || response->drop[i])) {
+        return fail(mgg::PlanningStatus::kBlocked,
+                    unsupported(response->step[i] ? "step reported"
+                                                  : "drop reported"));
+      }
+      if (context.robot_type != mgg::RobotType::kAerialRobot) {
+        if (!finite_ground || !finite_roughness) {
+          if (!provisional_missing_terrain) {
+            if (context.provisional_unknown_ground && paired_missing_terrain &&
+                !provisional_gap_within_bound) {
+              return fail(
+                  mgg::PlanningStatus::kBlocked,
+                  "indexed map provisional terrain connector exceeds its bound");
+            }
+            return fail(mgg::PlanningStatus::kBlocked,
+                        unsupported("ground or roughness is unavailable"));
+          }
+          // A provisional connector is supported only by the native MOLA edge
+          // checks already completed by graph construction and refinement. The
+          // indexed authority continues to veto every known hazard above. A
+          // finite terrain sample must close this bounded gap before the route
+          // may end.
+          provisional_gap_open = true;
+          used_provisional_missing_terrain = true;
+          continue;
+        }
+        const bool closes_provisional_connector =
+            context.provisional_unknown_ground && provisional_gap_open;
+        if (closes_provisional_connector && !provisional_gap_within_bound) {
+          return fail(
+              mgg::PlanningStatus::kBlocked,
+              "indexed map provisional terrain connector exceeds its bound");
+        }
+        if (response->roughness[i] > indexed_map_max_roughness_m_) {
+          return fail(mgg::PlanningStatus::kBlocked,
+                      unsupported("roughness exceeds its limit"));
+        }
+        if (expected_ground_z.size() != count) {
+          return fail(mgg::PlanningStatus::kBlocked,
+                      "indexed map ground does not support the emitted body height");
+        }
+        const double ground_mismatch =
+            std::abs(expected_ground_z[i] - response->ground_z[i]);
+        const Eigen::Vector3d component_ground(
+            request->samples[i].x, request->samples[i].y,
+            response->ground_z[i]);
+        const Eigen::Vector3d navigation_ground =
+            context.component_from_navigation.inverse() * component_ground;
+        refined_base_z[i] =
+            navigation_ground.z() + context.physical_size.z() / 2.0;
+        if (!std::isfinite(refined_base_z[i])) {
+          return fail(mgg::PlanningStatus::kBlocked,
+                      "indexed map ground refinement is non-finite");
+        }
+        if (ground_mismatch > indexed_map_ground_tolerance_m_ + 1e-9) {
+          const bool bounded_refinement =
+              height_refinement_available && dense_xy_progress[i] > 1e-9 &&
+              ground_mismatch <= context.max_step_height + 1e-6;
+          if (!bounded_refinement) {
+          return fail(
+              mgg::PlanningStatus::kBlocked,
+              "indexed map ground does not support the emitted body height");
+          }
+          needs_height_refinement = true;
+        }
+        const Eigen::Vector2d current_xy(request->samples[i].x,
+                                         request->samples[i].y);
+        if (have_previous_finite_ground) {
+          const double dz =
+              std::abs(response->ground_z[i] - previous_finite_ground);
+          const double inclination =
+              std::atan2(dz, (current_xy - previous_finite_xy).norm());
+          const bool incompatible_gap_height =
+              closes_provisional_connector &&
+              dz > context.max_step_height + 1e-6;
+          const bool incompatible_observed_height =
+              !closes_provisional_connector &&
+              dz > context.max_step_height + 1e-6 &&
+              inclination > context.max_inclination + 1e-6;
+          if (incompatible_gap_height || incompatible_observed_height) {
+            return fail(mgg::PlanningStatus::kBlocked,
+                        "indexed map route exceeds platform step or inclination "
+                        "limits");
+          }
+        } else if (closes_provisional_connector &&
+                   (expected_ground_z.empty() ||
+                    std::abs(response->ground_z[i] - expected_ground_z.front()) >
+                        context.max_step_height + 1e-6)) {
+          // With no measured root sample, compare the first observed support to
+          // the physical route-start plane. A blind interval cannot justify a
+          // ramp whose shape was never measured.
+          return fail(mgg::PlanningStatus::kBlocked,
+                      "indexed map route exceeds platform step or inclination "
+                      "limits");
+        }
+        previous_finite_ground = response->ground_z[i];
+        previous_finite_xy = current_xy;
+        have_previous_finite_ground = true;
+        have_measured_terrain = true;
+        if (route_xy_progress > 1e-9) {
+          have_positive_progress_terrain = true;
+        }
+        provisional_gap_open = false;
+        provisional_gap_distance = 0.0;
+      }
     }
     if (context.robot_type != mgg::RobotType::kAerialRobot) {
-      if (!finite_ground || !finite_roughness) {
-        if (!provisional_missing_terrain) {
-          if (context.provisional_unknown_ground && paired_missing_terrain &&
-              !provisional_gap_within_bound) {
-            return fail(
-                mgg::PlanningStatus::kBlocked,
-                "indexed map provisional terrain connector exceeds its bound");
-          }
-          return fail(mgg::PlanningStatus::kBlocked,
-                      unsupported("ground or roughness is unavailable"));
-        }
-        // A provisional connector is supported only by the native MOLA edge
-        // checks already completed by graph construction and refinement. The
-        // indexed authority continues to veto every known hazard above. A
-        // finite terrain sample must close this bounded gap before the route
-        // may end.
-        provisional_gap_open = true;
-        used_provisional_missing_terrain = true;
-        continue;
+      if (provisional_gap_open) {
+        return fail(mgg::PlanningStatus::kBlocked,
+                    "indexed map route ends without measured terrain support");
       }
-      const bool closes_provisional_connector =
-          context.provisional_unknown_ground && provisional_gap_open;
-      if (closes_provisional_connector && !provisional_gap_within_bound) {
+      if (!have_measured_terrain) {
+        return fail(mgg::PlanningStatus::kBlocked,
+                    "indexed map route has no measured terrain support");
+      }
+      if (used_provisional_missing_terrain &&
+          !have_positive_progress_terrain) {
         return fail(
             mgg::PlanningStatus::kBlocked,
-            "indexed map provisional terrain connector exceeds its bound");
+            "indexed map provisional terrain has no positive-progress support");
       }
-      if (response->roughness[i] > indexed_map_max_roughness_m_) {
-        return fail(mgg::PlanningStatus::kBlocked,
-                    unsupported("roughness exceeds its limit"));
-      }
-      if (expected_ground_z.size() != count ||
-          std::abs(expected_ground_z[i] - response->ground_z[i]) >
-          indexed_map_ground_tolerance_m_ + 1e-9) {
-        return fail(mgg::PlanningStatus::kBlocked,
-                    "indexed map ground does not support the emitted body height");
-      }
-      const Eigen::Vector2d current_xy(request->samples[i].x,
-                                       request->samples[i].y);
-      if (have_previous_finite_ground) {
-        const double dz =
-            std::abs(response->ground_z[i] - previous_finite_ground);
-        const double inclination =
-            std::atan2(dz, (current_xy - previous_finite_xy).norm());
-        const bool incompatible_gap_height =
-            closes_provisional_connector &&
-            dz > context.max_step_height + 1e-6;
-        const bool incompatible_observed_height =
-            !closes_provisional_connector &&
-            dz > context.max_step_height + 1e-6 &&
-            inclination > context.max_inclination + 1e-6;
-        if (incompatible_gap_height || incompatible_observed_height) {
-          return fail(mgg::PlanningStatus::kBlocked,
-                      "indexed map route exceeds platform step or inclination limits");
-        }
-      } else if (closes_provisional_connector &&
-                 (expected_ground_z.empty() ||
-                  std::abs(response->ground_z[i] - expected_ground_z.front()) >
-                      context.max_step_height + 1e-6)) {
-        // With no measured root sample, compare the first observed support to
-        // the physical route-start plane. A blind interval cannot justify a
-        // ramp whose shape was never measured.
-        return fail(mgg::PlanningStatus::kBlocked,
-                    "indexed map route exceeds platform step or inclination limits");
-      }
-      previous_finite_ground = response->ground_z[i];
-      previous_finite_xy = current_xy;
-      have_previous_finite_ground = true;
-      have_measured_terrain = true;
-      if (route_xy_progress > 1e-9) {
-        have_positive_progress_terrain = true;
-      }
-      provisional_gap_open = false;
-      provisional_gap_distance = 0.0;
     }
-  }
-  if (context.robot_type != mgg::RobotType::kAerialRobot) {
-    if (provisional_gap_open) {
-      return fail(mgg::PlanningStatus::kBlocked,
-                  "indexed map route ends without measured terrain support");
-    }
-    if (!have_measured_terrain) {
-      return fail(mgg::PlanningStatus::kBlocked,
-                  "indexed map route has no measured terrain support");
-    }
-    if (used_provisional_missing_terrain &&
-        !have_positive_progress_terrain) {
-      return fail(
-          mgg::PlanningStatus::kBlocked,
-          "indexed map provisional terrain has no positive-progress support");
-    }
-  }
-  {
-    const std::lock_guard<std::recursive_mutex> lock(planner_mutex_);
-    const auto& snapshot = context.mapping_snapshot;
-    if (!have_mapping_snapshot_ ||
-        mapping_snapshot_.component_id != snapshot.component_id ||
-        mapping_snapshot_.epoch != snapshot.epoch ||
-        mapping_snapshot_.graph_revision != snapshot.graph_revision ||
-        mapping_snapshot_.geometry_revision != snapshot.geometry_revision ||
-        mapping_snapshot_.source_stamp.sec != snapshot.source_stamp.sec ||
-        mapping_snapshot_.source_stamp.nanosec != snapshot.source_stamp.nanosec ||
-        !component_from_navigation_.matrix().isApprox(
-            context.component_from_navigation.matrix(), 1e-9)) {
+    if (!mapping_authority_is_current()) {
       return fail(mgg::PlanningStatus::kStaleRevision,
                   "indexed mapping authority changed during query");
     }
+    if (needs_height_refinement) {
+      if (!height_refinement_available || !path.speed_limits.empty()) {
+        return fail(mgg::PlanningStatus::kBlocked,
+                    "indexed map ground refinement is unavailable");
+      }
+      std::vector<mgg::StateVec> refined = dense_base_states;
+      for (std::size_t i = 0; i < count; ++i) {
+        if (std::isfinite(refined_base_z[i]) && dense_xy_progress[i] > 1e-9) {
+          refined[i].z() = refined_base_z[i];
+        }
+      }
+      for (std::size_t begin = 0; begin < count;) {
+        if (std::isfinite(refined_base_z[begin])) {
+          ++begin;
+          continue;
+        }
+        std::size_t end = begin;
+        while (end < count && !std::isfinite(refined_base_z[end])) ++end;
+        if (end >= count) {
+          return fail(mgg::PlanningStatus::kBlocked,
+                      "indexed map route ends without measured terrain support");
+        }
+        const std::size_t anchor = begin == 0 ? 0 : begin - 1;
+        const double span = dense_route_distance[end] -
+                            dense_route_distance[anchor];
+        const double anchor_correction =
+            refined[anchor].z() - dense_base_states[anchor].z();
+        const double end_correction =
+            refined[end].z() - dense_base_states[end].z();
+        for (std::size_t i = begin; i < end; ++i) {
+          if (i == 0 || dense_xy_progress[i] <= 1e-9) continue;
+          const double fraction =
+              span > 1e-12
+                  ? std::clamp((dense_route_distance[i] -
+                                dense_route_distance[anchor]) /
+                                   span,
+                               0.0, 1.0)
+                  : 0.0;
+          refined[i].z() += anchor_correction +
+                            fraction * (end_correction - anchor_correction);
+        }
+        begin = end;
+      }
+      for (std::size_t i = 1; i < refined.size(); ++i) {
+        const double rise = std::abs(refined[i].z() - refined[i - 1].z());
+        const double run =
+            (refined[i].head<2>() - refined[i - 1].head<2>()).norm();
+        const double inclination = std::atan2(rise, run);
+        if (rise > context.max_step_height + 1e-6 &&
+            inclination > context.max_inclination + 1e-6) {
+          return fail(mgg::PlanningStatus::kBlocked,
+                      "indexed map refined route exceeds platform step or "
+                      "inclination limits");
+        }
+      }
+      if (refined.size() < 2) {
+        return fail(mgg::PlanningStatus::kBlocked,
+                    "indexed map ground refinement has no emitted route");
+      }
+      path.poses.assign(refined.begin() + 1, refined.end());
+      height_refinement_available = false;
+      continue;
+    }
+    path.indexed_map_validated = true;
+    return true;
   }
-  path.indexed_map_validated = true;
-  return true;
 }
 
 mgg::FeasiblePath PlannerNode::refineCorridor(
@@ -3494,10 +3648,14 @@ void PlannerNode::onObjectiveRequest(
     }
   }
   const IndexedQueryContext query_context = indexedQueryContext();
+  const bool allow_explore_height_refinement =
+      core.objective == mgg::ObjectiveKind::kExplore &&
+      map_backend_ == "mola_snapshot" && provisional_unknown_ground_ &&
+      observed_ground_body_evidence_;
   map_read = mgg::MolaMap::ReadLease{};
   lock.unlock();
   if (path.status == mgg::PlanningStatus::kSucceeded) {
-    queryIndexedMap(path, query_context);
+    queryIndexedMap(path, query_context, allow_explore_height_refinement);
   }
   if (mola_map_ != nullptr) {
     lock.lock();
