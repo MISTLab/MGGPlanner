@@ -4,6 +4,7 @@
 #include <openssl/evp.h>
 
 #include <algorithm>
+#include <thread>
 #include <array>
 #include <cerrno>
 #include <cmath>
@@ -52,6 +53,14 @@ bool isDigest(const std::string& value) {
   static const std::regex pattern("^[0-9a-f]{64}$");
   return std::regex_match(value, pattern);
 }
+
+// Thrown when the snapshot and index describe different publications; the
+// loader retries these within its budget because the worker writes the two
+// files a moment apart.
+struct CoherenceRace : std::runtime_error {
+  using std::runtime_error::runtime_error;
+};
+constexpr std::chrono::milliseconds kCoherenceRetryInterval{100};
 
 std::string digest(const std::vector<std::uint8_t>& bytes) {
   EVP_MD_CTX* context = EVP_MD_CTX_new();
@@ -481,6 +490,25 @@ void MolaMap::workerLoop() {
 std::shared_ptr<const MolaMap::Snapshot> MolaMap::load(
     const PendingRequest& pending) const {
   const Clock::time_point deadline = Clock::now() + config_.max_load_time;
+  // The mapping worker replaces snapshot.json and mola/index.json as two
+  // atomic writes about a second apart, and a peer solution can move the
+  // authority key just before the product that matches it lands. A request
+  // that reads between those writes sees files that are each valid but do not
+  // yet describe each other. Retry within the load budget instead of failing
+  // the plan request on a race that resolves by itself.
+  for (;;) {
+    try {
+      return loadOnce(pending, deadline);
+    } catch (const CoherenceRace& race) {
+      if (Clock::now() + kCoherenceRetryInterval >= deadline)
+        throw std::runtime_error(race.what());
+      std::this_thread::sleep_for(kCoherenceRetryInterval);
+    }
+  }
+}
+
+std::shared_ptr<const MolaMap::Snapshot> MolaMap::loadOnce(
+    const PendingRequest& pending, const Clock::time_point deadline) const {
   const std::filesystem::path root(config_.peer_root);
   const auto snapshot_bytes = stableRead(root / "snapshot.json",
                                          config_.max_snapshot_bytes,
@@ -521,14 +549,14 @@ std::shared_ptr<const MolaMap::Snapshot> MolaMap::load(
           pending.request.graph_revision ||
       requested_manifest->value("geometry_revision", std::string()) !=
           pending.request.geometry_revision)
-    throw std::runtime_error("mapping manifest does not match authority key");
+    throw CoherenceRace("mapping manifest does not match authority key");
 
   if (!index.is_object() || index.value("version", 0) != 1 ||
       index.value("source_snapshot_id", std::string()) != snapshot_id ||
       index.value("source_sha256", std::string()) != source_digest ||
       !index.contains("artifacts") || !index["artifacts"].is_array() ||
       index["artifacts"].size() != source["manifests"].size())
-    throw std::runtime_error("MOLA index is not coherent with the mapping snapshot");
+    throw CoherenceRace("MOLA index is not coherent with the mapping snapshot");
   const json* requested_artifact = nullptr;
   std::unordered_set<std::string> artifact_components;
   for (const auto& artifact : index["artifacts"]) {
