@@ -33,7 +33,7 @@ find_package(tf2 REQUIRED)
 find_package(tf2_ros REQUIRED)
 find_package(tf2_geometry_msgs REQUIRED)
 
-add_library(${PROJECT_NAME} src/octomap_map.cpp src/mola_map.cpp)
+add_library(${PROJECT_NAME} src/octomap_map.cpp src/native_mola_grid.cpp src/mola_map.cpp)
 target_include_directories(${PROJECT_NAME} PUBLIC
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
   $<INSTALL_INTERFACE:include>

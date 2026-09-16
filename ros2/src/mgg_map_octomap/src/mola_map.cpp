@@ -223,21 +223,20 @@ void transformPoints(const Eigen::Isometry3d& transform,
   for (auto& point : points) point = transform * point;
 }
 
-bool canRepresent(const OctomapMap& map, const Eigen::Vector3d& point) {
+bool canRepresent(const NativeMolaGrid& map, const Eigen::Vector3d& point) {
   if (!point.allFinite()) return false;
-  octomap::OcTreeKey key;
-  return map.tree()->coordToKeyChecked(
-      octomap::point3d(static_cast<float>(point.x()),
-                       static_cast<float>(point.y()),
-                       static_cast<float>(point.z())),
-      key);
+  Eigen::Vector2d ignored;
+  return map.getAxisAlignedXYCellCenter(point.head<2>(), ignored) &&
+         std::isfinite(point.z() / map.getResolution()) &&
+         std::abs(point.z() / map.getResolution()) <
+             double(std::numeric_limits<std::int64_t>::max()) / 4.0;
 }
 
 }  // namespace
 
 struct MolaMap::Snapshot {
   MolaSnapshotRequest request;
-  std::shared_ptr<OctomapMap> map;
+  std::shared_ptr<NativeMolaGrid> map;
   std::string artifact_digest;
   Clock::time_point validated_at;
   mutable std::atomic<std::size_t> reader_pins{0};
@@ -761,52 +760,24 @@ std::shared_ptr<const MolaMap::Snapshot> MolaMap::load(
   }
 
   const auto previous = std::atomic_load(&active_);
-  std::shared_ptr<OctomapMap> map;
+  std::shared_ptr<NativeMolaGrid> map;
   if (previous != nullptr && previous->artifact_digest == expected_grid_digest) {
     map = previous->map;
   } else {
-    OctomapConfig map_config;
-    map_config.resolution = resolution;
-    map_config.max_range = -1.0;
-    map = std::make_shared<OctomapMap>(map_config);
-    const auto install = [&](const std::vector<Voxel>& voxels, const bool occupied_value) {
-      const float log_odds = occupied_value ? map->tree()->getClampingThresMaxLog()
-                                            : map->tree()->getClampingThresMinLog();
-      for (std::size_t i = 0; i < voxels.size(); ++i) {
-        const auto& voxel = voxels[i];
-        const Eigen::Vector3d centre = resolution *
-            (Eigen::Vector3d(static_cast<double>(voxel.x),
-                             static_cast<double>(voxel.y),
-                             static_cast<double>(voxel.z)) +
-             Eigen::Vector3d::Constant(0.5));
-        octomap::OcTreeKey key;
-        if (!centre.allFinite() || !map->tree()->coordToKeyChecked(
-                octomap::point3d(static_cast<float>(centre.x()),
-                                 static_cast<float>(centre.y()),
-                                 static_cast<float>(centre.z())), key))
-          throw std::runtime_error("MOLA voxel lies outside OctoMap bounds");
-        map->tree()->setNodeValue(key, log_odds, true);
-        if ((i & 4095u) == 0) checkDeadline(deadline);
-      }
-    };
-    install(free, false);
-    install(occupied, true);
-    for (std::size_t i = 0; i < surfaces.size(); ++i) {
-      const auto& surface = surfaces[i];
-      const double voxel_z = std::floor(surface.z / resolution);
-      const Eigen::Vector3d occupied_center = resolution *
-          (Eigen::Vector3d(static_cast<double>(surface.x),
-                           static_cast<double>(surface.y), voxel_z) +
-           Eigen::Vector3d::Constant(0.5));
-      if (!map->setMeasuredSurfaceZ(occupied_center, surface.z)) {
-        throw std::runtime_error(
-            "MOLA measured surface could not bind to occupied endpoint");
-      }
-      if ((i & 4095u) == 0) checkDeadline(deadline);
+    std::vector<NativeMolaGrid::Cell> native_occupied, native_free;
+    std::vector<NativeMolaGrid::Surface> native_surfaces;
+    native_occupied.reserve(occupied.size()); native_free.reserve(free.size());
+    native_surfaces.reserve(surfaces.size());
+    for (const auto& v : occupied) native_occupied.push_back({v.x, v.y, v.z});
+    for (const auto& v : free) native_free.push_back({v.x, v.y, v.z});
+    for (const auto& s : surfaces) {
+      native_surfaces.push_back({{s.x, s.y,
+          static_cast<std::int64_t>(std::floor(s.z / resolution))}, s.z});
     }
-    // Maximum-depth leaves are queried directly; a full inner-occupancy pass
-    // is unnecessary and would be one long OctoMap call that cannot observe
-    // the load deadline. Lazy insertion keeps every loop interruptible.
+    checkDeadline(deadline);
+    map = std::make_shared<NativeMolaGrid>(resolution,
+        std::move(native_occupied), std::move(native_free),
+        std::move(native_surfaces));
   }
   checkDeadline(deadline);
   // Tree construction may dominate the request. Ensure the source/index pair
@@ -815,7 +786,7 @@ std::shared_ptr<const MolaMap::Snapshot> MolaMap::load(
                  "mapping snapshot", deadline) != snapshot_bytes ||
       stableRead(root / "mola" / "index.json", config_.max_index_bytes,
                  "MOLA index", deadline) != index_bytes)
-    throw std::runtime_error("MOLA publication changed during tree construction");
+    throw std::runtime_error("MOLA publication changed during grid construction");
   auto result = std::make_shared<Snapshot>();
   result->request = pending.request;
   result->map = std::move(map);

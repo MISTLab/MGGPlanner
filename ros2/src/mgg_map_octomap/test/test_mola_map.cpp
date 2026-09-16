@@ -25,6 +25,7 @@
 #include "mgg_core/ground_projection.h"
 #include "mgg_core/grid_graph.h"
 #include "mgg_map_octomap/mola_map.h"
+#include "mgg_map_octomap/native_mola_grid.h"
 
 namespace {
 using json = nlohmann::json;
@@ -331,6 +332,77 @@ TEST(MolaMap, OccupiedOnlyCylinderPreservesRotatedCapsuleGeometry) {
             VoxelStatus::kOccupied);
   EXPECT_EQ(classify({2, 1, 0}, navigation_end, navigation_start),
             VoxelStatus::kOccupied);
+}
+
+TEST(MolaMap, MeasuredGroundBelowBodyDoesNotInheritVoxelTop) {
+  Publication publication;
+  MolaMap provider(config(publication));
+  // Cell z=-1 spans [-0.2,0]. Its measured return is -0.135, below the
+  // body's -0.013 lower face even though the coarse occupied cell overlaps.
+  const auto request = publication.publish(0, {{0, 0, -1}}, freeBlock(), true,
+                                           Eigen::Isometry3d::Identity(), {}, {},
+                                           0.325);
+  provider.requestSnapshot(request);
+  ASSERT_TRUE(waitFor([&]() { return provider.getStatus(); })) << provider.lastError();
+  const Eigen::Vector3d body(0.1, 0.1, 0.1343);
+  EXPECT_EQ(provider.getPathStatus(body, body, {0.2, 0.2, 0.295}, false),
+            VoxelStatus::kFree);
+  EXPECT_EQ(provider.getOccupiedOnlyCylinderPathStatus(body, body, 0.1, 0.295),
+            VoxelStatus::kFree);
+  EXPECT_EQ(provider.getStrictBoxStatus(body, {0.2, 0.2, 0.295}),
+            VoxelStatus::kOccupied);
+}
+
+TEST(NativeMolaGrid, HighAndUnmeasuredReturnsRemainBlockingOnSlopedSweep) {
+  using Grid = mgg::NativeMolaGrid;
+  const Eigen::Vector3d start(0.1, 0.1, 0.1343);
+  const Eigen::Vector3d end(0.5, 0.1, 0.3343);
+  Grid low(0.2, {{0, 0, -1}}, {}, {{{0, 0, -1}, -0.135}});
+  EXPECT_EQ(low.getOccupiedOnlyCylinderPathStatus(start, end, 0.1, 0.295),
+            VoxelStatus::kFree);
+  Grid high(0.2, {{0, 0, -1}}, {}, {{{0, 0, -1}, -0.0132}});
+  EXPECT_EQ(high.getOccupiedOnlyCylinderPathStatus(start, end, 0.1, 0.295),
+            VoxelStatus::kOccupied);
+  Grid missing(0.2, {{0, 0, -1}}, {}, {});
+  EXPECT_EQ(missing.getOccupiedOnlyCylinderPathStatus(start, end, 0.1, 0.295),
+            VoxelStatus::kOccupied);
+}
+
+TEST(NativeMolaGrid, R2MeasuredGroundDoesNotBlockInflatedBody) {
+  using Grid = mgg::NativeMolaGrid;
+  Grid map(0.2, {{135, 163, -1}}, {}, {{{135, 163, -1}, -0.14447}});
+  const Eigen::Vector3d center(26.8890352327, 32.8298884726, 0.1343023994);
+  const Eigen::Vector3d box_size(0.913862134, 0.913862134, 0.295);
+  EXPECT_EQ(map.getPathStatus(center, center, box_size, false),
+            VoxelStatus::kFree);
+  EXPECT_EQ(map.getOccupiedOnlyCylinderPathStatus(center, center, 0.456931067,
+                                                   0.295),
+            VoxelStatus::kFree);
+  EXPECT_EQ(map.getStrictBoxStatus(center, box_size), VoxelStatus::kOccupied);
+}
+
+TEST(NativeMolaGrid, RaySupercoverIncludesCornerCellsInBothDirections) {
+  using Grid = mgg::NativeMolaGrid;
+  Grid map(0.2, {{1, 0, 0}}, {{0, 0, 0}, {1, 1, 0}}, {});
+  const Eigen::Vector3d a(0.1, 0.1, 0.1);
+  const Eigen::Vector3d b(0.3, 0.3, 0.1);
+  EXPECT_EQ(map.getRayStatus(a, b, false), VoxelStatus::kOccupied);
+  EXPECT_EQ(map.getRayStatus(b, a, false), VoxelStatus::kOccupied);
+}
+
+TEST(NativeMolaGrid, RaySupercoverIncludesStartFaceInBothDirections) {
+  using Grid = mgg::NativeMolaGrid;
+  const Eigen::Vector3d face(0.2, 0.1, 0.1);
+  const Eigen::Vector3d interior(0.3, 0.1, 0.1);
+  Grid occupied(0.2, {{0, 0, 0}}, {{1, 0, 0}}, {});
+  EXPECT_EQ(occupied.getRayStatus(face, interior, false),
+            VoxelStatus::kOccupied);
+  EXPECT_EQ(occupied.getRayStatus(interior, face, false),
+            VoxelStatus::kOccupied);
+
+  Grid unknown(0.2, {}, {{1, 0, 0}}, {});
+  EXPECT_EQ(unknown.getRayStatus(face, interior, true), VoxelStatus::kUnknown);
+  EXPECT_EQ(unknown.getRayStatus(interior, face, true), VoxelStatus::kUnknown);
 }
 
 TEST(MolaMap, OccupiedOnlyCylinderRejectsTiltedOrExcessiveQueries) {

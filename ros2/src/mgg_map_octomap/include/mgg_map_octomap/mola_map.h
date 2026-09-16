@@ -18,7 +18,7 @@
 #include <Eigen/Dense>
 
 #include "mgg_core/map_interface.h"
-#include "mgg_map_octomap/octomap_map.h"
+#include "mgg_map_octomap/native_mola_grid.h"
 
 namespace mgg {
 
@@ -45,7 +45,7 @@ struct MolaSnapshotRequest {
 };
 
 /// A correction-aware MOLA provider. Requests enqueue bounded filesystem
-/// validation and tree construction on one worker; planner callbacks never
+/// validation and native-grid construction on one worker; planner callbacks never
 /// decode a grid. The active immutable tree is replaced atomically.
 class MolaMap : public MapInterface {
  private:
