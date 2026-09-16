@@ -29,6 +29,7 @@ rosidl_generate_interfaces(${PROJECT_NAME}
   "msg/Edge.msg"
   "msg/ExecutionPathMode.msg"
   "msg/Graph.msg"
+  "msg/MappingSnapshot.msg"
   "msg/PlannerStatus.msg"
   "msg/PlanningBound.msg"
   "msg/PlanningMode.msg"
@@ -63,6 +64,7 @@ rosidl_generate_interfaces(${PROJECT_NAME}
   "srv/PlannerSetSearchMode.srv"
   "srv/PlannerSetVel.srv"
   "srv/PlanObjective.srv"
+  "srv/QueryMapBatch.srv"
   "srv/PlannerSrv.srv"
   "srv/PlannerStringTrigger.srv"
 

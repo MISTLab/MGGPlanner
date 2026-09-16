@@ -8,6 +8,10 @@ string goal_landmark_id
 string component_id
 uint64 graph_revision
 uint64 map_revision
+uint64 map_epoch
+uint64 mapping_graph_revision
+string geometry_revision
+builtin_interfaces/Time map_source_stamp
 ---
 uint8 SUCCEEDED=0
 uint8 UNREACHABLE=1
@@ -18,5 +22,9 @@ uint8 status
 string component_id
 uint64 graph_revision
 uint64 map_revision
+uint64 map_epoch
+uint64 mapping_graph_revision
+string geometry_revision
+builtin_interfaces/Time map_source_stamp
 geometry_msgs/Pose[] path
 string reason

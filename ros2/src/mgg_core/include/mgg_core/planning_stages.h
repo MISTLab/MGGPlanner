@@ -35,6 +35,13 @@ struct PlanningRequest {
   std::string component_id;
   std::uint64_t graph_revision = 0;
   std::uint64_t map_revision = 0;
+  // Exact correction-aware mapping snapshot used for feasibility checks.
+  // These revisions are distinct from MGG's route graph/map revisions.
+  std::uint64_t map_epoch = 0;
+  std::uint64_t mapping_graph_revision = 0;
+  std::string geometry_revision;
+  std::int32_t map_source_stamp_sec = 0;
+  std::uint32_t map_source_stamp_nanosec = 0;
 };
 
 enum class PlanningStatus : std::uint8_t {
@@ -60,6 +67,11 @@ struct FeasiblePath {
   std::string component_id;
   std::uint64_t graph_revision = 0;
   std::uint64_t map_revision = 0;
+  std::uint64_t map_epoch = 0;
+  std::uint64_t mapping_graph_revision = 0;
+  std::string geometry_revision;
+  std::int32_t map_source_stamp_sec = 0;
+  std::uint32_t map_source_stamp_nanosec = 0;
   std::vector<StateVec> poses;
   std::vector<double> speed_limits;
   std::string reason;

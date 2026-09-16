@@ -31,7 +31,9 @@
 #include <visualization_msgs/msg/marker_array.hpp>
 
 #include <mgg_msgs/msg/graph.hpp>
+#include <mgg_msgs/msg/mapping_snapshot.hpp>
 #include <mgg_msgs/srv/plan_objective.hpp>
+#include <mgg_msgs/srv/query_map_batch.hpp>
 #include <mgg_msgs/srv/planner_srv.hpp>
 
 #include "mgg_core/geofence_manager.h"
@@ -49,16 +51,20 @@
 
 namespace mgg_ros {
 
+class PlannerNodeTestPeer;
+
 class PlannerNode : public rclcpp::Node {
  public:
   explicit PlannerNode(const rclcpp::NodeOptions& options);
 
  private:
+  friend class PlannerNodeTestPeer;
   void loadParameters();
   void onOdometry(nav_msgs::msg::Odometry::ConstSharedPtr msg);
   void onPointCloud(sensor_msgs::msg::PointCloud2::ConstSharedPtr msg);
   void onNeighbourGraph(mgg_msgs::msg::Graph::ConstSharedPtr msg);
   void onCoordinationExclusions(geometry_msgs::msg::PoseArray::ConstSharedPtr msg);
+  void onMappingSnapshot(mgg_msgs::msg::MappingSnapshot::ConstSharedPtr msg);
   void onBuildRequest(
       const std::shared_ptr<std_srvs::srv::Trigger::Request> request,
       std::shared_ptr<std_srvs::srv::Trigger::Response> response);
@@ -73,6 +79,7 @@ class PlannerNode : public rclcpp::Node {
       const std::shared_ptr<mgg_msgs::srv::PlanObjective::Request> request,
       std::shared_ptr<mgg_msgs::srv::PlanObjective::Response> response);
   mgg::FeasiblePath refineCorridor(const mgg::RouteCorridor& corridor);
+  bool queryIndexedMap(mgg::FeasiblePath& path);
   void publishOwnGraph();
   void publishPath();
   void publishMarkers();
@@ -163,6 +170,18 @@ class PlannerNode : public rclcpp::Node {
   std::vector<Eigen::Vector3d> coordination_exclusions_;
   std::chrono::steady_clock::time_point coordination_exclusions_received_;
   bool have_coordination_exclusions_ = false;
+  mgg_msgs::msg::MappingSnapshot mapping_snapshot_;
+  std::chrono::steady_clock::time_point mapping_snapshot_received_;
+  bool have_mapping_snapshot_ = false;
+  std::string indexed_map_query_service_;
+  double indexed_map_query_timeout_s_ = 1.0;
+  double indexed_map_snapshot_ttl_s_ = 3.0;
+  double indexed_map_sample_spacing_m_ = 0.20;
+  double indexed_map_max_roughness_m_ = 0.10;
+  // Zero disables ROS-clock source-age expiry. A keyframe timestamp binds the
+  // snapshot but does not advance while a healthy robot is stationary.
+  double indexed_map_max_source_age_s_ = 0.0;
+  Eigen::Isometry3d component_from_navigation_ = Eigen::Isometry3d::Identity();
   double communication_range_ = 10.0;
 
 
@@ -180,6 +199,8 @@ class PlannerNode : public rclcpp::Node {
   rclcpp::Subscription<mgg_msgs::msg::Graph>::SharedPtr neighbour_sub_;
   rclcpp::Subscription<geometry_msgs::msg::PoseArray>::SharedPtr
       coordination_exclusions_sub_;
+  rclcpp::Subscription<mgg_msgs::msg::MappingSnapshot>::SharedPtr
+      mapping_snapshot_sub_;
   rclcpp::Publisher<mgg_msgs::msg::Graph>::SharedPtr graph_pub_;
   rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr
       marker_pub_;
@@ -187,6 +208,7 @@ class PlannerNode : public rclcpp::Node {
   rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr build_srv_;
   rclcpp::Service<mgg_msgs::srv::PlannerSrv>::SharedPtr plan_srv_;
   rclcpp::Service<mgg_msgs::srv::PlanObjective>::SharedPtr objective_srv_;
+  rclcpp::Client<mgg_msgs::srv::QueryMapBatch>::SharedPtr indexed_map_client_;
   rclcpp::TimerBase::SharedPtr graph_timer_;
   /// One-shot guard against use_sim_time with no /clock.
   rclcpp::TimerBase::SharedPtr sim_time_check_;
