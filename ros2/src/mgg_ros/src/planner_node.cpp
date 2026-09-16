@@ -5,8 +5,10 @@
 #include <cmath>
 #include <cstdio>
 #include <future>
+#include <map>
 #include <regex>
 #include <stdexcept>
+#include <tuple>
 #include <geometry_msgs/msg/transform_stamped.hpp>
 #include <sensor_msgs/msg/point_cloud2.hpp>
 #include <sensor_msgs/point_cloud2_iterator.hpp>
@@ -1987,6 +1989,31 @@ mgg::FeasiblePath PlannerNode::refineCorridor(
     body.x() = xy_diagonal;
     body.y() = xy_diagonal;
   }
+  // Projection and traversal revisit the same grid poses many times during a
+  // refinement. The map is held stable for this RPC, so cache the relatively
+  // expensive footprint terrain query for this refinement only. A later RPC
+  // always observes newly inserted terrain.
+  std::map<std::tuple<double, double, double>, mgg::GridProjectionStatus>
+      footprint_terrain_cache;
+  const auto footprintTerrainStatus =
+      [this, &footprint_body, &footprint_terrain_cache](
+          const Eigen::Vector3d& driving_pose) {
+        if (!observed_ground_body_evidence_ ||
+            robot_params_.type != mgg::RobotType::kGroundRobot) {
+          return mgg::GridProjectionStatus::kSupported;
+        }
+        if (!driving_pose.allFinite()) {
+          return mgg::GridProjectionStatus::kBodyUnknown;
+        }
+        const auto key = std::make_tuple(
+            driving_pose.x(), driving_pose.y(), driving_pose.z());
+        const auto found = footprint_terrain_cache.find(key);
+        if (found != footprint_terrain_cache.end()) return found->second;
+        const mgg::GridProjectionStatus status =
+            objectiveFootprintTerrainStatus(driving_pose, footprint_body);
+        footprint_terrain_cache.emplace(key, status);
+        return status;
+      };
   const Eigen::Vector3d center_offset = robot_params_.center_offset;
   const mgg::StateVec current_anchor =
       physicalAnchorAtDrivingHeight(current_state_);
@@ -2029,10 +2056,11 @@ mgg::FeasiblePath PlannerNode::refineCorridor(
                from.head<2>(), to.head<2>(), body.head<2>()) !=
            mgg::GeofenceManager::CoordinateStatus::kViolated;
   };
-  const auto project = [this, body, footprint_body, center_offset, current_anchor, home_anchor,
+  const auto project = [this, body, center_offset, current_anchor, home_anchor,
                         have_connected_home_anchor, request_targets_home_anchor,
                         &corridor, &samePosition,
-                        &geofenceContains](mgg::StateVec& state) {
+                        &geofenceContains,
+                        &footprintTerrainStatus](mgg::StateVec& state) {
     if (robot_params_.type == mgg::RobotType::kGroundRobot) {
       const bool exact_explicit_goal =
           (corridor.request.objective == mgg::ObjectiveKind::kNavigate ||
@@ -2079,7 +2107,8 @@ mgg::FeasiblePath PlannerNode::refineCorridor(
       }
     }
     const Eigen::Vector3d center = state.head<3>() + center_offset;
-    if (!objectiveFootprintTerrainSupported(state.head<3>(), footprint_body)) {
+    if (footprintTerrainStatus(state.head<3>()) !=
+        mgg::GridProjectionStatus::kSupported) {
       return mgg::GridProjectionStatus::kNoGround;
     }
     const mgg::VoxelStatus body_status = objectiveBodyStatus(center, body);
@@ -2095,9 +2124,11 @@ mgg::FeasiblePath PlannerNode::refineCorridor(
     return mgg::GridProjectionStatus::kSupported;
   };
   const auto traverse =
-      [this, body, footprint_body, center_offset, current_anchor, home_anchor,
+      [this, body, center_offset, current_anchor, home_anchor,
        have_connected_home_anchor, &samePosition,
-       &geofenceAllows](const mgg::StateVec& a, const mgg::StateVec& b,
+       &geofenceAllows,
+       &footprintTerrainStatus](const mgg::StateVec& a,
+                                const mgg::StateVec& b,
                         std::vector<mgg::StateVec>& checked) {
         checked.clear();
         const bool a_provenance =
@@ -2178,8 +2209,8 @@ mgg::FeasiblePath PlannerNode::refineCorridor(
         }
         checked.reserve(projected.size());
         for (const Eigen::Vector3d& driving_pose : projected) {
-          if (!objectiveFootprintTerrainSupported(driving_pose,
-                                                  footprint_body)) {
+          if (footprintTerrainStatus(driving_pose) !=
+              mgg::GridProjectionStatus::kSupported) {
             checked.clear();
             return false;
           }

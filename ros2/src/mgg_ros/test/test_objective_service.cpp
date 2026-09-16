@@ -789,6 +789,12 @@ TEST(PlannerObjective, ProvisionalUnknownGroundRetainsGoalAndKnownVetoes) {
   EXPECT_NEAR(path.poses.back()[3], 1.1, 1e-9);
   EXPECT_FALSE(path.indexed_map_validated);
 
+  // Footprint results are scoped to one refinement. A known curb inserted
+  // after a successful request must be queried and veto the next request.
+  Peer::addMeasuredSurface(*clear, 4.0, 0.0, 0.125);
+  EXPECT_EQ(Peer::refine(*clear, corridor()).status,
+            mgg::PlanningStatus::kBlocked);
+
   auto wall = make();
   Peer::addBlockingWall(*wall, 2.0);
   EXPECT_EQ(Peer::refine(*wall, corridor()).status,
