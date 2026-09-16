@@ -83,7 +83,9 @@ class PlannerNode : public rclcpp::Node {
   void onObjectiveRequest(
       const std::shared_ptr<mgg_msgs::srv::PlanObjective::Request> request,
       std::shared_ptr<mgg_msgs::srv::PlanObjective::Response> response);
-  mgg::FeasiblePath refineCorridor(const mgg::RouteCorridor& corridor);
+  mgg::FeasiblePath refineCorridor(
+      const mgg::RouteCorridor& corridor,
+      const mgg::GridRefinementLimits* limits = nullptr);
   void convertPathToNavigationBase(mgg::FeasiblePath& path) const;
   struct IndexedQueryContext {
     mgg::StateVec route_start = mgg::StateVec::Zero();
@@ -118,7 +120,8 @@ class PlannerNode : public rclcpp::Node {
   /// geometry for a neighbour's graph to rendezvous with.
   void updateGlobalGraph();
   void stageGlobalBreadcrumbs(const mgg::StateVec& state);
-  bool projectStateToDrivingHeight(mgg::StateVec& state) const;
+  bool projectStateToDrivingHeight(mgg::StateVec& state,
+                                   bool preserve_xy = false) const;
   mgg::StateVec physicalAnchorAtDrivingHeight(
       const mgg::StateVec& base_pose) const;
   bool validateObjectiveStartSupport(
@@ -145,6 +148,7 @@ class PlannerNode : public rclcpp::Node {
   mgg::PlanningParams planning_params_;
   mgg::GridGraphParams grid_params_;
   mgg::GridRefinementLimits grid_refinement_limits_;
+  mgg::GridRefinementLimits objective_grid_limits_;
   double partial_route_min_progress_m_ = 1.0;
   double objective_start_support_max_distance_m_ = 3.0;
   mgg::BoundedSpaceParams global_space_;

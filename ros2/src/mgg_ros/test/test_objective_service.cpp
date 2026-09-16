@@ -209,6 +209,33 @@ class PlannerNodeTestPeer {
     ++node.map_revision_;
   }
 
+  static void configureLongKnownRoad(PlannerNode& node) {
+    configureBackboneTest(node);
+    acceptOdometry(node, 0.0, 0.0, 0.075);
+    {
+      const std::lock_guard<std::recursive_mutex> lock(node.planner_mutex_);
+      node.objective_grid_limits_.resolution_m = 0.50;
+      node.objective_grid_limits_.detour_margin_m = 2.0;
+      node.objective_grid_limits_.max_cells = 8192;
+      node.objective_grid_limits_.max_expansions = 8192;
+      node.objective_grid_limits_.timeout = std::chrono::milliseconds(1000);
+      std::vector<Eigen::Vector3d> floor;
+      for (int x = -2; x <= 602; ++x) {
+        for (int y = -10; y <= 10; ++y) {
+          floor.emplace_back(x * 0.05 + 0.025, y * 0.05 + 0.025, 0.025);
+        }
+      }
+      for (int repeat = 0; repeat < 6; ++repeat) {
+        node.cloud_map_->insertPointCloud(floor,
+                                          Eigen::Vector3d(15.0, 0.0, 1.5));
+      }
+      node.cloud_map_->augmentFreeBox({15.0, 0.0, 0.50},
+                                      {31.0, 1.0, 0.80});
+      ++node.map_revision_;
+    }
+    acceptOdometry(node, 0.0, 0.0, 0.075);
+  }
+
   static void addGridObstacle(PlannerNode& node, double z, bool wall,
                               double x = 0.9) {
     const std::lock_guard<std::recursive_mutex> lock(node.planner_mutex_);
@@ -383,8 +410,8 @@ class PlannerNodeTestPeer {
     auto request = std::make_shared<mgg_msgs::srv::PlanObjective::Request>();
     request->objective = mgg_msgs::srv::PlanObjective::Request::NAVIGATE;
     request->component_id = node.component_id_;
-    request->graph_revision = node.local_graph_revision_;
-    request->map_revision = node.local_graph_map_revision_;
+    request->graph_revision = node.graph_revision_;
+    request->map_revision = node.map_revision_;
     request->goal.position.x = goal.x();
     request->goal.position.y = goal.y();
     request->goal.position.z = goal.z();
@@ -730,7 +757,27 @@ TEST(PlannerBackbone, ExplicitGroundFailureIdentifiesCurrentOrGoal) {
       << response->reason;
 }
 
-TEST(PlannerObjective, FarNavigateReturnsCheckedPartialProxy) {
+TEST(PlannerObjective, NavigateCompletesThirtyMetreKnownRoadExactly) {
+  rclcpp::NodeOptions options;
+  options.parameter_overrides(
+      {rclcpp::Parameter("map.resolution", 0.05)});
+  auto planner = std::make_shared<mgg_ros::PlannerNode>(options);
+  using Peer = mgg_ros::PlannerNodeTestPeer;
+  Peer::configureLongKnownRoad(*planner);
+
+  const mgg::StateVec exact_goal(30.0, 0.0, 0.075, 0.9);
+  const auto response = Peer::requestObjective(
+      *planner, mgg::ObjectiveKind::kNavigate, exact_goal);
+  ASSERT_NE(response, nullptr);
+  ASSERT_EQ(response->status, Service::Response::SUCCEEDED)
+      << response->reason;
+  EXPECT_FALSE(response->partial);
+  ASSERT_FALSE(response->path.empty());
+  EXPECT_NEAR(response->path.back().position.x, exact_goal.x(), 1e-3);
+  EXPECT_NEAR(response->path.back().position.y, exact_goal.y(), 1e-3);
+}
+
+TEST(PlannerObjective, FarNavigateRejectsUnknownInsteadOfReturningProxy) {
   rclcpp::NodeOptions options;
   options.parameter_overrides(
       {rclcpp::Parameter("map.resolution", 0.05),
@@ -742,14 +789,12 @@ TEST(PlannerObjective, FarNavigateReturnsCheckedPartialProxy) {
   const mgg::StateVec exact_goal(30.0, 4.0, 0.075, 1.1);
   const auto response = Peer::requestBoundNavigate(*planner, exact_goal);
   ASSERT_NE(response, nullptr);
-  ASSERT_EQ(response->status, Service::Response::SUCCEEDED)
+  EXPECT_EQ(response->status, Service::Response::BLOCKED)
       << response->reason;
-  ASSERT_TRUE(response->partial);
+  EXPECT_FALSE(response->partial);
   EXPECT_FALSE(response->indexed_map_validated);
-  ASSERT_GE(response->path.size(), 2u);
-  EXPECT_NEAR(response->path.back().position.x, 1.50, 0.06);
-  EXPECT_LT(response->path.back().position.x, exact_goal.x());
-  EXPECT_EQ(response->graph_revision, 7u);
+  EXPECT_TRUE(response->path.empty());
+  EXPECT_EQ(response->graph_revision, Peer::globalGraphRevision(*planner));
   EXPECT_GT(response->map_revision, 0u);
 }
 
@@ -917,14 +962,14 @@ TEST(PlannerObjective, SnapshotRefreshCannotStarveIndexedResponse) {
   auto request = std::make_shared<Service::Request>();
   request->objective = Service::Request::NAVIGATE;
   request->component_id = snapshot.component_id;
-  request->graph_revision = Peer::localGraphRevision(*planner);
-  request->map_revision = Peer::localGraphMapRevision(*planner);
+  request->graph_revision = Peer::globalGraphRevision(*planner);
+  request->map_revision = 0;
   request->map_epoch = snapshot.epoch;
   request->mapping_graph_revision = snapshot.graph_revision;
   request->geometry_revision = snapshot.geometry_revision;
   request->map_source_stamp = snapshot.source_stamp;
-  request->goal.position.x = 30.0;
-  request->goal.position.y = 4.0;
+  request->goal.position.x = 1.5;
+  request->goal.position.y = 0.0;
   request->goal.position.z = 0.075;
   request->goal.orientation.w = 1.0;
   auto future = client->async_send_request(request);
@@ -936,7 +981,7 @@ TEST(PlannerObjective, SnapshotRefreshCannotStarveIndexedResponse) {
     if (response) {
       EXPECT_EQ(response->status, Service::Response::SUCCEEDED)
           << response->reason;
-      EXPECT_TRUE(response->partial);
+      EXPECT_FALSE(response->partial);
       EXPECT_TRUE(response->indexed_map_validated) << response->reason;
     }
   }
@@ -987,12 +1032,12 @@ TEST(PlannerObjective, PartialProxyHonorsPlatformStepCapInOctomap) {
         scenario.step_cap);
 
     const auto response = Peer::requestBoundNavigate(
-        *planner, mgg::StateVec(30.0, 0.0, 0.075, 0.0));
+        *planner, mgg::StateVec(1.50, 0.0, 0.075 + scenario.step_height, 0.0));
     ASSERT_NE(response, nullptr);
     if (scenario.accepted) {
       EXPECT_EQ(response->status, Service::Response::SUCCEEDED)
           << response->reason;
-      EXPECT_TRUE(response->partial);
+      EXPECT_FALSE(response->partial);
       EXPECT_FALSE(response->path.empty());
     } else {
       EXPECT_EQ(response->status, Service::Response::BLOCKED)

@@ -105,6 +105,18 @@ PlannerNode::PlannerNode(const rclcpp::NodeOptions& options)
   grid_refinement_limits_.timeout = std::chrono::milliseconds(std::clamp(
       declareOrGet<std::int64_t>(this, "grid_refinement_timeout_ms", 50),
       std::int64_t{1}, std::int64_t{5000}));
+  objective_grid_limits_ = grid_refinement_limits_;
+  objective_grid_limits_.detour_margin_m = std::clamp(
+      declareOrGet<double>(this, "objective_grid_margin_m", 4.0), 0.0, 25.0);
+  objective_grid_limits_.max_cells = static_cast<std::size_t>(std::clamp(
+      declareOrGet<std::int64_t>(this, "objective_grid_max_cells", 32768),
+      std::int64_t{64}, std::int64_t{262144}));
+  objective_grid_limits_.max_expansions = static_cast<std::size_t>(std::clamp(
+      declareOrGet<std::int64_t>(this, "objective_grid_max_expansions", 16384),
+      std::int64_t{1}, std::int64_t{262144}));
+  objective_grid_limits_.timeout = std::chrono::milliseconds(std::clamp(
+      declareOrGet<std::int64_t>(this, "objective_grid_timeout_ms", 500),
+      std::int64_t{1}, std::int64_t{5000}));
   const double requested_partial_progress = declareOrGet<double>(
       this, "partial_route_min_progress_m", partial_route_min_progress_m_);
   partial_route_min_progress_m_ =
@@ -933,16 +945,22 @@ std::string PlannerNode::buildLocalGraph(bool strict_projected_endpoints) {
   return std::string(buf);
 }
 
-bool PlannerNode::projectStateToDrivingHeight(mgg::StateVec& state) const {
+bool PlannerNode::projectStateToDrivingHeight(mgg::StateVec& state,
+                                              bool preserve_xy) const {
   if (robot_params_.type != mgg::RobotType::kGroundRobot) return true;
+  const Eigen::Vector2d requested_xy = state.head<2>();
   Eigen::Vector3d pos(state[0], state[1], state[2]);
   mgg::VoxelStatus status;
   const double ground_height = ground_->projectSample(pos, status);
   if (status != mgg::VoxelStatus::kOccupied || ground_height < 0.0) {
     return false;
   }
-  state[0] = pos[0];
-  state[1] = pos[1];
+  if (preserve_xy &&
+      (pos.head<2>() - requested_xy).cwiseAbs().maxCoeff() > 1e-3) {
+    return false;
+  }
+  state[0] = preserve_xy ? requested_xy.x() : pos[0];
+  state[1] = preserve_xy ? requested_xy.y() : pos[1];
   state[2] = pos[2] - (ground_height - planning_params_.max_ground_height);
   return true;
 }
@@ -1643,7 +1661,8 @@ bool PlannerNode::queryIndexedMap(mgg::FeasiblePath& path,
 }
 
 mgg::FeasiblePath PlannerNode::refineCorridor(
-    const mgg::RouteCorridor& corridor) {
+    const mgg::RouteCorridor& corridor,
+    const mgg::GridRefinementLimits* limits) {
   mgg::FeasiblePath result;
   result.status = corridor.status;
   result.mission_id = corridor.request.mission_id;
@@ -1720,7 +1739,13 @@ mgg::FeasiblePath PlannerNode::refineCorridor(
                         &corridor, &samePosition,
                         &geofenceContains](mgg::StateVec& state) {
     if (robot_params_.type == mgg::RobotType::kGroundRobot) {
-      if (!ground_ || !projectStateToDrivingHeight(state)) {
+      const bool exact_explicit_goal =
+          (corridor.request.objective == mgg::ObjectiveKind::kNavigate ||
+           corridor.request.objective == mgg::ObjectiveKind::kReturnHome) &&
+          (state.head<2>() - corridor.request.goal.pose.head<2>())
+                  .cwiseAbs().maxCoeff() <= 1e-6;
+      if (!ground_ ||
+          !projectStateToDrivingHeight(state, exact_explicit_goal)) {
         // Only two unsupported coordinates carry physical provenance: the
         // robot's current footprint and the retained initial Home anchor after
         // that anchor gained a checked connection. Arbitrary unsupported
@@ -1855,8 +1880,9 @@ mgg::FeasiblePath PlannerNode::refineCorridor(
         }
         return true;
       };
-  mgg::BoundedGridPlanner grid_planner(current_state_,
-                                       grid_refinement_limits_, project,
+  const mgg::GridRefinementLimits& active_limits =
+      limits != nullptr ? *limits : grid_refinement_limits_;
+  mgg::BoundedGridPlanner grid_planner(current_state_, active_limits, project,
                                        traverse);
   result = grid_planner.refine(corridor);
   if (result.status != mgg::PlanningStatus::kSucceeded) return result;
@@ -1894,9 +1920,7 @@ void PlannerNode::onObjectiveRequest(
   core.map_source_stamp_nanosec = request->map_source_stamp.nanosec;
   mgg::RouteCorridor corridor;
   corridor.request = core;
-  const bool local_objective =
-      core.objective == mgg::ObjectiveKind::kExplore ||
-      core.objective == mgg::ObjectiveKind::kNavigate;
+  const bool local_objective = core.objective == mgg::ObjectiveKind::kExplore;
   const std::uint64_t active_graph_revision =
       local_objective ? local_graph_revision_ : graph_revision_;
   const std::uint64_t active_map_revision =
@@ -1963,13 +1987,11 @@ void PlannerNode::onObjectiveRequest(
     // A zero revision requests a fresh local snapshot. Explicit revisions bind
     // the already-built snapshot and never rebuild underneath the request.
     std::string summary;
-    if (local_objective && request->graph_revision == 0) {
-      // Explore retains the legacy frontier policy that may admit projected
-      // endpoints with partially unknown body volume. A fresh Navigate graph
-      // filters those endpoints before topological selection so refinement
-      // can consider another observed candidate instead of failing on its
-      // first corridor waypoint.
-      summary = buildLocalGraph(core.objective == mgg::ObjectiveKind::kNavigate);
+    if (core.objective == mgg::ObjectiveKind::kExplore &&
+        request->graph_revision == 0) {
+      // Explore retains its legacy frontier policy. Explicit objectives do
+      // not rebuild or score a local gain graph.
+      summary = buildLocalGraph();
     }
     core.graph_revision = local_objective ? local_graph_revision_
                                           : graph_revision_;
@@ -1981,9 +2003,9 @@ void PlannerNode::onObjectiveRequest(
                                            : mgg::PlanningStatus::kSucceeded;
       corridor.reason = best_path_.empty() ? summary : "";
     } else {
-      mgg::GraphManager& graph =
-          core.objective == mgg::ObjectiveKind::kReturnHome ? *global_graph_
-                                                            : *local_graph_;
+      // All explicit objectives use the persistent graph snapshot. Missing or
+      // disconnected topology cannot suppress Navigate's bounded map A*.
+      mgg::GraphManager& graph = *global_graph_;
       mgg::StateVec graph_current = current_state_;
       mgg::PlanningRequest graph_request = core;
       const bool current_has_mapped_support =
@@ -1997,7 +2019,7 @@ void PlannerNode::onObjectiveRequest(
       }
       bool home_goal_supported = true;
       if (core.objective == mgg::ObjectiveKind::kReturnHome &&
-          !projectStateToDrivingHeight(graph_request.goal.pose)) {
+          !projectStateToDrivingHeight(graph_request.goal.pose, true)) {
         home_goal_supported = false;
         const mgg::Vertex* root = global_graph_->getVertex(0);
         const double home_delta =
@@ -2042,7 +2064,7 @@ void PlannerNode::onObjectiveRequest(
         // A distant unsupported goal may still receive a checked local proxy;
         // its exact terrain is assessed only when a later horizon reaches it.
         mgg::StateVec projected_goal = graph_request.goal.pose;
-        if (projectStateToDrivingHeight(projected_goal)) {
+        if (projectStateToDrivingHeight(projected_goal, true)) {
           graph_request.goal.pose = projected_goal;
         }
         mgg::TopologicalGoalPlanner objective_planner(
@@ -2059,7 +2081,28 @@ void PlannerNode::onObjectiveRequest(
     }
   }
 
-  mgg::FeasiblePath path = refineCorridor(corridor);
+  const mgg::GridRefinementLimits* objective_limits =
+      core.objective == mgg::ObjectiveKind::kNavigate
+          ? &objective_grid_limits_
+          : nullptr;
+  const auto objective_refinement_started = std::chrono::steady_clock::now();
+  mgg::FeasiblePath path = refineCorridor(corridor, objective_limits);
+  if (core.objective == mgg::ObjectiveKind::kNavigate &&
+      path.status != mgg::PlanningStatus::kSucceeded &&
+      !corridor.poses.empty()) {
+    const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - objective_refinement_started);
+    if (elapsed < objective_grid_limits_.timeout) {
+      mgg::RouteCorridor direct = corridor;
+      direct.status = mgg::PlanningStatus::kSucceeded;
+      direct.poses.clear();
+      direct.partial = false;
+      direct.reason.clear();
+      mgg::GridRefinementLimits remaining = objective_grid_limits_;
+      remaining.timeout -= elapsed;
+      path = refineCorridor(direct, &remaining);
+    }
+  }
   const IndexedQueryContext query_context = indexedQueryContext();
   map_read = mgg::MolaMap::ReadLease{};
   lock.unlock();

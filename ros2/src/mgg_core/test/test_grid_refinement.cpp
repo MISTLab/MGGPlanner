@@ -1,3 +1,4 @@
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cmath>
@@ -369,3 +370,62 @@ TEST(GridRefinement, ZeroTimeoutIsInvalidInsteadOfDisablingDeadline) {
 }
 
 }  // namespace
+
+TEST(GridRefinement, CompletesLongKnownRoadBeyondLocalGraphExtent) {
+  GridRefinementLimits value = limits();
+  value.detour_margin_m = 2.0;
+  value.max_cells = 4096;
+  value.max_expansions = 4096;
+  RouteCorridor route = routeTo(30.0, 0.0);
+  route.request.objective = mgg::ObjectiveKind::kNavigate;
+  route.poses = {StateVec(3.0, 0.0, 0.0, 0.0)};
+  BoundedGridPlanner planner(StateVec::Zero(), value, flatProjection(),
+                             sampledTraversal({}));
+  const FeasiblePath path = planner.refine(route);
+  ASSERT_EQ(path.status, PlanningStatus::kSucceeded) << path.reason;
+  ASSERT_FALSE(path.partial);
+  ASSERT_FALSE(path.poses.empty());
+  EXPECT_NEAR(path.poses.back().x(), 30.0, 1e-9);
+}
+
+TEST(GridRefinement, LongKnownRoadDetoursAndStillReachesExactGoal) {
+  GridRefinementLimits value = limits();
+  value.detour_margin_m = 2.0;
+  value.max_cells = 4096;
+  value.max_expansions = 4096;
+  RouteCorridor route = routeTo(30.0, 0.0);
+  route.request.objective = mgg::ObjectiveKind::kNavigate;
+  BoundedGridPlanner planner(
+      StateVec::Zero(), value, flatProjection(),
+      sampledTraversal({Eigen::Vector2d(15.0, 0.0)}));
+  const FeasiblePath path = planner.refine(route);
+  ASSERT_EQ(path.status, PlanningStatus::kSucceeded) << path.reason;
+  ASSERT_FALSE(path.poses.empty());
+  EXPECT_NEAR(path.poses.back().x(), 30.0, 1e-9);
+  EXPECT_TRUE(std::any_of(path.poses.begin(), path.poses.end(),
+                          [](const StateVec& pose) {
+                            return std::abs(pose.y()) > 0.5;
+                          }));
+}
+
+TEST(GridRefinement, LongUnknownGapFailsInsteadOfReturningPrefix) {
+  GridRefinementLimits value = limits();
+  value.detour_margin_m = 2.0;
+  value.max_cells = 4096;
+  value.max_expansions = 4096;
+  RouteCorridor route = routeTo(30.0, 0.0);
+  route.request.objective = mgg::ObjectiveKind::kNavigate;
+  route.poses = {StateVec(3.0, 0.0, 0.0, 0.0)};
+  auto known_ends = [](StateVec& state) {
+    state.z() = 0.0;
+    return (state.x() <= 4.0 || state.x() >= 29.0)
+               ? GridProjectionStatus::kSupported
+               : GridProjectionStatus::kBodyUnknown;
+  };
+  BoundedGridPlanner planner(StateVec::Zero(), value, known_ends,
+                             sampledTraversal({Eigen::Vector2d(15.0, 0.0)}));
+  const FeasiblePath path = planner.refine(route);
+  EXPECT_EQ(path.status, PlanningStatus::kBlocked);
+  EXPECT_FALSE(path.partial);
+  EXPECT_TRUE(path.poses.empty());
+}

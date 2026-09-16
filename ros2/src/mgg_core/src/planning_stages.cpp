@@ -51,6 +51,11 @@ RouteCorridor TopologicalGoalPlanner::plan(
   // the robot has travelled far beyond the last admitted breadcrumb.
   if (!graph.getNearestVertexInRange(&current, goal_vertex_tolerance_,
                                      &source)) {
+    if (request.objective == ObjectiveKind::kNavigate) {
+      result.status = PlanningStatus::kSucceeded;
+      result.reason.clear();
+      return result;  // bounded grid stage must solve current->exact goal
+    }
     char reason[192];
     std::snprintf(reason, sizeof(reason),
                   "current pose is outside the graph tolerance %.2f m at "
@@ -62,17 +67,18 @@ RouteCorridor TopologicalGoalPlanner::plan(
   }
   ShortestPathsReport shortest;
   if (!graph.findShortestPaths(source->id, shortest)) {
+    if (request.objective == ObjectiveKind::kNavigate) {
+      result.status = PlanningStatus::kSucceeded;
+      result.reason.clear();
+      return result;
+    }
     result.reason = "could not solve the topological graph";
     return result;
   }
 
   if (!graph.getNearestVertexInRange(&goal, goal_vertex_tolerance_, &target)) {
-    // getNearestVertexInRange reports an out-of-range nearest vertex through
-    // its output pointer even when it returns false.  Do not let that vertex
-    // masquerade as a selected proxy when no candidate makes progress.
     target = nullptr;
-    if (request.objective != ObjectiveKind::kNavigate ||
-        minimum_partial_progress_ <= 0.0) {
+    if (request.objective != ObjectiveKind::kNavigate) {
       char reason[192];
       std::snprintf(reason, sizeof(reason),
                     "goal is outside the graph tolerance %.2f m at "
@@ -81,15 +87,13 @@ RouteCorridor TopologicalGoalPlanner::plan(
       result.reason = reason;
       return result;
     }
-
+    // The prefix is only a seed for exact bounded grid completion. It is never
+    // returned as a successful proxy. An empty prefix asks the grid stage to
+    // search directly from current to the exact request-owned goal.
     const double initial_remaining =
         (goal.head<2>() - current.head<2>()).norm();
-    struct RankedProxy {
-      Vertex* vertex;
-      double remaining;
-      double cost;
-    };
-    std::vector<RankedProxy> eligible;
+    struct RankedSeed { Vertex* vertex; double remaining; double cost; };
+    std::vector<RankedSeed> eligible;
     eligible.reserve(graph.vertices_map_.size());
     for (const auto& entry : graph.vertices_map_) {
       Vertex* candidate = entry.second;
@@ -97,54 +101,43 @@ RouteCorridor TopologicalGoalPlanner::plan(
       const auto distance = shortest.distance_map.find(candidate->id);
       if (distance == shortest.distance_map.end() ||
           !std::isfinite(distance->second) ||
-          distance->second == std::numeric_limits<double>::max()) {
-        continue;
-      }
+          distance->second == std::numeric_limits<double>::max()) continue;
       const double remaining =
           (goal.head<2>() - candidate->state.head<2>()).norm();
-      const double progress = initial_remaining - remaining;
       if (!std::isfinite(remaining) ||
-          progress + 1e-9 < minimum_partial_progress_) {
+          initial_remaining - remaining + 1e-9 < minimum_partial_progress_)
         continue;
-      }
       eligible.push_back({candidate, remaining, distance->second});
     }
     std::sort(eligible.begin(), eligible.end(),
-              [](const RankedProxy& a, const RankedProxy& b) {
+              [](const RankedSeed& a, const RankedSeed& b) {
                 return std::tie(a.remaining, a.cost, a.vertex->id) <
                        std::tie(b.remaining, b.cost, b.vertex->id);
               });
-    for (const RankedProxy& candidate : eligible) {
+    for (const RankedSeed& candidate : eligible) {
       std::vector<StateVec> candidate_path;
       graph.getShortestPath(candidate.vertex->id, shortest, true,
                             candidate_path);
-      if (candidate_path.size() >= 2 &&
+      if (!candidate_path.empty() &&
           candidate_path.front().isApprox(source->state)) {
-        target = candidate.vertex;
         result.poses = std::move(candidate_path);
         break;
       }
     }
-    if (target == nullptr) {
-      char reason[224];
-      std::snprintf(reason, sizeof(reason),
-                    "no reachable local proxy makes the required %.2f m "
-                    "progress toward the exact goal",
-                    minimum_partial_progress_);
-      result.reason = reason;
-      return result;
-    }
-    result.partial = true;
-    // Face the remaining objective at the segment boundary. The exact target
-    // pose and its requested yaw remain untouched in result.request.goal.
-    result.poses.back()[3] =
-        std::atan2(goal.y() - target->state.y(),
-                   goal.x() - target->state.x());
+    result.status = PlanningStatus::kSucceeded;
+    result.partial = false;
+    result.reason.clear();
+    return result;
   } else {
     graph.getShortestPath(target->id, shortest, true, result.poses);
   }
   if (result.poses.empty() || !result.poses.front().isApprox(source->state)) {
     result.poses.clear();
+    if (request.objective == ObjectiveKind::kNavigate) {
+      result.status = PlanningStatus::kSucceeded;
+      result.reason.clear();
+      return result;  // disconnected topology cannot suppress map A*
+    }
     result.reason = "goal is in a disconnected graph component";
     return result;
   }
