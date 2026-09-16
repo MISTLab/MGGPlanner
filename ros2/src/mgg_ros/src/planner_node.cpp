@@ -2108,9 +2108,12 @@ void PlannerNode::onPlanRequest(
     core.map_source_stamp_nanosec = snapshot.source_stamp.nanosec;
   }
   // The legacy service shares the unified Explore corridor: the gain selector
-  // picks the target, the topological stage plans the route to it. It keeps
-  // its own tighter refinement profile and has no route continuation, so no
-  // horizon window is taken here.
+  // picks the target, the topological stage plans the route to it. It refines
+  // with the objective profile, the same budget PlanObjective gives Explore,
+  // because the legacy 50 ms profile was never exercised by an Explore
+  // corridor before this stage was shared and a full terrain-projected
+  // refinement does not fit it. It has no route continuation, so no horizon
+  // window is taken here.
   mgg::RouteCorridor corridor;
   corridor.request = core;
   if (have_explore_selection_) {
@@ -2125,7 +2128,8 @@ void PlannerNode::onPlanRequest(
   } else {
     corridor.status = mgg::PlanningStatus::kUnreachable;
   }
-  mgg::FeasiblePath feasible = refineCorridor(corridor);
+  mgg::FeasiblePath feasible =
+      refineCorridor(corridor, &objective_grid_limits_);
   const bool allow_explore_height_refinement =
       map_backend_ == "mola_snapshot" && provisional_unknown_ground_ &&
       observed_ground_body_evidence_;
