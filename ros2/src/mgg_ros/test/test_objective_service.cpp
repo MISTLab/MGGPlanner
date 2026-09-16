@@ -21,6 +21,23 @@ namespace mgg_ros {
 
 class PlannerNodeTestPeer {
  public:
+  static bool footprintTerrainSupported(PlannerNode& node,
+                                        const Eigen::Vector3d& pose,
+                                        const Eigen::Vector3d& body) {
+    return node.objectiveFootprintTerrainSupported(pose, body);
+  }
+  static void observeShallowRamp(PlannerNode& node) {
+    const std::lock_guard<std::recursive_mutex> lock(node.planner_mutex_);
+    for (double x = -0.3; x <= 0.3 + 1e-9; x += 0.05) {
+      const double z = 0.05 * (x + 0.3) / 0.6;
+      for (double y = -0.3; y <= 0.3 + 1e-9; y += 0.05) {
+        for (int repeat = 0; repeat < 6; ++repeat) {
+          node.cloud_map_->insertPointCloud(
+              {Eigen::Vector3d(x, y, z)}, Eigen::Vector3d(x, y, 1.5));
+        }
+      }
+    }
+  }
   static void configureBackboneTest(PlannerNode& node) {
     const std::lock_guard<std::recursive_mutex> lock(node.planner_mutex_);
     node.robot_params_.type = mgg::RobotType::kGroundRobot;
@@ -665,11 +682,11 @@ TEST(PlannerConfiguration, ObservedGroundPolicyIsExplicitAndSimulationCloudOnly)
 
 TEST(PlannerObjective, ObservedGroundAllowsUnknownAirButNotWallOrMissingGround) {
   using Peer = mgg_ros::PlannerNodeTestPeer;
-  auto make = [](const std::string& policy) {
+  auto make = [](const std::string& policy, double resolution = 0.05) {
     rclcpp::NodeOptions options;
     options.parameter_overrides(
         {rclcpp::Parameter("use_sim_time", true),
-         rclcpp::Parameter("map.resolution", 0.05),
+         rclcpp::Parameter("map.resolution", resolution),
          rclcpp::Parameter("objective_body_evidence_policy", policy)});
     auto node = std::make_shared<mgg_ros::PlannerNode>(options);
     Peer::configureBackboneTest(*node);
@@ -704,8 +721,12 @@ TEST(PlannerObjective, ObservedGroundAllowsUnknownAirButNotWallOrMissingGround) 
   EXPECT_EQ(Peer::refine(*unsupported, corridor(4.0)).status,
             mgg::PlanningStatus::kBlocked);
 
-  auto stepped = make("observed_ground");
-  Peer::addRaisedFloor(*stepped, 0.30);
+  // At 15 cm resolution the legacy AND rule sees a 15 cm kerb across a
+  // 30 cm edge sample as a 26.6 degree ramp and permits it under a 30 degree
+  // inclination cap. The objective terrain contract retains the 10 cm step
+  // bound independently.
+  auto stepped = make("observed_ground", 0.15);
+  Peer::addRaisedFloor(*stepped, 0.15);
   EXPECT_EQ(Peer::refine(*stepped, corridor(2.0)).status,
             mgg::PlanningStatus::kBlocked);
 
@@ -743,9 +764,58 @@ TEST(PlannerObjective, ObservedGroundBlindStartConnectorRetainsDistanceBound) {
       << connected.reason;
   EXPECT_NEAR(connected.poses.back().x(), 2.5, 1e-9);
 
+  auto curb = make(2.5);
+  // The kerb top remains below the raised body box, isolating the terrain
+  // footprint veto from the ordinary occupied-body check.
+  Peer::addOccupiedVoxel(*curb, 1.25, 0.10, 0.125);
+  EXPECT_EQ(Peer::refine(*curb, corridor(2.5)).status,
+            mgg::PlanningStatus::kBlocked);
+
   auto beyond = make(3.25);
   const mgg::FeasiblePath refused = Peer::refine(*beyond, corridor(3.25));
   EXPECT_EQ(refused.status, mgg::PlanningStatus::kBlocked);
+}
+
+TEST(PlannerObjective, ObservedGroundVetoesKnownFootprintTerrainHazards) {
+  using Peer = mgg_ros::PlannerNodeTestPeer;
+  const auto make = [] {
+    rclcpp::NodeOptions options;
+    options.parameter_overrides(
+        {rclcpp::Parameter("use_sim_time", true),
+         rclcpp::Parameter("map.resolution", 0.05),
+         rclcpp::Parameter("objective_body_evidence_policy", "observed_ground")});
+    auto node = std::make_shared<mgg_ros::PlannerNode>(options);
+    Peer::configureBackboneTest(*node);
+    return node;
+  };
+  const Eigen::Vector3d body(0.40, 0.20, 0.15);
+  const Eigen::Vector3d driving_pose(0.0, 0.0, 0.30);
+
+  auto flat = make();
+  Peer::observeGroundRectangle(*flat, -0.3, 0.3, -0.3, 0.3);
+  EXPECT_TRUE(Peer::footprintTerrainSupported(*flat, driving_pose, body));
+
+  // This obstacle is outside the narrow body's centreline but under a corner
+  // of the body at some yaw. The circumscribed footprint must see it.
+  Peer::addOccupiedVoxel(*flat, 0.20, 0.10, 0.125);
+  EXPECT_FALSE(Peer::footprintTerrainSupported(*flat, driving_pose, body));
+
+  auto missing_corner = make();
+  Peer::observeGroundRectangle(*missing_corner, -0.05, 0.05, -0.05, 0.05);
+  // Sparse lateral evidence is neutral; ordinary objective projection still
+  // requires known support on the centreline.
+  EXPECT_TRUE(
+      Peer::footprintTerrainSupported(*missing_corner, driving_pose, body));
+
+  // A fully observed shallow surface remains within the configured 10 cm
+  // step budget across the complete footprint.
+  auto shallow = make();
+  Peer::observeShallowRamp(*shallow);
+  EXPECT_TRUE(Peer::footprintTerrainSupported(
+      *shallow, Eigen::Vector3d(0.0, 0.0, 0.325), body));
+
+  EXPECT_FALSE(Peer::footprintTerrainSupported(
+      *shallow, driving_pose, Eigen::Vector3d(10.0, 10.0, 0.15)));
 }
 
 TEST(PlannerBackbone, CapturesHomeBeforeMotionAndConnectsOnlyMappedTerrain) {

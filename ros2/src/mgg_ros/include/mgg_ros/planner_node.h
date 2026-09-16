@@ -132,6 +132,9 @@ class PlannerNode : public rclcpp::Node {
   mgg::VoxelStatus objectiveSweptBodyStatus(
       const Eigen::Vector3d& from, const Eigen::Vector3d& to,
       const Eigen::Vector3d& body) const;
+  bool objectiveFootprintTerrainSupported(
+      const Eigen::Vector3d& driving_pose,
+      const Eigen::Vector3d& body) const;
   void refreshMolaRevision();
 
   mgg::ExpandContext makeContext();

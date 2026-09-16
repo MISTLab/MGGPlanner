@@ -1018,7 +1018,17 @@ bool PlannerNode::validateObjectiveStartSupport(
   // it never makes occupancy free: the full swept body follows the selected
   // objective evidence policy and always rejects occupied or invalid queries.
   std::vector<Eigen::Vector3d> projected;
-  const Eigen::Vector3d body = robot_params_.getPlanningSize();
+  const Eigen::Vector3d footprint_body = robot_params_.getPlanningSize();
+  Eigen::Vector3d body = footprint_body;
+  if (observed_ground_body_evidence_ &&
+      robot_params_.type == mgg::RobotType::kGroundRobot) {
+    // Objective states carry yaw, but the voxel map's box/path API is axis
+    // aligned. A square whose side is the rectangle diagonal contains the
+    // planning footprint at every yaw, preserving the occupied-space veto.
+    const double xy_diagonal = footprint_body.head<2>().norm();
+    body.x() = xy_diagonal;
+    body.y() = xy_diagonal;
+  }
   if (ground_->getProjectedEdgeStatus(
           anchor.head<3>(), supported.head<3>(), body,
           /*stop_at_unknown_voxel=*/false, projected,
@@ -1033,6 +1043,16 @@ bool PlannerNode::validateObjectiveStartSupport(
   const Eigen::Vector3d center_offset = robot_params_.center_offset;
   checked.reserve(projected.size());
   for (const Eigen::Vector3d& point : projected) {
+    if (!objectiveFootprintTerrainSupported(point, footprint_body)) {
+      checked.clear();
+      if (objective_start_support_failure_.empty() ||
+          objective_start_support_failure_ ==
+              "connector exceeds bounded distance") {
+        objective_start_support_failure_ =
+            "connector footprint intersects incompatible known terrain";
+      }
+      return false;
+    }
     // A hanging connector has no mapped terrain with which to justify a
     // gradual elevation change. Any observed floor outside the platform step
     // cap therefore refuses the connector, even when the end-to-end chord
@@ -1127,6 +1147,93 @@ mgg::VoxelStatus PlannerNode::objectiveSweptBodyStatus(
   return observed_ground_body_evidence_
              ? map_->getOccupiedOnlyPathStatus(from, to, body)
              : map_->getStrictPathStatus(from, to, body);
+}
+
+bool PlannerNode::objectiveFootprintTerrainSupported(
+    const Eigen::Vector3d& driving_pose,
+    const Eigen::Vector3d& body) const {
+  // This extra terrain contract is intentionally limited to simulation's
+  // observed-ground objective policy.  The legacy graph/exploration contract
+  // and strict-volume hardware planning retain their existing semantics.
+  if (!observed_ground_body_evidence_ ||
+      robot_params_.type != mgg::RobotType::kGroundRobot) {
+    return true;
+  }
+  if (!driving_pose.allFinite() || !body.allFinite() ||
+      (body.array() < 0.0).any() ||
+      !std::isfinite(planning_params_.max_ground_height) ||
+      !std::isfinite(planning_params_.max_step_height) ||
+      planning_params_.max_step_height < 0.0 || !ground_ ||
+      !std::isfinite(ground_->max_projection_length) ||
+      ground_->max_projection_length <= 0.0) {
+    return false;
+  }
+  const double resolution = map_->getResolution();
+  const double radius = 0.5 * body.head<2>().norm();
+  if (!std::isfinite(resolution) || resolution <= 0.0 ||
+      !std::isfinite(radius)) {
+    return false;
+  }
+
+  // A square around the footprint's circumscribed circle contains the body at
+  // every yaw. Half a voxel diagonal of padding includes voxels touched at its
+  // boundary despite the sampling lattice's phase relative to the map grid.
+  // Bound the floating-point ratio before converting it to an integer.
+  const double extent = radius + std::sqrt(0.5) * resolution;
+  const double intervals_d = std::ceil(2.0 * extent / resolution);
+  constexpr int kMaxFootprintSamples = 4096;
+  constexpr int kMaxIntervals = 63;
+  if (!std::isfinite(extent) || !std::isfinite(intervals_d) ||
+      intervals_d < 1.0 || intervals_d > kMaxIntervals) {
+    return false;
+  }
+  const int intervals = static_cast<int>(intervals_d);
+  const double spacing = 2.0 * extent / static_cast<double>(intervals);
+  int samples = 0;
+  const double nominal_ground_z =
+      driving_pose.z() - planning_params_.max_ground_height;
+
+  // getRayStatus(..., false) deliberately treats unobserved cells as
+  // traversable and its legacy API also returns Free when ray setup fails.
+  // Validate the entire bounded query volume once through the box API first;
+  // Unknown here means invalid geometry or an exceeded map work bound.
+  const Eigen::Vector3d query_center(
+      driving_pose.x() + robot_params_.center_offset.x(),
+      driving_pose.y() + robot_params_.center_offset.y(),
+      driving_pose.z() - 0.5 * ground_->max_projection_length);
+  const Eigen::Vector3d query_size(2.0 * extent, 2.0 * extent,
+                                   ground_->max_projection_length);
+  if (map_->getBoxStatus(query_center, query_size, false) ==
+      mgg::VoxelStatus::kUnknown) {
+    return false;
+  }
+  for (int ix = 0; ix <= intervals; ++ix) {
+    for (int iy = 0; iy <= intervals; ++iy) {
+      const double dx = -extent + ix * spacing;
+      const double dy = -extent + iy * spacing;
+      if (++samples > kMaxFootprintSamples) return false;
+      Eigen::Vector3d start =
+          driving_pose +
+          Eigen::Vector3d(robot_params_.center_offset.x() + dx,
+                          robot_params_.center_offset.y() + dy, 0.0);
+      const Eigen::Vector3d end =
+          start - Eigen::Vector3d(0.0, 0.0, ground_->max_projection_length);
+      Eigen::Vector3d hit;
+      const mgg::VoxelStatus ray = map_->getRayStatus(start, end, false, hit);
+      // Lateral absence of a hit is neutral: the centre ray already proves
+      // support for ordinary poses, while sparse simulated sensors cannot
+      // certify every footprint column. Known terrain is a veto when it rises
+      // or drops beyond the conservative platform step envelope.
+      if (ray == mgg::VoxelStatus::kUnknown ||
+          (ray == mgg::VoxelStatus::kOccupied &&
+           (!hit.allFinite() ||
+            std::abs(hit.z() - nominal_ground_z) >
+                planning_params_.max_step_height + 1e-6))) {
+        return false;
+      }
+    }
+  }
+  return samples > 0;
 }
 
 void PlannerNode::updateGlobalGraph() {
@@ -1772,7 +1879,14 @@ mgg::FeasiblePath PlannerNode::refineCorridor(
     return result;
   }
 
-  const Eigen::Vector3d body = robot_params_.getPlanningSize();
+  const Eigen::Vector3d footprint_body = robot_params_.getPlanningSize();
+  Eigen::Vector3d body = footprint_body;
+  if (observed_ground_body_evidence_ &&
+      robot_params_.type == mgg::RobotType::kGroundRobot) {
+    const double xy_diagonal = footprint_body.head<2>().norm();
+    body.x() = xy_diagonal;
+    body.y() = xy_diagonal;
+  }
   const Eigen::Vector3d center_offset = robot_params_.center_offset;
   const mgg::StateVec current_anchor =
       physicalAnchorAtDrivingHeight(current_state_);
@@ -1815,7 +1929,7 @@ mgg::FeasiblePath PlannerNode::refineCorridor(
                from.head<2>(), to.head<2>(), body.head<2>()) !=
            mgg::GeofenceManager::CoordinateStatus::kViolated;
   };
-  const auto project = [this, body, center_offset, current_anchor, home_anchor,
+  const auto project = [this, body, footprint_body, center_offset, current_anchor, home_anchor,
                         have_connected_home_anchor, request_targets_home_anchor,
                         &corridor, &samePosition,
                         &geofenceContains](mgg::StateVec& state) {
@@ -1857,6 +1971,9 @@ mgg::FeasiblePath PlannerNode::refineCorridor(
       }
     }
     const Eigen::Vector3d center = state.head<3>() + center_offset;
+    if (!objectiveFootprintTerrainSupported(state.head<3>(), footprint_body)) {
+      return mgg::GridProjectionStatus::kNoGround;
+    }
     const mgg::VoxelStatus body_status = objectiveBodyStatus(center, body);
     if (body_status == mgg::VoxelStatus::kOccupied) {
       return mgg::GridProjectionStatus::kBodyOccupied;
@@ -1870,7 +1987,7 @@ mgg::FeasiblePath PlannerNode::refineCorridor(
     return mgg::GridProjectionStatus::kSupported;
   };
   const auto traverse =
-      [this, body, center_offset, current_anchor, home_anchor,
+      [this, body, footprint_body, center_offset, current_anchor, home_anchor,
        have_connected_home_anchor, &samePosition,
        &geofenceAllows](const mgg::StateVec& a, const mgg::StateVec& b,
                         std::vector<mgg::StateVec>& checked) {
@@ -1940,6 +2057,23 @@ mgg::FeasiblePath PlannerNode::refineCorridor(
         }
         checked.reserve(projected.size());
         for (const Eigen::Vector3d& driving_pose : projected) {
+          if (!objectiveFootprintTerrainSupported(driving_pose,
+                                                  footprint_body)) {
+            checked.clear();
+            return false;
+          }
+          // The legacy edge rule permits a rise above the step cap whenever
+          // its average angle is below max_inclination. In observed-ground
+          // objective mode that can classify a 15 cm kerb sampled over one
+          // 30 cm map interval as a ramp. Keep an explicit per-sample height
+          // bound; this is intentionally conservative for ramps whose rise
+          // over one map sample exceeds the platform's step capability.
+          if (observed_ground_body_evidence_ && !checked.empty() &&
+              std::abs(driving_pose.z() - checked.back().z()) >
+                  planning_params_.max_step_height + 1e-6) {
+            checked.clear();
+            return false;
+          }
           mgg::StateVec pose = mgg::StateVec::Zero();
           pose.head<3>() = driving_pose;
           checked.push_back(pose);
