@@ -88,6 +88,14 @@ class PlannerNodeTestPeer {
     const std::lock_guard<std::recursive_mutex> lock(node.planner_mutex_);
     node.observed_ground_body_evidence_ = enabled;
   }
+  static void qualifyMolaPolicyForTest(PlannerNode& node) {
+    const std::lock_guard<std::recursive_mutex> lock(node.planner_mutex_);
+    node.map_backend_ = "mola_snapshot";
+  }
+  static void clearMolaPolicyForTest(PlannerNode& node) {
+    const std::lock_guard<std::recursive_mutex> lock(node.planner_mutex_);
+    node.map_backend_ = "cloud_octomap";
+  }
   static void setObjectiveGridWindow(PlannerNode& node, double margin,
                                      double maximum_margin,
                                      std::size_t max_cells = 32768) {
@@ -104,6 +112,13 @@ class PlannerNodeTestPeer {
   }
   static std::size_t localVertices(const PlannerNode& node) {
     return node.local_graph_->getNumVertices();
+  }
+  static mgg::StateVec localRootState(const PlannerNode& node) {
+    const mgg::Vertex* root = node.local_graph_->getVertex(0);
+    return root != nullptr
+               ? root->state
+               : mgg::StateVec::Constant(
+                     std::numeric_limits<double>::quiet_NaN());
   }
   static bool retainTerrainSafeExplorationPath(
       const std::vector<mgg::StateVec>& lattice,
@@ -1618,6 +1633,34 @@ TEST(PlannerExplore, QuantizedFloorHeightStillConnectsPhysicalRoot) {
   EXPECT_GE(response->path.size(), 2u);
 }
 
+TEST(PlannerExplore, QualifiedMolaRootKeepsPhysicalDrivingHeight) {
+  using Peer = mgg_ros::PlannerNodeTestPeer;
+  rclcpp::NodeOptions options;
+  options.parameter_overrides(
+      {rclcpp::Parameter("use_sim_time", true),
+       rclcpp::Parameter("map.resolution", 0.15),
+       rclcpp::Parameter("objective_body_evidence_policy", "observed_ground"),
+       rclcpp::Parameter("objective_ground_evidence_policy",
+                         "provisional_unknown")});
+
+  const auto configure = [&options](bool mola_policy) {
+    auto node = std::make_shared<mgg_ros::PlannerNode>(options);
+    Peer::configureExploreServiceScene(*node, true);
+    Peer::setPlanningBody(*node, Eigen::Vector3d(1.023, 0.778, 0.40));
+    Peer::setMaxGroundHeight(*node, 0.475);
+    // Deliberately disagree with the measured floor. The qualified policy
+    // must preserve the physical start while the legacy projection follows
+    // the mapped surface.
+    Peer::acceptOdometry(*node, 0.0, 0.0, 0.30);
+    if (mola_policy) Peer::qualifyMolaPolicyForTest(*node);
+    Peer::rebuildLocalGraph(*node);
+    return node;
+  };
+
+  auto mola = configure(true);
+  EXPECT_NEAR(Peer::localRootState(*mola).z(), 0.575, 1e-9);
+}
+
 TEST(PlannerExplore, InvalidSmoothedPathRestoresExactValidatedLattice) {
   using Peer = mgg_ros::PlannerNodeTestPeer;
   const std::vector<mgg::StateVec> lattice{
@@ -1645,12 +1688,12 @@ TEST(PlannerExplore, InvalidSmoothedPathRestoresExactValidatedLattice) {
 TEST(PlannerObjective, RemainingRouteValidationUsesLatestKnownHazards) {
   using Peer = mgg_ros::PlannerNodeTestPeer;
   using Service = mgg_msgs::srv::ValidateObjectiveRoute;
-  auto make = [] {
+  auto make = [](double resolution = 0.15) {
     rclcpp::NodeOptions options;
     options.parameter_overrides(
         {rclcpp::Parameter("use_sim_time", true),
          rclcpp::Parameter("mission_id", "mission-test"),
-         rclcpp::Parameter("map.resolution", 0.15),
+         rclcpp::Parameter("map.resolution", resolution),
          rclcpp::Parameter("objective_body_evidence_policy", "observed_ground"),
          rclcpp::Parameter("objective_ground_evidence_policy",
                            "provisional_unknown")});
@@ -1723,6 +1766,102 @@ TEST(PlannerObjective, RemainingRouteValidationUsesLatestKnownHazards) {
   Peer::addOccupiedVoxel(*stationary, 0.0, 0.0, 0.30);
   EXPECT_EQ(Peer::validateRoute(*stationary, stopped)->status,
             Service::Response::INVALID);
+
+  // Qualified MOLA simulation validates an any-yaw body with the exact
+  // circumscribed circle. A voxel under a diagonal-square-only corner is
+  // outside that envelope, while a voxel inside the circle remains a veto.
+  auto outside_circle = make(0.05);
+  Peer::setPlanningBody(*outside_circle,
+                        Eigen::Vector3d(0.40, 0.20, 0.15));
+  Peer::qualifyMolaPolicyForTest(*outside_circle);
+  Peer::addOccupiedVoxel(*outside_circle, 0.23, 0.23, 0.30);
+  EXPECT_EQ(Peer::validateRoute(*outside_circle, stopped)->status,
+            Service::Response::VALID);
+
+  auto legacy_square_corner = make(0.05);
+  Peer::setPlanningBody(*legacy_square_corner,
+                        Eigen::Vector3d(0.40, 0.20, 0.15));
+  Peer::addOccupiedVoxel(*legacy_square_corner, 0.23, 0.23, 0.30);
+  EXPECT_EQ(Peer::validateRoute(*legacy_square_corner, stopped)->status,
+            Service::Response::INVALID);
+
+  // Merely selecting the MOLA backend never opts an aerial platform into the
+  // ground-only circular envelope or exact-height terrain path.
+  auto aerial_mola = make(0.05);
+  Peer::configureAerialBackboneTest(*aerial_mola);
+  Peer::setPlanningBody(*aerial_mola,
+                        Eigen::Vector3d(0.40, 0.20, 0.15));
+  Peer::qualifyMolaPolicyForTest(*aerial_mola);
+  Peer::addOccupiedVoxel(*aerial_mola, 0.23, 0.23, 0.30);
+  EXPECT_EQ(Peer::validateRoute(*aerial_mola, stopped)->status,
+            Service::Response::INVALID);
+
+  auto inside_circle = make(0.05);
+  Peer::setPlanningBody(*inside_circle,
+                        Eigen::Vector3d(0.40, 0.20, 0.15));
+  Peer::qualifyMolaPolicyForTest(*inside_circle);
+  Peer::addOccupiedVoxel(*inside_circle, 0.18, 0.0, 0.30);
+  EXPECT_EQ(Peer::validateRoute(*inside_circle, stopped)->status,
+            Service::Response::INVALID);
+
+  auto moving_outside_circle = make(0.05);
+  Peer::setPlanningBody(*moving_outside_circle,
+                        Eigen::Vector3d(0.40, 0.20, 0.15));
+  Peer::qualifyMolaPolicyForTest(*moving_outside_circle);
+  Peer::addOccupiedVoxel(*moving_outside_circle, 3.23, 0.23, 0.30);
+  EXPECT_EQ(Peer::validateRoute(*moving_outside_circle, request())->status,
+            Service::Response::VALID);
+
+  auto moving_inside_circle = make(0.05);
+  Peer::setPlanningBody(*moving_inside_circle,
+                        Eigen::Vector3d(0.40, 0.20, 0.15));
+  Peer::qualifyMolaPolicyForTest(*moving_inside_circle);
+  Peer::addOccupiedVoxel(*moving_inside_circle, 3.18, 0.0, 0.30);
+  EXPECT_EQ(Peer::validateRoute(*moving_inside_circle, request())->status,
+            Service::Response::INVALID);
+
+  // The indexed route keeps its submitted heights even when the mapped floor
+  // would project its physical start lower. Validation still checks terrain,
+  // steps, swept occupancy, and geofences at those exact route heights.
+  auto height_disagreement = make(0.05);
+  Peer::setPlanningBody(*height_disagreement,
+                        Eigen::Vector3d(0.40, 0.20, 0.15));
+  Peer::setMaxStep(*height_disagreement, 0.15);
+  Peer::setMaxGroundHeight(*height_disagreement, 0.075);
+  Peer::qualifyMolaPolicyForTest(*height_disagreement);
+  Peer::acceptOdometry(*height_disagreement, 0.0, 0.0, 0.175);
+  Peer::observeGroundRectangleAt(*height_disagreement, -0.2, 0.2, -0.3, 0.3,
+                                 0.0);
+  Peer::observeGroundRectangleAt(*height_disagreement, 0.3, 1.3, -0.3, 0.3,
+                                 0.0);
+  Peer::observeFreeBodyBox(*height_disagreement,
+                           Eigen::Vector3d(0.5, 0.0, 0.55),
+                           Eigen::Vector3d(2.0, 1.0, 0.30));
+  // The observed lower floor itself is below the submitted body's lower face,
+  // but intersects the body if the route is reprojected down at its start.
+  Peer::finishMapRevision(*height_disagreement);
+  auto raised_start = std::make_shared<Service::Request>();
+  raised_start->mission_id = "mission-test";
+  raised_start->component_id = "world";
+  raised_start->frame_id = "world";
+  raised_start->lookahead_m = 1.0;
+  for (const double x : {0.0, 0.5, 1.0}) {
+    geometry_msgs::msg::Pose pose;
+    pose.position.x = x;
+    pose.position.z = 0.175;
+    pose.orientation.w = 1.0;
+    raised_start->path.push_back(pose);
+  }
+  Peer::clearMolaPolicyForTest(*height_disagreement);
+  const auto reprojected_height_validation =
+      Peer::validateRoute(*height_disagreement, raised_start);
+  EXPECT_EQ(reprojected_height_validation->status, Service::Response::INVALID)
+      << reprojected_height_validation->reason;
+  Peer::qualifyMolaPolicyForTest(*height_disagreement);
+  const auto height_validation = Peer::validateRoute(*height_disagreement,
+                                                     raised_start);
+  EXPECT_EQ(height_validation->status, Service::Response::VALID)
+      << height_validation->reason;
 
   auto known_beats_unavailable = make();
   Peer::addOccupiedVoxel(*known_beats_unavailable, 0.0, 0.0, 0.30);
@@ -3431,6 +3570,7 @@ TEST(IndexedObjectiveService, BatchedQueryIsBoundedAndUsesComponentFrame) {
   std::atomic<bool> delay{false};
   std::atomic<std::uint8_t> response_status{Query::Response::OK};
   std::atomic<double> ground_offset{0.0};
+  std::atomic<double> leading_root_ground_offset{0.0};
   std::atomic<double> ground_from_sample{0.30};
   std::atomic<double> received_body_x{0.0};
   std::atomic<double> received_body_y{0.0};
@@ -3466,27 +3606,37 @@ TEST(IndexedObjectiveService, BatchedQueryIsBoundedAndUsesComponentFrame) {
   };
   std::atomic<int> terrain_case{kOrdinaryTerrain};
   std::atomic<double> refinement_dip{0.0};
+  std::atomic<double> compatible_refinement_dip{0.0};
+  std::atomic<double> refinement_from_x{0.0};
   std::atomic<std::size_t> query_count{0};
+  std::atomic<std::size_t> first_query_sample_count{0};
   std::atomic<bool> occupy_refined_body{false};
+  std::atomic<bool> occupy_if_early_sample_was_lowered{false};
   std::atomic<bool> stale_refined_query{false};
   std::atomic<bool> replace_query_authority{false};
   std::atomic<bool> received_stop_at_unknown{true};
   std::vector<geometry_msgs::msg::Point> received;
   auto service = server->create_service<Query>(
       "/robot_1/mapping/query_batch",
-      [&delay, &response_status, &ground_offset, &ground_from_sample,
+      [&delay, &response_status, &ground_offset, &leading_root_ground_offset,
+       &ground_from_sample,
        &received_body_x, &received_body_y, &received_body_z,
        &received_max_step, &received_max_drop, &sample_occupancy,
        &sample_clearance, &blind_ground_prefix, &blind_clearance_prefix,
        &blind_ground_sample, &step_sample, &drop_sample,
        &drop_at_or_after_x,
-       &terrain_case, &refinement_dip, &query_count,
-       &occupy_refined_body, &stale_refined_query,
+       &terrain_case, &refinement_dip, &compatible_refinement_dip,
+       &refinement_from_x, &query_count, &first_query_sample_count,
+       &occupy_refined_body, &occupy_if_early_sample_was_lowered,
+       &stale_refined_query,
        &replace_query_authority, planner,
        &received_stop_at_unknown, &received](
           const Query::Request::SharedPtr request,
           Query::Response::SharedPtr response) {
         const std::size_t query_ordinal = ++query_count;
+        if (query_ordinal == 1) {
+          first_query_sample_count = request->samples.size();
+        }
         received = request->samples;
         if (delay.load()) std::this_thread::sleep_for(200ms);
         response->status = response_status.load();
@@ -3505,6 +3655,10 @@ TEST(IndexedObjectiveService, BatchedQueryIsBoundedAndUsesComponentFrame) {
         response->ground_z.reserve(n);
         for (std::size_t i = 0; i < n; ++i) {
           const auto& sample = request->samples[i];
+          const bool at_route_start_xy =
+              n > 0 &&
+              std::abs(sample.x - request->samples.front().x) <= 1e-9 &&
+              std::abs(sample.y - request->samples.front().y) <= 1e-9;
           const int active_case = terrain_case.load();
           const bool two_interval_blind =
               active_case == kTwoBlindIntervals &&
@@ -3531,16 +3685,22 @@ TEST(IndexedObjectiveService, BatchedQueryIsBoundedAndUsesComponentFrame) {
               (i < blind_ground_prefix.load() ||
                i == blind_ground_sample.load() || scenario_ground_missing)
               ? std::numeric_limits<double>::quiet_NaN()
-              : sample.z - ground_from_sample.load() + ground_offset.load());
+              : sample.z - ground_from_sample.load() + ground_offset.load() +
+                    (at_route_start_xy
+                         ? leading_root_ground_offset.load()
+                         : 0.0));
         }
-        if (refinement_dip.load() > 0.0 && n > 0) {
+        if (std::abs(refinement_dip.load()) > 0.0 && n > 0) {
           const double root_x = request->samples.front().x;
           for (std::size_t i = 0; i < n; ++i) {
             if (std::isfinite(response->ground_z[i])) {
+              const bool needs_refinement =
+                  request->samples[i].x >
+                  root_x + refinement_from_x.load() + 1e-9;
               response->ground_z[i] =
-                  request->samples[i].x > root_x + 1e-9
-                      ? -0.10 - refinement_dip.load()
-                      : -0.10;
+                  -0.10 - (needs_refinement
+                               ? refinement_dip.load()
+                               : compatible_refinement_dip.load());
             }
           }
         }
@@ -3613,6 +3773,18 @@ TEST(IndexedObjectiveService, BatchedQueryIsBoundedAndUsesComponentFrame) {
         }
         if (occupy_refined_body.load() && query_ordinal == 2 && n > 2) {
           response->occupancy[2] = Query::Response::OCCUPIED;
+        }
+        if (occupy_if_early_sample_was_lowered.load() &&
+            query_ordinal == 2) {
+          const double root_x = request->samples.front().x;
+          for (std::size_t i = 0; i < n; ++i) {
+            const double progress = request->samples[i].x - root_x;
+            if (progress > 0.20 && progress < 0.40 &&
+                request->samples[i].z <
+                    request->samples.front().z - 0.05) {
+              response->occupancy[i] = Query::Response::OCCUPIED;
+            }
+          }
         }
         if (stale_refined_query.load() && query_ordinal == 2) {
           ++response->graph_revision;
@@ -3739,6 +3911,41 @@ TEST(IndexedObjectiveService, BatchedQueryIsBoundedAndUsesComponentFrame) {
   sample_clearance = 100.0;
   blind_ground_prefix = 0;
 
+  // A MOLA root floor may be within the platform step cap but outside the
+  // tighter fitted-height tolerance. Explore preserves the exact physical
+  // start, including its duplicate root sample. A known obstacle still vetoes
+  // it, and a different pure-Z pose receives the ordinary height rejection.
+  mgg_ros::PlannerNodeTestPeer::qualifyMolaPolicyForTest(*planner);
+  mgg_ros::PlannerNodeTestPeer::setMaxStep(*planner, 0.15);
+  leading_root_ground_offset = -0.12;
+  path.status = mgg::PlanningStatus::kSucceeded;
+  path.poses = {mgg::StateVec(0.0, 0.0, 0.0, 0.0),
+                mgg::StateVec(1.2, 0.0, 0.0, 0.0)};
+  ASSERT_TRUE(mgg_ros::PlannerNodeTestPeer::query(
+      *planner, path, /*allow_explore_height_refinement=*/true))
+      << path.reason;
+  ASSERT_TRUE(path.indexed_map_validated);
+  ASSERT_FALSE(path.poses.empty());
+  EXPECT_NEAR(path.poses.front().z(), 0.0, 1e-9);
+
+  sample_occupancy = Query::Response::OCCUPIED;
+  path.status = mgg::PlanningStatus::kSucceeded;
+  path.poses = {mgg::StateVec(0.0, 0.0, 0.0, 0.0),
+                mgg::StateVec(1.2, 0.0, 0.0, 0.0)};
+  EXPECT_FALSE(mgg_ros::PlannerNodeTestPeer::query(
+      *planner, path, /*allow_explore_height_refinement=*/true));
+  EXPECT_NE(path.reason.find("occupied or unknown"), std::string::npos);
+  sample_occupancy = Query::Response::FREE;
+
+  path.status = mgg::PlanningStatus::kSucceeded;
+  path.poses = {mgg::StateVec(0.0, 0.0, 0.05, 0.0)};
+  EXPECT_FALSE(mgg_ros::PlannerNodeTestPeer::query(
+      *planner, path, /*allow_explore_height_refinement=*/true));
+  EXPECT_NE(path.reason.find("does not support the emitted body height"),
+            std::string::npos);
+  leading_root_ground_offset = 0.0;
+  mgg_ros::PlannerNodeTestPeer::setMaxStep(*planner, 0.10);
+
   // A fully measured stationary route never consumes the provisional policy.
   // It remains valid for generic Navigate/Home callers even though Explore
   // separately requires progress before dispatch.
@@ -3748,18 +3955,23 @@ TEST(IndexedObjectiveService, BatchedQueryIsBoundedAndUsesComponentFrame) {
   EXPECT_TRUE(path.indexed_map_validated);
 
   // Fully observed slopes retain the ordinary adjacent-sample inclination
-  // rule; the cross-gap step cap must not apply when no gap was used.
+  // rule and strict callers retain 3-D sample spacing; the cross-gap step cap
+  // must not apply when no gap was used.
+  query_count = 0;
   path.status = mgg::PlanningStatus::kSucceeded;
   path.poses = {mgg::StateVec(0.0, 0.0, 0.0, 0.0),
                 mgg::StateVec(1.2, 0.0, 0.30, 0.0)};
   EXPECT_TRUE(mgg_ros::PlannerNodeTestPeer::query(*planner, path));
   EXPECT_TRUE(path.indexed_map_validated);
+  EXPECT_EQ(query_count.load(), 1u);
+  EXPECT_EQ(received.size(), 7u);
 
   // A vertical, zero-XY route still receives the ordinary known-step veto.
   path.status = mgg::PlanningStatus::kSucceeded;
   path.poses = {mgg::StateVec(0.0, 0.0, 0.0, 0.0),
                 mgg::StateVec(0.0, 0.0, 0.30, 0.0)};
-  EXPECT_FALSE(mgg_ros::PlannerNodeTestPeer::query(*planner, path));
+  EXPECT_FALSE(mgg_ros::PlannerNodeTestPeer::query(
+      *planner, path, /*allow_explore_height_refinement=*/true));
   EXPECT_NE(path.reason.find("step or inclination limits"), std::string::npos);
 
   blind_ground_prefix = 2;
@@ -3802,7 +4014,8 @@ TEST(IndexedObjectiveService, BatchedQueryIsBoundedAndUsesComponentFrame) {
   path.status = mgg::PlanningStatus::kSucceeded;
   path.poses = {mgg::StateVec(0.0, 0.0, 0.0, 0.0),
                 mgg::StateVec(2.4, 0.0, 0.0, 0.0)};
-  EXPECT_TRUE(mgg_ros::PlannerNodeTestPeer::query(*planner, path));
+  EXPECT_TRUE(mgg_ros::PlannerNodeTestPeer::query(
+      *planner, path, /*allow_explore_height_refinement=*/true));
   EXPECT_TRUE(path.indexed_map_validated);
   ASSERT_EQ(received.size(), 10u);
 
@@ -4011,26 +4224,82 @@ TEST(IndexedObjectiveService, BatchedQueryIsBoundedAndUsesComponentFrame) {
   path.speed_limits.clear();
 
   query_count = 0;
+  // A translated exact one-spacing interval must remain three samples (the
+  // physical start, the explicit root, and the endpoint) on
+  // both the initial query and the post-refinement recheck. Binary subtraction
+  // makes (100.0 + 0.3) - 100.0 slightly larger than 0.3 on common platforms.
+  mgg_ros::PlannerNodeTestPeer::setCurrentStateWithoutExtendingBackbone(
+      *planner, 100.0, 0.0, 0.0);
   path.status = mgg::PlanningStatus::kSucceeded;
-  path.poses = {mgg::StateVec(0.0, 0.0, 0.0, 3.0),
-                mgg::StateVec(1.2, 0.0, 0.0, -3.0)};
-  EXPECT_TRUE(mgg_ros::PlannerNodeTestPeer::query(*planner, path, true));
+  path.poses = {mgg::StateVec(100.0, 0.0, 0.0, 3.0),
+                mgg::StateVec(100.3, 0.0, 0.0, -3.0)};
+  EXPECT_TRUE(mgg_ros::PlannerNodeTestPeer::query(*planner, path, true))
+      << path.reason;
   EXPECT_TRUE(path.indexed_map_validated);
   EXPECT_EQ(query_count.load(), 2u);
+  EXPECT_EQ(first_query_sample_count.load(), 3u);
+  EXPECT_EQ(received.size(), 3u);
+  EXPECT_EQ(received.size(), first_query_sample_count.load());
+  EXPECT_NEAR(received.front().x, 110.0, 1e-9);
+  EXPECT_NEAR(received[1].x, received.front().x, 1e-9);
+  EXPECT_NEAR(received[2].x, received.front().x + 0.30, 1e-9);
   ASSERT_GE(path.poses.size(), 2u);
-  EXPECT_NEAR(path.poses.front().x(), 0.0, 1e-9);
+  EXPECT_NEAR(path.poses.front().x(), 100.0, 1e-9);
   EXPECT_NEAR(path.poses.front().z(), 0.0, 1e-9);
   EXPECT_NEAR(path.poses.front()[3], 3.0, 1e-9);
-  EXPECT_NEAR(path.poses.back().x(), 1.2, 1e-9);
+  EXPECT_NEAR(path.poses.back().x(), 100.3, 1e-9);
   EXPECT_NEAR(path.poses.back().y(), 0.0, 1e-9);
-  EXPECT_NEAR(path.poses.back().z(), -0.11, 1e-9);
+  EXPECT_NEAR(path.poses.back().z(), -0.010, 2e-6);
   EXPECT_NEAR(path.poses.back()[3], -3.0, 1e-9);
+  mgg_ros::PlannerNodeTestPeer::setCurrentStateWithoutExtendingBackbone(
+      *planner, 0.0, 0.0, 0.0);
+
+  refinement_dip = -0.11;
+  query_count = 0;
+  path.status = mgg::PlanningStatus::kSucceeded;
+  path.poses = {mgg::StateVec(0.0, 0.0, 0.0, 0.0),
+                mgg::StateVec(1.2, 0.0, 0.0, 0.0)};
+  EXPECT_TRUE(mgg_ros::PlannerNodeTestPeer::query(*planner, path, true))
+      << path.reason;
+  EXPECT_EQ(query_count.load(), 2u);
+  ASSERT_FALSE(path.poses.empty());
+  EXPECT_NEAR(path.poses.back().z(), 0.010, 2e-6);
+  refinement_dip = 0.11;
+
+  // A later fitted sample must not rewrite earlier poses whose emitted
+  // heights already agreed with the indexed terrain. The second response
+  // simulates a voxel that would collide only if that early sample were
+  // incorrectly lowered with the later correction.
+  refinement_from_x = 0.60;
+  compatible_refinement_dip = 0.08;
+  occupy_if_early_sample_was_lowered = true;
+  query_count = 0;
+  path.status = mgg::PlanningStatus::kSucceeded;
+  path.poses = {mgg::StateVec(0.0, 0.0, 0.0, 0.0),
+                mgg::StateVec(1.2, 0.0, 0.0, 0.0)};
+  EXPECT_TRUE(mgg_ros::PlannerNodeTestPeer::query(*planner, path, true))
+      << path.reason;
+  EXPECT_EQ(query_count.load(), 2u);
+  ASSERT_FALSE(received.empty());
+  const double mixed_root_x = received.front().x;
+  const double mixed_root_z = received.front().z;
+  bool saw_unchanged_early_sample = false;
+  for (const auto& sample : received) {
+    const double progress = sample.x - mixed_root_x;
+    if (progress > 0.20 && progress < 0.40) {
+      EXPECT_NEAR(sample.z, mixed_root_z, 1e-9);
+      saw_unchanged_early_sample = true;
+    }
+  }
+  EXPECT_TRUE(saw_unchanged_early_sample);
+  occupy_if_early_sample_was_lowered = false;
 
   // The production failure combined a blind lidar prefix, a fitted-height
   // correction, and a later sparse interval. The corrected dense route must
   // preserve its explicit physical-root pose, interpolate the bounded gap,
   // and validate the new body heights with exactly one additional query.
   terrain_case = kTwoBlindIntervals;
+  refinement_from_x = 1.50;
   query_count = 0;
   path.status = mgg::PlanningStatus::kSucceeded;
   path.poses = {mgg::StateVec(0.0, 0.0, 0.0, 2.8),
@@ -4043,9 +4312,19 @@ TEST(IndexedObjectiveService, BatchedQueryIsBoundedAndUsesComponentFrame) {
   EXPECT_NEAR(path.poses.front().z(), 0.0, 1e-9);
   EXPECT_NEAR(path.poses.front()[3], 2.8, 1e-9);
   EXPECT_NEAR(path.poses.back().x(), 3.0, 1e-9);
-  EXPECT_NEAR(path.poses.back().z(), -0.11, 1e-9);
+  EXPECT_NEAR(path.poses.back().z(), -0.010, 2e-6);
   EXPECT_NEAR(path.poses.back()[3], -2.8, 1e-9);
-  for (const auto& pose : path.poses) EXPECT_TRUE(pose.allFinite());
+  bool saw_unchanged_gap_anchor = false;
+  for (const auto& pose : path.poses) {
+    EXPECT_TRUE(pose.allFinite());
+    if (std::abs(pose.x() - 0.9) <= 1e-9) {
+      EXPECT_NEAR(pose.z(), 0.0, 1e-9);
+      saw_unchanged_gap_anchor = true;
+    }
+  }
+  EXPECT_TRUE(saw_unchanged_gap_anchor);
+  compatible_refinement_dip = 0.0;
+  refinement_from_x = 0.0;
 
   terrain_case = kTerminalGap;
   query_count = 0;
@@ -4146,7 +4425,7 @@ TEST(IndexedObjectiveService, BatchedQueryIsBoundedAndUsesComponentFrame) {
   EXPECT_EQ(query_count.load(), 2u);
   ASSERT_FALSE(path.poses.empty());
   EXPECT_NEAR(path.poses.back().x(), 1.2, 1e-9);
-  EXPECT_NEAR(path.poses.back().z(), -0.11, 1e-9);
+  EXPECT_NEAR(path.poses.back().z(), -0.010, 2e-6);
   drop_at_or_after_x = std::numeric_limits<double>::infinity();
   drop_sample = std::numeric_limits<std::size_t>::max();
 

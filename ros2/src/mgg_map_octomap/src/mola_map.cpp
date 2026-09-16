@@ -993,6 +993,25 @@ VoxelStatus MolaMap::getPathStatus(const Eigen::Vector3d& start,
                                       stop_at_unknown_voxel);
 }
 
+VoxelStatus MolaMap::getOccupiedOnlyCylinderPathStatus(
+    const Eigen::Vector3d& start, const Eigen::Vector3d& end,
+    const double radius, const double height) const {
+  const auto snapshot = current();
+  if (snapshot == nullptr || !start.allFinite() || !end.allFinite() ||
+      !std::isfinite(radius) || radius < 0.0 || !std::isfinite(height) ||
+      height < 0.0) {
+    return VoxelStatus::kUnknown;
+  }
+  const auto& transform = snapshot->request.component_from_navigation;
+  const Eigen::Vector3d component_up =
+      transform.linear() * Eigen::Vector3d::UnitZ();
+  if (!component_up.isApprox(Eigen::Vector3d::UnitZ(), 1e-6)) {
+    return VoxelStatus::kUnknown;
+  }
+  return snapshot->map->getOccupiedOnlyCylinderPathStatus(
+      transform * start, transform * end, radius, height);
+}
+
 VoxelStatus MolaMap::getStrictBoxStatus(const Eigen::Vector3d& center,
                                         const Eigen::Vector3d& size) const {
   const auto snapshot = current();

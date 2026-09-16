@@ -120,6 +120,9 @@ class MolaMap : public MapInterface {
                             const Eigen::Vector3d& end,
                             const Eigen::Vector3d& box_size,
                             bool stop_at_unknown_voxel) const override;
+  VoxelStatus getOccupiedOnlyCylinderPathStatus(
+      const Eigen::Vector3d& start, const Eigen::Vector3d& end, double radius,
+      double height) const override;
   VoxelStatus getStrictBoxStatus(const Eigen::Vector3d& center,
                                  const Eigen::Vector3d& size) const override;
   VoxelStatus getStrictPathStatus(const Eigen::Vector3d& start,

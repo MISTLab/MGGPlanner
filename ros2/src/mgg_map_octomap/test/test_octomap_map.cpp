@@ -153,6 +153,124 @@ TEST(OctomapMap, OccupiedOnlySweepCoversEveryAabbFaceAndSegmentBoundary) {
   EXPECT_EQ(classify({0.10, 0.15, 0.0}), VoxelStatus::kFree);
 }
 
+TEST(OctomapMap, OccupiedOnlyCylinderUsesVoxelAabbAgainstSweptCapsule) {
+  const Eigen::Vector3d start(0.0, 0.0, 0.0);
+  const Eigen::Vector3d end(1.0, 0.0, 0.0);
+  constexpr double radius = 0.20;
+  constexpr double height = 0.40;
+  const auto classify = [&](const Eigen::Vector3d& obstacle,
+                            const Eigen::Vector3d& from,
+                            const Eigen::Vector3d& to) {
+    OctomapConfig cfg;
+    cfg.resolution = 0.10;
+    OctomapMap map(cfg);
+    EXPECT_NE(map.tree()->updateNode(
+                  octomap::point3d(static_cast<float>(obstacle.x()),
+                                   static_cast<float>(obstacle.y()),
+                                   static_cast<float>(obstacle.z())),
+                  true),
+              nullptr);
+    return map.getOccupiedOnlyCylinderPathStatus(from, to, radius, height);
+  };
+
+  // Every obstacle below lies in the swept square prism. The first cell's
+  // closest XY corner is sqrt(0.2^2 + 0.2^2) from the endpoint, so the
+  // true circular end cap excludes it even though a swept AABB would not.
+  EXPECT_EQ(classify({1.25, 0.25, 0.05}, start, end), VoxelStatus::kFree);
+  EXPECT_EQ(classify({1.25, 0.25, 0.05}, end, start),
+            VoxelStatus::kFree);
+
+  // Cell boxes, rather than only cell centers, intersect the capsule. Cover
+  // its interior, a tangential side face, the terminal cap, and a point body.
+  EXPECT_EQ(classify({0.55, 0.15, 0.05}, start, end),
+            VoxelStatus::kOccupied);
+  EXPECT_EQ(classify({0.55, 0.25, 0.05}, start, end),
+            VoxelStatus::kOccupied);
+  EXPECT_EQ(classify({1.25, 0.05, 0.05}, start, end),
+            VoxelStatus::kOccupied);
+  EXPECT_EQ(classify({0.25, 0.05, 0.05}, start, start),
+            VoxelStatus::kOccupied);
+  EXPECT_EQ(classify({0.55, 0.15, 0.05}, end, start),
+            VoxelStatus::kOccupied);
+
+  // Height is the full cylinder height. Occupied cells touching either
+  // horizontal face conservatively block the sweep.
+  EXPECT_EQ(classify({0.55, 0.05, 0.25}, start, end),
+            VoxelStatus::kOccupied);
+  EXPECT_EQ(classify({0.55, 0.05, -0.25}, start, end),
+            VoxelStatus::kOccupied);
+
+  // Closed lower faces are symmetric with upper faces. These cells touch
+  // only the negative Y side or the start cap respectively.
+  EXPECT_EQ(classify({0.55, -0.25, 0.05}, start, end),
+            VoxelStatus::kOccupied);
+  EXPECT_EQ(classify({-0.25, 0.05, 0.05}, start, end),
+            VoxelStatus::kOccupied);
+}
+
+TEST(OctomapMap, ZeroCylinderIncludesEveryCellTouchingItsBoundaryPoint) {
+  OctomapConfig cfg;
+  cfg.resolution = 0.10;
+  OctomapMap map(cfg);
+  // The occupied cell [-0.1,0]^3 touches the degenerate cylinder only at
+  // its upper corner. Closed-cell collision semantics still reject it.
+  ASSERT_NE(map.tree()->updateNode(octomap::point3d(-0.05F, -0.05F, -0.05F),
+                                   true),
+            nullptr);
+  EXPECT_EQ(map.getOccupiedOnlyCylinderPathStatus(
+                Eigen::Vector3d::Zero(), Eigen::Vector3d::Zero(), 0.0, 0.0),
+            VoxelStatus::kOccupied);
+}
+
+TEST(OctomapMap, ProductionResolutionTangenciesRemainConservative) {
+  const Eigen::Vector3d start(0.0, 0.0, 0.0);
+  const Eigen::Vector3d end(0.8, 0.0, 0.0);
+  const auto classify = [&](const Eigen::Vector3d& obstacle) {
+    OctomapConfig cfg;
+    cfg.resolution = 0.20;
+    OctomapMap map(cfg);
+    EXPECT_NE(map.tree()->updateNode(
+                  octomap::point3d(static_cast<float>(obstacle.x()),
+                                   static_cast<float>(obstacle.y()),
+                                   static_cast<float>(obstacle.z())),
+                  true),
+              nullptr);
+    return map.getOccupiedOnlyCylinderPathStatus(start, end, 0.20, 0.40);
+  };
+
+  // At the production map resolution these cells have nominal centers 0.3
+  // and faces at 0.2. Float-valued key centers must not turn exact contact
+  // into a tiny positive clearance on either the radial or vertical face.
+  EXPECT_EQ(classify({0.3, 0.3, 0.1}), VoxelStatus::kOccupied);
+  EXPECT_EQ(classify({0.3, 0.1, 0.3}), VoxelStatus::kOccupied);
+  EXPECT_EQ(classify({0.3, 0.1, -0.3}), VoxelStatus::kOccupied);
+}
+
+TEST(OctomapMap, OccupiedOnlyCylinderAllowsUnknownAndBoundsItsWork) {
+  OctomapConfig cfg;
+  cfg.resolution = 0.10;
+  OctomapMap map(cfg);
+  const Eigen::Vector3d start(0.05, 0.05, 0.05);
+  const Eigen::Vector3d end(1.05, 0.05, 0.05);
+
+  // Occupied-only semantics deliberately admit a completely sparse map.
+  EXPECT_EQ(map.getOccupiedOnlyCylinderPathStatus(start, end, 0.20, 0.30),
+            VoxelStatus::kFree);
+  const double nan = std::numeric_limits<double>::quiet_NaN();
+  EXPECT_EQ(map.getOccupiedOnlyCylinderPathStatus({nan, 0, 0}, end, 0.20,
+                                                   0.30),
+            VoxelStatus::kUnknown);
+  EXPECT_EQ(map.getOccupiedOnlyCylinderPathStatus(start, end, -0.01, 0.30),
+            VoxelStatus::kUnknown);
+  EXPECT_EQ(map.getOccupiedOnlyCylinderPathStatus(start, end, 0.20, nan),
+            VoxelStatus::kUnknown);
+  EXPECT_EQ(map.getOccupiedOnlyCylinderPathStatus(start, end, 4000.0, 0.30),
+            VoxelStatus::kUnknown);
+  EXPECT_EQ(map.getOccupiedOnlyCylinderPathStatus(
+                start, {500000.05, 0.05, 0.05}, 0.20, 0.30),
+            VoxelStatus::kUnknown);
+}
+
 TEST(OctomapMap, ExplicitQueriesRejectEvenOneUnknownKey) {
   OctomapConfig cfg;
   cfg.resolution = 0.05;

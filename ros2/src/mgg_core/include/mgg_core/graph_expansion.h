@@ -60,6 +60,10 @@ struct ExpandContext {
   /// mandatory before it can enter the graph. False keeps the hardware and
   /// legacy strict-volume prefilter.
   bool allow_unknown_lattice_body = false;
+  /// Qualified simulation bootstrap keeps the physical root at its odometry
+  /// height while the first edge is projected. This applies only when vertex
+  /// zero is the edge start; all later samples and endpoints remain projected.
+  bool preserve_hanging_root_start_height = false;
   /// Explicit-objective graph builds require a ground-projected candidate's
   /// final body box to be observed free. Explore leaves this false to retain
   /// its legacy frontier policy; explicit refinement still validates the full

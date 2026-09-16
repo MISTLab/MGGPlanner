@@ -55,6 +55,7 @@ double averageInclination(const std::vector<Eigen::Vector3d>& edge) {
 /// Can the robot travel the segment? Fills `projected_edge` for ground robots.
 bool edgeTraversable(const ExpandContext& ctx, const Eigen::Vector3d& start,
                      const Eigen::Vector3d& end, bool is_hanging,
+                     bool preserve_start_height,
                      std::vector<Eigen::Vector3d>& projected_edge,
                      ExpandGraphReport& rep) {
   if (ctx.robot->type == RobotType::kAerialRobot) {
@@ -63,7 +64,8 @@ bool edgeTraversable(const ExpandContext& ctx, const Eigen::Vector3d& start,
   }
   // Ground robot: the edge has to follow the terrain.
   const ProjectedEdgeStatus es = ctx.ground->getProjectedEdgeStatus(
-      start, end, ctx.robot_box_size, false, projected_edge, is_hanging);
+      start, end, ctx.robot_box_size, false, projected_edge, is_hanging,
+      preserve_start_height);
   ++rep.edge_status[static_cast<int>(es)];
   if (es == ProjectedEdgeStatus::kAdmissible) return true;
   if (es == ProjectedEdgeStatus::kSteep) ++rep.steep_edges;
@@ -174,6 +176,8 @@ void expandGraph(GraphManager& graph, Vertex& new_vertex,
   std::vector<Eigen::Vector3d> projected_edge;
   const bool is_hanging = nearest_vertex->is_hanging || new_vertex.is_hanging;
   bool admissible_edge = edgeTraversable(ctx, start_pos, end_pos, is_hanging,
+                                         ctx.preserve_hanging_root_start_height &&
+                                             nearest_vertex->id == 0,
                                          projected_edge, rep);
   if (admissible_edge && ctx.projected_edge_admissible &&
       !ctx.projected_edge_admissible(projected_edge)) {
@@ -258,7 +262,8 @@ void expandGraph(GraphManager& graph, Vertex& new_vertex,
     if (geofenceBlocks(ctx, p_start, p_end)) continue;
 
     std::vector<Eigen::Vector3d> neighbour_edge;
-    if (!edgeTraversable(ctx, p_start, p_end, false, neighbour_edge, rep)) {
+    if (!edgeTraversable(ctx, p_start, p_end, false, false, neighbour_edge,
+                         rep)) {
       continue;
     }
     if (ctx.projected_edge_admissible &&

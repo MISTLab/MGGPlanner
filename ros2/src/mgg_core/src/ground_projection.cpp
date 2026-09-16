@@ -65,7 +65,8 @@ double GroundProjection::projectSample(Eigen::Vector3d& sample,
 ProjectedEdgeStatus GroundProjection::getProjectedEdgeStatus(
     const Eigen::Vector3d& start, const Eigen::Vector3d& end,
     const Eigen::Vector3d& box_size, bool stop_at_unknown_voxel,
-    std::vector<Eigen::Vector3d>& projected_edge_out, bool is_hanging) const {
+    std::vector<Eigen::Vector3d>& projected_edge_out, bool is_hanging,
+    bool preserve_start_height) const {
   const double step_size = 2.0 * map_.getResolution();
   const double max_inclination = params_.max_inclination;
 
@@ -85,6 +86,10 @@ ProjectedEdgeStatus GroundProjection::getProjectedEdgeStatus(
     for (double step = 0.0; step < ray_len; step += step_size) {
       Eigen::Vector3d edge_point = start + step * ray_normed;
       last_point = edge_point;
+      if (preserve_start_height && step == 0.0) {
+        projected_edge.push_back(edge_point);
+        continue;
+      }
       VoxelStatus vs;
       const double ground_height = projectSample(edge_point, vs);
       // Intermediate points may hang only if an endpoint already does.
@@ -109,12 +114,14 @@ ProjectedEdgeStatus GroundProjection::getProjectedEdgeStatus(
   } else {
     VoxelStatus vs;
     Eigen::Vector3d start_m = start;
-    const double start_ground = projectSample(start_m, vs);
-    if ((vs == VoxelStatus::kUnknown || start_ground < 0.0) && !is_hanging) {
-      return ProjectedEdgeStatus::kHanging;
+    if (!preserve_start_height) {
+      const double start_ground = projectSample(start_m, vs);
+      if ((vs == VoxelStatus::kUnknown || start_ground < 0.0) && !is_hanging) {
+        return ProjectedEdgeStatus::kHanging;
+      }
+      if (vs == VoxelStatus::kOccupied && start_ground >= 0.0)
+        start_m(2) -= (start_ground - params_.max_ground_height);
     }
-    if (vs == VoxelStatus::kOccupied && start_ground >= 0.0)
-      start_m(2) -= (start_ground - params_.max_ground_height);
     projected_edge.push_back(start_m);
   }
 

@@ -159,6 +159,59 @@ TEST(GroundProjection, FlatEdgeIsAdmissible) {
   EXPECT_FALSE(path.empty());
 }
 
+TEST(GroundProjection, QualifiedRootPreservesPhysicalStartHeight) {
+  Terrain map;
+  PlanningParams params = makeParams();
+  params.max_step_height = 0.2;
+  GroundProjection gp(map, params);
+
+  std::vector<Eigen::Vector3d> ordinary;
+  ASSERT_EQ(gp.getProjectedEdgeStatus(
+                {0.0, 0.0, 0.65}, {1.0, 0.0, 0.5}, {0.2, 0.2, 0.2},
+                true, ordinary, true),
+            ProjectedEdgeStatus::kAdmissible);
+  ASSERT_FALSE(ordinary.empty());
+  EXPECT_LT(ordinary.front().z(), 0.55);
+
+  std::vector<Eigen::Vector3d> preserved;
+  ASSERT_EQ(gp.getProjectedEdgeStatus(
+                {0.0, 0.0, 0.65}, {1.0, 0.0, 0.5}, {0.2, 0.2, 0.2},
+                true, preserved, true, /*preserve_start_height=*/true),
+            ProjectedEdgeStatus::kAdmissible);
+  ASSERT_FALSE(preserved.empty());
+  EXPECT_NEAR(preserved.front().z(), 0.65, 1e-9);
+}
+
+class PhysicalStartObstacleTerrain : public Terrain {
+ public:
+  VoxelStatus getPathStatus(const Eigen::Vector3d& a,
+                            const Eigen::Vector3d& b,
+                            const Eigen::Vector3d& box,
+                            bool stop_at_unknown) const override {
+    if (a.z() > 0.6) return VoxelStatus::kOccupied;
+    return Terrain::getPathStatus(a, b, box, stop_at_unknown);
+  }
+};
+
+TEST(GroundProjection, PreservedStartStillRunsKnownCollisionCheck) {
+  PhysicalStartObstacleTerrain map;
+  PlanningParams params = makeParams();
+  params.max_step_height = 0.2;
+  GroundProjection gp(map, params);
+
+  std::vector<Eigen::Vector3d> ordinary;
+  EXPECT_EQ(gp.getProjectedEdgeStatus(
+                {0.0, 0.0, 0.65}, {1.0, 0.0, 0.5}, {0.2, 0.2, 0.2},
+                true, ordinary, true),
+            ProjectedEdgeStatus::kAdmissible);
+
+  std::vector<Eigen::Vector3d> preserved;
+  EXPECT_EQ(gp.getProjectedEdgeStatus(
+                {0.0, 0.0, 0.65}, {1.0, 0.0, 0.5}, {0.2, 0.2, 0.2},
+                true, preserved, true, /*preserve_start_height=*/true),
+            ProjectedEdgeStatus::kOccupied);
+}
+
 TEST(GroundProjection, SteepEdgeIsRejectedBeforeAnyMapQuery) {
   Terrain map;
   PlanningParams params = makeParams();
@@ -233,4 +286,3 @@ TEST(GroundProjection, ProjectsEndpointHeightToDrivingHeight) {
 }
 
 }  // namespace
-

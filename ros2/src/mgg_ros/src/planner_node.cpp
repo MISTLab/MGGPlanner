@@ -1015,16 +1015,26 @@ std::string PlannerNode::buildLocalGraph(bool strict_projected_endpoints) {
   mgg::StateVec root_state = current_state_;
   bool root_hanging = false;
   if (robot_params_.type == mgg::RobotType::kGroundRobot) {
-    Eigen::Vector3d pos(root_state[0], root_state[1], root_state[2]);
-    mgg::VoxelStatus vs;
-    const double ground_height = ground_->projectSample(pos, vs);
-    if (vs == mgg::VoxelStatus::kOccupied) {
-      root_state[2] = pos[2] - (ground_height - planning_params_.max_ground_height);
-    } else {
+    const bool preserve_physical_root =
+        map_backend_ == "mola_snapshot" && observed_ground_body_evidence_ &&
+        provisional_unknown_ground_;
+    if (preserve_physical_root) {
+      root_state = physicalAnchorAtDrivingHeight(current_state_);
       root_hanging = true;
-      // Odometry locates the base, whereas graph states locate the raised
-      // collision box. Preserve this offset even inside the sensor blind spot.
-      root_state[2] += planning_params_.max_ground_height - robot_params_.size[2] / 2.0;
+    } else {
+      Eigen::Vector3d pos(root_state[0], root_state[1], root_state[2]);
+      mgg::VoxelStatus vs;
+      const double ground_height = ground_->projectSample(pos, vs);
+      if (vs == mgg::VoxelStatus::kOccupied) {
+        root_state[2] =
+            pos[2] - (ground_height - planning_params_.max_ground_height);
+      } else {
+        root_hanging = true;
+        // Odometry locates the base, whereas graph states locate the raised
+        // collision box. Preserve this offset inside the sensor blind spot.
+        root_state[2] += planning_params_.max_ground_height -
+                         robot_params_.size[2] / 2.0;
+      }
     }
   }
   auto* root = new mgg::Vertex(0, root_state);
@@ -1032,8 +1042,9 @@ std::string PlannerNode::buildLocalGraph(bool strict_projected_endpoints) {
   // A single lidar return beneath the physical pose does not prove the
   // near-field connector between the robot and the first observed floor. In
   // the qualified simulation policy, keep only this local root eligible for
-  // the existing bounded hanging-edge bootstrap. Preserve its exact projected
-  // height above; all child vertices and all known-hazard checks remain strict.
+  // the existing bounded hanging-edge bootstrap. The qualified MOLA branch
+  // preserves its odometry-derived physical height above; all child vertices
+  // and all known-hazard checks remain strict.
   root->is_hanging =
       root_hanging ||
       (provisional_unknown_ground_ &&
@@ -1049,6 +1060,10 @@ std::string PlannerNode::buildLocalGraph(bool strict_projected_endpoints) {
   // when their body volume is not fully ray-observed; known occupied cells
   // still fail the prefilter. Hardware retains the strict default.
   ctx.allow_unknown_lattice_body = observed_ground_body_evidence_;
+  ctx.preserve_hanging_root_start_height =
+      map_backend_ == "mola_snapshot" && observed_ground_body_evidence_ &&
+      provisional_unknown_ground_ &&
+      robot_params_.type == mgg::RobotType::kGroundRobot;
   if (observed_ground_body_evidence_ &&
       robot_params_.type == mgg::RobotType::kGroundRobot) {
     // Explore bypasses explicit-objective grid refinement, so apply the same
@@ -1375,15 +1390,17 @@ bool PlannerNode::validateObjectiveStartSupport(
   Eigen::Vector3d body = footprint_body;
   if (observed_ground_body_evidence_ &&
       robot_params_.type == mgg::RobotType::kGroundRobot) {
-    // Objective states carry yaw, but the voxel map's box/path API is axis
-    // aligned. A square whose side is the rectangle diagonal contains the
-    // planning footprint at every yaw, preserving the occupied-space veto.
     const double xy_diagonal = footprint_body.head<2>().norm();
     body.x() = xy_diagonal;
     body.y() = xy_diagonal;
   }
+  const bool qualified_mola_body_envelope =
+      map_backend_ == "mola_snapshot" && observed_ground_body_evidence_ &&
+      provisional_unknown_ground_ &&
+      robot_params_.type == mgg::RobotType::kGroundRobot;
   if (ground_->getProjectedEdgeStatus(
-          anchor.head<3>(), supported.head<3>(), body,
+          anchor.head<3>(), supported.head<3>(),
+          qualified_mola_body_envelope ? footprint_body : body,
           /*stop_at_unknown_voxel=*/false, projected,
           /*is_hanging=*/true) != mgg::ProjectedEdgeStatus::kAdmissible ||
       projected.size() < 2) {
@@ -1497,9 +1514,20 @@ mgg::VoxelStatus PlannerNode::objectiveBodyStatus(
 mgg::VoxelStatus PlannerNode::objectiveSweptBodyStatus(
     const Eigen::Vector3d& from, const Eigen::Vector3d& to,
     const Eigen::Vector3d& body) const {
-  return observed_ground_body_evidence_
-             ? map_->getOccupiedOnlyPathStatus(from, to, body)
-             : map_->getStrictPathStatus(from, to, body);
+  if (observed_ground_body_evidence_) {
+    const Eigen::Vector3d planning_body = robot_params_.getPlanningSize();
+    if (map_backend_ == "mola_snapshot" && provisional_unknown_ground_ &&
+        robot_params_.type == mgg::RobotType::kGroundRobot) {
+      return map_->getOccupiedOnlyCylinderPathStatus(
+          from, to, 0.5 * planning_body.head<2>().norm(), planning_body.z());
+    }
+    Eigen::Vector3d legacy_body = planning_body;
+    const double diagonal = planning_body.head<2>().norm();
+    legacy_body.x() = diagonal;
+    legacy_body.y() = diagonal;
+    return map_->getOccupiedOnlyPathStatus(from, to, legacy_body);
+  }
+  return map_->getStrictPathStatus(from, to, body);
 }
 
 bool PlannerNode::objectiveFootprintTerrainSupported(
@@ -1687,10 +1715,6 @@ bool PlannerNode::objectiveTerrainPathSupported(
   }
   if (driving_path.empty()) return false;
   const Eigen::Vector3d footprint_body = robot_params_.getPlanningSize();
-  Eigen::Vector3d swept_body = footprint_body;
-  const double xy_diagonal = footprint_body.head<2>().norm();
-  swept_body.x() = xy_diagonal;
-  swept_body.y() = xy_diagonal;
   const Eigen::Vector3d physical_anchor =
       physicalAnchorAtDrivingHeight(current_state_).head<3>();
   for (std::size_t i = 0; i < driving_path.size(); ++i) {
@@ -1713,7 +1737,7 @@ bool PlannerNode::objectiveTerrainPathSupported(
         driving_path[i - 1] + robot_params_.center_offset;
     const Eigen::Vector3d to =
         driving_path[i] + robot_params_.center_offset;
-    if (objectiveSweptBodyStatus(from, to, swept_body) !=
+    if (objectiveSweptBodyStatus(from, to, footprint_body) !=
         mgg::VoxelStatus::kFree) {
       return false;
     }
@@ -2126,6 +2150,10 @@ PlannerNode::IndexedQueryContext PlannerNode::indexedQueryContext() const {
       objective_start_support_max_distance_m_;
   context.observed_ground_body_evidence = observed_ground_body_evidence_;
   context.provisional_unknown_ground = provisional_unknown_ground_;
+  context.preserve_physical_start_height =
+      map_backend_ == "mola_snapshot" && observed_ground_body_evidence_ &&
+      provisional_unknown_ground_ &&
+      robot_params_.type == mgg::RobotType::kGroundRobot;
   context.have_mapping_snapshot = have_mapping_snapshot_;
   context.mapping_snapshot_fresh_at_capture =
       have_mapping_snapshot_ &&
@@ -2262,15 +2290,39 @@ bool PlannerNode::queryIndexedMap(mgg::FeasiblePath& path,
     for (std::size_t segment = 1; segment < route.size(); ++segment) {
       const mgg::StateVec& a = route[segment - 1];
       const mgg::StateVec& b = route[segment];
-      const double distance = (b.head<3>() - a.head<3>()).norm();
+      // Qualified Explore terrain is indexed over XY. Keep its sample lattice
+      // stable when a bounded terrain correction changes only Z; the adjacent
+      // rise/inclination checks and native swept-body recheck still validate
+      // that corrected height. Every other caller retains full 3-D spacing.
+      const Eigen::Vector3d segment_delta = b.head<3>() - a.head<3>();
+      const double distance =
+          explore_route_recovery_allowed
+              ? segment_delta.head<2>().norm()
+              : segment_delta.norm();
       const double scaled_steps = distance / indexed_map_sample_spacing_m_;
       if (!std::isfinite(scaled_steps) ||
           scaled_steps > static_cast<double>(kMaxIndexedMapSamples)) {
         return fail(mgg::PlanningStatus::kBlocked,
                     "indexed map query sample budget exceeded");
       }
+      // Subtracting translated world coordinates can put an exact lattice
+      // multiple a few ulps above its integer (for example 100.3 - 100.0).
+      // Snap only within the floating-point error implied by those coordinate
+      // magnitudes; genuine over-spacing still receives another sample.
+      const double coordinate_scale =
+          std::max({1.0, a.head<3>().cwiseAbs().maxCoeff(),
+                    b.head<3>().cwiseAbs().maxCoeff()}) /
+          indexed_map_sample_spacing_m_;
+      const double nearest_steps = std::round(scaled_steps);
+      const double integer_tolerance =
+          16.0 * std::numeric_limits<double>::epsilon() *
+          std::max({1.0, std::abs(scaled_steps), coordinate_scale});
+      const double stable_scaled_steps =
+          std::abs(scaled_steps - nearest_steps) <= integer_tolerance
+              ? nearest_steps
+              : scaled_steps;
       const std::size_t steps = std::max<std::size_t>(
-          1, static_cast<std::size_t>(std::ceil(scaled_steps)));
+          1, static_cast<std::size_t>(std::ceil(stable_scaled_steps)));
       const std::size_t first_step = segment == 1 ? 0 : 1;
       const std::size_t additions = steps - first_step + 1;
       if (additions > kMaxIndexedMapSamples ||
@@ -2491,20 +2543,49 @@ bool PlannerNode::queryIndexedMap(mgg::FeasiblePath& path,
               response->ground_z[i]);
           const Eigen::Vector3d navigation_ground =
               context.component_from_navigation.inverse() * component_ground;
-          refined_base_z[i] =
+          const double fitted_base_z =
               navigation_ground.z() + context.physical_size.z() / 2.0;
-          if (!std::isfinite(refined_base_z[i])) {
+          if (!std::isfinite(fitted_base_z)) {
             return "indexed map ground refinement is non-finite";
           }
+          // Keep already-compatible poses at the exact height validated by
+          // the native planner. Samples that need a bounded correction move
+          // only to the nearest edge of the indexed agreement band. Missing
+          // intervals remain NaN here and are interpolated between these
+          // exact anchors below.
+          refined_base_z[i] = dense_base_states[i].z();
           if (ground_mismatch > indexed_map_ground_tolerance_m_ + 1e-9) {
+            const bool physical_start_sample =
+                explore_route_recovery_allowed &&
+                context.preserve_physical_start_height &&
+                dense_route_distance[i] <= 1e-9 &&
+                (dense_base_states[i].head<3>() -
+                 context.route_start.head<3>())
+                        .cwiseAbs()
+                        .maxCoeff() <= 1e-6;
+            const bool physical_start_mismatch =
+                physical_start_sample &&
+                ground_mismatch <= context.max_step_height + 1e-6;
             const bool bounded_refinement =
                 height_refinement_available && dense_xy_progress[i] > 1e-9 &&
                 ground_mismatch <= context.max_step_height + 1e-6;
-            if (!bounded_refinement) {
-              return "indexed map ground does not support the emitted body "
-                     "height";
+            if (!physical_start_mismatch && !bounded_refinement) {
+              char detail[192];
+              std::snprintf(
+                  detail, sizeof(detail),
+                  "indexed map ground does not support the emitted body "
+                  "height at sample %zu: mismatch %.6f m exceeds %.6f m",
+                  i, ground_mismatch, indexed_map_ground_tolerance_m_);
+              return std::string(detail);
             }
-            if (!first_refinement_sample) first_refinement_sample = i;
+            if (bounded_refinement) {
+              const double agreement_band = indexed_map_ground_tolerance_m_;
+              refined_base_z[i] = std::clamp(
+                  dense_base_states[i].z(),
+                  fitted_base_z - agreement_band,
+                  fitted_base_z + agreement_band);
+              if (!first_refinement_sample) first_refinement_sample = i;
+            }
           }
           const Eigen::Vector2d current_xy(request->samples[i].x,
                                            request->samples[i].y);
@@ -2648,6 +2729,33 @@ bool PlannerNode::queryIndexedMap(mgg::FeasiblePath& path,
       if (refined.size() < 2) {
         return fail(mgg::PlanningStatus::kBlocked,
                     "indexed map ground refinement has no emitted route");
+      }
+      // Height correction changes the exact 3-D sweep that the native graph
+      // approved. Recheck the corrected swept-body envelope against the same
+      // pinned native map before asking the indexed authority to validate it
+      // a second time. Terrain remains the indexed authority's responsibility
+      // on that second pass.
+      const double refined_body_radius = 0.5 * context.body.head<2>().norm();
+      for (std::size_t i = 1; i < refined.size(); ++i) {
+        if (std::chrono::steady_clock::now() > query_deadline) {
+          return fail(mgg::PlanningStatus::kBlocked,
+                      "indexed map query timed out");
+        }
+        Eigen::Vector3d from = refined[i - 1].head<3>() + context.center_offset;
+        Eigen::Vector3d to = refined[i].head<3>() + context.center_offset;
+        from.z() += context.graph_to_base;
+        to.z() += context.graph_to_base;
+        if (map_->getOccupiedOnlyCylinderPathStatus(
+                from, to, refined_body_radius, context.body.z()) !=
+            mgg::VoxelStatus::kFree) {
+          return fail(mgg::PlanningStatus::kBlocked,
+                      "indexed map refined route violates native body "
+                      "constraints");
+        }
+      }
+      if (std::chrono::steady_clock::now() > query_deadline) {
+        return fail(mgg::PlanningStatus::kBlocked,
+                    "indexed map query timed out");
       }
       path.poses.assign(refined.begin() + 1, refined.end());
       height_refinement_available = false;
@@ -3203,6 +3311,17 @@ void PlannerNode::onValidateObjectiveRoute(
   body.x() = diagonal;
   body.y() = diagonal;
   const Eigen::Vector3d center_offset = robot_params_.center_offset;
+  const bool qualified_mola_body_envelope =
+      map_backend_ == "mola_snapshot" && observed_ground_body_evidence_ &&
+      provisional_unknown_ground_ &&
+      robot_params_.type == mgg::RobotType::kGroundRobot;
+  const auto point_body_status =
+      [this, &body, qualified_mola_body_envelope](
+          const Eigen::Vector3d& center) {
+        return qualified_mola_body_envelope
+                   ? objectiveSweptBodyStatus(center, center, body)
+                   : objectiveBodyStatus(center, body);
+      };
   const mgg::StateVec physical_anchor =
       physicalAnchorAtDrivingHeight(current_state_);
   const auto isPhysicalCurrent = [this, &physical_anchor](
@@ -3219,7 +3338,7 @@ void PlannerNode::onValidateObjectiveRoute(
     const bool physical_current = isPhysicalCurrent(pose);
     const auto footprint_status =
         objectiveFootprintTerrainStatus(pose, footprint);
-    const mgg::VoxelStatus box = objectiveBodyStatus(pose + center_offset, body);
+    const mgg::VoxelStatus box = point_body_status(pose + center_offset);
     const bool geofence_invalid =
         planning_params_.geofence_checking_enable &&
         (!geofence_ ||
@@ -3239,11 +3358,54 @@ void PlannerNode::onValidateObjectiveRoute(
     }
     return;
   }
+  std::size_t exact_height_samples = 0;
   for (std::size_t segment = 1; segment < ahead.size(); ++segment) {
     std::vector<Eigen::Vector3d> projected;
-    const auto terrain = ground_->getProjectedEdgeStatus(
-        ahead[segment - 1].head<3>(), ahead[segment].head<3>(), body, false,
-        projected, true);
+    mgg::ProjectedEdgeStatus terrain = mgg::ProjectedEdgeStatus::kUnknown;
+    if (qualified_mola_body_envelope) {
+      // This route already passed the indexed terrain authority at these
+      // exact heights. Densify it for current-map footprint and capsule checks
+      // without borrowing a lateral native floor ray that would undo the
+      // bounded indexed correction.
+      const Eigen::Vector3d start = ahead[segment - 1].head<3>();
+      const Eigen::Vector3d end = ahead[segment].head<3>();
+      const Eigen::Vector3d delta = end - start;
+      const double length = delta.norm();
+      const double resolution = map_->getResolution();
+      const double inclination =
+          std::atan2(std::abs(delta.z()), delta.head<2>().norm());
+      if (!std::isfinite(length) || !std::isfinite(resolution) ||
+          resolution <= 0.0 ||
+          (std::abs(delta.z()) > planning_params_.max_step_height + 1e-6 &&
+           inclination > planning_params_.max_inclination + 1e-6)) {
+        terrain = mgg::ProjectedEdgeStatus::kSteep;
+      } else {
+        constexpr std::size_t kMaxExactHeightSamples = 4096;
+        const double scaled_steps = length / (2.0 * resolution);
+        if (!std::isfinite(scaled_steps) ||
+            scaled_steps > double(kMaxExactHeightSamples)) {
+          unavailable("remaining route validation exceeded its work bound");
+          return;
+        }
+        const std::size_t steps = std::max<std::size_t>(
+            1, static_cast<std::size_t>(std::ceil(scaled_steps)));
+        if (steps + 1 > kMaxExactHeightSamples - exact_height_samples) {
+          unavailable("remaining route validation exceeded its work bound");
+          return;
+        }
+        projected.reserve(steps + 1);
+        for (std::size_t i = 0; i <= steps; ++i) {
+          projected.push_back(start +
+                              (double(i) / double(steps)) * delta);
+        }
+        exact_height_samples += projected.size();
+        terrain = mgg::ProjectedEdgeStatus::kAdmissible;
+      }
+    } else {
+      terrain = ground_->getProjectedEdgeStatus(
+          ahead[segment - 1].head<3>(), ahead[segment].head<3>(), body, false,
+          projected, true);
+    }
     if (terrain == mgg::ProjectedEdgeStatus::kUnknown) {
       unavailable("map query was unavailable");
       return;
@@ -3252,7 +3414,7 @@ void PlannerNode::onValidateObjectiveRoute(
       invalid("remaining route intersects known terrain");
       return;
     }
-    if (provisional_unknown_ground_) {
+    if (provisional_unknown_ground_ && !qualified_mola_body_envelope) {
       double inherited_z = ahead[segment - 1].z();
       for (Eigen::Vector3d& pose : projected) {
         mgg::StateVec supported = mgg::StateVec::Zero();
@@ -3269,11 +3431,15 @@ void PlannerNode::onValidateObjectiveRoute(
     bool have_previous = false;
     for (std::size_t projected_index = 0;
          projected_index < projected.size(); ++projected_index) {
+      if (std::chrono::steady_clock::now() > validation_deadline) {
+        unavailable("remaining route validation exceeded its time bound");
+        return;
+      }
       const Eigen::Vector3d& pose = projected[projected_index];
       const bool physical_current =
           segment == 1 && projected_index == 0 && isPhysicalCurrent(pose);
       const Eigen::Vector3d center = pose + center_offset;
-      const mgg::VoxelStatus box = objectiveBodyStatus(center, body);
+      const mgg::VoxelStatus box = point_body_status(center);
       if (box == mgg::VoxelStatus::kOccupied) {
         invalid("remaining route intersects known occupied space");
         return;

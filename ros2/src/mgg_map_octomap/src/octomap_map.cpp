@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <limits>
 
 namespace mgg {
 namespace {
@@ -14,6 +15,69 @@ inline octomap::point3d toOct(const Eigen::Vector3d& v) {
 
 inline Eigen::Vector3d toEigen(const octomap::point3d& p) {
   return Eigen::Vector3d(p.x(), p.y(), p.z());
+}
+
+double pointSegmentDistanceSquared(const Eigen::Vector2d& point,
+                                   const Eigen::Vector2d& a,
+                                   const Eigen::Vector2d& b) {
+  const Eigen::Vector2d segment = b - a;
+  const double length_squared = segment.squaredNorm();
+  if (length_squared <= 1e-24) return (point - a).squaredNorm();
+  const double t = std::clamp((point - a).dot(segment) / length_squared,
+                              0.0, 1.0);
+  return (point - (a + t * segment)).squaredNorm();
+}
+
+double pointBoxDistanceSquared(const Eigen::Vector2d& point,
+                               const Eigen::Vector2d& lower,
+                               const Eigen::Vector2d& upper) {
+  const Eigen::Vector2d outside =
+      (lower - point).cwiseMax(Eigen::Vector2d::Zero()) +
+      (point - upper).cwiseMax(Eigen::Vector2d::Zero());
+  return outside.squaredNorm();
+}
+
+bool segmentIntersectsBox(const Eigen::Vector2d& a,
+                          const Eigen::Vector2d& b,
+                          const Eigen::Vector2d& lower,
+                          const Eigen::Vector2d& upper) {
+  double first = 0.0;
+  double last = 1.0;
+  const Eigen::Vector2d direction = b - a;
+  for (int axis = 0; axis < 2; ++axis) {
+    if (std::abs(direction[axis]) <= 1e-15) {
+      if (a[axis] < lower[axis] || a[axis] > upper[axis]) return false;
+      continue;
+    }
+    double enter = (lower[axis] - a[axis]) / direction[axis];
+    double leave = (upper[axis] - a[axis]) / direction[axis];
+    if (enter > leave) std::swap(enter, leave);
+    first = std::max(first, enter);
+    last = std::min(last, leave);
+    if (first > last) return false;
+  }
+  return true;
+}
+
+double segmentBoxDistanceSquared(const Eigen::Vector2d& a,
+                                 const Eigen::Vector2d& b,
+                                 const Eigen::Vector2d& center,
+                                 double half_cell) {
+  const Eigen::Vector2d lower =
+      center - Eigen::Vector2d::Constant(half_cell);
+  const Eigen::Vector2d upper =
+      center + Eigen::Vector2d::Constant(half_cell);
+  if (segmentIntersectsBox(a, b, lower, upper)) return 0.0;
+  double distance = std::min(pointBoxDistanceSquared(a, lower, upper),
+                             pointBoxDistanceSquared(b, lower, upper));
+  for (double x : {lower.x(), upper.x()}) {
+    for (double y : {lower.y(), upper.y()}) {
+      distance = std::min(
+          distance,
+          pointSegmentDistanceSquared(Eigen::Vector2d(x, y), a, b));
+    }
+  }
+  return distance;
 }
 
 }  // namespace
@@ -310,6 +374,113 @@ VoxelStatus OctomapMap::getPathStatus(const Eigen::Vector3d& start,
     if (s == VoxelStatus::kUnknown) saw_unknown = true;
   }
   return saw_unknown ? VoxelStatus::kUnknown : VoxelStatus::kFree;
+}
+
+VoxelStatus OctomapMap::getOccupiedOnlyCylinderPathStatus(
+    const Eigen::Vector3d& start, const Eigen::Vector3d& end,
+    const double radius, const double height) const {
+  if (!start.allFinite() || !end.allFinite() || !std::isfinite(radius) ||
+      radius < 0.0 || !std::isfinite(height) || height < 0.0) {
+    return VoxelStatus::kUnknown;
+  }
+  const double resolution = tree_->getResolution();
+  const double length = (end - start).norm();
+  if (!std::isfinite(resolution) || resolution <= 0.0 ||
+      !std::isfinite(length)) {
+    return VoxelStatus::kUnknown;
+  }
+  constexpr std::uint64_t kMaxWork = 1u << 22;
+  const double steps_d = std::max(1.0, std::ceil(length / resolution));
+  if (!std::isfinite(steps_d) || steps_d > double(kMaxWork)) {
+    return VoxelStatus::kUnknown;
+  }
+  const auto steps = static_cast<std::uint64_t>(steps_d);
+  const Eigen::Vector3d step = (end - start) / double(steps);
+  const double extent = resolution * 32768.0;
+  const double half_cell = 0.5 * resolution;
+  std::uint64_t work = 0;
+  for (std::uint64_t i = 0; i < steps; ++i) {
+    const Eigen::Vector3d a = start + double(i) * step;
+    const Eigen::Vector3d b = a + step;
+    const double coordinate_scale = std::max(
+        {1.0, resolution, radius, height, a.cwiseAbs().maxCoeff(),
+         b.cwiseAbs().maxCoeff()});
+    // OctoMap stores query coordinates in float point3d values even though
+    // its resolution and key conversion API use double. Treat closed voxel
+    // faces within that representation error as touching, rather than losing
+    // negative/radial/Z tangencies after float conversion.
+    const double face_epsilon =
+        16.0 * double(std::numeric_limits<float>::epsilon()) *
+        coordinate_scale;
+    const Eigen::Vector3d lower(
+        std::min(a.x(), b.x()) - radius,
+        std::min(a.y(), b.y()) - radius,
+        std::min(a.z(), b.z()) - 0.5 * height);
+    const Eigen::Vector3d upper(
+        std::max(a.x(), b.x()) + radius,
+        std::max(a.y(), b.y()) + radius,
+        std::max(a.z(), b.z()) + 0.5 * height);
+    const Eigen::Vector3d padded_lower =
+        lower - Eigen::Vector3d::Constant(resolution);
+    const Eigen::Vector3d padded_upper =
+        upper + Eigen::Vector3d::Constant(resolution);
+    if (!std::isfinite(extent) || extent <= 0.0 || !lower.allFinite() ||
+        !upper.allFinite() || !padded_lower.allFinite() ||
+        !padded_upper.allFinite() ||
+        (padded_lower.array() < -extent).any() ||
+        (padded_upper.array() >= extent).any()) {
+      return VoxelStatus::kUnknown;
+    }
+    octomap::OcTreeKey first, last;
+    if (!tree_->coordToKeyChecked(toOct(padded_lower), first) ||
+        !tree_->coordToKeyChecked(toOct(padded_upper), last)) {
+      return VoxelStatus::kUnknown;
+    }
+    std::uint64_t sample_work = 1;
+    for (int axis = 0; axis < 3; ++axis) {
+      const std::uint64_t count =
+          std::uint64_t(last[axis]) - first[axis] + 1;
+      if (count > (kMaxWork - work) / sample_work) {
+        return VoxelStatus::kUnknown;
+      }
+      sample_work *= count;
+    }
+    work += sample_work;
+    const Eigen::Vector2d a_xy = a.head<2>();
+    const Eigen::Vector2d b_xy = b.head<2>();
+    const double radius_squared =
+        (radius + face_epsilon) * (radius + face_epsilon);
+    for (std::uint32_t x = first[0]; x <= last[0]; ++x) {
+      for (std::uint32_t y = first[1]; y <= last[1]; ++y) {
+        const double cell_x =
+            tree_->keyToCoord(static_cast<octomap::key_type>(x));
+        const double cell_y =
+            tree_->keyToCoord(static_cast<octomap::key_type>(y));
+        if (segmentBoxDistanceSquared(
+                a_xy, b_xy, Eigen::Vector2d(cell_x, cell_y),
+                half_cell) > radius_squared) {
+          continue;
+        }
+        for (std::uint32_t z = first[2]; z <= last[2]; ++z) {
+          const octomap::OcTreeKey key(
+              static_cast<octomap::key_type>(x),
+              static_cast<octomap::key_type>(y),
+              static_cast<octomap::key_type>(z));
+          const double cell_z =
+              tree_->keyToCoord(static_cast<octomap::key_type>(z));
+          if (cell_z + half_cell < lower.z() - face_epsilon ||
+              cell_z - half_cell > upper.z() + face_epsilon) {
+            continue;
+          }
+          const octomap::point3d cell_center = tree_->keyToCoord(key);
+          if (statusAt(cell_center) == VoxelStatus::kOccupied) {
+            return VoxelStatus::kOccupied;
+          }
+        }
+      }
+    }
+  }
+  return VoxelStatus::kFree;
 }
 
 VoxelStatus OctomapMap::getStrictPathStatus(

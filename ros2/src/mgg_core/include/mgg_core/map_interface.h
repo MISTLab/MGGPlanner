@@ -224,6 +224,67 @@ class MapInterface {
     }
     return VoxelStatus::kFree;
   }
+
+  /// Occupancy of a vertical circular body swept between two centres.
+  /// Unknown air is admissible, while invalid/unbounded queries and any known
+  /// occupied voxel reject. Backends may override this to enumerate their
+  /// native grid without a map call per XY cell.
+  virtual VoxelStatus getOccupiedOnlyCylinderPathStatus(
+      const Eigen::Vector3d& start, const Eigen::Vector3d& end, double radius,
+      double height) const {
+    if (!start.allFinite() || !end.allFinite() || !std::isfinite(radius) ||
+        radius < 0.0 || !std::isfinite(height) || height < 0.0) {
+      return VoxelStatus::kUnknown;
+    }
+    const double resolution = getResolution();
+    const double length = (end - start).norm();
+    if (!std::isfinite(resolution) || resolution <= 0.0 ||
+        !std::isfinite(length)) {
+      return VoxelStatus::kUnknown;
+    }
+    constexpr std::uint64_t kMaxWork = 1u << 22;
+    constexpr std::size_t kMaxCircleCells = 4096;
+    const double steps_d = std::max(1.0, std::ceil(length / resolution));
+    if (!std::isfinite(steps_d) || steps_d > double(kMaxWork)) {
+      return VoxelStatus::kUnknown;
+    }
+    const auto steps = static_cast<std::uint64_t>(steps_d);
+    const Eigen::Vector3d step = (end - start) / double(steps);
+    const double sample_radius = radius + 0.5 * step.head<2>().norm();
+    const double sample_height = height + std::abs(step.z());
+    const double z_cells_d = std::ceil(sample_height / resolution) + 2.0;
+    if (!std::isfinite(sample_radius) || !std::isfinite(sample_height) ||
+        !std::isfinite(z_cells_d) || z_cells_d < 1.0 ||
+        z_cells_d > double(kMaxWork)) {
+      return VoxelStatus::kUnknown;
+    }
+    const auto z_cells = static_cast<std::uint64_t>(z_cells_d);
+    std::uint64_t work = 0;
+    std::vector<XYCellCenter> cells;
+    for (std::uint64_t i = 0; i < steps; ++i) {
+      const Eigen::Vector3d center =
+          start + (double(i) + 0.5) * step;
+      if (work > kMaxWork - kMaxCircleCells) {
+        return VoxelStatus::kUnknown;
+      }
+      work += kMaxCircleCells;
+      if (!getCircleIntersectingXYCellCenters(
+              center.head<2>(), sample_radius, kMaxCircleCells, cells)) {
+        return VoxelStatus::kUnknown;
+      }
+      if (cells.size() > (kMaxWork - work) / z_cells) {
+        return VoxelStatus::kUnknown;
+      }
+      work += static_cast<std::uint64_t>(cells.size()) * z_cells;
+      for (const XYCellCenter& cell : cells) {
+        const VoxelStatus status = getBoxStatus(
+            Eigen::Vector3d(cell.center.x(), cell.center.y(), center.z()),
+            Eigen::Vector3d(0.0, 0.0, sample_height), false);
+        if (status != VoxelStatus::kFree) return status;
+      }
+    }
+    return VoxelStatus::kFree;
+  }
   // ------------------------------------------------------- volumetric gain
 
   /// Casts a ray to every endpoint and tallies what each one passes through.

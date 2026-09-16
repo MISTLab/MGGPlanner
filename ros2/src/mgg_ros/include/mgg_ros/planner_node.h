@@ -107,6 +107,7 @@ class PlannerNode : public rclcpp::Node {
     double max_provisional_ground_prefix = 0.0;
     bool observed_ground_body_evidence = false;
     bool provisional_unknown_ground = false;
+    bool preserve_physical_start_height = false;
     bool have_mapping_snapshot = false;
     bool mapping_snapshot_fresh_at_capture = false;
     mgg_msgs::msg::MappingSnapshot mapping_snapshot;

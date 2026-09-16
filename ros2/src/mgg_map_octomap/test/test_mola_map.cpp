@@ -287,6 +287,73 @@ TEST(MolaMap, InvalidAndUnrepresentableQueriesRemainUnknown) {
             VoxelStatus::kUnknown);
 }
 
+TEST(MolaMap, OccupiedOnlyCylinderPreservesRotatedCapsuleGeometry) {
+  Eigen::Isometry3d component_from_navigation = Eigen::Isometry3d::Identity();
+  component_from_navigation.linear() =
+      Eigen::AngleAxisd(0.37, Eigen::Vector3d::UnitZ()).toRotationMatrix();
+  component_from_navigation.translation() = Eigen::Vector3d(2.0, -1.0, 0.4);
+  const Eigen::Vector3d component_start(0.1, 0.1, 0.1);
+  const Eigen::Vector3d component_end(1.1, 0.1, 0.1);
+  const Eigen::Vector3d navigation_start =
+      component_from_navigation.inverse() * component_start;
+  const Eigen::Vector3d navigation_end =
+      component_from_navigation.inverse() * component_end;
+  constexpr double radius = 0.30;
+  constexpr double height = 0.40;
+  const auto classify = [&](const Voxel& obstacle,
+                            const Eigen::Vector3d& from,
+                            const Eigen::Vector3d& to) {
+    Publication publication;
+    MolaMap provider(config(publication));
+    const auto request = publication.publish(
+        0, {obstacle}, freeBlock(), true, component_from_navigation);
+    provider.requestSnapshot(request);
+    if (!waitFor([&]() { return provider.getStatus(); })) {
+      ADD_FAILURE() << provider.lastError();
+      return VoxelStatus::kUnknown;
+    }
+    return provider.getOccupiedOnlyCylinderPathStatus(from, to, radius,
+                                                       height);
+  };
+
+  // The {6,2,0} cell occupies x=[1.2,1.4], y=[0.4,0.6] in component
+  // coordinates. Its closest corner is sqrt(0.1^2 + 0.3^2) from the end
+  // cap, outside radius 0.3 while still inside its enclosing square.
+  EXPECT_EQ(classify({6, 2, 0}, navigation_start, navigation_end),
+            VoxelStatus::kFree);
+  EXPECT_EQ(classify({6, 2, 0}, navigation_end, navigation_start),
+            VoxelStatus::kFree);
+
+  // These cell AABBs respectively overlap and touch the cylindrical side.
+  EXPECT_EQ(classify({2, 1, 0}, navigation_start, navigation_end),
+            VoxelStatus::kOccupied);
+  EXPECT_EQ(classify({2, 2, 0}, navigation_start, navigation_end),
+            VoxelStatus::kOccupied);
+  EXPECT_EQ(classify({2, 1, 0}, navigation_end, navigation_start),
+            VoxelStatus::kOccupied);
+}
+
+TEST(MolaMap, OccupiedOnlyCylinderRejectsTiltedOrExcessiveQueries) {
+  Publication publication;
+  Eigen::Isometry3d component_from_navigation = Eigen::Isometry3d::Identity();
+  component_from_navigation.linear() =
+      Eigen::AngleAxisd(0.05, Eigen::Vector3d::UnitX()).toRotationMatrix();
+  const auto request = publication.publish(
+      0, {{2, 1, 0}}, freeBlock(), true, component_from_navigation);
+  MolaMap provider(config(publication));
+  provider.requestSnapshot(request);
+  ASSERT_TRUE(waitFor([&]() { return provider.getStatus(); }))
+      << provider.lastError();
+
+  const Eigen::Vector3d start(0.1, 0.1, 0.1);
+  const Eigen::Vector3d end(1.1, 0.1, 0.1);
+  EXPECT_EQ(provider.getOccupiedOnlyCylinderPathStatus(start, end, 0.30, 0.40),
+            VoxelStatus::kUnknown);
+  EXPECT_EQ(provider.getOccupiedOnlyCylinderPathStatus(start, end, 4000.0,
+                                                        0.40),
+            VoxelStatus::kUnknown);
+}
+
 TEST(MolaMap, CorrectedSnapshotAtomicallyRetractsOldGeometry) {
   Publication publication;
   MolaMap provider(config(publication));
