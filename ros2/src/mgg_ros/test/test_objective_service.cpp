@@ -2533,6 +2533,33 @@ TEST(PlannerObjective, BlindStartBuilderReachesSupportPastOrdinaryEdgeLimit) {
       << response->reason;
 }
 
+TEST(PlannerObjective, FinitePhysicalRootRetainsBoundedBlindStartEligibility) {
+  rclcpp::NodeOptions options;
+  options.parameter_overrides(
+      {rclcpp::Parameter("use_sim_time", true),
+       rclcpp::Parameter("map.resolution", 0.05),
+       rclcpp::Parameter("objective_body_evidence_policy", "observed_ground"),
+       rclcpp::Parameter("objective_ground_evidence_policy",
+                         "provisional_unknown")});
+  using Peer = mgg_ros::PlannerNodeTestPeer;
+
+  auto planner = std::make_shared<mgg_ros::PlannerNode>(options);
+  Peer::configureBlindStartScene(*planner);
+  // An isolated measured patch at the physical root must not hide the real
+  // near-field floor gap before the first supported destination.
+  Peer::addBlindStartKnownFloor(*planner, 0.0, 0.0);
+  const std::string summary = Peer::rebuildBlindStartLocalGraph(*planner);
+  EXPECT_GT(Peer::localVertices(*planner), 1u) << summary;
+
+  auto blocked = std::make_shared<mgg_ros::PlannerNode>(options);
+  Peer::configureBlindStartScene(*blocked);
+  Peer::addBlindStartKnownFloor(*blocked, 0.0, 0.0);
+  Peer::addGridObstacle(*blocked, 0.325, true, 0.60);
+  const std::string blocked_summary =
+      Peer::rebuildBlindStartLocalGraph(*blocked);
+  EXPECT_EQ(Peer::localVertices(*blocked), 1u) << blocked_summary;
+}
+
 TEST(PlannerObjective, BlindStartRefusesWallUnknownStepAndObservedDrop) {
   rclcpp::NodeOptions options;
   options.parameter_overrides(
@@ -3381,6 +3408,23 @@ TEST(IndexedObjectiveService, BatchedQueryIsBoundedAndUsesComponentFrame) {
       std::numeric_limits<std::size_t>::max()};
   std::atomic<std::size_t> step_sample{std::numeric_limits<std::size_t>::max()};
   std::atomic<std::size_t> drop_sample{std::numeric_limits<std::size_t>::max()};
+  enum TerrainCase : int {
+    kOrdinaryTerrain = 0,
+    kTwoBlindIntervals,
+    kOverlongInternalGap,
+    kTerminalGap,
+    kFiniteRootThenBlind,
+    kOccupiedInsideGap,
+    kLowClearanceInsideGap,
+    kRoughClosingSupport,
+    kStepInsideGap,
+    kDropInsideGap,
+    kGroundOnlyMissing,
+    kRoughnessOnlyMissing,
+    kStepAcrossGap,
+    kClosingHeightMismatch,
+  };
+  std::atomic<int> terrain_case{kOrdinaryTerrain};
   std::atomic<bool> received_stop_at_unknown{true};
   std::vector<geometry_msgs::msg::Point> received;
   auto service = server->create_service<Query>(
@@ -3390,7 +3434,7 @@ TEST(IndexedObjectiveService, BatchedQueryIsBoundedAndUsesComponentFrame) {
        &received_max_step, &received_max_drop, &sample_occupancy,
        &sample_clearance, &blind_ground_prefix, &blind_clearance_prefix,
        &blind_ground_sample, &step_sample, &drop_sample,
-       &received_stop_at_unknown, &received](
+       &terrain_case, &received_stop_at_unknown, &received](
           const Query::Request::SharedPtr request,
           Query::Response::SharedPtr response) {
         received = request->samples;
@@ -3411,8 +3455,29 @@ TEST(IndexedObjectiveService, BatchedQueryIsBoundedAndUsesComponentFrame) {
         response->ground_z.reserve(n);
         for (std::size_t i = 0; i < n; ++i) {
           const auto& sample = request->samples[i];
+          const int active_case = terrain_case.load();
+          const bool two_interval_blind =
+              active_case == kTwoBlindIntervals &&
+              (i < 3 || (i >= 5 && i < 8));
+          const bool overlong_blind =
+              active_case == kOverlongInternalGap && i >= 3 && i < 13;
+          const bool terminal_blind = active_case == kTerminalGap && i >= 3;
+          const bool finite_root_then_blind =
+              active_case == kFiniteRootThenBlind && i >= 2;
+          const bool hazard_gap =
+              active_case >= kOccupiedInsideGap &&
+              active_case <= kDropInsideGap && i >= 3 && i < 5;
+          const bool mismatch_gap =
+              (active_case == kStepAcrossGap ||
+               active_case == kClosingHeightMismatch) &&
+              i >= 3 && i < 5;
+          const bool scenario_ground_missing =
+              two_interval_blind || overlong_blind || terminal_blind ||
+              finite_root_then_blind || hazard_gap || mismatch_gap ||
+              (active_case == kGroundOnlyMissing && i == 4);
           response->ground_z.push_back(
-              (i < blind_ground_prefix.load() || i == blind_ground_sample.load())
+              (i < blind_ground_prefix.load() ||
+               i == blind_ground_sample.load() || scenario_ground_missing)
               ? std::numeric_limits<double>::quiet_NaN()
               : sample.z - ground_from_sample.load() + ground_offset.load());
         }
@@ -3422,6 +3487,32 @@ TEST(IndexedObjectiveService, BatchedQueryIsBoundedAndUsesComponentFrame) {
         }
         if (blind_ground_sample.load() < n) {
           response->roughness[blind_ground_sample.load()] =
+              std::numeric_limits<double>::quiet_NaN();
+        }
+        const int active_case = terrain_case.load();
+        const auto set_missing_roughness = [&response, n](std::size_t begin,
+                                                          std::size_t end) {
+          for (std::size_t i = begin; i < std::min(n, end); ++i) {
+            response->roughness[i] =
+                std::numeric_limits<double>::quiet_NaN();
+          }
+        };
+        if (active_case == kTwoBlindIntervals) {
+          set_missing_roughness(0, 3);
+          set_missing_roughness(5, 8);
+        } else if (active_case == kOverlongInternalGap) {
+          set_missing_roughness(3, 13);
+        } else if (active_case == kTerminalGap) {
+          set_missing_roughness(3, n);
+        } else if (active_case == kFiniteRootThenBlind) {
+          set_missing_roughness(2, n);
+        } else if ((active_case >= kOccupiedInsideGap &&
+                    active_case <= kDropInsideGap) ||
+                   active_case == kStepAcrossGap ||
+                   active_case == kClosingHeightMismatch) {
+          set_missing_roughness(3, 5);
+        } else if (active_case == kRoughnessOnlyMissing && n > 4) {
+          response->roughness[4] =
               std::numeric_limits<double>::quiet_NaN();
         }
         response->clearance.assign(n, sample_clearance.load());
@@ -3434,6 +3525,19 @@ TEST(IndexedObjectiveService, BatchedQueryIsBoundedAndUsesComponentFrame) {
         response->drop.assign(n, false);
         if (step_sample.load() < n) response->step[step_sample.load()] = true;
         if (drop_sample.load() < n) response->drop[drop_sample.load()] = true;
+        if (n > 5 && active_case == kOccupiedInsideGap) {
+          response->occupancy[4] = Query::Response::OCCUPIED;
+        } else if (n > 5 && active_case == kLowClearanceInsideGap) {
+          response->clearance[4] = 0.01;
+        } else if (n > 5 && active_case == kRoughClosingSupport) {
+          response->roughness[5] = 0.20;
+        } else if (n > 5 && active_case == kStepInsideGap) {
+          response->step[4] = true;
+        } else if (n > 5 && active_case == kDropInsideGap) {
+          response->drop[4] = true;
+        } else if (n > 5 && active_case == kClosingHeightMismatch) {
+          response->ground_z[5] += 0.20;
+        }
       });
   rclcpp::executors::MultiThreadedExecutor executor(
       rclcpp::ExecutorOptions{}, 3);
@@ -3506,13 +3610,39 @@ TEST(IndexedObjectiveService, BatchedQueryIsBoundedAndUsesComponentFrame) {
   path.poses.push_back(mgg::StateVec(1.0, 0.0, 0.0, 0.0));
   EXPECT_FALSE(mgg_ros::PlannerNodeTestPeer::query(*planner, path));
   EXPECT_FALSE(path.indexed_map_validated);
+  EXPECT_NE(path.reason.find("ground or roughness is unavailable"),
+            std::string::npos);
 
-  // The separately qualified provisional policy admits only the leading
-  // sensor-blind connector. At least one later sample must retain exact
-  // measured terrain support.
+  // The separately qualified provisional policy admits only bounded,
+  // finite-supported sensor-blind connectors.
   mgg_ros::PlannerNodeTestPeer::setProvisionalUnknownGround(*planner, true);
   sample_occupancy = Query::Response::FREE;
   sample_clearance = 100.0;
+  blind_ground_prefix = 0;
+
+  // A fully measured stationary route never consumes the provisional policy.
+  // It remains valid for generic Navigate/Home callers even though Explore
+  // separately requires progress before dispatch.
+  path.status = mgg::PlanningStatus::kSucceeded;
+  path.poses = {mgg::StateVec(0.0, 0.0, 0.0, 0.0)};
+  EXPECT_TRUE(mgg_ros::PlannerNodeTestPeer::query(*planner, path));
+  EXPECT_TRUE(path.indexed_map_validated);
+
+  // Fully observed slopes retain the ordinary adjacent-sample inclination
+  // rule; the cross-gap step cap must not apply when no gap was used.
+  path.status = mgg::PlanningStatus::kSucceeded;
+  path.poses = {mgg::StateVec(0.0, 0.0, 0.0, 0.0),
+                mgg::StateVec(1.2, 0.0, 0.30, 0.0)};
+  EXPECT_TRUE(mgg_ros::PlannerNodeTestPeer::query(*planner, path));
+  EXPECT_TRUE(path.indexed_map_validated);
+
+  // A vertical, zero-XY route still receives the ordinary known-step veto.
+  path.status = mgg::PlanningStatus::kSucceeded;
+  path.poses = {mgg::StateVec(0.0, 0.0, 0.0, 0.0),
+                mgg::StateVec(0.0, 0.0, 0.30, 0.0)};
+  EXPECT_FALSE(mgg_ros::PlannerNodeTestPeer::query(*planner, path));
+  EXPECT_NE(path.reason.find("step or inclination limits"), std::string::npos);
+
   blind_ground_prefix = 2;
   blind_clearance_prefix = 2;
   path.status = mgg::PlanningStatus::kSucceeded;
@@ -3520,10 +3650,103 @@ TEST(IndexedObjectiveService, BatchedQueryIsBoundedAndUsesComponentFrame) {
   EXPECT_TRUE(mgg_ros::PlannerNodeTestPeer::query(*planner, path));
   EXPECT_TRUE(path.indexed_map_validated);
 
+  // Explore includes its local root in the path, after queryIndexedMap has
+  // already prepended current_state. Finite duplicate root samples are exact
+  // checked but cannot close the blind prefix until positive XY progress.
+  blind_ground_prefix = 0;
+  blind_clearance_prefix = 0;
+  path.status = mgg::PlanningStatus::kSucceeded;
+  path.poses = {mgg::StateVec(0.0, 0.0, 0.0, 0.0),
+                mgg::StateVec(1.2, 0.0, 0.0, 0.0)};
+  blind_ground_sample = 2;
+  EXPECT_TRUE(mgg_ros::PlannerNodeTestPeer::query(*planner, path));
+  EXPECT_TRUE(path.indexed_map_validated);
+
+  // A later gap is also admissible only when finite support brackets it within
+  // the same connector bound.
+  path.status = mgg::PlanningStatus::kSucceeded;
+  blind_ground_sample = 3;
+  EXPECT_TRUE(mgg_ros::PlannerNodeTestPeer::query(*planner, path));
+  EXPECT_TRUE(path.indexed_map_validated);
+  blind_ground_sample = std::numeric_limits<std::size_t>::max();
+  blind_ground_prefix = 2;
+  blind_clearance_prefix = 2;
+
+  // Faithful sparse-lidar shape: a blind start, finite terrain, a second
+  // bounded missing interval, and a finite endpoint. UNKNOWN body volume and
+  // NaN clearance remain qualified only by the simulation policy.
+  blind_ground_prefix = 0;
+  blind_clearance_prefix = 0;
+  terrain_case = kTwoBlindIntervals;
+  sample_occupancy = Query::Response::UNKNOWN;
+  sample_clearance = std::numeric_limits<double>::quiet_NaN();
+  path.status = mgg::PlanningStatus::kSucceeded;
+  path.poses = {mgg::StateVec(0.0, 0.0, 0.0, 0.0),
+                mgg::StateVec(2.4, 0.0, 0.0, 0.0)};
+  EXPECT_TRUE(mgg_ros::PlannerNodeTestPeer::query(*planner, path));
+  EXPECT_TRUE(path.indexed_map_validated);
+  ASSERT_EQ(received.size(), 10u);
+
+  terrain_case = kOverlongInternalGap;
+  sample_occupancy = Query::Response::FREE;
+  sample_clearance = 100.0;
+  path.status = mgg::PlanningStatus::kSucceeded;
+  path.poses = {mgg::StateVec(0.0, 0.0, 0.0, 0.0),
+                mgg::StateVec(4.2, 0.0, 0.0, 0.0)};
+  EXPECT_FALSE(mgg_ros::PlannerNodeTestPeer::query(*planner, path));
+  EXPECT_NE(path.reason.find("connector exceeds its bound"), std::string::npos);
+
+  terrain_case = kTerminalGap;
+  path.status = mgg::PlanningStatus::kSucceeded;
+  path.poses = {mgg::StateVec(0.0, 0.0, 0.0, 0.0),
+                mgg::StateVec(1.2, 0.0, 0.0, 0.0)};
+  EXPECT_FALSE(mgg_ros::PlannerNodeTestPeer::query(*planner, path));
+  EXPECT_NE(path.reason.find("ends without measured terrain support"),
+            std::string::npos);
+
+  terrain_case = kFiniteRootThenBlind;
+  path.status = mgg::PlanningStatus::kSucceeded;
+  path.poses = {mgg::StateVec(0.0, 0.0, 0.0, 0.0),
+                mgg::StateVec(1.2, 0.0, 0.0, 0.0)};
+  EXPECT_FALSE(mgg_ros::PlannerNodeTestPeer::query(*planner, path));
+  EXPECT_NE(path.reason.find("ends without measured terrain support"),
+            std::string::npos);
+
+  const auto expect_gap_hazard = [&](int active_case,
+                                     const char* expected_reason) {
+    terrain_case = active_case;
+    path.status = mgg::PlanningStatus::kSucceeded;
+    path.poses = {mgg::StateVec(0.0, 0.0, 0.0, 0.0),
+                  mgg::StateVec(1.2, 0.0, 0.0, 0.0)};
+    EXPECT_FALSE(mgg_ros::PlannerNodeTestPeer::query(*planner, path));
+    EXPECT_FALSE(path.indexed_map_validated);
+    EXPECT_NE(path.reason.find(expected_reason), std::string::npos)
+        << "case " << active_case << ": " << path.reason;
+  };
+  expect_gap_hazard(kOccupiedInsideGap, "occupied or unknown");
+  expect_gap_hazard(kLowClearanceInsideGap,
+                    "clearance is below body height");
+  expect_gap_hazard(kRoughClosingSupport, "roughness exceeds its limit");
+  expect_gap_hazard(kStepInsideGap, "step reported");
+  expect_gap_hazard(kDropInsideGap, "drop reported");
+  expect_gap_hazard(kGroundOnlyMissing,
+                    "ground or roughness is unavailable");
+  expect_gap_hazard(kRoughnessOnlyMissing,
+                    "ground or roughness is unavailable");
+  terrain_case = kStepAcrossGap;
+  path.status = mgg::PlanningStatus::kSucceeded;
+  path.poses = {mgg::StateVec(0.0, 0.0, 0.0, 0.0),
+                mgg::StateVec(1.2, 0.0, 0.30, 0.0)};
+  EXPECT_FALSE(mgg_ros::PlannerNodeTestPeer::query(*planner, path));
+  EXPECT_NE(path.reason.find("step or inclination limits"), std::string::npos);
+  expect_gap_hazard(kClosingHeightMismatch, "ground does not support");
+  terrain_case = kOrdinaryTerrain;
+
   step_sample = 1;
   path.status = mgg::PlanningStatus::kSucceeded;
   path.poses.push_back(mgg::StateVec(1.0, 0.0, 0.0, 0.0));
   EXPECT_FALSE(mgg_ros::PlannerNodeTestPeer::query(*planner, path));
+  EXPECT_NE(path.reason.find("step reported"), std::string::npos);
   step_sample = std::numeric_limits<std::size_t>::max();
 
   blind_ground_prefix = std::numeric_limits<std::size_t>::max();
@@ -3536,6 +3759,7 @@ TEST(IndexedObjectiveService, BatchedQueryIsBoundedAndUsesComponentFrame) {
   path.status = mgg::PlanningStatus::kSucceeded;
   path.poses.push_back(mgg::StateVec(1.0, 0.0, 0.0, 0.0));
   EXPECT_FALSE(mgg_ros::PlannerNodeTestPeer::query(*planner, path));
+  EXPECT_NE(path.reason.find("drop reported"), std::string::npos);
   drop_sample = std::numeric_limits<std::size_t>::max();
   blind_ground_prefix = 0;
   blind_clearance_prefix = 0;
@@ -3543,7 +3767,8 @@ TEST(IndexedObjectiveService, BatchedQueryIsBoundedAndUsesComponentFrame) {
   blind_ground_sample = 2;
   path.status = mgg::PlanningStatus::kSucceeded;
   path.poses.push_back(mgg::StateVec(1.0, 0.0, 0.0, 0.0));
-  EXPECT_FALSE(mgg_ros::PlannerNodeTestPeer::query(*planner, path));
+  EXPECT_TRUE(mgg_ros::PlannerNodeTestPeer::query(*planner, path));
+  EXPECT_TRUE(path.indexed_map_validated);
   blind_ground_sample = std::numeric_limits<std::size_t>::max();
 
   // The same distance bound as the native physical-start connector prevents
@@ -3565,6 +3790,8 @@ TEST(IndexedObjectiveService, BatchedQueryIsBoundedAndUsesComponentFrame) {
   path.poses.push_back(mgg::StateVec(1.0, 0.0, 0.0, 0.0));
   EXPECT_FALSE(mgg_ros::PlannerNodeTestPeer::query(*planner, path));
   EXPECT_FALSE(path.indexed_map_validated);
+  EXPECT_NE(path.reason.find("clearance is below body height"),
+            std::string::npos);
 
   sample_occupancy = Query::Response::FREE;
   sample_clearance = 100.0;

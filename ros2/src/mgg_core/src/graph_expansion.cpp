@@ -92,14 +92,19 @@ void expandGraph(GraphManager& graph, Vertex& new_vertex,
                             new_state[2] - origin[2]);
   double direction_norm = direction.norm();
 
-  const bool bounded_hanging_root =
+  const bool hanging_root =
       nearest_vertex->id == 0 && nearest_vertex->is_hanging &&
       std::isfinite(ctx.hanging_root_edge_length_max) &&
-      ctx.hanging_root_edge_length_max > ctx.planning->edge_length_max &&
-      direction_norm <= ctx.hanging_root_edge_length_max;
-  if (direction_norm > ctx.planning->edge_length_max &&
-      !bounded_hanging_root) {
-    direction = ctx.planning->edge_length_max * direction.normalized();
+      ctx.hanging_root_edge_length_max > 0.0;
+  // The physical root's blind-start allowance is an independent safety
+  // bound. It may extend a short ordinary edge limit to reach first support,
+  // or reduce a longer ordinary limit so configuration ordering can never
+  // turn the hanging exception into an unbounded edge.
+  const double effective_edge_length_max =
+      hanging_root ? ctx.hanging_root_edge_length_max
+                   : ctx.planning->edge_length_max;
+  if (direction_norm > effective_edge_length_max) {
+    direction = effective_edge_length_max * direction.normalized();
   } else if (!allow_short_edge &&
              direction_norm <= ctx.planning->edge_length_min) {
     rep.status = ExpandGraphStatus::kErrorShortEdge;
@@ -128,6 +133,11 @@ void expandGraph(GraphManager& graph, Vertex& new_vertex,
     new_state[2] = new_pos[2];
     direction = new_state.head<3>() - origin;
     direction_norm = direction.norm();
+    if (hanging_root &&
+        direction_norm > ctx.hanging_root_edge_length_max + 1e-9) {
+      rep.status = ExpandGraphStatus::kErrorCollisionEdge;
+      return;
+    }
     // The lattice precheck happens before ground projection, so its Z may not
     // describe the body box ultimately stored in the graph. Explicit
     // objectives cannot admit a waypoint that their refiner must immediately

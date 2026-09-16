@@ -8,6 +8,7 @@
 
 #include <gtest/gtest.h>
 
+#include "mgg_core/graph_expansion.h"
 #include "mgg_core/grid_graph.h"
 
 namespace {
@@ -175,6 +176,25 @@ TEST(GridGraph, SweepsTheLatticeAndGrowsTheGraph) {
   EXPECT_EQ(r.free_cells, 25);
   EXPECT_GT(r.vertices_added, 0);
   EXPECT_GT(f.graph.getNumVertices(), 1);
+}
+
+TEST(GridGraph, HangingRootLimitOverridesLongOrdinaryEdgeLimit) {
+  Fixture f;
+  f.planning.edge_length_max = 10.0;
+  f.ctx.hanging_root_edge_length_max = 1.0;
+  f.graph.vertices_map_.at(0)->is_hanging = true;
+  Vertex candidate(1, StateVec(5.0, 0.0, 0.0, 0.0));
+  mgg::ExpandGraphReport report;
+
+  mgg::expandGraph(f.graph, candidate, report, f.ctx);
+
+  ASSERT_EQ(report.num_vertices_added, 1);
+  StateVec bounded(1.0, 0.0, 0.0, 0.0);
+  Vertex* found = nullptr;
+  EXPECT_TRUE(f.graph.getNearestVertexInRange(&bounded, 1e-9, &found));
+  StateVec unbounded(5.0, 0.0, 0.0, 0.0);
+  found = nullptr;
+  EXPECT_FALSE(f.graph.getNearestVertexInRange(&unbounded, 1e-9, &found));
 }
 
 TEST(GridGraph, ProjectedEdgePolicyRejectsCandidateBeforeAdmission) {
