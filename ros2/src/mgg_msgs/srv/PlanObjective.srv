@@ -27,4 +27,6 @@ uint64 mapping_graph_revision
 string geometry_revision
 builtin_interfaces/Time map_source_stamp
 geometry_msgs/Pose[] path
+bool partial
+bool indexed_map_validated
 string reason

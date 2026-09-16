@@ -84,7 +84,23 @@ class PlannerNode : public rclcpp::Node {
       std::shared_ptr<mgg_msgs::srv::PlanObjective::Response> response);
   mgg::FeasiblePath refineCorridor(const mgg::RouteCorridor& corridor);
   void convertPathToNavigationBase(mgg::FeasiblePath& path) const;
-  bool queryIndexedMap(mgg::FeasiblePath& path);
+  struct IndexedQueryContext {
+    mgg::StateVec route_start = mgg::StateVec::Zero();
+    Eigen::Isometry3d component_from_navigation = Eigen::Isometry3d::Identity();
+    Eigen::Vector3d body = Eigen::Vector3d::Zero();
+    Eigen::Vector3d physical_size = Eigen::Vector3d::Zero();
+    Eigen::Vector3d center_offset = Eigen::Vector3d::Zero();
+    mgg::RobotType robot_type = mgg::RobotType::kGroundRobot;
+    double max_step_height = 0.0;
+    double max_inclination = 0.0;
+    double graph_to_base = 0.0;
+    bool have_mapping_snapshot = false;
+    mgg_msgs::msg::MappingSnapshot mapping_snapshot;
+    std::chrono::steady_clock::time_point mapping_snapshot_received;
+  };
+  IndexedQueryContext indexedQueryContext() const;
+  bool queryIndexedMap(mgg::FeasiblePath& path,
+                       const IndexedQueryContext& context);
   void publishOwnGraph();
   void publishPath();
   void publishMarkers();
@@ -118,6 +134,7 @@ class PlannerNode : public rclcpp::Node {
   mgg::PlanningParams planning_params_;
   mgg::GridGraphParams grid_params_;
   mgg::GridRefinementLimits grid_refinement_limits_;
+  double partial_route_min_progress_m_ = 1.0;
   mgg::BoundedSpaceParams global_space_;
   std::vector<mgg::BoundedSpaceParams> no_gain_zones_;
   std::unordered_map<std::string, mgg::SensorParams> sensors_;
@@ -210,6 +227,10 @@ class PlannerNode : public rclcpp::Node {
   double indexed_map_snapshot_ttl_s_ = 3.0;
   double indexed_map_sample_spacing_m_ = 0.20;
   double indexed_map_max_roughness_m_ = 0.10;
+  // Half of the currently pinned 0.20 m indexed-grid resolution. QueryMapBatch
+  // does not transport resolution, so deployments must change this parameter
+  // together with the provider resolution.
+  double indexed_map_ground_tolerance_m_ = 0.10;
   // Zero disables ROS-clock source-age expiry. A keyframe timestamp binds the
   // snapshot but does not advance while a healthy robot is stationary.
   double indexed_map_max_source_age_s_ = 0.0;
@@ -248,6 +269,9 @@ class PlannerNode : public rclcpp::Node {
   /// Reentrant, so the planning service and the subscriptions can run
   /// concurrently under a MultiThreadedExecutor. See the note in main().
   rclcpp::CallbackGroup::SharedPtr callback_group_;
+  /// Serializes service-side graph/refinement work without occupying executor
+  /// threads on planner_mutex_ while an indexed query is in flight.
+  rclcpp::CallbackGroup::SharedPtr planning_callback_group_;
 };
 
 }  // namespace mgg_ros

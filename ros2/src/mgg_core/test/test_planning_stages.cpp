@@ -47,7 +47,63 @@ TEST(PlanningStages, NavigateAndReturnHomeShareTheGraphStage) {
     EXPECT_DOUBLE_EQ(route.poses.back().x(), 3.0);
     // The graph corridor does not silently replace the requested exact goal.
     EXPECT_DOUBLE_EQ(route.request.goal.pose.x(), 3.1);
+    EXPECT_FALSE(route.partial);
   }
+}
+
+TEST(PlanningStages, FarNavigateUsesReachableProxyWithStrictProgress) {
+  Chain chain;
+  TopologicalGoalPlanner planner("component-a", 12, 34, 0.25, 1.0);
+  auto far = request(ObjectiveKind::kNavigate);
+  far.goal.pose = StateVec(30.0, 4.0, 0.0, 1.2);
+  const auto route = planner.plan(
+      chain.graph, StateVec(0.1, 0.0, 0.0, 0.0), far);
+  ASSERT_EQ(route.status, PlanningStatus::kSucceeded) << route.reason;
+  ASSERT_TRUE(route.partial);
+  ASSERT_EQ(route.poses.size(), 4u);
+  EXPECT_DOUBLE_EQ(route.poses.back().x(), 3.0);
+  EXPECT_NEAR(route.poses.back()[3], std::atan2(4.0, 27.0), 1e-12);
+  // The proxy is transport state only; the operator's exact goal and yaw stay
+  // immutable for the next continuation request.
+  EXPECT_DOUBLE_EQ(route.request.goal.pose.x(), 30.0);
+  EXPECT_DOUBLE_EQ(route.request.goal.pose.y(), 4.0);
+  EXPECT_DOUBLE_EQ(route.request.goal.pose[3], 1.2);
+}
+
+TEST(PlanningStages, FarNavigateFailsAtALocalMinimum) {
+  Chain chain;
+  TopologicalGoalPlanner planner("component-a", 12, 34, 0.25, 1.0);
+  auto far = request(ObjectiveKind::kNavigate);
+  far.goal.pose = StateVec(-30.0, 0.0, 0.0, 0.0);
+  const auto route = planner.plan(chain.graph, StateVec::Zero(), far);
+  EXPECT_EQ(route.status, PlanningStatus::kUnreachable);
+  EXPECT_FALSE(route.partial);
+  EXPECT_TRUE(route.poses.empty());
+  EXPECT_NE(route.reason.find("no reachable local proxy"), std::string::npos);
+}
+
+TEST(PlanningStages, PartialProgressMustMeetTheConfiguredMinimum) {
+  Chain chain;
+  TopologicalGoalPlanner planner("component-a", 12, 34, 0.25, 3.5);
+  auto far = request(ObjectiveKind::kNavigate);
+  far.goal.pose = StateVec(30.0, 0.0, 0.0, 0.0);
+  const auto route = planner.plan(chain.graph, StateVec::Zero(), far);
+  EXPECT_EQ(route.status, PlanningStatus::kUnreachable);
+  EXPECT_FALSE(route.partial);
+}
+
+TEST(PlanningStages, DisconnectedCloserProxyIsNotSelected) {
+  Chain chain;
+  auto* disconnected = new Vertex(4, StateVec(29.0, 0.0, 0.0, 0.0));
+  chain.graph.addVertex(disconnected);
+  TopologicalGoalPlanner planner("component-a", 12, 34, 0.25, 1.0);
+  auto far = request(ObjectiveKind::kNavigate);
+  far.goal.pose = StateVec(30.0, 0.0, 0.0, 0.0);
+  const auto route = planner.plan(chain.graph, StateVec::Zero(), far);
+  ASSERT_EQ(route.status, PlanningStatus::kSucceeded) << route.reason;
+  ASSERT_TRUE(route.partial);
+  ASSERT_FALSE(route.poses.empty());
+  EXPECT_DOUBLE_EQ(route.poses.back().x(), 3.0);
 }
 
 TEST(PlanningStages, StaleMapOrGraphSnapshotIsRejected) {

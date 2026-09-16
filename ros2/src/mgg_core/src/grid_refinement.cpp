@@ -51,6 +51,7 @@ void copyRequest(const RouteCorridor& corridor, FeasiblePath& path) {
   path.geometry_revision = corridor.request.geometry_revision;
   path.map_source_stamp_sec = corridor.request.map_source_stamp_sec;
   path.map_source_stamp_nanosec = corridor.request.map_source_stamp_nanosec;
+  path.partial = corridor.partial;
   path.reason = corridor.reason;
 }
 
@@ -122,6 +123,7 @@ FeasiblePath BoundedGridPlanner::refine(const RouteCorridor& corridor) {
   const auto fail = [&result](const std::string& reason) {
     result.status = PlanningStatus::kBlocked;
     result.poses.clear();
+    result.partial = false;
     result.reason = reason;
     return result;
   };
@@ -187,7 +189,11 @@ FeasiblePath BoundedGridPlanner::refine(const RouteCorridor& corridor) {
       waypoints.push_back(waypoint);
     }
   }
-  StateVec goal = corridor.request.goal.pose;
+  if (corridor.partial && waypoints.size() < 2) {
+    return fail("partial route has no progress proxy");
+  }
+  StateVec goal = corridor.partial ? waypoints.back()
+                                   : corridor.request.goal.pose;
   const double requested_goal_yaw = goal[3];
   if (interrupted(interruption_reason)) return fail(interruption_reason);
   if (!goal.allFinite()) {
@@ -199,7 +205,11 @@ FeasiblePath BoundedGridPlanner::refine(const RouteCorridor& corridor) {
   if (goal_status != GridProjectionStatus::kSupported || !goal.allFinite()) {
     return fail(projectionFailure("exact goal", goal_status, goal));
   }
-  if (!samePosition(waypoints.back(), goal)) {
+  if (corridor.partial) {
+    // The final corridor pose is the checked local proxy. The exact operator
+    // goal remains only in corridor.request.goal for the next continuation.
+    waypoints.back() = goal;
+  } else if (!samePosition(waypoints.back(), goal)) {
     waypoints.push_back(goal);
   } else {
     // The graph vertex supplies XYZ, but the request owns exact final yaw.

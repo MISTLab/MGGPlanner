@@ -107,6 +107,38 @@ TEST(GridRefinement, ExactGoalYawOverridesMatchingGraphVertex) {
   EXPECT_NEAR(path.poses.back()[3], 0.7, 1e-9);
 }
 
+TEST(GridRefinement, PartialRouteStopsAtProxyAndRetainsExactGoal) {
+  RouteCorridor route = routeTo(30.0, 4.0);
+  route.request.objective = mgg::ObjectiveKind::kNavigate;
+  route.poses = {StateVec(0.0, 0.0, 0.0, 0.0),
+                 StateVec(2.0, 0.0, 0.0, 0.25)};
+  route.partial = true;
+  BoundedGridPlanner planner(StateVec::Zero(), limits(), flatProjection(),
+                             sampledTraversal({}));
+  const FeasiblePath path = planner.refine(route);
+  ASSERT_EQ(path.status, PlanningStatus::kSucceeded) << path.reason;
+  EXPECT_TRUE(path.partial);
+  ASSERT_FALSE(path.poses.empty());
+  EXPECT_NEAR(path.poses.back().x(), 2.0, 1e-9);
+  EXPECT_NEAR(path.poses.back().y(), 0.0, 1e-9);
+  EXPECT_NEAR(path.poses.back()[3], 0.25, 1e-9);
+  EXPECT_DOUBLE_EQ(route.request.goal.pose.x(), 30.0);
+  EXPECT_DOUBLE_EQ(route.request.goal.pose.y(), 4.0);
+}
+
+TEST(GridRefinement, FailedPartialRouteCannotAdvertiseContinuation) {
+  RouteCorridor route = routeTo(30.0, 0.0);
+  route.request.objective = mgg::ObjectiveKind::kNavigate;
+  route.poses.clear();
+  route.partial = true;
+  BoundedGridPlanner planner(StateVec::Zero(), limits(), flatProjection(),
+                             sampledTraversal({}));
+  const FeasiblePath path = planner.refine(route);
+  EXPECT_EQ(path.status, PlanningStatus::kBlocked);
+  EXPECT_FALSE(path.partial);
+  EXPECT_TRUE(path.poses.empty());
+}
+
 TEST(GridRefinement, ProjectorCannotReplaceRequestOwnedGoalYaw) {
   auto yaw_mutating_projector = [](StateVec& state) {
     state.z() = 0.0;

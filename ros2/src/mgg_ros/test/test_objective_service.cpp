@@ -1,6 +1,7 @@
 #include <chrono>
 #include <atomic>
 #include <cmath>
+#include <future>
 #include <memory>
 #include <sstream>
 #include <thread>
@@ -250,6 +251,69 @@ class PlannerNodeTestPeer {
     node.geofence_->addGeofenceArea(polygon);
   }
 
+  static void addRaisedFloor(PlannerNode& node, double step_height) {
+    const std::lock_guard<std::recursive_mutex> lock(node.planner_mutex_);
+    for (int repeat = 0; repeat < 20; ++repeat) {
+      for (int x = 15; x <= 36; ++x) {
+        for (int y = -12; y <= 12; ++y) {
+          node.map_->tree()->updateNode(
+              octomap::point3d(static_cast<float>(x * 0.05 + 0.025),
+                               static_cast<float>(y * 0.05 + 0.025),
+                               static_cast<float>(step_height + 0.025)),
+              true);
+        }
+      }
+    }
+    ++node.map_revision_;
+  }
+
+  static void configurePartialNavigateScene(PlannerNode& node,
+                                            bool blocked_by_wall = false,
+                                            double step_height = 0.0,
+                                            double step_cap = 0.10) {
+    configureGridServiceScene(node);
+    acceptOdometry(node, 0.0, 0.0, 0.075);
+    if (blocked_by_wall) addGridObstacle(node, 0.325, true, 0.75);
+    if (step_height > 0.0) addRaisedFloor(node, step_height);
+    const std::lock_guard<std::recursive_mutex> lock(node.planner_mutex_);
+    node.planning_params_.max_step_height = step_cap;
+    node.local_graph_->reset();
+    mgg::Vertex* previous = nullptr;
+    for (int id = 0; id < 4; ++id) {
+      auto* vertex =
+          new mgg::Vertex(id, mgg::StateVec(id * 0.50, 0.0, 0.30, 0.0));
+      node.local_graph_->addVertex(vertex);
+      if (previous != nullptr) node.local_graph_->addEdge(previous, vertex, 0.50);
+      previous = vertex;
+    }
+    node.local_graph_revision_ = 7;
+    node.local_graph_map_revision_ = node.map_revision_;
+  }
+
+  static std::shared_ptr<mgg_msgs::srv::PlanObjective::Response>
+  requestBoundNavigate(PlannerNode& node, const mgg::StateVec& goal) {
+    auto request = std::make_shared<mgg_msgs::srv::PlanObjective::Request>();
+    request->objective = mgg_msgs::srv::PlanObjective::Request::NAVIGATE;
+    request->component_id = node.component_id_;
+    request->graph_revision = node.local_graph_revision_;
+    request->map_revision = node.local_graph_map_revision_;
+    request->goal.position.x = goal.x();
+    request->goal.position.y = goal.y();
+    request->goal.position.z = goal.z();
+    request->goal.orientation.z = std::sin(goal[3] / 2.0);
+    request->goal.orientation.w = std::cos(goal[3] / 2.0);
+    if (node.have_mapping_snapshot_) {
+      request->map_epoch = node.mapping_snapshot_.epoch;
+      request->mapping_graph_revision = node.mapping_snapshot_.graph_revision;
+      request->geometry_revision = node.mapping_snapshot_.geometry_revision;
+      request->map_source_stamp = node.mapping_snapshot_.source_stamp;
+    }
+    auto response =
+        std::make_shared<mgg_msgs::srv::PlanObjective::Response>();
+    node.onObjectiveRequest(request, response);
+    return response;
+  }
+
   static std::uint64_t localGraphRevision(const PlannerNode& node) {
     return node.local_graph_revision_;
   }
@@ -393,7 +457,12 @@ class PlannerNodeTestPeer {
   }
 
   static bool query(PlannerNode& node, mgg::FeasiblePath& path) {
-    return node.queryIndexedMap(path);
+    PlannerNode::IndexedQueryContext context;
+    {
+      const std::lock_guard<std::recursive_mutex> lock(node.planner_mutex_);
+      context = node.indexedQueryContext();
+    }
+    return node.queryIndexedMap(path, context);
   }
 
   static bool queryReady(const PlannerNode& node) {
@@ -402,6 +471,26 @@ class PlannerNodeTestPeer {
 
   static bool hasQueryClient(const PlannerNode& node) {
     return static_cast<bool>(node.indexed_map_client_);
+  }
+
+  static void setIndexedTerrainLimits(PlannerNode& node, double step,
+                                      double inclination) {
+    const std::lock_guard<std::recursive_mutex> lock(node.planner_mutex_);
+    node.planning_params_.max_step_height = step;
+    node.planning_params_.max_inclination = inclination;
+  }
+
+  static void configureIndexedRobotGeometry(
+      PlannerNode& node, const Eigen::Vector3d& physical_size,
+      const Eigen::Vector3d& extension,
+      const Eigen::Vector3d& center_offset, double max_ground_height) {
+    const std::lock_guard<std::recursive_mutex> lock(node.planner_mutex_);
+    node.robot_params_.size = physical_size;
+    node.robot_params_.size_extension = extension;
+    node.robot_params_.size_extension_min.setZero();
+    node.robot_params_.bound_mode = mgg::BoundModeType::kExtendedBound;
+    node.robot_params_.center_offset = center_offset;
+    node.planning_params_.max_ground_height = max_ground_height;
   }
 
   static void expireSnapshot(PlannerNode& node) {
@@ -539,6 +628,186 @@ TEST(PlannerBackbone, ExplicitGroundFailureIdentifiesCurrentOrGoal) {
                 "(10.00, 0.00,"),
             std::string::npos)
       << response->reason;
+}
+
+TEST(PlannerObjective, FarNavigateReturnsCheckedPartialProxy) {
+  rclcpp::NodeOptions options;
+  options.parameter_overrides(
+      {rclcpp::Parameter("map.resolution", 0.05),
+       rclcpp::Parameter("partial_route_min_progress_m", 1.0)});
+  auto planner = std::make_shared<mgg_ros::PlannerNode>(options);
+  using Peer = mgg_ros::PlannerNodeTestPeer;
+  Peer::configurePartialNavigateScene(*planner);
+
+  const mgg::StateVec exact_goal(30.0, 4.0, 0.075, 1.1);
+  const auto response = Peer::requestBoundNavigate(*planner, exact_goal);
+  ASSERT_NE(response, nullptr);
+  ASSERT_EQ(response->status, Service::Response::SUCCEEDED)
+      << response->reason;
+  ASSERT_TRUE(response->partial);
+  EXPECT_FALSE(response->indexed_map_validated);
+  ASSERT_GE(response->path.size(), 2u);
+  EXPECT_NEAR(response->path.back().position.x, 1.50, 0.06);
+  EXPECT_LT(response->path.back().position.x, exact_goal.x());
+  EXPECT_EQ(response->graph_revision, 7u);
+  EXPECT_GT(response->map_revision, 0u);
+}
+
+TEST(PlannerObjective, SnapshotRefreshCannotStarveIndexedResponse) {
+  using Query = mgg_msgs::srv::QueryMapBatch;
+  rclcpp::NodeOptions options;
+  options.parameter_overrides(
+      {rclcpp::Parameter("map.resolution", 0.05),
+       rclcpp::Parameter("partial_route_min_progress_m", 1.0),
+       rclcpp::Parameter("indexed_map_query_timeout_s", 0.25),
+       rclcpp::Parameter("indexed_map_query_service",
+                         "/robot_1/mapping/query_batch")});
+  auto planner = std::make_shared<mgg_ros::PlannerNode>(options);
+  using Peer = mgg_ros::PlannerNodeTestPeer;
+  Peer::configurePartialNavigateScene(*planner);
+
+  mgg_msgs::msg::MappingSnapshot snapshot;
+  snapshot.component_id = "local";
+  snapshot.epoch = 7;
+  snapshot.graph_revision = 8;
+  snapshot.geometry_revision = std::string(64, 'a');
+  const auto stamp = planner->now();
+  snapshot.source_stamp.sec = static_cast<std::int32_t>(stamp.seconds());
+  snapshot.source_stamp.nanosec =
+      static_cast<std::uint32_t>(stamp.nanoseconds() % 1000000000LL);
+  snapshot.component_from_navigation.rotation.w = 1.0;
+  Peer::acceptSnapshot(*planner, snapshot);
+
+  auto io = std::make_shared<rclcpp::Node>("partial_two_thread_io");
+  auto query_service = io->create_service<Query>(
+      "/robot_1/mapping/query_batch",
+      [planner, snapshot](const Query::Request::SharedPtr request,
+                          Query::Response::SharedPtr response) {
+        // This callback occupies the executor's second thread. With the old
+        // objective-wide mutex, refreshing the authority here blocked forever
+        // behind thread one and the indexed response could only time out.
+        mgg_ros::PlannerNodeTestPeer::acceptSnapshot(*planner, snapshot);
+        response->status = Query::Response::OK;
+        response->component_id = request->component_id;
+        response->epoch = request->epoch;
+        response->graph_revision = request->graph_revision;
+        response->geometry_revision = request->geometry_revision;
+        const auto n = request->samples.size();
+        response->occupancy.assign(n, Query::Response::FREE);
+        response->ground_z.assign(n, 0.0);
+        response->roughness.assign(n, 0.0);
+        response->clearance.assign(n, 100.0);
+        response->step.assign(n, false);
+        response->drop.assign(n, false);
+      });
+  auto client = io->create_client<Service>("plan_objective");
+  rclcpp::executors::MultiThreadedExecutor executor(
+      rclcpp::ExecutorOptions{}, 2);
+  executor.add_node(planner);
+  executor.add_node(io);
+  std::thread spinner([&executor]() { executor.spin(); });
+  const bool objective_ready = client->wait_for_service(3s);
+  const auto query_deadline = std::chrono::steady_clock::now() + 3s;
+  while (!Peer::queryReady(*planner) &&
+         std::chrono::steady_clock::now() < query_deadline) {
+    std::this_thread::sleep_for(10ms);
+  }
+  const bool query_ready = Peer::queryReady(*planner);
+  EXPECT_TRUE(objective_ready);
+  EXPECT_TRUE(query_ready);
+  if (!objective_ready || !query_ready) {
+    executor.cancel();
+    spinner.join();
+    return;
+  }
+
+  auto request = std::make_shared<Service::Request>();
+  request->objective = Service::Request::NAVIGATE;
+  request->component_id = snapshot.component_id;
+  request->graph_revision = Peer::localGraphRevision(*planner);
+  request->map_revision = Peer::localGraphMapRevision(*planner);
+  request->map_epoch = snapshot.epoch;
+  request->mapping_graph_revision = snapshot.graph_revision;
+  request->geometry_revision = snapshot.geometry_revision;
+  request->map_source_stamp = snapshot.source_stamp;
+  request->goal.position.x = 30.0;
+  request->goal.position.y = 4.0;
+  request->goal.position.z = 0.075;
+  request->goal.orientation.w = 1.0;
+  auto future = client->async_send_request(request);
+  const bool completed = future.wait_for(3s) == std::future_status::ready;
+  EXPECT_TRUE(completed);
+  if (completed) {
+    const auto response = future.get();
+    EXPECT_NE(response, nullptr);
+    if (response) {
+      EXPECT_EQ(response->status, Service::Response::SUCCEEDED)
+          << response->reason;
+      EXPECT_TRUE(response->partial);
+      EXPECT_TRUE(response->indexed_map_validated) << response->reason;
+    }
+  }
+
+  executor.cancel();
+  spinner.join();
+}
+
+TEST(PlannerObjective, PartialProxyCannotCrossObservedWall) {
+  rclcpp::NodeOptions options;
+  options.parameter_overrides(
+      {rclcpp::Parameter("map.resolution", 0.05),
+       rclcpp::Parameter("partial_route_min_progress_m", 1.0)});
+  auto planner = std::make_shared<mgg_ros::PlannerNode>(options);
+  using Peer = mgg_ros::PlannerNodeTestPeer;
+  Peer::configurePartialNavigateScene(*planner, /*blocked_by_wall=*/true);
+
+  const auto response = Peer::requestBoundNavigate(
+      *planner, mgg::StateVec(30.0, 0.0, 0.075, 0.0));
+  ASSERT_NE(response, nullptr);
+  EXPECT_EQ(response->status, Service::Response::BLOCKED) << response->reason;
+  EXPECT_FALSE(response->partial);
+  EXPECT_TRUE(response->path.empty());
+}
+
+TEST(PlannerObjective, PartialProxyHonorsPlatformStepCapInOctomap) {
+  struct Scenario {
+    double step_height;
+    double step_cap;
+    bool accepted;
+  };
+  const std::vector<Scenario> scenarios{
+      {0.05, 0.10, true},   // Bunker/Scout: sub-cap curb.
+      {0.15, 0.10, false},  // Bunker/Scout: sharp curb above cap.
+      {0.20, 0.30, true},   // Spot: same terrain remains below its cap.
+  };
+  for (const Scenario& scenario : scenarios) {
+    SCOPED_TRACE("height=" + std::to_string(scenario.step_height) +
+                 " cap=" + std::to_string(scenario.step_cap));
+    rclcpp::NodeOptions options;
+    options.parameter_overrides(
+        {rclcpp::Parameter("map.resolution", 0.05),
+         rclcpp::Parameter("partial_route_min_progress_m", 1.0)});
+    auto planner = std::make_shared<mgg_ros::PlannerNode>(options);
+    using Peer = mgg_ros::PlannerNodeTestPeer;
+    Peer::configurePartialNavigateScene(
+        *planner, /*blocked_by_wall=*/false, scenario.step_height,
+        scenario.step_cap);
+
+    const auto response = Peer::requestBoundNavigate(
+        *planner, mgg::StateVec(30.0, 0.0, 0.075, 0.0));
+    ASSERT_NE(response, nullptr);
+    if (scenario.accepted) {
+      EXPECT_EQ(response->status, Service::Response::SUCCEEDED)
+          << response->reason;
+      EXPECT_TRUE(response->partial);
+      EXPECT_FALSE(response->path.empty());
+    } else {
+      EXPECT_EQ(response->status, Service::Response::BLOCKED)
+          << response->reason;
+      EXPECT_FALSE(response->partial);
+      EXPECT_TRUE(response->path.empty());
+    }
+  }
 }
 
 TEST(PlannerBackbone, DelayedSupportBackfillsBentTrajectoryBeyondParentRadius) {
@@ -1116,6 +1385,7 @@ TEST(IndexedObjectiveService, MissingSnapshotFailsClosedWithoutNestedSpin) {
     EXPECT_NE(response, nullptr);
     if (response) {
       EXPECT_EQ(response->status, Service::Response::STALE_REVISION);
+      EXPECT_FALSE(response->indexed_map_validated);
     }
   }
 
@@ -1129,24 +1399,41 @@ TEST(IndexedObjectiveService, BatchedQueryIsBoundedAndUsesComponentFrame) {
   options.append_parameter_override("indexed_map_query_service",
                                     "/robot_1/mapping/query_batch");
   options.append_parameter_override("indexed_map_query_timeout_s", 0.05);
+  options.append_parameter_override("indexed_map_sample_spacing_m", 0.30);
   auto planner = std::make_shared<mgg_ros::PlannerNode>(options);
+  mgg_ros::PlannerNodeTestPeer::configureBackboneTest(*planner);
   auto server = std::make_shared<rclcpp::Node>("indexed_query_test_server");
   std::atomic<bool> delay{false};
+  std::atomic<std::uint8_t> response_status{Query::Response::OK};
+  std::atomic<double> ground_offset{0.0};
+  std::atomic<double> ground_from_sample{0.30};
+  std::atomic<double> received_body_x{0.0};
+  std::atomic<double> received_body_y{0.0};
+  std::atomic<double> received_body_z{0.0};
   std::vector<geometry_msgs::msg::Point> received;
   auto service = server->create_service<Query>(
       "/robot_1/mapping/query_batch",
-      [&delay, &received](const Query::Request::SharedPtr request,
-                          Query::Response::SharedPtr response) {
+      [&delay, &response_status, &ground_offset, &ground_from_sample,
+       &received_body_x, &received_body_y, &received_body_z, &received](
+          const Query::Request::SharedPtr request,
+          Query::Response::SharedPtr response) {
         received = request->samples;
         if (delay.load()) std::this_thread::sleep_for(200ms);
-        response->status = Query::Response::OK;
+        response->status = response_status.load();
         response->component_id = request->component_id;
         response->epoch = request->epoch;
         response->graph_revision = request->graph_revision;
         response->geometry_revision = request->geometry_revision;
         const auto n = request->samples.size();
+        received_body_x = request->body_size.x;
+        received_body_y = request->body_size.y;
+        received_body_z = request->body_size.z;
         response->occupancy.assign(n, Query::Response::FREE);
-        response->ground_z.assign(n, 0.0);
+        response->ground_z.reserve(n);
+        for (const auto& sample : request->samples) {
+          response->ground_z.push_back(
+              sample.z - ground_from_sample.load() + ground_offset.load());
+        }
         response->roughness.assign(n, 0.0);
         response->clearance.assign(n, 100.0);
         response->step.assign(n, false);
@@ -1186,15 +1473,78 @@ TEST(IndexedObjectiveService, BatchedQueryIsBoundedAndUsesComponentFrame) {
   path.map_source_stamp_sec = snapshot.source_stamp.sec;
   path.map_source_stamp_nanosec = snapshot.source_stamp.nanosec;
   path.poses.push_back(mgg::StateVec(1.0, 0.0, 0.0, 0.0));
+  mgg_ros::PlannerNodeTestPeer::setIndexedTerrainLimits(*planner, 0.10, 0.52);
   EXPECT_TRUE(mgg_ros::PlannerNodeTestPeer::query(*planner, path));
+  EXPECT_TRUE(path.indexed_map_validated);
   EXPECT_GE(received.size(), 2u);
   if (received.size() >= 2) {
     EXPECT_NEAR(received.front().x, 10.0, 1e-6);
     EXPECT_NEAR(received.back().x, 11.0, 1e-6);
+    EXPECT_NEAR(received.front().z, 0.225, 1e-6);
   }
 
+  ground_offset = 0.101;
+  EXPECT_FALSE(mgg_ros::PlannerNodeTestPeer::query(*planner, path));
+  EXPECT_FALSE(path.indexed_map_validated);
+  EXPECT_NE(path.reason.find("ground does not support"), std::string::npos);
+
+  path.status = mgg::PlanningStatus::kSucceeded;
+  path.poses.push_back(mgg::StateVec(0.20, 0.0, 0.15, 0.0));
+  ground_offset = 0.0;
+  EXPECT_FALSE(mgg_ros::PlannerNodeTestPeer::query(*planner, path));
+  EXPECT_FALSE(path.indexed_map_validated);
+  EXPECT_NE(path.reason.find("step or inclination"), std::string::npos);
+
+  path.status = mgg::PlanningStatus::kSucceeded;
+  path.poses.push_back(mgg::StateVec(1.0, 0.0, 0.0, 0.0));
+  ground_offset = 0.0;
+  response_status = Query::Response::UNAVAILABLE;
+  EXPECT_FALSE(mgg_ros::PlannerNodeTestPeer::query(*planner, path));
+  EXPECT_FALSE(path.indexed_map_validated);
+  EXPECT_EQ(path.status, mgg::PlanningStatus::kBlocked);
+
+  mgg_ros::PlannerNodeTestPeer::configureIndexedRobotGeometry(
+      *planner, Eigen::Vector3d(0.80, 0.50, 1.00),
+      Eigen::Vector3d(0.05, 0.05, 0.05),
+      Eigen::Vector3d(0.0, 0.0, 0.02), 0.975);
+  mgg_ros::PlannerNodeTestPeer::acceptOdometry(*planner, 0.0, 0.0, 0.50);
+  snapshot.component_from_navigation.rotation.z = std::sin(M_PI / 4.0);
+  snapshot.component_from_navigation.rotation.w = std::cos(M_PI / 4.0);
+  mgg_ros::PlannerNodeTestPeer::acceptSnapshot(*planner, snapshot);
+  path.status = mgg::PlanningStatus::kSucceeded;
+  path.poses.push_back(mgg::StateVec(1.0, 0.0, 0.50, 0.0));
+  response_status = Query::Response::OK;
+  ground_from_sample = 0.995;
+  EXPECT_TRUE(mgg_ros::PlannerNodeTestPeer::query(*planner, path));
+  EXPECT_TRUE(path.indexed_map_validated);
+  EXPECT_NEAR(received_body_x.load(), 0.55, 1e-6);
+  EXPECT_NEAR(received_body_y.load(), 0.85, 1e-6);
+  EXPECT_NEAR(received_body_z.load(), 1.05, 1e-6);
+  EXPECT_FALSE(received.empty());
+  if (!received.empty()) {
+    EXPECT_NEAR(received.front().z, 0.995, 1e-6);
+  }
+
+  mgg_ros::PlannerNodeTestPeer::configureIndexedRobotGeometry(
+      *planner, Eigen::Vector3d(0.80, 0.50, 1.00),
+      Eigen::Vector3d(0.05, 0.05, 0.05),
+      Eigen::Vector3d(0.10, 0.0, 0.02), 0.975);
+  path.status = mgg::PlanningStatus::kSucceeded;
+  path.poses.push_back(mgg::StateVec(1.0, 0.0, 0.50, 0.0));
+  EXPECT_FALSE(mgg_ros::PlannerNodeTestPeer::query(*planner, path));
+  EXPECT_FALSE(path.indexed_map_validated);
+  EXPECT_NE(path.reason.find("gravity alignment is invalid"), std::string::npos);
+
+  mgg_ros::PlannerNodeTestPeer::configureIndexedRobotGeometry(
+      *planner, Eigen::Vector3d(0.80, 0.50, 1.00),
+      Eigen::Vector3d(0.05, 0.05, 0.05),
+      Eigen::Vector3d(0.0, 0.0, 0.02), 0.975);
+  path.status = mgg::PlanningStatus::kSucceeded;
+  path.poses.push_back(mgg::StateVec(1.0, 0.0, 0.0, 0.0));
+  response_status = Query::Response::OK;
   delay = true;
   EXPECT_FALSE(mgg_ros::PlannerNodeTestPeer::query(*planner, path));
+  EXPECT_FALSE(path.indexed_map_validated);
   EXPECT_EQ(path.status, mgg::PlanningStatus::kBlocked);
   executor.cancel();
   spinner.join();

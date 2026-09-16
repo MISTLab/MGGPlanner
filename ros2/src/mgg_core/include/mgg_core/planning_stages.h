@@ -58,6 +58,10 @@ struct RouteCorridor {
   // Topological route in source-to-target order. The exact requested goal is
   // retained separately: a grid planner must decide how to connect it safely.
   std::vector<StateVec> poses;
+  // True when poses end at a local progress proxy rather than the exact goal
+  // retained in request.goal. A controller success for this corridor must
+  // trigger continuation, never completion of the operator objective.
+  bool partial = false;
   std::string reason;
 };
 
@@ -74,6 +78,10 @@ struct FeasiblePath {
   std::uint32_t map_source_stamp_nanosec = 0;
   std::vector<StateVec> poses;
   std::vector<double> speed_limits;
+  bool partial = false;
+  // True only after the complete emitted path passed QueryMapBatch against
+  // the exact mapping snapshot carried above.
+  bool indexed_map_validated = false;
   std::string reason;
 };
 
@@ -91,7 +99,8 @@ class TopologicalGoalPlanner {
   TopologicalGoalPlanner(std::string component_id,
                          std::uint64_t graph_revision,
                          std::uint64_t map_revision,
-                         double goal_vertex_tolerance);
+                         double goal_vertex_tolerance,
+                         double minimum_partial_progress = 0.0);
 
   RouteCorridor plan(GraphManager& graph, const StateVec& current,
                      const PlanningRequest& request) const;
@@ -101,6 +110,7 @@ class TopologicalGoalPlanner {
   std::uint64_t graph_revision_;
   std::uint64_t map_revision_;
   double goal_vertex_tolerance_;
+  double minimum_partial_progress_;
 };
 
 }  // namespace mgg

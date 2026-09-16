@@ -61,6 +61,12 @@ PlannerNode::PlannerNode(const rclcpp::NodeOptions& options)
   grid_refinement_limits_.timeout = std::chrono::milliseconds(std::clamp(
       declareOrGet<std::int64_t>(this, "grid_refinement_timeout_ms", 50),
       std::int64_t{1}, std::int64_t{5000}));
+  const double requested_partial_progress = declareOrGet<double>(
+      this, "partial_route_min_progress_m", partial_route_min_progress_m_);
+  partial_route_min_progress_m_ =
+      std::isfinite(requested_partial_progress)
+          ? std::clamp(requested_partial_progress, 0.10, 5.0)
+          : 1.0;
   geofence_ = std::make_unique<mgg::GeofenceManager>();
   local_graph_ = std::make_shared<mgg::GraphManager>();
   global_graph_ = std::make_shared<mgg::GraphManager>();
@@ -93,6 +99,8 @@ PlannerNode::PlannerNode(const rclcpp::NodeOptions& options)
 
   callback_group_ =
       create_callback_group(rclcpp::CallbackGroupType::Reentrant);
+  planning_callback_group_ =
+      create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
   rclcpp::SubscriptionOptions sub_opts;
   sub_opts.callback_group = callback_group_;
 
@@ -143,6 +151,10 @@ PlannerNode::PlannerNode(const rclcpp::NodeOptions& options)
   indexed_map_max_roughness_m_ = std::max(
       0.0, declareOrGet<double>(this, "indexed_map_max_roughness_m",
                                 indexed_map_max_roughness_m_));
+  indexed_map_ground_tolerance_m_ = std::clamp(
+      declareOrGet<double>(this, "indexed_map_ground_tolerance_m",
+                           indexed_map_ground_tolerance_m_),
+      0.0, 0.50);
   indexed_map_max_source_age_s_ = std::max(
       0.0, declareOrGet<double>(this, "indexed_map_max_source_age_s",
                                 indexed_map_max_source_age_s_));
@@ -173,7 +185,7 @@ PlannerNode::PlannerNode(const rclcpp::NodeOptions& options)
              std::shared_ptr<std_srvs::srv::Trigger::Response> res) {
         onBuildRequest(req, res);
       },
-      rclcpp::ServicesQoS(), callback_group_);
+      rclcpp::ServicesQoS(), planning_callback_group_);
 
   const double requested_global_spacing =
       declareOrGet<double>(this, "global_vertex_spacing", 1.0);
@@ -201,7 +213,7 @@ PlannerNode::PlannerNode(const rclcpp::NodeOptions& options)
              std::shared_ptr<mgg_msgs::srv::PlannerSrv::Response> res) {
         onPlanRequest(req, res);
       },
-      rclcpp::ServicesQoS(), callback_group_);
+      rclcpp::ServicesQoS(), planning_callback_group_);
 
   objective_srv_ = create_service<mgg_msgs::srv::PlanObjective>(
       "plan_objective",
@@ -209,7 +221,7 @@ PlannerNode::PlannerNode(const rclcpp::NodeOptions& options)
              std::shared_ptr<mgg_msgs::srv::PlanObjective::Response> res) {
         onObjectiveRequest(req, res);
       },
-      rclcpp::ServicesQoS(), callback_group_);
+      rclcpp::ServicesQoS(), planning_callback_group_);
 
   const double publish_period =
       declareOrGet<double>(this, "graph_publish_period_sec", 2.0);
@@ -785,12 +797,15 @@ std::string PlannerNode::buildLocalGraph() {
   publishPath();
   publishMarkers();
 
-  // Free cells with no vertices is the characteristic bring-up failure: the
-  // lattice is finding space but every candidate is being turned away. The
-  // reason breakdown is the only thing that separates a geometry mistake from
-  // a genuinely blocked robot, so report it whenever it happens.
+  // A very low graph acceptance ratio is the characteristic support failure:
+  // the lattice finds free body boxes while projection or swept edges reject
+  // nearly every candidate. Keep this aggregate; per-sample logs would flood
+  // the fleet and perturb planning timing.
   char why[128] = "";
-  if (r.vertices_added == 0 && r.free_cells > 0) {
+  const bool low_acceptance =
+      r.free_cells > 0 &&
+      static_cast<std::int64_t>(r.vertices_added) * 20 < r.free_cells;
+  if (low_acceptance) {
     std::snprintf(why, sizeof(why),
                   " (rejected: %d collision, %d no ground; edges: %d ok, "
                   "%d steep, %d occupied, %d unmapped, %d hanging)",
@@ -1042,6 +1057,7 @@ void PlannerNode::updateGlobalGraph() {
 void PlannerNode::onBuildRequest(
     const std::shared_ptr<std_srvs::srv::Trigger::Request>,
     std::shared_ptr<std_srvs::srv::Trigger::Response> response) {
+  const std::lock_guard<std::recursive_mutex> lock(planner_mutex_);
   response->message = buildLocalGraph();
   response->success = local_graph_->getNumVertices() > 1;
   RCLCPP_INFO(get_logger(), "%s", response->message.c_str());
@@ -1050,7 +1066,7 @@ void PlannerNode::onBuildRequest(
 void PlannerNode::onPlanRequest(
     const std::shared_ptr<mgg_msgs::srv::PlannerSrv::Request> request,
     std::shared_ptr<mgg_msgs::srv::PlannerSrv::Response> response) {
-  const std::lock_guard<std::recursive_mutex> lock(planner_mutex_);
+  std::unique_lock<std::recursive_mutex> lock(planner_mutex_);
   // A caller may pin the bound mode for this cycle, e.g. to squeeze through a
   // gap it would normally refuse.
   const mgg::BoundModeType previous = robot_params_.bound_mode;
@@ -1085,6 +1101,12 @@ void PlannerNode::onPlanRequest(
   corridor.status = best_path_.empty() ? mgg::PlanningStatus::kUnreachable
                                        : mgg::PlanningStatus::kSucceeded;
   mgg::FeasiblePath feasible = refineCorridor(corridor);
+  const IndexedQueryContext query_context = indexedQueryContext();
+  lock.unlock();
+  if (feasible.status == mgg::PlanningStatus::kSucceeded) {
+    queryIndexedMap(feasible, query_context);
+  }
+  lock.lock();
   const bool indexed_snapshot_missing =
       indexed_map_client_ &&
       (!have_mapping_snapshot_ ||
@@ -1117,12 +1139,33 @@ void PlannerNode::onPlanRequest(
   RCLCPP_INFO(get_logger(), "plan request: %s", summary.c_str());
 }
 
-bool PlannerNode::queryIndexedMap(mgg::FeasiblePath& path) {
+PlannerNode::IndexedQueryContext PlannerNode::indexedQueryContext() const {
+  IndexedQueryContext context;
+  context.route_start = current_state_;
+  context.component_from_navigation = component_from_navigation_;
+  context.body = robot_params_.getPlanningSize();
+  context.physical_size = robot_params_.size;
+  context.center_offset = robot_params_.center_offset;
+  context.robot_type = robot_params_.type;
+  context.max_step_height = planning_params_.max_step_height;
+  context.max_inclination = planning_params_.max_inclination;
+  context.graph_to_base =
+      planning_params_.max_ground_height - robot_params_.size.z() / 2.0;
+  context.have_mapping_snapshot = have_mapping_snapshot_;
+  context.mapping_snapshot = mapping_snapshot_;
+  context.mapping_snapshot_received = mapping_snapshot_received_;
+  return context;
+}
+
+bool PlannerNode::queryIndexedMap(mgg::FeasiblePath& path,
+                                  const IndexedQueryContext& context) {
+  path.indexed_map_validated = false;
   if (!indexed_map_client_) return true;
   const auto fail = [&path](mgg::PlanningStatus status,
                             const std::string& reason) {
     path.status = status;
     path.poses.clear();
+    path.partial = false;
     path.reason = reason;
     return false;
   };
@@ -1135,19 +1178,20 @@ bool PlannerNode::queryIndexedMap(mgg::FeasiblePath& path) {
     return fail(mgg::PlanningStatus::kStaleRevision,
                 "indexed mapping snapshot key or source stamp is invalid");
   }
-  if (!have_mapping_snapshot_ ||
+  if (!context.have_mapping_snapshot ||
       std::chrono::duration<double>(std::chrono::steady_clock::now() -
-                                    mapping_snapshot_received_).count() >
+                                    context.mapping_snapshot_received).count() >
           indexed_map_snapshot_ttl_s_) {
     return fail(mgg::PlanningStatus::kStaleRevision,
                 "indexed mapping authority is unavailable or expired");
   }
-  if (mapping_snapshot_.component_id != path.component_id ||
-      mapping_snapshot_.epoch != path.map_epoch ||
-      mapping_snapshot_.graph_revision != path.mapping_graph_revision ||
-      mapping_snapshot_.geometry_revision != path.geometry_revision ||
-      mapping_snapshot_.source_stamp.sec != path.map_source_stamp_sec ||
-      mapping_snapshot_.source_stamp.nanosec != path.map_source_stamp_nanosec) {
+  if (context.mapping_snapshot.component_id != path.component_id ||
+      context.mapping_snapshot.epoch != path.map_epoch ||
+      context.mapping_snapshot.graph_revision != path.mapping_graph_revision ||
+      context.mapping_snapshot.geometry_revision != path.geometry_revision ||
+      context.mapping_snapshot.source_stamp.sec != path.map_source_stamp_sec ||
+      context.mapping_snapshot.source_stamp.nanosec !=
+          path.map_source_stamp_nanosec) {
     return fail(mgg::PlanningStatus::kStaleRevision,
                 "indexed mapping authority changed during planning");
   }
@@ -1173,16 +1217,38 @@ bool PlannerNode::queryIndexedMap(mgg::FeasiblePath& path) {
   request->geometry_revision = path.geometry_revision;
   request->source_stamp.sec = path.map_source_stamp_sec;
   request->source_stamp.nanosec = path.map_source_stamp_nanosec;
-  const Eigen::Vector3d body = robot_params_.getPlanningSize();
-  request->body_size.x = body.x();
-  request->body_size.y = body.y();
-  request->body_size.z = body.z();
+  const Eigen::Vector3d body = context.body;
+  const Eigen::Vector3d component_body =
+      context.component_from_navigation.linear().cwiseAbs() * body;
+  const Eigen::Vector3d component_up =
+      context.component_from_navigation.linear() * Eigen::Vector3d::UnitZ();
+  if (!body.allFinite() || (body.array() <= 0.0).any() ||
+      !component_body.allFinite() || (component_body.array() <= 0.0).any() ||
+      !context.physical_size.allFinite() ||
+      (context.physical_size.array() <= 0.0).any() ||
+      !context.center_offset.allFinite() ||
+      context.center_offset.head<2>().norm() > 1e-9 ||
+      !component_up.allFinite() ||
+      (component_up - Eigen::Vector3d::UnitZ()).norm() > 1e-6 ||
+      !std::isfinite(indexed_map_ground_tolerance_m_) ||
+      !std::isfinite(context.max_step_height) ||
+      context.max_step_height < 0.0 ||
+      !std::isfinite(context.max_inclination) ||
+      context.max_inclination < 0.0 ||
+      !std::isfinite(context.graph_to_base)) {
+    return fail(mgg::PlanningStatus::kBlocked,
+                "indexed map body, terrain limits, or gravity alignment is invalid");
+  }
+  request->body_size.x = component_body.x();
+  request->body_size.y = component_body.y();
+  request->body_size.z = component_body.z();
   request->stop_at_unknown = true;
 
   std::vector<mgg::StateVec> route;
   route.reserve(path.poses.size() + 1);
-  route.push_back(current_state_);
+  route.push_back(context.route_start);
   route.insert(route.end(), path.poses.begin(), path.poses.end());
+  std::vector<double> expected_ground_z;
   for (std::size_t segment = 1; segment < route.size(); ++segment) {
     const Eigen::Vector3d a = route[segment - 1].head(3);
     const Eigen::Vector3d b = route[segment].head(3);
@@ -1191,15 +1257,27 @@ bool PlannerNode::queryIndexedMap(mgg::FeasiblePath& path) {
         1, static_cast<std::size_t>(std::ceil(distance /
                                               indexed_map_sample_spacing_m_)));
     for (std::size_t i = segment == 1 ? 0 : 1; i <= steps; ++i) {
-      const Eigen::Vector3d navigation =
-          a + (b - a) * (static_cast<double>(i) / steps) +
-          robot_params_.center_offset;
-      const Eigen::Vector3d component = component_from_navigation_ * navigation;
+      const Eigen::Vector3d base =
+          a + (b - a) * (static_cast<double>(i) / steps);
+      Eigen::Vector3d navigation = base + context.center_offset;
+      if (context.robot_type == mgg::RobotType::kGroundRobot) {
+        navigation.z() += context.graph_to_base;
+      }
+      const Eigen::Vector3d component =
+          context.component_from_navigation * navigation;
       geometry_msgs::msg::Point sample;
       sample.x = component.x();
       sample.y = component.y();
       sample.z = component.z();
       request->samples.push_back(sample);
+      if (context.robot_type == mgg::RobotType::kGroundRobot) {
+        Eigen::Vector3d contact = base;
+        contact.x() += context.center_offset.x();
+        contact.y() += context.center_offset.y();
+        contact.z() -= context.physical_size.z() / 2.0;
+        expected_ground_z.push_back(
+            (context.component_from_navigation * contact).z());
+      }
     }
   }
   if (request->samples.empty()) {
@@ -1207,9 +1285,9 @@ bool PlannerNode::queryIndexedMap(mgg::FeasiblePath& path) {
                 "indexed map query has no route samples");
   }
 
-  // The client and service use the node's reentrant callback group, and
-  // planner_main runs a MultiThreadedExecutor. Waiting on the future is
-  // bounded and never invokes nested spin_until_future_complete.
+  // The caller releases planner_mutex_ before this bounded wait. Snapshot and
+  // odometry callbacks therefore cannot occupy executor threads while blocked
+  // behind the planning callback. The exact authority is rechecked below.
   auto future = indexed_map_client_->async_send_request(request);
   if (future.wait_for(std::chrono::duration<double>(
           indexed_map_query_timeout_s_)) != std::future_status::ready) {
@@ -1255,17 +1333,54 @@ bool PlannerNode::queryIndexedMap(mgg::FeasiblePath& path) {
       return fail(mgg::PlanningStatus::kBlocked,
                   "indexed map route is occupied or unknown");
     }
-    if (robot_params_.type != mgg::RobotType::kAerialRobot &&
+    if (context.robot_type != mgg::RobotType::kAerialRobot &&
         (!std::isfinite(response->ground_z[i]) ||
          !std::isfinite(response->roughness[i]) ||
          response->roughness[i] > indexed_map_max_roughness_m_ ||
          !std::isfinite(response->clearance[i]) ||
-         response->clearance[i] < body.z() || response->step[i] ||
+        response->clearance[i] < component_body.z() || response->step[i] ||
          response->drop[i])) {
       return fail(mgg::PlanningStatus::kBlocked,
                   "indexed map terrain or clearance is unsupported");
     }
+    if (context.robot_type != mgg::RobotType::kAerialRobot) {
+      if (expected_ground_z.size() != count ||
+          std::abs(expected_ground_z[i] - response->ground_z[i]) >
+          indexed_map_ground_tolerance_m_ + 1e-9) {
+        return fail(mgg::PlanningStatus::kBlocked,
+                    "indexed map ground does not support the emitted body height");
+      }
+      if (i > 0) {
+        const double dx = request->samples[i].x - request->samples[i - 1].x;
+        const double dy = request->samples[i].y - request->samples[i - 1].y;
+        const double dz =
+            std::abs(response->ground_z[i] - response->ground_z[i - 1]);
+        const double inclination = std::atan2(dz, std::hypot(dx, dy));
+        if (dz > context.max_step_height + 1e-6 &&
+            inclination > context.max_inclination + 1e-6) {
+          return fail(mgg::PlanningStatus::kBlocked,
+                      "indexed map route exceeds platform step or inclination limits");
+        }
+      }
+    }
   }
+  {
+    const std::lock_guard<std::recursive_mutex> lock(planner_mutex_);
+    const auto& snapshot = context.mapping_snapshot;
+    if (!have_mapping_snapshot_ ||
+        mapping_snapshot_.component_id != snapshot.component_id ||
+        mapping_snapshot_.epoch != snapshot.epoch ||
+        mapping_snapshot_.graph_revision != snapshot.graph_revision ||
+        mapping_snapshot_.geometry_revision != snapshot.geometry_revision ||
+        mapping_snapshot_.source_stamp.sec != snapshot.source_stamp.sec ||
+        mapping_snapshot_.source_stamp.nanosec != snapshot.source_stamp.nanosec ||
+        !component_from_navigation_.matrix().isApprox(
+            context.component_from_navigation.matrix(), 1e-9)) {
+      return fail(mgg::PlanningStatus::kStaleRevision,
+                  "indexed mapping authority changed during query");
+    }
+  }
+  path.indexed_map_validated = true;
   return true;
 }
 
@@ -1282,6 +1397,7 @@ mgg::FeasiblePath PlannerNode::refineCorridor(
   result.geometry_revision = corridor.request.geometry_revision;
   result.map_source_stamp_sec = corridor.request.map_source_stamp_sec;
   result.map_source_stamp_nanosec = corridor.request.map_source_stamp_nanosec;
+  result.partial = corridor.partial;
   result.reason = corridor.reason;
   if (corridor.status != mgg::PlanningStatus::kSucceeded) return result;
 
@@ -1292,9 +1408,9 @@ mgg::FeasiblePath PlannerNode::refineCorridor(
     // deliberately permits a hanging local root and unknown beyond observed
     // rays during cold start.  Rechecking with the strict explicit-objective
     // policy here deadlocks a stationary robot whose lidar cannot see beneath
-    // itself.  The optional indexed query remains a stricter opt-in gate.
+    // itself. The caller applies the optional indexed query after releasing
+    // planner_mutex_.
     convertPathToNavigationBase(result);
-    queryIndexedMap(result);
     return result;
   }
 
@@ -1397,7 +1513,6 @@ mgg::FeasiblePath PlannerNode::refineCorridor(
   result = grid_planner.refine(corridor);
   if (result.status != mgg::PlanningStatus::kSucceeded) return result;
   convertPathToNavigationBase(result);
-  queryIndexedMap(result);
   return result;
 }
 
@@ -1411,7 +1526,7 @@ void PlannerNode::convertPathToNavigationBase(mgg::FeasiblePath& path) const {
 void PlannerNode::onObjectiveRequest(
     const std::shared_ptr<mgg_msgs::srv::PlanObjective::Request> request,
     std::shared_ptr<mgg_msgs::srv::PlanObjective::Response> response) {
-  const std::lock_guard<std::recursive_mutex> lock(planner_mutex_);
+  std::unique_lock<std::recursive_mutex> lock(planner_mutex_);
   mgg::PlanningRequest core;
   core.mission_id = request->mission_id;
   core.objective = static_cast<mgg::ObjectiveKind>(request->objective);
@@ -1511,8 +1626,6 @@ void PlannerNode::onObjectiveRequest(
       mgg::GraphManager& graph =
           core.objective == mgg::ObjectiveKind::kReturnHome ? *global_graph_
                                                             : *local_graph_;
-      mgg::TopologicalGoalPlanner planner(
-          core.component_id, core.graph_revision, core.map_revision, 1.0);
       mgg::StateVec graph_current = current_state_;
       mgg::PlanningRequest graph_request = core;
       if (!projectStateToDrivingHeight(graph_current)) {
@@ -1524,7 +1637,8 @@ void PlannerNode::onObjectiveRequest(
                       "(%.2f, %.2f, %.2f)",
                       graph_current.x(), graph_current.y(), graph_current.z());
         corridor.reason = reason;
-      } else if (!projectStateToDrivingHeight(graph_request.goal.pose)) {
+      } else if (core.objective == mgg::ObjectiveKind::kReturnHome &&
+                 !projectStateToDrivingHeight(graph_request.goal.pose)) {
         corridor.request = core;
         corridor.status = mgg::PlanningStatus::kUnreachable;
         char reason[192];
@@ -1535,7 +1649,20 @@ void PlannerNode::onObjectiveRequest(
                       graph_request.goal.pose.z());
         corridor.reason = reason;
       } else {
-        corridor = planner.plan(graph, graph_current, graph_request);
+        // A supported nearby goal must bind at its projected driving height.
+        // A distant unsupported goal may still receive a checked local proxy;
+        // its exact terrain is assessed only when a later horizon reaches it.
+        mgg::StateVec projected_goal = graph_request.goal.pose;
+        if (projectStateToDrivingHeight(projected_goal)) {
+          graph_request.goal.pose = projected_goal;
+        }
+        mgg::TopologicalGoalPlanner objective_planner(
+            core.component_id, core.graph_revision, core.map_revision, 1.0,
+            core.objective == mgg::ObjectiveKind::kNavigate
+                ? partial_route_min_progress_m_
+                : 0.0);
+        corridor =
+            objective_planner.plan(graph, graph_current, graph_request);
         // Graph lookup uses driving height, while refinement and the response
         // retain the caller's exact base-pose goal.
         corridor.request = core;
@@ -1543,7 +1670,12 @@ void PlannerNode::onObjectiveRequest(
     }
   }
 
-  const mgg::FeasiblePath path = refineCorridor(corridor);
+  mgg::FeasiblePath path = refineCorridor(corridor);
+  const IndexedQueryContext query_context = indexedQueryContext();
+  lock.unlock();
+  if (path.status == mgg::PlanningStatus::kSucceeded) {
+    queryIndexedMap(path, query_context);
+  }
   response->status = static_cast<std::uint8_t>(path.status);
   response->component_id = path.component_id;
   response->graph_revision = path.graph_revision;
@@ -1553,6 +1685,11 @@ void PlannerNode::onObjectiveRequest(
   response->geometry_revision = path.geometry_revision;
   response->map_source_stamp.sec = path.map_source_stamp_sec;
   response->map_source_stamp.nanosec = path.map_source_stamp_nanosec;
+  response->partial = path.status == mgg::PlanningStatus::kSucceeded &&
+                      path.partial;
+  response->indexed_map_validated =
+      path.status == mgg::PlanningStatus::kSucceeded &&
+      path.indexed_map_validated;
   response->reason = path.reason;
   for (const auto& pose : path.poses) response->path.push_back(toPoseMsg(pose));
 }
