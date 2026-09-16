@@ -127,6 +127,11 @@ class PlannerNode : public rclcpp::Node {
   bool validateObjectiveStartSupport(
       const mgg::StateVec& anchor, const mgg::StateVec& supported,
       std::vector<mgg::StateVec>& checked) const;
+  mgg::VoxelStatus objectiveBodyStatus(const Eigen::Vector3d& center,
+                                       const Eigen::Vector3d& body) const;
+  mgg::VoxelStatus objectiveSweptBodyStatus(
+      const Eigen::Vector3d& from, const Eigen::Vector3d& to,
+      const Eigen::Vector3d& body) const;
   void refreshMolaRevision();
 
   mgg::ExpandContext makeContext();
@@ -137,6 +142,7 @@ class PlannerNode : public rclcpp::Node {
   mgg::OctomapMap* cloud_map_ = nullptr;
   mgg::MolaMap* mola_map_ = nullptr;
   std::string map_backend_ = "cloud_octomap";
+  bool observed_ground_body_evidence_ = false;
   std::uint64_t observed_mola_generation_ = 0;
   std::unique_ptr<mgg::GroundProjection> ground_;
   std::unique_ptr<mgg::GeofenceManager> geofence_;

@@ -86,6 +86,22 @@ PlannerNode::PlannerNode(const rclcpp::NodeOptions& options)
   } else {
     throw std::invalid_argument("map.backend must be cloud_octomap or mola_snapshot");
   }
+  const std::string body_evidence_policy = declareOrGet<std::string>(
+      this, "objective_body_evidence_policy", "strict_volume");
+  if (body_evidence_policy == "observed_ground") {
+    if (map_backend_ != "cloud_octomap" ||
+        !get_parameter("use_sim_time").as_bool() ||
+        robot_params_.type != mgg::RobotType::kGroundRobot) {
+      throw std::invalid_argument(
+          "objective_body_evidence_policy=observed_ground requires a "
+          "simulated ground robot using map.backend=cloud_octomap");
+    }
+    observed_ground_body_evidence_ = true;
+  } else if (body_evidence_policy != "strict_volume") {
+    throw std::invalid_argument(
+        "objective_body_evidence_policy must be strict_volume or "
+        "observed_ground");
+  }
   ground_ = std::make_unique<mgg::GroundProjection>(*map_, planning_params_);
   const double grid_resolution_floor = map_->getResolution();
   grid_refinement_limits_.resolution_m = std::clamp(
@@ -999,8 +1015,8 @@ bool PlannerNode::validateObjectiveStartSupport(
   }
 
   // Missing ground may bridge one physical anchor to a mapped endpoint, but
-  // it never makes occupancy free: the full swept body remains a strict,
-  // unknown-rejecting query.
+  // it never makes occupancy free: the full swept body follows the selected
+  // objective evidence policy and always rejects occupied or invalid queries.
   std::vector<Eigen::Vector3d> projected;
   const Eigen::Vector3d body = robot_params_.getPlanningSize();
   if (ground_->getProjectedEdgeStatus(
@@ -1055,7 +1071,7 @@ bool PlannerNode::validateObjectiveStartSupport(
       checked.clear();
       return false;
     }
-    const mgg::VoxelStatus swept = map_->getStrictPathStatus(from, to, body);
+    const mgg::VoxelStatus swept = objectiveSweptBodyStatus(from, to, body);
     if (swept != mgg::VoxelStatus::kFree) {
       const bool collect_detail =
           objective_start_support_failure_.empty() ||
@@ -1075,7 +1091,7 @@ bool PlannerNode::validateObjectiveStartSupport(
           for (std::size_t sample = 0; sample < steps; ++sample) {
             const Eigen::Vector3d point =
                 from + (static_cast<double>(sample) + 0.5) * step;
-            if (map_->getStrictBoxStatus(point, swept_size) !=
+            if (objectiveBodyStatus(point, swept_size) !=
                 mgg::VoxelStatus::kFree) {
               first = point;
               break;
@@ -1085,7 +1101,8 @@ bool PlannerNode::validateObjectiveStartSupport(
         char detail[160];
         std::snprintf(
             detail, sizeof(detail),
-            "strict swept body %s near (%.2f, %.2f, %.2f)",
+            "%s swept body %s near (%.2f, %.2f, %.2f)",
+            observed_ground_body_evidence_ ? "occupied-only" : "strict",
             swept == mgg::VoxelStatus::kOccupied ? "occupied" : "unknown",
             first.x(), first.y(), first.z());
         objective_start_support_failure_ = detail;
@@ -1095,6 +1112,21 @@ bool PlannerNode::validateObjectiveStartSupport(
     }
   }
   return true;
+}
+
+mgg::VoxelStatus PlannerNode::objectiveBodyStatus(
+    const Eigen::Vector3d& center, const Eigen::Vector3d& body) const {
+  return observed_ground_body_evidence_
+             ? map_->getBoxStatus(center, body, false)
+             : map_->getStrictBoxStatus(center, body);
+}
+
+mgg::VoxelStatus PlannerNode::objectiveSweptBodyStatus(
+    const Eigen::Vector3d& from, const Eigen::Vector3d& to,
+    const Eigen::Vector3d& body) const {
+  return observed_ground_body_evidence_
+             ? map_->getOccupiedOnlyPathStatus(from, to, body)
+             : map_->getStrictPathStatus(from, to, body);
 }
 
 void PlannerNode::updateGlobalGraph() {
@@ -1825,7 +1857,7 @@ mgg::FeasiblePath PlannerNode::refineCorridor(
       }
     }
     const Eigen::Vector3d center = state.head<3>() + center_offset;
-    const mgg::VoxelStatus body_status = map_->getStrictBoxStatus(center, body);
+    const mgg::VoxelStatus body_status = objectiveBodyStatus(center, body);
     if (body_status == mgg::VoxelStatus::kOccupied) {
       return mgg::GridProjectionStatus::kBodyOccupied;
     }
@@ -1898,8 +1930,10 @@ mgg::FeasiblePath PlannerNode::refineCorridor(
         // robot center offset is applied only to the additional collision
         // sweep below; passing an offset pose to GroundProjection would shift
         // the returned driving pose by -center_offset.z.
-        if (ground_->getProjectedEdgeStatus(a.head<3>(), b.head<3>(), body,
-                                            true, projected, false) !=
+        if (ground_->getProjectedEdgeStatus(
+                a.head<3>(), b.head<3>(), body,
+                /*stop_at_unknown_voxel=*/!observed_ground_body_evidence_,
+                projected, false) !=
                 mgg::ProjectedEdgeStatus::kAdmissible ||
             projected.size() < 2) {
           return false;
@@ -1922,7 +1956,7 @@ mgg::FeasiblePath PlannerNode::refineCorridor(
           const Eigen::Vector3d checked_to =
               checked[i].head<3>() + center_offset;
           if (!geofenceAllows(checked_from, checked_to) ||
-              map_->getStrictPathStatus(checked_from, checked_to, body) !=
+              objectiveSweptBodyStatus(checked_from, checked_to, body) !=
                   mgg::VoxelStatus::kFree) {
             return false;
           }

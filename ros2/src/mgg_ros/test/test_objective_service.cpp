@@ -635,6 +635,119 @@ TEST(PlannerConfiguration, MolaBackendRequiresExactRouteValidator) {
       std::invalid_argument);
 }
 
+TEST(PlannerConfiguration, ObservedGroundPolicyIsExplicitAndSimulationCloudOnly) {
+  for (const std::string policy : {"unknown", "ObservedGround"}) {
+    rclcpp::NodeOptions options;
+    options.parameter_overrides(
+        {rclcpp::Parameter("objective_body_evidence_policy", policy)});
+    EXPECT_THROW(
+        { auto planner = std::make_shared<mgg_ros::PlannerNode>(options); },
+        std::invalid_argument);
+  }
+  rclcpp::NodeOptions hardware;
+  hardware.parameter_overrides(
+      {rclcpp::Parameter("objective_body_evidence_policy", "observed_ground")});
+  EXPECT_THROW(
+      { auto planner = std::make_shared<mgg_ros::PlannerNode>(hardware); },
+      std::invalid_argument);
+
+  rclcpp::NodeOptions mola;
+  mola.parameter_overrides(
+      {rclcpp::Parameter("use_sim_time", true),
+       rclcpp::Parameter("objective_body_evidence_policy", "observed_ground"),
+       rclcpp::Parameter("map.backend", "mola_snapshot"),
+       rclcpp::Parameter("indexed_map_query_service", "/query"),
+       rclcpp::Parameter("map.mola.peer_root", "/tmp")});
+  EXPECT_THROW(
+      { auto planner = std::make_shared<mgg_ros::PlannerNode>(mola); },
+      std::invalid_argument);
+}
+
+TEST(PlannerObjective, ObservedGroundAllowsUnknownAirButNotWallOrMissingGround) {
+  using Peer = mgg_ros::PlannerNodeTestPeer;
+  auto make = [](const std::string& policy) {
+    rclcpp::NodeOptions options;
+    options.parameter_overrides(
+        {rclcpp::Parameter("use_sim_time", true),
+         rclcpp::Parameter("map.resolution", 0.05),
+         rclcpp::Parameter("objective_body_evidence_policy", policy)});
+    auto node = std::make_shared<mgg_ros::PlannerNode>(options);
+    Peer::configureBackboneTest(*node);
+    Peer::acceptOdometry(*node, 0.0, 0.0, 0.075);
+    Peer::observeGroundRectangle(*node, -0.3, 2.3, -0.3, 0.3);
+    Peer::finishMapRevision(*node);
+    return node;
+  };
+  auto corridor = [](double goal_x) {
+    mgg::RouteCorridor route;
+    route.status = mgg::PlanningStatus::kSucceeded;
+    route.request.objective = mgg::ObjectiveKind::kNavigate;
+    route.request.goal.pose = mgg::StateVec(goal_x, 0.0, 0.075, 0.4);
+    return route;
+  };
+
+  auto strict = make("strict_volume");
+  EXPECT_EQ(Peer::refine(*strict, corridor(2.0)).status,
+            mgg::PlanningStatus::kBlocked);
+
+  auto observed = make("observed_ground");
+  const mgg::FeasiblePath clear = Peer::refine(*observed, corridor(2.0));
+  ASSERT_EQ(clear.status, mgg::PlanningStatus::kSucceeded) << clear.reason;
+  EXPECT_NEAR(clear.poses.back().x(), 2.0, 1e-9);
+  EXPECT_FALSE(clear.indexed_map_validated);
+
+  Peer::addOccupiedVoxel(*observed, 1.0, 0.0, 0.30);
+  EXPECT_EQ(Peer::refine(*observed, corridor(2.0)).status,
+            mgg::PlanningStatus::kBlocked);
+
+  auto unsupported = make("observed_ground");
+  EXPECT_EQ(Peer::refine(*unsupported, corridor(4.0)).status,
+            mgg::PlanningStatus::kBlocked);
+
+  auto stepped = make("observed_ground");
+  Peer::addRaisedFloor(*stepped, 0.30);
+  EXPECT_EQ(Peer::refine(*stepped, corridor(2.0)).status,
+            mgg::PlanningStatus::kBlocked);
+
+  auto fenced = make("observed_ground");
+  Peer::setGridGeofence(*fenced, -0.5, 0.5, -0.5, 0.5);
+  EXPECT_EQ(Peer::refine(*fenced, corridor(2.0)).status,
+            mgg::PlanningStatus::kBlocked);
+}
+
+TEST(PlannerObjective, ObservedGroundBlindStartConnectorRetainsDistanceBound) {
+  using Peer = mgg_ros::PlannerNodeTestPeer;
+  auto make = [](double support_x) {
+    rclcpp::NodeOptions options;
+    options.parameter_overrides(
+        {rclcpp::Parameter("use_sim_time", true),
+         rclcpp::Parameter("map.resolution", 0.05),
+         rclcpp::Parameter("objective_body_evidence_policy", "observed_ground")});
+    auto node = std::make_shared<mgg_ros::PlannerNode>(options);
+    Peer::configureBackboneTest(*node);
+    Peer::acceptOdometry(*node, 0.0, 0.0, 0.075);
+    Peer::observeDestinationSupport(*node, support_x);
+    return node;
+  };
+  auto corridor = [](double goal_x) {
+    mgg::RouteCorridor route;
+    route.status = mgg::PlanningStatus::kSucceeded;
+    route.request.objective = mgg::ObjectiveKind::kNavigate;
+    route.request.goal.pose = mgg::StateVec(goal_x, 0.0, 0.075, 0.0);
+    return route;
+  };
+
+  auto within = make(2.5);
+  const mgg::FeasiblePath connected = Peer::refine(*within, corridor(2.5));
+  ASSERT_EQ(connected.status, mgg::PlanningStatus::kSucceeded)
+      << connected.reason;
+  EXPECT_NEAR(connected.poses.back().x(), 2.5, 1e-9);
+
+  auto beyond = make(3.25);
+  const mgg::FeasiblePath refused = Peer::refine(*beyond, corridor(3.25));
+  EXPECT_EQ(refused.status, mgg::PlanningStatus::kBlocked);
+}
+
 TEST(PlannerBackbone, CapturesHomeBeforeMotionAndConnectsOnlyMappedTerrain) {
   rclcpp::NodeOptions options;
   options.parameter_overrides(

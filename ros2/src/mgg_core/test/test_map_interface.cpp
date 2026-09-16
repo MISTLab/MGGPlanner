@@ -168,6 +168,23 @@ TEST(MapInterface, ClassifiesTheThreeStates) {
   EXPECT_EQ(map.getVoxelStatus({50.0, 0.0, 1.0}), VoxelStatus::kUnknown);
 }
 
+TEST(MapInterface, OccupiedOnlySweepAllowsUnknownButRejectsInteriorAndBoundaryObstacles) {
+  AnalyticMap map;
+  const Eigen::Vector3d body(0.4, 0.4, 0.4);
+  EXPECT_EQ(map.getOccupiedOnlyPathStatus({11.0, 0.0, 1.0},
+                                          {12.0, 0.0, 1.0}, body),
+            VoxelStatus::kFree);
+  EXPECT_EQ(map.getOccupiedOnlyPathStatus({0.0, 0.0, 1.0},
+                                          {5.0, 0.0, 1.0}, body),
+            VoxelStatus::kOccupied);
+  EXPECT_EQ(map.getOccupiedOnlyPathStatus({0.0, 1.7, 1.0},
+                                          {5.0, 1.7, 1.0}, body),
+            VoxelStatus::kOccupied);
+  EXPECT_EQ(map.getOccupiedOnlyPathStatus(
+                {0.0, 0.0, 1.0}, {1e300, 0.0, 1.0}, body),
+            VoxelStatus::kUnknown);
+}
+
 TEST(MapInterface, RayStopsAtTheObstacleAndReportsWhere) {
   AnalyticMap map;
   Eigen::Vector3d end_voxel;

@@ -125,6 +125,34 @@ TEST(OctomapMap, StrictPathEnvelopeIncludesDiagonalCrossedVoxel) {
             VoxelStatus::kOccupied);
 }
 
+TEST(OctomapMap, OccupiedOnlySweepCoversEveryAabbFaceAndSegmentBoundary) {
+  const Eigen::Vector3d start(0.0, 0.0, 0.0);
+  const Eigen::Vector3d end(0.20, 0.0, 0.0);
+  const Eigen::Vector3d body(0.10, 0.10, 0.10);
+  const auto classify = [&](const Eigen::Vector3d& obstacle) {
+    OctomapConfig cfg;
+    cfg.resolution = 0.05;
+    OctomapMap map(cfg);
+    EXPECT_NE(map.tree()->updateNode(
+                  octomap::point3d(static_cast<float>(obstacle.x()),
+                                   static_cast<float>(obstacle.y()),
+                                   static_cast<float>(obstacle.z())),
+                  true),
+              nullptr);
+    return map.getOccupiedOnlyPathStatus(start, end, body);
+  };
+
+  // The continuously swept AABB is x=[-0.05, 0.25], y/z=[-0.05, 0.05].
+  // Pin both end faces, a boundary between resolution-sized segments, and a
+  // lateral face. Unknown space around each occupied key remains admissible.
+  EXPECT_EQ(classify({-0.05, 0.0, 0.0}), VoxelStatus::kOccupied);
+  EXPECT_EQ(classify({0.10, 0.0, 0.0}), VoxelStatus::kOccupied);
+  EXPECT_EQ(classify({0.25, 0.0, 0.0}), VoxelStatus::kOccupied);
+  EXPECT_EQ(classify({0.10, 0.05, 0.0}), VoxelStatus::kOccupied);
+  EXPECT_EQ(classify({0.10, 0.0, 0.05}), VoxelStatus::kOccupied);
+  EXPECT_EQ(classify({0.10, 0.15, 0.0}), VoxelStatus::kFree);
+}
+
 TEST(OctomapMap, ExplicitQueriesRejectEvenOneUnknownKey) {
   OctomapConfig cfg;
   cfg.resolution = 0.05;

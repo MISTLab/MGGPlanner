@@ -24,6 +24,9 @@
 #ifndef MGG_CORE_MAP_INTERFACE_H_
 #define MGG_CORE_MAP_INTERFACE_H_
 
+#include <algorithm>
+#include <cmath>
+#include <cstdint>
 #include <utility>
 #include <vector>
 
@@ -83,6 +86,47 @@ class MapInterface {
       const Eigen::Vector3d& start, const Eigen::Vector3d& end,
       const Eigen::Vector3d& box_size) const {
     return getPathStatus(start, end, box_size, true);
+  }
+  /// Conservatively reject occupied swept volume while allowing valid map
+  /// queries to contain unknown air. Each sample is the AABB swept over one
+  /// <=voxel-resolution interval, so obstacles at sample boundaries cannot
+  /// fall through gaps. kUnknown remains an error signal from invalid or
+  /// over-budget map queries rather than being silently accepted.
+  virtual VoxelStatus getOccupiedOnlyPathStatus(
+      const Eigen::Vector3d& start, const Eigen::Vector3d& end,
+      const Eigen::Vector3d& box_size) const {
+    if (!start.allFinite() || !end.allFinite() || !box_size.allFinite() ||
+        (box_size.array() < 0).any())
+      return VoxelStatus::kUnknown;
+    const double resolution = getResolution();
+    const double length = (end - start).norm();
+    if (!std::isfinite(resolution) || resolution <= 0.0 ||
+        !std::isfinite(length))
+      return VoxelStatus::kUnknown;
+    if (length < 1e-9) return getBoxStatus(start, box_size, false);
+    constexpr std::uint64_t kMaxSweepCells = 1u << 22;
+    const double steps_d = std::max(1.0, std::ceil(length / resolution));
+    if (!std::isfinite(steps_d) || steps_d > double(kMaxSweepCells))
+      return VoxelStatus::kUnknown;
+    const auto steps = static_cast<std::uint64_t>(steps_d);
+    const Eigen::Vector3d step = (end - start) / double(steps);
+    const Eigen::Vector3d swept_size = box_size + step.cwiseAbs();
+    std::uint64_t box_cells = 1;
+    for (int axis = 0; axis < 3; ++axis) {
+      const double count = std::ceil(swept_size[axis] / resolution) + 2.0;
+      if (!std::isfinite(count) ||
+          count > double(kMaxSweepCells / box_cells))
+        return VoxelStatus::kUnknown;
+      box_cells *= static_cast<std::uint64_t>(count);
+    }
+    if (steps > kMaxSweepCells / box_cells) return VoxelStatus::kUnknown;
+    for (std::uint64_t i = 0; i < steps; ++i) {
+      const double fraction = (double(i) + 0.5) / double(steps);
+      const VoxelStatus status = getBoxStatus(
+          start + fraction * (end - start), swept_size, false);
+      if (status != VoxelStatus::kFree) return status;
+    }
+    return VoxelStatus::kFree;
   }
   // ------------------------------------------------------- volumetric gain
 
