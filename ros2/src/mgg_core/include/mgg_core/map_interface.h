@@ -37,6 +37,29 @@
 
 namespace mgg {
 
+/// Largest tilt, in radians, between a map authority transform's Z axis and
+/// the navigation Z axis that XY footprint queries accept. Peer SLAM
+/// corrections between ground robots carry a few milliradians of pitch and
+/// roll, and the circle and cylinder contracts hold within this bound:
+/// cos(0.02) differs from one by two parts in ten thousand. Larger tilts still
+/// refuse, because a tilted footprint is no longer a circle in the map's XY
+/// plane.
+inline constexpr double kMaxAuthorityTiltRad = 0.02;
+
+/// Angle, in radians, between the rotated Z axis and Z.
+inline double authorityTiltRad(const Eigen::Matrix3d& rotation) {
+  const Eigen::Vector3d up = rotation * Eigen::Vector3d::UnitZ();
+  const double norm = up.norm();
+  if (!std::isfinite(norm) || norm <= 0.0) return std::numeric_limits<double>::infinity();
+  return std::acos(std::clamp(up.z() / norm, -1.0, 1.0));
+}
+
+/// True when XY footprint queries may treat the transform as level.
+inline bool authorityTiltAcceptable(const Eigen::Matrix3d& rotation) {
+  const double tilt = authorityTiltRad(rotation);
+  return std::isfinite(tilt) && tilt <= kMaxAuthorityTiltRad;
+}
+
 struct XYCellCenter {
   Eigen::Vector2d center = Eigen::Vector2d::Zero();
   std::int64_t grid_x = 0;

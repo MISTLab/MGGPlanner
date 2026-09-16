@@ -836,11 +836,11 @@ bool MolaMap::getCircleIntersectingXYCellCenters(
   }
   const auto& transform = snapshot->request.component_from_navigation;
   // A circle remains a circle under the yaw and translation used between the
-  // navigation and MOLA component frames. Tilt would turn the XY footprint
-  // into an ellipse and cannot satisfy this ground-query contract.
-  const Eigen::Vector3d component_up =
-      transform.linear() * Eigen::Vector3d::UnitZ();
-  if (!component_up.isApprox(Eigen::Vector3d::UnitZ(), 1e-6)) return false;
+  // navigation and MOLA component frames. A large tilt would turn the XY
+  // footprint into an ellipse and cannot satisfy this ground-query contract;
+  // the few milliradians a peer SLAM correction carries are within the
+  // documented tolerance.
+  if (!authorityTiltAcceptable(transform.linear())) return false;
   const Eigen::Vector3d navigation_reference(circle_center.x(),
                                               circle_center.y(), 0.0);
   const Eigen::Vector3d component_reference =
@@ -974,9 +974,9 @@ VoxelStatus MolaMap::getOccupiedOnlyCylinderPathStatus(
     return VoxelStatus::kUnknown;
   }
   const auto& transform = snapshot->request.component_from_navigation;
-  const Eigen::Vector3d component_up =
-      transform.linear() * Eigen::Vector3d::UnitZ();
-  if (!component_up.isApprox(Eigen::Vector3d::UnitZ(), 1e-6)) {
+  // The swept cylinder is upright in the navigation frame; see
+  // kMaxAuthorityTiltRad for the tilt this contract tolerates.
+  if (!authorityTiltAcceptable(transform.linear())) {
     return VoxelStatus::kUnknown;
   }
   return snapshot->map->getOccupiedOnlyCylinderPathStatus(
