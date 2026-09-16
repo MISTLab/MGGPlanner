@@ -80,6 +80,16 @@ class PlannerNodeTestPeer {
     const std::lock_guard<std::recursive_mutex> lock(node.planner_mutex_);
     node.provisional_unknown_ground_ = enabled;
   }
+  static void setObjectiveGridWindow(PlannerNode& node, double margin,
+                                     double maximum_margin,
+                                     std::size_t max_cells = 32768) {
+    const std::lock_guard<std::recursive_mutex> lock(node.planner_mutex_);
+    node.objective_grid_limits_.detour_margin_m = margin;
+    node.objective_grid_limits_.max_cells = max_cells;
+    node.objective_grid_limits_.max_expansions = 16384;
+    node.objective_grid_limits_.timeout = std::chrono::milliseconds(2000);
+    node.objective_grid_max_margin_m_ = maximum_margin;
+  }
   static std::string rebuildLocalGraph(PlannerNode& node) {
     const std::lock_guard<std::recursive_mutex> lock(node.planner_mutex_);
     return node.buildLocalGraph();
@@ -236,6 +246,21 @@ class PlannerNodeTestPeer {
     for (int repeat = 0; repeat < 20; ++repeat) {
       for (double y = -2.0; y <= 2.0; y += 0.10) {
         for (double z = 0.15; z <= 0.75; z += 0.10) {
+          node.cloud_map_->tree()->updateNode(
+              octomap::point3d(static_cast<float>(x), static_cast<float>(y),
+                               static_cast<float>(z)),
+              true);
+        }
+      }
+    }
+    ++node.map_revision_;
+  }
+  static void addBlockingWallSpan(PlannerNode& node, double x, double ymin,
+                                  double ymax) {
+    const std::lock_guard<std::recursive_mutex> lock(node.planner_mutex_);
+    for (int repeat = 0; repeat < 20; ++repeat) {
+      for (double y = ymin; y <= ymax + 1e-9; y += 0.05) {
+        for (double z = 0.15; z <= 0.75 + 1e-9; z += 0.05) {
           node.cloud_map_->tree()->updateNode(
               octomap::point3d(static_cast<float>(x), static_cast<float>(y),
                                static_cast<float>(z)),
@@ -1023,6 +1048,65 @@ TEST(PlannerObjective, ProvisionalUnknownGroundReachesDistantExactGoals) {
     EXPECT_NEAR(response->path.back().position.x, distance, 1e-9);
     EXPECT_NEAR(response->path.back().orientation.z, std::sin(0.35), 1e-9);
   }
+}
+
+TEST(PlannerObjective, ExplicitObjectiveUsesBoundedWiderDetourWindow) {
+  using Peer = mgg_ros::PlannerNodeTestPeer;
+  const auto make = [](double maximum_margin,
+                       std::size_t max_cells = 32768) {
+    rclcpp::NodeOptions options;
+    options.parameter_overrides(
+        {rclcpp::Parameter("use_sim_time", true),
+         rclcpp::Parameter("map.resolution", 0.15),
+         rclcpp::Parameter("objective_body_evidence_policy", "observed_ground"),
+         rclcpp::Parameter("objective_ground_evidence_policy",
+                           "provisional_unknown")});
+    auto node = std::make_shared<mgg_ros::PlannerNode>(options);
+    Peer::configureBackboneTest(*node);
+    Peer::setObjectiveGridWindow(*node, 4.0, maximum_margin, max_cells);
+    Peer::acceptOdometry(*node, 0.0, 0.0, 0.075);
+    // Make the map usable without adding floor support to the unknown route.
+    Peer::observeGroundRectangle(*node, -0.3, 0.3, 12.0, 12.3);
+    // This known wall seals the complete +/-4 m search window. A route exists
+    // around either end inside the separately bounded +/-8 m window.
+    Peer::addBlockingWallSpan(*node, 5.0, -4.6, 4.6);
+    Peer::finishMapRevision(*node);
+    return node;
+  };
+  const mgg::StateVec goal(10.0, 0.0, 0.075, 0.7);
+
+  auto narrow = make(4.0);
+  const auto blocked = Peer::requestBoundNavigate(*narrow, goal);
+  ASSERT_NE(blocked, nullptr);
+  EXPECT_EQ(blocked->status, Service::Response::BLOCKED);
+  EXPECT_NE(blocked->reason.find("within the bounded search window"),
+            std::string::npos)
+      << blocked->reason;
+
+  // A requested wider window must never exceed the existing allocation cap.
+  // This cap represents the +/-4 m corridor but cannot represent the detour.
+  auto cell_bounded = make(8.0, 3000);
+  const auto bounded = Peer::requestBoundNavigate(*cell_bounded, goal);
+  ASSERT_NE(bounded, nullptr);
+  EXPECT_EQ(bounded->status, Service::Response::BLOCKED);
+  EXPECT_NE(bounded->reason.find("within the bounded search window"),
+            std::string::npos)
+      << bounded->reason;
+
+  auto widened = make(8.0);
+  const auto response = Peer::requestBoundNavigate(*widened, goal);
+  ASSERT_NE(response, nullptr);
+  ASSERT_EQ(response->status, Service::Response::SUCCEEDED)
+      << response->reason;
+  ASSERT_FALSE(response->path.empty());
+  EXPECT_NEAR(response->path.back().position.x, goal.x(), 1e-6);
+  EXPECT_NEAR(response->path.back().position.y, goal.y(), 1e-6);
+  EXPECT_NEAR(response->path.back().orientation.z, std::sin(0.35), 1e-9);
+  EXPECT_NEAR(response->path.back().orientation.w, std::cos(0.35), 1e-9);
+  EXPECT_TRUE(std::any_of(response->path.begin(), response->path.end(),
+                          [](const auto& pose) {
+                            return std::abs(pose.position.y) > 4.7;
+                          }));
 }
 
 TEST(PlannerObjective, ProvisionalUnknownGroundReturnsToPhysicalHomeWithoutFloorHits) {

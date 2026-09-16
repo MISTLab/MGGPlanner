@@ -182,6 +182,7 @@ class PlannerNode : public rclcpp::Node {
   mgg::GridGraphParams grid_params_;
   mgg::GridRefinementLimits grid_refinement_limits_;
   mgg::GridRefinementLimits objective_grid_limits_;
+  double objective_grid_max_margin_m_ = 4.0;
   double partial_route_min_progress_m_ = 1.0;
   double objective_start_support_max_distance_m_ = 3.0;
   double objective_route_horizon_m_ = 8.0;

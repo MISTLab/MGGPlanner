@@ -591,7 +591,8 @@ FeasiblePath BoundedGridPlanner::refine(const RouteCorridor& corridor) {
       }
     }
     if (reached == kNoParent) {
-      return fail("no observed traversable grid detour for route segment " +
+      return fail("no observed traversable grid detour within the bounded "
+                  "search window for route segment " +
                   std::to_string(segment - 1) + "->" +
                   std::to_string(segment));
     }

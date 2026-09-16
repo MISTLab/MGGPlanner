@@ -5,6 +5,7 @@
 #include <cmath>
 #include <cstdio>
 #include <future>
+#include <limits>
 #include <map>
 #include <regex>
 #include <stdexcept>
@@ -37,6 +38,98 @@ std::string boundedObjectiveFailure(const std::string& reason) {
   if (compact.size() <= kLimit) return compact;
   return compact.substr(0, kLimit - kTail - 3) + "..." +
          compact.substr(compact.size() - kTail);
+}
+
+bool objectiveGridWindowFits(const mgg::RouteCorridor& corridor,
+                             const mgg::StateVec& current,
+                             double resolution, double margin,
+                             std::size_t max_cells) {
+  if (!current.allFinite() || !std::isfinite(resolution) || resolution <= 0.0 ||
+      !std::isfinite(margin) || margin < 0.0 || max_cells == 0) {
+    return false;
+  }
+  std::vector<mgg::StateVec> waypoints;
+  waypoints.reserve(corridor.poses.size() + 2);
+  waypoints.push_back(current);
+  for (const mgg::StateVec& pose : corridor.poses) {
+    if (!pose.allFinite()) return false;
+    if ((waypoints.back().head<3>() - pose.head<3>())
+            .cwiseAbs().maxCoeff() > 1e-6) {
+      waypoints.push_back(pose);
+    }
+  }
+  if (!corridor.partial) {
+    const mgg::StateVec& goal = corridor.request.goal.pose;
+    if (!goal.allFinite()) return false;
+    if ((waypoints.back().head<3>() - goal.head<3>())
+            .cwiseAbs().maxCoeff() > 1e-6) {
+      waypoints.push_back(goal);
+    }
+  }
+  for (std::size_t i = 1; i < waypoints.size(); ++i) {
+    const long double width =
+        std::ceil((std::abs(static_cast<long double>(waypoints[i].x()) -
+                            waypoints[i - 1].x()) +
+                   2.0L * margin) /
+                  resolution) +
+        3.0L;
+    const long double height =
+        std::ceil((std::abs(static_cast<long double>(waypoints[i].y()) -
+                            waypoints[i - 1].y()) +
+                   2.0L * margin) /
+                  resolution) +
+        3.0L;
+    if (!std::isfinite(width) || !std::isfinite(height) || width < 1.0L ||
+        height < 1.0L ||
+        width > static_cast<long double>(max_cells) ||
+        height > static_cast<long double>(max_cells) ||
+        width * height > static_cast<long double>(max_cells)) {
+      return false;
+    }
+  }
+  return true;
+}
+
+double widestObjectiveGridMargin(const mgg::RouteCorridor& corridor,
+                                 const mgg::StateVec& current,
+                                 const mgg::GridRefinementLimits& limits,
+                                 double maximum_margin) {
+  const double minimum_margin = limits.detour_margin_m;
+  if (!std::isfinite(maximum_margin) || maximum_margin <= minimum_margin ||
+      !objectiveGridWindowFits(corridor, current, limits.resolution_m,
+                               minimum_margin, limits.max_cells)) {
+    return minimum_margin;
+  }
+  const double resolution = limits.resolution_m;
+  const long double steps_value = std::floor(
+      (static_cast<long double>(maximum_margin) - minimum_margin) /
+          resolution +
+      1e-9L);
+  if (!std::isfinite(steps_value) || steps_value < 0.0L ||
+      steps_value >
+          static_cast<long double>(std::numeric_limits<std::size_t>::max())) {
+    return minimum_margin;
+  }
+  const std::size_t steps = static_cast<std::size_t>(steps_value);
+  std::size_t low = 0;
+  std::size_t high = steps;
+  while (low < high) {
+    const std::size_t middle = low + (high - low + 1) / 2;
+    const double candidate = minimum_margin + middle * resolution;
+    if (objectiveGridWindowFits(corridor, current, resolution, candidate,
+                                limits.max_cells)) {
+      low = middle;
+    } else {
+      high = middle - 1;
+    }
+  }
+  double selected = minimum_margin + low * resolution;
+  if (selected < maximum_margin &&
+      objectiveGridWindowFits(corridor, current, resolution, maximum_margin,
+                              limits.max_cells)) {
+    selected = maximum_margin;
+  }
+  return selected;
 }
 
 }  // namespace
@@ -164,6 +257,10 @@ PlannerNode::PlannerNode(const rclcpp::NodeOptions& options)
   objective_grid_limits_ = grid_refinement_limits_;
   objective_grid_limits_.detour_margin_m = std::clamp(
       declareOrGet<double>(this, "objective_grid_margin_m", 4.0), 0.0, 25.0);
+  objective_grid_max_margin_m_ = std::clamp(
+      declareOrGet<double>(this, "objective_grid_max_margin_m",
+                           objective_grid_limits_.detour_margin_m),
+      objective_grid_limits_.detour_margin_m, 25.0);
   objective_grid_limits_.max_cells = static_cast<std::size_t>(std::clamp(
       declareOrGet<std::int64_t>(this, "objective_grid_max_cells", 32768),
       std::int64_t{64}, std::int64_t{262144}));
@@ -2498,9 +2595,18 @@ mgg::FeasiblePath PlannerNode::refineCorridor(
         }
         return true;
       };
-  const mgg::GridRefinementLimits& active_limits =
-      limits != nullptr ? *limits : grid_refinement_limits_;
-  mgg::BoundedGridPlanner grid_planner(current_state_, active_limits, project,
+  mgg::GridRefinementLimits widened_objective_limits;
+  const mgg::GridRefinementLimits* active_limits =
+      limits != nullptr ? limits : &grid_refinement_limits_;
+  if (limits != nullptr &&
+      (corridor.request.objective == mgg::ObjectiveKind::kNavigate ||
+       corridor.request.objective == mgg::ObjectiveKind::kReturnHome)) {
+    widened_objective_limits = *limits;
+    widened_objective_limits.detour_margin_m = widestObjectiveGridMargin(
+        corridor, current_state_, *limits, objective_grid_max_margin_m_);
+    active_limits = &widened_objective_limits;
+  }
+  mgg::BoundedGridPlanner grid_planner(current_state_, *active_limits, project,
                                        traverse);
   result = grid_planner.refine(corridor);
   if (result.status != mgg::PlanningStatus::kSucceeded &&
