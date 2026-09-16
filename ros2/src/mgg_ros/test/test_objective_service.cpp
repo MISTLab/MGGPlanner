@@ -636,6 +636,18 @@ class PlannerNodeTestPeer {
   static mgg::StateVec globalVertexState(const PlannerNode& node, int id) {
     return node.global_graph_->getVertex(id)->state;
   }
+  static void addBadHomeCorridor(PlannerNode& node) {
+    const std::lock_guard<std::recursive_mutex> lock(node.planner_mutex_);
+    auto* bad = new mgg::Vertex(
+        1, mgg::StateVec(0.60, 0.46, 0.34, 0.0));
+    auto* current = new mgg::Vertex(
+        2, mgg::StateVec(1.20, 0.0, 0.30, 0.0));
+    node.global_graph_->addVertex(bad);
+    node.global_graph_->addVertex(current);
+    node.global_graph_->addEdge(node.global_graph_->getVertex(0), bad, 0.8);
+    node.global_graph_->addEdge(bad, current, 0.8);
+    ++node.graph_revision_;
+  }
 
   static bool initialAnchorSupported(const PlannerNode& node) {
     return node.initial_anchor_supported_;
@@ -918,6 +930,28 @@ TEST(PlannerObjective, ProvisionalHomeNeverOverridesAStaleRevision) {
       mgg::StateVec(0.0, 0.0, 0.20, 0.0), "kf-home", 999);
   EXPECT_EQ(response->status,
             mgg_msgs::srv::PlanObjective::Response::STALE_REVISION);
+}
+
+TEST(PlannerObjective, PhysicalHomeUsesDirectRouteBeforeBadBreadcrumb) {
+  using Peer = mgg_ros::PlannerNodeTestPeer;
+  rclcpp::NodeOptions options;
+  options.parameter_overrides(
+      {rclcpp::Parameter("use_sim_time", true),
+       rclcpp::Parameter("map.resolution", 0.15),
+       rclcpp::Parameter("objective_body_evidence_policy", "observed_ground"),
+       rclcpp::Parameter("objective_ground_evidence_policy", "provisional_unknown")});
+  auto node = std::make_shared<mgg_ros::PlannerNode>(options);
+  Peer::configureLongKnownRoad(*node);
+  Peer::acceptOdometry(*node, 1.20, 0.0, 0.075);
+  Peer::addBadHomeCorridor(*node);
+  const auto response = Peer::requestObjective(
+      *node, mgg::ObjectiveKind::kReturnHome,
+      mgg::StateVec(0.0, 0.0, 0.075, 0.2), "kf-home");
+  ASSERT_EQ(response->status,
+            mgg_msgs::srv::PlanObjective::Response::SUCCEEDED)
+      << response->reason;
+  ASSERT_GE(response->path.size(), 2u);
+  EXPECT_NEAR(response->path.back().position.x, 0.0, 1e-9);
 }
 
 TEST(PlannerExplore, FullSizeGroundRobotsExpandAtProjectedDrivingHeight) {

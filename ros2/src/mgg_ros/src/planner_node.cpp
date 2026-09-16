@@ -2678,29 +2678,29 @@ void PlannerNode::onObjectiveRequest(
         // support before any motion path can be returned.
         graph_current = physicalAnchorAtDrivingHeight(current_state_);
       }
+      const mgg::Vertex* home_root = global_graph_->getVertex(0);
+      const double home_delta =
+          have_initial_state_
+              ? (core.goal.pose.head<3>() - initial_state_.head<3>())
+                    .cwiseAbs().maxCoeff()
+              : std::numeric_limits<double>::infinity();
+      const double home_association_tolerance =
+          std::clamp(2.0 * map_->getResolution(), 0.01, 0.25);
+      const bool requests_physical_home =
+          core.objective == mgg::ObjectiveKind::kReturnHome &&
+          have_initial_state_ && home_root != nullptr &&
+          (home_delta <= 1e-3 ||
+           (!core.goal.landmark_id.empty() &&
+            home_delta <= home_association_tolerance));
+      provisional_physical_home =
+          provisional_unknown_ground_ && requests_physical_home;
       bool home_goal_supported = true;
       if (core.objective == mgg::ObjectiveKind::kReturnHome &&
           !projectStateToDrivingHeight(graph_request.goal.pose, true)) {
         home_goal_supported = false;
-        const mgg::Vertex* root = global_graph_->getVertex(0);
-        const double home_delta =
-            have_initial_state_
-                ? (core.goal.pose.head<3>() - initial_state_.head<3>())
-                      .cwiseAbs()
-                      .maxCoeff()
-                : std::numeric_limits<double>::infinity();
-        const double home_association_tolerance =
-            std::clamp(2.0 * map_->getResolution(), 0.01, 0.25);
-        const bool requests_physical_home =
-            have_initial_state_ && root != nullptr &&
-            (home_delta <= 1e-3 ||
-             (!core.goal.landmark_id.empty() &&
-              home_delta <= home_association_tolerance));
-        provisional_physical_home =
-            provisional_unknown_ground_ && requests_physical_home;
         if ((initial_anchor_supported_ || provisional_unknown_ground_) &&
             requests_physical_home) {
-          graph_request.goal.pose = root->state;
+          graph_request.goal.pose = home_root->state;
           home_goal_supported = true;
         }
       }
@@ -2751,10 +2751,13 @@ void PlannerNode::onObjectiveRequest(
           ? &objective_grid_limits_
           : nullptr;
   mgg::RouteCorridor primary = corridor;
-  if (explicit_objective_planned &&
-      core.objective == mgg::ObjectiveKind::kNavigate &&
+  const bool direct_primary =
+      explicit_objective_planned &&
+      (core.objective == mgg::ObjectiveKind::kNavigate ||
+       provisional_physical_home) &&
       (corridor.status == mgg::PlanningStatus::kSucceeded ||
-       corridor.status == mgg::PlanningStatus::kUnreachable)) {
+       corridor.status == mgg::PlanningStatus::kUnreachable);
+  if (direct_primary) {
     // The operator's exact goal is the primary corridor. A stale or sparse
     // breadcrumb graph must not consume the entire bounded grid budget trying
     // to repair one of its segments before the direct, unknown-permissive
@@ -2766,29 +2769,15 @@ void PlannerNode::onObjectiveRequest(
   }
   const auto objective_refinement_started = std::chrono::steady_clock::now();
   mgg::FeasiblePath path = refineCorridor(primary, objective_limits);
-  if (((core.objective == mgg::ObjectiveKind::kNavigate &&
-        corridor.status == mgg::PlanningStatus::kSucceeded &&
-       !corridor.poses.empty()) ||
-       (core.objective == mgg::ObjectiveKind::kReturnHome &&
-        explicit_objective_planned && provisional_physical_home &&
-        (corridor.status == mgg::PlanningStatus::kSucceeded ||
-         corridor.status == mgg::PlanningStatus::kUnreachable))) &&
+  if (direct_primary && corridor.status == mgg::PlanningStatus::kSucceeded &&
+      !corridor.poses.empty() &&
       path.status != mgg::PlanningStatus::kSucceeded) {
     const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::steady_clock::now() - objective_refinement_started);
     if (elapsed < objective_grid_limits_.timeout) {
       mgg::GridRefinementLimits remaining = objective_grid_limits_;
       remaining.timeout -= elapsed;
-      if (core.objective == mgg::ObjectiveKind::kNavigate) {
-        path = refineCorridor(corridor, &remaining);
-      } else {
-        mgg::RouteCorridor direct = corridor;
-        direct.status = mgg::PlanningStatus::kSucceeded;
-        direct.poses.clear();
-        direct.partial = false;
-        direct.reason.clear();
-        path = refineCorridor(direct, &remaining);
-      }
+      path = refineCorridor(corridor, &remaining);
     }
   }
   const IndexedQueryContext query_context = indexedQueryContext();
