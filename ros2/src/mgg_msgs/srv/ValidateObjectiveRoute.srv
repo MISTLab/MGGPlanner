@@ -1,0 +1,12 @@
+string mission_id
+string component_id
+string frame_id
+geometry_msgs/Pose[] path
+float64 lookahead_m
+---
+uint8 VALID=0
+uint8 INVALID=1
+uint8 UNAVAILABLE=2
+uint8 status
+uint64 map_revision
+string reason

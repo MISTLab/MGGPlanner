@@ -65,6 +65,7 @@ rosidl_generate_interfaces(${PROJECT_NAME}
   "srv/PlannerSetVel.srv"
   "srv/PlanObjective.srv"
   "srv/QueryMapBatch.srv"
+  "srv/ValidateObjectiveRoute.srv"
   "srv/PlannerSrv.srv"
   "srv/PlannerStringTrigger.srv"
 

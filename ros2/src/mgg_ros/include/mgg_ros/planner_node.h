@@ -37,6 +37,7 @@
 #include <mgg_msgs/msg/mapping_snapshot.hpp>
 #include <mgg_msgs/srv/plan_objective.hpp>
 #include <mgg_msgs/srv/query_map_batch.hpp>
+#include <mgg_msgs/srv/validate_objective_route.hpp>
 #include <mgg_msgs/srv/planner_srv.hpp>
 
 #include "mgg_core/geofence_manager.h"
@@ -135,9 +136,15 @@ class PlannerNode : public rclcpp::Node {
   bool objectiveFootprintTerrainSupported(
       const Eigen::Vector3d& driving_pose,
       const Eigen::Vector3d& body) const;
+  mgg::GridProjectionStatus objectiveFootprintTerrainStatus(
+      const Eigen::Vector3d& driving_pose,
+      const Eigen::Vector3d& body) const;
   bool objectiveTerrainPathSupported(
       const std::vector<Eigen::Vector3d>& driving_path) const;
   void refreshMolaRevision();
+  void onValidateObjectiveRoute(
+      const std::shared_ptr<mgg_msgs::srv::ValidateObjectiveRoute::Request>& request,
+      std::shared_ptr<mgg_msgs::srv::ValidateObjectiveRoute::Response> response);
 
   mgg::ExpandContext makeContext();
   mgg::GainContext makeGainContext();
@@ -149,6 +156,7 @@ class PlannerNode : public rclcpp::Node {
   std::string map_backend_ = "cloud_octomap";
   bool observed_ground_body_evidence_ = false;
   bool provisional_unknown_ground_ = false;
+  std::string mission_id_;
   std::uint64_t observed_mola_generation_ = 0;
   std::unique_ptr<mgg::GroundProjection> ground_;
   std::unique_ptr<mgg::GeofenceManager> geofence_;
@@ -290,6 +298,8 @@ class PlannerNode : public rclcpp::Node {
   rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr build_srv_;
   rclcpp::Service<mgg_msgs::srv::PlannerSrv>::SharedPtr plan_srv_;
   rclcpp::Service<mgg_msgs::srv::PlanObjective>::SharedPtr objective_srv_;
+  rclcpp::Service<mgg_msgs::srv::ValidateObjectiveRoute>::SharedPtr
+      validate_objective_route_srv_;
   rclcpp::Client<mgg_msgs::srv::QueryMapBatch>::SharedPtr indexed_map_client_;
   rclcpp::TimerBase::SharedPtr graph_timer_;
   /// One-shot guard against use_sim_time with no /clock.

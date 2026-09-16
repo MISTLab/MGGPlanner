@@ -30,6 +30,32 @@ class PlannerNodeTestPeer {
       PlannerNode& node, const std::vector<Eigen::Vector3d>& path) {
     return node.objectiveTerrainPathSupported(path);
   }
+  static std::shared_ptr<mgg_msgs::srv::ValidateObjectiveRoute::Response>
+  validateRoute(
+      PlannerNode& node,
+      const std::shared_ptr<mgg_msgs::srv::ValidateObjectiveRoute::Request>&
+          request) {
+    auto response =
+        std::make_shared<mgg_msgs::srv::ValidateObjectiveRoute::Response>();
+    node.onValidateObjectiveRoute(request, response);
+    return response;
+  }
+  static void setValidationComponent(PlannerNode& node,
+                                     const std::string& component) {
+    const std::lock_guard<std::recursive_mutex> lock(node.planner_mutex_);
+    node.mapping_snapshot_.component_id = component;
+    node.have_mapping_snapshot_ = true;
+  }
+  static void setPlanningBody(PlannerNode& node,
+                              const Eigen::Vector3d& size) {
+    const std::lock_guard<std::recursive_mutex> lock(node.planner_mutex_);
+    node.robot_params_.size = size;
+    node.robot_params_.size_extension.setZero();
+  }
+  static void setMaxStep(PlannerNode& node, double height) {
+    const std::lock_guard<std::recursive_mutex> lock(node.planner_mutex_);
+    node.planning_params_.max_step_height = height;
+  }
   static void observeShallowRamp(PlannerNode& node) {
     const std::lock_guard<std::recursive_mutex> lock(node.planner_mutex_);
     for (double x = -0.3; x <= 0.3 + 1e-9; x += 0.05) {
@@ -777,6 +803,147 @@ TEST(PlannerObjective, ProvisionalUnknownGroundRetainsGoalAndKnownVetoes) {
   Peer::setGridGeofence(*fenced, -0.5, 0.5, -0.5, 0.5);
   EXPECT_EQ(Peer::refine(*fenced, corridor()).status,
             mgg::PlanningStatus::kBlocked);
+}
+
+TEST(PlannerObjective, RemainingRouteValidationUsesLatestKnownHazards) {
+  using Peer = mgg_ros::PlannerNodeTestPeer;
+  using Service = mgg_msgs::srv::ValidateObjectiveRoute;
+  auto make = [] {
+    rclcpp::NodeOptions options;
+    options.parameter_overrides(
+        {rclcpp::Parameter("use_sim_time", true),
+         rclcpp::Parameter("mission_id", "mission-test"),
+         rclcpp::Parameter("map.resolution", 0.15),
+         rclcpp::Parameter("objective_body_evidence_policy", "observed_ground"),
+         rclcpp::Parameter("objective_ground_evidence_policy",
+                           "provisional_unknown")});
+    auto node = std::make_shared<mgg_ros::PlannerNode>(options);
+    Peer::configureBackboneTest(*node);
+    Peer::acceptOdometry(*node, 0.0, 0.0, 0.075);
+    Peer::observeGroundRectangle(*node, -0.3, 0.3, 8.0, 8.3);
+    Peer::finishMapRevision(*node);
+    return node;
+  };
+  auto request = [](double lookahead = 3.0) {
+    auto req = std::make_shared<Service::Request>();
+    req->mission_id = "mission-test";
+    req->component_id = "world";
+    req->frame_id = "world";
+    req->lookahead_m = lookahead;
+    for (double x : {0.0, 1.0, 2.0, 3.0, 4.0}) {
+      geometry_msgs::msg::Pose pose;
+      pose.position.x = x;
+      pose.position.z = 0.075;
+      pose.orientation.w = 1.0;
+      req->path.push_back(pose);
+    }
+    return req;
+  };
+
+  auto clear = make();
+  EXPECT_EQ(Peer::validateRoute(*clear, request())->status, Service::Response::VALID);
+
+  auto ahead = make();
+  Peer::addMeasuredSurface(*ahead, 2.0, 0.0, 0.125);
+  EXPECT_EQ(Peer::validateRoute(*ahead, request())->status,
+            Service::Response::INVALID);
+
+  auto behind = make();
+  Peer::acceptOdometry(*behind, 3.0, 0.0, 0.075);
+  Peer::addMeasuredSurface(*behind, 1.0, 0.0, 0.125);
+  EXPECT_EQ(Peer::validateRoute(*behind, request())->status,
+            Service::Response::VALID);
+
+  auto bounded = make();
+  Peer::addMeasuredSurface(*bounded, 4.0, 0.0, 0.125);
+  EXPECT_EQ(Peer::validateRoute(*bounded, request(2.0))->status,
+            Service::Response::VALID);
+  EXPECT_EQ(Peer::validateRoute(*bounded, request(12.0))->status,
+            Service::Response::UNAVAILABLE);
+
+  auto stale = request();
+  stale->mission_id = "old-mission";
+  EXPECT_EQ(Peer::validateRoute(*clear, stale)->status,
+            Service::Response::UNAVAILABLE);
+  stale = request();
+  stale->path[0].position.x = std::numeric_limits<double>::quiet_NaN();
+  EXPECT_EQ(Peer::validateRoute(*clear, stale)->status,
+            Service::Response::UNAVAILABLE);
+
+  auto component = make();
+  Peer::setValidationComponent(*component, "live-component");
+  auto old_component = request();
+  EXPECT_EQ(Peer::validateRoute(*component, old_component)->status,
+            Service::Response::UNAVAILABLE);
+  old_component->component_id = "live-component";
+  EXPECT_EQ(Peer::validateRoute(*component, old_component)->status,
+            Service::Response::VALID);
+
+  auto stationary = make();
+  auto stopped = request();
+  stopped->path.resize(2);
+  stopped->path[1] = stopped->path[0];
+  Peer::addOccupiedVoxel(*stationary, 0.0, 0.0, 0.30);
+  EXPECT_EQ(Peer::validateRoute(*stationary, stopped)->status,
+            Service::Response::INVALID);
+
+  auto known_beats_unavailable = make();
+  Peer::addOccupiedVoxel(*known_beats_unavailable, 0.0, 0.0, 0.30);
+  Peer::setMaxStep(*known_beats_unavailable,
+                   std::numeric_limits<double>::quiet_NaN());
+  EXPECT_EQ(Peer::validateRoute(*known_beats_unavailable, stopped)->status,
+            Service::Response::INVALID);
+
+  auto invalid_query = make();
+  Peer::setPlanningBody(*invalid_query, Eigen::Vector3d(100.0, 100.0, 0.15));
+  EXPECT_EQ(Peer::validateRoute(*invalid_query, stopped)->status,
+            Service::Response::UNAVAILABLE);
+
+  auto fenced_gap = make();
+  Peer::setGridGeofence(*fenced_gap, 1.34, 1.36, -0.02, 0.02);
+  EXPECT_EQ(Peer::validateRoute(*fenced_gap, request())->status,
+            Service::Response::INVALID);
+
+  auto dense = request();
+  dense->path.clear();
+  for (int i = 0; i < 60; ++i) {
+    geometry_msgs::msg::Pose pose;
+    pose.position.x = 0.05 * i;
+    pose.position.z = 0.075;
+    pose.orientation.w = 1.0;
+    dense->path.push_back(pose);
+  }
+  EXPECT_EQ(Peer::validateRoute(*clear, dense)->status,
+            Service::Response::VALID);
+
+  auto excessive = request();
+  excessive->path.clear();
+  for (int i = 0; i < 160; ++i) {
+    geometry_msgs::msg::Pose pose;
+    pose.position.x = i == 0 ? 0.0 : 0.20 + 0.015 * (i - 1);
+    pose.position.z = 0.075;
+    pose.orientation.w = 1.0;
+    excessive->path.push_back(pose);
+  }
+  EXPECT_EQ(Peer::validateRoute(*clear, excessive)->status,
+            Service::Response::UNAVAILABLE);
+  EXPECT_NE(Peer::validateRoute(*clear, excessive)->reason.find("work bound"),
+            std::string::npos);
+
+  auto ambiguous = request();
+  ambiguous->path.clear();
+  for (const auto& xy : std::vector<Eigen::Vector2d>{{0.0, 0.0}, {2.0, 0.0},
+                                                     {2.0, 0.10}, {0.0, 0.10},
+                                                     {-1.0, 0.10}}) {
+    geometry_msgs::msg::Pose pose;
+    pose.position.x = xy.x();
+    pose.position.y = xy.y();
+    pose.position.z = 0.075;
+    pose.orientation.w = 1.0;
+    ambiguous->path.push_back(pose);
+  }
+  EXPECT_EQ(Peer::validateRoute(*clear, ambiguous)->status,
+            Service::Response::UNAVAILABLE);
 }
 
 TEST(PlannerObjective, ObservedGroundAllowsUnknownAirButNotWallOrMissingGround) {

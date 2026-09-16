@@ -323,6 +323,16 @@ PlannerNode::PlannerNode(const rclcpp::NodeOptions& options)
         onObjectiveRequest(req, res);
       },
       rclcpp::ServicesQoS(), planning_callback_group_);
+  validate_objective_route_srv_ =
+      create_service<mgg_msgs::srv::ValidateObjectiveRoute>(
+          "validate_objective_route",
+          [this](const std::shared_ptr<
+                     mgg_msgs::srv::ValidateObjectiveRoute::Request> req,
+                 std::shared_ptr<
+                     mgg_msgs::srv::ValidateObjectiveRoute::Response> res) {
+            onValidateObjectiveRoute(req, res);
+          },
+          rclcpp::ServicesQoS(), planning_callback_group_);
 
   const double publish_period =
       declareOrGet<double>(this, "graph_publish_period_sec", 2.0);
@@ -382,6 +392,7 @@ void PlannerNode::loadParameters() {
   }
   world_frame_ = planning_params_.global_frame_id;
   component_id_ = declareOrGet<std::string>(this, "component_id", world_frame_);
+  mission_id_ = declareOrGet<std::string>(this, "mission_id", "");
   communication_range_ =
       declareOrGet<double>(this, "communication_range", 15.0);
 
@@ -1196,12 +1207,19 @@ mgg::VoxelStatus PlannerNode::objectiveSweptBodyStatus(
 bool PlannerNode::objectiveFootprintTerrainSupported(
     const Eigen::Vector3d& driving_pose,
     const Eigen::Vector3d& body) const {
+  return objectiveFootprintTerrainStatus(driving_pose, body) ==
+         mgg::GridProjectionStatus::kSupported;
+}
+
+mgg::GridProjectionStatus PlannerNode::objectiveFootprintTerrainStatus(
+    const Eigen::Vector3d& driving_pose,
+    const Eigen::Vector3d& body) const {
   // This extra terrain contract is intentionally limited to simulation's
   // observed-ground policy. Explicit objectives and Explore both use it;
   // strict-volume hardware planning retains its existing semantics.
   if (!observed_ground_body_evidence_ ||
       robot_params_.type != mgg::RobotType::kGroundRobot) {
-    return true;
+    return mgg::GridProjectionStatus::kSupported;
   }
   if (!driving_pose.allFinite() || !body.allFinite() ||
       (body.array() < 0.0).any() ||
@@ -1210,13 +1228,13 @@ bool PlannerNode::objectiveFootprintTerrainSupported(
       planning_params_.max_step_height < 0.0 || !ground_ ||
       !std::isfinite(ground_->max_projection_length) ||
       ground_->max_projection_length <= 0.0) {
-    return false;
+    return mgg::GridProjectionStatus::kBodyUnknown;
   }
   const double resolution = map_->getResolution();
   const double radius = 0.5 * body.head<2>().norm();
   if (!std::isfinite(resolution) || resolution <= 0.0 ||
       !std::isfinite(radius)) {
-    return false;
+    return mgg::GridProjectionStatus::kBodyUnknown;
   }
 
   // A square around the footprint's circumscribed circle contains the body at
@@ -1229,7 +1247,7 @@ bool PlannerNode::objectiveFootprintTerrainSupported(
   constexpr int kMaxIntervals = 63;
   if (!std::isfinite(extent) || !std::isfinite(intervals_d) ||
       intervals_d < 1.0 || intervals_d > kMaxIntervals) {
-    return false;
+    return mgg::GridProjectionStatus::kBodyUnknown;
   }
   const int intervals = static_cast<int>(intervals_d);
   const double spacing = 2.0 * extent / static_cast<double>(intervals);
@@ -1249,13 +1267,14 @@ bool PlannerNode::objectiveFootprintTerrainSupported(
                                    ground_->max_projection_length);
   if (map_->getBoxStatus(query_center, query_size, false) ==
       mgg::VoxelStatus::kUnknown) {
-    return false;
+    return mgg::GridProjectionStatus::kBodyUnknown;
   }
   for (int ix = 0; ix <= intervals; ++ix) {
     for (int iy = 0; iy <= intervals; ++iy) {
       const double dx = -extent + ix * spacing;
       const double dy = -extent + iy * spacing;
-      if (++samples > kMaxFootprintSamples) return false;
+      if (++samples > kMaxFootprintSamples)
+        return mgg::GridProjectionStatus::kBodyUnknown;
       Eigen::Vector3d start =
           driving_pose +
           Eigen::Vector3d(robot_params_.center_offset.x() + dx,
@@ -1274,11 +1293,14 @@ bool PlannerNode::objectiveFootprintTerrainSupported(
            (!hit.allFinite() ||
             std::abs(hit.z() - nominal_ground_z) >
                 planning_params_.max_step_height + 1e-6))) {
-        return false;
+        return ray == mgg::VoxelStatus::kUnknown
+                   ? mgg::GridProjectionStatus::kBodyUnknown
+                   : mgg::GridProjectionStatus::kNoGround;
       }
     }
   }
-  return samples > 0;
+  return samples > 0 ? mgg::GridProjectionStatus::kSupported
+                     : mgg::GridProjectionStatus::kBodyUnknown;
 }
 
 bool PlannerNode::objectiveTerrainPathSupported(
@@ -2143,6 +2165,17 @@ mgg::FeasiblePath PlannerNode::refineCorridor(
             projected.size() < 2) {
           return false;
         }
+        if (provisional_unknown_ground_) {
+          for (Eigen::Vector3d& driving_pose : projected) {
+            mgg::StateVec supported = mgg::StateVec::Zero();
+            supported.head<3>() = driving_pose;
+            if (projectStateToDrivingHeight(supported, true)) {
+              driving_pose = supported.head<3>();
+            } else {
+              driving_pose.z() = current_anchor.z();
+            }
+          }
+        }
         checked.reserve(projected.size());
         for (const Eigen::Vector3d& driving_pose : projected) {
           if (!objectiveFootprintTerrainSupported(driving_pose,
@@ -2205,6 +2238,261 @@ void PlannerNode::convertPathToNavigationBase(mgg::FeasiblePath& path) const {
   const double graph_to_base =
       planning_params_.max_ground_height - robot_params_.size[2] / 2.0;
   for (auto& pose : path.poses) pose[2] -= graph_to_base;
+}
+
+void PlannerNode::onValidateObjectiveRoute(
+    const std::shared_ptr<mgg_msgs::srv::ValidateObjectiveRoute::Request>& request,
+    std::shared_ptr<mgg_msgs::srv::ValidateObjectiveRoute::Response> response) {
+  using Response = mgg_msgs::srv::ValidateObjectiveRoute::Response;
+  const std::lock_guard<std::recursive_mutex> lock(planner_mutex_);
+  auto map_read = mola_map_ != nullptr ? mola_map_->acquireReadLease()
+                                       : mgg::MolaMap::ReadLease{};
+  refreshMolaRevision();
+  response->map_revision = map_revision_;
+  const auto validation_deadline =
+      std::chrono::steady_clock::now() + std::chrono::milliseconds(100);
+  const auto unavailable = [&response](const std::string& reason) {
+    response->status = Response::UNAVAILABLE;
+    response->reason = reason;
+  };
+  const auto invalid = [&response](const std::string& reason) {
+    response->status = Response::INVALID;
+    response->reason = reason;
+  };
+  if (!provisional_unknown_ground_ || map_backend_ != "cloud_octomap" ||
+      !map_ || !map_->getStatus() || !have_odometry_) {
+    unavailable("provisional route validation is unavailable");
+    return;
+  }
+  const std::string& active_component =
+      have_mapping_snapshot_ ? mapping_snapshot_.component_id : component_id_;
+  if (mission_id_.empty() || request->mission_id != mission_id_ ||
+      active_component.empty() || request->component_id != active_component ||
+      request->frame_id != world_frame_) {
+    unavailable("route authority does not match this planner");
+    return;
+  }
+  if (request->path.size() < 2 || request->path.size() > 2048 ||
+      !std::isfinite(request->lookahead_m) || request->lookahead_m < 0.5 ||
+      request->lookahead_m > 10.0) {
+    unavailable("route or lookahead is outside validation bounds");
+    return;
+  }
+
+  std::vector<mgg::StateVec> route;
+  route.reserve(request->path.size());
+  const double graph_to_base =
+      planning_params_.max_ground_height - robot_params_.size.z() / 2.0;
+  for (const auto& pose : request->path) {
+    mgg::StateVec state = fromPoseMsg(pose);
+    if (!state.allFinite()) {
+      unavailable("route contains a non-finite pose");
+      return;
+    }
+    state.z() += graph_to_base;
+    route.push_back(state);
+  }
+
+  std::size_t closest_segment = 0;
+  double closest_t = 0.0;
+  double closest_distance = std::numeric_limits<double>::infinity();
+  double closest_s = 0.0;
+  std::vector<double> route_s(route.size(), 0.0);
+  for (std::size_t i = 1; i < route.size(); ++i) {
+    route_s[i] = route_s[i - 1] +
+                 (route[i].head<2>() - route[i - 1].head<2>()).norm();
+  }
+  const Eigen::Vector2d current = current_state_.head<2>();
+  for (std::size_t i = 1; i < route.size(); ++i) {
+    const Eigen::Vector2d a = route[i - 1].head<2>();
+    const Eigen::Vector2d delta = route[i].head<2>() - a;
+    const double denom = delta.squaredNorm();
+    const double t = denom > 1e-12
+                         ? std::clamp((current - a).dot(delta) / denom, 0.0, 1.0)
+                         : 0.0;
+    const double distance = (current - (a + t * delta)).norm();
+    if (distance < closest_distance) {
+      closest_distance = distance;
+      closest_segment = i - 1;
+      closest_t = t;
+      closest_s = route_s[i - 1] + t * std::sqrt(denom);
+    }
+  }
+  const double association_limit =
+      std::clamp(robot_params_.getPlanningSize().head<2>().norm(), 0.5, 2.0);
+  if (!std::isfinite(closest_distance) || closest_distance > association_limit) {
+    unavailable("robot is not associated with the submitted route");
+    return;
+  }
+  const double ambiguity_tolerance =
+      std::max(0.10, map_->getResolution());
+  for (std::size_t i = 1; i < route.size(); ++i) {
+    const Eigen::Vector2d a = route[i - 1].head<2>();
+    const Eigen::Vector2d delta = route[i].head<2>() - a;
+    const double denom = delta.squaredNorm();
+    const double t = denom > 1e-12
+                         ? std::clamp((current - a).dot(delta) / denom, 0.0, 1.0)
+                         : 0.0;
+    const double candidate_s = route_s[i - 1] + t * std::sqrt(denom);
+    if (std::abs(candidate_s - closest_s) <= association_limit) continue;
+    if ((current - (a + t * delta)).norm() <=
+        closest_distance + ambiguity_tolerance) {
+      unavailable("robot progress is ambiguous on the submitted route");
+      return;
+    }
+  }
+
+  std::vector<mgg::StateVec> ahead;
+  ahead.push_back(route[closest_segment] +
+                  closest_t * (route[closest_segment + 1] -
+                               route[closest_segment]));
+  double remaining = request->lookahead_m;
+  for (std::size_t i = closest_segment + 1;
+       i < route.size() && remaining > 1e-9; ++i) {
+    const double length =
+        (route[i].head<3>() - ahead.back().head<3>()).norm();
+    if (!std::isfinite(length)) {
+      unavailable("route segment length is invalid");
+      return;
+    }
+    if (length <= remaining + 1e-9) {
+      if (length > 1e-9) ahead.push_back(route[i]);
+      remaining -= length;
+    } else if (length > 1e-12) {
+      mgg::StateVec boundary = ahead.back();
+      boundary.head<3>() +=
+          (remaining / length) * (route[i].head<3>() - ahead.back().head<3>());
+      ahead.push_back(boundary);
+      remaining = 0.0;
+    }
+    if (ahead.size() > 128 ||
+        std::chrono::steady_clock::now() > validation_deadline) {
+      unavailable("remaining route validation exceeded its work bound");
+      return;
+    }
+  }
+
+  const Eigen::Vector3d footprint = robot_params_.getPlanningSize();
+  Eigen::Vector3d body = footprint;
+  const double diagonal = footprint.head<2>().norm();
+  body.x() = diagonal;
+  body.y() = diagonal;
+  const Eigen::Vector3d center_offset = robot_params_.center_offset;
+  const double provisional_z = physicalAnchorAtDrivingHeight(current_state_).z();
+  for (mgg::StateVec& state : ahead) {
+    if (!projectStateToDrivingHeight(state, true)) state.z() = provisional_z;
+  }
+  if (ahead.size() < 2) {
+    const Eigen::Vector3d pose = ahead.front().head<3>();
+    const auto footprint_status =
+        objectiveFootprintTerrainStatus(pose, footprint);
+    const mgg::VoxelStatus box = objectiveBodyStatus(pose + center_offset, body);
+    const bool geofence_invalid =
+        planning_params_.geofence_checking_enable &&
+        (!geofence_ ||
+         geofence_->getBoxStatus((pose + center_offset).head<2>(),
+                                 body.head<2>()) ==
+             mgg::GeofenceManager::CoordinateStatus::kViolated);
+    if (box == mgg::VoxelStatus::kOccupied || geofence_invalid ||
+        footprint_status == mgg::GridProjectionStatus::kNoGround) {
+      invalid("stationary route intersects a known hazard");
+    } else if (footprint_status == mgg::GridProjectionStatus::kBodyUnknown ||
+               box == mgg::VoxelStatus::kUnknown) {
+      unavailable("stationary route query was unavailable");
+    } else {
+      response->status = Response::VALID;
+      response->reason = "route has no remaining validation segment";
+    }
+    return;
+  }
+  for (std::size_t segment = 1; segment < ahead.size(); ++segment) {
+    std::vector<Eigen::Vector3d> projected;
+    const auto terrain = ground_->getProjectedEdgeStatus(
+        ahead[segment - 1].head<3>(), ahead[segment].head<3>(), body, false,
+        projected, true);
+    if (terrain == mgg::ProjectedEdgeStatus::kUnknown) {
+      unavailable("map query was unavailable");
+      return;
+    }
+    if (terrain != mgg::ProjectedEdgeStatus::kAdmissible || projected.size() < 2) {
+      invalid("remaining route intersects known terrain");
+      return;
+    }
+    if (provisional_unknown_ground_) {
+      for (Eigen::Vector3d& pose : projected) {
+        mgg::StateVec supported = mgg::StateVec::Zero();
+        supported.head<3>() = pose;
+        if (projectStateToDrivingHeight(supported, true)) {
+          pose = supported.head<3>();
+        } else {
+          pose.z() = provisional_z;
+        }
+      }
+    }
+    Eigen::Vector3d previous;
+    bool have_previous = false;
+    for (const Eigen::Vector3d& pose : projected) {
+      const Eigen::Vector3d center = pose + center_offset;
+      const mgg::VoxelStatus box = objectiveBodyStatus(center, body);
+      if (box == mgg::VoxelStatus::kOccupied) {
+        invalid("remaining route intersects known occupied space");
+        return;
+      }
+      const auto footprint_status =
+          objectiveFootprintTerrainStatus(pose, footprint);
+      if (footprint_status == mgg::GridProjectionStatus::kNoGround) {
+        invalid("remaining route footprint intersects known terrain");
+        return;
+      }
+      if (box == mgg::VoxelStatus::kUnknown ||
+          footprint_status == mgg::GridProjectionStatus::kBodyUnknown) {
+        unavailable("remaining route map query was unavailable");
+        return;
+      }
+      if (planning_params_.geofence_checking_enable &&
+          (!geofence_ ||
+           geofence_->getBoxStatus(center.head<2>(), body.head<2>()) ==
+               mgg::GeofenceManager::CoordinateStatus::kViolated)) {
+        invalid("remaining route violates the geofence");
+        return;
+      }
+      if (have_previous &&
+          std::abs(pose.z() - previous.z()) >
+              planning_params_.max_step_height + 1e-6) {
+        invalid("remaining route exceeds the platform step limit");
+        return;
+      }
+      previous = pose;
+      have_previous = true;
+    }
+    for (std::size_t i = 1; i < projected.size(); ++i) {
+      const Eigen::Vector3d from = projected[i - 1] + center_offset;
+      const Eigen::Vector3d to = projected[i] + center_offset;
+      if (planning_params_.geofence_checking_enable &&
+          (!geofence_ ||
+           geofence_->getPathStatus(from.head<2>(), to.head<2>(),
+                                    body.head<2>()) ==
+               mgg::GeofenceManager::CoordinateStatus::kViolated)) {
+        invalid("remaining route crosses the geofence");
+        return;
+      }
+      const mgg::VoxelStatus swept = objectiveSweptBodyStatus(from, to, body);
+      if (swept == mgg::VoxelStatus::kUnknown) {
+        unavailable("remaining route sweep query was unavailable");
+        return;
+      }
+      if (swept == mgg::VoxelStatus::kOccupied) {
+        invalid("remaining route sweep intersects known occupied space");
+        return;
+      }
+      if (std::chrono::steady_clock::now() > validation_deadline) {
+        unavailable("remaining route validation exceeded its time bound");
+        return;
+      }
+    }
+  }
+  response->status = Response::VALID;
+  response->reason = "remaining route has no known hazard";
 }
 
 void PlannerNode::onObjectiveRequest(
