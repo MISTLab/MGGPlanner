@@ -62,6 +62,7 @@ rosidl_generate_interfaces(${PROJECT_NAME}
   "srv/PlannerSetPlanningMode.srv"
   "srv/PlannerSetSearchMode.srv"
   "srv/PlannerSetVel.srv"
+  "srv/PlanObjective.srv"
   "srv/PlannerSrv.srv"
   "srv/PlannerStringTrigger.srv"
 

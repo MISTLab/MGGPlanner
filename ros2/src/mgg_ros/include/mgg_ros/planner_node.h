@@ -29,6 +29,7 @@
 #include <visualization_msgs/msg/marker_array.hpp>
 
 #include <mgg_msgs/msg/graph.hpp>
+#include <mgg_msgs/srv/plan_objective.hpp>
 #include <mgg_msgs/srv/planner_srv.hpp>
 
 #include "mgg_core/geofence_manager.h"
@@ -38,6 +39,7 @@
 #include "mgg_core/graph_merge.h"
 #include "mgg_core/grid_graph.h"
 #include "mgg_core/path_selection.h"
+#include "mgg_core/planning_stages.h"
 #include "mgg_core/ground_projection.h"
 #include "mgg_core/params.h"
 #include "mgg_core/sensor_params.h"
@@ -61,6 +63,10 @@ class PlannerNode : public rclcpp::Node {
   void onPlanRequest(
       const std::shared_ptr<mgg_msgs::srv::PlannerSrv::Request> request,
       std::shared_ptr<mgg_msgs::srv::PlannerSrv::Response> response);
+  void onObjectiveRequest(
+      const std::shared_ptr<mgg_msgs::srv::PlanObjective::Request> request,
+      std::shared_ptr<mgg_msgs::srv::PlanObjective::Response> response);
+  mgg::FeasiblePath refineCorridor(const mgg::RouteCorridor& corridor);
   void publishOwnGraph();
   void publishPath();
   void publishMarkers();
@@ -141,6 +147,9 @@ class PlannerNode : public rclcpp::Node {
   int path_shortcut_corners_ = 0;
   int path_shortcut_to_ = 0;
   std::string world_frame_ = "world";
+  std::string component_id_ = "local";
+  std::uint64_t graph_revision_ = 0;
+  std::uint64_t map_revision_ = 0;
   double communication_range_ = 10.0;
 
 
@@ -162,6 +171,7 @@ class PlannerNode : public rclcpp::Node {
   rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr path_pub_;
   rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr build_srv_;
   rclcpp::Service<mgg_msgs::srv::PlannerSrv>::SharedPtr plan_srv_;
+  rclcpp::Service<mgg_msgs::srv::PlanObjective>::SharedPtr objective_srv_;
   rclcpp::TimerBase::SharedPtr graph_timer_;
   /// One-shot guard against use_sim_time with no /clock.
   rclcpp::TimerBase::SharedPtr sim_time_check_;
