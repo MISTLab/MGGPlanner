@@ -1,5 +1,6 @@
 #include "mgg_ros/planner_node.h"
 
+#include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
@@ -42,6 +43,24 @@ PlannerNode::PlannerNode(const rclcpp::NodeOptions& options)
   map_cfg.max_range = declareOrGet<double>(this, "map.max_range", 20.0);
   map_ = std::make_unique<mgg::OctomapMap>(map_cfg);
   ground_ = std::make_unique<mgg::GroundProjection>(*map_, planning_params_);
+  const double grid_resolution_floor = map_->getResolution();
+  grid_refinement_limits_.resolution_m = std::clamp(
+      declareOrGet<double>(this, "grid_refinement_resolution_m", 0.25),
+      grid_resolution_floor, std::max(2.0, grid_resolution_floor));
+  grid_refinement_limits_.detour_margin_m = std::clamp(
+      declareOrGet<double>(this, "grid_refinement_margin_m", 1.0), 0.0,
+      10.0);
+  grid_refinement_limits_.max_cells = static_cast<std::size_t>(std::clamp(
+      declareOrGet<std::int64_t>(this, "grid_refinement_max_cells", 4096),
+      std::int64_t{16}, std::int64_t{65536}));
+  grid_refinement_limits_.max_expansions =
+      static_cast<std::size_t>(std::clamp(
+          declareOrGet<std::int64_t>(this, "grid_refinement_max_expansions",
+                                     2048),
+          std::int64_t{1}, std::int64_t{65536}));
+  grid_refinement_limits_.timeout = std::chrono::milliseconds(std::clamp(
+      declareOrGet<std::int64_t>(this, "grid_refinement_timeout_ms", 50),
+      std::int64_t{1}, std::int64_t{5000}));
   geofence_ = std::make_unique<mgg::GeofenceManager>();
   local_graph_ = std::make_shared<mgg::GraphManager>();
   global_graph_ = std::make_shared<mgg::GraphManager>();
@@ -1124,70 +1143,93 @@ mgg::FeasiblePath PlannerNode::refineCorridor(
     return result;
   }
 
-  const auto admissible = [this](const mgg::StateVec& a,
-                                 const mgg::StateVec& b) {
-    mgg::StateVec projected_a = a;
-    mgg::StateVec projected_b = b;
-    if (robot_params_.type == mgg::RobotType::kGroundRobot &&
-        (!projectStateToDrivingHeight(projected_a) ||
-         !projectStateToDrivingHeight(projected_b))) {
-      return false;
-    }
-    const Eigen::Vector3d from = projected_a.head(3);
-    const Eigen::Vector3d to = projected_b.head(3);
-    if (from.isApprox(to)) return true;
-    const Eigen::Vector3d body = robot_params_.getPlanningSize();
-    if (robot_params_.type == mgg::RobotType::kAerialRobot) {
-      return map_->getPathStatus(from, to, body, true) ==
-             mgg::VoxelStatus::kFree;
-    }
-    std::vector<Eigen::Vector3d> projected;
-    return ground_->getProjectedEdgeStatus(from, to, body, true, projected,
-                                           false) ==
-           mgg::ProjectedEdgeStatus::kAdmissible;
+  const Eigen::Vector3d body = robot_params_.getPlanningSize();
+  const Eigen::Vector3d center_offset = robot_params_.center_offset;
+  const auto geofenceContains = [this, &body](const Eigen::Vector3d& center) {
+    if (!planning_params_.geofence_checking_enable) return true;
+    if (!geofence_) return false;
+    return geofence_->getBoxStatus(center.head<2>(), body.head<2>()) !=
+           mgg::GeofenceManager::CoordinateStatus::kViolated;
   };
-  if (result.poses.empty() || !admissible(current_state_, result.poses.front())) {
-    result.status = mgg::PlanningStatus::kBlocked;
-    result.poses.clear();
-    result.reason = "current pose cannot connect to the route corridor";
-    return result;
-  }
-  for (std::size_t i = 1; i < result.poses.size(); ++i) {
-    if (!admissible(result.poses[i - 1], result.poses[i])) {
-      result.status = mgg::PlanningStatus::kBlocked;
-      result.poses.clear();
-      result.reason = "route corridor segment " + std::to_string(i - 1) +
-                      "->" + std::to_string(i) +
-                      " is blocked in the current map";
-      return result;
+  const auto geofenceAllows = [this, &body](const Eigen::Vector3d& from,
+                                            const Eigen::Vector3d& to) {
+    if (!planning_params_.geofence_checking_enable) return true;
+    if (!geofence_) return false;
+    if ((from.head<2>() - to.head<2>()).norm() <= 1e-9) {
+      return geofence_->getBoxStatus(from.head<2>(), body.head<2>()) !=
+             mgg::GeofenceManager::CoordinateStatus::kViolated;
     }
-  }
-
-  // Explicit objectives retain the requested target separately from the
-  // graph vertex. Connect it only after the same terrain/footprint check.
-  if (!result.poses.empty()) {
-    mgg::StateVec projected_goal = corridor.request.goal.pose;
-    if (!projectStateToDrivingHeight(projected_goal)) {
-      result.status = mgg::PlanningStatus::kBlocked;
-      result.poses.clear();
-      result.reason = "the exact goal has no mapped terrain support";
-      return result;
+    return geofence_->getPathStatus(
+               from.head<2>(), to.head<2>(), body.head<2>()) !=
+           mgg::GeofenceManager::CoordinateStatus::kViolated;
+  };
+  const auto project = [this, body, center_offset,
+                        &geofenceContains](mgg::StateVec& state) {
+    if (robot_params_.type == mgg::RobotType::kGroundRobot) {
+      if (!ground_ || !projectStateToDrivingHeight(state)) return false;
     }
-    // Internally keep the whole corridor in the terrain-projected graph
-    // convention.  The response is converted back to navigation/base poses
-    // below, avoiding an artificial vertical tail from graph height to the
-    // caller's exact ground-robot goal.
-    if (!result.poses.back().isApprox(projected_goal) &&
-        !admissible(result.poses.back(), projected_goal)) {
-      result.status = mgg::PlanningStatus::kBlocked;
-      result.poses.clear();
-      result.reason = "the exact goal cannot be connected to its graph corridor";
-      return result;
-    }
-    if (!result.poses.back().isApprox(projected_goal)) {
-      result.poses.push_back(projected_goal);
-    }
-  }
+    const Eigen::Vector3d center = state.head<3>() + center_offset;
+    return map_->getStrictBoxStatus(center, body) == mgg::VoxelStatus::kFree &&
+           geofenceContains(center);
+  };
+  const auto traverse =
+      [this, body, center_offset,
+       &geofenceAllows](const mgg::StateVec& a, const mgg::StateVec& b,
+                        std::vector<mgg::StateVec>& checked) {
+        checked.clear();
+        const Eigen::Vector3d body_from = a.head<3>() + center_offset;
+        const Eigen::Vector3d body_to = b.head<3>() + center_offset;
+        if (!geofenceAllows(body_from, body_to)) return false;
+        if (robot_params_.type == mgg::RobotType::kAerialRobot) {
+          if (map_->getStrictPathStatus(body_from, body_to, body) !=
+              mgg::VoxelStatus::kFree) {
+            return false;
+          }
+          checked = {a, b};
+          return true;
+        }
+        if (!ground_) return false;
+        std::vector<Eigen::Vector3d> projected;
+        // GroundProjection owns the planner/driving-height convention.  The
+        // robot center offset is applied only to the additional collision
+        // sweep below; passing an offset pose to GroundProjection would shift
+        // the returned driving pose by -center_offset.z.
+        if (ground_->getProjectedEdgeStatus(a.head<3>(), b.head<3>(), body,
+                                            true, projected, false) !=
+                mgg::ProjectedEdgeStatus::kAdmissible ||
+            projected.size() < 2) {
+          return false;
+        }
+        checked.reserve(projected.size());
+        for (const Eigen::Vector3d& driving_pose : projected) {
+          mgg::StateVec pose = mgg::StateVec::Zero();
+          pose.head<3>() = driving_pose;
+          checked.push_back(pose);
+        }
+        if ((checked.front().head<3>() - a.head<3>()).cwiseAbs().maxCoeff() >
+                1e-6 ||
+            (checked.back().head<3>() - b.head<3>()).cwiseAbs().maxCoeff() >
+                1e-6) {
+          return false;
+        }
+        for (std::size_t i = 1; i < checked.size(); ++i) {
+          const Eigen::Vector3d checked_from =
+              checked[i - 1].head<3>() + center_offset;
+          const Eigen::Vector3d checked_to =
+              checked[i].head<3>() + center_offset;
+          if (!geofenceAllows(checked_from, checked_to) ||
+              map_->getStrictPathStatus(checked_from, checked_to, body) !=
+                  mgg::VoxelStatus::kFree) {
+            return false;
+          }
+        }
+        return true;
+      };
+  mgg::BoundedGridPlanner grid_planner(current_state_,
+                                       grid_refinement_limits_, project,
+                                       traverse);
+  result = grid_planner.refine(corridor);
+  if (result.status != mgg::PlanningStatus::kSucceeded) return result;
   convertPathToNavigationBase(result);
   queryIndexedMap(result);
   return result;

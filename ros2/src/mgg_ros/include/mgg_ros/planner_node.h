@@ -42,6 +42,7 @@
 #include "mgg_core/graph_manager.h"
 #include "mgg_core/graph_merge.h"
 #include "mgg_core/grid_graph.h"
+#include "mgg_core/grid_refinement.h"
 #include "mgg_core/path_selection.h"
 #include "mgg_core/planning_stages.h"
 #include "mgg_core/ground_projection.h"
@@ -112,6 +113,7 @@ class PlannerNode : public rclcpp::Node {
   mgg::RobotParams robot_params_;
   mgg::PlanningParams planning_params_;
   mgg::GridGraphParams grid_params_;
+  mgg::GridRefinementLimits grid_refinement_limits_;
   mgg::BoundedSpaceParams global_space_;
   std::vector<mgg::BoundedSpaceParams> no_gain_zones_;
   std::unordered_map<std::string, mgg::SensorParams> sensors_;

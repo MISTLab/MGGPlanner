@@ -113,32 +113,64 @@ VoxelStatus OctomapMap::getRayStatus(const Eigen::Vector3d& view_point,
   return result;
 }
 
+VoxelStatus OctomapMap::queryBox(const Eigen::Vector3d& center,
+                                  const Eigen::Vector3d& size,
+                                  double unknown_fraction) const {
+  // Bound a single map callback even for invalid/oversized robot geometry.
+  constexpr std::uint64_t kMaxBoxCells = 1u << 20;
+  if (!center.allFinite() || !size.allFinite() || (size.array() < 0).any()) {
+    return VoxelStatus::kUnknown;
+  }
+  const Eigen::Vector3d lower = center - size / 2.0;
+  const Eigen::Vector3d upper = center + size / 2.0;
+  const double extent = tree_->getResolution() * 32768.0;
+  if (!std::isfinite(extent) || extent <= 0.0 || !lower.allFinite() ||
+      !upper.allFinite() ||
+      (lower.array() < -extent).any() || (upper.array() >= extent).any()) {
+    return VoxelStatus::kUnknown;
+  }
+  octomap::OcTreeKey first, last;
+  if (!tree_->coordToKeyChecked(toOct(lower), first) ||
+      !tree_->coordToKeyChecked(toOct(upper), last)) {
+    return VoxelStatus::kUnknown;
+  }
+  std::uint64_t total = 1;
+  for (int axis = 0; axis < 3; ++axis) {
+    const std::uint64_t count = std::uint64_t(last[axis]) - first[axis] + 1;
+    if (count > kMaxBoxCells / total) return VoxelStatus::kUnknown;
+    total *= count;
+  }
+  std::uint64_t unknown = 0;
+  // Floating coordinate stepping can skip a positive-face key. Iterate every
+  // touched key exactly once, as augmentFreeBox does, including both faces.
+  for (std::uint32_t x = first[0]; x <= last[0]; ++x)
+    for (std::uint32_t y = first[1]; y <= last[1]; ++y)
+      for (std::uint32_t z = first[2]; z <= last[2]; ++z) {
+        const octomap::OcTreeKey key(static_cast<octomap::key_type>(x),
+                                    static_cast<octomap::key_type>(y),
+                                    static_cast<octomap::key_type>(z));
+        const VoxelStatus status = statusAt(tree_->keyToCoord(key));
+        if (status == VoxelStatus::kOccupied) return status;
+        if (status == VoxelStatus::kUnknown) {
+          if (unknown_fraction == 0.0) return status;
+          ++unknown;
+        }
+      }
+  return double(unknown) > unknown_fraction * double(total)
+             ? VoxelStatus::kUnknown : VoxelStatus::kFree;
+}
+
 VoxelStatus OctomapMap::getBoxStatus(const Eigen::Vector3d& center,
                                      const Eigen::Vector3d& size,
                                      bool stop_at_unknown_voxel) const {
-  const double r = tree_->getResolution();
-  int total = 0;
-  int unknown_count = 0;
-  for (double dx = -size.x() / 2; dx <= size.x() / 2; dx += r)
-    for (double dy = -size.y() / 2; dy <= size.y() / 2; dy += r)
-      for (double dz = -size.z() / 2; dz <= size.z() / 2; dz += r) {
-        ++total;
-        const VoxelStatus s =
-            statusAt(toOct(center + Eigen::Vector3d(dx, dy, dz)));
-        if (s == VoxelStatus::kOccupied) return VoxelStatus::kOccupied;
-        if (s == VoxelStatus::kUnknown) ++unknown_count;
-
-      }
-  // If stop_at_unknown_voxel is requested, allow a small fraction of unknown
-  // voxels (e.g. beam dispersion / ray gaps between elevation rings), but
-  // reject if a significant portion (>25%) of the box is unmapped.
-  if (stop_at_unknown_voxel && total > 0 &&
-      double(unknown_count) / double(total) > 0.25) {
-    return VoxelStatus::kUnknown;
-  }
-  return VoxelStatus::kFree;
+  // Preserve the existing exploration policy while fixing voxel enumeration.
+  return queryBox(center, size, stop_at_unknown_voxel ? 0.25 : 1.0);
 }
 
+VoxelStatus OctomapMap::getStrictBoxStatus(const Eigen::Vector3d& center,
+                                           const Eigen::Vector3d& size) const {
+  return queryBox(center, size, 0.0);
+}
 
 VoxelStatus OctomapMap::getPathStatus(const Eigen::Vector3d& start,
                                       const Eigen::Vector3d& end,
@@ -162,6 +194,51 @@ VoxelStatus OctomapMap::getPathStatus(const Eigen::Vector3d& start,
     if (s == VoxelStatus::kUnknown) saw_unknown = true;
   }
   return saw_unknown ? VoxelStatus::kUnknown : VoxelStatus::kFree;
+}
+
+VoxelStatus OctomapMap::getStrictPathStatus(
+    const Eigen::Vector3d& start, const Eigen::Vector3d& end,
+    const Eigen::Vector3d& box_size) const {
+  if (!start.allFinite() || !end.allFinite() || !box_size.allFinite() ||
+      (box_size.array() < 0).any()) return VoxelStatus::kUnknown;
+  const double resolution = tree_->getResolution();
+  const double length = (end - start).norm();
+  if (!std::isfinite(resolution) || resolution <= 0.0 ||
+      !std::isfinite(length)) {
+    return VoxelStatus::kUnknown;
+  }
+  if (length < 1e-9) return getStrictBoxStatus(start, box_size);
+  // Conservative upper bound on total voxel visits in this non-preemptible
+  // callback. The grid's cooperative deadline is checked around it.
+  constexpr std::uint64_t kMaxSweepCells = 1u << 22;
+  const double steps_d = std::max(1.0, std::ceil(length / resolution));
+  if (!std::isfinite(steps_d) || steps_d > double(kMaxSweepCells)) {
+    return VoxelStatus::kUnknown;
+  }
+  const std::uint64_t steps = static_cast<std::uint64_t>(steps_d);
+  const Eigen::Vector3d step = (end - start) / double(steps);
+  // Each query is the axis-aligned envelope of the continuously swept body
+  // over one <=resolution segment. It is conservative on diagonals and also
+  // covers every crossed voxel when box_size is zero.
+  const Eigen::Vector3d swept_size = box_size + step.cwiseAbs();
+  std::uint64_t box_cells = 1;
+  for (int axis = 0; axis < 3; ++axis) {
+    const double count = std::ceil(swept_size[axis] / resolution) + 2.0;
+    if (!std::isfinite(count) || count > double(kMaxSweepCells / box_cells)) {
+      return VoxelStatus::kUnknown;
+    }
+    box_cells *= static_cast<std::uint64_t>(count);
+  }
+  if (steps > kMaxSweepCells / box_cells) {
+    return VoxelStatus::kUnknown;
+  }
+  for (std::uint64_t i = 0; i < steps; ++i) {
+    const double fraction = (double(i) + 0.5) / double(steps);
+    const VoxelStatus status =
+        getStrictBoxStatus(start + fraction * (end - start), swept_size);
+    if (status != VoxelStatus::kFree) return status;
+  }
+  return VoxelStatus::kFree;
 }
 
 void OctomapMap::getScanStatus(

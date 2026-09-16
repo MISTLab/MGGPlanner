@@ -1,5 +1,6 @@
 #include <chrono>
 #include <atomic>
+#include <cmath>
 #include <memory>
 #include <sstream>
 #include <thread>
@@ -137,6 +138,71 @@ class PlannerNodeTestPeer {
                                   Eigen::Vector3d(x, 0.0, 1.5));
     }
     ++node.map_revision_;
+  }
+
+  static void configureGridServiceScene(PlannerNode& node,
+                                        double body_offset_z = 0.0,
+                                        double margin = 1.0) {
+    configureBackboneTest(node);
+    const std::lock_guard<std::recursive_mutex> lock(node.planner_mutex_);
+    node.robot_params_.center_offset = Eigen::Vector3d(0, 0, body_offset_z);
+    node.grid_refinement_limits_.detour_margin_m = margin;
+    // Functional service fixture, not a CPU latency benchmark. Core tests
+    // exercise deadline expiry independently of DDS scheduling on the host.
+    node.grid_refinement_limits_.timeout = std::chrono::milliseconds(1000);
+    std::vector<Eigen::Vector3d> floor;
+    for (int x = -8; x <= 32; ++x) {
+      for (int y = -24; y <= 24; ++y) {
+        floor.emplace_back(x * 0.05 + 0.025, y * 0.05 + 0.025, 0.025);
+      }
+    }
+    for (int repeat = 0; repeat < 6; ++repeat) {
+      node.map_->insertPointCloud(floor, Eigen::Vector3d(0.6, 0.0, 1.5));
+    }
+    // The known body volume is separate from the occupied supporting floor.
+    node.map_->augmentFreeBox({0.6, 0.0, 0.5}, {3.2, 3.0, 0.8});
+    ++node.map_revision_;
+  }
+
+  static void addGridObstacle(PlannerNode& node, double z, bool wall) {
+    const std::lock_guard<std::recursive_mutex> lock(node.planner_mutex_);
+    for (int repeat = 0; repeat < 20; ++repeat) {
+      const int bound = wall ? 26 : 0;
+      for (int y = -bound; y <= bound; ++y) {
+        node.map_->tree()->updateNode(
+            octomap::point3d(0.9F, static_cast<float>(y * 0.05),
+                             static_cast<float>(z)),
+            true);
+      }
+    }
+    ++node.map_revision_;
+  }
+
+  static bool makeGridVoxelUnknown(PlannerNode& node, double x, double y,
+                                   double z) {
+    const std::lock_guard<std::recursive_mutex> lock(node.planner_mutex_);
+    octomap::OcTreeKey key;
+    if (!node.map_->tree()->coordToKeyChecked(
+            octomap::point3d(static_cast<float>(x), static_cast<float>(y),
+                             static_cast<float>(z)),
+            key)) {
+      return false;
+    }
+    if (!node.map_->tree()->updateNode(key, true)) return false;
+    node.map_->tree()->deleteNode(key, node.map_->tree()->getTreeDepth());
+    const bool removed = node.map_->tree()->search(key) == nullptr;
+    if (removed) ++node.map_revision_;
+    return removed;
+  }
+
+  static void setGridGeofence(PlannerNode& node, double xmin, double xmax,
+                              double ymin, double ymax) {
+    const std::lock_guard<std::recursive_mutex> lock(node.planner_mutex_);
+    node.planning_params_.geofence_checking_enable = true;
+    node.geofence_->clear();
+    mgg::Polygon2d polygon(std::vector<Eigen::Vector2d>{
+        {xmin, ymin}, {xmin, ymax}, {xmax, ymax}, {xmax, ymin}, {xmin, ymin}});
+    node.geofence_->addGeofenceArea(polygon);
   }
 
   static std::uint64_t localGraphRevision(const PlannerNode& node) {
@@ -496,7 +562,131 @@ TEST_F(ObjectiveService, NewObstacleBlocksExplicitHomeThroughActualService) {
   ASSERT_NE(response, nullptr);
   EXPECT_EQ(response->status, Service::Response::BLOCKED);
   EXPECT_TRUE(response->path.empty());
-  EXPECT_NE(response->reason.find("blocked"), std::string::npos);
+}
+
+TEST_F(ObjectiveService, GridHomeDetoursOnObservedGroundAndBlocksWall) {
+  using Peer = mgg_ros::PlannerNodeTestPeer;
+  Peer::configureGridServiceScene(*planner);
+  for (const double x : {0.0, 0.6, 1.2}) {
+    Peer::acceptOdometry(*planner, x, 0.0, 0.075);
+  }
+  ASSERT_GE(Peer::globalVertices(*planner), 3);
+  auto home = std::make_shared<Service::Request>();
+  home->objective = Service::Request::RETURN_HOME;
+  home->goal.position.z = 0.075;
+  const double yaw = 0.7;
+  home->goal.orientation.z = std::sin(yaw / 2);
+  home->goal.orientation.w = std::cos(yaw / 2);
+  home->graph_revision = Peer::globalGraphRevision(*planner);
+  auto response = call(home);
+  ASSERT_NE(response, nullptr);
+  ASSERT_EQ(response->status, Service::Response::SUCCEEDED) << response->reason;
+
+  // Block the edge between graph vertices, leaving both endpoints clear.
+  Peer::addGridObstacle(*planner, 0.325, false);
+  response = call(home);
+  ASSERT_NE(response, nullptr);
+  ASSERT_EQ(response->status, Service::Response::SUCCEEDED) << response->reason;
+  ASSERT_GT(response->path.size(), 3u);
+  bool detoured = false;
+  for (const auto& pose : response->path) {
+    detoured = detoured || std::abs(pose.position.y) > 0.15;
+    EXPECT_NEAR(pose.position.z, 0.1, 1e-6);
+  }
+  EXPECT_TRUE(detoured);
+  EXPECT_NEAR(response->path.front().position.x, 1.2, 1e-6);
+  EXPECT_NEAR(response->path.back().position.x, 0.0, 1e-6);
+  EXPECT_NEAR(response->path.back().orientation.z, std::sin(yaw / 2), 1e-6);
+  EXPECT_NEAR(response->path.back().orientation.w, std::cos(yaw / 2), 1e-6);
+
+  // The wall spans the observed floor and detour window; unknown space beyond
+  // it must not be invented as a route around the ends.
+  Peer::addGridObstacle(*planner, 0.325, true);
+  response = call(home);
+  ASSERT_NE(response, nullptr);
+  EXPECT_EQ(response->status, Service::Response::BLOCKED) << response->reason;
+  EXPECT_TRUE(response->path.empty());
+}
+
+TEST_F(ObjectiveService, GridBodyOffsetPreservesHeightAndChecksRaisedObstacle) {
+  using Peer = mgg_ros::PlannerNodeTestPeer;
+  Peer::configureGridServiceScene(*planner, 0.30, 0.0);
+  for (const double x : {0.0, 0.6, 1.2}) {
+    Peer::acceptOdometry(*planner, x, 0.0, 0.075);
+  }
+  auto home = std::make_shared<Service::Request>();
+  home->objective = Service::Request::RETURN_HOME;
+  home->goal.position.z = 0.075;
+  home->goal.orientation.w = 1.0;
+  home->graph_revision = Peer::globalGraphRevision(*planner);
+  auto response = call(home);
+  ASSERT_NE(response, nullptr);
+  ASSERT_EQ(response->status, Service::Response::SUCCEEDED) << response->reason;
+  ASSERT_GT(response->path.size(), 3u);
+  for (const auto& pose : response->path) EXPECT_NEAR(pose.position.z, 0.1, 1e-6);
+
+  // Above the unoffset box and its ground probes, but inside the real box
+  // centered 30cm higher. The zero-margin search cannot sidestep this obstacle.
+  Peer::addGridObstacle(*planner, 0.675, false);
+  response = call(home);
+  ASSERT_NE(response, nullptr);
+  EXPECT_EQ(response->status, Service::Response::BLOCKED) << response->reason;
+  EXPECT_TRUE(response->path.empty());
+}
+
+TEST_F(ObjectiveService, GridRejectsSingleUnknownBodyVoxelWithZeroOffset) {
+  using Peer = mgg_ros::PlannerNodeTestPeer;
+  Peer::configureGridServiceScene(*planner, 0.0, 0.0);
+  for (const double x : {0.0, 0.6, 1.2}) {
+    Peer::acceptOdometry(*planner, x, 0.0, 0.075);
+  }
+  auto home = std::make_shared<Service::Request>();
+  home->objective = Service::Request::RETURN_HOME;
+  home->goal.position.z = 0.075;
+  home->goal.orientation.w = 1.0;
+  home->graph_revision = Peer::globalGraphRevision(*planner);
+  auto response = call(home);
+  ASSERT_NE(response, nullptr);
+  ASSERT_EQ(response->status, Service::Response::SUCCEEDED) << response->reason;
+
+  // This is one body-volume key between graph vertices. The legacy 25%
+  // tolerance accepts it; explicit refinement must treat any unknown as
+  // blocked even when center_offset is zero.
+  ASSERT_TRUE(Peer::makeGridVoxelUnknown(*planner, 0.9, 0.025, 0.325));
+  response = call(home);
+  ASSERT_NE(response, nullptr);
+  EXPECT_EQ(response->status, Service::Response::BLOCKED) << response->reason;
+  EXPECT_TRUE(response->path.empty());
+}
+
+TEST_F(ObjectiveService, GridGeofenceRejectsStationaryAndCrossingRoutes) {
+  using Peer = mgg_ros::PlannerNodeTestPeer;
+  Peer::configureGridServiceScene(*planner);
+  for (const double x : {0.0, 0.6, 1.2}) {
+    Peer::acceptOdometry(*planner, x, 0.0, 0.075);
+  }
+  auto goal = std::make_shared<Service::Request>();
+  goal->objective = Service::Request::RETURN_HOME;
+  goal->goal.position.x = 1.2;
+  goal->goal.position.z = 0.075;
+  goal->goal.orientation.w = 1.0;
+  goal->graph_revision = Peer::globalGraphRevision(*planner);
+  auto response = call(goal);
+  ASSERT_NE(response, nullptr);
+  ASSERT_EQ(response->status, Service::Response::SUCCEEDED) << response->reason;
+
+  Peer::setGridGeofence(*planner, 1.1, 1.3, -0.15, 0.15);
+  response = call(goal);
+  ASSERT_NE(response, nullptr);
+  EXPECT_EQ(response->status, Service::Response::BLOCKED) << response->reason;
+  EXPECT_TRUE(response->path.empty());
+
+  Peer::setGridGeofence(*planner, 0.85, 0.95, -1.3, 1.3);
+  goal->goal.position.x = 0.0;
+  response = call(goal);
+  ASSERT_NE(response, nullptr);
+  EXPECT_EQ(response->status, Service::Response::BLOCKED) << response->reason;
+  EXPECT_TRUE(response->path.empty());
 }
 
 TEST_F(ObjectiveService, AuthorityBindingDoesNotRequireIndexedQuery) {

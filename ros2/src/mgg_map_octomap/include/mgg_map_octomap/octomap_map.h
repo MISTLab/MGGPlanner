@@ -82,6 +82,14 @@ class OctomapMap : public MapInterface {
                             const Eigen::Vector3d& box_size,
                             bool stop_at_unknown_voxel) const override;
 
+  /// Explicit objectives require every touched voxel to be observed free.
+  /// Legacy MapInterface queries retain their configured historical tolerance.
+  VoxelStatus getStrictBoxStatus(const Eigen::Vector3d& center,
+                                  const Eigen::Vector3d& size) const;
+  VoxelStatus getStrictPathStatus(const Eigen::Vector3d& start,
+                                   const Eigen::Vector3d& end,
+                                   const Eigen::Vector3d& box_size) const;
+
   void getScanStatus(
       const Eigen::Vector3d& pos,
       const std::vector<Eigen::Vector3d>& multiray_endpoints, GainCounts& gain,
@@ -128,6 +136,9 @@ class OctomapMap : public MapInterface {
                Visitor visit) const;
 
   VoxelStatus statusAt(const octomap::point3d& p) const;
+  VoxelStatus queryBox(const Eigen::Vector3d& center,
+                       const Eigen::Vector3d& size,
+                       double unknown_fraction) const;
 
   std::unique_ptr<octomap::OcTree> tree_;
   OctomapConfig config_;

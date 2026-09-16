@@ -95,6 +95,67 @@ OctomapMap buildScene() {
   return map;
 }
 
+TEST(OctomapMap, BoxesIncludePositiveFaceOccupiedKeys) {
+  OctomapConfig cfg;
+  cfg.resolution = 0.05;
+  OctomapMap map(cfg);
+  map.augmentFreeBox({0.9, 0.0, 0.625}, {0.8, 0.8, 0.8});
+  octomap::OcTreeKey key;
+  ASSERT_TRUE(map.tree()->coordToKeyChecked(octomap::point3d(0.9f, 0.0f, 0.675f), key));
+  map.tree()->setNodeValue(key, map.tree()->getClampingThresMaxLog());
+  const Eigen::Vector3d center(0.9, 0.0, 0.625), body(0.2, 0.2, 0.15);
+  ASSERT_EQ(map.getVoxelStatus({0.9, 0.0, 0.675}), VoxelStatus::kOccupied);
+  EXPECT_EQ(map.getBoxStatus(center, body, true), VoxelStatus::kOccupied);
+  EXPECT_EQ(map.getStrictBoxStatus(center, body), VoxelStatus::kOccupied);
+  EXPECT_EQ(map.getStrictPathStatus({1.2, 0, 0.625}, {0.6, 0, 0.625}, body),
+            VoxelStatus::kOccupied);
+}
+
+TEST(OctomapMap, StrictPathEnvelopeIncludesDiagonalCrossedVoxel) {
+  OctomapConfig cfg;
+  cfg.resolution = 0.05;
+  OctomapMap map(cfg);
+  map.augmentFreeBox({0.05, 0.025, 0.0}, {0.15, 0.15, 0.10});
+  octomap::OcTreeKey key;
+  ASSERT_TRUE(map.tree()->coordToKeyChecked(
+      octomap::point3d(0.075F, 0.025F, 0.0F), key));
+  map.tree()->setNodeValue(key, map.tree()->getClampingThresMaxLog());
+  EXPECT_EQ(map.getStrictPathStatus({0.045, 0.01, 0.0}, {0.055, 0.055, 0.0},
+                                    Eigen::Vector3d::Zero()),
+            VoxelStatus::kOccupied);
+}
+
+TEST(OctomapMap, ExplicitQueriesRejectEvenOneUnknownKey) {
+  OctomapConfig cfg;
+  cfg.resolution = 0.05;
+  OctomapMap map(cfg);
+  map.augmentFreeBox({0.0, 0.0, 0.0}, {0.4, 0.4, 0.4});
+  octomap::OcTreeKey key;
+  ASSERT_TRUE(map.tree()->coordToKeyChecked(octomap::point3d(0.075f, 0.025f, 0.025f), key));
+  // Force this pruned free branch to maximum depth before deleting one leaf.
+  ASSERT_NE(map.tree()->updateNode(key, true), nullptr);
+  // deleteNode's bool indicates that the recursive caller may delete its
+  // child, not whether a leaf disappeared from a non-empty tree.
+  map.tree()->deleteNode(key, map.tree()->getTreeDepth());
+  ASSERT_EQ(map.tree()->search(key), nullptr);
+  const Eigen::Vector3d center = Eigen::Vector3d::Zero(), body(0.2, 0.2, 0.2);
+  EXPECT_EQ(map.getBoxStatus(center, body, true), VoxelStatus::kFree);
+  EXPECT_EQ(map.getStrictBoxStatus(center, body), VoxelStatus::kUnknown);
+  EXPECT_EQ(map.getStrictPathStatus(center, {0.1, 0.0, 0.0}, body),
+            VoxelStatus::kUnknown);
+}
+
+TEST(OctomapMap, ExplicitQueryBoundsRejectInvalidOrExcessiveWork) {
+  OctomapMap map;
+  EXPECT_EQ(map.getStrictBoxStatus({1e300, 0, 0}, {0.2, 0.2, 0.2}),
+            VoxelStatus::kUnknown);
+  EXPECT_EQ(map.getStrictBoxStatus({0, 0, 0}, {-1, 1, 1}), VoxelStatus::kUnknown);
+  EXPECT_EQ(map.getStrictBoxStatus({0, 0, 0}, {1000, 1000, 1000}),
+            VoxelStatus::kUnknown);
+  EXPECT_EQ(map.getStrictPathStatus({0, 0, 0}, {1e300, 0, 0}, {0.2, 0.2, 0.2}),
+            VoxelStatus::kUnknown);
+}
+
 TEST(OctomapMap, ResolutionMatchesBaseline) {
   OctomapMap map = buildScene();
   EXPECT_DOUBLE_EQ(map.getResolution(), 0.2);  // baseline: resolution,...,0.2
