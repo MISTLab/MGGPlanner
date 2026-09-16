@@ -13,6 +13,9 @@
 
 #include <Eigen/Dense>
 
+#include <functional>
+#include <vector>
+
 #include "mgg_core/geofence_manager.h"
 #include "mgg_core/graph_base.h"
 #include "mgg_core/graph_manager.h"
@@ -56,6 +59,11 @@ struct ExpandContext {
   /// its legacy frontier policy; explicit refinement still validates the full
   /// swept route independently.
   bool strict_projected_endpoint = false;
+  /// Optional final policy check for a ground-projected edge. This is applied
+  /// before either its candidate vertex or a graph-mode neighbour edge is
+  /// admitted. The points use the same coordinates passed to GroundProjection.
+  std::function<bool(const std::vector<Eigen::Vector3d>&)>
+      projected_edge_admissible;
 };
 
 /// Attaches `new_vertex` to `graph`: finds the nearest existing vertex, checks

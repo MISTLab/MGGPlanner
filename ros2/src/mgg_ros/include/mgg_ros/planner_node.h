@@ -135,6 +135,8 @@ class PlannerNode : public rclcpp::Node {
   bool objectiveFootprintTerrainSupported(
       const Eigen::Vector3d& driving_pose,
       const Eigen::Vector3d& body) const;
+  bool objectiveTerrainPathSupported(
+      const std::vector<Eigen::Vector3d>& driving_path) const;
   void refreshMolaRevision();
 
   mgg::ExpandContext makeContext();

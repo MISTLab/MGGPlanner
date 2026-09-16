@@ -165,6 +165,10 @@ void expandGraph(GraphManager& graph, Vertex& new_vertex,
   const bool is_hanging = nearest_vertex->is_hanging || new_vertex.is_hanging;
   bool admissible_edge = edgeTraversable(ctx, start_pos, end_pos, is_hanging,
                                          projected_edge, rep);
+  if (admissible_edge && ctx.projected_edge_admissible &&
+      !ctx.projected_edge_admissible(projected_edge)) {
+    admissible_edge = false;
+  }
   if (admissible_edge && ctx.robot->type == RobotType::kGroundRobot) {
     recordProjectedEdge(ctx.projected_graph, projected_edge, ctx.robot_id);
   }
@@ -245,6 +249,10 @@ void expandGraph(GraphManager& graph, Vertex& new_vertex,
 
     std::vector<Eigen::Vector3d> neighbour_edge;
     if (!edgeTraversable(ctx, p_start, p_end, false, neighbour_edge, rep)) {
+      continue;
+    }
+    if (ctx.projected_edge_admissible &&
+        !ctx.projected_edge_admissible(neighbour_edge)) {
       continue;
     }
     if (ctx.robot->type == RobotType::kGroundRobot) {

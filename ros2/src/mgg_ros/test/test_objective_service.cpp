@@ -26,6 +26,10 @@ class PlannerNodeTestPeer {
                                         const Eigen::Vector3d& body) {
     return node.objectiveFootprintTerrainSupported(pose, body);
   }
+  static bool terrainPathSupported(
+      PlannerNode& node, const std::vector<Eigen::Vector3d>& path) {
+    return node.objectiveTerrainPathSupported(path);
+  }
   static void observeShallowRamp(PlannerNode& node) {
     const std::lock_guard<std::recursive_mutex> lock(node.planner_mutex_);
     for (double x = -0.3; x <= 0.3 + 1e-9; x += 0.05) {
@@ -894,6 +898,8 @@ TEST(PlannerObjective, ObservedGroundVetoesKnownFootprintTerrainHazards) {
   // of the body at some yaw. The circumscribed footprint must see it.
   Peer::addMeasuredSurface(*flat, 0.20, 0.10, 0.125);
   EXPECT_FALSE(Peer::footprintTerrainSupported(*flat, driving_pose, body));
+  EXPECT_FALSE(Peer::terrainPathSupported(
+      *flat, {driving_pose, Eigen::Vector3d(0.10, 0.0, 0.30)}));
 
   auto missing_corner = make();
   Peer::observeGroundRectangle(*missing_corner, -0.05, 0.05, -0.05, 0.05);
@@ -901,6 +907,11 @@ TEST(PlannerObjective, ObservedGroundVetoesKnownFootprintTerrainHazards) {
   // requires known support on the centreline.
   EXPECT_TRUE(
       Peer::footprintTerrainSupported(*missing_corner, driving_pose, body));
+
+  auto unknown_transition = make();
+  EXPECT_FALSE(Peer::terrainPathSupported(
+      *unknown_transition,
+      {driving_pose, Eigen::Vector3d(0.30, 0.0, 0.425)}));
 
   // A fully observed shallow surface remains within the configured 10 cm
   // step budget across the complete footprint.

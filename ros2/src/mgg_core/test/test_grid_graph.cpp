@@ -177,6 +177,22 @@ TEST(GridGraph, SweepsTheLatticeAndGrowsTheGraph) {
   EXPECT_GT(f.graph.getNumVertices(), 1);
 }
 
+TEST(GridGraph, ProjectedEdgePolicyRejectsCandidateBeforeAdmission) {
+  Fixture f;
+  int checks = 0;
+  f.ctx.projected_edge_admissible =
+      [&checks](const std::vector<Eigen::Vector3d>&) {
+        ++checks;
+        return false;
+      };
+  const auto r = buildGridGraph(f.graph, StateVec(0, 0, 0, 0), smallGrid(),
+                                f.ctx, 0.0);
+  EXPECT_EQ(r.status, GridGraphStatus::kOk);
+  EXPECT_GT(checks, 0);
+  EXPECT_EQ(r.vertices_added, 0);
+  EXPECT_EQ(f.graph.getNumVertices(), 1);
+}
+
 TEST(GridGraph, RejectsBoundsThatDoNotStraddleTheRobot) {
   Fixture f;
   GridGraphParams g = smallGrid();

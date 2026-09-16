@@ -813,6 +813,21 @@ std::string PlannerNode::buildLocalGraph(bool strict_projected_endpoints) {
 
   mgg::ExpandContext ctx = makeContext();
   ctx.strict_projected_endpoint = strict_projected_endpoints;
+  if (observed_ground_body_evidence_ &&
+      robot_params_.type == mgg::RobotType::kGroundRobot) {
+    // Explore bypasses explicit-objective grid refinement, so apply the same
+    // known-terrain and occupied-body veto before graph alternatives are
+    // selected. Graph expansion supplies centre-offset coordinates.
+    ctx.projected_edge_admissible = [this](
+        const std::vector<Eigen::Vector3d>& projected) {
+      std::vector<Eigen::Vector3d> driving;
+      driving.reserve(projected.size());
+      for (const Eigen::Vector3d& point : projected) {
+        driving.push_back(point - robot_params_.center_offset);
+      }
+      return objectiveTerrainPathSupported(driving);
+    };
+  }
   const auto t_global = Clock::now();
   const mgg::GridGraphResult r = buildGridGraph(
       *local_graph_, current_state_, grid_params_, ctx, current_state_[3]);
@@ -925,6 +940,17 @@ std::string PlannerNode::buildLocalGraph(bool strict_projected_endpoints) {
       rebuilt.emplace_back(here.x(), here.y(), here.z(), yaw);
     }
     best_path_ = rebuilt;
+  }
+  if (observed_ground_body_evidence_ && !best_path_.empty()) {
+    std::vector<Eigen::Vector3d> driving;
+    driving.reserve(best_path_.size());
+    for (const mgg::StateVec& state : best_path_) {
+      driving.push_back(state.head<3>());
+    }
+    // Shortcutting and interpolation happen after graph admission. Refuse a
+    // selected path if either operation placed it across known incompatible
+    // terrain; the next cycle may select another frontier.
+    if (!objectiveTerrainPathSupported(driving)) best_path_.clear();
   }
   if (best_path_.size() >= 2) {
     // Remember where this path is heading, so the next cycle penalises
@@ -1171,8 +1197,8 @@ bool PlannerNode::objectiveFootprintTerrainSupported(
     const Eigen::Vector3d& driving_pose,
     const Eigen::Vector3d& body) const {
   // This extra terrain contract is intentionally limited to simulation's
-  // observed-ground objective policy.  The legacy graph/exploration contract
-  // and strict-volume hardware planning retain their existing semantics.
+  // observed-ground policy. Explicit objectives and Explore both use it;
+  // strict-volume hardware planning retains its existing semantics.
   if (!observed_ground_body_evidence_ ||
       robot_params_.type != mgg::RobotType::kGroundRobot) {
     return true;
@@ -1253,6 +1279,39 @@ bool PlannerNode::objectiveFootprintTerrainSupported(
     }
   }
   return samples > 0;
+}
+
+bool PlannerNode::objectiveTerrainPathSupported(
+    const std::vector<Eigen::Vector3d>& driving_path) const {
+  if (!observed_ground_body_evidence_ ||
+      robot_params_.type != mgg::RobotType::kGroundRobot) {
+    return true;
+  }
+  if (driving_path.empty()) return false;
+  const Eigen::Vector3d footprint_body = robot_params_.getPlanningSize();
+  Eigen::Vector3d swept_body = footprint_body;
+  const double xy_diagonal = footprint_body.head<2>().norm();
+  swept_body.x() = xy_diagonal;
+  swept_body.y() = xy_diagonal;
+  for (std::size_t i = 0; i < driving_path.size(); ++i) {
+    if (!objectiveFootprintTerrainSupported(driving_path[i], footprint_body)) {
+      return false;
+    }
+    if (i == 0) continue;
+    if (std::abs(driving_path[i].z() - driving_path[i - 1].z()) >
+        planning_params_.max_step_height + 1e-6) {
+      return false;
+    }
+    const Eigen::Vector3d from =
+        driving_path[i - 1] + robot_params_.center_offset;
+    const Eigen::Vector3d to =
+        driving_path[i] + robot_params_.center_offset;
+    if (objectiveSweptBodyStatus(from, to, swept_body) !=
+        mgg::VoxelStatus::kFree) {
+      return false;
+    }
+  }
+  return true;
 }
 
 void PlannerNode::updateGlobalGraph() {
