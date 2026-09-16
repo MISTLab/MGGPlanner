@@ -250,6 +250,9 @@ TEST(GridRefinement, UnknownCellsCannotFormADetour) {
   EXPECT_EQ(path.status, PlanningStatus::kBlocked);
   EXPECT_TRUE(path.poses.empty());
   EXPECT_NE(path.reason.find("no observed traversable"), std::string::npos);
+  EXPECT_NE(path.reason.find("grid evidence: projections="), std::string::npos);
+  EXPECT_NE(path.reason.find("unknown="), std::string::npos);
+  EXPECT_NE(path.reason.find("expansions="), std::string::npos);
 }
 
 TEST(GridRefinement, DoesNotCutDiagonallyBetweenBlockedCardinalCells) {

@@ -120,12 +120,41 @@ FeasiblePath BoundedGridPlanner::refine(const RouteCorridor& corridor) {
   FeasiblePath result;
   copyRequest(corridor, result);
   if (corridor.status != PlanningStatus::kSucceeded) return result;
-  const auto fail = [&result](const std::string& reason) {
+  const auto diagnostics_started = std::chrono::steady_clock::now();
+  std::size_t projection_counts[5] = {0, 0, 0, 0, 0};
+  std::size_t traversal_attempts = 0;
+  std::size_t traversal_rejections = 0;
+  std::size_t expansions = 0;
+  const auto fail = [&](const std::string& reason) {
     result.status = PlanningStatus::kBlocked;
     result.poses.clear();
     result.partial = false;
     result.reason = reason;
+    const std::size_t projections =
+        projection_counts[0] + projection_counts[1] + projection_counts[2] +
+        projection_counts[3] + projection_counts[4];
+    if (projections != 0 || traversal_attempts != 0 || expansions != 0) {
+      const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+          std::chrono::steady_clock::now() - diagnostics_started);
+      char summary[320];
+      std::snprintf(
+          summary, sizeof(summary),
+          " [grid evidence: projections=%zu supported=%zu no_ground=%zu "
+          "occupied=%zu unknown=%zu geofence=%zu traversals=%zu rejected=%zu "
+          "expansions=%zu elapsed_ms=%lld]",
+          projections, projection_counts[0], projection_counts[1],
+          projection_counts[2], projection_counts[3], projection_counts[4],
+          traversal_attempts, traversal_rejections, expansions,
+          static_cast<long long>(elapsed.count()));
+      result.reason += summary;
+    }
     return result;
+  };
+  const auto project_state = [&](StateVec& state) {
+    const GridProjectionStatus status = project_(state);
+    const std::size_t index = static_cast<std::size_t>(status);
+    if (index < 5) ++projection_counts[index];
+    return status;
   };
   if (corridor.request.objective != ObjectiveKind::kNavigate &&
       corridor.request.objective != ObjectiveKind::kReturnHome) {
@@ -158,7 +187,7 @@ FeasiblePath BoundedGridPlanner::refine(const RouteCorridor& corridor) {
   std::string interruption_reason;
   if (interrupted(interruption_reason)) return fail(interruption_reason);
   StateVec start = current_;
-  const GridProjectionStatus start_status = project_(start);
+  const GridProjectionStatus start_status = project_state(start);
   if (interrupted(interruption_reason)) return fail(interruption_reason);
   if (start_status != GridProjectionStatus::kSupported ||
       !start.allFinite()) {
@@ -177,7 +206,7 @@ FeasiblePath BoundedGridPlanner::refine(const RouteCorridor& corridor) {
                   std::to_string(waypoint_index) +
                   "] rejected: state is non-finite");
     }
-    const GridProjectionStatus waypoint_status = project_(waypoint);
+    const GridProjectionStatus waypoint_status = project_state(waypoint);
     if (interrupted(interruption_reason)) return fail(interruption_reason);
     if (waypoint_status != GridProjectionStatus::kSupported ||
         !waypoint.allFinite()) {
@@ -199,7 +228,7 @@ FeasiblePath BoundedGridPlanner::refine(const RouteCorridor& corridor) {
   if (!goal.allFinite()) {
     return fail("the exact goal has no supported collision-free grid state");
   }
-  const GridProjectionStatus goal_status = project_(goal);
+  const GridProjectionStatus goal_status = project_state(goal);
   if (interrupted(interruption_reason)) return fail(interruption_reason);
   goal[3] = requested_goal_yaw;
   if (goal_status != GridProjectionStatus::kSupported || !goal.allFinite()) {
@@ -223,18 +252,22 @@ FeasiblePath BoundedGridPlanner::refine(const RouteCorridor& corridor) {
     return result;
   }
 
-  std::size_t expansions = 0;
   std::size_t sequence = 0;
-  const auto traverse = [this, &interrupted](const StateVec& a,
+  const auto traverse = [this, &interrupted, &traversal_attempts,
+                         &traversal_rejections](const StateVec& a,
                                const StateVec& b,
                                std::vector<StateVec>* checked,
                                double* length,
                                std::string& interruption_reason) {
     if (interrupted(interruption_reason)) return false;
     std::vector<StateVec> local;
+    ++traversal_attempts;
     const bool accepted = traversable_(a, b, local);
     if (interrupted(interruption_reason)) return false;
-    if (!accepted) return false;
+    if (!accepted) {
+      ++traversal_rejections;
+      return false;
+    }
     if (local.size() < 2 || !samePosition(local.front(), a) ||
         !samePosition(local.back(), b)) {
       return false;
@@ -330,7 +363,7 @@ FeasiblePath BoundedGridPlanner::refine(const RouteCorridor& corridor) {
       const double lattice_y = origin_y + static_cast<double>(y) * resolution;
       value.state = StateVec(lattice_x, lattice_y, parent_z, 0.0);
       if (interrupted(reason)) return false;
-      const GridProjectionStatus projection_status = project_(value.state);
+      const GridProjectionStatus projection_status = project_state(value.state);
       if (interrupted(reason)) return false;
       if (projection_status != GridProjectionStatus::kSupported ||
           !value.state.allFinite()) {
