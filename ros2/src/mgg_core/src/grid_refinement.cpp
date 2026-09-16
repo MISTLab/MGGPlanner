@@ -195,11 +195,20 @@ FeasiblePath BoundedGridPlanner::refine(const RouteCorridor& corridor) {
   std::size_t expansions = 0;
   std::unordered_map<DirectedEdgeKey, TraversalResult, DirectedEdgeHash>
       traversal_cache;
+  // Indices into corridor.poses for the segment currently being validated.
+  // kNoCorridorIndex is the implicit start (the live pose) and
+  // corridor.poses.size() the exact request-owned goal.
+  std::size_t active_from_index = kNoCorridorIndex;
+  std::size_t active_to_index = kNoCorridorIndex;
+  bool active_segment_known = false;
   const auto fail = [&](const std::string& reason) {
     result.status = PlanningStatus::kBlocked;
     result.poses.clear();
     result.partial = false;
     result.reason = reason;
+    result.blocked_segment_identified = active_segment_known;
+    result.blocked_from_index = active_from_index;
+    result.blocked_to_index = active_to_index;
     const std::size_t projections =
         projection_counts[0] + projection_counts[1] + projection_counts[2] +
         projection_counts[3] + projection_counts[4];
@@ -234,8 +243,10 @@ FeasiblePath BoundedGridPlanner::refine(const RouteCorridor& corridor) {
            status == GridProjectionStatus::kProvisionalUnknown;
   };
   if (corridor.request.objective != ObjectiveKind::kNavigate &&
-      corridor.request.objective != ObjectiveKind::kReturnHome) {
-    return fail("grid refinement supports Navigate and ReturnHome only");
+      corridor.request.objective != ObjectiveKind::kReturnHome &&
+      corridor.request.objective != ObjectiveKind::kExplore) {
+    return fail(
+        "grid refinement supports Explore, Navigate and ReturnHome only");
   }
   if (!current_.allFinite() || !std::isfinite(limits_.resolution_m) ||
       !std::isfinite(limits_.detour_margin_m) ||
@@ -274,11 +285,19 @@ FeasiblePath BoundedGridPlanner::refine(const RouteCorridor& corridor) {
   }
 
   std::vector<StateVec> waypoints;
+  // Corridor-pose index behind each waypoint, so a rejected waypoint or an
+  // unrefinable segment can name the corridor it belongs to.
+  std::vector<std::size_t> waypoint_source;
   waypoints.reserve(corridor.poses.size() + 2);
+  waypoint_source.reserve(corridor.poses.size() + 2);
   waypoints.push_back(start);
+  waypoint_source.push_back(kNoCorridorIndex);
   for (std::size_t waypoint_index = 0;
        waypoint_index < corridor.poses.size(); ++waypoint_index) {
     StateVec waypoint = corridor.poses[waypoint_index];
+    active_from_index = waypoint_source.back();
+    active_to_index = waypoint_index;
+    active_segment_known = true;
     if (interrupted(interruption_reason)) return fail(interruption_reason);
     if (!waypoint.allFinite()) {
       return fail("route corridor waypoint[" +
@@ -299,13 +318,31 @@ FeasiblePath BoundedGridPlanner::refine(const RouteCorridor& corridor) {
     }
     if (!samePosition(waypoints.back(), waypoint)) {
       waypoints.push_back(waypoint);
+      waypoint_source.push_back(waypoint_index);
+    } else {
+      waypoint_source.back() = waypoint_index;
     }
   }
+  active_segment_known = false;
+  active_from_index = kNoCorridorIndex;
+  active_to_index = kNoCorridorIndex;
   if (corridor.partial && waypoints.size() < 2) {
     return fail("partial route has no progress proxy");
   }
   StateVec goal = corridor.partial ? waypoints.back()
                                    : corridor.request.goal.pose;
+  if (corridor.partial) {
+    // The proxy is the last corridor pose, so name the corridor segment that
+    // ends there rather than the pose on its own.
+    active_from_index = waypoint_source.size() >= 2u
+                            ? waypoint_source[waypoint_source.size() - 2u]
+                            : kNoCorridorIndex;
+    active_to_index = waypoint_source.back();
+  } else {
+    active_from_index = waypoint_source.back();
+    active_to_index = corridor.poses.size();
+  }
+  active_segment_known = true;
   const double requested_goal_yaw = goal[3];
   if (interrupted(interruption_reason)) return fail(interruption_reason);
   if (!goal.allFinite()) {
@@ -343,10 +380,16 @@ FeasiblePath BoundedGridPlanner::refine(const RouteCorridor& corridor) {
     waypoints.back() = goal;
   } else if (!samePosition(waypoints.back(), goal)) {
     waypoints.push_back(goal);
+    waypoint_source.push_back(corridor.poses.size());
   } else {
     // The graph vertex supplies XYZ, but the request owns exact final yaw.
+    // Its corridor index is kept: when the goal coincides with the last
+    // corridor pose, that pose is the more useful thing to name as blocked.
     waypoints.back() = goal;
   }
+  active_segment_known = false;
+  active_from_index = kNoCorridorIndex;
+  active_to_index = kNoCorridorIndex;
   if (waypoints.size() == 1) {
     if (interrupted(interruption_reason)) return fail(interruption_reason);
     result.status = PlanningStatus::kSucceeded;
@@ -421,6 +464,9 @@ FeasiblePath BoundedGridPlanner::refine(const RouteCorridor& corridor) {
   for (std::size_t segment = 1; segment < waypoints.size(); ++segment) {
     const StateVec& from = waypoints[segment - 1];
     const StateVec& to = waypoints[segment];
+    active_from_index = waypoint_source[segment - 1];
+    active_to_index = waypoint_source[segment];
+    active_segment_known = true;
     StateVec connected_to = to;
     if (interrupted(interruption_reason)) return fail(interruption_reason);
     std::vector<StateVec> direct_path;
@@ -843,10 +889,12 @@ FeasiblePath BoundedGridPlanner::refine(const RouteCorridor& corridor) {
         result.poses[i].y() - result.poses[i - 1].y(),
         result.poses[i].x() - result.poses[i - 1].x());
   }
+  active_segment_known = false;
   if (interrupted(interruption_reason)) return fail(interruption_reason);
   result.poses.back()[3] = goal[3];
   result.status = PlanningStatus::kSucceeded;
   result.reason.clear();
+  result.blocked_segment_identified = false;
   return result;
 }
 

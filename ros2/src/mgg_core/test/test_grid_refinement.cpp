@@ -387,9 +387,44 @@ TEST(GridRefinement, ProjectorCannotReplaceRequestOwnedGoalYaw) {
   EXPECT_NEAR(path.poses.back()[3], 0.7, 1e-9);
 }
 
-TEST(GridRefinement, RejectsExploreBeforeCallingMapPredicates) {
+TEST(GridRefinement, RefinesExploreThroughTheSharedTerrainStage) {
+  // Explore now shares one grid stage with Navigate and ReturnHome, so its
+  // selected target is projected and its corridor swept like any other.
   RouteCorridor route = routeTo(1.0, 0.0);
   route.request.objective = mgg::ObjectiveKind::kExplore;
+  int projections = 0;
+  auto project = [&projections](StateVec& state) {
+    ++projections;
+    state.z() = 0.0;
+    return GridProjectionStatus::kSupported;
+  };
+  BoundedGridPlanner planner(StateVec::Zero(), limits(), project,
+                             sampledTraversal({}));
+  const FeasiblePath path = planner.refine(route);
+  EXPECT_EQ(path.status, PlanningStatus::kSucceeded) << path.reason;
+  EXPECT_GT(projections, 0);
+  ASSERT_FALSE(path.poses.empty());
+  EXPECT_NEAR(path.poses.back().x(), 1.0, 1e-9);
+  EXPECT_FALSE(path.blocked_segment_identified);
+}
+
+TEST(GridRefinement, ExploreDetoursAroundAnObstacleLikeExplicitObjectives) {
+  RouteCorridor route = routeTo(3.0, 0.0);
+  route.request.objective = mgg::ObjectiveKind::kExplore;
+  BoundedGridPlanner planner(StateVec::Zero(), limits(), flatProjection(),
+                             sampledTraversal({{2.0, 0.0}}));
+  const FeasiblePath path = planner.refine(route);
+  ASSERT_EQ(path.status, PlanningStatus::kSucceeded) << path.reason;
+  ASSERT_FALSE(path.poses.empty());
+  EXPECT_NEAR(path.poses.back().x(), 3.0, 1e-9);
+  for (const StateVec& pose : path.poses) {
+    EXPECT_GT((pose.head<2>() - Eigen::Vector2d(2.0, 0.0)).norm(), 0.34);
+  }
+}
+
+TEST(GridRefinement, RejectsObjectivesWithNoGridStageBeforeMapPredicates) {
+  RouteCorridor route = routeTo(1.0, 0.0);
+  route.request.objective = mgg::ObjectiveKind::kInspect;
   int projections = 0;
   auto project = [&projections](StateVec&) {
     ++projections;
@@ -400,6 +435,80 @@ TEST(GridRefinement, RejectsExploreBeforeCallingMapPredicates) {
   const FeasiblePath path = planner.refine(route);
   EXPECT_EQ(path.status, PlanningStatus::kBlocked);
   EXPECT_EQ(projections, 0);
+  EXPECT_FALSE(path.blocked_segment_identified);
+}
+
+TEST(GridRefinement, NamesTheRejectedCorridorWaypointForBlockedFeedback) {
+  RouteCorridor route;
+  route.status = PlanningStatus::kSucceeded;
+  route.request.objective = mgg::ObjectiveKind::kReturnHome;
+  route.poses.push_back(StateVec(1.0, 0.0, 0.0, 0.0));
+  route.poses.push_back(StateVec(2.0, 0.0, 0.0, 0.0));
+  route.request.goal.pose = route.poses.back();
+  auto project = [](StateVec& state) {
+    state.z() = 0.0;
+    return std::abs(state.x() - 2.0) < 1e-9 ? GridProjectionStatus::kNoGround
+                                            : GridProjectionStatus::kSupported;
+  };
+  BoundedGridPlanner planner(StateVec::Zero(), limits(), project,
+                             sampledTraversal({}));
+  const FeasiblePath path = planner.refine(route);
+  ASSERT_EQ(path.status, PlanningStatus::kBlocked);
+  ASSERT_TRUE(path.blocked_segment_identified);
+  EXPECT_EQ(path.blocked_from_index, 0u);
+  EXPECT_EQ(path.blocked_to_index, 1u);
+}
+
+TEST(GridRefinement, NamesTheCorridorSegmentWithNoTraversableDetour) {
+  RouteCorridor route;
+  route.status = PlanningStatus::kSucceeded;
+  route.request.objective = mgg::ObjectiveKind::kExplore;
+  route.poses.push_back(StateVec(1.0, 0.0, 0.0, 0.0));
+  route.poses.push_back(StateVec(4.0, 0.0, 0.0, 0.0));
+  route.request.goal.pose = route.poses.back();
+  // A wall across the whole detour window between the two corridor poses.
+  auto walled = [](const StateVec& from, const StateVec& to,
+                   std::vector<StateVec>& checked) {
+    const double length = (to.head<2>() - from.head<2>()).norm();
+    const int steps = std::max(1, static_cast<int>(std::ceil(length / 0.1)));
+    checked.clear();
+    for (int i = 0; i <= steps; ++i) {
+      const double t = static_cast<double>(i) / steps;
+      StateVec sample = from + t * (to - from);
+      if (sample.x() > 1.9 && sample.x() < 2.6) return false;
+      checked.push_back(sample);
+    }
+    return true;
+  };
+  BoundedGridPlanner planner(StateVec::Zero(), limits(), flatProjection(),
+                             walled);
+  const FeasiblePath path = planner.refine(route);
+  ASSERT_EQ(path.status, PlanningStatus::kBlocked) << path.reason;
+  ASSERT_TRUE(path.blocked_segment_identified);
+  EXPECT_EQ(path.blocked_from_index, 0u);
+  EXPECT_EQ(path.blocked_to_index, 1u);
+}
+
+TEST(GridRefinement, PartialCorridorNamesTheSegmentEndingAtItsProxy) {
+  RouteCorridor route;
+  route.status = PlanningStatus::kSucceeded;
+  route.partial = true;
+  route.request.objective = mgg::ObjectiveKind::kNavigate;
+  route.poses.push_back(StateVec(1.0, 0.0, 0.0, 0.0));
+  route.poses.push_back(StateVec(2.0, 0.0, 0.0, 0.0));
+  route.request.goal.pose = StateVec(30.0, 0.0, 0.0, 0.0);
+  auto blocked_after_first = [](const StateVec& from, const StateVec& to,
+                               std::vector<StateVec>& checked) {
+    if (from.x() >= 1.0 - 1e-9 || to.x() >= 1.5) return false;
+    checked = {from, to};
+    return true;
+  };
+  BoundedGridPlanner planner(StateVec::Zero(), limits(), flatProjection(),
+                             blocked_after_first);
+  const FeasiblePath path = planner.refine(route);
+  ASSERT_EQ(path.status, PlanningStatus::kBlocked);
+  ASSERT_TRUE(path.blocked_segment_identified);
+  EXPECT_EQ(path.blocked_to_index, 1u);
 }
 
 TEST(GridRefinement, ReportsWaypointIndexCoordinatesAndProjectionClass) {

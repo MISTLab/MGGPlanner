@@ -181,13 +181,189 @@ TEST(PlanningStages, NonfiniteGoalIsRejectedBeforeGraphLookup) {
             PlanningStatus::kUnsupportedObjective);
 }
 
-TEST(PlanningStages, ExploreIsKeptBehindItsExistingSelector) {
+TEST(PlanningStages, ExploreSharesTheGraphStageWithItsSelectedTarget) {
+  // The utility/gain selector chooses the leaf; the shared stage plans the
+  // corridor to it exactly as it does for Navigate and ReturnHome.
   Chain chain;
   TopologicalGoalPlanner planner("component-a", 12, 34, 0.25);
-  EXPECT_EQ(
-      planner.plan(chain.graph, StateVec::Zero(), request(ObjectiveKind::kExplore))
-          .status,
-      PlanningStatus::kUnsupportedObjective);
+  auto explore = request(ObjectiveKind::kExplore);
+  explore.goal.pose = StateVec(3.0, 0.0, 0.0, 0.4);
+  const auto route =
+      planner.plan(chain.graph, StateVec(0.1, 0.0, 0.0, 0.0), explore);
+  ASSERT_EQ(route.status, PlanningStatus::kSucceeded) << route.reason;
+  ASSERT_EQ(route.poses.size(), 4u);
+  EXPECT_DOUBLE_EQ(route.poses.front().x(), 0.0);
+  EXPECT_DOUBLE_EQ(route.poses.back().x(), 3.0);
+  EXPECT_FALSE(route.partial);
+  EXPECT_DOUBLE_EQ(route.request.goal.pose[3], 0.4);
+}
+
+TEST(PlanningStages, ExploreNeverBootstrapsAConnectorBeyondTheGraph) {
+  // Only Navigate may follow an optimistic connector towards a goal the graph
+  // cannot reach. An exploration candidate must end on measured support, so
+  // its target has to bind to an admitted vertex.
+  Chain chain;
+  TopologicalGoalPlanner planner("component-a", 12, 34, 0.25, 1.0);
+  auto explore = request(ObjectiveKind::kExplore);
+  explore.goal.pose = StateVec(30.0, 0.0, 0.0, 0.0);
+  const auto route = planner.plan(chain.graph, StateVec::Zero(), explore);
+  EXPECT_EQ(route.status, PlanningStatus::kUnreachable);
+  EXPECT_TRUE(route.poses.empty());
+}
+
+TEST(PlanningStages, ObjectivesWithoutAGraphStageStayUnsupported) {
+  Chain chain;
+  TopologicalGoalPlanner planner("component-a", 12, 34, 0.25);
+  EXPECT_EQ(planner
+                .plan(chain.graph, StateVec::Zero(),
+                      request(ObjectiveKind::kInspect))
+                .status,
+            PlanningStatus::kUnsupportedObjective);
+}
+
+// A diamond whose upper leg is cheaper, so the unmarked corridor is
+// deterministic and a mark has a visible alternative.
+class Diamond {
+ public:
+  Diamond() {
+    auto* source = new Vertex(0, StateVec(0.0, 0.0, 0.0, 0.0));
+    auto* upper = new Vertex(1, StateVec(1.0, 1.0, 0.0, 0.0));
+    auto* lower = new Vertex(2, StateVec(1.0, -1.0, 0.0, 0.0));
+    auto* target = new Vertex(3, StateVec(2.0, 0.0, 0.0, 0.0));
+    graph.addVertex(source);
+    graph.addVertex(upper);
+    graph.addVertex(lower);
+    graph.addVertex(target);
+    graph.addEdge(source, upper, 1.0);
+    graph.addEdge(upper, target, 1.0);
+    graph.addEdge(source, lower, 4.0);
+    graph.addEdge(lower, target, 4.0);
+  }
+  GraphManager graph;
+};
+
+PlanningRequest diamondRequest(ObjectiveKind objective) {
+  PlanningRequest value = request(objective);
+  value.goal.pose = StateVec(2.0, 0.0, 0.0, 0.0);
+  return value;
+}
+
+TEST(BlockedCorridor, MarkForcesAnAlternativeTopologicalRoute) {
+  for (const auto objective : {ObjectiveKind::kExplore,
+                               ObjectiveKind::kNavigate,
+                               ObjectiveKind::kReturnHome}) {
+    Diamond diamond;
+    TopologicalGoalPlanner planner("component-a", 12, 34, 0.25);
+    const auto unmarked = planner.plan(diamond.graph, StateVec::Zero(),
+                                       diamondRequest(objective));
+    ASSERT_EQ(unmarked.status, PlanningStatus::kSucceeded) << unmarked.reason;
+    ASSERT_EQ(unmarked.poses.size(), 3u);
+    EXPECT_DOUBLE_EQ(unmarked.poses[1].y(), 1.0);
+
+    BlockedCorridorRegistry registry;
+    registry.block(StateVec(0.0, 0.0, 0.0, 0.0), StateVec(1.0, 1.0, 0.0, 0.0),
+                   7, 100.0);
+    BlockedCorridorView view;
+    view.registry = &registry;
+    view.map_revision = 7;
+    view.now_s = 100.0;
+    ASSERT_TRUE(view.active());
+    const auto rerouted = planner.plan(diamond.graph, StateVec::Zero(),
+                                       diamondRequest(objective), view);
+    ASSERT_EQ(rerouted.status, PlanningStatus::kSucceeded) << rerouted.reason;
+    ASSERT_EQ(rerouted.poses.size(), 3u);
+    EXPECT_DOUBLE_EQ(rerouted.poses[1].y(), -1.0);
+  }
+}
+
+TEST(BlockedCorridor, MarkIsUndirectedAndLeavesOtherCorridorsAlone) {
+  BlockedCorridorRegistry registry;
+  registry.block(StateVec(0.0, 0.0, 0.0, 0.0), StateVec(1.0, 1.0, 0.0, 0.0), 7,
+                 100.0);
+  EXPECT_TRUE(registry.isBlocked(StateVec(1.0, 1.0, 0.0, 0.0),
+                                 StateVec(0.0, 0.0, 0.0, 0.0), 7, 100.0));
+  EXPECT_FALSE(registry.isBlocked(StateVec(0.0, 0.0, 0.0, 0.0),
+                                  StateVec(1.0, -1.0, 0.0, 0.0), 7, 100.0));
+  // A segment shorter than one cell would mark the pose rather than a
+  // corridor, so it is refused.
+  registry.block(StateVec(5.0, 5.0, 0.0, 0.0), StateVec(5.01, 5.0, 0.0, 0.0), 7,
+                 100.0);
+  EXPECT_FALSE(registry.isBlocked(StateVec(5.0, 5.0, 0.0, 0.0),
+                                  StateVec(5.01, 5.0, 0.0, 0.0), 7, 100.0));
+}
+
+TEST(BlockedCorridor, MarksExpireOnTimeAndOnAMaterialMapRevision) {
+  BlockedCorridorLimits limits;
+  limits.ttl_s = 5.0;
+  limits.revision_window = 3;
+  BlockedCorridorRegistry registry(limits);
+  const StateVec from(0.0, 0.0, 0.0, 0.0);
+  const StateVec to(1.0, 1.0, 0.0, 0.0);
+  registry.block(from, to, 10, 100.0);
+  EXPECT_TRUE(registry.isBlocked(from, to, 10, 104.9));
+  EXPECT_FALSE(registry.isBlocked(from, to, 10, 105.1));
+  EXPECT_TRUE(registry.isBlocked(from, to, 12, 100.0));
+  EXPECT_FALSE(registry.isBlocked(from, to, 13, 100.0));
+  // A snapshot replacement that moves the revision backwards invalidates the
+  // map the mark was taken against.
+  EXPECT_FALSE(registry.isBlocked(from, to, 9, 100.0));
+  EXPECT_EQ(registry.activeCount(13, 100.0), 0u);
+}
+
+TEST(BlockedCorridor, MemoryStaysBounded) {
+  BlockedCorridorLimits limits;
+  limits.max_entries = 4;
+  limits.ttl_s = 1000.0;
+  limits.revision_window = 10000;
+  BlockedCorridorRegistry registry(limits);
+  for (int i = 0; i < 50; ++i) {
+    registry.block(StateVec(10.0 * i, 0.0, 0.0, 0.0),
+                   StateVec(10.0 * i + 5.0, 0.0, 0.0, 0.0), 1, 10.0);
+  }
+  EXPECT_EQ(registry.size(), 4u);
+  // The newest marks survive; the oldest were evicted.
+  EXPECT_TRUE(registry.isBlocked(StateVec(490.0, 0.0, 0.0, 0.0),
+                                 StateVec(495.0, 0.0, 0.0, 0.0), 1, 10.0));
+  EXPECT_FALSE(registry.isBlocked(StateVec(0.0, 0.0, 0.0, 0.0),
+                                  StateVec(5.0, 0.0, 0.0, 0.0), 1, 10.0));
+}
+
+TEST(BlockedCorridor, NoLiveMarkLeavesTheCorridorUntouched) {
+  Diamond diamond;
+  TopologicalGoalPlanner planner("component-a", 12, 34, 0.25);
+  BlockedCorridorRegistry registry;
+  registry.block(StateVec(0.0, 0.0, 0.0, 0.0), StateVec(1.0, 1.0, 0.0, 0.0), 7,
+                 100.0);
+  BlockedCorridorView expired;
+  expired.registry = &registry;
+  expired.map_revision = 7;
+  expired.now_s = 1000.0;  // past the default ten-second lifetime
+  EXPECT_FALSE(expired.active());
+  const auto route = planner.plan(diamond.graph, StateVec::Zero(),
+                                  diamondRequest(ObjectiveKind::kNavigate),
+                                  expired);
+  ASSERT_EQ(route.status, PlanningStatus::kSucceeded) << route.reason;
+  ASSERT_EQ(route.poses.size(), 3u);
+  EXPECT_DOUBLE_EQ(route.poses[1].y(), 1.0);
+}
+
+TEST(BlockedCorridor, EveryCorridorBlockedLeavesTheGoalUnreachable) {
+  Diamond diamond;
+  TopologicalGoalPlanner planner("component-a", 12, 34, 0.25);
+  BlockedCorridorRegistry registry;
+  registry.block(StateVec(0.0, 0.0, 0.0, 0.0), StateVec(1.0, 1.0, 0.0, 0.0), 7,
+                 100.0);
+  registry.block(StateVec(0.0, 0.0, 0.0, 0.0), StateVec(1.0, -1.0, 0.0, 0.0), 7,
+                 100.0);
+  BlockedCorridorView view;
+  view.registry = &registry;
+  view.map_revision = 7;
+  view.now_s = 100.0;
+  const auto route = planner.plan(diamond.graph, StateVec::Zero(),
+                                  diamondRequest(ObjectiveKind::kExplore),
+                                  view);
+  EXPECT_EQ(route.status, PlanningStatus::kUnreachable);
+  EXPECT_EQ(route.reason, "goal has no unblocked corridor in the active graph");
 }
 
 }  // namespace
