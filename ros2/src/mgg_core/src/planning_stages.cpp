@@ -24,6 +24,11 @@ RouteCorridor TopologicalGoalPlanner::plan(
     result.reason = "objective is not an explicit topological goal";
     return result;
   }
+  if (!current.allFinite() || !request.goal.pose.allFinite()) {
+    result.status = PlanningStatus::kUnsupportedObjective;
+    result.reason = "current pose and goal must contain only finite values";
+    return result;
+  }
   if (request.component_id != component_id_ ||
       request.graph_revision != graph_revision_ ||
       request.map_revision != map_revision_) {

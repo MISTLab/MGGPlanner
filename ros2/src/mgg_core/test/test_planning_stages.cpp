@@ -1,5 +1,7 @@
 #include <gtest/gtest.h>
 
+#include <limits>
+
 #include "mgg_core/planning_stages.h"
 
 namespace {
@@ -68,6 +70,15 @@ TEST(PlanningStages, GoalMustResolveToTheActiveGraph) {
   far.goal.pose.x() = 30.0;
   EXPECT_EQ(planner.plan(chain.graph, StateVec::Zero(), far).status,
             PlanningStatus::kUnreachable);
+}
+
+TEST(PlanningStages, NonfiniteGoalIsRejectedBeforeGraphLookup) {
+  Chain chain;
+  TopologicalGoalPlanner planner("component-a", 12, 34, 0.25);
+  auto invalid = request(ObjectiveKind::kNavigate);
+  invalid.goal.pose.x() = std::numeric_limits<double>::quiet_NaN();
+  EXPECT_EQ(planner.plan(chain.graph, StateVec::Zero(), invalid).status,
+            PlanningStatus::kUnsupportedObjective);
 }
 
 TEST(PlanningStages, ExploreIsKeptBehindItsExistingSelector) {

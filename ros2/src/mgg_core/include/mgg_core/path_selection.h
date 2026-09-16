@@ -78,7 +78,10 @@ PathSelectionResult selectBestPath(GraphManager& graph,
                                    const RobotParams& robot,
                                    const EdgeInclinations& inclinations,
                                    double map_resolution,
-                                   double exploring_direction);
+                                   double exploring_direction,
+                                   const std::vector<Eigen::Vector3d>&
+                                       excluded_endpoints = {},
+                                   double exclusion_radius = 0.0);
 
 }  // namespace mgg
 

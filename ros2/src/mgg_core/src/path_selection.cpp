@@ -1,5 +1,6 @@
 #include "mgg_core/path_selection.h"
 
+#include <algorithm>
 #include <cmath>
 
 #include "mgg_core/trajectory.h"
@@ -11,7 +12,10 @@ PathSelectionResult selectBestPath(GraphManager& graph,
                                    const RobotParams& robot,
                                    const EdgeInclinations& inclinations,
                                    double map_resolution,
-                                   double exploring_direction) {
+                                   double exploring_direction,
+                                   const std::vector<Eigen::Vector3d>&
+                                       excluded_endpoints,
+                                   double exclusion_radius) {
   PathSelectionResult result;
 
   ShortestPathsReport rep;
@@ -25,6 +29,12 @@ PathSelectionResult selectBestPath(GraphManager& graph,
     std::vector<Vertex*> path;
     graph.getShortestPath(leaf->id, rep, true, path);
     if (path.size() <= 1) continue;  // needs at least root and leaf
+    const bool excluded = std::any_of(
+        excluded_endpoints.begin(), excluded_endpoints.end(),
+        [leaf, exclusion_radius](const Eigen::Vector3d& center) {
+          return (leaf->state.head(3) - center).norm() <= exclusion_radius;
+        });
+    if (excluded) continue;
     ++result.leaves_evaluated;
 
     double path_gain = 0.0;

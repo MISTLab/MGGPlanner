@@ -35,6 +35,14 @@ PciNode::PciNode(const rclcpp::NodeOptions& options)
       },
       rclcpp::ServicesQoS(), callback_group_);
 
+  replan_srv_ = create_service<std_srvs::srv::Trigger>(
+      "pci_replan",
+      [this](const std::shared_ptr<std_srvs::srv::Trigger::Request> req,
+             std::shared_ptr<std_srvs::srv::Trigger::Response> res) {
+        onReplan(req, res);
+      },
+      rclcpp::ServicesQoS(), callback_group_);
+
   stop_srv_ = create_service<std_srvs::srv::Trigger>(
       "pci_stop",
       [this](const std::shared_ptr<std_srvs::srv::Trigger::Request> req,
@@ -131,7 +139,7 @@ void PciNode::onOdometry(nav_msgs::msg::Odometry::ConstSharedPtr msg) {
                 "goal reached (dist=%.2f m <= %.2f m); requesting next plan",
                 dist_to_goal, reach_distance_);
     path_in_progress_ = false;
-    stalled_plans_ = 0;
+    stall_budget_.noteProgress();
     lock.unlock();
     planAndPublish();
   }
@@ -278,7 +286,7 @@ void PciNode::tick() {
                   "robot made no progress for %.1f s (> %.1f s); replanning",
                   stuck_duration, stuck_timeout_sec_);
       path_in_progress_ = false;
-      if (++stalled_plans_ >= 3) {
+      if (stall_budget_.noteStall()) {
         running_ = false;
         publishPath({});
         publishStatus("blocked");
@@ -297,7 +305,7 @@ void PciNode::onTrigger(
     std::lock_guard<std::mutex> lock(mutex_);
     running_ = true;
     ++generation_;
-    stalled_plans_ = 0;
+    stall_budget_.noteProgress();
     publishStatus("starting");
     exploration_completed_ = false;
     consecutive_empty_plans_ = 0;
@@ -310,6 +318,33 @@ void PciNode::onTrigger(
   response->message = path_in_progress_
                           ? "started autonomous exploration"
                           : "failed to start path";
+}
+
+void PciNode::onReplan(
+    const std::shared_ptr<std_srvs::srv::Trigger::Request>,
+    std::shared_ptr<std_srvs::srv::Trigger::Response> response) {
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (!running_) {
+      response->success = false;
+      response->message = "exploration is not active";
+      return;
+    }
+    if (planning_in_progress_) {
+      response->success = false;
+      response->message = "a planning cycle is already running";
+      return;
+    }
+    exploration_completed_ = false;
+    consecutive_empty_plans_ = 0;
+    path_in_progress_ = false;
+  }
+  planAndPublish();
+
+  std::lock_guard<std::mutex> lock(mutex_);
+  response->success = path_in_progress_;
+  response->message = path_in_progress_ ? "published a fresh exploration path"
+                                        : "failed to produce a fresh path";
 }
 
 

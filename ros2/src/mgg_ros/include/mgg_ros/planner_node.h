@@ -14,6 +14,7 @@
 #ifndef MGG_ROS_PLANNER_NODE_H_
 #define MGG_ROS_PLANNER_NODE_H_
 
+#include <chrono>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -21,6 +22,7 @@
 
 #include <nav_msgs/msg/odometry.hpp>
 #include <nav_msgs/msg/path.hpp>
+#include <geometry_msgs/msg/pose_array.hpp>
 #include <sensor_msgs/msg/point_cloud2.hpp>
 #include <rclcpp/rclcpp.hpp>
 #include <std_srvs/srv/trigger.hpp>
@@ -56,6 +58,7 @@ class PlannerNode : public rclcpp::Node {
   void onOdometry(nav_msgs::msg::Odometry::ConstSharedPtr msg);
   void onPointCloud(sensor_msgs::msg::PointCloud2::ConstSharedPtr msg);
   void onNeighbourGraph(mgg_msgs::msg::Graph::ConstSharedPtr msg);
+  void onCoordinationExclusions(geometry_msgs::msg::PoseArray::ConstSharedPtr msg);
   void onBuildRequest(
       const std::shared_ptr<std_srvs::srv::Trigger::Request> request,
       std::shared_ptr<std_srvs::srv::Trigger::Response> response);
@@ -63,6 +66,9 @@ class PlannerNode : public rclcpp::Node {
   void onPlanRequest(
       const std::shared_ptr<mgg_msgs::srv::PlannerSrv::Request> request,
       std::shared_ptr<mgg_msgs::srv::PlannerSrv::Response> response);
+  // Planning is synchronous and serialized with map updates. The ROS service
+  // cannot cancel an in-progress graph build; callers must enforce a bounded
+  // wait and may retry against the returned revisions.
   void onObjectiveRequest(
       const std::shared_ptr<mgg_msgs::srv::PlanObjective::Request> request,
       std::shared_ptr<mgg_msgs::srv::PlanObjective::Response> response);
@@ -149,7 +155,14 @@ class PlannerNode : public rclcpp::Node {
   std::string world_frame_ = "world";
   std::string component_id_ = "local";
   std::uint64_t graph_revision_ = 0;
+  std::uint64_t local_graph_revision_ = 0;
+  std::uint64_t local_graph_map_revision_ = 0;
   std::uint64_t map_revision_ = 0;
+  double reservation_exclusion_radius_m_ = 4.0;
+  double reservation_exclusion_ttl_s_ = 3.0;
+  std::vector<Eigen::Vector3d> coordination_exclusions_;
+  std::chrono::steady_clock::time_point coordination_exclusions_received_;
+  bool have_coordination_exclusions_ = false;
   double communication_range_ = 10.0;
 
 
@@ -165,6 +178,8 @@ class PlannerNode : public rclcpp::Node {
   rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr odom_sub_;
   rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr cloud_sub_;
   rclcpp::Subscription<mgg_msgs::msg::Graph>::SharedPtr neighbour_sub_;
+  rclcpp::Subscription<geometry_msgs::msg::PoseArray>::SharedPtr
+      coordination_exclusions_sub_;
   rclcpp::Publisher<mgg_msgs::msg::Graph>::SharedPtr graph_pub_;
   rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr
       marker_pub_;

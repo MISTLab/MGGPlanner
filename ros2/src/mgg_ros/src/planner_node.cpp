@@ -94,6 +94,20 @@ PlannerNode::PlannerNode(const rclcpp::NodeOptions& options)
       [this](mgg_msgs::msg::Graph::ConstSharedPtr m) { onNeighbourGraph(m); },
       sub_opts);
 
+  reservation_exclusion_radius_m_ = std::max(
+      0.0, declareOrGet<double>(this, "reservation_exclusion_radius_m",
+                                reservation_exclusion_radius_m_));
+  reservation_exclusion_ttl_s_ = std::max(
+      0.0, declareOrGet<double>(this, "reservation_exclusion_ttl_s",
+                                reservation_exclusion_ttl_s_));
+  coordination_exclusions_sub_ =
+      create_subscription<geometry_msgs::msg::PoseArray>(
+          "coordination_exclusions", rclcpp::QoS(10),
+          [this](geometry_msgs::msg::PoseArray::ConstSharedPtr m) {
+            onCoordinationExclusions(m);
+          },
+          sub_opts);
+
   graph_pub_ = create_publisher<mgg_msgs::msg::Graph>("neighbour_graph_out",
                                                       rclcpp::QoS(10));
   marker_pub_ = create_publisher<visualization_msgs::msg::MarkerArray>(
@@ -300,6 +314,34 @@ void PlannerNode::onPointCloud(
   }
 }
 
+void PlannerNode::onCoordinationExclusions(
+    geometry_msgs::msg::PoseArray::ConstSharedPtr msg) {
+  if (msg->header.frame_id != world_frame_) {
+    RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 5000,
+                         "ignoring coordination exclusions in frame '%s'",
+                         msg->header.frame_id.c_str());
+    return;
+  }
+  std::vector<Eigen::Vector3d> centers;
+  centers.reserve(msg->poses.size());
+  for (const auto& pose : msg->poses) {
+    const auto& p = pose.position;
+    const auto& q = pose.orientation;
+    if (!std::isfinite(p.x) || !std::isfinite(p.y) || !std::isfinite(p.z) ||
+        std::abs(q.x) > 1e-6 || std::abs(q.y) > 1e-6 ||
+        std::abs(q.z) > 1e-6 || std::abs(q.w - 1.0) > 1e-6) {
+      RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 5000,
+                           "ignoring invalid coordination exclusions");
+      return;
+    }
+    centers.emplace_back(p.x, p.y, p.z);
+  }
+  const std::lock_guard<std::recursive_mutex> lock(planner_mutex_);
+  coordination_exclusions_ = std::move(centers);
+  coordination_exclusions_received_ = std::chrono::steady_clock::now();
+  have_coordination_exclusions_ = true;
+}
+
 void PlannerNode::onNeighbourGraph(mgg_msgs::msg::Graph::ConstSharedPtr msg) {
   if (msg->vertices.empty()) return;
   const int sender = msg->vertices.front().robot_id;
@@ -419,6 +461,8 @@ std::string PlannerNode::buildLocalGraph() {
   const auto t_global = Clock::now();
   const mgg::GridGraphResult r = buildGridGraph(
       *local_graph_, current_state_, grid_params_, ctx, current_state_[3]);
+  ++local_graph_revision_;
+  local_graph_map_revision_ = map_revision_;
 
   if (r.status == mgg::GridGraphStatus::kInvalidBounds) {
     return "grid bounds invalid: min_val must be <= 0, max_val >= 0 and "
@@ -443,9 +487,17 @@ std::string PlannerNode::buildLocalGraph() {
   }
 
   const auto t_gain = Clock::now();
+  std::vector<Eigen::Vector3d> exclusions;
+  if (have_coordination_exclusions_ &&
+      std::chrono::duration<double>(std::chrono::steady_clock::now() -
+                                    coordination_exclusions_received_)
+              .count() <= reservation_exclusion_ttl_s_) {
+    exclusions = coordination_exclusions_;
+  }
   const mgg::PathSelectionResult sel = mgg::selectBestPath(
       *local_graph_, planning_params_, robot_params_, edge_inclinations_,
-      map_->getResolution(), exploring_direction_);
+      map_->getResolution(), exploring_direction_, exclusions,
+      reservation_exclusion_radius_m_);
 
   best_path_.clear();
   path_shortcut_from_ = 0;
@@ -722,8 +774,8 @@ mgg::FeasiblePath PlannerNode::refineCorridor(
   result.status = corridor.status;
   result.mission_id = corridor.request.mission_id;
   result.component_id = component_id_;
-  result.graph_revision = graph_revision_;
-  result.map_revision = map_revision_;
+  result.graph_revision = corridor.request.graph_revision;
+  result.map_revision = corridor.request.map_revision;
   result.reason = corridor.reason;
   if (corridor.status != mgg::PlanningStatus::kSucceeded) return result;
 
@@ -732,6 +784,7 @@ mgg::FeasiblePath PlannerNode::refineCorridor(
                                  const mgg::StateVec& b) {
     const Eigen::Vector3d from = a.head(3);
     const Eigen::Vector3d to = b.head(3);
+    if (from.isApprox(to)) return true;
     const Eigen::Vector3d body = robot_params_.getPlanningSize();
     if (robot_params_.type == mgg::RobotType::kAerialRobot) {
       return map_->getPathStatus(from, to, body, true) ==
@@ -742,6 +795,12 @@ mgg::FeasiblePath PlannerNode::refineCorridor(
                                            false) ==
            mgg::ProjectedEdgeStatus::kAdmissible;
   };
+  if (result.poses.empty() || !admissible(current_state_, result.poses.front())) {
+    result.status = mgg::PlanningStatus::kBlocked;
+    result.poses.clear();
+    result.reason = "current pose cannot connect to the route corridor";
+    return result;
+  }
   for (std::size_t i = 1; i < result.poses.size(); ++i) {
     if (!admissible(result.poses[i - 1], result.poses[i])) {
       result.status = mgg::PlanningStatus::kBlocked;
@@ -779,33 +838,62 @@ void PlannerNode::onObjectiveRequest(
   core.goal.landmark_id = request->goal_landmark_id;
   core.component_id = request->component_id.empty() ? component_id_
                                                     : request->component_id;
-  core.graph_revision = request->graph_revision == 0 ? graph_revision_
-                                                     : request->graph_revision;
-  core.map_revision = request->map_revision == 0 ? map_revision_
-                                                 : request->map_revision;
-
   mgg::RouteCorridor corridor;
-  if (!have_odometry_ || !map_->getStatus()) {
-    corridor.request = core;
+  corridor.request = core;
+  const bool local_objective =
+      core.objective == mgg::ObjectiveKind::kExplore ||
+      core.objective == mgg::ObjectiveKind::kNavigate;
+  const std::uint64_t active_graph_revision =
+      local_objective ? local_graph_revision_ : graph_revision_;
+  const std::uint64_t active_map_revision =
+      local_objective && request->graph_revision != 0
+          ? local_graph_map_revision_
+          : map_revision_;
+  const bool supported = request->objective <=
+                         mgg_msgs::srv::PlanObjective::Request::RETURN_HOME;
+  const bool explicit_goal =
+      core.objective == mgg::ObjectiveKind::kNavigate ||
+      core.objective == mgg::ObjectiveKind::kReturnHome;
+  if (!supported || !current_state_.allFinite() ||
+      (explicit_goal && !core.goal.pose.allFinite())) {
+    corridor.status = mgg::PlanningStatus::kUnsupportedObjective;
+    corridor.reason = "objective and goal must be supported and finite";
+  } else if (core.component_id != component_id_ ||
+             (request->graph_revision != 0 &&
+              request->graph_revision != active_graph_revision) ||
+             (request->map_revision != 0 &&
+              request->map_revision != active_map_revision) ||
+             (local_objective && request->graph_revision != 0 &&
+              local_graph_map_revision_ != map_revision_)) {
+    corridor.status = mgg::PlanningStatus::kStaleRevision;
+    corridor.reason = "component or planning snapshot revision is stale";
+  } else if (!have_odometry_ || !map_->getStatus()) {
     corridor.status = mgg::PlanningStatus::kBlocked;
     corridor.reason = "odometry or planning map is unavailable";
-  } else if (core.objective == mgg::ObjectiveKind::kExplore) {
-    const std::string summary = buildLocalGraph();
-    corridor.request = core;
-    corridor.poses = best_path_;
-    corridor.status = best_path_.empty() ? mgg::PlanningStatus::kUnreachable
-                                         : mgg::PlanningStatus::kSucceeded;
-    corridor.reason = best_path_.empty() ? summary : "";
   } else {
-    mgg::GraphManager& graph =
-        core.objective == mgg::ObjectiveKind::kReturnHome ? *global_graph_
-                                                          : *local_graph_;
-    if (core.objective == mgg::ObjectiveKind::kNavigate) buildLocalGraph();
-    if (request->graph_revision == 0) core.graph_revision = graph_revision_;
-    if (request->map_revision == 0) core.map_revision = map_revision_;
-    mgg::TopologicalGoalPlanner planner(component_id_, graph_revision_,
-                                        map_revision_, 1.0);
-    corridor = planner.plan(graph, current_state_, core);
+    // A zero revision requests a fresh local snapshot. Explicit revisions bind
+    // the already-built snapshot and never rebuild underneath the request.
+    std::string summary;
+    if (local_objective && request->graph_revision == 0) {
+      summary = buildLocalGraph();
+    }
+    core.graph_revision = local_objective ? local_graph_revision_
+                                          : graph_revision_;
+    core.map_revision = map_revision_;
+    if (core.objective == mgg::ObjectiveKind::kExplore) {
+      corridor.request = core;
+      corridor.poses = best_path_;
+      corridor.status = best_path_.empty() ? mgg::PlanningStatus::kUnreachable
+                                           : mgg::PlanningStatus::kSucceeded;
+      corridor.reason = best_path_.empty() ? summary : "";
+    } else {
+      mgg::GraphManager& graph =
+          core.objective == mgg::ObjectiveKind::kReturnHome ? *global_graph_
+                                                            : *local_graph_;
+      mgg::TopologicalGoalPlanner planner(
+          component_id_, core.graph_revision, core.map_revision, 1.0);
+      corridor = planner.plan(graph, current_state_, core);
+    }
   }
 
   const mgg::FeasiblePath path = refineCorridor(corridor);

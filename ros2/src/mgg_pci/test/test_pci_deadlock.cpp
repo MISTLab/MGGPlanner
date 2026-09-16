@@ -14,6 +14,8 @@
 #include <rclcpp/rclcpp.hpp>
 #include <std_srvs/srv/trigger.hpp>
 
+#include "mgg_pci/pci_node.h"
+
 namespace {
 
 using namespace std::chrono_literals;
@@ -101,6 +103,23 @@ TEST(PciExecutor, SingleThreadedExecutorDeadlocksOnANestedServiceCall) {
 // PciNode and its main() use.
 TEST(PciExecutor, MultiThreadedExecutorWithAReentrantGroupSucceeds) {
   EXPECT_TRUE(runNestedCall<rclcpp::executors::MultiThreadedExecutor>(true));
+}
+
+TEST(PciWatchdog, ThreeConsecutiveStallsExhaustTheBudget) {
+  mgg_pci::StallBudget budget(3);
+  EXPECT_FALSE(budget.noteStall());
+  EXPECT_FALSE(budget.noteStall());
+  EXPECT_TRUE(budget.noteStall());
+  EXPECT_EQ(budget.count(), 3);
+}
+
+TEST(PciWatchdog, ProgressResetsConsecutiveStalls) {
+  mgg_pci::StallBudget budget(3);
+  EXPECT_FALSE(budget.noteStall());
+  EXPECT_FALSE(budget.noteStall());
+  budget.noteProgress();
+  EXPECT_EQ(budget.count(), 0);
+  EXPECT_FALSE(budget.noteStall());
 }
 
 }  // namespace

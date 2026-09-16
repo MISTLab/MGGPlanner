@@ -18,6 +18,7 @@
 #ifndef MGG_PCI_PCI_NODE_H_
 #define MGG_PCI_PCI_NODE_H_
 
+#include <algorithm>
 #include <memory>
 #include <string>
 
@@ -31,6 +32,18 @@
 
 namespace mgg_pci {
 
+class StallBudget {
+ public:
+  explicit StallBudget(int limit = 3) : limit_(std::max(1, limit)) {}
+  bool noteStall() { return ++count_ >= limit_; }
+  void noteProgress() { count_ = 0; }
+  int count() const { return count_; }
+
+ private:
+  int limit_;
+  int count_ = 0;
+};
+
 class PciNode : public rclcpp::Node {
  public:
   explicit PciNode(const rclcpp::NodeOptions& options);
@@ -38,6 +51,8 @@ class PciNode : public rclcpp::Node {
  private:
   void onTrigger(const std::shared_ptr<std_srvs::srv::Trigger::Request> request,
                  std::shared_ptr<std_srvs::srv::Trigger::Response> response);
+  void onReplan(const std::shared_ptr<std_srvs::srv::Trigger::Request> request,
+                std::shared_ptr<std_srvs::srv::Trigger::Response> response);
   void onStop(const std::shared_ptr<std_srvs::srv::Trigger::Request> request,
               std::shared_ptr<std_srvs::srv::Trigger::Response> response);
   void onOdometry(nav_msgs::msg::Odometry::ConstSharedPtr msg);
@@ -55,6 +70,7 @@ class PciNode : public rclcpp::Node {
 
   rclcpp::Client<mgg_msgs::srv::PlannerSrv>::SharedPtr planner_client_;
   rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr trigger_srv_;
+  rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr replan_srv_;
   rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr stop_srv_;
   rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr odom_sub_;
   rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr path_pub_;
@@ -64,7 +80,7 @@ class PciNode : public rclcpp::Node {
   std::mutex mutex_;
   rclcpp::Publisher<std_msgs::msg::String>::SharedPtr status_pub_;
   int plan_status_ = -1;
-  int stalled_plans_ = 0;
+  StallBudget stall_budget_;
   uint64_t generation_ = 0;
   bool running_ = false;
   bool have_odometry_ = false;

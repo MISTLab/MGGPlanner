@@ -60,6 +60,20 @@ TEST(PathSelection, PicksTheBranchWithMoreGain) {
   EXPECT_EQ(r.best_path.front()->id, 0);   // root first
 }
 
+TEST(PathSelection, PeerEndpointExclusionChoosesAnotherBranch) {
+  Fork f;
+  for (Vertex* v : f.x_branch) v->vol_gain.gain = 100.0;
+  for (Vertex* v : f.y_branch) v->vol_gain.gain = 10.0;
+  EdgeInclinations flat;
+
+  const std::vector<Eigen::Vector3d> exclusions{
+      Eigen::Vector3d(3.0, 0.0, 0.0)};
+  const auto r = mgg::selectBestPath(f.graph, makePlanning(), RobotParams(),
+                                     flat, 0.2, 0.0, exclusions, 0.5);
+  EXPECT_EQ(r.best_path_id, 6);
+  EXPECT_EQ(r.leaves_evaluated, 1);
+}
+
 TEST(PathSelection, LengthPenaltyDiscountsDistantGain) {
   Fork f;
   // Same total gain, but the +y branch concentrates it near the root.
