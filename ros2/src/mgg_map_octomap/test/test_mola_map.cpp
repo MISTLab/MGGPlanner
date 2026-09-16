@@ -426,6 +426,35 @@ TEST(MolaMap, OccupiedOnlyCylinderRejectsTiltedOrExcessiveQueries) {
             VoxelStatus::kUnknown);
 }
 
+TEST(MolaMap, SmallAuthorityTiltIsTolerated) {
+  // A peer SLAM correction between ground robots carries a few milliradians
+  // of pitch and roll. Footprint queries must keep working under it, or a
+  // merged fleet loses every lattice edge the moment its component frame
+  // stops being its own map frame.
+  Publication publication;
+  Eigen::Isometry3d component_from_navigation = Eigen::Isometry3d::Identity();
+  component_from_navigation.linear() =
+      Eigen::AngleAxisd(0.005, Eigen::Vector3d::UnitX()).toRotationMatrix();
+  const auto request = publication.publish(
+      0, {{2, 1, 0}}, freeBlock(), true, component_from_navigation);
+  MolaMap provider(config(publication));
+  provider.requestSnapshot(request);
+  ASSERT_TRUE(waitFor([&]() { return provider.getStatus(); }))
+      << provider.lastError();
+
+  const Eigen::Vector3d start(0.1, 0.1, 0.1);
+  const Eigen::Vector3d end(1.1, 0.1, 0.1);
+  EXPECT_EQ(provider.getOccupiedOnlyCylinderPathStatus(start, end, 0.30, 0.40),
+            VoxelStatus::kOccupied);
+  std::vector<mgg::XYCellCenter> centers;
+  EXPECT_TRUE(provider.getCircleIntersectingXYCellCenters(
+      Eigen::Vector2d(0.5, 0.3), 0.3, 64, centers));
+  EXPECT_FALSE(centers.empty());
+  EXPECT_GT(mgg::authorityTiltRad(component_from_navigation.linear()), 0.004);
+  EXPECT_LT(mgg::authorityTiltRad(component_from_navigation.linear()),
+            mgg::kMaxAuthorityTiltRad);
+}
+
 TEST(MolaMap, CorrectedSnapshotAtomicallyRetractsOldGeometry) {
   Publication publication;
   MolaMap provider(config(publication));

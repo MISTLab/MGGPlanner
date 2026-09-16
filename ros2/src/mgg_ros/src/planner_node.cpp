@@ -2326,7 +2326,8 @@ bool PlannerNode::queryIndexedMap(mgg::FeasiblePath& path,
         !context.center_offset.allFinite() ||
         context.center_offset.head<2>().norm() > 1e-9 ||
         !component_up.allFinite() ||
-        (component_up - Eigen::Vector3d::UnitZ()).norm() > 1e-6 ||
+        !mgg::authorityTiltAcceptable(
+            context.component_from_navigation.linear()) ||
         !std::isfinite(indexed_map_ground_tolerance_m_) ||
         !std::isfinite(context.max_step_height) ||
         context.max_step_height < 0.0 ||
