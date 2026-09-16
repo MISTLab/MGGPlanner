@@ -56,6 +56,10 @@ class PlannerNodeTestPeer {
     const std::lock_guard<std::recursive_mutex> lock(node.planner_mutex_);
     node.planning_params_.max_step_height = height;
   }
+  static void setMaxGroundHeight(PlannerNode& node, double height) {
+    const std::lock_guard<std::recursive_mutex> lock(node.planner_mutex_);
+    node.planning_params_.max_ground_height = height;
+  }
   static void observeShallowRamp(PlannerNode& node) {
     const std::lock_guard<std::recursive_mutex> lock(node.planner_mutex_);
     for (double x = -0.3; x <= 0.3 + 1e-9; x += 0.05) {
@@ -809,6 +813,34 @@ TEST(PlannerObjective, ProvisionalUnknownGroundRetainsGoalAndKnownVetoes) {
   Peer::setGridGeofence(*fenced, -0.5, 0.5, -0.5, 0.5);
   EXPECT_EQ(Peer::refine(*fenced, corridor()).status,
             mgg::PlanningStatus::kBlocked);
+}
+
+TEST(PlannerObjective, ProvisionalUnknownGroundReachesDistantExactGoals) {
+  using Peer = mgg_ros::PlannerNodeTestPeer;
+  rclcpp::NodeOptions options;
+  options.parameter_overrides(
+      {rclcpp::Parameter("use_sim_time", true),
+       rclcpp::Parameter("map.resolution", 0.15),
+       rclcpp::Parameter("objective_body_evidence_policy", "observed_ground"),
+       rclcpp::Parameter("objective_ground_evidence_policy", "provisional_unknown")});
+  auto node = std::make_shared<mgg_ros::PlannerNode>(options);
+  Peer::configureBackboneTest(*node);
+  Peer::setPlanningBody(*node, Eigen::Vector3d(1.023, 0.778, 0.40));
+  Peer::setMaxGroundHeight(*node, 0.475);
+  Peer::acceptOdometry(*node, 0.0, 0.0, 0.20);
+  Peer::observeGroundRectangle(*node, -0.6, 0.6, -0.5, 0.5);
+  Peer::finishMapRevision(*node);
+  for (const double distance : {25.0, 50.0, 100.0}) {
+    const auto response = Peer::requestObjective(
+        *node, mgg::ObjectiveKind::kNavigate,
+        mgg::StateVec(distance, 0.0, 0.20, 0.7));
+    ASSERT_EQ(response->status,
+              mgg_msgs::srv::PlanObjective::Response::SUCCEEDED)
+        << distance << "m: " << response->reason;
+    ASSERT_FALSE(response->path.empty());
+    EXPECT_NEAR(response->path.back().position.x, distance, 1e-9);
+    EXPECT_NEAR(response->path.back().orientation.z, std::sin(0.35), 1e-9);
+  }
 }
 
 TEST(PlannerObjective, RemainingRouteValidationUsesLatestKnownHazards) {
