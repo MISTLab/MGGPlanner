@@ -58,7 +58,7 @@ class PlannerNodeTestPeer {
     for (int repeat = 0; repeat < 10; ++repeat) {
       for (double x = -0.3; x <= 2.1; x += 0.10) {
         for (const double y : {-0.2, 0.0, 0.2}) {
-          node.map_->insertPointCloud({Eigen::Vector3d(x, y, 0.0)},
+          node.cloud_map_->insertPointCloud({Eigen::Vector3d(x, y, 0.0)},
                                       Eigen::Vector3d(x, y, 1.5));
         }
       }
@@ -70,7 +70,7 @@ class PlannerNodeTestPeer {
   static void observeBodyCorridor(PlannerNode& node) {
     const std::lock_guard<std::recursive_mutex> lock(node.planner_mutex_);
     // Model a fully observed free body volume after the ground-only phase.
-    node.map_->augmentFreeBox(Eigen::Vector3d(0.75, 0.0, 0.35),
+    node.cloud_map_->augmentFreeBox(Eigen::Vector3d(0.75, 0.0, 0.35),
                               Eigen::Vector3d(2.5, 0.8, 0.20));
     ++node.map_revision_;
     node.updateGlobalGraph();
@@ -81,13 +81,13 @@ class PlannerNodeTestPeer {
     for (int repeat = 0; repeat < 10; ++repeat) {
       for (const double dx : {-0.2, 0.0, 0.2}) {
         for (const double dy : {-0.2, 0.0, 0.2}) {
-          node.map_->insertPointCloud(
+          node.cloud_map_->insertPointCloud(
               {Eigen::Vector3d(x + dx, dy, 0.0)},
               Eigen::Vector3d(x + dx, dy, 1.5));
         }
       }
     }
-    node.map_->augmentFreeBox(Eigen::Vector3d(x, 0.0, 0.35),
+    node.cloud_map_->augmentFreeBox(Eigen::Vector3d(x, 0.0, 0.35),
                               Eigen::Vector3d(0.25, 0.25, 0.20));
     ++node.map_revision_;
   }
@@ -98,7 +98,7 @@ class PlannerNodeTestPeer {
     for (int repeat = 0; repeat < 6; ++repeat) {
       for (double x = xmin; x <= xmax + 1e-9; x += 0.10) {
         for (double y = ymin; y <= ymax + 1e-9; y += 0.10) {
-          node.map_->insertPointCloud({Eigen::Vector3d(x, y, 0.0)},
+          node.cloud_map_->insertPointCloud({Eigen::Vector3d(x, y, 0.0)},
                                       Eigen::Vector3d(x, y, 1.5));
         }
       }
@@ -109,14 +109,14 @@ class PlannerNodeTestPeer {
                                  const Eigen::Vector3d& center,
                                  const Eigen::Vector3d& size) {
     const std::lock_guard<std::recursive_mutex> lock(node.planner_mutex_);
-    node.map_->augmentFreeBox(center, size);
+    node.cloud_map_->augmentFreeBox(center, size);
   }
 
   static void addOccupiedVoxel(PlannerNode& node, double x, double y,
                                double z) {
     const std::lock_guard<std::recursive_mutex> lock(node.planner_mutex_);
     for (int repeat = 0; repeat < 20; ++repeat) {
-      node.map_->tree()->updateNode(
+      node.cloud_map_->tree()->updateNode(
           octomap::point3d(static_cast<float>(x), static_cast<float>(y),
                            static_cast<float>(z)),
           true);
@@ -161,17 +161,17 @@ class PlannerNodeTestPeer {
 
     // Cover every footprint box and offset ground probe used by the strict
     // global-edge check. Keep the lower face above the occupied floor.
-    node.map_->augmentFreeBox(Eigen::Vector3d(0.60, 0.0, 0.40),
+    node.cloud_map_->augmentFreeBox(Eigen::Vector3d(0.60, 0.0, 0.40),
                               Eigen::Vector3d(2.4, 1.2, 0.60));
     for (int repeat = 0; repeat < 10; ++repeat) {
       for (double x = support_root ? -0.3 : 0.30; x <= 1.3; x += 0.10) {
         for (const double y : {-0.2, 0.0, 0.2}) {
-          node.map_->insertPointCloud({Eigen::Vector3d(x, y, 0.0)},
+          node.cloud_map_->insertPointCloud({Eigen::Vector3d(x, y, 0.0)},
                                       Eigen::Vector3d(x, y, 1.5));
         }
       }
     }
-    node.map_->augmentFreeBox(Eigen::Vector3d(0.60, 0.0, 0.40),
+    node.cloud_map_->augmentFreeBox(Eigen::Vector3d(0.60, 0.0, 0.40),
                               Eigen::Vector3d(2.4, 1.2, 0.60));
     ++node.map_revision_;
   }
@@ -179,7 +179,7 @@ class PlannerNodeTestPeer {
   static void addCorridorObstacle(PlannerNode& node, double x) {
     const std::lock_guard<std::recursive_mutex> lock(node.planner_mutex_);
     for (int repeat = 0; repeat < 20; ++repeat) {
-      node.map_->insertPointCloud({Eigen::Vector3d(x, 0.0, 0.30)},
+      node.cloud_map_->insertPointCloud({Eigen::Vector3d(x, 0.0, 0.30)},
                                   Eigen::Vector3d(x, 0.0, 1.5));
     }
     ++node.map_revision_;
@@ -202,10 +202,10 @@ class PlannerNodeTestPeer {
       }
     }
     for (int repeat = 0; repeat < 6; ++repeat) {
-      node.map_->insertPointCloud(floor, Eigen::Vector3d(0.6, 0.0, 1.5));
+      node.cloud_map_->insertPointCloud(floor, Eigen::Vector3d(0.6, 0.0, 1.5));
     }
     // The known body volume is separate from the occupied supporting floor.
-    node.map_->augmentFreeBox({0.6, 0.0, 0.5}, {3.2, 3.0, 0.8});
+    node.cloud_map_->augmentFreeBox({0.6, 0.0, 0.5}, {3.2, 3.0, 0.8});
     ++node.map_revision_;
   }
 
@@ -215,7 +215,7 @@ class PlannerNodeTestPeer {
     for (int repeat = 0; repeat < 20; ++repeat) {
       const int bound = wall ? 26 : 0;
       for (int y = -bound; y <= bound; ++y) {
-        node.map_->tree()->updateNode(
+        node.cloud_map_->tree()->updateNode(
             octomap::point3d(static_cast<float>(x),
                              static_cast<float>(y * 0.05),
                              static_cast<float>(z)),
@@ -229,15 +229,15 @@ class PlannerNodeTestPeer {
                                    double z) {
     const std::lock_guard<std::recursive_mutex> lock(node.planner_mutex_);
     octomap::OcTreeKey key;
-    if (!node.map_->tree()->coordToKeyChecked(
+    if (!node.cloud_map_->tree()->coordToKeyChecked(
             octomap::point3d(static_cast<float>(x), static_cast<float>(y),
                              static_cast<float>(z)),
             key)) {
       return false;
     }
-    if (!node.map_->tree()->updateNode(key, true)) return false;
-    node.map_->tree()->deleteNode(key, node.map_->tree()->getTreeDepth());
-    const bool removed = node.map_->tree()->search(key) == nullptr;
+    if (!node.cloud_map_->tree()->updateNode(key, true)) return false;
+    node.cloud_map_->tree()->deleteNode(key, node.cloud_map_->tree()->getTreeDepth());
+    const bool removed = node.cloud_map_->tree()->search(key) == nullptr;
     if (removed) ++node.map_revision_;
     return removed;
   }
@@ -257,7 +257,7 @@ class PlannerNodeTestPeer {
     for (int repeat = 0; repeat < 20; ++repeat) {
       for (int x = 15; x <= 36; ++x) {
         for (int y = -12; y <= 12; ++y) {
-          node.map_->tree()->updateNode(
+          node.cloud_map_->tree()->updateNode(
               octomap::point3d(static_cast<float>(x * 0.05 + 0.025),
                                static_cast<float>(y * 0.05 + 0.025),
                                static_cast<float>(step_height + 0.025)),
@@ -308,7 +308,7 @@ class PlannerNodeTestPeer {
     for (int repeat = 0; repeat < 20; ++repeat) {
       for (double x = 1.0; x <= 1.5; x += 0.05) {
         for (const double y : {-0.20, 0.0, 0.20}) {
-          node.map_->tree()->updateNode(
+          node.cloud_map_->tree()->updateNode(
               octomap::point3d(static_cast<float>(x), static_cast<float>(y),
                                static_cast<float>(supported_ground_z + 0.025)),
               true);
@@ -343,7 +343,7 @@ class PlannerNodeTestPeer {
     for (int repeat = 0; repeat < 20; ++repeat) {
       for (double dx = -0.15; dx <= 0.15; dx += 0.05) {
         for (double y = -0.20; y <= 0.20; y += 0.05) {
-          node.map_->tree()->updateNode(
+          node.cloud_map_->tree()->updateNode(
               octomap::point3d(static_cast<float>(x + dx),
                                static_cast<float>(y),
                                static_cast<float>(ground_z + 0.025)),
@@ -597,6 +597,16 @@ namespace {
 using namespace std::chrono_literals;
 using Service = mgg_msgs::srv::PlanObjective;
 using LegacyService = mgg_msgs::srv::PlannerSrv;
+
+TEST(PlannerConfiguration, MolaBackendRequiresExactRouteValidator) {
+  rclcpp::NodeOptions options;
+  options.parameter_overrides(
+      {rclcpp::Parameter("map.backend", "mola_snapshot"),
+       rclcpp::Parameter("map.mola.peer_root", "/tmp")});
+  EXPECT_THROW(
+      { auto planner = std::make_shared<mgg_ros::PlannerNode>(options); },
+      std::invalid_argument);
+}
 
 TEST(PlannerBackbone, CapturesHomeBeforeMotionAndConnectsOnlyMappedTerrain) {
   rclcpp::NodeOptions options;

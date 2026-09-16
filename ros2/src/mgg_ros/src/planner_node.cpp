@@ -6,6 +6,7 @@
 #include <cstdio>
 #include <future>
 #include <regex>
+#include <stdexcept>
 #include <geometry_msgs/msg/transform_stamped.hpp>
 #include <sensor_msgs/msg/point_cloud2.hpp>
 #include <sensor_msgs/point_cloud2_iterator.hpp>
@@ -38,10 +39,53 @@ PlannerNode::PlannerNode(const rclcpp::NodeOptions& options)
 
   loadParameters();
 
-  mgg::OctomapConfig map_cfg;
-  map_cfg.resolution = declareOrGet<double>(this, "map.resolution", 0.2);
-  map_cfg.max_range = declareOrGet<double>(this, "map.max_range", 20.0);
-  map_ = std::make_unique<mgg::OctomapMap>(map_cfg);
+  const double map_resolution = declareOrGet<double>(this, "map.resolution", 0.2);
+  map_backend_ = declareOrGet<std::string>(this, "map.backend", map_backend_);
+  indexed_map_query_service_ = declareOrGet<std::string>(
+      this, "indexed_map_query_service", indexed_map_query_service_);
+  if (map_backend_ == "mola_snapshot" && indexed_map_query_service_.empty()) {
+    throw std::invalid_argument(
+        "map.backend=mola_snapshot requires indexed_map_query_service for "
+        "exact route validation");
+  }
+  if (map_backend_ == "cloud_octomap") {
+    mgg::OctomapConfig map_cfg;
+    map_cfg.resolution = map_resolution;
+    map_cfg.max_range = declareOrGet<double>(this, "map.max_range", 20.0);
+    auto backend = std::make_unique<mgg::OctomapMap>(map_cfg);
+    cloud_map_ = backend.get();
+    map_ = std::move(backend);
+  } else if (map_backend_ == "mola_snapshot") {
+    mgg::MolaMapConfig map_cfg;
+    map_cfg.resolution = map_resolution;
+    map_cfg.peer_root = declareOrGet<std::string>(this, "map.mola.peer_root", "");
+    map_cfg.snapshot_ttl_sec = std::clamp(
+        declareOrGet<double>(this, "map.mola.snapshot_ttl_sec", 3.0), 0.1, 60.0);
+    map_cfg.max_snapshot_bytes = static_cast<std::size_t>(std::clamp(
+        declareOrGet<std::int64_t>(this, "map.mola.max_snapshot_bytes", 4194304),
+        std::int64_t{1024}, std::int64_t{4 * 1024 * 1024}));
+    map_cfg.max_index_bytes = static_cast<std::size_t>(std::clamp(
+        declareOrGet<std::int64_t>(this, "map.mola.max_index_bytes", 4194304),
+        std::int64_t{1024}, std::int64_t{4 * 1024 * 1024}));
+    map_cfg.max_grid_bytes = static_cast<std::size_t>(std::clamp(
+        declareOrGet<std::int64_t>(this, "map.mola.max_grid_bytes", 268435456),
+        std::int64_t{1024}, std::int64_t{256 * 1024 * 1024}));
+    map_cfg.max_voxels = static_cast<std::size_t>(std::clamp(
+        declareOrGet<std::int64_t>(this, "map.mola.max_voxels", 2000000),
+        std::int64_t{1}, std::int64_t{2000000}));
+    map_cfg.max_load_time = std::chrono::milliseconds(std::clamp(
+        declareOrGet<std::int64_t>(this, "map.mola.max_load_ms", 2000),
+        std::int64_t{1}, std::int64_t{10000}));
+    auto backend = std::make_unique<mgg::MolaMap>(map_cfg);
+    mola_map_ = backend.get();
+    map_ = std::move(backend);
+    RCLCPP_INFO(get_logger(),
+                "map backend '%s': source '%s', resolution %.3f m, TTL %.1f s",
+                map_backend_.c_str(), map_cfg.peer_root.c_str(), map_cfg.resolution,
+                map_cfg.snapshot_ttl_sec);
+  } else {
+    throw std::invalid_argument("map.backend must be cloud_octomap or mola_snapshot");
+  }
   ground_ = std::make_unique<mgg::GroundProjection>(*map_, planning_params_);
   const double grid_resolution_floor = map_->getResolution();
   grid_refinement_limits_.resolution_m = std::clamp(
@@ -99,10 +143,12 @@ PlannerNode::PlannerNode(const rclcpp::NodeOptions& options)
     }
   }
 
-  cloud_tf_timeout_sec_ =
-      declareOrGet<double>(this, "cloud_tf_timeout_sec", cloud_tf_timeout_sec_);
-  tf_buffer_ = std::make_unique<tf2_ros::Buffer>(get_clock());
-  tf_listener_ = std::make_shared<tf2_ros::TransformListener>(*tf_buffer_);
+  if (cloud_map_ != nullptr) {
+    cloud_tf_timeout_sec_ =
+        declareOrGet<double>(this, "cloud_tf_timeout_sec", cloud_tf_timeout_sec_);
+    tf_buffer_ = std::make_unique<tf2_ros::Buffer>(get_clock());
+    tf_listener_ = std::make_shared<tf2_ros::TransformListener>(*tf_buffer_);
+  }
 
   callback_group_ =
       create_callback_group(rclcpp::CallbackGroupType::Reentrant);
@@ -116,14 +162,16 @@ PlannerNode::PlannerNode(const rclcpp::NodeOptions& options)
       [this](nav_msgs::msg::Odometry::ConstSharedPtr m) { onOdometry(m); },
       sub_opts);
 
-  rclcpp::QoS cloud_qos(rclcpp::KeepLast(10));
-  cloud_qos.best_effort();
-  cloud_sub_ = create_subscription<sensor_msgs::msg::PointCloud2>(
-      "pointcloud", cloud_qos,
-      [this](sensor_msgs::msg::PointCloud2::ConstSharedPtr m) {
-        onPointCloud(m);
-      },
-      sub_opts);
+  if (cloud_map_ != nullptr) {
+    rclcpp::QoS cloud_qos(rclcpp::KeepLast(10));
+    cloud_qos.best_effort();
+    cloud_sub_ = create_subscription<sensor_msgs::msg::PointCloud2>(
+        "pointcloud", cloud_qos,
+        [this](sensor_msgs::msg::PointCloud2::ConstSharedPtr m) {
+          onPointCloud(m);
+        },
+        sub_opts);
+  }
 
   neighbour_sub_ = create_subscription<mgg_msgs::msg::Graph>(
       "neighbour_graph_in", rclcpp::QoS(10),
@@ -144,8 +192,6 @@ PlannerNode::PlannerNode(const rclcpp::NodeOptions& options)
           },
           sub_opts);
 
-  indexed_map_query_service_ = declareOrGet<std::string>(
-      this, "indexed_map_query_service", indexed_map_query_service_);
   indexed_map_query_timeout_s_ = std::max(
       0.01, declareOrGet<double>(this, "indexed_map_query_timeout_s",
                                  indexed_map_query_timeout_s_));
@@ -326,6 +372,14 @@ mgg::ExpandContext PlannerNode::makeContext() {
   return ctx;
 }
 
+void PlannerNode::refreshMolaRevision() {
+  if (mola_map_ == nullptr) return;
+  const std::uint64_t generation = mola_map_->activeGeneration();
+  if (generation == observed_mola_generation_) return;
+  observed_mola_generation_ = generation;
+  ++map_revision_;
+}
+
 void PlannerNode::stageGlobalBreadcrumbs(const mgg::StateVec& state) {
   if (!have_global_sampling_anchor_) {
     global_sampling_anchor_ = state;
@@ -457,12 +511,13 @@ void PlannerNode::onOdometry(nav_msgs::msg::Odometry::ConstSharedPtr msg) {
     have_initial_state_ = true;
   }
   stageGlobalBreadcrumbs(state);
+  refreshMolaRevision();
   updateGlobalGraph();
 }
 
 void PlannerNode::onPointCloud(
     sensor_msgs::msg::PointCloud2::ConstSharedPtr msg) {
-  if (msg->data.empty()) return;
+  if (cloud_map_ == nullptr || msg->data.empty()) return;
 
   // Transform into world coordinates before projecting into the octree.
   // The sensor publishes in its own frame (e.g. "r0/lidar") and the map lives
@@ -503,7 +558,7 @@ void PlannerNode::onPointCloud(
   }
   if (!points.empty()) {
     const std::lock_guard<std::recursive_mutex> lock(planner_mutex_);
-    map_->insertPointCloud(points, origin);
+    cloud_map_->insertPointCloud(points, origin);
     ++map_revision_;
     // A new map revision may admit the first blocked chronological breadcrumb.
     if (have_odometry_ &&
@@ -564,6 +619,20 @@ void PlannerNode::onMappingSnapshot(
   mapping_snapshot_ = *msg;
   mapping_snapshot_received_ = std::chrono::steady_clock::now();
   have_mapping_snapshot_ = true;
+  if (mola_map_ != nullptr) {
+    refreshMolaRevision();
+    const std::string prior_error = mola_map_->lastError();
+    if (!prior_error.empty()) {
+      RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 5000,
+                           "MOLA map unavailable: %s", prior_error.c_str());
+    }
+    const std::uint64_t source_stamp_ns =
+        static_cast<std::uint64_t>(msg->source_stamp.sec) * 1000000000ull +
+        msg->source_stamp.nanosec;
+    mola_map_->requestSnapshot({msg->component_id, msg->epoch,
+                                msg->graph_revision, msg->geometry_revision,
+                                source_stamp_ns, component_from_navigation_});
+  }
 }
 
 void PlannerNode::onNeighbourGraph(mgg_msgs::msg::Graph::ConstSharedPtr msg) {
@@ -573,6 +642,9 @@ void PlannerNode::onNeighbourGraph(mgg_msgs::msg::Graph::ConstSharedPtr msg) {
 
   // Merging reads the map to decide reachability and writes the global graph.
   const std::lock_guard<std::recursive_mutex> lock(planner_mutex_);
+  auto map_read = mola_map_ != nullptr ? mola_map_->acquireReadLease()
+                                       : mgg::MolaMap::ReadLease{};
+  refreshMolaRevision();
 
   // Communication range filter: robots must be within direct radio range.
   Eigen::Isometry3d t_ours_theirs = Eigen::Isometry3d::Identity();
@@ -645,8 +717,18 @@ std::string PlannerNode::buildLocalGraph() {
   // ray-casting through it. Point clouds arriving meanwhile queue up, and the
   // subscription's best-effort depth decides how many survive.
   const std::lock_guard<std::recursive_mutex> lock(planner_mutex_);
+  auto map_read = mola_map_ != nullptr ? mola_map_->acquireReadLease()
+                                       : mgg::MolaMap::ReadLease{};
+  refreshMolaRevision();
   if (!have_odometry_) return "no odometry received yet";
-  if (!map_->getStatus()) return "map is empty; no point cloud received yet";
+  if (!map_->getStatus()) {
+    if (mola_map_ != nullptr) {
+      const std::string detail = mola_map_->lastError();
+      return detail.empty() ? "MOLA map snapshot is missing or stale"
+                            : "MOLA map unavailable: " + detail;
+    }
+    return "map is empty; no point cloud received yet";
+  }
 
   // Per-phase timing. A cycle that never returns says nothing about which of
   // the three phases is responsible, and they scale with completely different
@@ -947,6 +1029,9 @@ bool PlannerNode::validateObjectiveStartSupport(
 }
 
 void PlannerNode::updateGlobalGraph() {
+  auto map_read = mola_map_ != nullptr ? mola_map_->acquireReadLease()
+                                       : mgg::MolaMap::ReadLease{};
+  refreshMolaRevision();
   if (!have_odometry_ || !have_initial_state_) return;
 
   if (global_graph_->getNumVertices() == 0) {
@@ -1206,6 +1291,8 @@ void PlannerNode::onBuildRequest(
     const std::shared_ptr<std_srvs::srv::Trigger::Request>,
     std::shared_ptr<std_srvs::srv::Trigger::Response> response) {
   const std::lock_guard<std::recursive_mutex> lock(planner_mutex_);
+  auto map_read = mola_map_ != nullptr ? mola_map_->acquireReadLease()
+                                       : mgg::MolaMap::ReadLease{};
   response->message = buildLocalGraph();
   response->success = local_graph_->getNumVertices() > 1;
   RCLCPP_INFO(get_logger(), "%s", response->message.c_str());
@@ -1215,6 +1302,11 @@ void PlannerNode::onPlanRequest(
     const std::shared_ptr<mgg_msgs::srv::PlannerSrv::Request> request,
     std::shared_ptr<mgg_msgs::srv::PlannerSrv::Response> response) {
   std::unique_lock<std::recursive_mutex> lock(planner_mutex_);
+  auto map_read = mola_map_ != nullptr ? mola_map_->acquireReadLease()
+                                       : mgg::MolaMap::ReadLease{};
+  refreshMolaRevision();
+  const std::uint64_t mola_generation_at_start =
+      mola_map_ != nullptr ? mola_map_->activeGeneration() : 0;
   // A caller may pin the bound mode for this cycle, e.g. to squeeze through a
   // gap it would normally refuse.
   const mgg::BoundModeType previous = robot_params_.bound_mode;
@@ -1250,11 +1342,26 @@ void PlannerNode::onPlanRequest(
                                        : mgg::PlanningStatus::kSucceeded;
   mgg::FeasiblePath feasible = refineCorridor(corridor);
   const IndexedQueryContext query_context = indexedQueryContext();
+  map_read = mgg::MolaMap::ReadLease{};
   lock.unlock();
   if (feasible.status == mgg::PlanningStatus::kSucceeded) {
     queryIndexedMap(feasible, query_context);
   }
   lock.lock();
+  map_read = mola_map_ != nullptr ? mola_map_->acquireReadLease()
+                                  : mgg::MolaMap::ReadLease{};
+  const bool mola_ready = mola_map_ == nullptr || mola_map_->getStatus();
+  refreshMolaRevision();
+  if (mola_map_ != nullptr &&
+      feasible.status == mgg::PlanningStatus::kSucceeded &&
+      (!mola_ready ||
+       mola_map_->activeGeneration() != mola_generation_at_start)) {
+    feasible.status = mgg::PlanningStatus::kStaleRevision;
+    feasible.reason = "MOLA map snapshot changed during planning";
+    feasible.poses.clear();
+    feasible.partial = false;
+    feasible.indexed_map_validated = false;
+  }
   const bool indexed_snapshot_missing =
       indexed_map_client_ &&
       (!have_mapping_snapshot_ ||
@@ -1763,8 +1870,13 @@ void PlannerNode::convertPathToNavigationBase(mgg::FeasiblePath& path) const {
 
 void PlannerNode::onObjectiveRequest(
     const std::shared_ptr<mgg_msgs::srv::PlanObjective::Request> request,
-    std::shared_ptr<mgg_msgs::srv::PlanObjective::Response> response) {
+  std::shared_ptr<mgg_msgs::srv::PlanObjective::Response> response) {
   std::unique_lock<std::recursive_mutex> lock(planner_mutex_);
+  auto map_read = mola_map_ != nullptr ? mola_map_->acquireReadLease()
+                                       : mgg::MolaMap::ReadLease{};
+  refreshMolaRevision();
+  const std::uint64_t mola_generation_at_start =
+      mola_map_ != nullptr ? mola_map_->activeGeneration() : 0;
   mgg::PlanningRequest core;
   core.mission_id = request->mission_id;
   core.objective = static_cast<mgg::ObjectiveKind>(request->objective);
@@ -1941,9 +2053,25 @@ void PlannerNode::onObjectiveRequest(
 
   mgg::FeasiblePath path = refineCorridor(corridor);
   const IndexedQueryContext query_context = indexedQueryContext();
+  map_read = mgg::MolaMap::ReadLease{};
   lock.unlock();
   if (path.status == mgg::PlanningStatus::kSucceeded) {
     queryIndexedMap(path, query_context);
+  }
+  if (mola_map_ != nullptr) {
+    lock.lock();
+    map_read = mola_map_->acquireReadLease();
+    const bool mola_ready = mola_map_->getStatus();
+    refreshMolaRevision();
+    if (path.status == mgg::PlanningStatus::kSucceeded &&
+        (!mola_ready ||
+         mola_map_->activeGeneration() != mola_generation_at_start)) {
+      path.status = mgg::PlanningStatus::kStaleRevision;
+      path.reason = "MOLA map snapshot changed during planning";
+      path.poses.clear();
+      path.partial = false;
+      path.indexed_map_validated = false;
+    }
   }
   response->status = static_cast<std::uint8_t>(path.status);
   response->component_id = path.component_id;

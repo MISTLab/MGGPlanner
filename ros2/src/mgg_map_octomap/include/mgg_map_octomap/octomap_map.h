@@ -85,10 +85,10 @@ class OctomapMap : public MapInterface {
   /// Explicit objectives require every touched voxel to be observed free.
   /// Legacy MapInterface queries retain their configured historical tolerance.
   VoxelStatus getStrictBoxStatus(const Eigen::Vector3d& center,
-                                  const Eigen::Vector3d& size) const;
+                                  const Eigen::Vector3d& size) const override;
   VoxelStatus getStrictPathStatus(const Eigen::Vector3d& start,
                                    const Eigen::Vector3d& end,
-                                   const Eigen::Vector3d& box_size) const;
+                                   const Eigen::Vector3d& box_size) const override;
 
   void getScanStatus(
       const Eigen::Vector3d& pos,

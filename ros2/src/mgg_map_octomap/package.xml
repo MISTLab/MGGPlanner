@@ -21,6 +21,8 @@
   <depend>mgg_core</depend>
   <depend>octomap</depend>
   <depend>eigen</depend>
+  <depend>nlohmann_json</depend>
+  <depend>openssl</depend>
 
   <!-- ROS dependencies of the ingest node only; the OctomapMap class itself
        links none of these. -->

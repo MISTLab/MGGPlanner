@@ -75,6 +75,15 @@ class MapInterface {
                                     const Eigen::Vector3d& box_size,
                                     bool stop_at_unknown_voxel) const = 0;
 
+  virtual VoxelStatus getStrictBoxStatus(const Eigen::Vector3d& center,
+                                         const Eigen::Vector3d& size) const {
+    return getBoxStatus(center, size, true);
+  }
+  virtual VoxelStatus getStrictPathStatus(
+      const Eigen::Vector3d& start, const Eigen::Vector3d& end,
+      const Eigen::Vector3d& box_size) const {
+    return getPathStatus(start, end, box_size, true);
+  }
   // ------------------------------------------------------- volumetric gain
 
   /// Casts a ray to every endpoint and tallies what each one passes through.

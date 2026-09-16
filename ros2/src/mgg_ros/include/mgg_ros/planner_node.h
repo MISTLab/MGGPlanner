@@ -51,6 +51,7 @@
 #include "mgg_core/ground_projection.h"
 #include "mgg_core/params.h"
 #include "mgg_core/sensor_params.h"
+#include "mgg_map_octomap/mola_map.h"
 #include "mgg_map_octomap/octomap_map.h"
 
 namespace mgg_ros {
@@ -123,12 +124,17 @@ class PlannerNode : public rclcpp::Node {
   bool validateObjectiveStartSupport(
       const mgg::StateVec& anchor, const mgg::StateVec& supported,
       std::vector<mgg::StateVec>& checked) const;
+  void refreshMolaRevision();
 
   mgg::ExpandContext makeContext();
   mgg::GainContext makeGainContext();
 
   // Core state. None of these know about ROS.
-  std::unique_ptr<mgg::OctomapMap> map_;
+  std::unique_ptr<mgg::MapInterface> map_;
+  mgg::OctomapMap* cloud_map_ = nullptr;
+  mgg::MolaMap* mola_map_ = nullptr;
+  std::string map_backend_ = "cloud_octomap";
+  std::uint64_t observed_mola_generation_ = 0;
   std::unique_ptr<mgg::GroundProjection> ground_;
   std::unique_ptr<mgg::GeofenceManager> geofence_;
   std::shared_ptr<mgg::GraphManager> local_graph_;
