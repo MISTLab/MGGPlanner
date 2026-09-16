@@ -33,6 +33,12 @@ class PlannerNodeTestPeer {
     node.global_vertex_spacing_ = 0.50;
   }
 
+  static void configureAerialBackboneTest(PlannerNode& node) {
+    configureBackboneTest(node);
+    const std::lock_guard<std::recursive_mutex> lock(node.planner_mutex_);
+    node.robot_params_.type = mgg::RobotType::kAerialRobot;
+  }
+
   static void acceptOdometry(PlannerNode& node, double x, double y, double z) {
     auto msg = std::make_shared<nav_msgs::msg::Odometry>();
     msg->pose.pose.position.x = x;
@@ -82,6 +88,43 @@ class PlannerNodeTestPeer {
     node.map_->augmentFreeBox(Eigen::Vector3d(x, 0.0, 0.35),
                               Eigen::Vector3d(0.25, 0.25, 0.20));
     ++node.map_revision_;
+  }
+
+  static void observeGroundRectangle(PlannerNode& node, double xmin,
+                                     double xmax, double ymin, double ymax) {
+    const std::lock_guard<std::recursive_mutex> lock(node.planner_mutex_);
+    for (int repeat = 0; repeat < 6; ++repeat) {
+      for (double x = xmin; x <= xmax + 1e-9; x += 0.10) {
+        for (double y = ymin; y <= ymax + 1e-9; y += 0.10) {
+          node.map_->insertPointCloud({Eigen::Vector3d(x, y, 0.0)},
+                                      Eigen::Vector3d(x, y, 1.5));
+        }
+      }
+    }
+  }
+
+  static void observeFreeBodyBox(PlannerNode& node,
+                                 const Eigen::Vector3d& center,
+                                 const Eigen::Vector3d& size) {
+    const std::lock_guard<std::recursive_mutex> lock(node.planner_mutex_);
+    node.map_->augmentFreeBox(center, size);
+  }
+
+  static void addOccupiedVoxel(PlannerNode& node, double x, double y,
+                               double z) {
+    const std::lock_guard<std::recursive_mutex> lock(node.planner_mutex_);
+    for (int repeat = 0; repeat < 20; ++repeat) {
+      node.map_->tree()->updateNode(
+          octomap::point3d(static_cast<float>(x), static_cast<float>(y),
+                           static_cast<float>(z)),
+          true);
+    }
+  }
+
+  static void finishMapRevision(PlannerNode& node) {
+    const std::lock_guard<std::recursive_mutex> lock(node.planner_mutex_);
+    ++node.map_revision_;
+    node.updateGlobalGraph();
   }
 
   static void configureExploreServiceScene(PlannerNode& node,
@@ -164,13 +207,15 @@ class PlannerNodeTestPeer {
     ++node.map_revision_;
   }
 
-  static void addGridObstacle(PlannerNode& node, double z, bool wall) {
+  static void addGridObstacle(PlannerNode& node, double z, bool wall,
+                              double x = 0.9) {
     const std::lock_guard<std::recursive_mutex> lock(node.planner_mutex_);
     for (int repeat = 0; repeat < 20; ++repeat) {
       const int bound = wall ? 26 : 0;
       for (int y = -bound; y <= bound; ++y) {
         node.map_->tree()->updateNode(
-            octomap::point3d(0.9F, static_cast<float>(y * 0.05),
+            octomap::point3d(static_cast<float>(x),
+                             static_cast<float>(y * 0.05),
                              static_cast<float>(z)),
             true);
       }
@@ -233,6 +278,73 @@ class PlannerNodeTestPeer {
 
   static int globalEdges(const PlannerNode& node) {
     return node.global_graph_->getNumEdges();
+  }
+
+  static std::size_t pendingBreadcrumbs(const PlannerNode& node) {
+    return node.pending_global_breadcrumbs_.size();
+  }
+
+  static double pendingBreadcrumbLength(const PlannerNode& node) {
+    return node.pending_global_length_m_;
+  }
+
+  static bool backboneHistoryLost(const PlannerNode& node) {
+    return node.global_backbone_history_lost_;
+  }
+
+  static std::string backboneHistoryLostReason(const PlannerNode& node) {
+    return node.global_backbone_history_lost_reason_;
+  }
+
+  static void setBackboneLimits(PlannerNode& node, std::size_t samples,
+                                double length, std::size_t drain) {
+    const std::lock_guard<std::recursive_mutex> lock(node.planner_mutex_);
+    node.pending_global_max_samples_ = samples;
+    node.pending_global_max_length_m_ = length;
+    node.pending_global_drain_max_samples_ = drain;
+  }
+
+  static void setBackboneSpacing(PlannerNode& node, double spacing) {
+    const std::lock_guard<std::recursive_mutex> lock(node.planner_mutex_);
+    node.global_vertex_spacing_ = spacing;
+  }
+
+  static bool hasGlobalVertexNear(const PlannerNode& node, double x, double y,
+                                  double tolerance) {
+    for (const auto& entry : node.global_graph_->vertices_map_) {
+      if (entry.second == nullptr) continue;
+      if (std::hypot(entry.second->state.x() - x,
+                     entry.second->state.y() - y) <= tolerance) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  static bool allGlobalEdgesAtMost(const PlannerNode& node, double limit) {
+    for (const auto& entry : node.global_graph_->edge_map_) {
+      for (const auto& edge : entry.second) {
+        if (edge.second > limit) return false;
+      }
+    }
+    return true;
+  }
+
+  static std::shared_ptr<mgg_msgs::srv::PlanObjective::Response>
+  requestObjective(PlannerNode& node, mgg::ObjectiveKind objective,
+                   const mgg::StateVec& goal) {
+    auto request = std::make_shared<mgg_msgs::srv::PlanObjective::Request>();
+    request->objective = static_cast<std::uint8_t>(objective);
+    request->component_id = node.component_id_;
+    request->goal.position.x = goal.x();
+    request->goal.position.y = goal.y();
+    request->goal.position.z = goal.z();
+    request->goal.orientation.z = std::sin(goal[3] / 2.0);
+    request->goal.orientation.w = std::cos(goal[3] / 2.0);
+    auto response =
+        std::make_shared<mgg_msgs::srv::PlanObjective::Response>();
+    node.onObjectiveRequest(request, response);
+    return response;
   }
 
   static mgg::StateVec globalVertexState(const PlannerNode& node, int id) {
@@ -340,8 +452,9 @@ TEST(PlannerBackbone, CapturesHomeBeforeMotionAndConnectsOnlyMappedTerrain) {
   EXPECT_EQ(mgg_ros::PlannerNodeTestPeer::globalVertices(*planner), 1);
   EXPECT_EQ(mgg_ros::PlannerNodeTestPeer::globalEdges(*planner), 0);
 
-  // Once the body corridor is observed free, the reached pose connects to the
-  // refined original anchor.
+  // Once the body corridor is observed free, both retained chronological
+  // breadcrumbs connect instead of replacing the travelled segment by one
+  // long edge.
   mgg_ros::PlannerNodeTestPeer::observeBodyCorridor(*planner);
   mgg::StateVec observed_here = mgg::StateVec::Zero();
   observed_here.x() = 1.20;
@@ -349,8 +462,8 @@ TEST(PlannerBackbone, CapturesHomeBeforeMotionAndConnectsOnlyMappedTerrain) {
   EXPECT_EQ(mgg_ros::PlannerNodeTestPeer::globalEdgeStatus(
                 *planner, authority_home, observed_here),
             mgg::ProjectedEdgeStatus::kAdmissible);
-  ASSERT_EQ(mgg_ros::PlannerNodeTestPeer::globalVertices(*planner), 2);
-  ASSERT_EQ(mgg_ros::PlannerNodeTestPeer::globalEdges(*planner), 1);
+  ASSERT_EQ(mgg_ros::PlannerNodeTestPeer::globalVertices(*planner), 3);
+  ASSERT_EQ(mgg_ros::PlannerNodeTestPeer::globalEdges(*planner), 2);
   const mgg::StateVec home =
       mgg_ros::PlannerNodeTestPeer::globalVertexState(*planner, 0);
   EXPECT_NEAR(home.x(), 0.0, 0.11);
@@ -358,8 +471,8 @@ TEST(PlannerBackbone, CapturesHomeBeforeMotionAndConnectsOnlyMappedTerrain) {
   EXPECT_NEAR(home.z(), 0.30, 0.11);
 
   mgg_ros::PlannerNodeTestPeer::acceptOdometry(*planner, 1.80, 0.0, 0.075);
-  ASSERT_EQ(mgg_ros::PlannerNodeTestPeer::globalVertices(*planner), 3);
-  ASSERT_EQ(mgg_ros::PlannerNodeTestPeer::globalEdges(*planner), 2);
+  ASSERT_EQ(mgg_ros::PlannerNodeTestPeer::globalVertices(*planner), 4);
+  ASSERT_EQ(mgg_ros::PlannerNodeTestPeer::globalEdges(*planner), 3);
 
   // Authority home is a base pose, while graph vertices sit at driving
   // height.  The normal goal tolerance still selects the initial anchor.
@@ -391,6 +504,188 @@ TEST(PlannerBackbone, CapturesHomeBeforeMotionAndConnectsOnlyMappedTerrain) {
     EXPECT_NEAR(pose.z(), 0.075, 0.06);
   }
 
+}
+
+TEST(PlannerBackbone, DelayedSupportBackfillsBentTrajectoryBeyondParentRadius) {
+  rclcpp::NodeOptions options;
+  options.parameter_overrides(
+      {rclcpp::Parameter("map.resolution", 0.05)});
+  auto planner = std::make_shared<mgg_ros::PlannerNode>(options);
+  using Peer = mgg_ros::PlannerNodeTestPeer;
+  Peer::configureBackboneTest(*planner);
+
+  // Travel around an off-grid right angle before any terrain is mapped. The
+  // endpoint is farther from home than the old 5*spacing parent radius.
+  Peer::acceptOdometry(*planner, 0.0, 0.0, 0.075);
+  for (int i = 1; i <= 11; ++i) {
+    Peer::acceptOdometry(*planner, 0.0, i * 0.25, 0.075);
+  }
+  for (int i = 1; i <= 12; ++i) {
+    Peer::acceptOdometry(*planner, i * 0.25, 2.75, 0.075);
+  }
+  ASSERT_EQ(Peer::globalVertices(*planner), 1);
+  ASSERT_GE(Peer::pendingBreadcrumbs(*planner), 12u);
+  EXPECT_GT(Peer::pendingBreadcrumbLength(*planner), 5.0);
+
+  // Observe only the two travelled legs. An obstacle makes the direct
+  // home-to-current diagonal invalid, so success requires retained history.
+  Peer::observeGroundRectangle(*planner, -0.3, 3.3, -0.3, 3.1);
+  Peer::observeFreeBodyBox(*planner, {0.0, 1.375, 0.40},
+                           {0.6, 3.35, 0.40});
+  Peer::observeFreeBodyBox(*planner, {1.5, 2.75, 0.40}, {3.6, 0.6, 0.40});
+  Peer::addOccupiedVoxel(*planner, 1.5, 1.375, 0.30);
+  Peer::finishMapRevision(*planner);
+
+  mgg::StateVec home(0.0, 0.0, 0.075, 0.0);
+  mgg::StateVec current(3.0, 2.75, 0.075, 0.0);
+  EXPECT_NE(Peer::globalEdgeStatus(*planner, home, current),
+            mgg::ProjectedEdgeStatus::kAdmissible);
+  EXPECT_EQ(Peer::pendingBreadcrumbs(*planner), 0u);
+  EXPECT_FALSE(Peer::backboneHistoryLost(*planner));
+  EXPECT_GE(Peer::globalVertices(*planner), 12);
+  EXPECT_EQ(Peer::globalEdges(*planner), Peer::globalVertices(*planner) - 1);
+  EXPECT_TRUE(Peer::allGlobalEdgesAtMost(*planner, 0.75));
+  EXPECT_TRUE(Peer::hasGlobalVertexNear(*planner, 0.0, 2.75, 0.05));
+
+  const mgg::RouteCorridor route = Peer::planHome(*planner, home);
+  EXPECT_EQ(route.status, mgg::PlanningStatus::kSucceeded) << route.reason;
+  EXPECT_GE(route.poses.size(), 12u);
+}
+
+TEST(PlannerBackbone, BlockedHeadWaitsForNewMapAndIsNeverSkipped) {
+  rclcpp::NodeOptions options;
+  options.parameter_overrides(
+      {rclcpp::Parameter("map.resolution", 0.05)});
+  auto planner = std::make_shared<mgg_ros::PlannerNode>(options);
+  using Peer = mgg_ros::PlannerNodeTestPeer;
+  Peer::configureBackboneTest(*planner);
+
+  Peer::acceptOdometry(*planner, 0.0, 0.0, 0.075);
+  for (int i = 1; i <= 8; ++i) {
+    Peer::acceptOdometry(*planner, i * 0.25, 0.0, 0.075);
+  }
+  ASSERT_EQ(Peer::pendingBreadcrumbs(*planner), 4u);
+
+  // Ground can support the root and every queued sample, while body clearance
+  // remains unknown. The first head must hold back all later known positions.
+  Peer::observeGroundSupport(*planner);
+  ASSERT_TRUE(Peer::initialAnchorSupported(*planner));
+  EXPECT_EQ(Peer::globalVertices(*planner), 1);
+  EXPECT_EQ(Peer::pendingBreadcrumbs(*planner), 4u);
+
+  // More odometry on the same map revision cannot consume or skip that head.
+  Peer::acceptOdometry(*planner, 2.10, 0.0, 0.075);
+  EXPECT_EQ(Peer::globalVertices(*planner), 1);
+  EXPECT_EQ(Peer::pendingBreadcrumbs(*planner), 4u);
+
+  Peer::observeBodyCorridor(*planner);
+  EXPECT_EQ(Peer::pendingBreadcrumbs(*planner), 0u);
+  EXPECT_EQ(Peer::globalVertices(*planner), 5);
+  EXPECT_EQ(Peer::globalEdges(*planner), 4);
+  EXPECT_TRUE(Peer::allGlobalEdgesAtMost(*planner, 0.75));
+}
+
+TEST(PlannerBackbone, RepeatedOutAndBackReusesOwnedTrajectoryVertices) {
+  rclcpp::NodeOptions options;
+  options.parameter_overrides(
+      {rclcpp::Parameter("map.resolution", 0.05)});
+  auto planner = std::make_shared<mgg_ros::PlannerNode>(options);
+  using Peer = mgg_ros::PlannerNodeTestPeer;
+  Peer::configureBackboneTest(*planner);
+
+  Peer::acceptOdometry(*planner, 0.0, 0.0, 0.075);
+  Peer::observeGroundSupport(*planner);
+  Peer::observeBodyCorridor(*planner);
+  for (int i = 1; i <= 8; ++i) {
+    Peer::acceptOdometry(*planner, i * 0.25, 0.0, 0.075);
+  }
+  ASSERT_EQ(Peer::globalVertices(*planner), 5);
+  ASSERT_EQ(Peer::globalEdges(*planner), 4);
+
+  for (int i = 7; i >= 0; --i) {
+    Peer::acceptOdometry(*planner, i * 0.25, 0.0, 0.075);
+  }
+  EXPECT_EQ(Peer::pendingBreadcrumbs(*planner), 0u);
+  EXPECT_EQ(Peer::globalVertices(*planner), 5);
+  EXPECT_EQ(Peer::globalEdges(*planner), 4);
+  EXPECT_FALSE(Peer::backboneHistoryLost(*planner));
+}
+
+TEST(PlannerBackbone, StationaryNoiseDoesNotFillBoundedQueueAndOverflowFailsHome) {
+  rclcpp::NodeOptions options;
+  options.parameter_overrides(
+      {rclcpp::Parameter("map.resolution", 0.05)});
+  auto planner = std::make_shared<mgg_ros::PlannerNode>(options);
+  using Peer = mgg_ros::PlannerNodeTestPeer;
+  Peer::configureBackboneTest(*planner);
+  Peer::setBackboneLimits(*planner, 2, 100.0, 32);
+
+  Peer::acceptOdometry(*planner, 0.0, 0.0, 0.075);
+  for (int i = 0; i < 1000; ++i) {
+    Peer::acceptOdometry(*planner, i % 2 == 0 ? 0.01 : -0.01, 0.0, 0.075);
+  }
+  EXPECT_EQ(Peer::pendingBreadcrumbs(*planner), 0u);
+  EXPECT_FALSE(Peer::backboneHistoryLost(*planner));
+
+  Peer::acceptOdometry(*planner, 0.50, 0.0, 0.075);
+  Peer::acceptOdometry(*planner, 1.00, 0.0, 0.075);
+  Peer::acceptOdometry(*planner, 1.50, 0.0, 0.075);
+  ASSERT_TRUE(Peer::backboneHistoryLost(*planner));
+  EXPECT_EQ(Peer::pendingBreadcrumbs(*planner), 2u);
+
+  const mgg::StateVec home(0.0, 0.0, 0.075, 0.0);
+  const auto response =
+      Peer::requestObjective(*planner, mgg::ObjectiveKind::kReturnHome, home);
+  EXPECT_EQ(response->status, static_cast<std::uint8_t>(
+                                  mgg::PlanningStatus::kBlocked));
+  EXPECT_NE(response->reason.find("global trajectory history was lost"),
+            std::string::npos);
+}
+
+TEST(PlannerBackbone, NumericNoProgressLatchesLostHistoryOnce) {
+  rclcpp::NodeOptions options;
+  using Peer = mgg_ros::PlannerNodeTestPeer;
+
+  auto boundary = std::make_shared<mgg_ros::PlannerNode>(options);
+  Peer::configureAerialBackboneTest(*boundary);
+  Peer::setBackboneSpacing(*boundary, 0.01);
+  Peer::acceptOdometry(*boundary, 0.0, 0.0, 0.0);
+  Peer::acceptOdometry(*boundary, 0.0099999995, 0.0, 0.0);
+  EXPECT_FALSE(Peer::backboneHistoryLost(*boundary));
+  EXPECT_EQ(Peer::pendingBreadcrumbs(*boundary), 0u);
+  Peer::acceptOdometry(*boundary, 0.01, 0.0, 0.0);
+  EXPECT_FALSE(Peer::backboneHistoryLost(*boundary));
+  EXPECT_EQ(Peer::pendingBreadcrumbs(*boundary), 1u);
+
+  auto planner = std::make_shared<mgg_ros::PlannerNode>(options);
+  Peer::configureAerialBackboneTest(*planner);
+
+  // At this magnitude, adding the 0.5 m spacing rounds back to the anchor.
+  // The sampler must stop instead of filling the bounded queue with copies.
+  Peer::acceptOdometry(*planner, 1e20, 0.0, 0.0);
+  Peer::acceptOdometry(*planner, 1e20 + 1e10, 0.0, 0.0);
+  ASSERT_TRUE(Peer::backboneHistoryLost(*planner));
+  EXPECT_EQ(Peer::pendingBreadcrumbs(*planner), 0u);
+
+  // A later extreme displacement cannot append or emit another loss state.
+  Peer::acceptOdometry(*planner, -1e154, 0.0, 0.0);
+  EXPECT_EQ(Peer::pendingBreadcrumbs(*planner), 0u);
+  const mgg::StateVec home(1e20, 0.0, 0.0, 0.0);
+  const auto response =
+      Peer::requestObjective(*planner, mgg::ObjectiveKind::kReturnHome, home);
+  EXPECT_EQ(response->status, static_cast<std::uint8_t>(
+                                  mgg::PlanningStatus::kBlocked));
+  EXPECT_NE(response->reason.find("global trajectory history was lost"),
+            std::string::npos);
+
+  auto extreme = std::make_shared<mgg_ros::PlannerNode>(options);
+  Peer::configureAerialBackboneTest(*extreme);
+  Peer::acceptOdometry(*extreme, -1e308, 0.0, 0.0);
+  Peer::acceptOdometry(*extreme, 1e308, 0.0, 0.0);
+  ASSERT_TRUE(Peer::backboneHistoryLost(*extreme));
+  EXPECT_EQ(Peer::pendingBreadcrumbs(*extreme), 0u);
+  EXPECT_NE(Peer::backboneHistoryLostReason(*extreme).find("finite"),
+            std::string::npos);
 }
 
 TEST(PlannerBackbone, LegacyExploreRetainsHangingRootBootstrapPolicy) {
@@ -583,7 +878,9 @@ TEST_F(ObjectiveService, GridHomeDetoursOnObservedGroundAndBlocksWall) {
   ASSERT_EQ(response->status, Service::Response::SUCCEEDED) << response->reason;
 
   // Block the edge between graph vertices, leaving both endpoints clear.
-  Peer::addGridObstacle(*planner, 0.325, false);
+  // New backbone samples are at 0.5 m spacing, so place the blocker midway
+  // between 0.5 and 1.0 rather than on either supported endpoint.
+  Peer::addGridObstacle(*planner, 0.325, false, 0.75);
   response = call(home);
   ASSERT_NE(response, nullptr);
   ASSERT_EQ(response->status, Service::Response::SUCCEEDED) << response->reason;
@@ -601,7 +898,7 @@ TEST_F(ObjectiveService, GridHomeDetoursOnObservedGroundAndBlocksWall) {
 
   // The wall spans the observed floor and detour window; unknown space beyond
   // it must not be invented as a route around the ends.
-  Peer::addGridObstacle(*planner, 0.325, true);
+  Peer::addGridObstacle(*planner, 0.325, true, 0.75);
   response = call(home);
   ASSERT_NE(response, nullptr);
   EXPECT_EQ(response->status, Service::Response::BLOCKED) << response->reason;

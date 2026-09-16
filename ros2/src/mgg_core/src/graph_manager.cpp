@@ -162,7 +162,10 @@ bool GraphManager::getNearestVertices(const StateVec* state, double range,
   kdres* neighbors =
       kd_nearest_range3(kd_tree_, state->x(), state->y(), state->z(), range);
   int neighbors_size = kd_res_size(neighbors);
-  if (neighbors_size <= 0) return false;
+  if (neighbors_size <= 0) {
+    kd_res_free(neighbors);
+    return false;
+  }
   v_res->clear();
   for (int i = 0; i < neighbors_size; ++i) {
     Vertex* new_neighbor = (Vertex*)kd_res_item_data(neighbors);

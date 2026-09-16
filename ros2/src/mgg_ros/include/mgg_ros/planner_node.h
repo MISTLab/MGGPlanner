@@ -15,6 +15,9 @@
 #define MGG_ROS_PLANNER_NODE_H_
 
 #include <chrono>
+#include <cstddef>
+#include <cstdint>
+#include <deque>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -97,6 +100,7 @@ class PlannerNode : public rclcpp::Node {
   /// Without the trajectory backbone there is nothing to broadcast and no
   /// geometry for a neighbour's graph to rendezvous with.
   void updateGlobalGraph();
+  void stageGlobalBreadcrumbs(const mgg::StateVec& state);
   bool projectStateToDrivingHeight(mgg::StateVec& state) const;
 
   mgg::ExpandContext makeContext();
@@ -152,11 +156,27 @@ class PlannerNode : public rclcpp::Node {
   /// How long to wait for the transform matching a cloud's stamp.
   double cloud_tf_timeout_sec_ = 0.1;
   double global_vertex_spacing_ = 1.0;
-  /// Raw navigation-frame odometry at the last global-graph vertex.  Keeping
-  /// this separate from the terrain-projected vertex avoids mixing base height
-  /// with collision-box driving height in the spacing test.
-  Eigen::Vector3d last_global_anchor_ = Eigen::Vector3d::Zero();
-  bool have_global_anchor_ = false;
+  struct PendingGlobalBreadcrumb {
+    mgg::StateVec state = mgg::StateVec::Zero();
+    double path_length = 0.0;
+  };
+  /// Raw navigation-frame trajectory samples waiting for mapped support.
+  /// Values, rather than graph pointers, keep ownership with GraphManager.
+  std::deque<PendingGlobalBreadcrumb> pending_global_breadcrumbs_;
+  std::size_t pending_global_max_samples_ = 128;
+  double pending_global_max_length_m_ = 128.0;
+  std::size_t pending_global_drain_max_samples_ = 32;
+  double pending_global_length_m_ = 0.0;
+  mgg::StateVec global_sampling_anchor_ = mgg::StateVec::Zero();
+  bool have_global_sampling_anchor_ = false;
+  mgg::StateVec last_global_odometry_ = mgg::StateVec::Zero();
+  Eigen::Vector3d last_global_motion_ = Eigen::Vector3d::Zero();
+  int last_own_global_vertex_id_ = 0;
+  bool global_backbone_blocked_on_map_ = false;
+  std::uint64_t global_backbone_blocked_map_revision_ = 0;
+  bool global_backbone_blockage_reported_ = false;
+  bool global_backbone_history_lost_ = false;
+  std::string global_backbone_history_lost_reason_;
   /// Heading the robot has been travelling, for the direction penalty.
   double exploring_direction_ = 0.0;
   mgg::EdgeInclinations edge_inclinations_;

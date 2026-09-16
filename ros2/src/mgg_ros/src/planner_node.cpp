@@ -175,8 +175,25 @@ PlannerNode::PlannerNode(const rclcpp::NodeOptions& options)
       },
       rclcpp::ServicesQoS(), callback_group_);
 
-  global_vertex_spacing_ =
+  const double requested_global_spacing =
       declareOrGet<double>(this, "global_vertex_spacing", 1.0);
+  global_vertex_spacing_ = std::isfinite(requested_global_spacing)
+                               ? std::clamp(requested_global_spacing, 0.01, 100.0)
+                               : 1.0;
+  pending_global_max_samples_ = static_cast<std::size_t>(std::clamp(
+      declareOrGet<std::int64_t>(this, "global_backbone_pending_max_samples",
+                                 128),
+      std::int64_t{8}, std::int64_t{4096}));
+  const double requested_pending_length = declareOrGet<double>(
+      this, "global_backbone_pending_max_length_m", 128.0);
+  pending_global_max_length_m_ =
+      std::isfinite(requested_pending_length)
+          ? std::clamp(requested_pending_length, global_vertex_spacing_,
+                       10000.0)
+          : 128.0;
+  pending_global_drain_max_samples_ = static_cast<std::size_t>(std::clamp(
+      declareOrGet<std::int64_t>(this, "global_backbone_drain_max_samples", 32),
+      std::int64_t{1}, std::int64_t{512}));
 
   plan_srv_ = create_service<mgg_msgs::srv::PlannerSrv>(
       "mggplanner",
@@ -288,6 +305,121 @@ mgg::ExpandContext PlannerNode::makeContext() {
   return ctx;
 }
 
+void PlannerNode::stageGlobalBreadcrumbs(const mgg::StateVec& state) {
+  if (!have_global_sampling_anchor_) {
+    global_sampling_anchor_ = state;
+    have_global_sampling_anchor_ = true;
+    last_global_odometry_ = state;
+    return;
+  }
+
+  const auto loseHistory = [this](const char* reason) {
+    if (global_backbone_history_lost_) return;
+    global_backbone_history_lost_ = true;
+    global_backbone_history_lost_reason_ = reason;
+    RCLCPP_ERROR(get_logger(),
+                 "global trajectory history lost: %s (%zu samples, %.1f m); "
+                 "Return Home will remain blocked",
+                 global_backbone_history_lost_reason_.c_str(),
+                 pending_global_breadcrumbs_.size(), pending_global_length_m_);
+  };
+  const auto append = [this](const mgg::StateVec& sample,
+                             double path_length, const auto& lose_history) {
+    if (global_backbone_history_lost_) return false;
+    if (!sample.allFinite() || !std::isfinite(path_length) ||
+        path_length <= 0.0) {
+      lose_history("invalid pending breadcrumb geometry");
+      return false;
+    }
+    const bool count_full =
+        pending_global_breadcrumbs_.size() >= pending_global_max_samples_;
+    const bool length_full =
+        pending_global_length_m_ + path_length >
+        pending_global_max_length_m_ + 1e-9;
+    if (count_full || length_full) {
+      lose_history(count_full ? "pending breadcrumb count limit exceeded"
+                              : "pending breadcrumb length limit exceeded");
+      return false;
+    }
+    pending_global_breadcrumbs_.push_back({sample, path_length});
+    pending_global_length_m_ += path_length;
+    return true;
+  };
+
+  const auto interpolate = [](const mgg::StateVec& a,
+                              const mgg::StateVec& b, double fraction) {
+    mgg::StateVec sample = a + fraction * (b - a);
+    const double yaw_delta =
+        std::atan2(std::sin(b[3] - a[3]), std::cos(b[3] - a[3]));
+    sample[3] = a[3] + fraction * yaw_delta;
+    return sample;
+  };
+
+  const Eigen::Vector3d motion =
+      state.head<3>() - last_global_odometry_.head<3>();
+  if (!motion.allFinite()) {
+    loseHistory("odometry displacement is not finite");
+    return;
+  }
+  const double last_motion_norm = last_global_motion_.norm();
+  const double motion_norm = motion.norm();
+  if (!std::isfinite(last_motion_norm) || !std::isfinite(motion_norm)) {
+    loseHistory("odometry displacement exceeds numeric range");
+    return;
+  }
+  if (!global_backbone_history_lost_ && last_motion_norm > 1e-6 &&
+      motion_norm > 1e-6) {
+    const double cosine = std::clamp(
+        (last_global_motion_ / last_motion_norm).dot(motion / motion_norm),
+        -1.0, 1.0);
+    const double turn = std::acos(cosine);
+    const Eigen::Vector3d from_anchor_delta =
+        last_global_odometry_.head<3>() - global_sampling_anchor_.head<3>();
+    const double from_anchor = from_anchor_delta.norm();
+    if (!from_anchor_delta.allFinite() || !std::isfinite(from_anchor)) {
+      loseHistory("breadcrumb progress exceeds numeric range");
+      return;
+    }
+    // Keep meaningful corners that fall between regular samples. The minimum
+    // displacement prevents stationary pose noise from manufacturing vertices.
+    if (turn >= M_PI / 6.0 &&
+        from_anchor >= global_vertex_spacing_ * 0.25) {
+      if (append(last_global_odometry_, from_anchor, loseHistory)) {
+        global_sampling_anchor_ = last_global_odometry_;
+      }
+    }
+  }
+
+  while (!global_backbone_history_lost_) {
+    const Eigen::Vector3d delta =
+        state.head<3>() - global_sampling_anchor_.head<3>();
+    const double distance = delta.norm();
+    if (!delta.allFinite() || !std::isfinite(distance)) {
+      loseHistory("breadcrumb progress exceeds numeric range");
+      break;
+    }
+    if (distance < global_vertex_spacing_) break;
+    const double fraction = global_vertex_spacing_ / distance;
+    if (!std::isfinite(fraction) || fraction <= 0.0 || fraction > 1.0 + 1e-9) {
+      loseHistory("breadcrumb interpolation made no finite progress");
+      break;
+    }
+    const mgg::StateVec sample =
+        interpolate(global_sampling_anchor_, state, fraction);
+    if ((sample.head<3>().array() ==
+         global_sampling_anchor_.head<3>().array())
+            .all()) {
+      loseHistory("breadcrumb interpolation made no numeric progress");
+      break;
+    }
+    if (!append(sample, global_vertex_spacing_, loseHistory)) break;
+    global_sampling_anchor_ = sample;
+  }
+
+  if (motion_norm > 1e-6) last_global_motion_ = motion;
+  last_global_odometry_ = state;
+}
+
 void PlannerNode::onOdometry(nav_msgs::msg::Odometry::ConstSharedPtr msg) {
   const mgg::StateVec state = fromPoseMsg(msg->pose.pose);
   if (!state.allFinite()) {
@@ -303,26 +435,7 @@ void PlannerNode::onOdometry(nav_msgs::msg::Odometry::ConstSharedPtr msg) {
     initial_state_ = state;
     have_initial_state_ = true;
   }
-
-  // The global graph is a trajectory backbone, so it has to be laid down as
-  // the robot drives rather than once a planning cycle. A new vertex only
-  // attaches to a parent within global_vertex_spacing * 5, and a cycle can be
-  // forty seconds apart: the robot covers several metres in that time, ends up
-  // beyond the attachment radius of everything, and the graph stays at the one
-  // seed vertex for the whole run. That is silent - the seed is published, so
-  // the exchange looks healthy - and it means two robots' graphs are two
-  // isolated points that can never come close enough to merge. Measured: four
-  // robots, 0.65 Hz of graph traffic, one vertex per message, zero merges.
-  //
-  // Only the distance test runs at odometry rate. The rest is behind it and
-  // fires every global_vertex_spacing of travel, so the map queries and the
-  // sweep over existing vertices happen a couple of times a metre.
-  const Eigen::Vector3d here(current_state_[0], current_state_[1],
-                             current_state_[2]);
-  if (have_global_anchor_ &&
-      (here - last_global_anchor_).norm() < global_vertex_spacing_) {
-    return;
-  }
+  stageGlobalBreadcrumbs(state);
   updateGlobalGraph();
 }
 
@@ -371,16 +484,10 @@ void PlannerNode::onPointCloud(
     const std::lock_guard<std::recursive_mutex> lock(planner_mutex_);
     map_->insertPointCloud(points, origin);
     ++map_revision_;
-    // A graph update can be waiting on ground/free-space evidence at the
-    // initial anchor or at the next spaced breadcrumb.  Retry only in those
-    // states; ordinary clouds do not cause a full graph sweep.
-    if (have_odometry_) {
-      const Eigen::Vector3d here(current_state_[0], current_state_[1],
-                                 current_state_[2]);
-      if (!initial_anchor_supported_ || !have_global_anchor_ ||
-          (here - last_global_anchor_).norm() >= global_vertex_spacing_) {
-        updateGlobalGraph();
-      }
+    // A new map revision may admit the first blocked chronological breadcrumb.
+    if (have_odometry_ &&
+        (!initial_anchor_supported_ || !pending_global_breadcrumbs_.empty())) {
+      updateGlobalGraph();
     }
   }
 }
@@ -750,8 +857,7 @@ void PlannerNode::updateGlobalGraph() {
     root->robot_id = static_cast<int>(planning_params_.robot_id);
     root->is_hanging = !initial_anchor_supported_;
     global_graph_->addVertex(root);
-    last_global_anchor_ = initial_state_.head<3>();
-    have_global_anchor_ = true;
+    last_own_global_vertex_id_ = 0;
     ++graph_revision_;
     RCLCPP_INFO(get_logger(),
                 "global graph captured initial anchor at (%.2f, %.2f, %.2f)%s",
@@ -759,12 +865,35 @@ void PlannerNode::updateGlobalGraph() {
                 initial_anchor_supported_ ? "" : " (awaiting mapped support)");
   }
 
+  // A failed support or edge query can only change after the map changes.
+  // Odometry may continue appending behind that head, but it must not turn one
+  // unchanged unknown cell into repeated map work or skip ahead in the queue.
+  if (global_backbone_blocked_on_map_ &&
+      global_backbone_blocked_map_revision_ == map_revision_) {
+    return;
+  }
+  global_backbone_blocked_on_map_ = false;
+
   if (!initial_anchor_supported_) {
     mgg::StateVec supported_root = initial_state_;
-    if (!projectStateToDrivingHeight(supported_root)) return;
-    auto* root = global_graph_->getVertex(0);
+    if (!projectStateToDrivingHeight(supported_root)) {
+      global_backbone_blocked_on_map_ = true;
+      global_backbone_blocked_map_revision_ = map_revision_;
+      return;
+    }
+    auto root_it = global_graph_->vertices_map_.find(0);
+    auto* root = root_it == global_graph_->vertices_map_.end()
+                     ? nullptr
+                     : root_it->second;
     if (root == nullptr ||
-        !global_graph_->updateVertexState(0, supported_root)) return;
+        !global_graph_->updateVertexState(0, supported_root)) {
+      global_backbone_history_lost_ = true;
+      global_backbone_history_lost_reason_ =
+          "initial graph vertex is unavailable";
+      RCLCPP_ERROR(get_logger(), "global trajectory history lost: %s",
+                   global_backbone_history_lost_reason_.c_str());
+      return;
+    }
     root->is_hanging = false;
     initial_anchor_supported_ = true;
     ++graph_revision_;
@@ -774,113 +903,139 @@ void PlannerNode::updateGlobalGraph() {
                 supported_root[0], supported_root[1], supported_root[2]);
   }
 
-  const Eigen::Vector3d raw_here(current_state_[0], current_state_[1],
-                                 current_state_[2]);
-  if ((raw_here - last_global_anchor_).norm() < global_vertex_spacing_) return;
-
-  mgg::StateVec state = current_state_;
-  if (!projectStateToDrivingHeight(state)) return;
-
   const mgg::ExpandContext ctx = makeContext();
-  const Eigen::Vector3d here(state[0], state[1], state[2]);
-
-  // First, verify we are at least global_vertex_spacing_ from any existing vertex
-  // of this robot to avoid cluttering the graph with near-duplicates.
-  double min_dist_to_any = std::numeric_limits<double>::max();
-  for (const auto& entry : global_graph_->vertices_map_) {
-    if (entry.second == nullptr) continue;
-    if (entry.second->robot_id != static_cast<int>(planning_params_.robot_id)) {
-      continue;
-    }
-    const Eigen::Vector3d vpos(entry.second->state[0], entry.second->state[1],
-                               entry.second->state[2]);
-    const double d = (vpos - here).norm();
-    if (d < min_dist_to_any) {
-      min_dist_to_any = d;
-    }
-  }
-  if (min_dist_to_any < global_vertex_spacing_) return;
-
-  // Find candidate vertices of this robot sorted by Euclidean distance,
-  // and choose the closest one whose connecting edge is collision-free (admissible).
-  std::vector<std::pair<double, mgg::Vertex*>> candidates;
-  for (const auto& entry : global_graph_->vertices_map_) {
-    if (entry.second == nullptr) continue;
-    if (entry.second->robot_id != static_cast<int>(planning_params_.robot_id)) {
-      continue;
-    }
-    const Eigen::Vector3d vpos(entry.second->state[0], entry.second->state[1],
-                               entry.second->state[2]);
-    const double d = (vpos - here).norm();
-    if (d <= global_vertex_spacing_ * 5.0) {
-      candidates.emplace_back(d, entry.second);
-    }
-  }
-  std::sort(candidates.begin(), candidates.end(),
-            [](const auto& a, const auto& b) { return a.first < b.first; });
-
-  mgg::Vertex* parent_vertex = nullptr;
-  double edge_distance = 0.0;
-  for (const auto& cand : candidates) {
-    const Eigen::Vector3d origin(cand.second->state[0], cand.second->state[1],
-                                 cand.second->state[2]);
-    bool admissible = false;
-    double projected_distance = cand.first;
+  const auto admitEdge = [this, &ctx](const Eigen::Vector3d& from,
+                                      const Eigen::Vector3d& to,
+                                      double& distance,
+                                      const char*& blocked_reason) {
+    distance = (to - from).norm();
+    blocked_reason = "unknown";
     if (robot_params_.type == mgg::RobotType::kGroundRobot) {
       std::vector<Eigen::Vector3d> projected_edge;
       const auto status = ground_->getProjectedEdgeStatus(
-          origin, here, ctx.robot_box_size, /*stop_at_unknown_voxel=*/true,
+          from, to, ctx.robot_box_size, /*stop_at_unknown_voxel=*/true,
           projected_edge, /*is_hanging=*/false);
-      if (status == mgg::ProjectedEdgeStatus::kAdmissible) {
-        admissible = true;
-        projected_distance = 0.0;
-        for (size_t i = 1; i < projected_edge.size(); ++i) {
-          projected_distance +=
-              (projected_edge[i] - projected_edge[i - 1]).norm();
+      if (status != mgg::ProjectedEdgeStatus::kAdmissible) {
+        if (status == mgg::ProjectedEdgeStatus::kSteep) {
+          blocked_reason = "steep";
+        } else if (status == mgg::ProjectedEdgeStatus::kOccupied) {
+          blocked_reason = "occupied";
+        } else if (status == mgg::ProjectedEdgeStatus::kHanging) {
+          blocked_reason = "no ground";
         }
-        if (!projected_edge.empty()) {
-          state[0] = projected_edge.back().x();
-          state[1] = projected_edge.back().y();
-          state[2] = projected_edge.back().z();
-        }
+        return false;
       }
-    } else {
-      admissible = map_->getPathStatus(
-                       origin, here, ctx.robot_box_size,
-                       /*stop_at_unknown=*/true) == mgg::VoxelStatus::kFree;
+      distance = 0.0;
+      for (std::size_t i = 1; i < projected_edge.size(); ++i) {
+        distance += (projected_edge[i] - projected_edge[i - 1]).norm();
+      }
+      return true;
     }
-    if (admissible) {
-      parent_vertex = cand.second;
-      edge_distance = projected_distance;
+    const auto status = map_->getPathStatus(
+        from, to, ctx.robot_box_size, /*stop_at_unknown=*/true);
+    if (status == mgg::VoxelStatus::kOccupied) blocked_reason = "occupied";
+    return status == mgg::VoxelStatus::kFree;
+  };
+
+  std::size_t drained = 0;
+  while (!pending_global_breadcrumbs_.empty() &&
+         drained < pending_global_drain_max_samples_) {
+    const PendingGlobalBreadcrumb& pending = pending_global_breadcrumbs_.front();
+    mgg::StateVec state = pending.state;
+    if (!projectStateToDrivingHeight(state)) {
+      global_backbone_blocked_on_map_ = true;
+      global_backbone_blocked_map_revision_ = map_revision_;
+      if (!global_backbone_blockage_reported_) {
+        RCLCPP_WARN(get_logger(),
+                    "global trajectory blocked on no ground at (%.2f, %.2f); "
+                    "retaining %zu chronological breadcrumb(s)",
+                    state.x(), state.y(), pending_global_breadcrumbs_.size());
+        global_backbone_blockage_reported_ = true;
+      }
       break;
     }
-  }
 
-  // If no candidate has an admissible line of sight (e.g. turned a blind wall corner),
-  // do NOT create an edge cutting through the wall.
-  if (parent_vertex == nullptr) {
-    // Nothing in range with a clear line to it. Expected briefly around a
-    // blind corner, and the right answer is to wait rather than run an edge
-    // through the wall - but if it persists the backbone has stalled and the
-    // robot will never share anything, so say so.
-    RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 10000,
-                         "global graph has no reachable parent within %.1f m of "
-                         "(%.2f, %.2f); it has %d vertices and is not growing",
-                         global_vertex_spacing_ * 5.0, here.x(), here.y(),
-                         global_graph_->getNumVertices());
-    return;
-  }
+    auto parent_it =
+        global_graph_->vertices_map_.find(last_own_global_vertex_id_);
+    mgg::Vertex* parent_vertex =
+        parent_it == global_graph_->vertices_map_.end() ? nullptr
+                                                       : parent_it->second;
+    if (parent_vertex == nullptr ||
+        parent_vertex->robot_id != static_cast<int>(planning_params_.robot_id)) {
+      global_backbone_history_lost_ = true;
+      global_backbone_history_lost_reason_ =
+          "last owned graph vertex is unavailable";
+      RCLCPP_ERROR(get_logger(), "global trajectory history lost: %s",
+                   global_backbone_history_lost_reason_.c_str());
+      return;
+    }
 
-  auto* v = new mgg::Vertex(global_graph_->generateVertexID(), state);
-  v->robot_id = static_cast<int>(planning_params_.robot_id);
-  v->parent = parent_vertex;
-  v->distance = parent_vertex->distance + edge_distance;
-  parent_vertex->children.push_back(v);
-  global_graph_->addVertex(v);
-  global_graph_->addEdge(v, parent_vertex, edge_distance);
-  last_global_anchor_ = raw_here;
-  have_global_anchor_ = true;
-  ++graph_revision_;
+    const Eigen::Vector3d origin = parent_vertex->state.head<3>();
+    const Eigen::Vector3d here = state.head<3>();
+    double edge_distance = 0.0;
+    const char* blocked_reason = "unknown";
+    if (!admitEdge(origin, here, edge_distance, blocked_reason)) {
+      global_backbone_blocked_on_map_ = true;
+      global_backbone_blocked_map_revision_ = map_revision_;
+      if (!global_backbone_blockage_reported_) {
+        RCLCPP_WARN(get_logger(),
+                    "global trajectory blocked on %s at (%.2f, %.2f); "
+                    "retaining %zu chronological breadcrumb(s)",
+                    blocked_reason, here.x(), here.y(),
+                    pending_global_breadcrumbs_.size());
+        global_backbone_blockage_reported_ = true;
+      }
+      break;
+    }
+
+    // Repeated passes should reuse an owned vertex rather than grow the graph
+    // forever. The chronological predecessor-to-head transition has already
+    // passed above; a separate strict 3D transition check prevents an XY-near
+    // vertex across a wall or on another floor from becoming an unchecked
+    // alias. Reuse changes no parent, child, or graph edge.
+    mgg::Vertex* reused_vertex = nullptr;
+    std::vector<mgg::Vertex*> nearby;
+    if (global_graph_->getNearestVertices(
+            &state, global_vertex_spacing_ * 0.25, &nearby)) {
+      double nearest_distance = std::numeric_limits<double>::max();
+      for (mgg::Vertex* candidate : nearby) {
+        if (candidate == nullptr ||
+            candidate->robot_id !=
+                static_cast<int>(planning_params_.robot_id)) {
+          continue;
+        }
+        const double candidate_distance =
+            (candidate->state.head<3>() - here).norm();
+        double reuse_edge_distance = 0.0;
+        const char* reuse_blocked_reason = "unknown";
+        if (candidate_distance < nearest_distance &&
+            admitEdge(here, candidate->state.head<3>(), reuse_edge_distance,
+                      reuse_blocked_reason)) {
+          nearest_distance = candidate_distance;
+          reused_vertex = candidate;
+        }
+      }
+    }
+
+    if (reused_vertex != nullptr) {
+      last_own_global_vertex_id_ = reused_vertex->id;
+    } else {
+      auto* v = new mgg::Vertex(global_graph_->generateVertexID(), state);
+      v->robot_id = static_cast<int>(planning_params_.robot_id);
+      v->parent = parent_vertex;
+      v->distance = parent_vertex->distance + edge_distance;
+      parent_vertex->children.push_back(v);
+      global_graph_->addVertex(v);
+      global_graph_->addEdge(v, parent_vertex, edge_distance);
+      last_own_global_vertex_id_ = v->id;
+      ++graph_revision_;
+    }
+    pending_global_length_m_ =
+        std::max(0.0, pending_global_length_m_ - pending.path_length);
+    pending_global_breadcrumbs_.pop_front();
+    ++drained;
+    global_backbone_blockage_reported_ = false;
+  }
 }
 
 
@@ -1317,6 +1472,11 @@ void PlannerNode::onObjectiveRequest(
               local_graph_map_revision_ != map_revision_)) {
     corridor.status = mgg::PlanningStatus::kStaleRevision;
     corridor.reason = "component or planning snapshot revision is stale";
+  } else if (core.objective == mgg::ObjectiveKind::kReturnHome &&
+             global_backbone_history_lost_) {
+    corridor.status = mgg::PlanningStatus::kBlocked;
+    corridor.reason = "global trajectory history was lost: " +
+                      global_backbone_history_lost_reason_;
   } else if (!have_odometry_ || !map_->getStatus()) {
     corridor.status = mgg::PlanningStatus::kBlocked;
     corridor.reason = "odometry or planning map is unavailable";
