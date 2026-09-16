@@ -1321,11 +1321,22 @@ mgg::FeasiblePath PlannerNode::refineCorridor(
   const auto project = [this, body, center_offset,
                         &geofenceContains](mgg::StateVec& state) {
     if (robot_params_.type == mgg::RobotType::kGroundRobot) {
-      if (!ground_ || !projectStateToDrivingHeight(state)) return false;
+      if (!ground_ || !projectStateToDrivingHeight(state)) {
+        return mgg::GridProjectionStatus::kNoGround;
+      }
     }
     const Eigen::Vector3d center = state.head<3>() + center_offset;
-    return map_->getStrictBoxStatus(center, body) == mgg::VoxelStatus::kFree &&
-           geofenceContains(center);
+    const mgg::VoxelStatus body_status = map_->getStrictBoxStatus(center, body);
+    if (body_status == mgg::VoxelStatus::kOccupied) {
+      return mgg::GridProjectionStatus::kBodyOccupied;
+    }
+    if (body_status != mgg::VoxelStatus::kFree) {
+      return mgg::GridProjectionStatus::kBodyUnknown;
+    }
+    if (!geofenceContains(center)) {
+      return mgg::GridProjectionStatus::kGeofenceViolation;
+    }
+    return mgg::GridProjectionStatus::kSupported;
   };
   const auto traverse =
       [this, body, center_offset,
@@ -1504,11 +1515,25 @@ void PlannerNode::onObjectiveRequest(
           core.component_id, core.graph_revision, core.map_revision, 1.0);
       mgg::StateVec graph_current = current_state_;
       mgg::PlanningRequest graph_request = core;
-      if (!projectStateToDrivingHeight(graph_current) ||
-          !projectStateToDrivingHeight(graph_request.goal.pose)) {
+      if (!projectStateToDrivingHeight(graph_current)) {
         corridor.request = core;
         corridor.status = mgg::PlanningStatus::kUnreachable;
-        corridor.reason = "current pose or goal has no mapped terrain support";
+        char reason[192];
+        std::snprintf(reason, sizeof(reason),
+                      "current pose rejected: no mapped ground support at "
+                      "(%.2f, %.2f, %.2f)",
+                      graph_current.x(), graph_current.y(), graph_current.z());
+        corridor.reason = reason;
+      } else if (!projectStateToDrivingHeight(graph_request.goal.pose)) {
+        corridor.request = core;
+        corridor.status = mgg::PlanningStatus::kUnreachable;
+        char reason[192];
+        std::snprintf(reason, sizeof(reason),
+                      "goal rejected: no mapped ground support at "
+                      "(%.2f, %.2f, %.2f)",
+                      graph_request.goal.pose.x(), graph_request.goal.pose.y(),
+                      graph_request.goal.pose.z());
+        corridor.reason = reason;
       } else {
         corridor = planner.plan(graph, graph_current, graph_request);
         // Graph lookup uses driving height, while refinement and the response

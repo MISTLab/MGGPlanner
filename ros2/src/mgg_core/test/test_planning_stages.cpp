@@ -68,8 +68,11 @@ TEST(PlanningStages, GoalMustResolveToTheActiveGraph) {
   TopologicalGoalPlanner planner("component-a", 12, 34, 0.25);
   auto far = request(ObjectiveKind::kReturnHome);
   far.goal.pose.x() = 30.0;
-  EXPECT_EQ(planner.plan(chain.graph, StateVec::Zero(), far).status,
-            PlanningStatus::kUnreachable);
+  const auto route = planner.plan(chain.graph, StateVec::Zero(), far);
+  EXPECT_EQ(route.status, PlanningStatus::kUnreachable);
+  EXPECT_EQ(route.reason,
+            "goal is outside the graph tolerance 0.25 m at "
+            "(30.00, 0.00, 0.00)");
 }
 
 TEST(PlanningStages, CurrentPoseMustResolveToTheActiveGraph) {
@@ -77,8 +80,12 @@ TEST(PlanningStages, CurrentPoseMustResolveToTheActiveGraph) {
   TopologicalGoalPlanner planner("component-a", 12, 34, 0.25);
   auto home = request(ObjectiveKind::kReturnHome);
   home.goal.pose = StateVec::Zero();
-  EXPECT_EQ(planner.plan(chain.graph, StateVec(30.0, 0.0, 0.0, 0.0), home).status,
-            PlanningStatus::kUnreachable);
+  const auto route =
+      planner.plan(chain.graph, StateVec(30.0, 0.0, 0.0, 0.0), home);
+  EXPECT_EQ(route.status, PlanningStatus::kUnreachable);
+  EXPECT_EQ(route.reason,
+            "current pose is outside the graph tolerance 0.25 m at "
+            "(30.00, 0.00, 0.00)");
 }
 
 TEST(PlanningStages, NonfiniteGoalIsRejectedBeforeGraphLookup) {

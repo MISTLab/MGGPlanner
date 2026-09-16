@@ -14,6 +14,7 @@ namespace {
 
 using mgg::BoundedGridPlanner;
 using mgg::FeasiblePath;
+using mgg::GridProjectionStatus;
 using mgg::GridRefinementLimits;
 using mgg::PlanningStatus;
 using mgg::RouteCorridor;
@@ -41,7 +42,8 @@ GridRefinementLimits limits() {
 auto flatProjection() {
   return [](StateVec& state) {
     state.z() = 0.0;
-    return state.allFinite();
+    return state.allFinite() ? GridProjectionStatus::kSupported
+                             : GridProjectionStatus::kNoGround;
   };
 }
 
@@ -109,7 +111,7 @@ TEST(GridRefinement, ProjectorCannotReplaceRequestOwnedGoalYaw) {
   auto yaw_mutating_projector = [](StateVec& state) {
     state.z() = 0.0;
     state[3] = -2.4;
-    return true;
+    return GridProjectionStatus::kSupported;
   };
   BoundedGridPlanner planner(StateVec::Zero(), limits(),
                              yaw_mutating_projector, sampledTraversal({}));
@@ -125,13 +127,65 @@ TEST(GridRefinement, RejectsExploreBeforeCallingMapPredicates) {
   int projections = 0;
   auto project = [&projections](StateVec&) {
     ++projections;
-    return true;
+    return GridProjectionStatus::kSupported;
   };
   BoundedGridPlanner planner(StateVec::Zero(), limits(), project,
                              sampledTraversal({}));
   const FeasiblePath path = planner.refine(route);
   EXPECT_EQ(path.status, PlanningStatus::kBlocked);
   EXPECT_EQ(projections, 0);
+}
+
+TEST(GridRefinement, ReportsWaypointIndexCoordinatesAndProjectionClass) {
+  const std::vector<std::pair<GridProjectionStatus, std::string>> failures = {
+      {GridProjectionStatus::kNoGround, "no mapped ground support"},
+      {GridProjectionStatus::kBodyOccupied,
+       "body intersects occupied space"},
+      {GridProjectionStatus::kBodyUnknown, "body includes unknown space"},
+      {GridProjectionStatus::kGeofenceViolation, "geofence violation"},
+  };
+  for (const auto& [status, expected_class] : failures) {
+    SCOPED_TRACE(expected_class);
+    RouteCorridor route = routeTo(2.0, 0.0);
+    route.poses.insert(route.poses.begin(), StateVec(1.0, -0.5, 0.25, 0.0));
+    auto project = [status](StateVec& state) {
+      return state.x() == 1.0 ? status : GridProjectionStatus::kSupported;
+    };
+    BoundedGridPlanner planner(StateVec::Zero(), limits(), project,
+                               sampledTraversal({}));
+    const FeasiblePath path = planner.refine(route);
+    EXPECT_EQ(path.status, PlanningStatus::kBlocked);
+    EXPECT_NE(path.reason.find("route corridor waypoint[0] rejected"),
+              std::string::npos);
+    EXPECT_NE(path.reason.find(expected_class), std::string::npos);
+    EXPECT_NE(path.reason.find("(1.00, -0.50, 0.25)"), std::string::npos);
+  }
+}
+
+TEST(GridRefinement, IdentifiesCurrentAndExactGoalProjectionFailures) {
+  auto current_failure = [](StateVec& state) {
+    return state.x() == 0.0 ? GridProjectionStatus::kBodyUnknown
+                            : GridProjectionStatus::kSupported;
+  };
+  BoundedGridPlanner current_planner(StateVec::Zero(), limits(),
+                                     current_failure, sampledTraversal({}));
+  const FeasiblePath current = current_planner.refine(routeTo(2.0, 0.0));
+  EXPECT_NE(current.reason.find("current pose rejected: body includes unknown "
+                                "space at (0.00, 0.00, 0.00)"),
+            std::string::npos);
+
+  RouteCorridor route = routeTo(2.25, -0.25);
+  route.poses = {StateVec(1.0, 0.0, 0.0, 0.0)};
+  auto goal_failure = [](StateVec& state) {
+    return state.x() == 2.25 ? GridProjectionStatus::kGeofenceViolation
+                             : GridProjectionStatus::kSupported;
+  };
+  BoundedGridPlanner goal_planner(StateVec::Zero(), limits(), goal_failure,
+                                  sampledTraversal({}));
+  const FeasiblePath goal = goal_planner.refine(route);
+  EXPECT_NE(goal.reason.find("exact goal rejected: geofence violation at "
+                             "(2.25, -0.25, 0.00)"),
+            std::string::npos);
 }
 
 TEST(GridRefinement, FindsObservedDetourAroundBlockedChord) {
@@ -152,7 +206,9 @@ TEST(GridRefinement, UnknownCellsCannotFormADetour) {
   const std::set<std::pair<int, int>> known{{0, 0}, {1, 0}, {2, 0}};
   auto project = [known](StateVec& state) {
     return known.count({static_cast<int>(std::lround(state.x())),
-                        static_cast<int>(std::lround(state.y()))}) != 0;
+                        static_cast<int>(std::lround(state.y()))}) != 0
+               ? GridProjectionStatus::kSupported
+               : GridProjectionStatus::kBodyUnknown;
   };
   BoundedGridPlanner planner(
       StateVec::Zero(), limits(), project,
@@ -167,7 +223,9 @@ TEST(GridRefinement, DoesNotCutDiagonallyBetweenBlockedCardinalCells) {
   const std::set<std::pair<int, int>> known{{0, 0}, {1, 1}, {2, 2}};
   auto project = [known](StateVec& state) {
     return known.count({static_cast<int>(std::lround(state.x())),
-                        static_cast<int>(std::lround(state.y()))}) != 0;
+                        static_cast<int>(std::lround(state.y()))}) != 0
+               ? GridProjectionStatus::kSupported
+               : GridProjectionStatus::kBodyUnknown;
   };
   auto traverse = [](const StateVec& from, const StateVec& to,
                      std::vector<StateVec>& checked) {
@@ -258,7 +316,7 @@ TEST(GridRefinement, CancellationRaisedByEndpointProjectionIsObserved) {
   auto project = [&cancelled, &projections](StateVec& state) {
     state.z() = 0.0;
     if (++projections == 2) cancelled = true;
-    return true;
+    return GridProjectionStatus::kSupported;
   };
   BoundedGridPlanner planner(StateVec::Zero(), limits(), project,
                              sampledTraversal({}),

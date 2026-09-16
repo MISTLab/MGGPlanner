@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <climits>
 #include <cmath>
+#include <cstdio>
 #include <limits>
 #include <queue>
 #include <string>
@@ -55,6 +56,33 @@ void copyRequest(const RouteCorridor& corridor, FeasiblePath& path) {
 
 bool samePosition(const StateVec& a, const StateVec& b) {
   return (a.head<3>() - b.head<3>()).cwiseAbs().maxCoeff() <= 1e-6;
+}
+
+const char* projectionFailureClass(GridProjectionStatus status) {
+  switch (status) {
+    case GridProjectionStatus::kNoGround:
+      return "no mapped ground support";
+    case GridProjectionStatus::kBodyOccupied:
+      return "body intersects occupied space";
+    case GridProjectionStatus::kBodyUnknown:
+      return "body includes unknown space";
+    case GridProjectionStatus::kGeofenceViolation:
+      return "geofence violation";
+    case GridProjectionStatus::kSupported:
+      return "projector returned an invalid supported state";
+  }
+  return "unknown projection failure";
+}
+
+std::string projectionFailure(const std::string& endpoint,
+                              GridProjectionStatus status,
+                              const StateVec& state) {
+  char reason[256];
+  std::snprintf(reason, sizeof(reason),
+                "%s rejected: %s at (%.2f, %.2f, %.2f)", endpoint.c_str(),
+                projectionFailureClass(status), state.x(), state.y(),
+                state.z());
+  return reason;
 }
 
 double pathLength(const std::vector<StateVec>& path,
@@ -128,24 +156,32 @@ FeasiblePath BoundedGridPlanner::refine(const RouteCorridor& corridor) {
   std::string interruption_reason;
   if (interrupted(interruption_reason)) return fail(interruption_reason);
   StateVec start = current_;
-  const bool start_supported = project_(start);
+  const GridProjectionStatus start_status = project_(start);
   if (interrupted(interruption_reason)) return fail(interruption_reason);
-  if (!start_supported || !start.allFinite()) {
-    return fail("current pose has no supported collision-free grid state");
+  if (start_status != GridProjectionStatus::kSupported ||
+      !start.allFinite()) {
+    return fail(projectionFailure("current pose", start_status, start));
   }
 
   std::vector<StateVec> waypoints;
   waypoints.reserve(corridor.poses.size() + 2);
   waypoints.push_back(start);
-  for (StateVec waypoint : corridor.poses) {
+  for (std::size_t waypoint_index = 0;
+       waypoint_index < corridor.poses.size(); ++waypoint_index) {
+    StateVec waypoint = corridor.poses[waypoint_index];
     if (interrupted(interruption_reason)) return fail(interruption_reason);
     if (!waypoint.allFinite()) {
-      return fail("route corridor has an unsupported endpoint");
+      return fail("route corridor waypoint[" +
+                  std::to_string(waypoint_index) +
+                  "] rejected: state is non-finite");
     }
-    const bool waypoint_supported = project_(waypoint);
+    const GridProjectionStatus waypoint_status = project_(waypoint);
     if (interrupted(interruption_reason)) return fail(interruption_reason);
-    if (!waypoint_supported || !waypoint.allFinite()) {
-      return fail("route corridor has an unsupported endpoint");
+    if (waypoint_status != GridProjectionStatus::kSupported ||
+        !waypoint.allFinite()) {
+      return fail(projectionFailure(
+          "route corridor waypoint[" + std::to_string(waypoint_index) + "]",
+          waypoint_status, waypoint));
     }
     if (!samePosition(waypoints.back(), waypoint)) {
       waypoints.push_back(waypoint);
@@ -157,11 +193,11 @@ FeasiblePath BoundedGridPlanner::refine(const RouteCorridor& corridor) {
   if (!goal.allFinite()) {
     return fail("the exact goal has no supported collision-free grid state");
   }
-  const bool goal_supported = project_(goal);
+  const GridProjectionStatus goal_status = project_(goal);
   if (interrupted(interruption_reason)) return fail(interruption_reason);
   goal[3] = requested_goal_yaw;
-  if (!goal_supported || !goal.allFinite()) {
-    return fail("the exact goal has no supported collision-free grid state");
+  if (goal_status != GridProjectionStatus::kSupported || !goal.allFinite()) {
+    return fail(projectionFailure("exact goal", goal_status, goal));
   }
   if (!samePosition(waypoints.back(), goal)) {
     waypoints.push_back(goal);
@@ -284,9 +320,12 @@ FeasiblePath BoundedGridPlanner::refine(const RouteCorridor& corridor) {
       const double lattice_y = origin_y + static_cast<double>(y) * resolution;
       value.state = StateVec(lattice_x, lattice_y, parent_z, 0.0);
       if (interrupted(reason)) return false;
-      const bool supported = project_(value.state);
+      const GridProjectionStatus projection_status = project_(value.state);
       if (interrupted(reason)) return false;
-      if (!supported || !value.state.allFinite()) return false;
+      if (projection_status != GridProjectionStatus::kSupported ||
+          !value.state.allFinite()) {
+        return false;
+      }
       // Keep the discrete XY identity separate from a small support-probe
       // correction, but reject a projection that jumps into another cell.
       if (std::abs(value.state.x() - lattice_x) > 0.5 * resolution + 1e-9 ||

@@ -19,10 +19,21 @@ struct GridRefinementLimits {
   std::chrono::milliseconds timeout{50};
 };
 
+/// Result of projecting an explicit-route state and checking the full body.
+/// Keeping the rejection class in the callback result lets callers report the
+/// failed check without repeating any map query.
+enum class GridProjectionStatus {
+  kSupported,
+  kNoGround,
+  kBodyOccupied,
+  kBodyUnknown,
+  kGeofenceViolation,
+};
+
 /// Projects a pose onto supported terrain and verifies that the robot's full
 /// footprint fits there. The input z is the nearest parent's driving height;
 /// implementations must fail rather than select an unrelated stacked surface.
-using GridProjectState = std::function<bool(StateVec&)>;
+using GridProjectState = std::function<GridProjectionStatus(StateVec&)>;
 
 /// Verifies a swept segment, including occupancy, footprint, terrain step,
 /// incline, and geofence policy. Unknown space must return false. On success,

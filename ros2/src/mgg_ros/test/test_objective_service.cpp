@@ -506,6 +506,41 @@ TEST(PlannerBackbone, CapturesHomeBeforeMotionAndConnectsOnlyMappedTerrain) {
 
 }
 
+TEST(PlannerBackbone, ExplicitGroundFailureIdentifiesCurrentOrGoal) {
+  rclcpp::NodeOptions options;
+  options.parameter_overrides(
+      {rclcpp::Parameter("map.resolution", 0.05)});
+  using Peer = mgg_ros::PlannerNodeTestPeer;
+
+  auto unsupported_current = std::make_shared<mgg_ros::PlannerNode>(options);
+  Peer::configureBackboneTest(*unsupported_current);
+  Peer::acceptOdometry(*unsupported_current, 0.0, 0.0, 0.075);
+  Peer::observeDestinationSupport(*unsupported_current, 2.0);
+  const mgg::StateVec home(0.0, 0.0, 0.075, 0.0);
+  auto response = Peer::requestObjective(
+      *unsupported_current, mgg::ObjectiveKind::kReturnHome, home);
+  ASSERT_NE(response, nullptr);
+  EXPECT_NE(response->reason.find(
+                "current pose rejected: no mapped ground support at "
+                "(0.00, 0.00,"),
+            std::string::npos)
+      << response->reason;
+
+  auto unsupported_goal = std::make_shared<mgg_ros::PlannerNode>(options);
+  Peer::configureBackboneTest(*unsupported_goal);
+  Peer::acceptOdometry(*unsupported_goal, 0.0, 0.0, 0.075);
+  Peer::observeGroundSupport(*unsupported_goal);
+  const mgg::StateVec distant_goal(10.0, 0.0, 0.075, 0.0);
+  response = Peer::requestObjective(
+      *unsupported_goal, mgg::ObjectiveKind::kReturnHome, distant_goal);
+  ASSERT_NE(response, nullptr);
+  EXPECT_NE(response->reason.find(
+                "goal rejected: no mapped ground support at "
+                "(10.00, 0.00,"),
+            std::string::npos)
+      << response->reason;
+}
+
 TEST(PlannerBackbone, DelayedSupportBackfillsBentTrajectoryBeyondParentRadius) {
   rclcpp::NodeOptions options;
   options.parameter_overrides(
@@ -857,6 +892,10 @@ TEST_F(ObjectiveService, NewObstacleBlocksExplicitHomeThroughActualService) {
   ASSERT_NE(response, nullptr);
   EXPECT_EQ(response->status, Service::Response::BLOCKED);
   EXPECT_TRUE(response->path.empty());
+  EXPECT_NE(response->reason.find("route corridor waypoint["),
+            std::string::npos);
+  EXPECT_NE(response->reason.find("body intersects occupied space at"),
+            std::string::npos);
 }
 
 TEST_F(ObjectiveService, GridHomeDetoursOnObservedGroundAndBlocksWall) {
@@ -954,6 +993,10 @@ TEST_F(ObjectiveService, GridRejectsSingleUnknownBodyVoxelWithZeroOffset) {
   ASSERT_NE(response, nullptr);
   EXPECT_EQ(response->status, Service::Response::BLOCKED) << response->reason;
   EXPECT_TRUE(response->path.empty());
+  EXPECT_NE(response->reason.find("route corridor waypoint[0] rejected"),
+            std::string::npos);
+  EXPECT_NE(response->reason.find("body includes unknown space at"),
+            std::string::npos);
 }
 
 TEST_F(ObjectiveService, GridGeofenceRejectsStationaryAndCrossingRoutes) {
@@ -977,6 +1020,8 @@ TEST_F(ObjectiveService, GridGeofenceRejectsStationaryAndCrossingRoutes) {
   ASSERT_NE(response, nullptr);
   EXPECT_EQ(response->status, Service::Response::BLOCKED) << response->reason;
   EXPECT_TRUE(response->path.empty());
+  EXPECT_NE(response->reason.find("current pose rejected: geofence violation at"),
+            std::string::npos);
 
   Peer::setGridGeofence(*planner, 0.85, 0.95, -1.3, 1.3);
   goal->goal.position.x = 0.0;

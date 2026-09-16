@@ -1,6 +1,7 @@
 #include "mgg_core/planning_stages.h"
 
 #include <algorithm>
+#include <cstdio>
 #include <utility>
 
 namespace mgg {
@@ -43,9 +44,24 @@ RouteCorridor TopologicalGoalPlanner::plan(
   // Both ends must bind to the active graph.  An unbounded source lookup can
   // turn a lone home landmark into an apparently valid one-pose route after
   // the robot has travelled far beyond the last admitted breadcrumb.
-  if (!graph.getNearestVertexInRange(&current, goal_vertex_tolerance_, &source) ||
-      !graph.getNearestVertexInRange(&goal, goal_vertex_tolerance_, &target)) {
-    result.reason = "current pose or goal is outside the graph";
+  if (!graph.getNearestVertexInRange(&current, goal_vertex_tolerance_,
+                                     &source)) {
+    char reason[192];
+    std::snprintf(reason, sizeof(reason),
+                  "current pose is outside the graph tolerance %.2f m at "
+                  "(%.2f, %.2f, %.2f)",
+                  goal_vertex_tolerance_, current.x(), current.y(),
+                  current.z());
+    result.reason = reason;
+    return result;
+  }
+  if (!graph.getNearestVertexInRange(&goal, goal_vertex_tolerance_, &target)) {
+    char reason[192];
+    std::snprintf(reason, sizeof(reason),
+                  "goal is outside the graph tolerance %.2f m at "
+                  "(%.2f, %.2f, %.2f)",
+                  goal_vertex_tolerance_, goal.x(), goal.y(), goal.z());
+    result.reason = reason;
     return result;
   }
 
