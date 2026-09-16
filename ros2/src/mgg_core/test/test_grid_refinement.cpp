@@ -553,6 +553,70 @@ TEST(GridRefinement, GoalBiasedSearchBoundsMapQueriesOnWideDetourGrid) {
   EXPECT_NEAR(path.poses.back().x(), 20.0, 1e-9);
 }
 
+TEST(GridRefinement, MemoizesRepeatedKnownIncomingHeightKeys) {
+  GridRefinementLimits bounded = limits();
+  bounded.resolution_m = 0.25;
+  bounded.detour_margin_m = 4.0;
+  bounded.max_cells = 8192;
+  bounded.max_expansions = 2048;
+  bounded.timeout = std::chrono::milliseconds(500);
+  std::map<std::array<double, 3>, std::size_t> projection_calls;
+  auto ramp = [&projection_calls](StateVec& state) {
+    // Endpoint qualification happens outside the cell store. Count only
+    // interior lattice projections so repeated calls identify ensureCell.
+    if (state.x() > 0.5 && state.x() < 19.5) {
+      ++projection_calls[{state.x(), state.y(), state.z()}];
+    }
+    state.z() = 0.025 * state.x() + 0.010 * state.y();
+    return GridProjectionStatus::kSupported;
+  };
+  BoundedGridPlanner planner(
+      StateVec::Zero(), bounded, ramp,
+      sampledTraversal({Eigen::Vector2d(10.0, -1.0)}));
+
+  const FeasiblePath path = planner.refine(routeTo(20.0, -2.0));
+
+  ASSERT_EQ(path.status, PlanningStatus::kSucceeded) << path.reason;
+  ASSERT_FALSE(projection_calls.empty());
+  EXPECT_TRUE(std::all_of(
+      projection_calls.begin(), projection_calls.end(), [](const auto& call) {
+        return call.second == 1u;
+      }));
+}
+
+TEST(GridRefinement, FullKnownIncomingMemoFallsBackToProjection) {
+  GridRefinementLimits bounded = limits();
+  bounded.resolution_m = 0.25;
+  bounded.detour_margin_m = 4.0;
+  bounded.max_cells = 300;
+  bounded.max_expansions = 2048;
+  bounded.timeout = std::chrono::milliseconds(500);
+  std::size_t projections = 0;
+  std::map<std::array<double, 3>, std::size_t> projection_calls;
+  auto ramp = [&projections, &projection_calls](StateVec& state) {
+    ++projections;
+    if (state.x() > 0.5 && state.x() < 19.5) {
+      ++projection_calls[{state.x(), state.y(), state.z()}];
+    }
+    state.z() = 0.025 * state.x() + 0.010 * state.y();
+    return GridProjectionStatus::kSupported;
+  };
+  BoundedGridPlanner planner(
+      StateVec::Zero(), bounded, ramp,
+      sampledTraversal({Eigen::Vector2d(10.0, -1.0)}));
+
+  const FeasiblePath path = planner.refine(routeTo(20.0, -2.0));
+
+  ASSERT_EQ(path.status, PlanningStatus::kSucceeded) << path.reason;
+  EXPECT_NEAR(path.poses.back().x(), 20.0, 1e-9);
+  EXPECT_NEAR(path.poses.back().y(), -2.0, 1e-9);
+  EXPECT_GT(projections, bounded.max_cells);
+  EXPECT_TRUE(std::any_of(
+      projection_calls.begin(), projection_calls.end(), [](const auto& call) {
+        return call.second > 1u;
+      }));
+}
+
 TEST(GridRefinement, SparseSearchReachesFarDiagonalBeyondDenseAreaLimit) {
   GridRefinementLimits bounded = limits();
   bounded.resolution_m = 0.5;

@@ -483,6 +483,9 @@ FeasiblePath BoundedGridPlanner::refine(const RouteCorridor& corridor) {
         {limits_.max_cells, limits_.max_expansions, std::size_t{4096}}));
     std::unordered_map<CellKey, std::size_t, CellKeyHash> cell_lookup;
     cell_lookup.reserve(cells.capacity());
+    std::unordered_map<CellKey, std::size_t, CellKeyHash>
+        known_incoming_lookup;
+    known_incoming_lookup.reserve(cells.capacity());
     const auto index = [nx](std::size_t x, std::size_t y) {
       return y * nx + x;
     };
@@ -496,6 +499,11 @@ FeasiblePath BoundedGridPlanner::refine(const RouteCorridor& corridor) {
       const auto found = cell_lookup.find(key);
       if (found != cell_lookup.end()) {
         return cells[found->second].valid ? found->second : kNoParent;
+      }
+      const auto known_incoming = known_incoming_lookup.find(key);
+      if (known_incoming != known_incoming_lookup.end()) {
+        return cells[known_incoming->second].valid ? known_incoming->second
+                                                   : kNoParent;
       }
       if (cells.size() >= limits_.max_cells) {
         reason = "grid refinement exceeded the cell limit";
@@ -534,6 +542,14 @@ FeasiblePath BoundedGridPlanner::refine(const RouteCorridor& corridor) {
             // so lookup memory remains bounded by twice max_cells.
             cell_lookup.erase(key);
             cells.pop_back();
+            // The immutable planner snapshot makes this exact incoming-height
+            // alias stable for the rest of refine(). Keep it outside the node
+            // lookup so node-owned keys retain their existing 2*max_cells
+            // bound; once the separate max_cells memo is full, safely fall
+            // back to the projection path above.
+            if (known_incoming_lookup.size() < limits_.max_cells) {
+              known_incoming_lookup.emplace(key, canonical_node);
+            }
             return cells[canonical_node].valid ? canonical_node : kNoParent;
           }
           cell_lookup.emplace(canonical, node);
