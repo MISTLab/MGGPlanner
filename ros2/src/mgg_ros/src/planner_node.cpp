@@ -1072,13 +1072,15 @@ std::string PlannerNode::buildLocalGraph(bool strict_projected_endpoints) {
 }
 
 bool PlannerNode::projectStateToDrivingHeight(mgg::StateVec& state,
-                                              bool preserve_xy) const {
+                                              bool preserve_xy,
+                                              bool accept_ground_above_sample) const {
   if (robot_params_.type != mgg::RobotType::kGroundRobot) return true;
   const Eigen::Vector2d requested_xy = state.head<2>();
   Eigen::Vector3d pos(state[0], state[1], state[2]);
   mgg::VoxelStatus status;
   const double ground_height = ground_->projectSample(pos, status);
-  if (status != mgg::VoxelStatus::kOccupied || ground_height < 0.0) {
+  if (status != mgg::VoxelStatus::kOccupied || !std::isfinite(ground_height) ||
+      (!accept_ground_above_sample && ground_height < 0.0)) {
     return false;
   }
   if (preserve_xy &&
@@ -1087,8 +1089,75 @@ bool PlannerNode::projectStateToDrivingHeight(mgg::StateVec& state,
   }
   state[0] = preserve_xy ? requested_xy.x() : pos[0];
   state[1] = preserve_xy ? requested_xy.y() : pos[1];
-  state[2] = pos[2] - (ground_height - planning_params_.max_ground_height);
-  return true;
+  const double projected_z =
+      pos[2] - (ground_height - planning_params_.max_ground_height);
+  if (!std::isfinite(projected_z)) return false;
+  state[2] = projected_z;
+  return state.allFinite();
+}
+
+bool PlannerNode::resolveNavigateGoalDrivingHeight(
+    mgg::StateVec& state) const {
+  if (robot_params_.type != mgg::RobotType::kGroundRobot) {
+    return projectStateToDrivingHeight(state, true);
+  }
+  if (!state.allFinite() || !ground_ || !map_ ||
+      !std::isfinite(robot_params_.size.z()) || robot_params_.size.z() < 0.0 ||
+      !std::isfinite(planning_params_.max_ground_height) ||
+      !std::isfinite(ground_->max_projection_length) ||
+      ground_->max_projection_length <= 0.0) {
+    return false;
+  }
+  const double resolution = map_->getResolution();
+  if (!std::isfinite(resolution) || resolution <= 0.0) return false;
+  const double map_extent = resolution * 32768.0;
+  if (!std::isfinite(map_extent) || map_extent <= 0.0 ||
+      (state.head<3>().cwiseAbs().array() >= map_extent).any()) {
+    return false;
+  }
+  if (projectStateToDrivingHeight(state, true)) return true;
+
+  // A UI goal carries navigation-base Z, which is often the robot's current
+  // height even when distant road terrain has risen gradually. Search upward
+  // in bounded vertical bands for the first observed surface at the exact XY.
+  // The resulting pose is still only an A* endpoint: footprint, body,
+  // geofence, step, inclination, and swept-edge checks must connect it from
+  // the current pose before any command path is emitted.
+  constexpr std::size_t kMaxHeightProbes = 64;
+  const mgg::StateVec requested = state;
+  const double navigation_to_driving =
+      planning_params_.max_ground_height - robot_params_.size.z() / 2.0;
+  const double band = std::max(0.20, 2.0 * resolution);
+  const double search_limit = ground_->max_projection_length;
+  const double stride =
+      std::max(band, search_limit / double(kMaxHeightProbes - 1));
+  const double requested_ground = requested.z() - robot_params_.size.z() / 2.0;
+  if (!std::isfinite(navigation_to_driving) || !std::isfinite(stride) ||
+      !std::isfinite(requested_ground)) {
+    return false;
+  }
+
+  for (std::size_t probe = 0; probe < kMaxHeightProbes; ++probe) {
+    const double lift = std::min(search_limit, probe * stride);
+    mgg::StateVec candidate = requested;
+    candidate.z() += navigation_to_driving + lift;
+    if (!candidate.allFinite() ||
+        (candidate.head<3>().cwiseAbs().array() >= map_extent).any()) {
+      return false;
+    }
+    if (projectStateToDrivingHeight(candidate, true, true)) {
+      const double resolved_ground =
+          candidate.z() - planning_params_.max_ground_height;
+      const double rise = resolved_ground - requested_ground;
+      if (std::isfinite(rise) && rise >= -1e-6 &&
+          rise <= search_limit + 1e-6) {
+        state = candidate;
+        return true;
+      }
+    }
+    if (lift >= search_limit) break;
+  }
+  return false;
 }
 
 mgg::StateVec PlannerNode::physicalAnchorAtDrivingHeight(
@@ -2205,14 +2274,27 @@ mgg::FeasiblePath PlannerNode::refineCorridor(
                         &footprintTerrainStatus](mgg::StateVec& state) {
     bool physical_anchor_fallback = false;
     const bool physical_current = isPhysicalCurrent(state);
+    const bool at_physical_current_xy =
+        (state.head<2>() - current_anchor.head<2>())
+            .cwiseAbs().maxCoeff() <= 1e-6;
     if (robot_params_.type == mgg::RobotType::kGroundRobot) {
+      const bool exact_navigate_goal =
+          corridor.request.objective == mgg::ObjectiveKind::kNavigate &&
+          (state.head<2>() - corridor.request.goal.pose.head<2>())
+                  .cwiseAbs().maxCoeff() <= 1e-6;
       const bool exact_explicit_goal =
           (corridor.request.objective == mgg::ObjectiveKind::kNavigate ||
            corridor.request.objective == mgg::ObjectiveKind::kReturnHome) &&
           (state.head<2>() - corridor.request.goal.pose.head<2>())
                   .cwiseAbs().maxCoeff() <= 1e-6;
-      if (!ground_ ||
-          !projectStateToDrivingHeight(state, exact_explicit_goal)) {
+      const bool resolve_exact_navigate_height =
+          exact_navigate_goal && !at_physical_current_xy;
+      const bool height_projected =
+          ground_ &&
+          (resolve_exact_navigate_height
+               ? resolveNavigateGoalDrivingHeight(state)
+               : projectStateToDrivingHeight(state, exact_explicit_goal));
+      if (!height_projected) {
         if (provisional_unknown_ground_) {
           // Unknown terrain carries no height evidence. Continue from the
           // physical robot's current driving plane without modifying XY/yaw;
@@ -2873,7 +2955,18 @@ void PlannerNode::onObjectiveRequest(
         // A distant unsupported goal may still receive a checked local proxy;
         // its exact terrain is assessed only when a later horizon reaches it.
         mgg::StateVec projected_goal = graph_request.goal.pose;
-        if (projectStateToDrivingHeight(projected_goal, true)) {
+        const bool navigate_goal_is_current =
+            core.objective == mgg::ObjectiveKind::kNavigate &&
+            (projected_goal.head<2>() - current_state_.head<2>())
+                    .cwiseAbs().maxCoeff() <= 1e-6;
+        const bool resolve_exact_navigate_height =
+            core.objective == mgg::ObjectiveKind::kNavigate &&
+            !navigate_goal_is_current;
+        const bool projected_goal_supported =
+            resolve_exact_navigate_height
+                ? resolveNavigateGoalDrivingHeight(projected_goal)
+                : projectStateToDrivingHeight(projected_goal, true);
+        if (projected_goal_supported) {
           graph_request.goal.pose = projected_goal;
         }
         mgg::TopologicalGoalPlanner objective_planner(

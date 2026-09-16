@@ -359,6 +359,30 @@ class PlannerNodeTestPeer {
     acceptOdometry(node, 0.0, 0.0, 0.075);
   }
 
+  static void configureLongKnownRamp(PlannerNode& node) {
+    configureBackboneTest(node);
+    acceptOdometry(node, 0.0, 0.0, 0.075);
+    const std::lock_guard<std::recursive_mutex> lock(node.planner_mutex_);
+    node.objective_grid_limits_.resolution_m = 0.20;
+    node.objective_grid_limits_.detour_margin_m = 0.50;
+    node.objective_grid_limits_.max_cells = 4096;
+    node.objective_grid_limits_.max_expansions = 4096;
+    node.objective_grid_limits_.timeout = std::chrono::milliseconds(1000);
+    std::vector<Eigen::Vector3d> floor;
+    for (int x = -4; x <= 64; ++x) {
+      const double world_x = x * 0.05 + 0.025;
+      const double ground_z = std::max(0.0, 0.10 * world_x) + 0.025;
+      for (int y = -12; y <= 12; ++y) {
+        floor.emplace_back(world_x, y * 0.05 + 0.025, ground_z);
+      }
+    }
+    for (int repeat = 0; repeat < 6; ++repeat) {
+      node.cloud_map_->insertPointCloud(floor,
+                                        Eigen::Vector3d(1.5, 0.0, 1.5));
+    }
+    ++node.map_revision_;
+  }
+
   static void configureNavigateGraphCorridor(
       PlannerNode& node, const std::vector<mgg::StateVec>& poses) {
     configureGridServiceScene(node, 0.0, 1.0);
@@ -1829,6 +1853,70 @@ TEST(PlannerObjective, NavigateCompletesThirtyMetreKnownRoadExactly) {
   EXPECT_NEAR(response->path.back().position.y, exact_goal.y(), 1e-3);
 }
 
+TEST(PlannerObjective, NavigateResolvesStaleStartHeightAcrossLongShallowRamp) {
+  rclcpp::NodeOptions options;
+  options.parameter_overrides(
+      {rclcpp::Parameter("map.resolution", 0.05),
+       rclcpp::Parameter("objective_ground_evidence_policy",
+                         "provisional_unknown"),
+       rclcpp::Parameter("objective_body_evidence_policy", "observed_ground"),
+       rclcpp::Parameter("use_sim_time", true)});
+  auto planner = std::make_shared<mgg_ros::PlannerNode>(options);
+  using Peer = mgg_ros::PlannerNodeTestPeer;
+  Peer::configureLongKnownRamp(*planner);
+
+  // Goal Z deliberately retains the starting base height. The endpoint's
+  // locally flat ground is 30 cm higher, reached by a continuous 10% grade.
+  const mgg::StateVec goal(3.0, 0.0, 0.075, 0.4);
+  const auto response = Peer::requestBoundNavigate(*planner, goal);
+
+  ASSERT_NE(response, nullptr);
+  ASSERT_EQ(response->status, Service::Response::SUCCEEDED)
+      << response->reason;
+  ASSERT_FALSE(response->path.empty());
+  EXPECT_NEAR(response->path.back().position.x, goal.x(), 1e-3);
+  EXPECT_NEAR(response->path.back().position.y, goal.y(), 1e-3);
+  EXPECT_NEAR(response->path.back().position.z, 0.4025, 0.03);
+  EXPECT_NEAR(response->path.back().orientation.z, std::sin(0.2), 1e-6);
+  EXPECT_NEAR(response->path.back().orientation.w, std::cos(0.2), 1e-6);
+}
+
+TEST(PlannerObjective, NavigateHeightResolutionCannotTeleportOntoCeiling) {
+  rclcpp::NodeOptions options;
+  options.parameter_overrides(
+      {rclcpp::Parameter("map.resolution", 0.05),
+       rclcpp::Parameter("objective_ground_evidence_policy",
+                         "provisional_unknown"),
+       rclcpp::Parameter("objective_body_evidence_policy", "observed_ground"),
+       rclcpp::Parameter("use_sim_time", true)});
+  using Peer = mgg_ros::PlannerNodeTestPeer;
+  const auto make = [&options] {
+    auto planner = std::make_shared<mgg_ros::PlannerNode>(options);
+    Peer::configureBackboneTest(*planner);
+    Peer::acceptOdometry(*planner, 0.0, 0.0, 0.075);
+    Peer::observeGroundRectangleAt(*planner, -0.3, 0.3, -0.3, 0.3, 0.40);
+    return planner;
+  };
+
+  auto stationary = make();
+  const auto turn = Peer::requestBoundNavigate(
+      *stationary, mgg::StateVec(0.0, 0.0, 0.0, 0.8));
+  ASSERT_NE(turn, nullptr);
+  ASSERT_EQ(turn->status, Service::Response::SUCCEEDED) << turn->reason;
+  ASSERT_EQ(turn->path.size(), 1u);
+  EXPECT_NEAR(turn->path.front().position.z, 0.075, 1e-6);
+  EXPECT_NEAR(turn->path.front().orientation.z, std::sin(0.4), 1e-6);
+  EXPECT_NEAR(turn->path.front().orientation.w, std::cos(0.4), 1e-6);
+
+  auto near = make();
+  const auto cannot_climb = Peer::requestBoundNavigate(
+      *near, mgg::StateVec(0.01, 0.0, 0.0, 0.0));
+  ASSERT_NE(cannot_climb, nullptr);
+  EXPECT_EQ(cannot_climb->status, Service::Response::BLOCKED)
+      << cannot_climb->reason;
+  EXPECT_TRUE(cannot_climb->path.empty());
+}
+
 TEST(PlannerObjective, NavigateUsesHelpfulGraphBeforeUnknownExactSuffix) {
   rclcpp::NodeOptions options;
   options.parameter_overrides(
@@ -2154,6 +2242,17 @@ TEST(PlannerObjective, PartialProxyHonorsPlatformStepCapInOctomap) {
       EXPECT_FALSE(response->partial);
       EXPECT_TRUE(response->path.empty());
     }
+
+    // Resolving a stale start-height goal onto known raised terrain does not
+    // waive the edge step limit. The sharp Scout curb remains blocked, while
+    // terrain within each platform's configured limit retains its result.
+    const auto stale_height_response = Peer::requestBoundNavigate(
+        *planner, mgg::StateVec(1.50, 0.0, 0.075, 0.0));
+    ASSERT_NE(stale_height_response, nullptr);
+    EXPECT_EQ(stale_height_response->status,
+              scenario.accepted ? Service::Response::SUCCEEDED
+                                : Service::Response::BLOCKED)
+        << stale_height_response->reason;
   }
 }
 

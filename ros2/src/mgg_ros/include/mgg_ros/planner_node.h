@@ -128,7 +128,9 @@ class PlannerNode : public rclcpp::Node {
   void updateGlobalGraph();
   void stageGlobalBreadcrumbs(const mgg::StateVec& state);
   bool projectStateToDrivingHeight(mgg::StateVec& state,
-                                   bool preserve_xy = false) const;
+                                   bool preserve_xy = false,
+                                   bool accept_ground_above_sample = false) const;
+  bool resolveNavigateGoalDrivingHeight(mgg::StateVec& state) const;
   mgg::StateVec physicalAnchorAtDrivingHeight(
       const mgg::StateVec& base_pose) const;
   bool validateObjectiveStartSupport(
