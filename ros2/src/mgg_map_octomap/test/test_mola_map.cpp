@@ -114,7 +114,8 @@ class Publication {
                                   Eigen::Isometry3d::Identity(),
                               std::string artifact_snapshot_id = {},
                               std::string artifact_source_digest = {},
-                              double surface_fraction = 0.5) {
+                              double surface_fraction = 0.5,
+                              std::size_t retired = 0) {
     std::sort(occupied.begin(), occupied.end(), less);
     std::sort(free.begin(), free.end(), less);
     free.erase(std::remove_if(free.begin(), free.end(), [&](const Voxel& value) {
@@ -123,7 +124,9 @@ class Publication {
     const std::string geometry(64, static_cast<char>('a' + revision));
     const std::string snapshot_id(64, static_cast<char>('1' + revision));
     const std::uint64_t source_stamp = 1000 + revision;
-    const std::size_t points = occupied.size();
+    // Every stored point is either a surface sample or an endpoint the builder
+    // retired because later qualified rays saw through its voxel.
+    const std::size_t points = occupied.size() + retired;
     const json chunk{{"sha256", std::string(64, 'c')},
                      {"size_bytes", 16 + 12 * points},
                      {"point_count", points},
@@ -173,7 +176,8 @@ class Publication {
         {"point_count", points},
         {"occupied_count", occupied.size()},
         {"free_count", free.size()},
-        {"surface_count", points},
+        {"surface_count", occupied.size()},
+        {"retired_count", retired},
         {"ray_steps", free.empty() ? 0 : free.size()},
         {"qualified_ray_keyframes", qualified ? 1 : 0}};
     const std::string metadata_bytes = metadata.dump();
@@ -272,6 +276,108 @@ TEST(MolaMap, LoadsQualifiedTernaryMapAndAppliesFullSe3) {
             VoxelStatus::kUnknown);
   EXPECT_FALSE(map->augmentFreeBox(free_navigation + Eigen::Vector3d(5, 0, 0),
                                    Eigen::Vector3d::Ones()));
+}
+
+// Rewrites a published grid's SDMGRID1 metadata and restates the index
+// descriptors, so a test can present one specific contract violation.
+void rewriteGridMetadata(const std::filesystem::path& root,
+                         const std::function<void(json&)>& mutate) {
+  const auto grid_path = root / "mola" / "components" / "native.sdpg";
+  const std::string grid = readFile(grid_path);
+  ASSERT_GT(grid.size(), 12u);
+  std::uint32_t metadata_size = 0;
+  for (unsigned int i = 0; i < 4; ++i)
+    metadata_size |= static_cast<std::uint32_t>(
+                         static_cast<unsigned char>(grid.at(8 + i)))
+                     << (8 * i);
+  json metadata = json::parse(grid.substr(12, metadata_size));
+  mutate(metadata);
+  const std::string metadata_bytes = metadata.dump();
+  std::string replacement("SDMGRID1", 8);
+  u32(replacement, static_cast<std::uint32_t>(metadata_bytes.size()));
+  replacement += metadata_bytes;
+  replacement += grid.substr(12 + metadata_size);
+  write(grid_path, replacement);
+  json index = json::parse(readFile(root / "mola" / "index.json"));
+  index["artifacts"][0]["planner"]["size_bytes"] = replacement.size();
+  index["artifacts"][0]["planner"]["sha256"] = sha256(replacement);
+  write(root / "mola" / "index.json", index.dump());
+}
+
+std::vector<Voxel> freeBlockWithout(const Voxel& endpoint) {
+  auto result = freeBlock();
+  result.erase(std::remove_if(result.begin(), result.end(),
+                              [&](const Voxel& value) {
+                                return value.x == endpoint.x &&
+                                       value.y == endpoint.y &&
+                                       value.z == endpoint.z;
+                              }),
+               result.end());
+  return result;
+}
+
+// Visibility retirement. A peer robot captured beside this one leaves an
+// occupied voxel and terrain surface samples that obstacle expiry alone cannot
+// disprove, so the builder drops both once later qualified rays have seen
+// through the voxel. The retired endpoint keeps its place in point_count, which
+// every reader still cross-checks against the manifest chunks.
+TEST(MolaMap, AcceptsVisibilityRetiredEndpointsAgainstStoredPointCount) {
+  Publication publication;
+  const Voxel endpoint{10, 0, 2};
+  const auto request = publication.publish(
+      0, {endpoint}, freeBlockWithout(endpoint), true,
+      Eigen::Isometry3d::Identity(), {}, {}, 0.5, 1);
+  MolaMap provider(config(publication));
+  provider.requestSnapshot(request);
+  ASSERT_TRUE(waitFor([&]() { return provider.getStatus(); }))
+      << provider.lastError();
+  EXPECT_EQ(provider.getVoxelStatus({2.1, 0.1, 0.5}), VoxelStatus::kOccupied);
+  EXPECT_EQ(provider.getVoxelStatus({0.1, 0.1, 0.1}), VoxelStatus::kFree);
+}
+
+TEST(MolaMap, RejectsSurfaceAndRetiredCountsBelowStoredPointCount) {
+  Publication publication;
+  const Voxel endpoint{10, 0, 2};
+  const auto request = publication.publish(
+      0, {endpoint}, freeBlockWithout(endpoint), true,
+      Eigen::Isometry3d::Identity(), {}, {}, 0.5, 1);
+  // Claim nothing was retired while the manifest still stores two points.
+  rewriteGridMetadata(publication.root,
+                      [](json& metadata) { metadata["retired_count"] = 0; });
+  MolaMap provider(config(publication));
+  provider.requestSnapshot(request);
+  ASSERT_TRUE(waitFor([&]() { return !provider.lastError().empty(); }));
+  EXPECT_FALSE(provider.getStatus());
+  EXPECT_NE(provider.lastError().find("surfaces do not match source points"),
+            std::string::npos)
+      << provider.lastError();
+}
+
+TEST(MolaMap, RejectsAGridWithoutARetiredCount) {
+  Publication publication;
+  const auto request = publication.publish(0, {{5, 0, 0}}, freeBlock());
+  rewriteGridMetadata(publication.root,
+                      [](json& metadata) { metadata.erase("retired_count"); });
+  MolaMap provider(config(publication));
+  provider.requestSnapshot(request);
+  ASSERT_TRUE(waitFor([&]() { return !provider.lastError().empty(); }));
+  EXPECT_FALSE(provider.getStatus());
+  EXPECT_NE(provider.lastError().find("metadata fields are invalid"),
+            std::string::npos)
+      << provider.lastError();
+}
+
+TEST(MolaMap, RejectsRetirementWithoutQualifiedRayEvidence) {
+  Publication publication;
+  const auto request = publication.publish(
+      0, {{5, 0, 0}}, {}, false, Eigen::Isometry3d::Identity(), {}, {}, 0.5, 1);
+  MolaMap provider(config(publication));
+  provider.requestSnapshot(request);
+  ASSERT_TRUE(waitFor([&]() { return !provider.lastError().empty(); }));
+  EXPECT_FALSE(provider.getStatus());
+  EXPECT_NE(provider.lastError().find("lack qualified ray evidence"),
+            std::string::npos)
+      << provider.lastError();
 }
 
 TEST(MolaMap, InvalidAndUnrepresentableQueriesRemainUnknown) {

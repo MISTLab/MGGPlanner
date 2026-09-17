@@ -148,11 +148,26 @@ class PlannerNode : public rclcpp::Node {
     mgg_msgs::msg::MappingSnapshot mapping_snapshot;
   };
   IndexedQueryContext indexedQueryContext() const;
+  /// Validates a refined route against the indexed terrain authority.
+  ///
+  /// \param allow_prefix_truncation qualified Explore may shorten the route to
+  ///   its last fully checked measured sample after any rejection.
+  /// \param allow_bounded_unknown_tail qualified Navigate/Home may retain a
+  ///   bounded unmeasured tail behind physical provenance.
+  /// \param allow_continuable_prefix Navigate/Home may shorten the route to its
+  ///   last fully checked measured sample when the only rejection is that the
+  ///   terrain ahead is unmeasured or lies beyond the provisional connector
+  ///   bound. Known impassable terrain still fails closed.
+  /// \param truncated_to_validated_prefix set when the emitted route is a
+  ///   strict prefix of the requested one, so the caller resumes its committed
+  ///   objective from that exact endpoint instead of the requested horizon.
   bool queryIndexedMap(mgg::FeasiblePath& path,
                        const IndexedQueryContext& context,
                        bool allow_height_refinement = false,
                        bool allow_prefix_truncation = false,
-                       bool allow_bounded_unknown_tail = false);
+                       bool allow_bounded_unknown_tail = false,
+                       bool allow_continuable_prefix = false,
+                       bool* truncated_to_validated_prefix = nullptr);
   void publishOwnGraph();
   void publishPath();
   void publishMarkers();

@@ -198,6 +198,41 @@ double widestObjectiveGridMargin(const mgg::RouteCorridor& corridor,
   return selected;
 }
 
+/// XY arc length of an emitted local section, measured from the pose the route
+/// started at. Only XY is used: the graph plane and the navigation base plane
+/// differ solely in Z, so this length is the same in both.
+double emittedSectionXyLength(const mgg::StateVec& start,
+                              const std::vector<mgg::StateVec>& poses) {
+  double length = 0.0;
+  Eigen::Vector2d previous = start.head<2>();
+  for (const mgg::StateVec& pose : poses) {
+    length += (pose.head<2>() - previous).norm();
+    previous = pose.head<2>();
+  }
+  return length;
+}
+
+/// Replays the bounded objective window walk to report how many global route
+/// poses a section of the given XY length actually consumed. The window walk
+/// and this replay share one arc-length coordinate, so a section that the
+/// indexed authority shortened resumes exactly where it stopped instead of
+/// where its horizon had asked to stop.
+std::size_t objectiveRouteIndexAfterLength(
+    const std::vector<mgg::StateVec>& poses, std::size_t begin,
+    const mgg::StateVec& start, double length) {
+  std::size_t index = std::min(begin, poses.size());
+  double remaining = std::isfinite(length) ? std::max(0.0, length) : 0.0;
+  Eigen::Vector2d previous = start.head<2>();
+  while (index < poses.size()) {
+    const double distance = (poses[index].head<2>() - previous).norm();
+    if (!std::isfinite(distance) || distance > remaining + 1e-6) break;
+    remaining -= distance;
+    previous = poses[index].head<2>();
+    ++index;
+  }
+  return index;
+}
+
 }  // namespace
 
 PlannerNode::PlannerNode(const rclcpp::NodeOptions& options)
@@ -2225,8 +2260,11 @@ bool PlannerNode::queryIndexedMap(mgg::FeasiblePath& path,
                                   const IndexedQueryContext& context,
                                   bool allow_height_refinement,
                                   bool allow_prefix_truncation,
-                                  bool allow_bounded_unknown_tail) {
+                                  bool allow_bounded_unknown_tail,
+                                  bool allow_continuable_prefix,
+                                  bool* truncated_to_validated_prefix) {
   path.indexed_map_validated = false;
+  if (truncated_to_validated_prefix) *truncated_to_validated_prefix = false;
   if (!indexed_map_client_) return true;
   const auto fail = [&path](mgg::PlanningStatus status,
                             const std::string& reason) {
@@ -2247,6 +2285,15 @@ bool PlannerNode::queryIndexedMap(mgg::FeasiblePath& path,
       allow_prefix_truncation && qualified_height_refinement_allowed;
   const bool bounded_unknown_tail_allowed =
       allow_bounded_unknown_tail && qualified_height_refinement_allowed;
+  // A committed Navigate/Home objective may outrun the measured floor. Driving
+  // the strictly validated part of the section is never weaker than the route
+  // the native planner already approved, so this needs no provisional-ground
+  // qualification: it only ever emits samples that passed every check below,
+  // and only when the rejection was the absence of terrain evidence rather
+  // than evidence of a hazard.
+  const bool continuable_prefix_allowed =
+      allow_continuable_prefix &&
+      context.robot_type != mgg::RobotType::kAerialRobot;
   bool height_refinement_available = qualified_height_refinement_allowed;
   static const std::regex kDigest("^[0-9a-fA-F]{64}$");
   if (path.component_id.empty() ||
@@ -2511,7 +2558,22 @@ bool PlannerNode::queryIndexedMap(mgg::FeasiblePath& path,
         count, std::numeric_limits<double>::quiet_NaN());
     std::optional<std::size_t> prefix_end;
     std::optional<std::size_t> first_refinement_sample;
-    const auto validate_route = [&]() -> std::optional<std::string> {
+    // Why a route was rejected decides whether its validated prefix may still
+    // be driven. Absent terrain evidence ahead (unknown occupancy, an
+    // unmeasured interval, an over-long provisional connector) is a horizon
+    // that later observations can move. Every other rejection is evidence of a
+    // hazard and fails the whole section closed.
+    struct Rejection {
+      std::string reason;
+      bool unmeasured_ahead = false;
+    };
+    const auto hazard = [](std::string reason) {
+      return Rejection{std::move(reason), false};
+    };
+    const auto unmeasured = [](std::string reason) {
+      return Rejection{std::move(reason), true};
+    };
+    const auto validate_route = [&]() -> std::optional<Rejection> {
       for (std::size_t i = 0; i < count; ++i) {
         if (i > 0) {
           const Eigen::Vector3d previous(request->samples[i - 1].x,
@@ -2557,32 +2619,36 @@ bool PlannerNode::queryIndexedMap(mgg::FeasiblePath& path,
                  std::to_string(i) + ": " + detail;
         };
         if (occupied || !occupancy_supported) {
-          return "indexed map route is occupied or unknown";
+          // Unknown space is a horizon. Occupied space is a wall.
+          const std::string reason = "indexed map route is occupied or unknown";
+          return occupied ? hazard(reason) : unmeasured(reason);
         }
         if (context.robot_type != mgg::RobotType::kAerialRobot &&
             !std::isfinite(response->clearance[i]) &&
             !unknown_clearance_allowed) {
-          return unsupported("clearance is unavailable");
+          return hazard(unsupported("clearance is unavailable"));
         }
         if (context.robot_type != mgg::RobotType::kAerialRobot &&
             std::isfinite(response->clearance[i]) &&
             response->clearance[i] < component_body.z()) {
-          return unsupported("clearance is below body height");
+          return hazard(unsupported("clearance is below body height"));
         }
         if (context.robot_type != mgg::RobotType::kAerialRobot &&
             (response->step[i] || response->drop[i])) {
-          return unsupported(response->step[i] ? "step reported"
-                                               : "drop reported");
+          return hazard(unsupported(response->step[i] ? "step reported"
+                                                      : "drop reported"));
         }
         if (context.robot_type != mgg::RobotType::kAerialRobot) {
           if (!finite_ground || !finite_roughness) {
             if (!provisional_missing_terrain) {
               if (context.provisional_unknown_ground &&
                   paired_missing_terrain && !provisional_gap_within_bound) {
-                return "indexed map provisional terrain connector exceeds its "
-                       "bound";
+                return unmeasured(
+                    "indexed map provisional terrain connector exceeds its "
+                    "bound");
               }
-              return unsupported("ground or roughness is unavailable");
+              return unmeasured(unsupported("ground or roughness is "
+                                            "unavailable"));
             }
             // Native MOLA edge checks support this bounded connector. Explore
             // still requires later measured support before emitting a prefix;
@@ -2595,11 +2661,12 @@ bool PlannerNode::queryIndexedMap(mgg::FeasiblePath& path,
               context.provisional_unknown_ground && provisional_gap_open;
           if (closes_provisional_connector &&
               !provisional_gap_within_bound) {
-            return "indexed map provisional terrain connector exceeds its "
-                   "bound";
+            return unmeasured(
+                "indexed map provisional terrain connector exceeds its "
+                "bound");
           }
           if (response->roughness[i] > indexed_map_max_roughness_m_) {
-            return unsupported("roughness exceeds its limit");
+            return hazard(unsupported("roughness exceeds its limit"));
           }
           const double ground_mismatch =
               std::abs(expected_ground_z[i] - response->ground_z[i]);
@@ -2611,7 +2678,7 @@ bool PlannerNode::queryIndexedMap(mgg::FeasiblePath& path,
           const double fitted_base_z =
               navigation_ground.z() + context.physical_size.z() / 2.0;
           if (!std::isfinite(fitted_base_z)) {
-            return "indexed map ground refinement is non-finite";
+            return hazard("indexed map ground refinement is non-finite");
           }
           // Keep already-compatible poses at the exact height validated by
           // the native planner. Samples that need a bounded correction move
@@ -2641,7 +2708,7 @@ bool PlannerNode::queryIndexedMap(mgg::FeasiblePath& path,
                   "indexed map ground does not support the emitted body "
                   "height at sample %zu: mismatch %.6f m exceeds %.6f m",
                   i, ground_mismatch, indexed_map_ground_tolerance_m_);
-              return std::string(detail);
+              return hazard(std::string(detail));
             }
             if (bounded_refinement) {
               const double agreement_band = indexed_map_ground_tolerance_m_;
@@ -2667,16 +2734,18 @@ bool PlannerNode::queryIndexedMap(mgg::FeasiblePath& path,
                 dz > context.max_step_height + 1e-6 &&
                 inclination > context.max_inclination + 1e-6;
             if (incompatible_gap_height || incompatible_observed_height) {
-              return "indexed map route exceeds platform step or inclination "
-                     "limits";
+              return hazard(
+                  "indexed map route exceeds platform step or inclination "
+                  "limits");
             }
           } else if (closes_provisional_connector &&
                      (expected_ground_z.empty() ||
                       std::abs(response->ground_z[i] -
                                expected_ground_z.front()) >
                           context.max_step_height + 1e-6)) {
-            return "indexed map route exceeds platform step or inclination "
-                   "limits";
+            return hazard(
+                "indexed map route exceeds platform step or inclination "
+                "limits");
           }
           previous_finite_ground = response->ground_z[i];
           previous_finite_xy = current_xy;
@@ -2698,33 +2767,44 @@ bool PlannerNode::queryIndexedMap(mgg::FeasiblePath& path,
       }
       if (context.robot_type != mgg::RobotType::kAerialRobot) {
         if (provisional_gap_open && !bounded_unknown_tail_allowed) {
-          return "indexed map route ends without measured terrain support";
+          return unmeasured(
+              "indexed map route ends without measured terrain support");
         }
         if (!have_measured_terrain && !bounded_unknown_tail_allowed) {
-          return "indexed map route has no measured terrain support";
+          return unmeasured(
+              "indexed map route has no measured terrain support");
         }
         if (used_provisional_missing_terrain &&
             !have_positive_progress_terrain &&
             !bounded_unknown_tail_allowed) {
-          return "indexed map provisional terrain has no positive-progress "
-                 "support";
+          return unmeasured(
+              "indexed map provisional terrain has no positive-progress "
+              "support");
         }
       }
       return std::nullopt;
     };
 
-    const std::optional<std::string> route_failure = validate_route();
+    const std::optional<Rejection> route_failure = validate_route();
     std::size_t accepted_count = count;
     bool used_validated_prefix = false;
     if (route_failure) {
-      if (!prefix_truncation_allowed || !prefix_end ||
+      // Qualified Explore may shorten after any rejection. A committed
+      // Navigate/Home section may shorten only when terrain evidence ran out
+      // ahead; its caller then resumes the same objective from this endpoint.
+      const bool continuable =
+          continuable_prefix_allowed && route_failure->unmeasured_ahead;
+      if ((!prefix_truncation_allowed && !continuable) || !prefix_end ||
           !path.speed_limits.empty()) {
-        return fail(mgg::PlanningStatus::kBlocked, *route_failure);
+        return fail(mgg::PlanningStatus::kBlocked, route_failure->reason);
       }
       accepted_count = *prefix_end + 1;
       used_validated_prefix = true;
       path.partial = true;
       path.reason.clear();
+      if (truncated_to_validated_prefix) {
+        *truncated_to_validated_prefix = true;
+      }
     }
     const bool needs_height_refinement =
         first_refinement_sample && *first_refinement_sample < accepted_count;
@@ -4158,12 +4238,24 @@ void PlannerNode::onObjectiveRequest(
   }
   const ObjectiveIndexedFlags indexed_flags =
       objectiveIndexedQueryFlags(core.objective);
+  const bool explicit_objective =
+      core.objective == mgg::ObjectiveKind::kNavigate ||
+      core.objective == mgg::ObjectiveKind::kReturnHome;
+  // A committed objective whose section the indexed authority shortens resumes
+  // along this exact route. Retain the route the grid planner approved before
+  // validation so a direct Navigate without a graph corridor still has one.
+  const std::vector<mgg::StateVec> validated_section_route =
+      explicit_objective && path.status == mgg::PlanningStatus::kSucceeded
+          ? path.poses
+          : std::vector<mgg::StateVec>{};
+  bool truncated_to_prefix = false;
   map_read.allowPublication();
   lock.unlock();
   if (path.status == mgg::PlanningStatus::kSucceeded) {
     queryIndexedMap(path, query_context, indexed_flags.height_refinement,
                     indexed_flags.prefix_truncation,
-                    indexed_flags.bounded_unknown_tail);
+                    indexed_flags.bounded_unknown_tail, explicit_objective,
+                    &truncated_to_prefix);
   }
   if (mola_map_ != nullptr) {
     lock.lock();
@@ -4187,6 +4279,54 @@ void PlannerNode::onObjectiveRequest(
     path.poses.clear();
     path.partial = false;
     path.indexed_map_validated = false;
+  }
+  if (objective_generation == objective_request_generation_ &&
+      path.status == mgg::PlanningStatus::kSucceeded && path.partial &&
+      truncated_to_prefix && explicit_objective && !path.poses.empty()) {
+    // The indexed authority accepted only a validated prefix of this section.
+    // The committed destination does not move, so the continuation resumes
+    // where the emitted prefix ends rather than where the horizon asked to
+    // stop. A section that was the final one now needs a continuation too.
+    if (!lock.owns_lock()) lock.lock();
+    if (global_objective_path.empty() && !validated_section_route.empty()) {
+      // No graph corridor existed, so the direct route the grid planner already
+      // approved to the exact goal becomes the continuation topology. Global
+      // route poses carry graph driving height, while a refined path is a
+      // navigation-base path.
+      global_objective_path = validated_section_route;
+      if (robot_params_.type == mgg::RobotType::kGroundRobot) {
+        for (mgg::StateVec& pose : global_objective_path) {
+          pose.z() += query_context.graph_to_base;
+        }
+      }
+    }
+    if (global_objective_path.empty()) {
+      path.status = mgg::PlanningStatus::kBlocked;
+      path.reason = "validated objective prefix has no continuation route";
+      path.poses.clear();
+      path.partial = false;
+      path.indexed_map_validated = false;
+    } else {
+      if (!pending_objective_route) {
+        pending_objective_route = std::make_unique<CachedObjectiveRoute>();
+        pending_objective_route->id =
+            route_instance_id_ + "-" + std::to_string(++route_sequence_);
+        pending_objective_route->mission_id = core.mission_id;
+        pending_objective_route->component_id = core.component_id;
+        pending_objective_route->objective = core.objective;
+        pending_objective_route->graph_revision = core.graph_revision;
+        pending_objective_route->exact_goal = core.goal;
+        pending_objective_route->global_poses = global_objective_path;
+      }
+      const std::size_t resume_index = std::min(
+          objectiveRouteIndexAfterLength(
+              pending_objective_route->global_poses, 0,
+              query_context.route_start,
+              emittedSectionXyLength(query_context.route_start, path.poses)),
+          pending_objective_route->global_poses.size() - 1u);
+      pending_objective_route->next_index = resume_index;
+      pending_objective_route->expected_endpoint = path.poses.back();
+    }
   }
   if (objective_generation == objective_request_generation_ &&
       path.status == mgg::PlanningStatus::kSucceeded && path.partial &&
@@ -4406,6 +4546,10 @@ void PlannerNode::onRefineObjectiveRoute(
       path = std::move(fallback);
     }
   }
+  const mgg::StateVec section_start = current_state_;
+  const std::vector<mgg::StateVec> route_poses =
+      cached_objective_route_->global_poses;
+  bool truncated_to_prefix = false;
   map_read.allowPublication();
   lock.unlock();
   if (path.status == mgg::PlanningStatus::kSucceeded) {
@@ -4415,7 +4559,8 @@ void PlannerNode::onRefineObjectiveRoute(
         robot_params_.type == mgg::RobotType::kGroundRobot;
     queryIndexedMap(path, query_context, qualified_explicit_ground,
                     /*allow_prefix_truncation=*/false,
-                    qualified_explicit_ground);
+                    qualified_explicit_ground,
+                    /*allow_continuable_prefix=*/true, &truncated_to_prefix);
   }
   lock.lock();
   if (mola_map_ != nullptr) {
@@ -4441,7 +4586,18 @@ void PlannerNode::onRefineObjectiveRoute(
     path.indexed_map_validated = false;
   }
   if (path.status == mgg::PlanningStatus::kSucceeded) {
-    if (path.partial) {
+    if (path.partial && truncated_to_prefix && !path.poses.empty() &&
+        !route_poses.empty()) {
+      // Only a validated prefix of this section was accepted. The committed
+      // destination is unchanged, so resume from the emitted endpoint. A final
+      // section shortened this way keeps its cached route instead of retiring.
+      cached_objective_route_->next_index = std::min(
+          objectiveRouteIndexAfterLength(
+              route_poses, begin, section_start,
+              emittedSectionXyLength(section_start, path.poses)),
+          route_poses.size() - 1u);
+      cached_objective_route_->expected_endpoint = path.poses.back();
+    } else if (path.partial) {
       cached_objective_route_->next_index = next_index;
       cached_objective_route_->expected_endpoint =
           corridor.request.goal.pose;

@@ -929,6 +929,22 @@ class PlannerNodeTestPeer {
                                 /*allow_bounded_unknown_tail=*/true);
   }
 
+  /// Navigate/Home validation that may fall back to the validated prefix of a
+  /// section whose terrain evidence ran out ahead.
+  static bool queryContinuable(PlannerNode& node, mgg::FeasiblePath& path,
+                               bool* truncated = nullptr,
+                               bool qualified_ground = true) {
+    PlannerNode::IndexedQueryContext context;
+    {
+      const std::lock_guard<std::recursive_mutex> lock(node.planner_mutex_);
+      context = node.indexedQueryContext();
+    }
+    return node.queryIndexedMap(path, context, qualified_ground,
+                                /*allow_prefix_truncation=*/false,
+                                qualified_ground,
+                                /*allow_continuable_prefix=*/true, truncated);
+  }
+
   static bool queryAfterCapturedSnapshotReceiptAges(
       PlannerNode& node, mgg::FeasiblePath& path) {
     PlannerNode::IndexedQueryContext context;
@@ -975,6 +991,32 @@ class PlannerNodeTestPeer {
   static std::string cachedObjectiveRouteId(PlannerNode& node) {
     const std::lock_guard<std::recursive_mutex> lock(node.planner_mutex_);
     return node.cached_objective_route_ ? node.cached_objective_route_->id : "";
+  }
+
+  static bool hasCachedObjectiveRoute(PlannerNode& node) {
+    const std::lock_guard<std::recursive_mutex> lock(node.planner_mutex_);
+    return static_cast<bool>(node.cached_objective_route_);
+  }
+
+  static mgg::StateVec cachedObjectiveRouteEndpoint(PlannerNode& node) {
+    const std::lock_guard<std::recursive_mutex> lock(node.planner_mutex_);
+    return node.cached_objective_route_
+               ? node.cached_objective_route_->expected_endpoint
+               : mgg::StateVec::Zero();
+  }
+
+  static std::size_t cachedObjectiveRouteNextIndex(PlannerNode& node) {
+    const std::lock_guard<std::recursive_mutex> lock(node.planner_mutex_);
+    return node.cached_objective_route_
+               ? node.cached_objective_route_->next_index
+               : std::numeric_limits<std::size_t>::max();
+  }
+
+  static std::size_t cachedObjectiveRouteSize(PlannerNode& node) {
+    const std::lock_guard<std::recursive_mutex> lock(node.planner_mutex_);
+    return node.cached_objective_route_
+               ? node.cached_objective_route_->global_poses.size()
+               : 0u;
   }
 
   static mgg_msgs::msg::MappingSnapshot mappingSnapshot(
@@ -3502,6 +3544,144 @@ TEST(PlannerObjective, OlderIndexedRequestCannotReplaceNewerRouteCache) {
   spinner.join();
 }
 
+TEST(PlannerObjective, NavigateBeyondMeasuredFloorDrivesPrefixSections) {
+  using Query = mgg_msgs::srv::QueryMapBatch;
+  using Peer = mgg_ros::PlannerNodeTestPeer;
+  rclcpp::NodeOptions options;
+  options.parameter_overrides(
+      {rclcpp::Parameter("map.resolution", 0.05),
+       rclcpp::Parameter("indexed_map_query_timeout_s", 2.0),
+       rclcpp::Parameter("indexed_map_query_service",
+                         "/measured_floor/query_batch")});
+  auto planner = std::make_shared<mgg_ros::PlannerNode>(options);
+  Peer::configureLongKnownRoad(*planner);
+  Peer::setFreshMappingComponent(*planner, "shared-component");
+  auto io = std::make_shared<rclcpp::Node>("measured_floor_io");
+  // The native map knows the whole road. The indexed authority has measured
+  // only the floor this far, exactly as a cold-start low lidar leaves it.
+  std::atomic<double> measured_to_x{2.0};
+  std::atomic<int> query_count{0};
+  auto query_group =
+      io->create_callback_group(rclcpp::CallbackGroupType::Reentrant);
+  auto query_service = io->create_service<Query>(
+      "/measured_floor/query_batch",
+      [&measured_to_x, &query_count](const Query::Request::SharedPtr request,
+                                     Query::Response::SharedPtr response) {
+        ++query_count;
+        response->status = Query::Response::OK;
+        response->component_id = request->component_id;
+        response->epoch = request->epoch;
+        response->graph_revision = request->graph_revision;
+        response->geometry_revision = request->geometry_revision;
+        const auto n = request->samples.size();
+        response->occupancy.assign(n, Query::Response::FREE);
+        response->clearance.assign(n, 100.0);
+        response->step.assign(n, false);
+        response->drop.assign(n, false);
+        const double reach = measured_to_x.load();
+        for (std::size_t i = 0; i < n; ++i) {
+          const bool measured = request->samples[i].x <= reach + 1e-9;
+          response->ground_z.push_back(
+              measured ? 0.0 : std::numeric_limits<double>::quiet_NaN());
+          response->roughness.push_back(
+              measured ? 0.0 : std::numeric_limits<double>::quiet_NaN());
+        }
+      },
+      rclcpp::ServicesQoS(), query_group);
+  rclcpp::executors::MultiThreadedExecutor executor(
+      rclcpp::ExecutorOptions{}, 3);
+  executor.add_node(planner);
+  executor.add_node(io);
+  std::thread spinner([&executor]() { executor.spin(); });
+  const auto deadline = std::chrono::steady_clock::now() + 3s;
+  while (!Peer::queryReady(*planner) &&
+         std::chrono::steady_clock::now() < deadline) {
+    std::this_thread::sleep_for(10ms);
+  }
+  const bool query_ready = Peer::queryReady(*planner);
+  EXPECT_TRUE(query_ready);
+  if (!query_ready) {
+    executor.cancel();
+    spinner.join();
+    return;
+  }
+
+  // The operator commits to a destination far beyond the measured floor.
+  const auto first = Peer::requestMappedObjective(
+      *planner, mgg::ObjectiveKind::kNavigate,
+      mgg::StateVec(12.0, 0.0, 0.075, 0.0));
+  ASSERT_NE(first, nullptr);
+  EXPECT_EQ(first->status, Service::Response::SUCCEEDED) << first->reason;
+  EXPECT_TRUE(first->partial);
+  EXPECT_TRUE(first->indexed_map_validated);
+  EXPECT_FALSE(first->route_id.empty());
+  ASSERT_FALSE(first->path.empty());
+  ASSERT_FALSE(first->global_path.empty());
+  // The executable section stops on measured support past the useful-progress
+  // bound, while the committed destination stays exactly where it was asked.
+  const double first_reach = first->path.back().position.x;
+  EXPECT_GE(first_reach, 1.0);
+  EXPECT_LE(first_reach, 2.0 + 1e-6);
+  EXPECT_NEAR(first_reach, 2.0, 0.30);
+  EXPECT_NEAR(first->global_path.back().position.x, 12.0, 1e-9);
+  EXPECT_TRUE(Peer::hasCachedObjectiveRoute(*planner));
+  EXPECT_EQ(Peer::cachedObjectiveRouteId(*planner), first->route_id);
+  EXPECT_NEAR(Peer::cachedObjectiveRouteEndpoint(*planner).x(), first_reach,
+              1e-9);
+  const std::size_t resume_index = Peer::cachedObjectiveRouteNextIndex(*planner);
+  EXPECT_LT(resume_index, Peer::cachedObjectiveRouteSize(*planner));
+
+  auto refine_request =
+      std::make_shared<mgg_msgs::srv::RefineObjectiveRoute::Request>();
+  refine_request->route_id = first->route_id;
+  refine_request->component_id = Peer::mappingSnapshot(*planner).component_id;
+  refine_request->map_epoch = Peer::mappingSnapshot(*planner).epoch;
+  refine_request->mapping_graph_revision =
+      Peer::mappingSnapshot(*planner).graph_revision;
+  refine_request->geometry_revision =
+      Peer::mappingSnapshot(*planner).geometry_revision;
+  refine_request->map_source_stamp =
+      Peer::mappingSnapshot(*planner).source_stamp;
+
+  // The robot arrives. Nothing new has been measured, so the next section has no
+  // prefix worth driving and keeps failing with its exact terrain reason. The
+  // cached route survives, so a later attempt can still continue.
+  Peer::acceptOdometry(*planner, first_reach, 0.0, 0.075);
+  const auto stalled = Peer::refineObjectiveRoute(*planner, refine_request);
+  ASSERT_NE(stalled, nullptr);
+  EXPECT_EQ(stalled->status,
+            mgg_msgs::srv::RefineObjectiveRoute::Response::BLOCKED)
+      << stalled->reason;
+  EXPECT_TRUE(stalled->path.empty());
+  EXPECT_TRUE(Peer::hasCachedObjectiveRoute(*planner));
+
+  // The next floor section is measured. The continuation resumes from the
+  // emitted prefix endpoint and commits to the same destination.
+  measured_to_x = 5.0;
+  const auto resumed = Peer::refineObjectiveRoute(*planner, refine_request);
+  ASSERT_NE(resumed, nullptr);
+  EXPECT_EQ(resumed->status,
+            mgg_msgs::srv::RefineObjectiveRoute::Response::SUCCEEDED)
+      << resumed->reason;
+  EXPECT_TRUE(resumed->partial);
+  EXPECT_TRUE(resumed->indexed_map_validated);
+  ASSERT_FALSE(resumed->path.empty());
+  EXPECT_NEAR(resumed->path.front().position.x, first_reach, 0.60);
+  const double second_reach = resumed->path.back().position.x;
+  EXPECT_GE(second_reach, first_reach + 1.0);
+  EXPECT_LE(second_reach, 5.0 + 1e-6);
+  EXPECT_NEAR(second_reach, 5.0, 0.30);
+  EXPECT_EQ(Peer::cachedObjectiveRouteId(*planner), first->route_id);
+  EXPECT_NEAR(Peer::cachedObjectiveRouteEndpoint(*planner).x(), second_reach,
+              1e-9);
+  EXPECT_GE(Peer::cachedObjectiveRouteNextIndex(*planner), resume_index);
+  EXPECT_LT(Peer::cachedObjectiveRouteNextIndex(*planner),
+            Peer::cachedObjectiveRouteSize(*planner));
+
+  executor.cancel();
+  spinner.join();
+}
+
 TEST(PlannerObjective, PartialProxyCannotCrossObservedWall) {
   rclcpp::NodeOptions options;
   options.parameter_overrides(
@@ -4206,6 +4386,8 @@ TEST(IndexedObjectiveService, BatchedQueryIsBoundedAndUsesComponentFrame) {
   std::atomic<std::size_t> drop_sample{std::numeric_limits<std::size_t>::max()};
   std::atomic<double> drop_at_or_after_x{
       std::numeric_limits<double>::infinity()};
+  std::atomic<std::size_t> occupied_from_sample{
+      std::numeric_limits<std::size_t>::max()};
   enum TerrainCase : int {
     kOrdinaryTerrain = 0,
     kTwoBlindIntervals,
@@ -4243,7 +4425,7 @@ TEST(IndexedObjectiveService, BatchedQueryIsBoundedAndUsesComponentFrame) {
        &received_max_step, &received_max_drop, &sample_occupancy,
        &sample_clearance, &blind_ground_prefix, &blind_clearance_prefix,
        &blind_ground_sample, &step_sample, &drop_sample,
-       &drop_at_or_after_x,
+       &drop_at_or_after_x, &occupied_from_sample,
        &terrain_case, &refinement_dip, &compatible_refinement_dip,
        &refinement_from_x, &query_count, &first_query_sample_count,
        &occupy_refined_body, &occupy_if_early_sample_was_lowered,
@@ -4376,6 +4558,9 @@ TEST(IndexedObjectiveService, BatchedQueryIsBoundedAndUsesComponentFrame) {
               request->samples.front().x + drop_at_or_after_x.load()) {
             response->drop[i] = true;
           }
+        }
+        for (std::size_t i = occupied_from_sample.load(); i < n; ++i) {
+          response->occupancy[i] = Query::Response::OCCUPIED;
         }
         if (n > 5 && active_case == kOccupiedInsideGap) {
           response->occupancy[4] = Query::Response::OCCUPIED;
@@ -5097,6 +5282,90 @@ TEST(IndexedObjectiveService, BatchedQueryIsBoundedAndUsesComponentFrame) {
   EXPECT_EQ(query_count.load(), 1u);
   ASSERT_FALSE(path.poses.empty());
   EXPECT_NEAR(path.poses.back().x(), 1.8, 1e-9);
+
+  // A committed Navigate/Home section may outrun the measured floor. Its
+  // validated prefix is drivable, so the section is shortened to the last fully
+  // checked measured sample and reported partial; the strict Navigate/Home
+  // caller still rejects exactly the same terrain evidence outright.
+  const auto committed_section = [&](double reach) {
+    path.status = mgg::PlanningStatus::kSucceeded;
+    path.partial = false;
+    path.indexed_map_validated = false;
+    path.reason.clear();
+    path.poses = {mgg::StateVec(0.0, 0.0, 0.0, 0.0),
+                  mgg::StateVec(reach, 0.0, 0.0, 0.0)};
+  };
+  bool truncated = false;
+  query_count = 0;
+  committed_section(6.0);
+  EXPECT_FALSE(mgg_ros::PlannerNodeTestPeer::queryExplicit(*planner, path));
+  EXPECT_NE(path.reason.find("connector exceeds its bound"), std::string::npos);
+
+  query_count = 0;
+  committed_section(6.0);
+  EXPECT_TRUE(mgg_ros::PlannerNodeTestPeer::queryContinuable(*planner, path,
+                                                             &truncated))
+      << path.reason;
+  EXPECT_TRUE(truncated);
+  EXPECT_TRUE(path.partial);
+  EXPECT_TRUE(path.indexed_map_validated);
+  EXPECT_TRUE(path.reason.empty());
+  EXPECT_EQ(query_count.load(), 1u);
+  ASSERT_FALSE(path.poses.empty());
+  EXPECT_NEAR(path.poses.back().x(), 1.8, 1e-9);
+  for (const auto& pose : path.poses) EXPECT_TRUE(pose.allFinite());
+
+  // The provisional-ground policy is not a precondition. Any ground platform
+  // may drive the part of its section that measured terrain already supports.
+  truncated = false;
+  query_count = 0;
+  committed_section(6.0);
+  EXPECT_TRUE(mgg_ros::PlannerNodeTestPeer::queryContinuable(
+      *planner, path, &truncated, /*qualified_ground=*/false))
+      << path.reason;
+  EXPECT_TRUE(truncated);
+  EXPECT_TRUE(path.partial);
+  ASSERT_FALSE(path.poses.empty());
+  EXPECT_NEAR(path.poses.back().x(), 1.8, 1e-9);
+  terrain_case = kOrdinaryTerrain;
+
+  // Known impassable terrain is not a horizon. An occupied tail fails the whole
+  // committed section closed, while qualified Explore keeps its own policy of
+  // shortening to the last checked sample after any rejection.
+  occupied_from_sample = 8;
+  truncated = true;
+  query_count = 0;
+  committed_section(6.0);
+  EXPECT_FALSE(
+      mgg_ros::PlannerNodeTestPeer::queryContinuable(*planner, path,
+                                                     &truncated));
+  EXPECT_FALSE(truncated);
+  EXPECT_FALSE(path.partial);
+  EXPECT_FALSE(path.indexed_map_validated);
+  EXPECT_TRUE(path.poses.empty());
+  EXPECT_NE(path.reason.find("occupied or unknown"), std::string::npos);
+
+  query_count = 0;
+  committed_section(6.0);
+  EXPECT_TRUE(mgg_ros::PlannerNodeTestPeer::query(*planner, path, true))
+      << path.reason;
+  EXPECT_TRUE(path.partial);
+  ASSERT_FALSE(path.poses.empty());
+  EXPECT_NEAR(path.poses.back().x(), 1.8, 1e-9);
+  occupied_from_sample = std::numeric_limits<std::size_t>::max();
+
+  // A measured floor that ends before the useful-progress bound leaves no
+  // prefix worth driving, so the exact terrain rejection stands.
+  terrain_case = kTerminalGap;
+  truncated = true;
+  query_count = 0;
+  committed_section(6.0);
+  EXPECT_FALSE(
+      mgg_ros::PlannerNodeTestPeer::queryContinuable(*planner, path,
+                                                     &truncated));
+  EXPECT_FALSE(truncated);
+  EXPECT_TRUE(path.poses.empty());
+  EXPECT_NE(path.reason.find("connector exceeds its bound"), std::string::npos);
   terrain_case = kOrdinaryTerrain;
 
   // A prefix containing corrected fitted ground is not complete after the
