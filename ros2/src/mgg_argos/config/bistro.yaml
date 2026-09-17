@@ -187,9 +187,13 @@
       nonuniform_ray_cast: true
       ray_cast_step_size_multiplier: 1.0
       freespace_cloud_enable: false
-      leafs_only_for_volumetric_gain: false
+      # Gain is what the planner spends its time on: ray casting from every
+      # vertex of a ~700-vertex lattice took 4.0 s of a 4.6 s request (Bistro,
+      # 2026-09-17). Leaves are where exploration goes next, and a 0.2 m
+      # cluster radius on a 0.5 m lattice clustered nothing.
+      leafs_only_for_volumetric_gain: true
       cluster_vertices_for_gain: true
-      clustering_radius: 0.2
+      clustering_radius: 1.0
       build_grid_local_graph: true
       # Not a clearance: this is the height at which the robot's collision
       # box rides above the ground. Vertices land here, and every edge is
