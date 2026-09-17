@@ -378,6 +378,13 @@ PlannerNode::PlannerNode(const rclcpp::NodeOptions& options)
       std::isfinite(requested_partial_progress)
           ? std::clamp(requested_partial_progress, 0.10, 5.0)
           : 1.0;
+  const double requested_step_tolerance = declareOrGet<double>(
+      this, "footprint_step_measurement_tolerance_m",
+      footprint_step_tolerance_m_);
+  footprint_step_tolerance_m_ =
+      std::isfinite(requested_step_tolerance)
+          ? std::clamp(requested_step_tolerance, 0.0, 0.05)
+          : 0.01;
   const double requested_start_support = declareOrGet<double>(
       this, "objective_start_support_max_distance_m",
       objective_start_support_max_distance_m_);
@@ -1668,6 +1675,10 @@ mgg::GridProjectionStatus PlannerNode::objectiveFootprintTerrainStatus(
   std::vector<FootprintGroundHit> ground_hits;
   ground_hits.reserve(footprint_cells.size());
   bool needs_connected_support = false;
+  // The platform limit plus the map's measurement tolerance; see
+  // footprint_step_tolerance_m_.
+  const double footprint_step_limit =
+      planning_params_.max_step_height + footprint_step_tolerance_m_ + 1e-6;
   double first_unsupported_delta = 0.0;
 
   // getRayStatus(..., false) deliberately treats unobserved cells as
@@ -1710,7 +1721,7 @@ mgg::GridProjectionStatus PlannerNode::objectiveFootprintTerrainStatus(
       }
       const double delta = hit.z() - nominal_ground_z;
       const bool center_compatible =
-          std::abs(delta) <= planning_params_.max_step_height + 1e-6;
+          std::abs(delta) <= footprint_step_limit;
       if (!center_compatible && !needs_connected_support) {
         first_unsupported_delta = delta;
         needs_connected_support = true;
@@ -1753,7 +1764,7 @@ mgg::GridProjectionStatus PlannerNode::objectiveFootprintTerrainStatus(
         const double dz =
             std::abs(ground_hits[neighbour_index].z - current.z);
         const double inclination = std::atan2(dz, resolution);
-        if (dz > planning_params_.max_step_height + 1e-6 &&
+        if (dz > footprint_step_limit &&
             inclination > planning_params_.max_inclination + 1e-6) {
           continue;
         }
@@ -1762,17 +1773,19 @@ mgg::GridProjectionStatus PlannerNode::objectiveFootprintTerrainStatus(
       }
     }
     if (std::any_of(ground_hits.begin(), ground_hits.end(),
-                    [nominal_ground_z, this](const FootprintGroundHit& hit) {
+                    [nominal_ground_z, footprint_step_limit](const FootprintGroundHit& hit) {
                       return !hit.connected &&
                              std::abs(hit.z - nominal_ground_z) >
-                                 planning_params_.max_step_height + 1e-6;
+                                 footprint_step_limit;
                     })) {
       char detail[160];
       std::snprintf(detail, sizeof(detail),
-                    "known %s %.3f m exceeds step limit %.3f m",
+                    "known %s %.3f m exceeds step limit %.3f m plus %.3f m "
+                    "measurement tolerance",
                     first_unsupported_delta > 0.0 ? "rise" : "drop",
                     std::abs(first_unsupported_delta),
-                    planning_params_.max_step_height);
+                    planning_params_.max_step_height,
+                    footprint_step_tolerance_m_);
       record_failure(detail);
       return mgg::GridProjectionStatus::kNoGround;
     }

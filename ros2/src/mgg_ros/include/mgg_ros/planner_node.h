@@ -250,6 +250,14 @@ class PlannerNode : public rclcpp::Node {
   mgg::GridRefinementLimits objective_grid_limits_;
   double objective_grid_max_margin_m_ = 4.0;
   double partial_route_min_progress_m_ = 1.0;
+  /// Measurement tolerance added to the platform step limit when footprint
+  /// ground heights are compared. Map points are quantised at centimetre
+  /// scale, so a kerb exactly at the limit otherwise flips between admitted
+  /// and refused on noise (measured on Bistro: refusals at 0.151 m and
+  /// 0.152 m against a 0.150 m limit). It is a statement about measurement
+  /// resolution, not about what the platform can climb, and stays well below
+  /// the margin between the limit and a physically refused step.
+  double footprint_step_tolerance_m_ = 0.01;
   double objective_start_support_max_distance_m_ = 3.0;
   double objective_route_horizon_m_ = 8.0;
   double objective_route_progress_tolerance_m_ = 1.0;

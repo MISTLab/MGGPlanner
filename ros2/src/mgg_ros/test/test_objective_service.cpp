@@ -2480,6 +2480,26 @@ TEST(PlannerObjective, ObservedGroundBlindStartConnectorRetainsDistanceBound) {
             std::string::npos)
       << curb_refused.reason;
 
+  // The same kerb is admitted once the configured measurement tolerance
+  // covers its excess over the limit: the tolerance, not noise, decides a
+  // borderline step.
+  {
+    rclcpp::NodeOptions options;
+    options.parameter_overrides(
+        {rclcpp::Parameter("use_sim_time", true),
+         rclcpp::Parameter("map.resolution", 0.05),
+         rclcpp::Parameter("objective_body_evidence_policy", "observed_ground"),
+         rclcpp::Parameter("footprint_step_measurement_tolerance_m", 0.05)});
+    auto tolerant = std::make_shared<mgg_ros::PlannerNode>(options);
+    Peer::configureBackboneTest(*tolerant);
+    Peer::acceptOdometry(*tolerant, 0.0, 0.0, 0.075);
+    Peer::observeDestinationSupport(*tolerant, 2.5);
+    Peer::addMeasuredSurface(*tolerant, 1.25, 0.10, 0.125);
+    const mgg::FeasiblePath admitted = Peer::refine(*tolerant, corridor(2.5));
+    EXPECT_EQ(admitted.status, mgg::PlanningStatus::kSucceeded)
+        << admitted.reason;
+  }
+
   auto beyond = make(3.25);
   const mgg::FeasiblePath refused = Peer::refine(*beyond, corridor(3.25));
   EXPECT_EQ(refused.status, mgg::PlanningStatus::kBlocked);
