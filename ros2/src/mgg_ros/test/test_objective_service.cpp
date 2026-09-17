@@ -881,11 +881,6 @@ class PlannerNodeTestPeer {
     return planner.plan(*node.global_graph_, node.current_state_, request);
   }
 
-  static mgg::FeasiblePath refinePreferringDirect(
-      PlannerNode& node, const mgg::RouteCorridor& corridor) {
-    return node.refineCorridorPreferringDirect(corridor,
-                                               &node.objective_grid_limits_);
-  }
   static mgg::FeasiblePath refine(PlannerNode& node,
                                   const mgg::RouteCorridor& corridor) {
     return node.refineCorridor(corridor);
@@ -1297,58 +1292,6 @@ TEST(PlannerObjective, ProvisionalUnknownGroundRetainsGoalAndKnownVetoes) {
   Peer::setGridGeofence(*fenced, -0.5, 0.5, -0.5, 0.5);
   EXPECT_EQ(Peer::refine(*fenced, corridor()).status,
             mgg::PlanningStatus::kBlocked);
-}
-
-TEST(PlannerObjective, DetouringCorridorTriesTheDirectPathFirst) {
-  using Peer = mgg_ros::PlannerNodeTestPeer;
-  auto make = [] {
-    rclcpp::NodeOptions options;
-    options.parameter_overrides(
-        {rclcpp::Parameter("use_sim_time", true),
-         rclcpp::Parameter("map.resolution", 0.15),
-         rclcpp::Parameter("objective_body_evidence_policy", "observed_ground"),
-         rclcpp::Parameter("objective_ground_evidence_policy",
-                           "provisional_unknown")});
-    auto node = std::make_shared<mgg_ros::PlannerNode>(options);
-    Peer::configureBackboneTest(*node);
-    Peer::acceptOdometry(*node, 0.0, 0.0, 0.075);
-    Peer::observeGroundRectangle(*node, -1.0, 5.0, -1.0, 4.0);
-    Peer::finishMapRevision(*node);
-    return node;
-  };
-  // The graph route swings 3 m sideways on its way to a goal 4 m straight ahead.
-  mgg::RouteCorridor loop;
-  loop.status = mgg::PlanningStatus::kSucceeded;
-  loop.request.objective = mgg::ObjectiveKind::kNavigate;
-  loop.request.goal.pose = mgg::StateVec(4.0, 0.0, 0.075, 1.1);
-  loop.poses = {mgg::StateVec(0.0, 3.0, 0.075, 0.0),
-                mgg::StateVec(4.0, 3.0, 0.075, 0.0),
-                mgg::StateVec(4.0, 0.0, 0.075, 1.1)};
-  const auto lateral_reach = [](const mgg::FeasiblePath& path) {
-    double reach = 0.0;
-    for (const auto& pose : path.poses) reach = std::max(reach, pose.y());
-    return reach;
-  };
-
-  auto clear = make();
-  const mgg::FeasiblePath followed = Peer::refine(*clear, loop);
-  ASSERT_EQ(followed.status, mgg::PlanningStatus::kSucceeded) << followed.reason;
-  EXPECT_GT(lateral_reach(followed), 2.5);
-  const mgg::FeasiblePath direct = Peer::refinePreferringDirect(*clear, loop);
-  ASSERT_EQ(direct.status, mgg::PlanningStatus::kSucceeded) << direct.reason;
-  EXPECT_LT(lateral_reach(direct), 1.0);
-  EXPECT_NEAR(direct.poses.back().x(), 4.0, 1e-9);
-  EXPECT_NEAR(direct.poses.back()[3], 1.1, 1e-9);
-
-  // With the straight line walled off, the corridor is still the answer.
-  auto wall = make();
-  Peer::addBlockingWall(*wall, 2.0);
-  const mgg::FeasiblePath around = Peer::refinePreferringDirect(*wall, loop);
-  if (around.status == mgg::PlanningStatus::kSucceeded) {
-    EXPECT_GT(lateral_reach(around), 1.0);
-  } else {
-    EXPECT_EQ(Peer::refine(*wall, loop).status, around.status) << around.reason;
-  }
 }
 
 TEST(PlannerObjective, ProvisionalUnknownGroundReachesDistantExactGoals) {

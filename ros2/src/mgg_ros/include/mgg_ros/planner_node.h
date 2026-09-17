@@ -95,15 +95,6 @@ class PlannerNode : public rclcpp::Node {
   mgg::FeasiblePath refineCorridor(
       const mgg::RouteCorridor& corridor,
       const mgg::GridRefinementLimits* limits = nullptr);
-  /// refineCorridor, except that a complete corridor which is a large detour
-  /// against the straight line to its goal first tries a direct grid search.
-  /// A corridor follows whatever graph edges exist; at a grouped start those
-  /// led a robot on a 12 m loop around its parked neighbours to a leaf 5 m
-  /// straight ahead (2026-09-17). Every pose of the direct path passes the same
-  /// projection and traversal checks, and the corridor remains the fallback.
-  mgg::FeasiblePath refineCorridorPreferringDirect(
-      const mgg::RouteCorridor& corridor,
-      const mgg::GridRefinementLimits* limits);
   /// Everything one objective needs to ask the topological stage again after
   /// a corridor has been marked blocked. Shared by Explore, Navigate and Home.
   struct TopologicalRetry {
@@ -272,10 +263,6 @@ class PlannerNode : public rclcpp::Node {
   /// from their end the next section sees the hazard up close and routes
   /// around it. Zero restores refusing the whole section.
   double hazard_prefix_standoff_m_ = 1.5;
-  /// A corridor longer than this many straight-line distances, and by at
-  /// least corridor_detour_min_excess_m_, tries the direct search first.
-  double corridor_detour_ratio_ = 1.5;
-  double corridor_detour_min_excess_m_ = 2.0;
   /// Measurement tolerance added to the platform step limit when footprint
   /// ground heights are compared. Map points are quantised at centimetre
   /// scale, so a kerb exactly at the limit otherwise flips between admitted
