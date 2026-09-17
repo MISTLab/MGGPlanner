@@ -18,6 +18,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <deque>
+#include <optional>
 #include <functional>
 #include <memory>
 #include <mutex>
@@ -128,6 +129,9 @@ class PlannerNode : public rclcpp::Node {
   /// Marks the cached route's segment closest to a hazard the controller or
   /// the route validator reported. Bounded by the cached route length.
   void blockCachedRouteNear(const Eigen::Vector3d& hazard);
+  /// Marks the segment of `route` closest to `hazard`.
+  void blockRouteNear(const std::vector<mgg::StateVec>& route,
+                      const Eigen::Vector3d& hazard);
   void convertPathToNavigationBase(mgg::FeasiblePath& path) const;
   struct IndexedQueryContext {
     mgg::StateVec route_start = mgg::StateVec::Zero();
@@ -157,7 +161,9 @@ class PlannerNode : public rclcpp::Node {
   /// \param allow_continuable_prefix Navigate/Home may shorten the route to its
   ///   last fully checked measured sample when the only rejection is that the
   ///   terrain ahead is unmeasured or lies beyond the provisional connector
-  ///   bound. Known impassable terrain still fails closed.
+  ///   bound. A hazard farther along the route shortens the section to the
+  ///   last checked sample at least hazard_prefix_standoff_m before it; a
+  ///   hazard nearer than that still fails closed.
   /// \param truncated_to_validated_prefix set when the emitted route is a
   ///   strict prefix of the requested one, so the caller resumes its committed
   ///   objective from that exact endpoint instead of the requested horizon.
@@ -167,7 +173,8 @@ class PlannerNode : public rclcpp::Node {
                        bool allow_prefix_truncation = false,
                        bool allow_bounded_unknown_tail = false,
                        bool allow_continuable_prefix = false,
-                       bool* truncated_to_validated_prefix = nullptr);
+                       bool* truncated_to_validated_prefix = nullptr,
+                       Eigen::Vector3d* hazard_ahead = nullptr);
   void publishOwnGraph();
   void publishPath();
   void publishMarkers();
@@ -250,6 +257,12 @@ class PlannerNode : public rclcpp::Node {
   mgg::GridRefinementLimits objective_grid_limits_;
   double objective_grid_max_margin_m_ = 4.0;
   double partial_route_min_progress_m_ = 1.0;
+  /// Distance a committed section keeps from a hazard found farther along its
+  /// route. The hazard was seen from the section start, often tens of metres
+  /// away; the checked samples before it are as valid as any other route, and
+  /// from their end the next section sees the hazard up close and routes
+  /// around it. Zero restores refusing the whole section.
+  double hazard_prefix_standoff_m_ = 1.5;
   /// Measurement tolerance added to the platform step limit when footprint
   /// ground heights are compared. Map points are quantised at centimetre
   /// scale, so a kerb exactly at the limit otherwise flips between admitted
@@ -370,6 +383,15 @@ class PlannerNode : public rclcpp::Node {
   std::uint64_t map_revision_ = 0;
   double reservation_exclusion_radius_m_ = 4.0;
   double reservation_exclusion_ttl_s_ = 3.0;
+  /// Exploration leaves whose final route was refused, with the time of the
+  /// refusal. The gain selector is deterministic: without this it picks the
+  /// same leaf again, the same sample is refused again, and the robot sits at
+  /// "planner returned no path" for good (robot_2, 2026-09-17, thirteen
+  /// identical refusals in three minutes). Refused leaves are excluded from
+  /// selection, like a peer's reservation, until they expire.
+  std::deque<std::pair<Eigen::Vector3d, double>> rejected_explore_leaves_;
+  double rejected_explore_leaf_ttl_s_ = 60.0;
+  std::optional<Eigen::Vector3d> selected_explore_leaf_;
   std::vector<Eigen::Vector3d> coordination_exclusions_;
   std::chrono::steady_clock::time_point coordination_exclusions_received_;
   bool have_coordination_exclusions_ = false;

@@ -378,6 +378,12 @@ PlannerNode::PlannerNode(const rclcpp::NodeOptions& options)
       std::isfinite(requested_partial_progress)
           ? std::clamp(requested_partial_progress, 0.10, 5.0)
           : 1.0;
+  hazard_prefix_standoff_m_ = declareOrGet<double>(
+      this, "hazard_prefix_standoff_m", hazard_prefix_standoff_m_);
+  hazard_prefix_standoff_m_ =
+      std::isfinite(hazard_prefix_standoff_m_)
+          ? std::clamp(hazard_prefix_standoff_m_, 0.0, 10.0)
+          : 0.0;
   const double requested_step_tolerance = declareOrGet<double>(
       this, "footprint_step_measurement_tolerance_m",
       footprint_step_tolerance_m_);
@@ -1182,6 +1188,15 @@ std::string PlannerNode::buildLocalGraph(bool strict_projected_endpoints) {
               .count() <= reservation_exclusion_ttl_s_) {
     exclusions = coordination_exclusions_;
   }
+  const double selection_now_s = steadyNowSeconds();
+  while (!rejected_explore_leaves_.empty() &&
+         selection_now_s - rejected_explore_leaves_.front().second >
+             rejected_explore_leaf_ttl_s_) {
+    rejected_explore_leaves_.pop_front();
+  }
+  for (const auto& rejected : rejected_explore_leaves_) {
+    exclusions.push_back(rejected.first);
+  }
   const mgg::PathSelectionResult sel = mgg::selectBestPath(
       *local_graph_, planning_params_, robot_params_, edge_inclinations_,
       map_->getResolution(), exploring_direction_, exclusions,
@@ -1193,6 +1208,10 @@ std::string PlannerNode::buildLocalGraph(bool strict_projected_endpoints) {
   path_shortcut_to_ = 0;
   for (const mgg::Vertex* v : sel.best_path) {
     if (v != nullptr) best_path_.push_back(v->state);
+  }
+  selected_explore_leaf_.reset();
+  if (!best_path_.empty()) {
+    selected_explore_leaf_ = best_path_.back().head<3>();
   }
   const std::vector<mgg::StateVec> selected_lattice_path = best_path_;
   // The gain selector owns the exploration target. The shared topological
@@ -2214,6 +2233,20 @@ void PlannerNode::onPlanRequest(
     // failed indexed query.  Keeping the selector's graph-height path here
     // bypassed the rejection whenever the optional indexed service was off.
     best_path_.clear();
+    // A refusal on evidence, as opposed to a stale or missing map, is a
+    // verdict on this leaf: leave it out of the next selections.
+    const bool interrupted =
+        feasible.reason.find("deadline") != std::string::npos ||
+        feasible.reason.find("cancelled") != std::string::npos;
+    if (selected_explore_leaf_ && !interrupted &&
+        (feasible.status == mgg::PlanningStatus::kBlocked ||
+         feasible.status == mgg::PlanningStatus::kUnreachable)) {
+      rejected_explore_leaves_.emplace_back(*selected_explore_leaf_,
+                                            steadyNowSeconds());
+      while (rejected_explore_leaves_.size() > 32u) {
+        rejected_explore_leaves_.pop_front();
+      }
+    }
   }
 
   const auto& response_path =
@@ -2275,7 +2308,8 @@ bool PlannerNode::queryIndexedMap(mgg::FeasiblePath& path,
                                   bool allow_prefix_truncation,
                                   bool allow_bounded_unknown_tail,
                                   bool allow_continuable_prefix,
-                                  bool* truncated_to_validated_prefix) {
+                                  bool* truncated_to_validated_prefix,
+                                  Eigen::Vector3d* hazard_ahead) {
   path.indexed_map_validated = false;
   if (truncated_to_validated_prefix) *truncated_to_validated_prefix = false;
   if (!indexed_map_client_) return true;
@@ -2571,6 +2605,11 @@ bool PlannerNode::queryIndexedMap(mgg::FeasiblePath& path,
         count, std::numeric_limits<double>::quiet_NaN());
     std::optional<std::size_t> prefix_end;
     std::optional<std::size_t> first_refinement_sample;
+    // Route length at each sample, every sample that could end a prefix, and
+    // the sample being judged: what a hazard needs to keep its standoff.
+    std::vector<double> sample_xy_progress(count, 0.0);
+    std::vector<std::size_t> prefix_candidates;
+    std::size_t examined_sample = 0;
     // Why a route was rejected decides whether its validated prefix may still
     // be driven. Absent terrain evidence ahead (unknown occupancy, an
     // unmeasured interval, an over-long provisional connector) is a horizon
@@ -2599,6 +2638,8 @@ bool PlannerNode::queryIndexedMap(mgg::FeasiblePath& path,
           provisional_gap_distance += delta.norm();
           route_xy_progress += delta.head<2>().norm();
         }
+        sample_xy_progress[i] = route_xy_progress;
+        examined_sample = i;
         const bool occupied = response->occupancy[i] ==
                               mgg_msgs::srv::QueryMapBatch::Response::OCCUPIED;
         const bool unknown = response->occupancy[i] ==
@@ -2775,6 +2816,7 @@ bool PlannerNode::queryIndexedMap(mgg::FeasiblePath& path,
           if (endpoint_displacement + 1e-9 >=
               partial_route_min_progress_m_) {
             prefix_end = i;
+            prefix_candidates.push_back(i);
           }
         }
       }
@@ -2805,8 +2847,26 @@ bool PlannerNode::queryIndexedMap(mgg::FeasiblePath& path,
       // Qualified Explore may shorten after any rejection. A committed
       // Navigate/Home section may shorten only when terrain evidence ran out
       // ahead; its caller then resumes the same objective from this endpoint.
+      bool hazard_standoff_prefix = false;
+      if (continuable_prefix_allowed && !route_failure->unmeasured_ahead &&
+          hazard_prefix_standoff_m_ > 0.0 && examined_sample < count) {
+        for (auto candidate = prefix_candidates.rbegin();
+             candidate != prefix_candidates.rend(); ++candidate) {
+          if (sample_xy_progress[examined_sample] -
+                  sample_xy_progress[*candidate] + 1e-9 >=
+              hazard_prefix_standoff_m_) {
+            prefix_end = *candidate;
+            hazard_standoff_prefix = true;
+            break;
+          }
+        }
+        if (hazard_standoff_prefix && hazard_ahead != nullptr) {
+          *hazard_ahead = dense_base_states[examined_sample].head<3>();
+        }
+      }
       const bool continuable =
-          continuable_prefix_allowed && route_failure->unmeasured_ahead;
+          continuable_prefix_allowed &&
+          (route_failure->unmeasured_ahead || hazard_standoff_prefix);
       if ((!prefix_truncation_allowed && !continuable) || !prefix_end ||
           !path.speed_limits.empty()) {
         return fail(mgg::PlanningStatus::kBlocked, route_failure->reason);
@@ -3756,9 +3816,13 @@ void PlannerNode::blockCorridorSegment(const mgg::StateVec& from,
 }
 
 void PlannerNode::blockCachedRouteNear(const Eigen::Vector3d& hazard) {
-  if (!cached_objective_route_ || !hazard.allFinite()) return;
-  const std::vector<mgg::StateVec>& route = cached_objective_route_->global_poses;
-  if (route.size() < 2) return;
+  if (!cached_objective_route_) return;
+  blockRouteNear(cached_objective_route_->global_poses, hazard);
+}
+
+void PlannerNode::blockRouteNear(const std::vector<mgg::StateVec>& route,
+                                 const Eigen::Vector3d& hazard) {
+  if (!hazard.allFinite() || route.size() < 2) return;
   std::size_t best = 0;
   double best_distance = std::numeric_limits<double>::infinity();
   for (std::size_t i = 1; i < route.size(); ++i) {
@@ -4262,17 +4326,25 @@ void PlannerNode::onObjectiveRequest(
           ? path.poses
           : std::vector<mgg::StateVec>{};
   bool truncated_to_prefix = false;
+  Eigen::Vector3d hazard_ahead =
+      Eigen::Vector3d::Constant(std::numeric_limits<double>::quiet_NaN());
   map_read.allowPublication();
   lock.unlock();
   if (path.status == mgg::PlanningStatus::kSucceeded) {
     queryIndexedMap(path, query_context, indexed_flags.height_refinement,
                     indexed_flags.prefix_truncation,
                     indexed_flags.bounded_unknown_tail, explicit_objective,
-                    &truncated_to_prefix);
+                    &truncated_to_prefix, &hazard_ahead);
   }
   if (mola_map_ != nullptr) {
     lock.lock();
     map_read.reacquirePublication();
+    // The section stops short of a hazard on its route. Mark that corridor
+    // segment, so the continuation asks the topological stage for a way
+    // around it instead of the same route again.
+    if (hazard_ahead.allFinite()) {
+      blockRouteNear(global_objective_path, hazard_ahead);
+    }
     const bool mola_ready = mola_map_->getStatus();
     refreshMolaRevision();
     if (path.status == mgg::PlanningStatus::kSucceeded &&

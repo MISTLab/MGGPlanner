@@ -5372,6 +5372,26 @@ TEST(IndexedObjectiveService, BatchedQueryIsBoundedAndUsesComponentFrame) {
   EXPECT_TRUE(path.partial);
   ASSERT_FALSE(path.poses.empty());
   EXPECT_NEAR(path.poses.back().x(), 1.8, 1e-9);
+
+  // A hazard farther along a committed section is a different matter. The
+  // checked samples before it are as drivable as any route, so the section is
+  // shortened to the last of them that keeps the standoff, and the objective
+  // continues from there with a close view of what blocked it.
+  occupied_from_sample = 16;
+  truncated = false;
+  query_count = 0;
+  committed_section(6.0);
+  EXPECT_TRUE(mgg_ros::PlannerNodeTestPeer::queryContinuable(*planner, path,
+                                                             &truncated))
+      << path.reason;
+  EXPECT_TRUE(truncated);
+  EXPECT_TRUE(path.partial);
+  EXPECT_TRUE(path.indexed_map_validated);
+  ASSERT_FALSE(path.poses.empty());
+  // Samples lie 0.3 m apart, so the hazard starts 4.8 m along the section and
+  // the last checked sample that keeps the 1.5 m standoff is at 3.0 m.
+  EXPECT_NEAR(path.poses.back().x(), 3.0, 0.31);
+  EXPECT_LE(path.poses.back().x(), 4.8 - 1.5 + 1e-6);
   occupied_from_sample = std::numeric_limits<std::size_t>::max();
 
   // A measured floor that ends before the useful-progress bound leaves no

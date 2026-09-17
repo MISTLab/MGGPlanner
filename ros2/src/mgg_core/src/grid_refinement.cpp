@@ -297,10 +297,15 @@ FeasiblePath BoundedGridPlanner::refine(const RouteCorridor& corridor) {
   // Corridor-pose index behind each waypoint, so a rejected waypoint or an
   // unrefinable segment can name the corridor it belongs to.
   std::vector<std::size_t> waypoint_source;
+  // Whether each waypoint stands on measured ground, as opposed to the
+  // provisional plane a Navigate corridor may cross.
+  std::vector<bool> waypoint_supported;
   waypoints.reserve(corridor.poses.size() + 2);
   waypoint_source.reserve(corridor.poses.size() + 2);
+  waypoint_supported.reserve(corridor.poses.size() + 2);
   waypoints.push_back(start);
   waypoint_source.push_back(kNoCorridorIndex);
+  waypoint_supported.push_back(true);
   for (std::size_t waypoint_index = 0;
        waypoint_index < corridor.poses.size(); ++waypoint_index) {
     StateVec waypoint = corridor.poses[waypoint_index];
@@ -328,8 +333,22 @@ FeasiblePath BoundedGridPlanner::refine(const RouteCorridor& corridor) {
     if (!samePosition(waypoints.back(), waypoint)) {
       waypoints.push_back(waypoint);
       waypoint_source.push_back(waypoint_index);
+      waypoint_supported.push_back(waypoint_status ==
+                                   GridProjectionStatus::kSupported);
     } else {
       waypoint_source.back() = waypoint_index;
+    }
+  }
+  if (corridor.partial) {
+    // The proxy of a partial section must stand on measured ground, while the
+    // corridor leading to it may cross the provisional plane. A horizon that
+    // happens to end on provisional terrain therefore does not refuse the
+    // objective: the section ends at the last supported corridor pose and the
+    // continuation plans the rest once that ground has been observed.
+    while (waypoints.size() >= 2u && !waypoint_supported.back()) {
+      waypoints.pop_back();
+      waypoint_source.pop_back();
+      waypoint_supported.pop_back();
     }
   }
   active_segment_known = false;

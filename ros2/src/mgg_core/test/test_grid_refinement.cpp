@@ -345,6 +345,31 @@ TEST(GridRefinement, ProvisionalEndpointRemainsInvalidForPartialNavigate) {
   EXPECT_TRUE(path.poses.empty());
 }
 
+TEST(GridRefinement, PartialNavigateEndsAtTheLastSupportedCorridorPose) {
+  // The horizon of a partial section ends on provisional terrain. The section
+  // stops at the last corridor pose on measured ground instead of refusing.
+  RouteCorridor route = routeTo(3.0, 0.0);
+  route.request.objective = mgg::ObjectiveKind::kNavigate;
+  route.partial = true;
+  StateVec middle = StateVec::Zero();
+  middle.x() = 1.0;
+  StateVec horizon = StateVec::Zero();
+  horizon.x() = 2.0;
+  route.poses = {middle, horizon};
+  auto project = [](StateVec& state) {
+    return state.x() < 1.5 ? GridProjectionStatus::kSupported
+                           : GridProjectionStatus::kProvisionalUnknown;
+  };
+  BoundedGridPlanner planner(StateVec::Zero(), limits(), project,
+                             sampledTraversal({}));
+
+  const FeasiblePath path = planner.refine(route);
+  ASSERT_EQ(path.status, PlanningStatus::kSucceeded) << path.reason;
+  EXPECT_TRUE(path.partial);
+  ASSERT_FALSE(path.poses.empty());
+  EXPECT_NEAR(path.poses.back().x(), 1.0, 1e-9);
+}
+
 TEST(GridRefinement, ProvisionalEndpointRemainsInvalidForReturnHome) {
   auto project = [](StateVec& state) {
     return state.head<2>().norm() < 1e-9
