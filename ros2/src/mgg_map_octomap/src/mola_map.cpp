@@ -973,6 +973,50 @@ VoxelStatus MolaMap::getGroundRayStatus(
   return status;
 }
 
+void MolaMap::setTransientDiscs(std::vector<Eigen::Vector2d> centres,
+                                const double radius_m, const double ttl_s) {
+  auto discs = std::make_shared<TransientDiscs>();
+  if (std::isfinite(radius_m) && radius_m > 0.0 && std::isfinite(ttl_s) &&
+      ttl_s > 0.0) {
+    for (const Eigen::Vector2d& centre : centres) {
+      if (centre.allFinite()) discs->centres.push_back(centre);
+    }
+    discs->radius_m = radius_m;
+    discs->expires =
+        Clock::now() + std::chrono::duration_cast<Clock::duration>(
+                           std::chrono::duration<double>(ttl_s));
+  }
+  std::atomic_store(&transient_discs_,
+                    std::shared_ptr<const TransientDiscs>(std::move(discs)));
+}
+
+bool MolaMap::discsBlockSweep(const Eigen::Vector3d& start,
+                              const Eigen::Vector3d& end,
+                              const double half_width) const {
+  const auto discs = std::atomic_load(&transient_discs_);
+  if (discs == nullptr || discs->centres.empty() ||
+      Clock::now() > discs->expires) {
+    return false;
+  }
+  const Eigen::Vector2d a = start.head<2>();
+  const Eigen::Vector2d delta = end.head<2>() - a;
+  const double length_squared = delta.squaredNorm();
+  const double reach = discs->radius_m + half_width;
+  for (const Eigen::Vector2d& centre : discs->centres) {
+    const double t =
+        length_squared > 1e-12
+            ? std::clamp((centre - a).dot(delta) / length_squared, 0.0, 1.0)
+            : 0.0;
+    if ((centre - (a + t * delta)).squaredNorm() < reach * reach) return true;
+  }
+  return false;
+}
+
+bool MolaMap::discsBlockBox(const Eigen::Vector3d& center,
+                            const Eigen::Vector3d& size) const {
+  return discsBlockSweep(center, center, 0.5 * std::max(size.x(), size.y()));
+}
+
 VoxelStatus MolaMap::getBoxStatus(const Eigen::Vector3d& center,
                                   const Eigen::Vector3d& size,
                                   const bool stop_at_unknown_voxel) const {
@@ -980,6 +1024,7 @@ VoxelStatus MolaMap::getBoxStatus(const Eigen::Vector3d& center,
   if (snapshot == nullptr) return VoxelStatus::kUnknown;
   if (!center.allFinite() || !size.allFinite() || (size.array() < 0.0).any())
     return VoxelStatus::kUnknown;
+  if (discsBlockBox(center, size)) return VoxelStatus::kOccupied;
   const auto& transform = snapshot->request.component_from_navigation;
   return snapshot->map->getBoxStatus(transform * center,
                                      enclosingSize(transform.linear(), size),
@@ -995,6 +1040,8 @@ VoxelStatus MolaMap::getPathStatus(const Eigen::Vector3d& start,
   if (!start.allFinite() || !end.allFinite() || !box_size.allFinite() ||
       (box_size.array() < 0.0).any())
     return VoxelStatus::kUnknown;
+  if (discsBlockSweep(start, end, 0.5 * std::max(box_size.x(), box_size.y())))
+    return VoxelStatus::kOccupied;
   const auto& transform = snapshot->request.component_from_navigation;
   return snapshot->map->getPathStatus(transform * start, transform * end,
                                       enclosingSize(transform.linear(), box_size),
@@ -1010,6 +1057,7 @@ VoxelStatus MolaMap::getOccupiedOnlyCylinderPathStatus(
       height < 0.0) {
     return VoxelStatus::kUnknown;
   }
+  if (discsBlockSweep(start, end, radius)) return VoxelStatus::kOccupied;
   const auto& transform = snapshot->request.component_from_navigation;
   // The swept cylinder is upright in the navigation frame; see
   // kMaxAuthorityTiltRad for the tilt this contract tolerates.
@@ -1026,6 +1074,7 @@ VoxelStatus MolaMap::getStrictBoxStatus(const Eigen::Vector3d& center,
   if (snapshot == nullptr) return VoxelStatus::kUnknown;
   if (!center.allFinite() || !size.allFinite() || (size.array() < 0.0).any())
     return VoxelStatus::kUnknown;
+  if (discsBlockBox(center, size)) return VoxelStatus::kOccupied;
   const auto& transform = snapshot->request.component_from_navigation;
   return snapshot->map->getStrictBoxStatus(
       transform * center, enclosingSize(transform.linear(), size));
@@ -1039,6 +1088,8 @@ VoxelStatus MolaMap::getStrictPathStatus(
   if (!start.allFinite() || !end.allFinite() || !box_size.allFinite() ||
       (box_size.array() < 0.0).any())
     return VoxelStatus::kUnknown;
+  if (discsBlockSweep(start, end, 0.5 * std::max(box_size.x(), box_size.y())))
+    return VoxelStatus::kOccupied;
   const auto& transform = snapshot->request.component_from_navigation;
   return snapshot->map->getStrictPathStatus(
       transform * start, transform * end,

@@ -513,6 +513,17 @@ PlannerNode::PlannerNode(const rclcpp::NodeOptions& options)
             onCoordinationExclusions(m);
           },
           sub_opts);
+  peer_body_radius_m_ = std::clamp(
+      declareOrGet<double>(this, "peer_body_radius_m", peer_body_radius_m_), 0.0,
+      5.0);
+  peer_body_ttl_s_ = std::clamp(
+      declareOrGet<double>(this, "peer_body_ttl_s", peer_body_ttl_s_), 0.1, 30.0);
+  peer_bodies_sub_ = create_subscription<geometry_msgs::msg::PoseArray>(
+      "peer_bodies", rclcpp::QoS(10),
+      [this](geometry_msgs::msg::PoseArray::ConstSharedPtr m) {
+        onPeerBodies(m);
+      },
+      sub_opts);
 
   indexed_map_query_timeout_s_ = std::max(
       0.01, declareOrGet<double>(this, "indexed_map_query_timeout_s",
@@ -937,6 +948,26 @@ void PlannerNode::onCoordinationExclusions(
   coordination_exclusions_ = std::move(centers);
   coordination_exclusions_received_ = std::chrono::steady_clock::now();
   have_coordination_exclusions_ = true;
+}
+
+void PlannerNode::onPeerBodies(
+    geometry_msgs::msg::PoseArray::ConstSharedPtr msg) {
+  if (mola_map_ == nullptr || peer_body_radius_m_ <= 0.0) return;
+  if (msg->header.frame_id != world_frame_) {
+    RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 5000,
+                         "ignoring peer bodies in frame '%s'",
+                         msg->header.frame_id.c_str());
+    return;
+  }
+  std::vector<Eigen::Vector2d> centres;
+  centres.reserve(msg->poses.size());
+  for (const auto& pose : msg->poses) {
+    if (std::isfinite(pose.position.x) && std::isfinite(pose.position.y)) {
+      centres.emplace_back(pose.position.x, pose.position.y);
+    }
+  }
+  mola_map_->setTransientDiscs(std::move(centres), peer_body_radius_m_,
+                               peer_body_ttl_s_);
 }
 
 void PlannerNode::onMappingSnapshot(

@@ -316,6 +316,42 @@ std::vector<Voxel> freeBlockWithout(const Voxel& endpoint) {
   return result;
 }
 
+TEST(MolaMap, TransientDiscsAreOccupiedUntilTheyExpire) {
+  Publication publication;
+  const Voxel endpoint{10, 0, 2};
+  const auto request = publication.publish(0, {endpoint},
+                                           freeBlockWithout(endpoint), true,
+                                           Eigen::Isometry3d::Identity());
+  MolaMap provider(config(publication));
+  mgg::MapInterface* map = &provider;
+  provider.requestSnapshot(request);
+  ASSERT_TRUE(waitFor([&]() { return map->getStatus(); })) << provider.lastError();
+
+  const Eigen::Vector3d here(0.1, 0.1, 0.1);
+  const Eigen::Vector3d there(0.5, 0.1, 0.1);
+  const Eigen::Vector3d body(0.1, 0.1, 0.1);
+  ASSERT_EQ(map->getBoxStatus(here, body, true), VoxelStatus::kFree);
+  ASSERT_EQ(map->getPathStatus(here, there, body, true), VoxelStatus::kFree);
+
+  // A neighbour stands beside the segment: nothing in the map says so.
+  provider.setTransientDiscs({Eigen::Vector2d(0.3, 0.35)}, 0.25, 60.0);
+  EXPECT_EQ(map->getBoxStatus(here, body, true), VoxelStatus::kFree);
+  EXPECT_EQ(map->getPathStatus(here, there, body, true), VoxelStatus::kOccupied);
+  EXPECT_EQ(map->getStrictPathStatus(here, there, body), VoxelStatus::kOccupied);
+  EXPECT_EQ(map->getBoxStatus(Eigen::Vector3d(0.3, 0.2, 0.1), body, true),
+            VoxelStatus::kOccupied);
+  EXPECT_EQ(map->getOccupiedOnlyCylinderPathStatus(here, there, 0.1, 0.2),
+            VoxelStatus::kOccupied);
+
+  // The neighbour left, or its reports stopped: the map decides again.
+  provider.setTransientDiscs({}, 0.25, 60.0);
+  EXPECT_EQ(map->getPathStatus(here, there, body, true), VoxelStatus::kFree);
+  provider.setTransientDiscs({Eigen::Vector2d(0.3, 0.35)}, 0.25, 0.05);
+  std::this_thread::sleep_for(std::chrono::milliseconds(120));
+  EXPECT_EQ(map->getPathStatus(here, there, body, true), VoxelStatus::kFree);
+}
+
+
 // Visibility retirement. A peer robot captured beside this one leaves an
 // occupied voxel and terrain surface samples that obstacle expiry alone cannot
 // disprove, so the builder drops both once later qualified rays have seen

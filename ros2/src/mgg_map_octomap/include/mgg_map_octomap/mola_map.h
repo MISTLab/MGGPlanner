@@ -101,6 +101,16 @@ class MolaMap : public MapInterface {
       std::size_t maximum_cells,
       std::vector<XYCellCenter>& centers) const override;
   bool getStatus() const override;
+
+  /// Bodies that stand in the world and in no map: other robots of the fleet.
+  /// A capture-time mask keeps them out of the persistent product, so without
+  /// this the planner routes straight through a parked neighbour. Each disc is
+  /// a vertical cylinder of unbounded height in the navigation frame; the box,
+  /// path and cylinder queries report it occupied. The list expires after
+  /// `ttl_s`, so a silent publisher cannot freeze an obstacle in place. The
+  /// cost per query is one distance test per disc.
+  void setTransientDiscs(std::vector<Eigen::Vector2d> centres, double radius_m,
+                         double ttl_s);
   VoxelStatus getVoxelStatus(const Eigen::Vector3d& position) const override;
   VoxelStatus getRayStatus(const Eigen::Vector3d& view_point,
                            const Eigen::Vector3d& voxel_to_test,
@@ -187,6 +197,16 @@ class MolaMap : public MapInterface {
   bool stopping_ = false;
   std::thread worker_;
 
+  struct TransientDiscs {
+    std::vector<Eigen::Vector2d> centres;
+    double radius_m = 0.0;
+    std::chrono::steady_clock::time_point expires;
+  };
+  std::shared_ptr<const TransientDiscs> transient_discs_;
+  bool discsBlockBox(const Eigen::Vector3d& center,
+                     const Eigen::Vector3d& size) const;
+  bool discsBlockSweep(const Eigen::Vector3d& start, const Eigen::Vector3d& end,
+                       double half_width) const;
   mutable std::mutex error_mutex_;
   std::string last_error_;
   mutable std::recursive_mutex publication_mutex_;

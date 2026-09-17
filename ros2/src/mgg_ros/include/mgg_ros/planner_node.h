@@ -74,6 +74,7 @@ class PlannerNode : public rclcpp::Node {
   void onPointCloud(sensor_msgs::msg::PointCloud2::ConstSharedPtr msg);
   void onNeighbourGraph(mgg_msgs::msg::Graph::ConstSharedPtr msg);
   void onCoordinationExclusions(geometry_msgs::msg::PoseArray::ConstSharedPtr msg);
+  void onPeerBodies(geometry_msgs::msg::PoseArray::ConstSharedPtr msg);
   void onMappingSnapshot(mgg_msgs::msg::MappingSnapshot::ConstSharedPtr msg);
   void onBuildRequest(
       const std::shared_ptr<std_srvs::srv::Trigger::Request> request,
@@ -428,6 +429,13 @@ class PlannerNode : public rclcpp::Node {
   rclcpp::Subscription<mgg_msgs::msg::Graph>::SharedPtr neighbour_sub_;
   rclcpp::Subscription<geometry_msgs::msg::PoseArray>::SharedPtr
       coordination_exclusions_sub_;
+  rclcpp::Subscription<geometry_msgs::msg::PoseArray>::SharedPtr
+      peer_bodies_sub_;
+  /// Radius of the keep-out disc around every reported peer, and how long a
+  /// report stays valid. The fleet layer publishes where the other robots
+  /// stand; the MOLA map treats them as occupied for as long as that holds.
+  double peer_body_radius_m_ = 0.7;
+  double peer_body_ttl_s_ = 3.0;
   rclcpp::Subscription<mgg_msgs::msg::MappingSnapshot>::SharedPtr
       mapping_snapshot_sub_;
   rclcpp::Publisher<mgg_msgs::msg::Graph>::SharedPtr graph_pub_;
