@@ -378,6 +378,15 @@ PlannerNode::PlannerNode(const rclcpp::NodeOptions& options)
       std::isfinite(requested_partial_progress)
           ? std::clamp(requested_partial_progress, 0.10, 5.0)
           : 1.0;
+  corridor_detour_ratio_ = declareOrGet<double>(
+      this, "corridor_detour_ratio", corridor_detour_ratio_);
+  if (!std::isfinite(corridor_detour_ratio_)) corridor_detour_ratio_ = 0.0;
+  corridor_detour_min_excess_m_ = declareOrGet<double>(
+      this, "corridor_detour_min_excess_m", corridor_detour_min_excess_m_);
+  if (!std::isfinite(corridor_detour_min_excess_m_) ||
+      corridor_detour_min_excess_m_ < 0.0) {
+    corridor_detour_min_excess_m_ = 2.0;
+  }
   hazard_prefix_standoff_m_ = declareOrGet<double>(
       this, "hazard_prefix_standoff_m", hazard_prefix_standoff_m_);
   hazard_prefix_standoff_m_ =
@@ -2196,7 +2205,7 @@ void PlannerNode::onPlanRequest(
     corridor.status = mgg::PlanningStatus::kUnreachable;
   }
   mgg::FeasiblePath feasible =
-      refineCorridor(corridor, &objective_grid_limits_);
+      refineCorridorPreferringDirect(corridor, &objective_grid_limits_);
   const bool allow_explore_height_refinement =
       map_backend_ == "mola_snapshot" && provisional_unknown_ground_ &&
       observed_ground_body_evidence_;
@@ -3002,6 +3011,49 @@ bool PlannerNode::queryIndexedMap(mgg::FeasiblePath& path,
     path.indexed_map_validated = true;
     return true;
   }
+}
+
+mgg::FeasiblePath PlannerNode::refineCorridorPreferringDirect(
+    const mgg::RouteCorridor& corridor,
+    const mgg::GridRefinementLimits* limits) {
+  const mgg::StateVec& goal = corridor.request.goal.pose;
+  if (limits == nullptr || corridor.status != mgg::PlanningStatus::kSucceeded ||
+      corridor.partial || corridor.poses.size() < 2u || !goal.allFinite() ||
+      !current_state_.allFinite() || corridor_detour_ratio_ <= 1.0) {
+    return refineCorridor(corridor, limits);
+  }
+  double length = 0.0;
+  Eigen::Vector2d previous = current_state_.head<2>();
+  for (const mgg::StateVec& pose : corridor.poses) {
+    if (!pose.allFinite()) return refineCorridor(corridor, limits);
+    length += (pose.head<2>() - previous).norm();
+    previous = pose.head<2>();
+  }
+  length += (goal.head<2>() - previous).norm();
+  const double straight = (goal.head<2>() - current_state_.head<2>()).norm();
+  if (length <= corridor_detour_ratio_ * straight ||
+      length - straight <= corridor_detour_min_excess_m_) {
+    return refineCorridor(corridor, limits);
+  }
+  const auto started = std::chrono::steady_clock::now();
+  mgg::GridRefinementLimits direct_limits = *limits;
+  direct_limits.timeout = std::max(std::chrono::milliseconds(1),
+                                   direct_limits.timeout / 2);
+  mgg::FeasiblePath direct =
+      refineCorridor(objectiveLocalEndpointCorridor(corridor), &direct_limits);
+  if (direct.status == mgg::PlanningStatus::kSucceeded) {
+    RCLCPP_INFO(get_logger(),
+                "corridor of %.1f m to a goal %.1f m away replaced by a direct "
+                "grid path",
+                length, straight);
+    return direct;
+  }
+  mgg::GridRefinementLimits remaining = *limits;
+  const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+      std::chrono::steady_clock::now() - started);
+  remaining.timeout = std::max(std::chrono::milliseconds(1),
+                               remaining.timeout - elapsed);
+  return refineCorridor(corridor, &remaining);
 }
 
 mgg::FeasiblePath PlannerNode::refineCorridor(
@@ -4204,7 +4256,8 @@ void PlannerNode::onObjectiveRequest(
       corridor.status == mgg::PlanningStatus::kSucceeded &&
       !corridor.poses.empty();
   const auto objective_refinement_started = std::chrono::steady_clock::now();
-  mgg::FeasiblePath path = refineCorridor(primary, objective_limits);
+  mgg::FeasiblePath path =
+      refineCorridorPreferringDirect(primary, objective_limits);
   if (topological_corridor_primary &&
       path.status != mgg::PlanningStatus::kSucceeded) {
     // Blocked-corridor feedback. Mark the corridor segment the bounded grid
