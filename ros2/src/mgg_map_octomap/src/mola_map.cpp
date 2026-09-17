@@ -658,7 +658,7 @@ std::shared_ptr<const MolaMap::Snapshot> MolaMap::loadOnce(
       "schema", "graph_version", "identity", "source_stamp_ns",
       "resolution_m", "ray_angular_resolution_rad", "ray_step_fraction",
       "point_count", "occupied_count", "free_count", "surface_count",
-      "ray_steps", "qualified_ray_keyframes"};
+      "retired_count", "ray_steps", "qualified_ray_keyframes"};
   if (metadata.size() != metadata_fields.size())
     throw std::runtime_error("MOLA planner metadata fields are invalid");
   for (auto it = metadata.begin(); it != metadata.end(); ++it)
@@ -708,15 +708,24 @@ std::shared_ptr<const MolaMap::Snapshot> MolaMap::loadOnce(
     throw std::runtime_error("MOLA planner voxel count exceeds its bound");
   const std::size_t surface_count = asSize(metadata.at("surface_count"),
                                            "surface count", config_.max_voxels);
+  const std::size_t retired_count = asSize(metadata.at("retired_count"),
+                                           "retired count", config_.max_voxels);
   const std::size_t qualified = asSize(metadata.at("qualified_ray_keyframes"),
                                        "qualified ray count", config_.max_voxels);
   const std::size_t ray_steps = asSize(metadata.at("ray_steps"), "ray steps",
                                        std::numeric_limits<std::size_t>::max());
   if (qualified != expected_qualified)
     throw std::runtime_error("MOLA planner qualified-ray provenance is invalid");
-  if (surface_count != expected_points)
+  // point_count stays the manifest's stored point count. Every stored point is
+  // either a surface sample or an endpoint the builder retired because later
+  // qualified rays saw through its voxel.
+  if (static_cast<std::uint64_t>(surface_count) +
+          static_cast<std::uint64_t>(retired_count) !=
+      expected_points)
     throw std::runtime_error("MOLA planner surfaces do not match source points");
-  if (qualified == 0 && (free_count != 0 || ray_steps != 0))
+  // Retirement rests on the same evidence free space does: only a qualified
+  // capture's rays can prove an endpoint was seen through.
+  if (qualified == 0 && (free_count != 0 || ray_steps != 0 || retired_count != 0))
     throw std::runtime_error("MOLA free voxels lack qualified ray evidence");
   std::size_t expected_body = checkedProduct(occupied_count + free_count, 24u);
   expected_body = checkedSum(expected_body, checkedProduct(surface_count, 24u));
