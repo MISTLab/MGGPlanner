@@ -54,10 +54,18 @@ bool isDigest(const std::string& value) {
   return std::regex_match(value, pattern);
 }
 
-// Thrown when the snapshot and index describe different publications; the
-// loader retries these within its budget because the worker writes the two
-// files a moment apart.
+// Thrown when the publication on disk is not the one the request names: the
+// source and index describe different publications (the worker writes the two
+// files a moment apart), a file was replaced while it was being read, or the
+// product carries another revision than the authority key. The loader retries
+// these within its budget; after the budget the worker keeps a compatible
+// predecessor in service instead of dropping the map.
 struct CoherenceRace : std::runtime_error {
+  using std::runtime_error::runtime_error;
+};
+// Thrown when the load budget runs out; load() reports it as the race that
+// consumed the budget when one was seen.
+struct DeadlineExceeded : std::runtime_error {
   using std::runtime_error::runtime_error;
 };
 constexpr std::chrono::milliseconds kCoherenceRetryInterval{100};
@@ -86,7 +94,7 @@ std::string digest(const json& value) {
 
 void checkDeadline(const Clock::time_point deadline) {
   if (Clock::now() > deadline)
-    throw std::runtime_error("MOLA map load exceeded its time bound");
+    throw DeadlineExceeded("MOLA map load exceeded its time bound");
 }
 
 bool sameFile(const struct stat& a, const struct stat& b) {
@@ -132,7 +140,7 @@ std::vector<std::uint8_t> stableRead(const std::filesystem::path& path,
         ::read(fd.get(), bytes.data() + offset, bytes.size() - offset);
     if (count < 0 && errno == EINTR) continue;
     if (count <= 0) {
-      throw std::runtime_error(std::string(label) + " changed while reading");
+      throw CoherenceRace(std::string(label) + " changed while reading");
     }
     offset += static_cast<std::size_t>(count);
     checkDeadline(deadline);
@@ -142,7 +150,9 @@ std::vector<std::uint8_t> stableRead(const std::filesystem::path& path,
   const bool stable = ::fstat(fd.get(), &after) == 0 &&
                       ::stat(path.c_str(), &named) == 0 && sameFile(opened, after) &&
                       sameFile(after, named);
-  if (!stable) throw std::runtime_error(std::string(label) + " changed while reading");
+  // A file replaced or truncated under the reader is a publication in
+  // progress, not a broken product; the caller retries within its budget.
+  if (!stable) throw CoherenceRace(std::string(label) + " changed while reading");
   return bytes;
 }
 
@@ -222,6 +232,20 @@ bool sameIdentity(const MolaSnapshotRequest& a, const MolaSnapshotRequest& b) {
          a.source_stamp_ns == b.source_stamp_ns;
 }
 
+bool sameTransform(const MolaSnapshotRequest& a, const MolaSnapshotRequest& b) {
+  return a.component_from_navigation.matrix().isApprox(
+      b.component_from_navigation.matrix(), 1e-9);
+}
+
+// Two requests are compatible when one geometry may stand in for the other
+// while a newer revision is decoded: the same component of the same epoch,
+// placed by the same authority transform. A revision, geometry revision or
+// source stamp that differs only means the product is a few keyframes behind.
+bool compatible(const MolaSnapshotRequest& a, const MolaSnapshotRequest& b) {
+  return a.component_id == b.component_id && a.epoch == b.epoch &&
+         sameTransform(a, b);
+}
+
 Eigen::Vector3d enclosingSize(const Eigen::Matrix3d& rotation,
                               const Eigen::Vector3d& size) {
   return rotation.cwiseAbs() * size;
@@ -247,8 +271,25 @@ struct MolaMap::Snapshot {
   MolaSnapshotRequest request;
   std::shared_ptr<NativeMolaGrid> map;
   std::string artifact_digest;
-  Clock::time_point validated_at;
+  // Steady-clock nanoseconds of the last on-disk confirmation that this
+  // geometry may be served: set by the load that built it and refreshed in
+  // place when a compatible successor heartbeat ends in a coherence race.
+  // The geometry itself stays immutable.
+  mutable std::atomic<std::int64_t> validated_at_ns{0};
   mutable std::atomic<std::size_t> reader_pins{0};
+
+  void markValidated(const Clock::time_point when) const {
+    validated_at_ns.store(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            when.time_since_epoch()).count(),
+        std::memory_order_release);
+  }
+  bool expired(const Clock::time_point now, const double ttl_sec) const {
+    const std::chrono::nanoseconds validated(
+        validated_at_ns.load(std::memory_order_acquire));
+    return std::chrono::duration<double>(now.time_since_epoch() - validated)
+               .count() > ttl_sec;
+  }
 };
 
 struct MolaMap::PendingRequest {
@@ -369,12 +410,12 @@ void MolaMap::requestSnapshot(const MolaSnapshotRequest& request) {
         publication_mutex_);
     std::lock_guard<std::mutex> lock(request_mutex_);
     const auto active = std::atomic_load(&active_);
-    if (active != nullptr &&
-        (!sameIdentity(active->request, request) ||
-         !active->request.component_from_navigation.matrix().isApprox(
-             request.component_from_navigation.matrix(), 1e-9))) {
-      // A corrected key or authority transform must never coexist with the old
-      // geometry, even while the new product is being decoded.
+    if (active != nullptr && !compatible(active->request, request)) {
+      // Another component or epoch, or a moved authority transform, must never
+      // coexist with the old geometry, even while the new product is being
+      // decoded. A compatible successor (a newer revision of the same
+      // component under the same transform) keeps the active snapshot in
+      // service until the worker installs the successor or retains it.
       std::atomic_store(&active_, std::shared_ptr<const Snapshot>());
       active_generation_.fetch_add(1, std::memory_order_release);
     }
@@ -431,6 +472,10 @@ std::uint64_t MolaMap::activeGeneration() const {
   return active_generation_.load(std::memory_order_acquire);
 }
 
+std::uint64_t MolaMap::retainedPredecessorCount() const {
+  return retained_predecessor_count_.load(std::memory_order_relaxed);
+}
+
 void MolaMap::failIfLatest(const std::uint64_t generation,
                            const std::string& error) {
   const std::lock_guard<std::recursive_mutex> publication_lock(
@@ -438,6 +483,36 @@ void MolaMap::failIfLatest(const std::uint64_t generation,
   std::lock_guard<std::mutex> request_lock(request_mutex_);
   if (generation != generation_) return;
   if (std::atomic_load(&active_) != nullptr) {
+    std::atomic_store(&active_, std::shared_ptr<const Snapshot>());
+    active_generation_.fetch_add(1, std::memory_order_release);
+  }
+  std::lock_guard<std::mutex> lock(error_mutex_);
+  last_error_ = error;
+}
+
+void MolaMap::retainPredecessorOrFail(const PendingRequest& pending,
+                                      const std::string& error) {
+  const std::lock_guard<std::recursive_mutex> publication_lock(
+      publication_mutex_);
+  std::lock_guard<std::mutex> request_lock(request_mutex_);
+  const auto active = std::atomic_load(&active_);
+  if (active != nullptr && compatible(active->request, pending.request)) {
+    // The product on disk still describes another revision, or the
+    // source/index pair is mid-replacement. The active geometry is the same
+    // component of the same epoch under the same authority transform, so it
+    // stays the right map to serve until the successor lands. Refresh its
+    // validity clock so current() does not expire it: this heartbeat confirmed
+    // the authority is alive on this component. This also covers a request a
+    // newer heartbeat has superseded, because every request since the
+    // install was compatible (an incompatible one would have retracted it)
+    // and the next attempt may not finish before the clock would run out.
+    // last_error_ stays untouched: it is empty whenever a snapshot is active.
+    active->markValidated(Clock::now());
+    retained_predecessor_count_.fetch_add(1, std::memory_order_relaxed);
+    return;
+  }
+  if (pending.generation != generation_) return;
+  if (active != nullptr) {
     std::atomic_store(&active_, std::shared_ptr<const Snapshot>());
     active_generation_.fetch_add(1, std::memory_order_release);
   }
@@ -460,27 +535,33 @@ void MolaMap::workerLoop() {
           publication_mutex_);
       std::lock_guard<std::mutex> request_lock(request_mutex_);
       if (pending->generation != generation_) {
-        // An equivalent heartbeat that arrived during validation is covered
-        // by the just-finished coherent read. Consume it to avoid starvation
-        // when validation takes longer than the heartbeat interval.
+        // A newer heartbeat arrived during validation. An incompatible one
+        // (or a reset) has already retracted the active snapshot, and this
+        // geometry must not resurface under it. A compatible successor keeps
+        // being served from this snapshot, a fresher predecessor than the one
+        // it would otherwise retain, and stays queued for its own load. An
+        // equivalent heartbeat is covered by the just-finished coherent read:
+        // consume it to avoid starvation when validation takes longer than
+        // the heartbeat interval.
         if (pending_ == nullptr ||
-            !sameIdentity(pending_->request, loaded->request) ||
-            !pending_->request.component_from_navigation.matrix().isApprox(
-                loaded->request.component_from_navigation.matrix(), 1e-9))
+            !compatible(pending_->request, loaded->request))
           continue;
-        pending_.reset();
+        if (sameIdentity(pending_->request, loaded->request)) pending_.reset();
       }
       const auto prior = std::atomic_load(&active_);
+      // A retained predecessor is replaced here by its successor: the
+      // identity differs, so the generation advances exactly once for it.
       const bool semantic_change =
           prior == nullptr || !sameIdentity(prior->request, loaded->request) ||
           prior->artifact_digest != loaded->artifact_digest ||
-          !prior->request.component_from_navigation.matrix().isApprox(
-              loaded->request.component_from_navigation.matrix(), 1e-9);
+          !sameTransform(prior->request, loaded->request);
       std::atomic_store(&active_, std::move(loaded));
       if (semantic_change)
         active_generation_.fetch_add(1, std::memory_order_release);
       std::lock_guard<std::mutex> error_lock(error_mutex_);
       last_error_.clear();
+    } catch (const CoherenceRace& race) {
+      retainPredecessorOrFail(*pending, race.what());
     } catch (const std::exception& error) {
       failIfLatest(pending->generation, error.what());
     }
@@ -490,35 +571,51 @@ void MolaMap::workerLoop() {
 std::shared_ptr<const MolaMap::Snapshot> MolaMap::load(
     const PendingRequest& pending) const {
   const Clock::time_point deadline = Clock::now() + config_.max_load_time;
-  // The mapping worker replaces snapshot.json and mola/index.json as two
-  // atomic writes about a second apart, and a peer solution can move the
-  // authority key just before the product that matches it lands. A request
-  // that reads between those writes sees files that are each valid but do not
-  // yet describe each other. Retry within the load budget instead of failing
-  // the plan request on a race that resolves by itself.
+  // The mapping worker publishes a product as two atomic writes a moment
+  // apart: mola/source.json, the exact mapping snapshot bytes it built from,
+  // and then mola/index.json, whose source digest and snapshot ID name those
+  // bytes. A request that reads between the two writes sees files that are
+  // each valid but do not yet describe each other. The authority key only
+  // names revisions with a published product, but the worker publishes a few
+  // seconds behind the newest revision, so a heartbeat can also reach a
+  // product that still carries the previous revision. Retry within the load
+  // budget instead of failing the plan request on a race that resolves by
+  // itself; when the budget runs out the race is reported as such, and the
+  // worker keeps a compatible predecessor in service.
+  std::string race_seen;
   for (;;) {
     try {
       return loadOnce(pending, deadline);
     } catch (const CoherenceRace& race) {
-      if (Clock::now() + kCoherenceRetryInterval >= deadline)
-        throw std::runtime_error(race.what());
+      if (Clock::now() + kCoherenceRetryInterval >= deadline) throw;
+      race_seen = race.what();
       std::this_thread::sleep_for(kCoherenceRetryInterval);
+    } catch (const DeadlineExceeded&) {
+      // The budget went to waiting out a race that never resolved; report the
+      // race, not a slow read, so the predecessor is retained rather than
+      // dropped. A first attempt that runs out of time is a slow load.
+      if (race_seen.empty()) throw;
+      throw CoherenceRace(race_seen);
     }
   }
 }
 
 std::shared_ptr<const MolaMap::Snapshot> MolaMap::loadOnce(
     const PendingRequest& pending, const Clock::time_point deadline) const {
+  // The product describes itself: mola/source.json holds the exact mapping
+  // snapshot bytes the worker built from, and mola/index.json names those
+  // bytes. The capture process's own snapshot.json in the peer root may
+  // already be ahead of the product and is never read.
   const std::filesystem::path root(config_.peer_root);
-  const auto snapshot_bytes = stableRead(root / "snapshot.json",
-                                         config_.max_snapshot_bytes,
-                                         "mapping snapshot", deadline);
-  const auto index_bytes = stableRead(root / "mola" / "index.json",
-                                      config_.max_index_bytes,
+  const std::filesystem::path source_path = root / "mola" / "source.json";
+  const std::filesystem::path index_path = root / "mola" / "index.json";
+  const auto source_bytes = stableRead(source_path, config_.max_snapshot_bytes,
+                                       "MOLA source snapshot", deadline);
+  const auto index_bytes = stableRead(index_path, config_.max_index_bytes,
                                       "MOLA index", deadline);
-  const json source = decodeJson(snapshot_bytes, "mapping snapshot");
+  const json source = decodeJson(source_bytes, "MOLA source snapshot");
   const json index = decodeJson(index_bytes, "MOLA index");
-  const std::string source_digest = digest(snapshot_bytes);
+  const std::string source_digest = digest(source_bytes);
   if (!source.is_object() || source.value("schema", std::string()) != kSnapshotSchema ||
       !source.contains("manifests") || !source["manifests"].is_array() ||
       source["manifests"].size() > kComponentLimit)
@@ -605,12 +702,13 @@ std::shared_ptr<const MolaMap::Snapshot> MolaMap::loadOnce(
   if (grid_bytes.size() != expected_size || digest(grid_bytes) != expected_grid_digest)
     throw std::runtime_error("MOLA planner grid integrity check failed");
   // Re-read both transaction markers after the artifact. This catches a
-  // source correction or index replacement during decode preparation.
-  if (stableRead(root / "snapshot.json", config_.max_snapshot_bytes,
-                 "mapping snapshot", deadline) != snapshot_bytes ||
-      stableRead(root / "mola" / "index.json", config_.max_index_bytes,
-                 "MOLA index", deadline) != index_bytes)
-    throw std::runtime_error("MOLA publication changed during validation");
+  // source or index replacement during decode preparation; the pair read
+  // above may then no longer be the publication the artifact belongs to.
+  if (stableRead(source_path, config_.max_snapshot_bytes,
+                 "MOLA source snapshot", deadline) != source_bytes ||
+      stableRead(index_path, config_.max_index_bytes, "MOLA index",
+                 deadline) != index_bytes)
+    throw CoherenceRace("MOLA publication changed during validation");
 
   if (grid_bytes.size() < 12 ||
       std::memcmp(grid_bytes.data(), "SDMGRID1", 8) != 0)
@@ -819,16 +917,16 @@ std::shared_ptr<const MolaMap::Snapshot> MolaMap::loadOnce(
   checkDeadline(deadline);
   // Tree construction may dominate the request. Ensure the source/index pair
   // is still the pair validated above before this candidate can become live.
-  if (stableRead(root / "snapshot.json", config_.max_snapshot_bytes,
-                 "mapping snapshot", deadline) != snapshot_bytes ||
-      stableRead(root / "mola" / "index.json", config_.max_index_bytes,
-                 "MOLA index", deadline) != index_bytes)
-    throw std::runtime_error("MOLA publication changed during grid construction");
+  if (stableRead(source_path, config_.max_snapshot_bytes,
+                 "MOLA source snapshot", deadline) != source_bytes ||
+      stableRead(index_path, config_.max_index_bytes, "MOLA index",
+                 deadline) != index_bytes)
+    throw CoherenceRace("MOLA publication changed during grid construction");
   auto result = std::make_shared<Snapshot>();
   result->request = pending.request;
   result->map = std::move(map);
   result->artifact_digest = expected_grid_digest;
-  result->validated_at = Clock::now();
+  result->markValidated(Clock::now());
   return result;
 }
 
@@ -838,17 +936,16 @@ std::shared_ptr<const MolaMap::Snapshot> MolaMap::current() const {
   }
   auto value = std::atomic_load(&active_);
   if (value == nullptr) return nullptr;
-  if (std::chrono::duration<double>(Clock::now() - value->validated_at).count() >
-      config_.snapshot_ttl_sec) {
+  if (value->expired(Clock::now(), config_.snapshot_ttl_sec)) {
     const std::lock_guard<std::recursive_mutex> lock(publication_mutex_);
     value = std::atomic_load(&active_);
     if (value != nullptr &&
-        std::chrono::duration<double>(Clock::now() - value->validated_at).count() >
-            config_.snapshot_ttl_sec) {
+        value->expired(Clock::now(), config_.snapshot_ttl_sec)) {
       // A transaction admitted while this exact snapshot was fresh may finish
       // on it, but another thread may neither use nor expire that transaction's
       // snapshot. The final pin release performs ordinary expiry if no coherent
-      // heartbeat has installed a refreshed replacement.
+      // heartbeat has installed a refreshed replacement or refreshed this
+      // snapshot's validity clock in place.
       if (value->reader_pins.load(std::memory_order_acquire) != 0)
         return nullptr;
       std::atomic_store(&active_, std::shared_ptr<const Snapshot>());

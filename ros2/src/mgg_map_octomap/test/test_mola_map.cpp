@@ -81,11 +81,18 @@ std::string readFile(const std::filesystem::path& path) {
                      std::istreambuf_iterator<char>());
 }
 
+// Atomic like the mapping worker's publication: a reader sees the previous
+// or the new file, never a truncated one. The loader may be mid-retry while a
+// test publishes, and a truncated file would be a structural error.
 void write(const std::filesystem::path& path, const std::string& bytes) {
-  std::ofstream output(path, std::ios::binary | std::ios::trunc);
-  ASSERT_TRUE(output.good());
-  output.write(bytes.data(), static_cast<std::streamsize>(bytes.size()));
-  ASSERT_TRUE(output.good());
+  const std::filesystem::path staging = path.string() + ".staging";
+  {
+    std::ofstream output(staging, std::ios::binary | std::ios::trunc);
+    ASSERT_TRUE(output.good());
+    output.write(bytes.data(), static_cast<std::streamsize>(bytes.size()));
+    ASSERT_TRUE(output.good());
+  }
+  std::filesystem::rename(staging, path);
 }
 
 std::vector<Voxel> freeBlock() {
@@ -96,6 +103,20 @@ std::vector<Voxel> freeBlock() {
   return result;
 }
 
+// One mapping worker product: the exact source snapshot bytes it was built
+// from, the index that names them, the planner grid, and the authority key
+// that a heartbeat carries for it.
+struct Product {
+  MolaSnapshotRequest request;
+  std::string source_bytes;
+  std::string index_bytes;
+  std::string grid_bytes;
+};
+
+// A peer root laid out like the deployment: the product lives under mola/
+// (source.json, index.json, components/). The capture process's own
+// snapshot.json in the peer root is not part of the product and is never
+// written here; the loader must ignore it.
 class Publication {
  public:
   Publication() {
@@ -116,6 +137,28 @@ class Publication {
                               std::string artifact_source_digest = {},
                               double surface_fraction = 0.5,
                               std::size_t retired = 0) {
+    const Product product =
+        build(revision, std::move(occupied), std::move(free), qualified,
+              transform, std::move(artifact_snapshot_id),
+              std::move(artifact_source_digest), surface_fraction, retired);
+    publish(product);
+    return product.request;
+  }
+
+  // Write a built product in the worker's order: the artifact, then the
+  // source bytes, then the index that names them.
+  void publish(const Product& product) {
+    write(root / "mola" / "components" / "native.sdpg", product.grid_bytes);
+    write(root / "mola" / "source.json", product.source_bytes);
+    write(root / "mola" / "index.json", product.index_bytes);
+  }
+
+  Product build(std::uint64_t revision, std::vector<Voxel> occupied,
+                std::vector<Voxel> free, bool qualified = true,
+                Eigen::Isometry3d transform = Eigen::Isometry3d::Identity(),
+                std::string artifact_snapshot_id = {},
+                std::string artifact_source_digest = {},
+                double surface_fraction = 0.5, std::size_t retired = 0) {
     std::sort(occupied.begin(), occupied.end(), less);
     std::sort(free.begin(), free.end(), less);
     free.erase(std::remove_if(free.begin(), free.end(), [&](const Voxel& value) {
@@ -213,10 +256,8 @@ class Publication {
                                  {"sha256", grid_digest},
                                  {"source_sha256", artifact_source_digest},
                                  {"source_snapshot_id", artifact_snapshot_id}}}}})}};
-    write(root / "mola" / "components" / "native.sdpg", grid);
-    write(root / "snapshot.json", source_bytes);
-    write(root / "mola" / "index.json", index.dump());
-    return {"component:test", 1, revision, geometry, source_stamp, transform};
+    return {{"component:test", 1, revision, geometry, source_stamp, transform},
+            source_bytes, index.dump(), grid};
   }
 
   std::filesystem::path root;
@@ -605,8 +646,9 @@ TEST(MolaMap, SmallAuthorityTiltIsTolerated) {
 }
 
 TEST(MolaMap, IndexRacingBehindTheSnapshotResolvesWithinTheLoadBudget) {
-  // The worker writes snapshot.json before mola/index.json. A request that
-  // lands between the two must wait for the index rather than fail the plan.
+  // The worker writes mola/source.json before mola/index.json. A request
+  // that lands between the two must wait for the index rather than fail the
+  // plan.
   Publication publication;
   publication.publish(0, {{5, 0, 0}}, freeBlock());
   const std::string stale_index = readFile(publication.root / "mola" / "index.json");
@@ -644,6 +686,15 @@ TEST(MolaMap, PersistentIndexMismatchStillFailsAtTheLoadDeadline) {
       << provider.lastError();
 }
 
+// A peer correction moves the authority transform by one cell along x. In the
+// corrected placement the first product's occupied cell (5,0,0) sits at
+// navigation x=0.9 and the second's (8,0,0) at x=1.5.
+Eigen::Isometry3d correctedTransform() {
+  Eigen::Isometry3d value = Eigen::Isometry3d::Identity();
+  value.translation() = Eigen::Vector3d(0.2, 0.0, 0.0);
+  return value;
+}
+
 TEST(MolaMap, CorrectedSnapshotAtomicallyRetractsOldGeometry) {
   Publication publication;
   MolaMap provider(config(publication));
@@ -652,19 +703,22 @@ TEST(MolaMap, CorrectedSnapshotAtomicallyRetractsOldGeometry) {
   ASSERT_TRUE(waitFor([&]() { return provider.getStatus(); })) << provider.lastError();
   EXPECT_EQ(provider.getVoxelStatus({1.1, 0.1, 0.1}), VoxelStatus::kOccupied);
 
-  auto second = publication.publish(1, {{8, 0, 0}}, freeBlock());
+  // The corrected transform makes the new key incompatible with the old
+  // geometry, which is retracted before the product is decoded.
+  auto second = publication.publish(1, {{8, 0, 0}}, freeBlock(), true,
+                                    correctedTransform());
   provider.requestSnapshot(second);
   // The fixture is small enough that the worker may already have installed
   // the correction when requestSnapshot returns. If it has, it must be the
   // new geometry; the retracted tree may never reappear.
   if (provider.getStatus()) {
     EXPECT_EQ(provider.getVoxelStatus({1.1, 0.1, 0.1}), VoxelStatus::kFree);
-    EXPECT_EQ(provider.getVoxelStatus({1.7, 0.1, 0.1}),
+    EXPECT_EQ(provider.getVoxelStatus({1.5, 0.1, 0.1}),
               VoxelStatus::kOccupied);
   }
   ASSERT_TRUE(waitFor([&]() { return provider.getStatus(); })) << provider.lastError();
   EXPECT_EQ(provider.getVoxelStatus({1.1, 0.1, 0.1}), VoxelStatus::kFree);
-  EXPECT_EQ(provider.getVoxelStatus({1.7, 0.1, 0.1}), VoxelStatus::kOccupied);
+  EXPECT_EQ(provider.getVoxelStatus({1.5, 0.1, 0.1}), VoxelStatus::kOccupied);
 
   std::filesystem::remove(publication.root / "mola" / "index.json");
   provider.requestSnapshot(second);
@@ -683,32 +737,35 @@ TEST(MolaMap, ReadLeaseKeepsOneSnapshotAcrossAQueryTransaction) {
       << provider.lastError();
 
   const auto second = publication.publish(1, {{8, 0, 0}}, freeBlock());
-  std::atomic<bool> correction_started{false};
-  std::atomic<bool> correction_returned{false};
-  std::thread correction;
+  std::atomic<bool> successor_started{false};
+  std::atomic<bool> successor_returned{false};
+  std::thread successor;
   {
     auto lease = provider.acquireReadLease();
-    correction = std::thread([&]() {
-      correction_started.store(true, std::memory_order_release);
+    successor = std::thread([&]() {
+      successor_started.store(true, std::memory_order_release);
       provider.requestSnapshot(second);
-      correction_returned.store(true, std::memory_order_release);
+      successor_returned.store(true, std::memory_order_release);
     });
     ASSERT_TRUE(waitFor([&]() {
-      return correction_started.load(std::memory_order_acquire);
+      return successor_started.load(std::memory_order_acquire);
     }));
     std::this_thread::sleep_for(std::chrono::milliseconds(20));
-    EXPECT_FALSE(correction_returned.load(std::memory_order_acquire));
+    EXPECT_FALSE(successor_returned.load(std::memory_order_acquire));
     EXPECT_EQ(provider.getVoxelStatus({1.1, 0.1, 0.1}),
               VoxelStatus::kOccupied);
     EXPECT_EQ(provider.getVoxelStatus({1.7, 0.1, 0.1}), VoxelStatus::kFree);
   }
-  correction.join();
-  EXPECT_FALSE(provider.getStatus());
-  ASSERT_TRUE(waitFor([&]() { return provider.getStatus(); }))
-      << provider.lastError();
+  successor.join();
+  // The successor is a newer revision of the same component under the same
+  // transform, so the first geometry stays in service until the worker
+  // installs the second; there is no gap without a map.
+  EXPECT_TRUE(provider.getStatus());
+  ASSERT_TRUE(waitFor([&]() {
+    return provider.getStatus() &&
+           provider.getVoxelStatus({1.7, 0.1, 0.1}) == VoxelStatus::kOccupied;
+  })) << provider.lastError();
   EXPECT_EQ(provider.getVoxelStatus({1.1, 0.1, 0.1}), VoxelStatus::kFree);
-  EXPECT_EQ(provider.getVoxelStatus({1.7, 0.1, 0.1}),
-            VoxelStatus::kOccupied);
 }
 
 TEST(MolaMap, ReadLeasePinsAdmittedSnapshotAcrossTtlAndPublicationWindow) {
@@ -823,7 +880,11 @@ TEST(MolaMap, CorrectionDuringPublicationWindowInvalidatesGenerationNotPin) {
   ASSERT_TRUE(waitFor([&]() { return provider.getStatus(); }))
       << provider.lastError();
   const auto loaded_generation = provider.activeGeneration();
-  const auto second = publication.publish(1, {{8, 0, 0}}, freeBlock());
+  // A moved authority transform is incompatible with the admitted geometry:
+  // the generation advances before the product is decoded, while the
+  // transaction keeps the snapshot it was admitted with.
+  const auto second = publication.publish(1, {{8, 0, 0}}, freeBlock(), true,
+                                          correctedTransform());
 
   {
     auto lease = provider.acquireReadLease();
@@ -845,7 +906,7 @@ TEST(MolaMap, CorrectionDuringPublicationWindowInvalidatesGenerationNotPin) {
     return provider.getStatus() &&
            provider.getVoxelStatus({1.1, 0.1, 0.1}) == VoxelStatus::kFree;
   })) << provider.lastError();
-  EXPECT_EQ(provider.getVoxelStatus({1.7, 0.1, 0.1}),
+  EXPECT_EQ(provider.getVoxelStatus({1.5, 0.1, 0.1}),
             VoxelStatus::kOccupied);
 }
 
@@ -900,6 +961,180 @@ TEST(MolaMap, HeartbeatRefreshDoesNotChurnButExpiryAndRecoveryDo) {
   ASSERT_TRUE(waitFor([&]() { return provider.getStatus(); }))
       << provider.lastError();
   EXPECT_GT(provider.activeGeneration(), expired_generation);
+}
+
+// A short TTL and load budget, so successor loads run out of budget and the
+// snapshot would expire within a test rather than within seconds.
+MolaMapConfig successorConfig(const Publication& publication) {
+  MolaMapConfig value = config(publication);
+  value.snapshot_ttl_sec = 0.6;
+  value.max_load_time = std::chrono::milliseconds(200);
+  return value;
+}
+
+TEST(MolaMap, CompatibleSuccessorKeepsThePredecessorWhileItsProductIsAbsent) {
+  // The authority key advances to a revision the mapping worker has not
+  // published yet. The predecessor is the same component of the same epoch
+  // under the same transform, so it stays in service across more than a TTL
+  // of heartbeats, with no error reported and no generation churn.
+  Publication publication;
+  MolaMap provider(successorConfig(publication));
+  const auto predecessor = publication.publish(0, {{5, 0, 0}}, freeBlock());
+  provider.requestSnapshot(predecessor);
+  ASSERT_TRUE(waitFor([&]() { return provider.getStatus(); }))
+      << provider.lastError();
+  const auto loaded_generation = provider.activeGeneration();
+
+  const auto successor = publication.build(1, {{8, 0, 0}}, freeBlock());
+  const auto start = std::chrono::steady_clock::now();
+  const auto span = std::chrono::milliseconds(1500);
+  while (std::chrono::steady_clock::now() - start < span) {
+    provider.requestSnapshot(successor.request);
+    EXPECT_TRUE(provider.getStatus());
+    EXPECT_EQ(provider.getVoxelStatus({1.1, 0.1, 0.1}),
+              VoxelStatus::kOccupied);
+    EXPECT_TRUE(provider.lastError().empty()) << provider.lastError();
+    EXPECT_EQ(provider.activeGeneration(), loaded_generation);
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+  }
+  EXPECT_GT(provider.retainedPredecessorCount(), 0u);
+  EXPECT_TRUE(provider.getStatus());
+}
+
+TEST(MolaMap, SuccessorProductLandingInstallsOnceBesideAPinnedPredecessor) {
+  Publication publication;
+  MolaMap provider(successorConfig(publication));
+  const auto predecessor = publication.publish(0, {{5, 0, 0}}, freeBlock());
+  provider.requestSnapshot(predecessor);
+  ASSERT_TRUE(waitFor([&]() { return provider.getStatus(); }))
+      << provider.lastError();
+  const auto loaded_generation = provider.activeGeneration();
+  const auto successor = publication.build(1, {{8, 0, 0}}, freeBlock());
+  provider.requestSnapshot(successor.request);
+  ASSERT_TRUE(waitFor([&]() {
+    return provider.retainedPredecessorCount() > 0;
+  }));
+  EXPECT_TRUE(provider.getStatus());
+  EXPECT_EQ(provider.activeGeneration(), loaded_generation);
+
+  {
+    // A transaction admitted on the predecessor stays on it while the
+    // successor's product lands and the next heartbeat installs it.
+    auto lease = provider.acquireReadLease();
+    lease.allowPublication();
+    publication.publish(successor);
+    provider.requestSnapshot(successor.request);
+    ASSERT_TRUE(waitFor([&]() {
+      return provider.activeGeneration() != loaded_generation;
+    })) << provider.lastError();
+    EXPECT_EQ(provider.activeGeneration(), loaded_generation + 1);
+    EXPECT_EQ(provider.getVoxelStatus({1.1, 0.1, 0.1}),
+              VoxelStatus::kOccupied);
+    EXPECT_EQ(provider.getVoxelStatus({1.7, 0.1, 0.1}), VoxelStatus::kFree);
+    lease.reacquirePublication();
+  }
+  EXPECT_TRUE(provider.getStatus());
+  EXPECT_EQ(provider.activeGeneration(), loaded_generation + 1);
+  EXPECT_EQ(provider.getVoxelStatus({1.1, 0.1, 0.1}), VoxelStatus::kFree);
+  EXPECT_EQ(provider.getVoxelStatus({1.7, 0.1, 0.1}), VoxelStatus::kOccupied);
+  EXPECT_TRUE(provider.lastError().empty()) << provider.lastError();
+
+  // Further heartbeats for the installed key reload without churn.
+  provider.requestSnapshot(successor.request);
+  std::this_thread::sleep_for(std::chrono::milliseconds(300));
+  EXPECT_TRUE(provider.getStatus());
+  EXPECT_EQ(provider.activeGeneration(), loaded_generation + 1);
+  EXPECT_TRUE(provider.lastError().empty()) << provider.lastError();
+}
+
+TEST(MolaMap, IncompatibleRequestRetractsTheActiveSnapshotAtOnce) {
+  Publication publication;
+  MolaMap provider(successorConfig(publication));
+  const auto predecessor = publication.publish(0, {{5, 0, 0}}, freeBlock());
+  provider.requestSnapshot(predecessor);
+  ASSERT_TRUE(waitFor([&]() { return provider.getStatus(); }))
+      << provider.lastError();
+  auto generation = provider.activeGeneration();
+
+  // Another epoch: the old geometry may not stand in for it, and the product
+  // on disk cannot satisfy it, so the map is gone and the failure is reported.
+  auto other_epoch = predecessor;
+  other_epoch.epoch = 2;
+  provider.requestSnapshot(other_epoch);
+  EXPECT_FALSE(provider.getStatus());
+  EXPECT_GT(provider.activeGeneration(), generation);
+  ASSERT_TRUE(waitFor([&]() { return !provider.lastError().empty(); }));
+  EXPECT_FALSE(provider.getStatus());
+  EXPECT_NE(provider.lastError().find("does not match authority key"),
+            std::string::npos)
+      << provider.lastError();
+  EXPECT_EQ(provider.retainedPredecessorCount(), 0u);
+
+  // Back on the published key, then a moved authority transform.
+  provider.requestSnapshot(predecessor);
+  ASSERT_TRUE(waitFor([&]() { return provider.getStatus(); }))
+      << provider.lastError();
+  generation = provider.activeGeneration();
+  const auto moved =
+      publication.build(1, {{8, 0, 0}}, freeBlock(), true, correctedTransform());
+  provider.requestSnapshot(moved.request);
+  EXPECT_FALSE(provider.getStatus());
+  EXPECT_GT(provider.activeGeneration(), generation);
+  ASSERT_TRUE(waitFor([&]() { return !provider.lastError().empty(); }));
+  EXPECT_FALSE(provider.getStatus());
+  EXPECT_EQ(provider.retainedPredecessorCount(), 0u);
+}
+
+TEST(MolaMap, StructuralErrorInASuccessorStillDropsThePredecessor) {
+  Publication publication;
+  MolaMap provider(successorConfig(publication));
+  const auto predecessor = publication.publish(0, {{5, 0, 0}}, freeBlock());
+  provider.requestSnapshot(predecessor);
+  ASSERT_TRUE(waitFor([&]() { return provider.getStatus(); }))
+      << provider.lastError();
+  const auto loaded_generation = provider.activeGeneration();
+
+  // The successor's product is published but its grid does not match the
+  // index: a broken product, not a race, so nothing may be served.
+  const auto successor = publication.publish(1, {{8, 0, 0}}, freeBlock());
+  const auto grid_path = publication.root / "mola" / "components" / "native.sdpg";
+  write(grid_path, readFile(grid_path) + "x");
+  provider.requestSnapshot(successor);
+  ASSERT_TRUE(waitFor([&]() { return !provider.lastError().empty(); }));
+  EXPECT_FALSE(provider.getStatus());
+  EXPECT_GT(provider.activeGeneration(), loaded_generation);
+  EXPECT_NE(provider.lastError().find("integrity check failed"),
+            std::string::npos)
+      << provider.lastError();
+  EXPECT_EQ(provider.retainedPredecessorCount(), 0u);
+}
+
+TEST(MolaMap, NewerPeerSnapshotBesideAnOlderProductIsIgnored) {
+  Publication publication;
+  const auto older = publication.publish(0, {{5, 0, 0}}, freeBlock());
+  const auto newer = publication.build(1, {{8, 0, 0}}, freeBlock());
+  // The capture process has already moved the peer root's snapshot.json on
+  // to a revision the worker has not published. Only mola/source.json
+  // describes the product.
+  write(publication.root / "snapshot.json", newer.source_bytes);
+
+  MolaMap provider(successorConfig(publication));
+  provider.requestSnapshot(older);
+  ASSERT_TRUE(waitFor([&]() { return provider.getStatus(); }))
+      << provider.lastError();
+  EXPECT_EQ(provider.getVoxelStatus({1.1, 0.1, 0.1}), VoxelStatus::kOccupied);
+  EXPECT_TRUE(provider.lastError().empty()) << provider.lastError();
+
+  // The key snapshot.json names has no product: a provider without a
+  // predecessor reports the product's revision mismatch, not an index that
+  // disagrees with snapshot.json.
+  MolaMap fresh(successorConfig(publication));
+  fresh.requestSnapshot(newer.request);
+  ASSERT_TRUE(waitFor([&]() { return !fresh.lastError().empty(); }));
+  EXPECT_FALSE(fresh.getStatus());
+  EXPECT_NE(fresh.lastError().find("does not match authority key"),
+            std::string::npos)
+      << fresh.lastError();
 }
 
 TEST(MolaMap, DrivesCoreGridConstructionThroughMapInterface) {

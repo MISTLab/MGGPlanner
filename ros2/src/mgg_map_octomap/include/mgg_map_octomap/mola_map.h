@@ -25,7 +25,11 @@ namespace mgg {
 struct MolaMapConfig {
   std::string peer_root;
   double resolution = 0.2;
+  /// An active snapshot expires this long after its last on-disk
+  /// confirmation: the load that built it, a same-key reload, or a compatible
+  /// successor heartbeat that found no product for its revision yet.
   double snapshot_ttl_sec = 3.0;
+  /// Bound on `<peer_root>/mola/source.json`.
   std::size_t max_snapshot_bytes = 4u * 1024u * 1024u;
   std::size_t max_index_bytes = 4u * 1024u * 1024u;
   std::size_t max_grid_bytes = 256u * 1024u * 1024u;
@@ -47,6 +51,21 @@ struct MolaSnapshotRequest {
 /// A correction-aware MOLA provider. Requests enqueue bounded filesystem
 /// validation and native-grid construction on one worker; planner callbacks never
 /// decode a grid. The active immutable tree is replaced atomically.
+///
+/// The product is self-described: the mapping worker writes
+/// `<peer_root>/mola/source.json` (the exact mapping snapshot bytes it built
+/// from) and then `<peer_root>/mola/index.json`, whose `source_sha256` and
+/// `source_snapshot_id` name those bytes. `<peer_root>/snapshot.json` may run
+/// ahead of the product and is never read here.
+///
+/// Two requests are compatible when they name the same component and epoch
+/// and carry the same authority transform. A compatible successor request
+/// (a newer graph revision, geometry revision or source stamp) keeps the
+/// active snapshot in service while its product is decoded; if the product on
+/// disk still describes another revision when the load budget runs out, the
+/// predecessor is kept and its validity clock refreshed, because a
+/// product-gated authority key only names revisions the worker has published.
+/// An incompatible or invalid request retracts the active snapshot at once.
 class MolaMap : public MapInterface {
  private:
   struct Snapshot;
@@ -90,10 +109,17 @@ class MolaMap : public MapInterface {
 
   /// Queue the latest authority heartbeat. Even an unchanged key is
   /// revalidated, so disappearance or retraction cannot refresh freshness.
+  /// A request compatible with the active snapshot leaves it in service; an
+  /// incompatible or invalid one retracts it before this call returns.
   void requestSnapshot(const MolaSnapshotRequest& request);
   ReadLease acquireReadLease() const;
+  /// The error that removed or withheld the active snapshot; empty while a
+  /// snapshot is served, including one retained across a pending successor.
   std::string lastError() const;
   std::uint64_t activeGeneration() const;
+  /// Number of successor loads that ended in a coherence race after the load
+  /// budget while a compatible predecessor stayed in service.
+  std::uint64_t retainedPredecessorCount() const;
 
   double getResolution() const override;
   bool getCircleIntersectingXYCellCenters(
@@ -187,7 +213,13 @@ class MolaMap : public MapInterface {
   /// One read of the peer directory against a fixed deadline.
   std::shared_ptr<const Snapshot> loadOnce(const PendingRequest& pending,
                                            std::chrono::steady_clock::time_point deadline) const;
+  /// Structural failure: drop the active snapshot and record the error unless
+  /// a newer request has already superseded this one.
   void failIfLatest(std::uint64_t generation, const std::string& error);
+  /// Coherence race after the retry budget: keep a compatible predecessor in
+  /// service and refresh its validity clock, otherwise fail as failIfLatest.
+  void retainPredecessorOrFail(const PendingRequest& pending,
+                               const std::string& error);
 
   MolaMapConfig config_;
   mutable std::mutex request_mutex_;
@@ -212,6 +244,7 @@ class MolaMap : public MapInterface {
   mutable std::recursive_mutex publication_mutex_;
   mutable std::shared_ptr<const Snapshot> active_;
   mutable std::atomic<std::uint64_t> active_generation_{0};
+  std::atomic<std::uint64_t> retained_predecessor_count_{0};
   static thread_local std::vector<ThreadPin> thread_pins_;
 };
 
