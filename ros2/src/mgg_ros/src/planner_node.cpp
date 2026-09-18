@@ -1487,7 +1487,8 @@ mgg::StateVec PlannerNode::physicalAnchorAtDrivingHeight(
 
 bool PlannerNode::validateObjectiveStartSupport(
     const mgg::StateVec& anchor, const mgg::StateVec& supported,
-    std::vector<mgg::StateVec>& checked, bool tolerate_unknown_body) const {
+    std::vector<mgg::StateVec>& checked, bool tolerate_unknown_body,
+    bool physical_anchor) const {
   checked.clear();
   if (robot_params_.type != mgg::RobotType::kGroundRobot || !ground_ ||
       !anchor.allFinite() || !supported.allFinite() ||
@@ -1536,8 +1537,18 @@ bool PlannerNode::validateObjectiveStartSupport(
 
   const Eigen::Vector3d center_offset = robot_params_.center_offset;
   checked.reserve(projected.size());
-  for (const Eigen::Vector3d& point : projected) {
-    if (!objectiveFootprintTerrainSupported(point, footprint_body)) {
+  for (std::size_t point_index = 0; point_index < projected.size();
+       ++point_index) {
+    const Eigen::Vector3d& point = projected[point_index];
+    // Odometry proves that the robot stands on the anchor itself. A kerb a
+    // few millimetres over the step limit under one wheel must not refuse
+    // the connector; every point the robot has yet to reach, the height
+    // steps and the whole swept body remain mandatory.
+    const bool stationary_physical_pose =
+        physical_anchor && point_index == 0 &&
+        (point - anchor.head<3>()).cwiseAbs().maxCoeff() <= 1e-6;
+    if (!stationary_physical_pose &&
+        !objectiveFootprintTerrainSupported(point, footprint_body)) {
       checked.clear();
       if (objective_start_support_failure_.empty() ||
           objective_start_support_failure_ ==
@@ -3201,9 +3212,11 @@ mgg::FeasiblePath PlannerNode::refineCorridor(
         // robot's current footprint and the retained initial Home anchor after
         // that anchor gained a checked connection. Arbitrary unsupported
         // goals and intermediate grid cells still fail closed.
+        bool physical_anchor = false;
         if (samePosition(state, current_state_) ||
             samePosition(state, current_anchor)) {
           state = current_anchor;
+          physical_anchor = true;
         } else if (have_connected_home_anchor &&
                    (samePosition(state, initial_state_) ||
                     samePosition(state, home_anchor) ||
@@ -3215,9 +3228,13 @@ mgg::FeasiblePath PlannerNode::refineCorridor(
         }
         const Eigen::Vector3d anchor_center =
             state.head<3>() + center_offset;
-        if (map_->getBoxStatus(anchor_center, body,
+        // The robot's own pose is never the reason a plan is refused: the
+        // outgoing edge checks below decide whether it can leave. The
+        // retained Home anchor keeps its occupancy veto.
+        if (!physical_anchor &&
+            map_->getBoxStatus(anchor_center, body,
                                /*stop_at_unknown_voxel=*/false) ==
-            mgg::VoxelStatus::kOccupied) {
+                mgg::VoxelStatus::kOccupied) {
           return mgg::GridProjectionStatus::kBodyOccupied;
         }
         if (!geofenceContains(anchor_center)) {
@@ -3230,8 +3247,11 @@ mgg::FeasiblePath PlannerNode::refineCorridor(
     Eigen::Vector3d center = state.head<3>() + center_offset;
     // Odometry proves that the robot already occupies this one exact pose.
     // Permit it to seed a route even when a conservative terrain footprint
-    // query rejects the stationary pose. Body occupancy and geofence checks
-    // below, and the complete outgoing edge checks, remain mandatory.
+    // query rejects the stationary pose (a kerb a few millimetres over the
+    // step limit under one wheel) or when its body box holds occupied space
+    // it is evidently not colliding with. Unknown body volume and geofence
+    // checks below, and the complete outgoing edge checks, remain mandatory:
+    // they decide whether the robot can leave, not whether it may stand.
     if (!physical_anchor_fallback) {
       const mgg::GridProjectionStatus footprint_status =
           footprintTerrainStatus(state.head<3>());
@@ -3248,9 +3268,8 @@ mgg::FeasiblePath PlannerNode::refineCorridor(
             ? objectiveSweptBodyStatus(center, center, footprint_body)
             : objectiveBodyStatus(center, body, tolerate_unknown_body);
     if (body_status == mgg::VoxelStatus::kOccupied) {
-      return mgg::GridProjectionStatus::kBodyOccupied;
-    }
-    if (body_status != mgg::VoxelStatus::kFree) {
+      if (!physical_current) return mgg::GridProjectionStatus::kBodyOccupied;
+    } else if (body_status != mgg::VoxelStatus::kFree) {
       return mgg::GridProjectionStatus::kBodyUnknown;
     }
     if (!geofenceContains(center)) {
@@ -3301,11 +3320,14 @@ mgg::FeasiblePath PlannerNode::refineCorridor(
           }
           const mgg::StateVec& anchor = a_anchor ? a : b;
           const mgg::StateVec& mapped = a_anchor ? b : a;
+          const bool anchor_is_physical_current =
+              a_anchor ? a_physical_current : b_physical_current;
           mgg::StateVec projected_mapped = mapped;
           if (!projectStateToDrivingHeight(projected_mapped) ||
               !samePosition(projected_mapped, mapped) ||
               !validateObjectiveStartSupport(anchor, mapped, checked,
-                                             tolerate_unknown_body)) {
+                                             tolerate_unknown_body,
+                                             anchor_is_physical_current)) {
             checked.clear();
             return false;
           }

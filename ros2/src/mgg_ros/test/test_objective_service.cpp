@@ -2946,6 +2946,53 @@ TEST(PlannerBackbone, ExplicitGroundFailureIdentifiesCurrentOrGoal) {
       << response->reason;
 }
 
+TEST(PlannerBackbone, PhysicalCurrentFootprintRiseCannotRefuseTheStartConnector) {
+  // The robot stands in its sensor's ground blind spot with one 16 cm terrain
+  // return under its own footprint, a kerb a few millimetres over the step
+  // limit. Odometry proves it occupies that pose, so the pose itself must not
+  // refuse the Navigate; the same return on the road ahead still does.
+  using Peer = mgg_ros::PlannerNodeTestPeer;
+  const auto make = [] {
+    rclcpp::NodeOptions options;
+    options.parameter_overrides(
+        {rclcpp::Parameter("use_sim_time", true),
+         rclcpp::Parameter("map.resolution", 0.05),
+         rclcpp::Parameter("objective_body_evidence_policy", "observed_ground")});
+    auto node = std::make_shared<mgg_ros::PlannerNode>(options);
+    Peer::configureBackboneTest(*node);
+    Peer::acceptOdometry(*node, 0.0, 0.0, 0.075);
+    Peer::observeDestinationSupport(*node, 2.5);
+    return node;
+  };
+  mgg::RouteCorridor route;
+  route.status = mgg::PlanningStatus::kSucceeded;
+  route.request.objective = mgg::ObjectiveKind::kNavigate;
+  route.request.goal.pose = mgg::StateVec(2.5, 0.0, 0.075, 0.0);
+  const Eigen::Vector3d body(0.20, 0.20, 0.15);
+
+  auto under_robot = make();
+  // Off the centre and offset projection probes, inside the footprint circle.
+  Peer::addMeasuredSurface(*under_robot, -0.06, 0.06, 0.16);
+  ASSERT_FALSE(Peer::footprintTerrainSupported(
+      *under_robot, Eigen::Vector3d(0.0, 0.0, 0.30), body));
+  const mgg::FeasiblePath escaped = Peer::refine(*under_robot, route);
+  ASSERT_EQ(escaped.status, mgg::PlanningStatus::kSucceeded)
+      << escaped.reason;
+  ASSERT_FALSE(escaped.poses.empty());
+  EXPECT_NEAR(escaped.poses.back().x(), 2.5, 1e-9);
+
+  auto ahead = make();
+  Peer::addMeasuredSurface(*ahead, 0.94, 0.06, 0.16);
+  ASSERT_FALSE(Peer::footprintTerrainSupported(
+      *ahead, Eigen::Vector3d(1.0, 0.0, 0.30), body));
+  const mgg::FeasiblePath refused = Peer::refine(*ahead, route);
+  EXPECT_EQ(refused.status, mgg::PlanningStatus::kBlocked) << refused.reason;
+  EXPECT_TRUE(refused.poses.empty());
+  EXPECT_NE(refused.reason.find("first footprint rejection: known rise"),
+            std::string::npos)
+      << refused.reason;
+}
+
 TEST(PlannerObjective, NavigateReturnsBoundedWindowForThirtyMetreKnownRoad) {
   rclcpp::NodeOptions options;
   options.parameter_overrides(

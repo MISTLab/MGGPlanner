@@ -198,10 +198,13 @@ class PlannerNode : public rclcpp::Node {
   bool resolveNavigateGoalDrivingHeight(mgg::StateVec& state) const;
   mgg::StateVec physicalAnchorAtDrivingHeight(
       const mgg::StateVec& base_pose) const;
+  /// `physical_anchor`: odometry proves the robot stands on `anchor`, so the
+  /// footprint terrain veto does not apply to that stationary pose itself.
   bool validateObjectiveStartSupport(
       const mgg::StateVec& anchor, const mgg::StateVec& supported,
       std::vector<mgg::StateVec>& checked,
-      bool tolerate_unknown_body = false) const;
+      bool tolerate_unknown_body = false,
+      bool physical_anchor = false) const;
   /// Body-volume verdicts for the shared refinement stage.
   ///
   /// `tolerate_unknown` reproduces graph_expansion's lattice policy, which
