@@ -177,7 +177,11 @@
       augment_free_voxels_time: 1
       free_frustum_before_planning: false
       use_ray_model_for_volumetric_gain: true
-      path_length_penalty: 0.07
+      # Gain is discounted by exp(-penalty * route length). At 0.07 a leaf two
+      # metres away kept winning through a 10 m graph route around parked
+      # neighbours (robot_1, 2026-09-17); at 0.25 a 10 m route keeps 8 percent
+      # of its gain and a 3 m route 47 percent.
+      path_length_penalty: 0.25
       path_direction_penalty: 0.3
       hanging_vertex_penalty: 5.0
       exp_gain_voxel_size: 0.5
