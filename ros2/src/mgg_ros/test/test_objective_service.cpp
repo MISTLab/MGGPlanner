@@ -2000,9 +2000,10 @@ TEST(PlannerExplore, BlockedExploreCorridorSelectsTheAlternativeRoute) {
   Peer::configureGridServiceScene(*obstructed);
   Peer::acceptOdometry(*obstructed, 0.0, 0.0, 0.075);
   Peer::setObjectiveGridWindow(*obstructed, 0.25, 0.25);
-  // An obstacle standing on the upper vertex itself, so the corridor cannot be
-  // repaired by a local detour and the topological stage has to be asked again.
-  Peer::addBlockingWallSpan(*obstructed, 0.50, 0.05, 0.40);
+  // An obstacle standing on the upper vertex and across the whole detour
+  // window. The rejected vertex is dropped, but its span still cannot be
+  // repaired locally, so the topological stage has to be asked again.
+  Peer::addBlockingWallSpan(*obstructed, 0.50, -0.25, 0.40);
   Peer::setExploreSelection(*obstructed, lattice, edges, 3);
   const auto rerouted = Peer::requestPinnedExplore(*obstructed);
   ASSERT_EQ(rerouted->status,
@@ -2028,7 +2029,9 @@ TEST(PlannerObjective, BlockedHomeCorridorSelectsTheAlternativeRoute) {
   Peer::configureGridServiceScene(*obstructed);
   Peer::acceptOdometry(*obstructed, 1.00, 0.0, 0.075);
   Peer::setObjectiveGridWindow(*obstructed, 0.25, 0.25);
-  Peer::addBlockingWallSpan(*obstructed, 0.50, 0.05, 0.40);
+  // Across the whole detour window: the dropped upper vertex must leave a
+  // span the grid cannot repair, see BlockedExploreCorridorSelects...
+  Peer::addBlockingWallSpan(*obstructed, 0.50, -0.25, 0.40);
   Peer::setGlobalTopology(*obstructed, graph, edges);
   const auto rerouted =
       Peer::requestObjective(*obstructed, mgg::ObjectiveKind::kReturnHome, home);
@@ -2052,7 +2055,7 @@ TEST(PlannerObjective, BlockedMarksExpireAndDoNotOutliveTheirMapRevision) {
   Peer::configureGridServiceScene(*node);
   Peer::acceptOdometry(*node, 1.00, 0.0, 0.075);
   Peer::setObjectiveGridWindow(*node, 0.25, 0.25);
-  Peer::addBlockingWallSpan(*node, 0.50, 0.05, 0.40);
+  Peer::addBlockingWallSpan(*node, 0.50, -0.25, 0.40);
   Peer::setGlobalTopology(*node, graph, edges);
   // One new map revision is material here, so the mark cannot survive the
   // measurement that might have changed the verdict behind it.
@@ -4239,16 +4242,17 @@ TEST_F(ObjectiveService, GridRejectsSingleUnknownBodyVoxelWithZeroOffset) {
 
   // This is one body-volume key between graph vertices. The legacy 25%
   // tolerance accepts it; explicit refinement must treat any unknown as
-  // blocked even when center_offset is zero.
+  // blocked even when center_offset is zero. The graph waypoint it rejects
+  // is dropped as a hint, and the strict sweep then refuses the span that
+  // replaces it, so the route stays blocked with no margin to detour in.
   ASSERT_TRUE(Peer::makeGridVoxelUnknown(*planner, 0.9, 0.025, 0.325));
   response = call(home);
   ASSERT_NE(response, nullptr);
   EXPECT_EQ(response->status, Service::Response::BLOCKED) << response->reason;
   EXPECT_TRUE(response->path.empty());
-  EXPECT_NE(response->reason.find("route corridor waypoint[0] rejected"),
-            std::string::npos);
-  EXPECT_NE(response->reason.find("body includes unknown space at"),
-            std::string::npos);
+  EXPECT_NE(response->reason.find("rejected waypoints: 0"),
+            std::string::npos)
+      << response->reason;
 }
 
 TEST_F(ObjectiveService, GridGeofenceRejectsStationaryAndCrossingRoutes) {

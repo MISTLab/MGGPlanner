@@ -569,8 +569,10 @@ TEST(GridRefinement, ReportsWaypointIndexCoordinatesAndProjectionClass) {
   };
   for (const auto& [status, expected_class] : failures) {
     SCOPED_TRACE(expected_class);
+    // A single-waypoint corridor: once its only pose is rejected nothing of
+    // the corridor survives, so the request still fails and names that pose.
     RouteCorridor route = routeTo(2.0, 0.0);
-    route.poses.insert(route.poses.begin(), StateVec(1.0, -0.5, 0.25, 0.0));
+    route.poses = {StateVec(1.0, -0.5, 0.25, 0.0)};
     auto project = [status](StateVec& state) {
       return state.x() == 1.0 ? status : GridProjectionStatus::kSupported;
     };
@@ -579,10 +581,166 @@ TEST(GridRefinement, ReportsWaypointIndexCoordinatesAndProjectionClass) {
     const FeasiblePath path = planner.refine(route);
     EXPECT_EQ(path.status, PlanningStatus::kBlocked);
     EXPECT_NE(path.reason.find("route corridor waypoint[0] rejected"),
-              std::string::npos);
+              std::string::npos)
+        << path.reason;
     EXPECT_NE(path.reason.find(expected_class), std::string::npos);
     EXPECT_NE(path.reason.find("(1.00, -0.50, 0.25)"), std::string::npos);
+    EXPECT_TRUE(path.blocked_segment_identified);
+    EXPECT_EQ(path.blocked_from_index, mgg::kNoCorridorIndex);
+    EXPECT_EQ(path.blocked_to_index, 0u);
   }
+}
+
+TEST(GridRefinement, DropsARejectedMiddleWaypointAndRefinesAroundIt) {
+  // The middle graph waypoint stands on a post beside the robot's earlier
+  // track. It is a refinement hint, not a requirement: the bounded search
+  // connects its neighbours around the post instead of refusing the route.
+  RouteCorridor route = routeTo(3.0, 0.0);
+  route.poses = {StateVec(1.0, 0.0, 0.0, 0.0), StateVec(2.0, 0.0, 0.0, 0.0),
+                 StateVec(3.0, 0.0, 0.0, 0.0)};
+  auto project = [](StateVec& state) {
+    state.z() = 0.0;
+    return (state.head<2>() - Eigen::Vector2d(2.0, 0.0)).norm() < 1e-9
+               ? GridProjectionStatus::kBodyOccupied
+               : GridProjectionStatus::kSupported;
+  };
+  BoundedGridPlanner planner(StateVec::Zero(), limits(), project,
+                             sampledTraversal({{2.0, 0.0}}));
+  const FeasiblePath path = planner.refine(route);
+  ASSERT_EQ(path.status, PlanningStatus::kSucceeded) << path.reason;
+  EXPECT_TRUE(path.reason.empty()) << path.reason;
+  EXPECT_FALSE(path.blocked_segment_identified);
+  ASSERT_FALSE(path.poses.empty());
+  EXPECT_NEAR(path.poses.back().x(), 3.0, 1e-9);
+  EXPECT_NEAR(path.poses.back().y(), 0.0, 1e-9);
+  EXPECT_NEAR(path.poses.back()[3], 0.7, 1e-9);
+  for (const StateVec& pose : path.poses) {
+    EXPECT_GT((pose.head<2>() - Eigen::Vector2d(2.0, 0.0)).norm(), 0.34);
+  }
+}
+
+TEST(GridRefinement, DropsARejectedLastWaypointWhenTheExactGoalIsSupported) {
+  // A full corridor's endpoint is the request-owned exact goal, which is
+  // projected on its own. The last graph pose is only a hint like the rest.
+  RouteCorridor route = routeTo(3.0, 0.0);
+  route.poses = {StateVec(1.0, 0.0, 0.0, 0.0), StateVec(2.0, 0.5, 0.0, 0.0)};
+  auto project = [](StateVec& state) {
+    state.z() = 0.0;
+    return (state.head<2>() - Eigen::Vector2d(2.0, 0.5)).norm() < 1e-9
+               ? GridProjectionStatus::kNoGround
+               : GridProjectionStatus::kSupported;
+  };
+  BoundedGridPlanner planner(StateVec::Zero(), limits(), project,
+                             sampledTraversal({}));
+  const FeasiblePath path = planner.refine(route);
+  ASSERT_EQ(path.status, PlanningStatus::kSucceeded) << path.reason;
+  EXPECT_TRUE(path.reason.empty()) << path.reason;
+  ASSERT_FALSE(path.poses.empty());
+  EXPECT_NEAR(path.poses.back().x(), 3.0, 1e-9);
+  EXPECT_NEAR(path.poses.back().y(), 0.0, 1e-9);
+  for (const StateVec& pose : path.poses) {
+    EXPECT_GT((pose.head<2>() - Eigen::Vector2d(2.0, 0.5)).norm(), 1e-3);
+  }
+}
+
+TEST(GridRefinement, PartialCorridorWithOnlyRejectedWaypointsFails) {
+  RouteCorridor route = routeTo(30.0, 0.0);
+  route.request.objective = mgg::ObjectiveKind::kNavigate;
+  route.partial = true;
+  route.poses = {StateVec(1.0, 0.0, 0.0, 0.0), StateVec(2.0, 0.0, 0.0, 0.0)};
+  auto project = [](StateVec& state) {
+    state.z() = 0.0;
+    return state.x() >= 1.0 ? GridProjectionStatus::kNoGround
+                            : GridProjectionStatus::kSupported;
+  };
+  BoundedGridPlanner planner(StateVec::Zero(), limits(), project,
+                             sampledTraversal({}));
+  const FeasiblePath path = planner.refine(route);
+  EXPECT_EQ(path.status, PlanningStatus::kBlocked);
+  EXPECT_FALSE(path.partial);
+  EXPECT_TRUE(path.poses.empty());
+  // The proxy is the mandatory endpoint of the section and is named itself;
+  // the earlier hint it could not fall back on is listed with it.
+  EXPECT_NE(path.reason.find("route corridor waypoint[1] rejected"),
+            std::string::npos)
+      << path.reason;
+  EXPECT_NE(path.reason.find("rejected waypoints: 0"),
+            std::string::npos)
+      << path.reason;
+
+  // A partial corridor reduced to its proxy alone fails the same way.
+  route.poses = {StateVec(2.0, 0.0, 0.0, 0.0)};
+  const FeasiblePath proxy_only = planner.refine(route);
+  EXPECT_EQ(proxy_only.status, PlanningStatus::kBlocked);
+  EXPECT_NE(proxy_only.reason.find("route corridor waypoint[0] rejected"),
+            std::string::npos)
+      << proxy_only.reason;
+}
+
+TEST(GridRefinement, RejectedProxyOfAPartialCorridorRemainsMandatory) {
+  // The continuation resumes from the proxy, so it cannot be dropped even
+  // when an earlier hint survives.
+  RouteCorridor route = routeTo(30.0, 0.0);
+  route.request.objective = mgg::ObjectiveKind::kNavigate;
+  route.partial = true;
+  route.poses = {StateVec(1.0, 0.0, 0.0, 0.0), StateVec(2.0, 0.0, 0.0, 0.0)};
+  auto project = [](StateVec& state) {
+    state.z() = 0.0;
+    return std::abs(state.x() - 2.0) < 1e-9 ? GridProjectionStatus::kNoGround
+                                            : GridProjectionStatus::kSupported;
+  };
+  BoundedGridPlanner planner(StateVec::Zero(), limits(), project,
+                             sampledTraversal({}));
+  const FeasiblePath path = planner.refine(route);
+  EXPECT_EQ(path.status, PlanningStatus::kBlocked);
+  EXPECT_NE(path.reason.find("route corridor waypoint[1] rejected"),
+            std::string::npos)
+      << path.reason;
+  EXPECT_EQ(path.reason.find("rejected waypoints"), std::string::npos)
+      << path.reason;
+  ASSERT_TRUE(path.blocked_segment_identified);
+  EXPECT_EQ(path.blocked_from_index, 0u);
+  EXPECT_EQ(path.blocked_to_index, 1u);
+}
+
+TEST(GridRefinement, NamesTheDroppedWaypointWhenItsSpanCannotBeRefined) {
+  // Waypoint 1 is dropped, and the span 0->2 that replaces it meets a wall
+  // across the whole window. Blocked feedback keys on adjacent corridor
+  // poses, so the segment named is the one leading into the dropped pose.
+  RouteCorridor route;
+  route.status = PlanningStatus::kSucceeded;
+  route.request.objective = mgg::ObjectiveKind::kReturnHome;
+  route.poses = {StateVec(1.0, 0.0, 0.0, 0.0), StateVec(2.0, 0.0, 0.0, 0.0),
+                 StateVec(4.0, 0.0, 0.0, 0.0)};
+  route.request.goal.pose = route.poses.back();
+  auto project = [](StateVec& state) {
+    state.z() = 0.0;
+    return (state.head<2>() - Eigen::Vector2d(2.0, 0.0)).norm() < 1e-9
+               ? GridProjectionStatus::kBodyOccupied
+               : GridProjectionStatus::kSupported;
+  };
+  auto walled = [](const StateVec& from, const StateVec& to,
+                   std::vector<StateVec>& checked) {
+    const double length = (to.head<2>() - from.head<2>()).norm();
+    const int steps = std::max(1, static_cast<int>(std::ceil(length / 0.1)));
+    checked.clear();
+    for (int i = 0; i <= steps; ++i) {
+      const double t = static_cast<double>(i) / steps;
+      StateVec sample = from + t * (to - from);
+      if (sample.x() > 2.9 && sample.x() < 3.6) return false;
+      checked.push_back(sample);
+    }
+    return true;
+  };
+  BoundedGridPlanner planner(StateVec::Zero(), limits(), project, walled);
+  const FeasiblePath path = planner.refine(route);
+  ASSERT_EQ(path.status, PlanningStatus::kBlocked) << path.reason;
+  EXPECT_NE(path.reason.find("rejected waypoints: 1"),
+            std::string::npos)
+      << path.reason;
+  ASSERT_TRUE(path.blocked_segment_identified);
+  EXPECT_EQ(path.blocked_from_index, 0u);
+  EXPECT_EQ(path.blocked_to_index, 1u);
 }
 
 TEST(GridRefinement, IdentifiesCurrentAndExactGoalProjectionFailures) {

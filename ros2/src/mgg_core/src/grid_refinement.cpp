@@ -206,6 +206,11 @@ FeasiblePath BoundedGridPlanner::refine(const RouteCorridor& corridor) {
   // as corridor evidence, or a loaded planner would mark good corridors and
   // push the robot onto worse routes.
   bool interruption_observed = false;
+  // Corridor poses whose projection failed and which the refinement dropped
+  // so the bounded search could connect their neighbours. A graph waypoint is
+  // a refinement hint: one post beside the robot's own earlier track must not
+  // refuse a whole objective. They are named only when the request fails.
+  std::vector<std::size_t> rejected_waypoints;
   const auto fail = [&](const std::string& reason) {
     result.status = PlanningStatus::kBlocked;
     result.poses.clear();
@@ -215,6 +220,20 @@ FeasiblePath BoundedGridPlanner::refine(const RouteCorridor& corridor) {
         active_segment_known && !interruption_observed;
     result.blocked_from_index = active_from_index;
     result.blocked_to_index = active_to_index;
+    if (!rejected_waypoints.empty()) {
+      // Kept short: the node bounds a failure reason to a few hundred
+      // characters before it reaches the operator.
+      constexpr std::size_t kListedRejections = 8;
+      std::string listed = " [rejected waypoints:";
+      for (std::size_t i = 0; i < rejected_waypoints.size(); ++i) {
+        if (i == kListedRejections) {
+          listed += " ...";
+          break;
+        }
+        listed += (i == 0 ? " " : ", ") + std::to_string(rejected_waypoints[i]);
+      }
+      result.reason += listed + "]";
+    }
     const std::size_t projections =
         projection_counts[0] + projection_counts[1] + projection_counts[2] +
         projection_counts[3] + projection_counts[4];
@@ -297,15 +316,26 @@ FeasiblePath BoundedGridPlanner::refine(const RouteCorridor& corridor) {
   // Corridor-pose index behind each waypoint, so a rejected waypoint or an
   // unrefinable segment can name the corridor it belongs to.
   std::vector<std::size_t> waypoint_source;
+  // Corridor-pose index that names the segment ending at each waypoint when
+  // that segment cannot be refined: the waypoint's own index, or the first
+  // corridor pose dropped after the previous surviving waypoint. Blocked
+  // feedback keys on adjacent corridor poses, and a dropped pose is the
+  // hazard the topological stage should route around.
+  std::vector<std::size_t> waypoint_entry;
   // Whether each waypoint stands on measured ground, as opposed to the
   // provisional plane a Navigate corridor may cross.
   std::vector<bool> waypoint_supported;
   waypoints.reserve(corridor.poses.size() + 2);
   waypoint_source.reserve(corridor.poses.size() + 2);
+  waypoint_entry.reserve(corridor.poses.size() + 2);
   waypoint_supported.reserve(corridor.poses.size() + 2);
   waypoints.push_back(start);
   waypoint_source.push_back(kNoCorridorIndex);
+  waypoint_entry.push_back(kNoCorridorIndex);
   waypoint_supported.push_back(true);
+  // First corridor pose dropped since the last surviving waypoint.
+  std::size_t pending_rejection = kNoCorridorIndex;
+  std::string first_rejection;
   for (std::size_t waypoint_index = 0;
        waypoint_index < corridor.poses.size(); ++waypoint_index) {
     StateVec waypoint = corridor.poses[waypoint_index];
@@ -326,18 +356,42 @@ FeasiblePath BoundedGridPlanner::refine(const RouteCorridor& corridor) {
     if ((waypoint_status != GridProjectionStatus::kSupported &&
          !provisional_navigate_waypoint) ||
         !waypoint.allFinite()) {
-      return fail(projectionFailure(
+      const std::string rejection = projectionFailure(
           "route corridor waypoint[" + std::to_string(waypoint_index) + "]",
-          waypoint_status, waypoint));
+          waypoint_status, waypoint);
+      // The last pose of a partial corridor is the section's exact local
+      // proxy, which the continuation resumes from. It is a mandatory
+      // endpoint; every earlier graph pose is a refinement hint.
+      const bool mandatory_proxy =
+          corridor.partial && waypoint_index + 1u == corridor.poses.size();
+      if (mandatory_proxy) return fail(rejection);
+      if (first_rejection.empty()) first_rejection = rejection;
+      if (pending_rejection == kNoCorridorIndex) {
+        pending_rejection = waypoint_index;
+      }
+      rejected_waypoints.push_back(waypoint_index);
+      continue;
     }
     if (!samePosition(waypoints.back(), waypoint)) {
       waypoints.push_back(waypoint);
       waypoint_source.push_back(waypoint_index);
+      waypoint_entry.push_back(pending_rejection == kNoCorridorIndex
+                                   ? waypoint_index
+                                   : pending_rejection);
       waypoint_supported.push_back(waypoint_status ==
                                    GridProjectionStatus::kSupported);
     } else {
       waypoint_source.back() = waypoint_index;
     }
+    pending_rejection = kNoCorridorIndex;
+  }
+  if (!rejected_waypoints.empty() && waypoints.size() < 2u) {
+    // Nothing of the corridor survived projection, so there is no evidence
+    // left to refine along. Name the first rejection, as before.
+    active_from_index = kNoCorridorIndex;
+    active_to_index = rejected_waypoints.front();
+    active_segment_known = true;
+    return fail(first_rejection);
   }
   if (corridor.partial) {
     // The proxy of a partial section must stand on measured ground, while the
@@ -348,6 +402,7 @@ FeasiblePath BoundedGridPlanner::refine(const RouteCorridor& corridor) {
     while (waypoints.size() >= 2u && !waypoint_supported.back()) {
       waypoints.pop_back();
       waypoint_source.pop_back();
+      waypoint_entry.pop_back();
       waypoint_supported.pop_back();
     }
   }
@@ -359,16 +414,21 @@ FeasiblePath BoundedGridPlanner::refine(const RouteCorridor& corridor) {
   }
   StateVec goal = corridor.partial ? waypoints.back()
                                    : corridor.request.goal.pose;
+  // The exact goal follows the last surviving corridor pose. When later poses
+  // were dropped, the first of them names the segment for blocked feedback.
+  const std::size_t goal_entry = pending_rejection == kNoCorridorIndex
+                                     ? corridor.poses.size()
+                                     : pending_rejection;
   if (corridor.partial) {
     // The proxy is the last corridor pose, so name the corridor segment that
     // ends there rather than the pose on its own.
     active_from_index = waypoint_source.size() >= 2u
                             ? waypoint_source[waypoint_source.size() - 2u]
                             : kNoCorridorIndex;
-    active_to_index = waypoint_source.back();
+    active_to_index = waypoint_entry.back();
   } else {
     active_from_index = waypoint_source.back();
-    active_to_index = corridor.poses.size();
+    active_to_index = goal_entry;
   }
   active_segment_known = true;
   const double requested_goal_yaw = goal[3];
@@ -409,6 +469,7 @@ FeasiblePath BoundedGridPlanner::refine(const RouteCorridor& corridor) {
   } else if (!samePosition(waypoints.back(), goal)) {
     waypoints.push_back(goal);
     waypoint_source.push_back(corridor.poses.size());
+    waypoint_entry.push_back(goal_entry);
   } else {
     // The graph vertex supplies XYZ, but the request owns exact final yaw.
     // Its corridor index is kept: when the goal coincides with the last
@@ -493,7 +554,7 @@ FeasiblePath BoundedGridPlanner::refine(const RouteCorridor& corridor) {
     const StateVec& from = waypoints[segment - 1];
     const StateVec& to = waypoints[segment];
     active_from_index = waypoint_source[segment - 1];
-    active_to_index = waypoint_source[segment];
+    active_to_index = waypoint_entry[segment];
     active_segment_known = true;
     StateVec connected_to = to;
     if (interrupted(interruption_reason)) return fail(interruption_reason);
