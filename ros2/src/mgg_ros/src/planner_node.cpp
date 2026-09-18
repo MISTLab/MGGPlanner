@@ -378,6 +378,10 @@ PlannerNode::PlannerNode(const rclcpp::NodeOptions& options)
       std::isfinite(requested_partial_progress)
           ? std::clamp(requested_partial_progress, 0.10, 5.0)
           : 1.0;
+  odometry_height_error_max_m_ = std::clamp(
+      declareOrGet<double>(this, "odometry_height_error_max_m",
+                           odometry_height_error_max_m_),
+      0.0, 1.0);
   hazard_prefix_standoff_m_ = declareOrGet<double>(
       this, "hazard_prefix_standoff_m", hazard_prefix_standoff_m_);
   hazard_prefix_standoff_m_ =
@@ -2633,6 +2637,48 @@ bool PlannerNode::queryIndexedMap(mgg::FeasiblePath& path,
       return fail(mgg::PlanningStatus::kBlocked,
                   "indexed map ground does not support the emitted body "
                   "height");
+    }
+    // The emitted heights follow the robot's odometry, whose height drifts
+    // while the mapped ground does not (0.16 m over two hours refused every
+    // goal, 2026-09-18). Such a drift is one constant offset between the
+    // expected heights and the mapped ground at the robot's own position and
+    // along the whole route. Only that uniform case is corrected: the median
+    // over the samples ahead is the estimate, and every finite sample,
+    // including the one under the robot, must agree with it within the
+    // tolerance. A dip or a rise that begins ahead of the robot, or a floor
+    // that is odd only under the robot, is not uniform and is still judged
+    // below. Offsets within the step limit are left to the bounded height
+    // refinement that already handles them.
+    if (context.robot_type == mgg::RobotType::kGroundRobot) {
+      std::vector<double> ahead;
+      std::vector<double> all;
+      for (std::size_t i = 0; i < count; ++i) {
+        if (std::isfinite(response->ground_z[i]) &&
+            std::isfinite(expected_ground_z[i])) {
+          const double offset = expected_ground_z[i] - response->ground_z[i];
+          all.push_back(offset);
+          if (dense_xy_progress[i] > 1e-9) ahead.push_back(offset);
+        }
+      }
+      if (ahead.size() >= 3u) {
+        std::nth_element(ahead.begin(), ahead.begin() + ahead.size() / 2,
+                         ahead.end());
+        const double bias = ahead[ahead.size() / 2];
+        const bool uniform = std::all_of(
+            all.begin(), all.end(), [&](double offset) {
+              return std::abs(offset - bias) <=
+                     indexed_map_ground_tolerance_m_ + 1e-9;
+            });
+        if (uniform && std::abs(bias) > context.max_step_height &&
+            std::abs(bias) <= odometry_height_error_max_m_) {
+          for (double& expected : expected_ground_z) expected -= bias;
+          RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 10000,
+                               "odometry height is %.3f m off the mapped "
+                               "ground along the route; expected heights "
+                               "corrected",
+                               bias);
+        }
+      }
     }
     bool have_measured_terrain = false;
     bool have_positive_progress_terrain = false;

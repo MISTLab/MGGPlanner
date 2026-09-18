@@ -5092,7 +5092,22 @@ TEST(IndexedObjectiveService, BatchedQueryIsBoundedAndUsesComponentFrame) {
   path.status = mgg::PlanningStatus::kSucceeded;
   path.poses.push_back(mgg::StateVec(1.0, 0.0, 0.0, 0.0));
 
+  // A uniform offset beyond the step limit, under the robot as well as along
+  // the whole route, is the odometry's height error rather than terrain: it
+  // is removed and the route is accepted. Beyond the bound it is not.
   ground_offset = 0.101;
+  EXPECT_TRUE(mgg_ros::PlannerNodeTestPeer::query(*planner, path))
+      << path.reason;
+  EXPECT_TRUE(path.indexed_map_validated);
+  ground_offset = 0.30;
+  path.status = mgg::PlanningStatus::kSucceeded;
+  path.poses.push_back(mgg::StateVec(1.0, 0.0, 0.0, 0.0));
+  EXPECT_TRUE(mgg_ros::PlannerNodeTestPeer::query(*planner, path))
+      << path.reason;
+  EXPECT_TRUE(path.indexed_map_validated);
+  ground_offset = 0.6;
+  path.status = mgg::PlanningStatus::kSucceeded;
+  path.poses.push_back(mgg::StateVec(1.0, 0.0, 0.0, 0.0));
   EXPECT_FALSE(mgg_ros::PlannerNodeTestPeer::query(*planner, path));
   EXPECT_FALSE(path.indexed_map_validated);
   EXPECT_NE(path.reason.find("ground does not support"), std::string::npos);

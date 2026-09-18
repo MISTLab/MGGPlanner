@@ -267,6 +267,11 @@ class PlannerNode : public rclcpp::Node {
   /// from their end the next section sees the hazard up close and routes
   /// around it. Zero restores refusing the whole section.
   double hazard_prefix_standoff_m_ = 1.5;
+  /// Largest disagreement between a route's emitted height, which follows
+  /// the odometry, and the mapped ground that the indexed validation treats
+  /// as odometry height error: the start keeps its physical height and later
+  /// samples are refined onto the map. Terrain steps are judged separately.
+  double odometry_height_error_max_m_ = 0.5;
   /// Measurement tolerance added to the platform step limit when footprint
   /// ground heights are compared. Map points are quantised at centimetre
   /// scale, so a kerb exactly at the limit otherwise flips between admitted
