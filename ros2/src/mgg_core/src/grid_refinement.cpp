@@ -393,9 +393,14 @@ FeasiblePath BoundedGridPlanner::refine(const RouteCorridor& corridor) {
     // Nothing of the corridor survived projection, so there is no evidence
     // left to refine along. A partial section names its proxy, the pose the
     // continuation would have resumed from; a full one its first rejection.
-    active_from_index = kNoCorridorIndex;
     active_to_index = proxy_rejection.empty() ? rejected_waypoints.front()
                                               : corridor.poses.size() - 1u;
+    // Name the corridor segment leading into the rejected pose, so the
+    // topological stage can be asked for a route around it. A corridor
+    // usually starts at the robot's own pose, which is not a segment start
+    // the registry can key on; the pose before the rejected one is.
+    active_from_index =
+        active_to_index > 0u ? active_to_index - 1u : kNoCorridorIndex;
     active_segment_known = true;
     return fail(proxy_rejection.empty() ? first_rejection : proxy_rejection);
   }

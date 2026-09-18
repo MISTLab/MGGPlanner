@@ -708,6 +708,18 @@ TEST(GridRefinement, RejectedProxyOfAPartialCorridorEndsAtTheLastSupportedPose) 
       << refused.reason;
   ASSERT_TRUE(refused.blocked_segment_identified);
   EXPECT_EQ(refused.blocked_to_index, 0u);
+
+  // A section usually starts at the robot's own pose, which is merged into
+  // the start. When its only other pose is the rejected proxy, the segment
+  // leading into the proxy is named, so the topological stage can be asked
+  // for a route around it.
+  RouteCorridor from_here = route;
+  from_here.poses = {StateVec::Zero(), StateVec(2.0, 0.0, 0.0, 0.0)};
+  const FeasiblePath named = planner.refine(from_here);
+  EXPECT_EQ(named.status, PlanningStatus::kBlocked);
+  ASSERT_TRUE(named.blocked_segment_identified);
+  EXPECT_EQ(named.blocked_from_index, 0u);
+  EXPECT_EQ(named.blocked_to_index, 1u);
 }
 
 TEST(GridRefinement, NamesTheDroppedWaypointWhenItsSpanCannotBeRefined) {
