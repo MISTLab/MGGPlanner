@@ -970,6 +970,25 @@ class PlannerNodeTestPeer {
     {
       const std::lock_guard<std::recursive_mutex> lock(node.planner_mutex_);
       context = node.indexedQueryContext();
+      ++node.mapping_snapshot_.epoch;
+    }
+    const bool result = node.queryIndexedMap(path, context);
+    {
+      const std::lock_guard<std::recursive_mutex> lock(node.planner_mutex_);
+      --node.mapping_snapshot_.epoch;
+    }
+    return result;
+  }
+
+  // A newer revision of the same component landing during the query is a
+  // product transition, not a frame change: the query finishes on the key it
+  // captured.
+  static bool queryAfterCapturedSnapshotRevisionAdvances(
+      PlannerNode& node, mgg::FeasiblePath& path) {
+    PlannerNode::IndexedQueryContext context;
+    {
+      const std::lock_guard<std::recursive_mutex> lock(node.planner_mutex_);
+      context = node.indexedQueryContext();
       ++node.mapping_snapshot_.graph_revision;
     }
     const bool result = node.queryIndexedMap(path, context);
@@ -4767,6 +4786,14 @@ TEST(IndexedObjectiveService, BatchedQueryIsBoundedAndUsesComponentFrame) {
       mgg_ros::PlannerNodeTestPeer::queryAfterCapturedSnapshotReceiptAges(
           *planner, path));
   EXPECT_TRUE(path.indexed_map_validated);
+
+  path.status = mgg::PlanningStatus::kSucceeded;
+  path.poses = {mgg::StateVec(1.0, 0.0, 0.0, 0.0)};
+  EXPECT_TRUE(
+      mgg_ros::PlannerNodeTestPeer::queryAfterCapturedSnapshotRevisionAdvances(
+          *planner, path));
+  EXPECT_TRUE(path.indexed_map_validated);
+  EXPECT_EQ(path.mapping_graph_revision, snapshot.graph_revision);
 
   path.status = mgg::PlanningStatus::kSucceeded;
   path.poses = {mgg::StateVec(1.0, 0.0, 0.0, 0.0)};

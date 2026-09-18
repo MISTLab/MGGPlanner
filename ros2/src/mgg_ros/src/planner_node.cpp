@@ -2426,17 +2426,20 @@ bool PlannerNode::queryIndexedMap(mgg::FeasiblePath& path,
     return fail(mgg::PlanningStatus::kBlocked,
                 "indexed map query service is unavailable");
   }
+  // The key captured at the start of the plan stays the key of every batch:
+  // the indexed map server keeps answering a superseded key for a grace
+  // period, and a route binds to the geometry it was checked against. Only
+  // another component or epoch, or a moved authority transform, makes the
+  // captured geometry the wrong one. A revision, geometry revision or source
+  // stamp that advanced during the query (a product lands every 2 to 6 s per
+  // robot while the fleet drives) is not a frame change; failing on it made
+  // exploration crawl on 2026-09-18 (retry backoff to 10 s per plan).
   const auto mapping_authority_is_current = [this, &context]() {
     const std::lock_guard<std::recursive_mutex> lock(planner_mutex_);
     const auto& snapshot = context.mapping_snapshot;
     return have_mapping_snapshot_ &&
            mapping_snapshot_.component_id == snapshot.component_id &&
            mapping_snapshot_.epoch == snapshot.epoch &&
-           mapping_snapshot_.graph_revision == snapshot.graph_revision &&
-           mapping_snapshot_.geometry_revision == snapshot.geometry_revision &&
-           mapping_snapshot_.source_stamp.sec == snapshot.source_stamp.sec &&
-           mapping_snapshot_.source_stamp.nanosec ==
-               snapshot.source_stamp.nanosec &&
            component_from_navigation_.matrix().isApprox(
                context.component_from_navigation.matrix(), 1e-9);
   };

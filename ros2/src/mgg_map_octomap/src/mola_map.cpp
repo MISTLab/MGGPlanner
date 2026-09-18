@@ -1104,14 +1104,39 @@ bool MolaMap::discsBlockSweep(const Eigen::Vector3d& start,
         length_squared > 1e-12
             ? std::clamp((centre - a).dot(delta) / length_squared, 0.0, 1.0)
             : 0.0;
-    if ((centre - (a + t * delta)).squaredNorm() < reach * reach) return true;
+    const double closest = (centre - (a + t * delta)).squaredNorm();
+    if (closest >= reach * reach) continue;
+    // A sweep that starts inside a disc's reach begins where the robot (or
+    // a lattice cell it can already reach) stands beside that neighbour: the
+    // disc is a margin, not a measured collision, and two robots that stop
+    // 0.9 m apart must be able to drive away from each other. Only a sweep
+    // that brings the body closer to the neighbour than its start already is
+    // stays blocked; one that keeps or increases the distance may leave.
+    // Measured on benchbot 2026-09-18: robot_0 and robot_2 parked 0.9 m apart
+    // and every outgoing lattice edge of both was rejected as a collision
+    // (4851 of 4852 cells) until the trial ended.
+    const double at_start = (centre - a).squaredNorm();
+    if (at_start < reach * reach && closest >= at_start - 1e-9) continue;
+    return true;
   }
   return false;
 }
 
 bool MolaMap::discsBlockBox(const Eigen::Vector3d& center,
                             const Eigen::Vector3d& size) const {
-  return discsBlockSweep(center, center, 0.5 * std::max(size.x(), size.y()));
+  // A box is a place, not a departure: inside a neighbour's reach it is
+  // occupied, whichever way a sweep through it might be allowed to leave.
+  const auto discs = std::atomic_load(&transient_discs_);
+  if (discs == nullptr || discs->centres.empty() ||
+      Clock::now() > discs->expires) {
+    return false;
+  }
+  const double reach = discs->radius_m + 0.5 * std::max(size.x(), size.y());
+  const Eigen::Vector2d at = center.head<2>();
+  for (const Eigen::Vector2d& centre : discs->centres) {
+    if ((centre - at).squaredNorm() < reach * reach) return true;
+  }
+  return false;
 }
 
 VoxelStatus MolaMap::getBoxStatus(const Eigen::Vector3d& center,

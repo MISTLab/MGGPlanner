@@ -384,6 +384,23 @@ TEST(MolaMap, TransientDiscsAreOccupiedUntilTheyExpire) {
   EXPECT_EQ(map->getOccupiedOnlyCylinderPathStatus(here, there, 0.1, 0.2),
             VoxelStatus::kOccupied);
 
+  // A sweep that starts inside the neighbour's reach may leave it but not
+  // approach it: two robots parked side by side must be able to drive apart.
+  const Eigen::Vector3d beside(0.3, 0.2, 0.1);
+  EXPECT_EQ(map->getBoxStatus(beside, body, true), VoxelStatus::kOccupied);
+  EXPECT_EQ(map->getPathStatus(beside, Eigen::Vector3d(0.3, -0.4, 0.1), body,
+                               true),
+            VoxelStatus::kFree);
+  EXPECT_EQ(map->getStrictPathStatus(beside, Eigen::Vector3d(0.3, -0.4, 0.1),
+                                     body),
+            VoxelStatus::kFree);
+  EXPECT_EQ(map->getPathStatus(beside, Eigen::Vector3d(0.3, 0.3, 0.1), body,
+                               true),
+            VoxelStatus::kOccupied);
+  EXPECT_EQ(map->getPathStatus(beside, Eigen::Vector3d(0.9, 0.6, 0.1), body,
+                               true),
+            VoxelStatus::kOccupied);
+
   // The neighbour left, or its reports stopped: the map decides again.
   provider.setTransientDiscs({}, 0.25, 60.0);
   EXPECT_EQ(map->getPathStatus(here, there, body, true), VoxelStatus::kFree);
