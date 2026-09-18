@@ -1365,6 +1365,39 @@ TEST(PlannerObjective,
               1e-9);
 }
 
+TEST(PlannerObjective, SectionProxyStepsBackFromAMeasuredKerb) {
+  // A 12 m Navigate along a fully known road with a graph route every metre
+  // is sectioned at 7.5 m, between two vertices. A kerb sample at 7.5 m lies
+  // under the footprint of that interpolated proxy and would refuse the
+  // whole section; the proxy steps back along the route instead.
+  using Peer = mgg_ros::PlannerNodeTestPeer;
+  rclcpp::NodeOptions options;
+  options.parameter_overrides(
+      {rclcpp::Parameter("use_sim_time", true),
+       rclcpp::Parameter("map.resolution", 0.15),
+       rclcpp::Parameter("objective_route_horizon_m", 7.5),
+       rclcpp::Parameter("objective_body_evidence_policy", "observed_ground"),
+       rclcpp::Parameter("objective_ground_evidence_policy",
+                         "provisional_unknown")});
+  auto node = std::make_shared<mgg_ros::PlannerNode>(options);
+  Peer::configureLongKnownRoad(*node);
+  Peer::addLinearHomeCorridor(*node, 12);
+  Peer::addMeasuredSurface(*node, 7.5, 0.0, 0.225);
+  Peer::finishMapRevision(*node);
+
+  const auto response = Peer::requestObjective(
+      *node, mgg::ObjectiveKind::kNavigate,
+      mgg::StateVec(12.0, 0.0, 0.30, 0.0));
+  ASSERT_EQ(response->status,
+            mgg_msgs::srv::PlanObjective::Response::SUCCEEDED)
+      << response->reason;
+  ASSERT_TRUE(response->partial);
+  ASSERT_FALSE(response->path.empty());
+  EXPECT_LT(response->path.back().position.x, 7.1);
+  EXPECT_GT(response->path.back().position.x, 5.0);
+  EXPECT_FALSE(response->route_id.empty());
+}
+
 TEST(PlannerObjective, ExplicitObjectiveUsesBoundedWiderDetourWindow) {
   using Peer = mgg_ros::PlannerNodeTestPeer;
   const auto make = [](double maximum_margin,

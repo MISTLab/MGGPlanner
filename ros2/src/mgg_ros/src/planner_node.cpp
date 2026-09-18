@@ -3923,11 +3923,55 @@ bool PlannerNode::sliceObjectiveRouteWindow(
     const mgg::StateVec& target = corridor.poses[next_index];
     const double distance = (target.head<2>() - previous.head<2>()).norm();
     if (distance > remaining + 1e-9) {
+      // The section's proxy is an interpolated point of the route. Where the
+      // horizon happens to fall on a measured kerb or step the whole section
+      // would be refused, so step the proxy back along the route, half a
+      // metre at a time down to the useful-progress bound, until its
+      // footprint no longer meets measured incompatible terrain. Unknown
+      // ground is not a reason to step back: the provisional policy and the
+      // validated prefix own that horizon. A few footprint checks, no search.
+      const Eigen::Vector3d direction =
+          (target.head<3>() - previous.head<3>()) / distance;
+      const Eigen::Vector3d footprint = robot_params_.getPlanningSize();
+      double reach = remaining;
       mgg::StateVec endpoint = previous;
-      endpoint.head<3>() +=
-          (target.head<3>() - previous.head<3>()) * (remaining / distance);
-      endpoint[3] = target[3];
-      local.poses.push_back(endpoint);
+      for (;;) {
+        endpoint.head<3>() = previous.head<3>() + direction * reach;
+        endpoint[3] = target[3];
+        // Route poses already sit at driving height, like the graph they
+        // come from, so the footprint is checked there directly.
+        bool measured_hazard = false;
+        if (robot_params_.type == mgg::RobotType::kGroundRobot) {
+          const Eigen::Vector3d driving = endpoint.head<3>();
+          measured_hazard =
+              objectiveFootprintTerrainStatus(driving, footprint) ==
+                  mgg::GridProjectionStatus::kNoGround ||
+              objectiveSweptBodyStatus(driving + robot_params_.center_offset,
+                                       driving + robot_params_.center_offset,
+                                       footprint) == mgg::VoxelStatus::kOccupied;
+        }
+        // Never below the previous route pose, and never below the
+        // useful-progress bound from where the robot stands.
+        const double next = std::max(0.0, reach - 0.5);
+        if (!measured_hazard || reach <= 0.0 ||
+            (endpoint.head<2>() - current_state_.head<2>()).norm() <=
+                partial_route_min_progress_m_ + 1e-9) {
+          break;
+        }
+        reach = next;
+      }
+      if (reach < remaining) {
+        RCLCPP_INFO(get_logger(),
+                    "section proxy stepped back from %.1f m to %.1f m along "
+                    "the route: measured terrain at the horizon",
+                    remaining, reach);
+      }
+      // A proxy stepped all the way back onto the previous route pose is
+      // that pose: the section ends there rather than listing it twice.
+      if (local.poses.empty() ||
+          (local.poses.back().head<3>() - endpoint.head<3>()).norm() > 1e-6) {
+        local.poses.push_back(endpoint);
+      }
       break;
     }
     local.poses.push_back(target);
