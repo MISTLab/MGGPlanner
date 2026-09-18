@@ -659,8 +659,8 @@ TEST(GridRefinement, PartialCorridorWithOnlyRejectedWaypointsFails) {
   EXPECT_EQ(path.status, PlanningStatus::kBlocked);
   EXPECT_FALSE(path.partial);
   EXPECT_TRUE(path.poses.empty());
-  // The proxy is the mandatory endpoint of the section and is named itself;
-  // the earlier hint it could not fall back on is listed with it.
+  // The proxy is the pose the continuation would have resumed from and is
+  // named itself; the earlier hint it could not fall back on is listed too.
   EXPECT_NE(path.reason.find("route corridor waypoint[1] rejected"),
             std::string::npos)
       << path.reason;
@@ -677,9 +677,9 @@ TEST(GridRefinement, PartialCorridorWithOnlyRejectedWaypointsFails) {
       << proxy_only.reason;
 }
 
-TEST(GridRefinement, RejectedProxyOfAPartialCorridorRemainsMandatory) {
-  // The continuation resumes from the proxy, so it cannot be dropped even
-  // when an earlier hint survives.
+TEST(GridRefinement, RejectedProxyOfAPartialCorridorEndsAtTheLastSupportedPose) {
+  // The continuation resumes from wherever the section ends, so a proxy on
+  // an obstacle shortens the section to the surviving hint before it.
   RouteCorridor route = routeTo(30.0, 0.0);
   route.request.objective = mgg::ObjectiveKind::kNavigate;
   route.partial = true;
@@ -692,15 +692,22 @@ TEST(GridRefinement, RejectedProxyOfAPartialCorridorRemainsMandatory) {
   BoundedGridPlanner planner(StateVec::Zero(), limits(), project,
                              sampledTraversal({}));
   const FeasiblePath path = planner.refine(route);
-  EXPECT_EQ(path.status, PlanningStatus::kBlocked);
-  EXPECT_NE(path.reason.find("route corridor waypoint[1] rejected"),
+  ASSERT_EQ(path.status, PlanningStatus::kSucceeded) << path.reason;
+  EXPECT_TRUE(path.partial);
+  ASSERT_FALSE(path.poses.empty());
+  EXPECT_NEAR(path.poses.back().x(), 1.0, 1e-9);
+  EXPECT_TRUE(path.reason.empty());
+
+  // With no supported pose left before it, the rejected proxy is named.
+  RouteCorridor only_proxy = route;
+  only_proxy.poses = {StateVec(2.0, 0.0, 0.0, 0.0)};
+  const FeasiblePath refused = planner.refine(only_proxy);
+  EXPECT_EQ(refused.status, PlanningStatus::kBlocked);
+  EXPECT_NE(refused.reason.find("route corridor waypoint[0] rejected"),
             std::string::npos)
-      << path.reason;
-  EXPECT_EQ(path.reason.find("rejected waypoints"), std::string::npos)
-      << path.reason;
-  ASSERT_TRUE(path.blocked_segment_identified);
-  EXPECT_EQ(path.blocked_from_index, 0u);
-  EXPECT_EQ(path.blocked_to_index, 1u);
+      << refused.reason;
+  ASSERT_TRUE(refused.blocked_segment_identified);
+  EXPECT_EQ(refused.blocked_to_index, 0u);
 }
 
 TEST(GridRefinement, NamesTheDroppedWaypointWhenItsSpanCannotBeRefined) {

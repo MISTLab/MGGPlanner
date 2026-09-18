@@ -336,6 +336,7 @@ FeasiblePath BoundedGridPlanner::refine(const RouteCorridor& corridor) {
   // First corridor pose dropped since the last surviving waypoint.
   std::size_t pending_rejection = kNoCorridorIndex;
   std::string first_rejection;
+  std::string proxy_rejection;
   for (std::size_t waypoint_index = 0;
        waypoint_index < corridor.poses.size(); ++waypoint_index) {
     StateVec waypoint = corridor.poses[waypoint_index];
@@ -359,12 +360,15 @@ FeasiblePath BoundedGridPlanner::refine(const RouteCorridor& corridor) {
       const std::string rejection = projectionFailure(
           "route corridor waypoint[" + std::to_string(waypoint_index) + "]",
           waypoint_status, waypoint);
-      // The last pose of a partial corridor is the section's exact local
-      // proxy, which the continuation resumes from. It is a mandatory
-      // endpoint; every earlier graph pose is a refinement hint.
-      const bool mandatory_proxy =
-          corridor.partial && waypoint_index + 1u == corridor.poses.size();
-      if (mandatory_proxy) return fail(rejection);
+      // The last pose of a partial corridor is the section's local proxy,
+      // which the continuation resumes from. When it is rejected the section
+      // ends at the last supported corridor pose instead (below): the robot
+      // still advances, and the next section sees the rejected pose as an
+      // intermediate waypoint it can drop and route around. Only a section
+      // with no supported pose left fails, and then names this rejection.
+      if (corridor.partial && waypoint_index + 1u == corridor.poses.size()) {
+        proxy_rejection = rejection;
+      }
       if (first_rejection.empty()) first_rejection = rejection;
       if (pending_rejection == kNoCorridorIndex) {
         pending_rejection = waypoint_index;
@@ -387,11 +391,13 @@ FeasiblePath BoundedGridPlanner::refine(const RouteCorridor& corridor) {
   }
   if (!rejected_waypoints.empty() && waypoints.size() < 2u) {
     // Nothing of the corridor survived projection, so there is no evidence
-    // left to refine along. Name the first rejection, as before.
+    // left to refine along. A partial section names its proxy, the pose the
+    // continuation would have resumed from; a full one its first rejection.
     active_from_index = kNoCorridorIndex;
-    active_to_index = rejected_waypoints.front();
+    active_to_index = proxy_rejection.empty() ? rejected_waypoints.front()
+                                              : corridor.poses.size() - 1u;
     active_segment_known = true;
-    return fail(first_rejection);
+    return fail(proxy_rejection.empty() ? first_rejection : proxy_rejection);
   }
   if (corridor.partial) {
     // The proxy of a partial section must stand on measured ground, while the

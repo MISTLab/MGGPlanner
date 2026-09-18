@@ -1713,7 +1713,7 @@ TEST(PlannerObjective, RollingHomeDetourPreservesRouteTokenAndProgress) {
             mgg_msgs::srv::RefineObjectiveRoute::Response::BLOCKED);
 }
 
-TEST(PlannerObjective, PartialHomeNeverSkipsAnOccupiedLocalEndpoint) {
+TEST(PlannerObjective, PartialHomeEndsShortOfAnOccupiedLocalEndpoint) {
   using Peer = mgg_ros::PlannerNodeTestPeer;
   rclcpp::NodeOptions options;
   options.parameter_overrides(
@@ -1732,14 +1732,17 @@ TEST(PlannerObjective, PartialHomeNeverSkipsAnOccupiedLocalEndpoint) {
       *node, mgg::ObjectiveKind::kReturnHome,
       mgg::StateVec(0.0, 0.0, 0.075, 0.0), "kf-home");
 
-  EXPECT_EQ(response->status,
-            mgg_msgs::srv::PlanObjective::Response::BLOCKED);
-  EXPECT_TRUE(response->path.empty());
-  EXPECT_TRUE(response->route_id.empty());
-  EXPECT_NE(response->reason.find("route corridor waypoint["),
-            std::string::npos);
-  EXPECT_EQ(response->reason.find("local endpoint fallback"),
-            std::string::npos);
+  // The section's proxy sits on the obstacle at 1.6 m. The section is not
+  // refused and does not jump past the obstacle: it ends at the last
+  // supported corridor pose before it, and the continuation takes it from
+  // there with the obstacle as an intermediate waypoint to route around.
+  ASSERT_EQ(response->status,
+            mgg_msgs::srv::PlanObjective::Response::SUCCEEDED)
+      << response->reason;
+  ASSERT_FALSE(response->path.empty());
+  EXPECT_FALSE(response->route_id.empty());
+  EXPECT_GT(response->path.back().position.x, 1.6);
+  EXPECT_LT(response->path.back().position.x, 3.0);
 }
 
 TEST(PlannerObjective, OccupiedFinalHomeRemainsBlockedAfterGraphHintFallback) {
