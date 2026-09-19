@@ -4535,6 +4535,9 @@ TEST(IndexedObjectiveService, BatchedQueryIsBoundedAndUsesComponentFrame) {
   std::atomic<std::size_t> blind_clearance_prefix{0};
   std::atomic<std::size_t> blind_ground_sample{
       std::numeric_limits<std::size_t>::max()};
+  // When set, the blind sample reports no clearance either: the server had
+  // no terrain fit there at all, as between two lidar rings.
+  std::atomic<bool> blind_sample_clearance{false};
   std::atomic<std::size_t> step_sample{std::numeric_limits<std::size_t>::max()};
   std::atomic<std::size_t> drop_sample{std::numeric_limits<std::size_t>::max()};
   std::atomic<double> drop_at_or_after_x{
@@ -4577,7 +4580,7 @@ TEST(IndexedObjectiveService, BatchedQueryIsBoundedAndUsesComponentFrame) {
        &received_body_x, &received_body_y, &received_body_z,
        &received_max_step, &received_max_drop, &sample_occupancy,
        &sample_clearance, &blind_ground_prefix, &blind_clearance_prefix,
-       &blind_ground_sample, &step_sample, &drop_sample,
+       &blind_ground_sample, &blind_sample_clearance, &step_sample, &drop_sample,
        &drop_at_or_after_x, &occupied_from_sample,
        &terrain_case, &refinement_dip, &compatible_refinement_dip,
        &refinement_from_x, &query_count, &first_query_sample_count,
@@ -4698,6 +4701,10 @@ TEST(IndexedObjectiveService, BatchedQueryIsBoundedAndUsesComponentFrame) {
         for (std::size_t i = 0;
              i < std::min(n, blind_clearance_prefix.load()); ++i) {
           response->clearance[i] =
+              std::numeric_limits<double>::quiet_NaN();
+        }
+        if (blind_sample_clearance.load() && blind_ground_sample.load() < n) {
+          response->clearance[blind_ground_sample.load()] =
               std::numeric_limits<double>::quiet_NaN();
         }
         response->step.assign(n, false);
@@ -4964,6 +4971,18 @@ TEST(IndexedObjectiveService, BatchedQueryIsBoundedAndUsesComponentFrame) {
   blind_ground_sample = 3;
   EXPECT_TRUE(mgg_ros::PlannerNodeTestPeer::query(*planner, path));
   EXPECT_TRUE(path.indexed_map_validated);
+
+  // The ring gap of a sparse lidar: the ground between two rings is
+  // unobserved, the body volume above it is ray-proven free, and the server
+  // has no terrain fit there, so it reports no clearance either. That is
+  // the same bracketed gap, a horizon and not a hazard (benchbot,
+  // 2026-09-19: a 3 m goal was refused with "clearance is unavailable" at
+  // such a gap 2.4 m ahead of the Scout).
+  blind_sample_clearance = true;
+  path.status = mgg::PlanningStatus::kSucceeded;
+  EXPECT_TRUE(mgg_ros::PlannerNodeTestPeer::query(*planner, path)) << path.reason;
+  EXPECT_TRUE(path.indexed_map_validated);
+  blind_sample_clearance = false;
   blind_ground_sample = std::numeric_limits<std::size_t>::max();
   blind_ground_prefix = 2;
   blind_clearance_prefix = 2;
@@ -5660,7 +5679,8 @@ TEST(PlannerObjective, GlobalRasterCorridorRunsFromTheRobotToTheExactGoal) {
        rclcpp::Parameter("global_raster_max_expansions", 5000),
        rclcpp::Parameter("global_raster_timeout_ms", 200),
        rclcpp::Parameter("global_raster_blocked_penalty_m", 20.0),
-       rclcpp::Parameter("global_raster_unknown_cost_factor", 4.0)});
+       rclcpp::Parameter("global_raster_unknown_cost_factor", 4.0),
+       rclcpp::Parameter("global_raster_inflation_cost_factor", 2.0)});
   auto planner = std::make_shared<mgg_ros::PlannerNode>(options);
   using Peer = mgg_ros::PlannerNodeTestPeer;
   Peer::configureBackboneTest(*planner);
@@ -5682,6 +5702,7 @@ TEST(PlannerObjective, GlobalRasterCorridorRunsFromTheRobotToTheExactGoal) {
   EXPECT_NEAR(limits.driving_offset, 0.30, 1e-12);
   EXPECT_NEAR(limits.blocked_penalty, 20.0, 1e-12);
   EXPECT_NEAR(limits.unknown_cost_factor, 4.0, 1e-12);
+  EXPECT_NEAR(limits.inflated_cost_factor, 2.0, 1e-12);
   EXPECT_EQ(limits.max_expansions, 5000u);
   EXPECT_EQ(limits.timeout, std::chrono::milliseconds(200));
 

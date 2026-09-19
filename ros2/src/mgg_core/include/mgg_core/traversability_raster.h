@@ -25,9 +25,13 @@ enum class RasterCellState : std::uint8_t {
   kUnknown = 0,
   /// Observed ground with nothing in the body band above it.
   kFree,
-  /// An obstacle stands in the body band above the ground, or the cell lies
-  /// within the body radius of one that does.
+  /// An obstacle stands in the body band above the ground.
   kObstacle,
+  /// Observed ground with nothing in the body band, within the body radius
+  /// of an obstacle cell: the body may or may not fit, at this resolution.
+  /// A planner may cross it at a cost and leave the exact footprint to the
+  /// refinement, or treat it as an obstacle.
+  kInflated,
 };
 
 struct TraversabilityRaster {

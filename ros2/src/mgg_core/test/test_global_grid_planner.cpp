@@ -482,6 +482,61 @@ TEST(GlobalGridPlanner, UnknownCellsAreCrossedAtTheirCostWhenAdmitted) {
             GlobalGridPlanStatus::kUnreachable);
 }
 
+TEST(GlobalGridPlanner, InflatedCellsAreObstaclesUntilAdmittedAtACost) {
+  // A wall along y = 1.25 across x in [1.0, 3.0) with its inflation ring
+  // (the cells around it), on an 8 by 4 raster. The goal stands in the ring
+  // beside the wall, as an operator's goal next to a building does.
+  auto raster = flatRaster(8, 4);
+  for (std::size_t x = 2; x < 6; ++x) {
+    setCell(*raster, x, 2, RasterCellState::kObstacle);
+  }
+  for (std::size_t x = 1; x < 7; ++x) {
+    for (const std::size_t y : {1u, 3u}) {
+      setCell(*raster, x, y, RasterCellState::kInflated);
+    }
+  }
+  setCell(*raster, 1, 2, RasterCellState::kInflated);
+  setCell(*raster, 6, 2, RasterCellState::kInflated);
+  const Eigen::Vector2d from(0.25, 0.25);
+  const Eigen::Vector2d beside(2.25, 0.75);
+
+  // Refused as an obstacle endpoint by default, with a reason that says why.
+  const GlobalGridPlan refused = GlobalGridPlanner(raster, limits()).plan(from, beside);
+  EXPECT_EQ(refused.status, GlobalGridPlanStatus::kGoalObstacle);
+  EXPECT_NE(refused.reason.find("body radius"), std::string::npos) << refused.reason;
+
+  // Admitted at a cost: the route reaches the goal and enters the ring only
+  // for the goal cell itself, staying on free cells before that.
+  GlobalGridPlannerLimits admit = limits();
+  admit.inflated_cost_factor = 3.0;
+  const GlobalGridPlan reached = GlobalGridPlanner(raster, admit).plan(from, beside);
+  ASSERT_EQ(reached.status, GlobalGridPlanStatus::kSucceeded) << reached.reason;
+  EXPECT_NEAR(reached.poses.back().x(), 2.25, 1e-9);
+  EXPECT_NEAR(reached.poses.back().y(), 0.75, 1e-9);
+  std::size_t inflated_poses = 0;
+  for (const StateVec& pose : reached.poses) {
+    inflated_poses += raster->stateAtXY(pose.head<2>()) == RasterCellState::kInflated;
+  }
+  EXPECT_EQ(inflated_poses, 1u);
+  EXPECT_TRUE(avoidsState(*raster, reached.poses, RasterCellState::kObstacle));
+
+  // A start in the ring (a robot parked beside the wall) leaves it.
+  const GlobalGridPlan parked =
+      GlobalGridPlanner(raster, admit).plan(beside, Eigen::Vector2d(3.75, 0.25));
+  ASSERT_EQ(parked.status, GlobalGridPlanStatus::kSucceeded) << parked.reason;
+  EXPECT_TRUE(avoidsState(*raster, parked.poses, RasterCellState::kObstacle));
+
+  // Obstacle cells themselves stay refused whatever the factor.
+  EXPECT_EQ(GlobalGridPlanner(raster, admit)
+                .plan(from, Eigen::Vector2d(2.25, 1.25))
+                .status,
+            GlobalGridPlanStatus::kGoalObstacle);
+  GlobalGridPlannerLimits bad = limits();
+  bad.inflated_cost_factor = 0.5;
+  EXPECT_EQ(GlobalGridPlanner(raster, bad).plan(from, beside).status,
+            GlobalGridPlanStatus::kInvalidConfiguration);
+}
+
 TEST(GlobalGridPlanner, CarriedGroundJudgesTheStepBackOntoKnownGround) {
   // The start sits in a 3 by 3 unobserved block with no known neighbour in
   // reach; the caller's hint is its ground. Known ground beyond is at 0.0 m.

@@ -48,6 +48,13 @@ struct GlobalGridPlannerLimits {
   /// would answer only short goals. The rise and drop limits apply where a
   /// known cell is entered, against the last known ground along the path.
   double unknown_cost_factor = 0.0;
+  /// Zero treats kInflated cells (observed ground within the body radius of
+  /// an obstacle) as obstacles. A factor of one or more admits them at that
+  /// multiple of the edge length: whether the body fits there is a question
+  /// for the exact footprint checks of the refinement, and a robot parked
+  /// beside a wall, or a goal placed beside one, must not lose the whole
+  /// route to a cell-sized inflation ring.
+  double inflated_cost_factor = 0.0;
   /// The search ends with kBudgetExceeded once this many cells have been
   /// expanded.
   std::size_t max_expansions = 200000;
@@ -106,7 +113,9 @@ struct GlobalGridPlan {
 /// is cut. Marked edges cost their length plus the blocked penalty: a mark
 /// is a routing preference, never a veto.
 ///
-/// With `unknown_cost_factor` set, kUnknown cells are admitted too at that
+/// With `inflated_cost_factor` set, kInflated cells are admitted at that
+/// multiple of the edge length, endpoints included; otherwise they are
+/// obstacles. With `unknown_cost_factor` set, kUnknown cells are admitted too at that
 /// multiple of the edge length. An unknown cell carries the last known ground
 /// along the path into it (the emitted pose stands on that ground), and the
 /// rise and drop limits are judged against it when a known cell is entered

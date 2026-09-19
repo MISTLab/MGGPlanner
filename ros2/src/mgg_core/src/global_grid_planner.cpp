@@ -121,11 +121,22 @@ GlobalGridPlan GlobalGridPlanner::plan(const Eigen::Vector2d& start_xy,
       !std::isfinite(limits_.blocked_penalty) || limits_.blocked_penalty < 0.0 ||
       !std::isfinite(limits_.unknown_cost_factor) ||
       (limits_.unknown_cost_factor != 0.0 && limits_.unknown_cost_factor < 1.0) ||
+      !std::isfinite(limits_.inflated_cost_factor) ||
+      (limits_.inflated_cost_factor != 0.0 &&
+       limits_.inflated_cost_factor < 1.0) ||
       limits_.max_expansions == 0 || limits_.timeout.count() <= 0) {
     return finish(GlobalGridPlanStatus::kInvalidConfiguration,
                   "global grid planner limits are invalid");
   }
   const bool allow_unknown = limits_.unknown_cost_factor > 0.0;
+  const bool allow_inflated = limits_.inflated_cost_factor > 0.0;
+  // A cell the search may stand on for its own ground: observed, with
+  // nothing in the body band, and (when admitted) within an obstacle's
+  // inflation ring.
+  const auto standing = [&](RasterCellState state) {
+    return state == RasterCellState::kFree ||
+           (allow_inflated && state == RasterCellState::kInflated);
+  };
   std::size_t start_x = 0;
   std::size_t start_y = 0;
   std::size_t goal_x = 0;
@@ -163,17 +174,21 @@ GlobalGridPlan GlobalGridPlanner::plan(const Eigen::Vector2d& start_xy,
     const char* label = is_start ? "start" : "goal";
     const std::size_t index = raster.index(cx, cy);
     const RasterCellState state = raster.state[index];
-    if (state == RasterCellState::kObstacle) {
+    if (state == RasterCellState::kObstacle ||
+        (state == RasterCellState::kInflated && !allow_inflated)) {
       char text[160];
       std::snprintf(text, sizeof(text),
-                    "%s (%.2f, %.2f) lies on an obstacle cell", label, xy.x(),
-                    xy.y());
+                    state == RasterCellState::kObstacle
+                        ? "%s (%.2f, %.2f) lies on an obstacle cell"
+                        : "%s (%.2f, %.2f) lies within the body radius of an "
+                          "obstacle",
+                    label, xy.x(), xy.y());
       status = is_start ? GlobalGridPlanStatus::kStartObstacle
                         : GlobalGridPlanStatus::kGoalObstacle;
       reason = text;
       return false;
     }
-    if (state == RasterCellState::kFree) {
+    if (standing(state)) {
       ground = raster.ground_z[index];
       if (std::isfinite(ground)) return true;
     }
@@ -192,7 +207,7 @@ GlobalGridPlan GlobalGridPlanner::plan(const Eigen::Vector2d& start_xy,
         const std::size_t neighbour =
             raster.index(static_cast<std::size_t>(nx),
                          static_cast<std::size_t>(ny));
-        if (raster.state[neighbour] != RasterCellState::kFree) continue;
+        if (!standing(raster.state[neighbour])) continue;
         const double height = raster.ground_z[neighbour];
         if (!std::isfinite(height)) continue;
         // Distance from the endpoint to the nearest point of the cell square.
@@ -306,8 +321,7 @@ GlobalGridPlan GlobalGridPlanner::plan(const Eigen::Vector2d& start_xy,
   const auto knownGroundOf = [&](std::size_t index) {
     if (index == start) return start_ground;
     if (index == goal) return goal_ground;
-    return raster.state[index] == RasterCellState::kFree ? raster.ground_z[index]
-                                                          : kNaN;
+    return standing(raster.state[index]) ? raster.ground_z[index] : kNaN;
   };
   // The ground the search stands on at a cell: its own when known, else the
   // last known ground along the path that reached it (set with the parent).
@@ -322,12 +336,17 @@ GlobalGridPlan GlobalGridPlanner::plan(const Eigen::Vector2d& start_xy,
   const auto admissible = [&](std::size_t index) {
     if (discBlocked(index)) return false;
     if (index == start || index == goal) return true;
-    if (raster.state[index] == RasterCellState::kObstacle) return false;
-    if (raster.state[index] == RasterCellState::kFree &&
+    const RasterCellState state = raster.state[index];
+    if (state == RasterCellState::kObstacle) return false;
+    if (state == RasterCellState::kInflated) return allow_inflated;
+    if (state == RasterCellState::kFree &&
         std::isfinite(raster.ground_z[index])) {
       return true;
     }
     return allow_unknown;
+  };
+  const auto isInflatedCell = [&](std::size_t index) {
+    return raster.state[index] == RasterCellState::kInflated;
   };
   const auto poseOf = [&](std::size_t index) {
     const std::size_t x = index % raster.width;
@@ -445,10 +464,13 @@ GlobalGridPlan GlobalGridPlanner::plan(const Eigen::Vector2d& start_xy,
       }
       double edge = is_diagonal ? diagonal : straight;
       // Unobserved ground costs its multiple; a goal whose ground a
-      // neighbour lent counts as observed, a carried goal does not.
+      // neighbour lent counts as observed, a carried goal does not. An
+      // inflated cell costs its own multiple, the goal included.
       if (allow_unknown &&
           (next == goal ? !std::isfinite(goal_ground) : isUnknownCell(next))) {
         edge *= limits_.unknown_cost_factor;
+      } else if (allow_inflated && isInflatedCell(next)) {
+        edge *= limits_.inflated_cost_factor;
       }
       if (blocked) {
         if (!active_pose_ready) {

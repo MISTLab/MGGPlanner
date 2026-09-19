@@ -477,6 +477,18 @@ PlannerNode::PlannerNode(const rclcpp::NodeOptions& options)
       std::isfinite(requested_unknown_factor) && requested_unknown_factor > 0.0
           ? std::clamp(requested_unknown_factor, 1.0, 100.0)
           : 0.0;
+  // Cells within the body radius of an obstacle are crossed at this multiple
+  // rather than refused: whether the body fits is the refinement's exact
+  // footprint question, and a robot parked beside a wall or a goal placed
+  // beside one must keep its route. Zero refuses them.
+  const double requested_inflation_factor = declareOrGet<double>(
+      this, "global_raster_inflation_cost_factor",
+      global_raster_inflation_cost_factor_);
+  global_raster_inflation_cost_factor_ =
+      std::isfinite(requested_inflation_factor) &&
+              requested_inflation_factor > 0.0
+          ? std::clamp(requested_inflation_factor, 1.0, 100.0)
+          : 0.0;
   geofence_ = std::make_unique<mgg::GeofenceManager>();
   local_graph_ = std::make_shared<mgg::GraphManager>();
   global_graph_ = std::make_shared<mgg::GraphManager>();
@@ -2901,9 +2913,14 @@ bool PlannerNode::queryIndexedMap(mgg::FeasiblePath& path,
           const std::string reason = "indexed map route is occupied or unknown";
           return occupied ? hazard(reason) : unmeasured(reason);
         }
+        // A sample the server could not fit terrain under (both ground and
+        // roughness missing) has no clearance either; whether that gap is a
+        // bounded connector or the horizon is the ground logic's question
+        // below, not a hazard: between two lidar rings the ground is
+        // unobserved while the body volume above it is ray-proven free.
         if (context.robot_type != mgg::RobotType::kAerialRobot &&
             !std::isfinite(response->clearance[i]) &&
-            !unknown_clearance_allowed) {
+            !unknown_clearance_allowed && !paired_missing_terrain) {
           return hazard(unsupported("clearance is unavailable"));
         }
         if (context.robot_type != mgg::RobotType::kAerialRobot &&
@@ -4141,6 +4158,7 @@ mgg::GlobalGridPlannerLimits PlannerNode::globalRasterLimits() const {
   limits.body_radius = 0.5 * robot_params_.getPlanningSize().head<2>().norm();
   limits.blocked_penalty = global_raster_blocked_penalty_m_;
   limits.unknown_cost_factor = global_raster_unknown_cost_factor_;
+  limits.inflated_cost_factor = global_raster_inflation_cost_factor_;
   limits.max_expansions = global_raster_max_expansions_;
   limits.timeout = global_raster_timeout_;
   return limits;

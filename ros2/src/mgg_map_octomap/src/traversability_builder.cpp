@@ -173,10 +173,11 @@ std::shared_ptr<const TraversabilityRaster> buildTraversabilityRaster(
     raster->state[index] = RasterCellState::kFree;
   }
 
-  // Inflation: a cell within the body radius of an obstacle cell is an
-  // obstacle. The distance is from the cell centre to the nearest point of
-  // the obstacle cell's square, so the ring of neighbours counts as soon as
-  // the body reaches past half a cell.
+  // Inflation: a free cell within the body radius of an obstacle cell is
+  // marked inflated (the body may not fit there; the planner decides what
+  // that costs). The distance is from the cell centre to the nearest point
+  // of the obstacle cell's square, so the ring of neighbours counts as soon
+  // as the body reaches past half a cell.
   struct Offset {
     long dx;
     long dy;
@@ -208,7 +209,7 @@ std::shared_ptr<const TraversabilityRaster> buildTraversabilityRaster(
         const std::size_t neighbour = raster->index(
             static_cast<std::size_t>(nx), static_cast<std::size_t>(ny));
         if (raster->state[neighbour] == RasterCellState::kFree) {
-          raster->state[neighbour] = RasterCellState::kObstacle;
+          raster->state[neighbour] = RasterCellState::kInflated;
         }
       }
     }

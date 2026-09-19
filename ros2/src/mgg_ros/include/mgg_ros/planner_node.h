@@ -309,13 +309,15 @@ class PlannerNode : public rclcpp::Node {
   std::size_t objective_route_max_poses_ = 4096;
   /// Full-map raster stage of Navigate and ReturnHome on the MOLA backend:
   /// the raster cell size, the A* budget, deadline and blocked-edge penalty,
-  /// and the cost multiple of unobserved cells (zero refuses them). The
-  /// topological stage remains the fallback.
+  /// and the cost multiples of unobserved cells and of cells within the body
+  /// radius of an obstacle (zero refuses them). The topological stage
+  /// remains the fallback.
   double global_raster_cell_m_ = 0.5;
   std::size_t global_raster_max_expansions_ = 200000;
   std::chrono::milliseconds global_raster_timeout_{500};
   double global_raster_blocked_penalty_m_ = 20.0;
   double global_raster_unknown_cost_factor_ = 3.0;
+  double global_raster_inflation_cost_factor_ = 3.0;
   /// Corridors whose bounded refinement or execution has just been rejected.
   /// Bounded and expiring; it only steers corridor choice and never relaxes a
   /// terrain, body, step, drop or geofence veto.

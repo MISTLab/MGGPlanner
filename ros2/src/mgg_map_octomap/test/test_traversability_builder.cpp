@@ -106,7 +106,7 @@ TEST(TraversabilityBuilder, GroundHeightsKerbAndUnknownColumns) {
   EXPECT_NEAR(raster->groundAtXY(Eigen::Vector2d(2.75, -0.75)), 0.05, 1e-9);
   // The table top's inflation does reach the kerb cell beside it.
   EXPECT_EQ(raster->stateAtXY(Eigen::Vector2d(3.75, 0.25)),
-            RasterCellState::kObstacle);
+            RasterCellState::kInflated);
   // The hole has no surface: unknown with NaN ground.
   EXPECT_EQ(raster->stateAtXY(Eigen::Vector2d(1.25, -0.25)),
             RasterCellState::kUnknown);
@@ -133,13 +133,14 @@ TEST(TraversabilityBuilder, WallIsAnObstacleInflatedByTheBodyRadius) {
     EXPECT_NEAR(raster->groundAtXY(Eigen::Vector2d(x, 1.75)), 0.05, 1e-9);
   }
   // The ring within 0.4 m of the wall's squares is inflated: the cells below
-  // and beside it, including the diagonal corners.
+  // and beside it, including the diagonal corners. They keep their ground.
   EXPECT_EQ(raster->stateAtXY(Eigen::Vector2d(0.75, 1.25)),
-            RasterCellState::kObstacle);
+            RasterCellState::kInflated);
+  EXPECT_NEAR(raster->groundAtXY(Eigen::Vector2d(0.75, 1.25)), 0.05, 1e-9);
   EXPECT_EQ(raster->stateAtXY(Eigen::Vector2d(-0.25, 1.75)),
-            RasterCellState::kObstacle);
+            RasterCellState::kInflated);
   EXPECT_EQ(raster->stateAtXY(Eigen::Vector2d(2.25, 1.25)),
-            RasterCellState::kObstacle);
+            RasterCellState::kInflated);
   // Two cells away the road is free again.
   EXPECT_EQ(raster->stateAtXY(Eigen::Vector2d(0.75, 0.75)),
             RasterCellState::kFree);

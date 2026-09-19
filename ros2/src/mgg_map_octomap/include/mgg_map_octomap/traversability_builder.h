@@ -6,8 +6,9 @@
 //             is the ground and the table top an obstacle in the body band.
 //   obstacle  any occupied voxel whose top lies above ground + step band and
 //             whose bottom lies below ground + body band: matter the robot
-//             can neither roll over nor pass beneath. Obstacle cells are then
-//             inflated by the body radius.
+//             can neither roll over nor pass beneath.
+//   inflated  a free cell within the body radius of an obstacle cell; the
+//             body may not fit there at this resolution.
 //   unknown   no voxel the cell covers has a surface; or, with a clearance
 //             requirement, the free voxels above the ground do not reach it.
 //   free      everything else.
@@ -31,7 +32,7 @@ namespace mgg {
 struct RasterParams {
   /// Raster cell size, metres.
   double cell_size_m = 0.5;
-  /// Lateral inflation of obstacle cells: a cell is an obstacle when any
+  /// Lateral inflation of obstacle cells: a free cell is inflated when any
   /// point of an obstacle cell lies within this distance of its centre.
   double body_radius_m = 0.0;
   /// Step band: matter up to this height above the ground is terrain the
