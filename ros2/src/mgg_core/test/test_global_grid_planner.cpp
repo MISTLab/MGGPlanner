@@ -427,6 +427,117 @@ TEST(GlobalGridPlanner, InvalidLimitsAreRefused) {
                 .plan(Eigen::Vector2d(0.25, 0.25), Eigen::Vector2d(1.75, 1.75))
                 .status,
             GlobalGridPlanStatus::kNoRaster);
+  bad = limits();
+  bad.unknown_cost_factor = 0.5;
+  EXPECT_EQ(GlobalGridPlanner(raster, bad)
+                .plan(Eigen::Vector2d(0.25, 0.25), Eigen::Vector2d(1.75, 1.75))
+                .status,
+            GlobalGridPlanStatus::kInvalidConfiguration);
+}
+
+TEST(GlobalGridPlanner, UnknownCellsAreCrossedAtTheirCostWhenAdmitted) {
+  // An 8 by 5 raster with an unobserved column at x = 4 in rows 0 to 3; row
+  // 4 is observed all along, so a known detour exists over the top.
+  auto raster = flatRaster(8, 5);
+  for (std::size_t y = 0; y < 4; ++y) {
+    setCell(*raster, 4, y, RasterCellState::kUnknown);
+  }
+  const Eigen::Vector2d from(0.75, 0.75);
+  const Eigen::Vector2d to(3.75, 0.75);
+
+  // The straight route crosses one unknown cell (2.5 m known + 0.5 m
+  // unknown); the known detour over row 4 is six diagonals, 4.24 m. At a
+  // factor of 3 the crossing costs 4.0 m and wins; at 8 it costs 6.5 m and
+  // the detour wins. The crossed cell carries the ground of the cell before
+  // it, so every pose stays at driving height.
+  GlobalGridPlannerLimits cheap = limits();
+  cheap.unknown_cost_factor = 3.0;
+  const GlobalGridPlan crossing = GlobalGridPlanner(raster, cheap).plan(from, to);
+  ASSERT_EQ(crossing.status, GlobalGridPlanStatus::kSucceeded) << crossing.reason;
+  EXPECT_FALSE(avoidsState(*raster, crossing.poses, RasterCellState::kUnknown));
+  EXPECT_NEAR(crossing.length_m, 3.0, 1e-9);
+  EXPECT_TRUE(onCellCentres(*raster, crossing.poses));
+  for (const StateVec& pose : crossing.poses) EXPECT_NEAR(pose.z(), 0.40, 1e-9);
+
+  GlobalGridPlannerLimits dear = limits();
+  dear.unknown_cost_factor = 8.0;
+  const GlobalGridPlan detour = GlobalGridPlanner(raster, dear).plan(from, to);
+  ASSERT_EQ(detour.status, GlobalGridPlanStatus::kSucceeded) << detour.reason;
+  EXPECT_TRUE(avoidsState(*raster, detour.poses, RasterCellState::kUnknown));
+  EXPECT_GT(detour.length_m, 4.0);
+
+  // A wall on the known side leaves only the crossing; the search takes it.
+  auto walled = flatRaster(8, 5);
+  for (std::size_t y = 0; y < 4; ++y) {
+    setCell(*walled, 4, y, RasterCellState::kUnknown);
+  }
+  for (std::size_t x = 0; x < 8; ++x) {
+    setCell(*walled, x, 4, RasterCellState::kObstacle);
+  }
+  const GlobalGridPlan forced = GlobalGridPlanner(walled, dear).plan(from, to);
+  ASSERT_EQ(forced.status, GlobalGridPlanStatus::kSucceeded) << forced.reason;
+  EXPECT_FALSE(avoidsState(*walled, forced.poses, RasterCellState::kUnknown));
+  // Without the factor the same raster is unreachable, as before.
+  EXPECT_EQ(GlobalGridPlanner(walled, limits()).plan(from, to).status,
+            GlobalGridPlanStatus::kUnreachable);
+}
+
+TEST(GlobalGridPlanner, CarriedGroundJudgesTheStepBackOntoKnownGround) {
+  // The start sits in a 3 by 3 unobserved block with no known neighbour in
+  // reach; the caller's hint is its ground. Known ground beyond is at 0.0 m.
+  auto island = flatRaster(8, 3);
+  for (std::size_t y = 0; y < 3; ++y) {
+    for (std::size_t x = 0; x < 3; ++x) {
+      setCell(*island, x, y, RasterCellState::kUnknown);
+    }
+  }
+  GlobalGridPlannerLimits admit = limits();
+  admit.unknown_cost_factor = 3.0;
+  const GlobalGridPlanner planner(island, admit);
+  const Eigen::Vector2d from(0.75, 0.75);
+  const Eigen::Vector2d to(3.75, 0.75);
+
+  // No hint: refused as before, with the reason.
+  const GlobalGridPlan unhinted = planner.plan(from, to);
+  EXPECT_EQ(unhinted.status, GlobalGridPlanStatus::kStartUnknown);
+
+  // A 0.20 m hint is a 0.20 m drop onto the known road, within the 0.25 m
+  // drop limit: the route crosses the block on the hinted ground and steps
+  // down where the observed cells begin.
+  const GlobalGridPlan stepped = planner.plan(from, to, {}, {}, 0.20);
+  ASSERT_EQ(stepped.status, GlobalGridPlanStatus::kSucceeded) << stepped.reason;
+  EXPECT_NEAR(stepped.poses.front().z(), 0.60, 1e-9);
+  EXPECT_NEAR(stepped.poses.back().z(), 0.40, 1e-9);
+  bool stepped_down = false;
+  for (std::size_t i = 1; i < stepped.poses.size(); ++i) {
+    const double delta = stepped.poses[i].z() - stepped.poses[i - 1].z();
+    EXPECT_LE(delta, 1e-9);
+    if (delta < -0.19) stepped_down = true;
+  }
+  EXPECT_TRUE(stepped_down);
+
+  // A 0.50 m hint would be a 0.50 m drop everywhere the road begins: no
+  // route may step down that far, so the goal is unreachable.
+  const GlobalGridPlan cliff = planner.plan(from, to, {}, {}, 0.50);
+  EXPECT_EQ(cliff.status, GlobalGridPlanStatus::kUnreachable) << cliff.reason;
+
+  // A goal in an unobserved region beyond the map carries the last known
+  // ground of its path and costs its multiple.
+  auto beyond = flatRaster(8, 3, 0.5, 0.10);
+  for (std::size_t y = 0; y < 3; ++y) {
+    for (std::size_t x = 5; x < 8; ++x) {
+      setCell(*beyond, x, y, RasterCellState::kUnknown);
+    }
+  }
+  const GlobalGridPlan onward =
+      GlobalGridPlanner(beyond, admit).plan(from, Eigen::Vector2d(3.75, 0.75));
+  ASSERT_EQ(onward.status, GlobalGridPlanStatus::kSucceeded) << onward.reason;
+  EXPECT_NEAR(onward.poses.back().z(), 0.50, 1e-9);
+  EXPECT_NEAR(onward.poses.back().x(), 3.75, 1e-9);
+  EXPECT_EQ(GlobalGridPlanner(beyond, limits())
+                .plan(from, Eigen::Vector2d(3.75, 0.75))
+                .status,
+            GlobalGridPlanStatus::kGoalUnknown);
 }
 
 }  // namespace

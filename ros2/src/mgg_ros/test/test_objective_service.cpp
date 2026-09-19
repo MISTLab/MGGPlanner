@@ -5659,18 +5659,21 @@ TEST(PlannerObjective, GlobalRasterCorridorRunsFromTheRobotToTheExactGoal) {
        rclcpp::Parameter("global_raster_cell_m", 0.5),
        rclcpp::Parameter("global_raster_max_expansions", 5000),
        rclcpp::Parameter("global_raster_timeout_ms", 200),
-       rclcpp::Parameter("global_raster_blocked_penalty_m", 20.0)});
+       rclcpp::Parameter("global_raster_blocked_penalty_m", 20.0),
+       rclcpp::Parameter("global_raster_unknown_cost_factor", 4.0)});
   auto planner = std::make_shared<mgg_ros::PlannerNode>(options);
   using Peer = mgg_ros::PlannerNodeTestPeer;
   Peer::configureBackboneTest(*planner);
   Peer::setDropHeight(*planner, 0.25);
 
-  // Platform limits reach the raster and the planner unchanged: a 0.20 by
-  // 0.20 m exact body, 0.30 m driving height, 0.10 m step, 0.25 m drop.
+  // Platform limits reach the raster and the planner: a 0.20 by 0.20 m
+  // exact body, 0.30 m driving height, 0.10 m step, 0.25 m drop. Relief
+  // inside one raster cell is terrain up to the larger of the two limits
+  // (a cell has no direction of travel); the planner keeps both.
   const mgg::RasterParams params = Peer::globalRasterParams(*planner);
   EXPECT_NEAR(params.cell_size_m, 0.5, 1e-12);
   EXPECT_NEAR(params.body_radius_m, 0.5 * std::hypot(0.20, 0.20), 1e-9);
-  EXPECT_NEAR(params.max_step_height_m, 0.10, 1e-12);
+  EXPECT_NEAR(params.max_step_height_m, 0.25, 1e-12);
   EXPECT_NEAR(params.body_height_m, 0.30 + 0.075, 1e-9);
   EXPECT_NEAR(params.min_clearance_m, 0.0, 1e-12);
   const mgg::GlobalGridPlannerLimits limits = Peer::globalRasterLimits(*planner);
@@ -5678,6 +5681,7 @@ TEST(PlannerObjective, GlobalRasterCorridorRunsFromTheRobotToTheExactGoal) {
   EXPECT_NEAR(limits.max_drop_height, 0.25, 1e-12);
   EXPECT_NEAR(limits.driving_offset, 0.30, 1e-12);
   EXPECT_NEAR(limits.blocked_penalty, 20.0, 1e-12);
+  EXPECT_NEAR(limits.unknown_cost_factor, 4.0, 1e-12);
   EXPECT_EQ(limits.max_expansions, 5000u);
   EXPECT_EQ(limits.timeout, std::chrono::milliseconds(200));
 

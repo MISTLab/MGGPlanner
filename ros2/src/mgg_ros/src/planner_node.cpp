@@ -466,6 +466,17 @@ PlannerNode::PlannerNode(const rclcpp::NodeOptions& options)
       std::isfinite(requested_blocked_penalty)
           ? std::clamp(requested_blocked_penalty, 0.0, 1000.0)
           : 20.0;
+  // Zero refuses unobserved cells; one or more admits them at that multiple
+  // of their length. A lidar map is banded with unobserved ground between
+  // rings beyond a few metres and most goals lie past the observed map, so
+  // the default admits them and lets the rolling refinement judge them.
+  const double requested_unknown_factor = declareOrGet<double>(
+      this, "global_raster_unknown_cost_factor",
+      global_raster_unknown_cost_factor_);
+  global_raster_unknown_cost_factor_ =
+      std::isfinite(requested_unknown_factor) && requested_unknown_factor > 0.0
+          ? std::clamp(requested_unknown_factor, 1.0, 100.0)
+          : 0.0;
   geofence_ = std::make_unique<mgg::GeofenceManager>();
   local_graph_ = std::make_shared<mgg::GraphManager>();
   global_graph_ = std::make_shared<mgg::GraphManager>();
@@ -4092,7 +4103,19 @@ mgg::RasterParams PlannerNode::globalRasterParams() const {
   params.cell_size_m = global_raster_cell_m_;
   const Eigen::Vector3d body = robot_params_.getPlanningSize();
   params.body_radius_m = 0.5 * body.head<2>().norm();
-  params.max_step_height_m = std::max(0.0, planning_params_.max_step_height);
+  // Relief inside one cell is terrain up to the larger of the climb and drop
+  // limits, not the climb limit alone: a cell has no direction of travel,
+  // and a kerb whose lip and gutter share a cell (Bistro kerbs stand 0.16 to
+  // 0.19 m over a 0.15 m climb limit) would otherwise be a wall in both
+  // directions, sealing every sidewalk-to-road return the drop limit allows.
+  // The kerb remains a ground difference between the cells on either side,
+  // which the planner judges with the asymmetric rule, and the rolling
+  // refinement judges the exact voxels. A LIO map also lays double floors up
+  // to 0.2 m apart in one column, which the climb limit alone would call
+  // obstacles.
+  params.max_step_height_m =
+      std::max({0.0, planning_params_.max_step_height,
+                planning_params_.max_drop_height});
   // The planning box is centred max_ground_height above the ground, plus the
   // centre offset, so its top is the height below which matter is an
   // obstacle and above which the robot passes beneath.
@@ -4117,6 +4140,7 @@ mgg::GlobalGridPlannerLimits PlannerNode::globalRasterLimits() const {
   limits.driving_offset = planning_params_.max_ground_height;
   limits.body_radius = 0.5 * robot_params_.getPlanningSize().head<2>().norm();
   limits.blocked_penalty = global_raster_blocked_penalty_m_;
+  limits.unknown_cost_factor = global_raster_unknown_cost_factor_;
   limits.max_expansions = global_raster_max_expansions_;
   limits.timeout = global_raster_timeout_;
   return limits;
@@ -4159,8 +4183,12 @@ bool PlannerNode::planGlobalRasterCorridor(
     };
   }
   const mgg::GlobalGridPlanner planner(raster, limits);
+  // The robot's own footprint is masked out of its map; when no observed
+  // cell within the body radius can lend the start its ground, the robot
+  // stands at driving height above the ground it reports.
   const mgg::GlobalGridPlan plan =
-      planner.plan(current.head<2>(), goal.head<2>(), discs, blocked);
+      planner.plan(current.head<2>(), goal.head<2>(), discs, blocked,
+                   current.z() - limits.driving_offset);
   if (plan.status != mgg::GlobalGridPlanStatus::kSucceeded ||
       plan.poses.empty()) {
     failure = plan.reason.empty() ? mgg::toString(plan.status) : plan.reason;

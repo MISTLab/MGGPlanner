@@ -11,6 +11,7 @@ namespace mgg {
 namespace {
 
 constexpr std::size_t kNoParent = std::numeric_limits<std::size_t>::max();
+constexpr double kNaN = std::numeric_limits<double>::quiet_NaN();
 /// Bound on the cells a raster may hold before the per-cell search arrays
 /// (cost, parent, flags) are refused: 16 million cells is a 2 km square at
 /// 0.5 m, far beyond any single-component map this planner serves.
@@ -86,7 +87,8 @@ GlobalGridPlanner::GlobalGridPlanner(
 GlobalGridPlan GlobalGridPlanner::plan(const Eigen::Vector2d& start_xy,
                                        const Eigen::Vector2d& goal_xy,
                                        const std::vector<TransientDisc>& discs,
-                                       const BlockedEdge& blocked) const {
+                                       const BlockedEdge& blocked,
+                                       double start_ground_hint) const {
   const auto started = std::chrono::steady_clock::now();
   GlobalGridPlan result;
   const auto finish = [&](GlobalGridPlanStatus status,
@@ -117,10 +119,13 @@ GlobalGridPlan GlobalGridPlanner::plan(const Eigen::Vector2d& start_xy,
       !std::isfinite(limits_.driving_offset) ||
       !std::isfinite(limits_.body_radius) || limits_.body_radius < 0.0 ||
       !std::isfinite(limits_.blocked_penalty) || limits_.blocked_penalty < 0.0 ||
+      !std::isfinite(limits_.unknown_cost_factor) ||
+      (limits_.unknown_cost_factor != 0.0 && limits_.unknown_cost_factor < 1.0) ||
       limits_.max_expansions == 0 || limits_.timeout.count() <= 0) {
     return finish(GlobalGridPlanStatus::kInvalidConfiguration,
                   "global grid planner limits are invalid");
   }
+  const bool allow_unknown = limits_.unknown_cost_factor > 0.0;
   std::size_t start_x = 0;
   std::size_t start_y = 0;
   std::size_t goal_x = 0;
@@ -224,17 +229,27 @@ GlobalGridPlan GlobalGridPlanner::plan(const Eigen::Vector2d& start_xy,
     return true;
   };
 
-  double start_ground = 0.0;
-  double goal_ground = 0.0;
+  // An endpoint no neighbour can lend a ground to is carried when unknown
+  // cells are admitted: the start stands on the caller's hint, the goal on
+  // the last known ground of the path that reaches it. NaN marks "carried".
+  double start_ground = kNaN;
+  double goal_ground = kNaN;
   GlobalGridPlanStatus endpoint_status = GlobalGridPlanStatus::kSucceeded;
   std::string endpoint_reason;
   if (!resolveEndpoint(start_x, start_y, start_xy, true, start_ground,
                        endpoint_status, endpoint_reason)) {
-    return finish(endpoint_status, endpoint_reason);
+    if (!allow_unknown || endpoint_status != GlobalGridPlanStatus::kStartUnknown ||
+        !std::isfinite(start_ground_hint)) {
+      return finish(endpoint_status, endpoint_reason);
+    }
+    start_ground = start_ground_hint;
   }
   if (!resolveEndpoint(goal_x, goal_y, goal_xy, false, goal_ground,
                        endpoint_status, endpoint_reason)) {
-    return finish(endpoint_status, endpoint_reason);
+    if (!allow_unknown || endpoint_status != GlobalGridPlanStatus::kGoalUnknown) {
+      return finish(endpoint_status, endpoint_reason);
+    }
+    goal_ground = kNaN;
   }
 
   // Transient discs, rasterised once: a cell is refused when its centre lies
@@ -286,24 +301,40 @@ GlobalGridPlan GlobalGridPlanner::plan(const Eigen::Vector2d& start_xy,
     return finish(GlobalGridPlanStatus::kGoalInDisc, reason);
   }
 
-  const auto groundOf = [&](std::size_t index) {
+  // The ground a cell is known to stand on: NaN for an unknown cell and for
+  // a carried endpoint.
+  const auto knownGroundOf = [&](std::size_t index) {
     if (index == start) return start_ground;
     if (index == goal) return goal_ground;
-    return raster.ground_z[index];
+    return raster.state[index] == RasterCellState::kFree ? raster.ground_z[index]
+                                                          : kNaN;
   };
-  // A cell the search may stand on: known free, or one of the two endpoints,
-  // whose ground was resolved above.
+  // The ground the search stands on at a cell: its own when known, else the
+  // last known ground along the path that reached it (set with the parent).
+  std::vector<double> carried(raster.size(), kNaN);
+  carried[start] = start_ground;
+  const auto isUnknownCell = [&](std::size_t index) {
+    return raster.state[index] == RasterCellState::kUnknown ||
+           !std::isfinite(raster.ground_z[index]);
+  };
+  // A cell the search may stand on: known free, an unknown cell when those
+  // are admitted, or one of the two endpoints, resolved or carried above.
   const auto admissible = [&](std::size_t index) {
-    if (index == start || index == goal) return !discBlocked(index);
-    return raster.state[index] == RasterCellState::kFree && !discBlocked(index) &&
-           std::isfinite(raster.ground_z[index]);
+    if (discBlocked(index)) return false;
+    if (index == start || index == goal) return true;
+    if (raster.state[index] == RasterCellState::kObstacle) return false;
+    if (raster.state[index] == RasterCellState::kFree &&
+        std::isfinite(raster.ground_z[index])) {
+      return true;
+    }
+    return allow_unknown;
   };
   const auto poseOf = [&](std::size_t index) {
     const std::size_t x = index % raster.width;
     const std::size_t y = index / raster.width;
     const Eigen::Vector2d centre = raster.centre(x, y);
     return StateVec(centre.x(), centre.y(),
-                    groundOf(index) + limits_.driving_offset, 0.0);
+                    carried[index] + limits_.driving_offset, 0.0);
   };
   const auto emit = [&](const std::vector<std::size_t>& chain) {
     result.poses.clear();
@@ -381,7 +412,7 @@ GlobalGridPlan GlobalGridPlanner::plan(const Eigen::Vector2d& start_xy,
     closed[entry.index] = 1;
     const std::size_t active_x = entry.index % raster.width;
     const std::size_t active_y = entry.index / raster.width;
-    const double active_ground = groundOf(entry.index);
+    const double active_ground = carried[entry.index];
     StateVec active_pose;
     bool active_pose_ready = false;
     for (int direction = 0; direction < 8; ++direction) {
@@ -394,9 +425,16 @@ GlobalGridPlan GlobalGridPlanner::plan(const Eigen::Vector2d& start_xy,
       const std::size_t next = raster.index(static_cast<std::size_t>(nx),
                                             static_cast<std::size_t>(ny));
       if (closed[next] != 0 || !admissible(next)) continue;
-      const double next_ground = groundOf(next);
-      const double delta = next_ground - active_ground;
-      if (delta > rise_limit || -delta > drop_limit) continue;
+      // The step rule needs a known ground on both sides: an unknown cell
+      // carries the active ground, and a known cell entered from carried
+      // ground is judged against that.
+      const double next_known = knownGroundOf(next);
+      const double next_ground =
+          std::isfinite(next_known) ? next_known : active_ground;
+      if (std::isfinite(next_known) && std::isfinite(active_ground)) {
+        const double delta = next_known - active_ground;
+        if (delta > rise_limit || -delta > drop_limit) continue;
+      }
       const bool is_diagonal = kDx[direction] != 0 && kDy[direction] != 0;
       if (is_diagonal) {
         const std::size_t side_x = raster.index(
@@ -406,17 +444,28 @@ GlobalGridPlan GlobalGridPlanner::plan(const Eigen::Vector2d& start_xy,
         if (!admissible(side_x) || !admissible(side_y)) continue;
       }
       double edge = is_diagonal ? diagonal : straight;
+      // Unobserved ground costs its multiple; a goal whose ground a
+      // neighbour lent counts as observed, a carried goal does not.
+      if (allow_unknown &&
+          (next == goal ? !std::isfinite(goal_ground) : isUnknownCell(next))) {
+        edge *= limits_.unknown_cost_factor;
+      }
       if (blocked) {
         if (!active_pose_ready) {
           active_pose = poseOf(entry.index);
           active_pose_ready = true;
         }
-        if (blocked(active_pose, poseOf(next))) edge += limits_.blocked_penalty;
+        const Eigen::Vector2d next_centre = raster.centre(
+            static_cast<std::size_t>(nx), static_cast<std::size_t>(ny));
+        const StateVec next_pose(next_centre.x(), next_centre.y(),
+                                 next_ground + limits_.driving_offset, 0.0);
+        if (blocked(active_pose, next_pose)) edge += limits_.blocked_penalty;
       }
       const double candidate = entry.cost + edge;
       if (candidate + 1e-12 >= cost[next]) continue;
       cost[next] = candidate;
       parent[next] = entry.index;
+      carried[next] = next_ground;
       open.push({candidate + heuristic(next), candidate, next, sequence++});
     }
   }

@@ -15,6 +15,7 @@
 #include <chrono>
 #include <cstddef>
 #include <functional>
+#include <limits>
 #include <memory>
 #include <string>
 #include <vector>
@@ -38,6 +39,15 @@ struct GlobalGridPlannerLimits {
   double body_radius = 0.0;
   /// Cost added to an edge the blocked-corridor view marks, metres.
   double blocked_penalty = 20.0;
+  /// Zero refuses unknown cells. A factor of one or more admits them at that
+  /// multiple of the edge length: the search prefers observed ground and
+  /// crosses unobserved ground only where the known detour would be longer
+  /// than the factor times the crossing. A lidar map is banded with
+  /// unobserved ground between rings beyond a few metres, and a goal is
+  /// often beyond the observed map, so a planner that refused unknown cells
+  /// would answer only short goals. The rise and drop limits apply where a
+  /// known cell is entered, against the last known ground along the path.
+  double unknown_cost_factor = 0.0;
   /// The search ends with kBudgetExceeded once this many cells have been
   /// expanded.
   std::size_t max_expansions = 200000;
@@ -95,6 +105,16 @@ struct GlobalGridPlan {
 /// for a diagonal, both cardinal side cells are admissible too, so no corner
 /// is cut. Marked edges cost their length plus the blocked penalty: a mark
 /// is a routing preference, never a veto.
+///
+/// With `unknown_cost_factor` set, kUnknown cells are admitted too at that
+/// multiple of the edge length. An unknown cell carries the last known ground
+/// along the path into it (the emitted pose stands on that ground), and the
+/// rise and drop limits are judged against it when a known cell is entered
+/// again. Endpoints whose ground no neighbour can lend are carried the same
+/// way: the start from `start_ground_hint`, the goal from its path. The
+/// carried ground makes admission path-dependent, and a closed cell is not
+/// reopened for another carried ground; the rare route this misses is one
+/// that crosses unobserved ground between two ground levels.
 class GlobalGridPlanner {
  public:
   using BlockedEdge = std::function<bool(const StateVec&, const StateVec&)>;
@@ -104,10 +124,15 @@ class GlobalGridPlanner {
 
   /// Plans from the cell containing `start_xy` to the cell containing
   /// `goal_xy`. `blocked` may be empty; it is only consulted when set.
+  /// `start_ground_hint` is the ground the start stands on when the raster
+  /// cannot say (the robot's own height less the driving offset); it is only
+  /// used with `unknown_cost_factor` set, and NaN leaves such a start refused.
   GlobalGridPlan plan(const Eigen::Vector2d& start_xy,
                       const Eigen::Vector2d& goal_xy,
                       const std::vector<TransientDisc>& discs = {},
-                      const BlockedEdge& blocked = {}) const;
+                      const BlockedEdge& blocked = {},
+                      double start_ground_hint =
+                          std::numeric_limits<double>::quiet_NaN()) const;
 
   const GlobalGridPlannerLimits& limits() const { return limits_; }
 
