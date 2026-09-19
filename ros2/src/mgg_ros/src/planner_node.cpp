@@ -4120,17 +4120,15 @@ mgg::RasterParams PlannerNode::globalRasterParams() const {
   params.cell_size_m = global_raster_cell_m_;
   const Eigen::Vector3d body = robot_params_.getPlanningSize();
   params.body_radius_m = 0.5 * body.head<2>().norm();
-  // Relief inside one cell is terrain up to the larger of the climb and drop
-  // limits, not the climb limit alone: a cell has no direction of travel,
-  // and a kerb whose lip and gutter share a cell (Bistro kerbs stand 0.16 to
-  // 0.19 m over a 0.15 m climb limit) would otherwise be a wall in both
-  // directions, sealing every sidewalk-to-road return the drop limit allows.
-  // The kerb remains a ground difference between the cells on either side,
-  // which the planner judges with the asymmetric rule, and the rolling
-  // refinement judges the exact voxels. A LIO map also lays double floors up
-  // to 0.2 m apart in one column, which the climb limit alone would call
-  // obstacles.
-  params.max_step_height_m =
+  // Relief inside one cell up to the climb limit is terrain; between the
+  // climb and drop limits it is a step the raster marks like an inflated
+  // cell (crossed at a cost, the refinement's footprint checks judging the
+  // direction): a kerb whose lip and gutter share a cell must neither be a
+  // wall in both directions, sealing every sidewalk-to-road return the drop
+  // limit allows, nor free, which sent routes along kerb lines the footprint
+  // check then refused (benchbot, 2026-09-19).
+  params.max_step_height_m = std::max(0.0, planning_params_.max_step_height);
+  params.max_drop_height_m =
       std::max({0.0, planning_params_.max_step_height,
                 planning_params_.max_drop_height});
   // The planning box is centred max_ground_height above the ground, plus the

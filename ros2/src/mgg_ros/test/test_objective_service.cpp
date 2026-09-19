@@ -5687,13 +5687,13 @@ TEST(PlannerObjective, GlobalRasterCorridorRunsFromTheRobotToTheExactGoal) {
   Peer::setDropHeight(*planner, 0.25);
 
   // Platform limits reach the raster and the planner: a 0.20 by 0.20 m
-  // exact body, 0.30 m driving height, 0.10 m step, 0.25 m drop. Relief
-  // inside one raster cell is terrain up to the larger of the two limits
-  // (a cell has no direction of travel); the planner keeps both.
+  // exact body, 0.30 m driving height, 0.10 m step, 0.25 m drop. The raster
+  // takes both bands (relief between them is a step crossed at a cost).
   const mgg::RasterParams params = Peer::globalRasterParams(*planner);
   EXPECT_NEAR(params.cell_size_m, 0.5, 1e-12);
   EXPECT_NEAR(params.body_radius_m, 0.5 * std::hypot(0.20, 0.20), 1e-9);
-  EXPECT_NEAR(params.max_step_height_m, 0.25, 1e-12);
+  EXPECT_NEAR(params.max_step_height_m, 0.10, 1e-12);
+  EXPECT_NEAR(params.max_drop_height_m, 0.25, 1e-12);
   EXPECT_NEAR(params.body_height_m, 0.30 + 0.075, 1e-9);
   EXPECT_NEAR(params.min_clearance_m, 0.0, 1e-12);
   const mgg::GlobalGridPlannerLimits limits = Peer::globalRasterLimits(*planner);

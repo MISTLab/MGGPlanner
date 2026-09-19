@@ -201,6 +201,16 @@ TEST(TraversabilityBuilder, KerbInsideOneCellIsAnObstacleAboveTheStepBand) {
   const auto climbs = mgg::buildTraversabilityRaster(map, spot);
   ASSERT_NE(climbs, nullptr);
   EXPECT_EQ(climbs->stateAtXY(Eigen::Vector2d(3.25, 0.25)), RasterCellState::kFree);
+  // A platform that climbs 0.15 m but may drop 0.25 m sees a step: marked
+  // like an inflated cell, crossed at a cost, never a wall.
+  RasterParams bunker = scout;
+  bunker.max_drop_height_m = 0.25;
+  const auto steps = mgg::buildTraversabilityRaster(map, bunker);
+  ASSERT_NE(steps, nullptr);
+  EXPECT_EQ(steps->stateAtXY(Eigen::Vector2d(3.25, 0.25)),
+            RasterCellState::kInflated);
+  EXPECT_NEAR(steps->groundAtXY(Eigen::Vector2d(3.25, 0.25)), 0.05, 1e-9);
+  EXPECT_EQ(steps->stateAtXY(Eigen::Vector2d(3.75, 0.25)), RasterCellState::kFree);
 }
 
 TEST(TraversabilityBuilder, TransformPlacesTheRasterInTheNavigationFrame) {

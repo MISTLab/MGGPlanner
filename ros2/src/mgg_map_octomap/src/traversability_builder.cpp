@@ -24,6 +24,8 @@ bool validParams(const RasterParams& params) {
          std::isfinite(params.body_radius_m) && params.body_radius_m >= 0.0 &&
          std::isfinite(params.max_step_height_m) &&
          params.max_step_height_m >= 0.0 &&
+         std::isfinite(params.max_drop_height_m) &&
+         params.max_drop_height_m >= 0.0 &&
          std::isfinite(params.body_height_m) &&
          params.body_height_m >= params.max_step_height_m &&
          std::isfinite(params.min_clearance_m) && params.min_clearance_m >= 0.0 &&
@@ -112,9 +114,18 @@ std::shared_ptr<const TraversabilityRaster> buildTraversabilityRaster(
 
   // Obstacles: an occupied voxel whose top rises above the step band and
   // whose bottom lies below the body band. The top is the measured surface
-  // when the voxel has one, otherwise the voxel's geometric top.
+  // when the voxel has one, otherwise the voxel's geometric top. Relief
+  // between the step band and the drop band is a step (a kerb lip sharing
+  // the cell with its gutter): the cell is marked like an inflated one, so a
+  // route crosses it only at a cost and the refinement's footprint checks
+  // judge the direction of travel. A cell has no direction, so it cannot
+  // apply the asymmetric rule itself.
   std::vector<std::uint8_t> obstacle(cells, 0);
+  std::vector<std::uint8_t> step(cells, 0);
   const double step_band = params.max_step_height_m + params.step_tolerance_m;
+  const double drop_band =
+      std::max(params.max_step_height_m, params.max_drop_height_m) +
+      params.step_tolerance_m;
   for (const auto& voxel : occupied) {
     const Eigen::Vector3d centre = place(centreOf(voxel));
     std::size_t index = 0;
@@ -131,7 +142,11 @@ std::shared_ptr<const TraversabilityRaster> buildTraversabilityRaster(
     }
     const double bottom = centre.z() - half;
     if (top > ground + step_band && bottom < ground + params.body_height_m) {
-      obstacle[index] = 1;
+      if (top > ground + drop_band) {
+        obstacle[index] = 1;
+      } else {
+        step[index] = 1;
+      }
     }
   }
 
@@ -162,6 +177,10 @@ std::shared_ptr<const TraversabilityRaster> buildTraversabilityRaster(
     if (!std::isfinite(raster->ground_z[index])) continue;
     if (obstacle[index] != 0) {
       raster->state[index] = RasterCellState::kObstacle;
+      continue;
+    }
+    if (step[index] != 0) {
+      raster->state[index] = RasterCellState::kInflated;
       continue;
     }
     if (required_layers > 0) {

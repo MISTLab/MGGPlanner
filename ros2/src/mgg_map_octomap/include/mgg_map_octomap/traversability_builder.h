@@ -7,8 +7,10 @@
 //   obstacle  any occupied voxel whose top lies above ground + step band and
 //             whose bottom lies below ground + body band: matter the robot
 //             can neither roll over nor pass beneath.
-//   inflated  a free cell within the body radius of an obstacle cell; the
-//             body may not fit there at this resolution.
+//   inflated  a free cell within the body radius of an obstacle cell (the
+//             body may not fit there at this resolution), or a cell whose
+//             relief lies between the step band and the drop band (a kerb
+//             the platform may descend but not climb).
 //   unknown   no voxel the cell covers has a surface; or, with a clearance
 //             requirement, the free voxels above the ground do not reach it.
 //   free      everything else.
@@ -38,6 +40,11 @@ struct RasterParams {
   /// Step band: matter up to this height above the ground is terrain the
   /// platform rolls over (the platform's max_step_height).
   double max_step_height_m = 0.0;
+  /// Drop band: matter between the step band and this height above the
+  /// ground is a step the platform may descend but not climb (a kerb lip in
+  /// the gutter's cell); the cell is marked kInflated, crossed at a cost,
+  /// and the refinement judges the direction. Zero means the step band.
+  double max_drop_height_m = 0.0;
   /// Body band: matter between the step band and this height above the
   /// ground is an obstacle; above it the robot passes beneath.
   double body_height_m = 0.0;
@@ -52,6 +59,7 @@ struct RasterParams {
     return cell_size_m == other.cell_size_m &&
            body_radius_m == other.body_radius_m &&
            max_step_height_m == other.max_step_height_m &&
+           max_drop_height_m == other.max_drop_height_m &&
            body_height_m == other.body_height_m &&
            min_clearance_m == other.min_clearance_m &&
            step_tolerance_m == other.step_tolerance_m;
