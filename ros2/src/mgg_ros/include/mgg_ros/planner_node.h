@@ -196,6 +196,11 @@ class PlannerNode : public rclcpp::Node {
                                    bool preserve_xy = false,
                                    bool accept_ground_above_sample = false) const;
   bool resolveNavigateGoalDrivingHeight(mgg::StateVec& state) const;
+  /// Driving height from the mapped ground around `state` when its own
+  /// column is unobserved: the median of the footprint's ground hits, if
+  /// enough cells report ground within one step of each other. False when
+  /// the footprint is mostly unknown or the hits disagree.
+  bool footprintDrivingHeight(mgg::StateVec& state) const;
   mgg::StateVec physicalAnchorAtDrivingHeight(
       const mgg::StateVec& base_pose) const;
   /// `physical_anchor`: odometry proves the robot stands on `anchor`, so the

@@ -238,12 +238,16 @@ void BlockedCorridorRegistry::clear() { entries_.clear(); }
 TopologicalGoalPlanner::TopologicalGoalPlanner(
     std::string component_id, std::uint64_t graph_revision,
     std::uint64_t map_revision, double goal_vertex_tolerance,
-    double minimum_partial_progress)
+    double minimum_partial_progress, double return_home_connector_radius)
     : component_id_(std::move(component_id)),
       graph_revision_(graph_revision),
       map_revision_(map_revision),
       goal_vertex_tolerance_(std::max(0.0, goal_vertex_tolerance)),
-      minimum_partial_progress_(std::max(0.0, minimum_partial_progress)) {}
+      minimum_partial_progress_(std::max(0.0, minimum_partial_progress)),
+      return_home_connector_radius_(
+          std::isfinite(return_home_connector_radius)
+              ? std::max(0.0, return_home_connector_radius)
+              : 0.0) {}
 
 RouteCorridor TopologicalGoalPlanner::plan(
     GraphManager& graph, const StateVec& current,
@@ -277,6 +281,12 @@ RouteCorridor TopologicalGoalPlanner::plan(
   // Both ends must bind to the active graph.  An unbounded source lookup can
   // turn a lone home landmark into an apparently valid one-pose route after
   // the robot has travelled far beyond the last admitted breadcrumb.
+  // A ReturnHome whose start is off the graph but within the connector
+  // radius routes from the nearest vertex and prepends the live pose, so the
+  // corridor's first segment is the unvalidated connector that the rolling
+  // grid stage checks. Beyond the radius the refusal stands: a lone home
+  // landmark must not become a one-segment route from anywhere.
+  bool home_connector = false;
   if (!graph.getNearestVertexInRange(&current, goal_vertex_tolerance_,
                                      &source)) {
     if (request.objective == ObjectiveKind::kNavigate) {
@@ -287,14 +297,21 @@ RouteCorridor TopologicalGoalPlanner::plan(
       result.poses = {current, goal};
       return result;
     }
-    char reason[192];
-    std::snprintf(reason, sizeof(reason),
-                  "current pose is outside the graph tolerance %.2f m at "
-                  "(%.2f, %.2f, %.2f)",
-                  goal_vertex_tolerance_, current.x(), current.y(),
-                  current.z());
-    result.reason = reason;
-    return result;
+    if (request.objective == ObjectiveKind::kReturnHome &&
+        return_home_connector_radius_ > goal_vertex_tolerance_ &&
+        graph.getNearestVertexInRange(&current, return_home_connector_radius_,
+                                      &source)) {
+      home_connector = true;
+    } else {
+      char reason[192];
+      std::snprintf(reason, sizeof(reason),
+                    "current pose is outside the graph tolerance %.2f m at "
+                    "(%.2f, %.2f, %.2f)",
+                    goal_vertex_tolerance_, current.x(), current.y(),
+                    current.z());
+      result.reason = reason;
+      return result;
+    }
   }
   // Routing around marks is the only reason to leave the existing search:
   // with nothing marked, the corridor is bit-for-bit the one MGG produced
@@ -411,6 +428,7 @@ RouteCorridor TopologicalGoalPlanner::plan(
                         : "goal is in a disconnected graph component";
     return result;
   }
+  if (home_connector) result.poses.insert(result.poses.begin(), current);
   result.status = PlanningStatus::kSucceeded;
   return result;
 }

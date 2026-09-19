@@ -1415,6 +1415,57 @@ bool PlannerNode::projectStateToDrivingHeight(mgg::StateVec& state,
   return state.allFinite();
 }
 
+bool PlannerNode::footprintDrivingHeight(mgg::StateVec& state) const {
+  if (robot_params_.type != mgg::RobotType::kGroundRobot || !ground_ ||
+      !map_ || !state.allFinite() ||
+      !std::isfinite(planning_params_.max_ground_height) ||
+      !std::isfinite(planning_params_.max_step_height) ||
+      !std::isfinite(ground_->max_projection_length) ||
+      ground_->max_projection_length <= 0.0) {
+    return false;
+  }
+  const Eigen::Vector3d body = robot_params_.getPlanningSize();
+  const double radius = 0.5 * body.head<2>().norm();
+  const Eigen::Vector2d center =
+      state.head<2>() + robot_params_.center_offset.head<2>();
+  constexpr int kMaxFootprintSamples = 4096;
+  std::vector<mgg::XYCellCenter> cells;
+  if (!std::isfinite(radius) || radius <= 0.0 ||
+      !map_->getCircleIntersectingXYCellCenters(center, radius,
+                                                kMaxFootprintSamples, cells) ||
+      cells.empty()) {
+    return false;
+  }
+  // Cast from well above any plausible driving plane so a pose whose height
+  // is only provisional still finds the surface below it.
+  const double start_z = state.z() + ground_->max_projection_length;
+  std::vector<double> hits;
+  hits.reserve(cells.size());
+  for (const mgg::XYCellCenter& cell : cells) {
+    const Eigen::Vector3d start(cell.center.x(), cell.center.y(), start_z);
+    const Eigen::Vector3d end =
+        start - Eigen::Vector3d(0.0, 0.0, 2.0 * ground_->max_projection_length);
+    Eigen::Vector3d hit;
+    if (map_->getGroundRayStatus(start, end, false, hit) ==
+            mgg::VoxelStatus::kOccupied &&
+        hit.allFinite()) {
+      hits.push_back(hit.z());
+    }
+  }
+  // Half the footprint must report ground, and the hits must lie within one
+  // step of each other: a real rise or drop inside the footprint is not
+  // averaged away, it is left for the footprint check to refuse.
+  if (hits.size() * 2 < cells.size()) return false;
+  std::sort(hits.begin(), hits.end());
+  const double spread = hits.back() - hits.front();
+  if (spread > planning_params_.max_step_height + footprint_step_tolerance_m_) {
+    return false;
+  }
+  const double ground = hits[hits.size() / 2];
+  state[2] = ground + planning_params_.max_ground_height;
+  return state.allFinite();
+}
+
 bool PlannerNode::resolveNavigateGoalDrivingHeight(
     mgg::StateVec& state) const {
   if (robot_params_.type != mgg::RobotType::kGroundRobot) {
@@ -3253,7 +3304,16 @@ mgg::FeasiblePath PlannerNode::refineCorridor(
               corridor.request.objective != mgg::ObjectiveKind::kNavigate) {
             state[2] = current_anchor[2];
           } else {
+            // The pose's own column is unobserved. Checking its footprint at
+            // an unprojected height reported the flat road around a
+            // neighbour's masked footprint as `known rise 0.30 m` (the
+            // requested navigation height minus the driving offset, against
+            // the mapped road) and refused the goal seven runs in a row on
+            // benchbot, 2026-09-18. Take the driving height from the mapped
+            // ground around the pose when that ground is flat; the height
+            // stays provisional and the centre cell stays unknown.
             provisional_unknown_height = true;
+            (void)footprintDrivingHeight(state);
           }
           physical_anchor_fallback = samePosition(state, current_anchor);
         } else {
