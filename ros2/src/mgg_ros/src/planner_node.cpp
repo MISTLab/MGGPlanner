@@ -442,6 +442,30 @@ PlannerNode::PlannerNode(const rclcpp::NodeOptions& options)
   objective_route_max_poses_ = static_cast<std::size_t>(std::clamp(
       declareOrGet<std::int64_t>(this, "objective_route_max_poses", 4096),
       std::int64_t{2}, std::int64_t{65536}));
+  // The full-map raster stage. Its cell size is the spacing of the global
+  // route's waypoints; the sections, refinement and validation behind it
+  // keep their own resolutions.
+  const double requested_raster_cell =
+      declareOrGet<double>(this, "global_raster_cell_m", global_raster_cell_m_);
+  global_raster_cell_m_ = std::isfinite(requested_raster_cell)
+                              ? std::clamp(requested_raster_cell, 0.1, 5.0)
+                              : 0.5;
+  global_raster_max_expansions_ = static_cast<std::size_t>(std::clamp(
+      declareOrGet<std::int64_t>(this, "global_raster_max_expansions",
+                                 static_cast<std::int64_t>(
+                                     global_raster_max_expansions_)),
+      std::int64_t{1}, std::int64_t{16777216}));
+  global_raster_timeout_ = std::chrono::milliseconds(std::clamp(
+      declareOrGet<std::int64_t>(this, "global_raster_timeout_ms",
+                                 static_cast<std::int64_t>(
+                                     global_raster_timeout_.count())),
+      std::int64_t{1}, std::int64_t{10000}));
+  const double requested_blocked_penalty = declareOrGet<double>(
+      this, "global_raster_blocked_penalty_m", global_raster_blocked_penalty_m_);
+  global_raster_blocked_penalty_m_ =
+      std::isfinite(requested_blocked_penalty)
+          ? std::clamp(requested_blocked_penalty, 0.0, 1000.0)
+          : 20.0;
   geofence_ = std::make_unique<mgg::GeofenceManager>();
   local_graph_ = std::make_shared<mgg::GraphManager>();
   global_graph_ = std::make_shared<mgg::GraphManager>();
@@ -4063,6 +4087,126 @@ void PlannerNode::blockRouteNear(const std::vector<mgg::StateVec>& route,
   blockCorridorSegment(route[best - 1], route[best]);
 }
 
+mgg::RasterParams PlannerNode::globalRasterParams() const {
+  mgg::RasterParams params;
+  params.cell_size_m = global_raster_cell_m_;
+  const Eigen::Vector3d body = robot_params_.getPlanningSize();
+  params.body_radius_m = 0.5 * body.head<2>().norm();
+  params.max_step_height_m = std::max(0.0, planning_params_.max_step_height);
+  // The planning box is centred max_ground_height above the ground, plus the
+  // centre offset, so its top is the height below which matter is an
+  // obstacle and above which the robot passes beneath.
+  params.body_height_m =
+      std::max(params.max_step_height_m,
+               planning_params_.max_ground_height + 0.5 * body.z() +
+                   robot_params_.center_offset.z());
+  // Clearance evidence stays with the refinement stage's body policy; the
+  // raster judges observed ground and observed obstacles only.
+  params.min_clearance_m = 0.0;
+  params.step_tolerance_m = footprint_step_tolerance_m_;
+  return params;
+}
+
+mgg::GlobalGridPlannerLimits PlannerNode::globalRasterLimits() const {
+  mgg::GlobalGridPlannerLimits limits;
+  limits.max_step_height = std::max(0.0, planning_params_.max_step_height);
+  // A zero drop limit means the step limit, as everywhere else in the node.
+  limits.max_drop_height = std::max(planning_params_.max_drop_height,
+                                    planning_params_.max_step_height);
+  limits.step_tolerance = footprint_step_tolerance_m_;
+  limits.driving_offset = planning_params_.max_ground_height;
+  limits.body_radius = 0.5 * robot_params_.getPlanningSize().head<2>().norm();
+  limits.blocked_penalty = global_raster_blocked_penalty_m_;
+  limits.max_expansions = global_raster_max_expansions_;
+  limits.timeout = global_raster_timeout_;
+  return limits;
+}
+
+bool PlannerNode::planGlobalRasterCorridor(
+    const std::shared_ptr<const mgg::TraversabilityRaster>& raster,
+    const mgg::StateVec& current, const mgg::StateVec& goal,
+    mgg::RouteCorridor& corridor, std::string& failure) const {
+  failure.clear();
+  if (raster == nullptr) {
+    failure = "no traversability raster for the active MOLA snapshot";
+    return false;
+  }
+  if (!current.allFinite() || !goal.allFinite()) {
+    failure = "current pose or goal is not finite";
+    return false;
+  }
+  const mgg::GlobalGridPlannerLimits limits = globalRasterLimits();
+  // Other robots stand in the world and in no map. Their discs are the
+  // neighbour's body radius; the cell test is on the cell centre, so the
+  // disc grows by this robot's body radius as the box queries do.
+  std::vector<mgg::TransientDisc> discs;
+  if (mola_map_ != nullptr) {
+    const mgg::MolaMap::TransientDiscSet live = mola_map_->transientDiscs();
+    const double reach = live.radius_m + limits.body_radius;
+    discs.reserve(live.centres.size());
+    for (const Eigen::Vector2d& centre : live.centres) {
+      discs.push_back({centre, reach});
+    }
+  }
+  // Marked corridors are a routing preference: the penalty steers the route
+  // away from a segment the refinement or the controller just rejected.
+  // Only consulted while a mark is live; the lookup is per expanded edge.
+  const mgg::BlockedCorridorView view = blockedCorridorView();
+  mgg::GlobalGridPlanner::BlockedEdge blocked;
+  if (view.active()) {
+    blocked = [view](const mgg::StateVec& a, const mgg::StateVec& b) {
+      return view.blocked(a, b);
+    };
+  }
+  const mgg::GlobalGridPlanner planner(raster, limits);
+  const mgg::GlobalGridPlan plan =
+      planner.plan(current.head<2>(), goal.head<2>(), discs, blocked);
+  if (plan.status != mgg::GlobalGridPlanStatus::kSucceeded ||
+      plan.poses.empty()) {
+    failure = plan.reason.empty() ? mgg::toString(plan.status) : plan.reason;
+    RCLCPP_INFO(get_logger(),
+                "global raster route unavailable (%s) after %zu expansions "
+                "in %lld ms on a %zu x %zu raster: %s",
+                mgg::toString(plan.status), plan.expansions,
+                static_cast<long long>(plan.elapsed.count()), raster->width,
+                raster->height, failure.c_str());
+    return false;
+  }
+  // The raster route runs from cell centre to cell centre. The corridor
+  // starts at the robot itself and ends at the exact goal, like every other
+  // corridor the section machinery consumes; the goal keeps the raster's
+  // driving height for its cell and the request's yaw.
+  std::vector<mgg::StateVec> poses = plan.poses;
+  mgg::StateVec goal_pose = goal;
+  goal_pose.z() = poses.back().z();
+  if (poses.size() < 2u) {
+    poses = {current, goal_pose};
+  } else {
+    poses.front() = current;
+    poses.back() = goal_pose;
+  }
+  for (std::size_t i = 1; i < poses.size(); ++i) {
+    poses[i - 1][3] = std::atan2(poses[i].y() - poses[i - 1].y(),
+                                 poses[i].x() - poses[i - 1].x());
+  }
+  poses.back()[3] = goal[3];
+  double length = 0.0;
+  for (std::size_t i = 1; i < poses.size(); ++i) {
+    length += (poses[i].head<2>() - poses[i - 1].head<2>()).norm();
+  }
+  RCLCPP_INFO(get_logger(),
+              "global raster route: %.1f m over %zu cells (%zu expansions, "
+              "%lld ms search, %zu x %zu raster at %.2f m)",
+              length, plan.poses.size(), plan.expansions,
+              static_cast<long long>(plan.elapsed.count()), raster->width,
+              raster->height, raster->cell_size);
+  corridor.status = mgg::PlanningStatus::kSucceeded;
+  corridor.partial = false;
+  corridor.reason.clear();
+  corridor.poses = std::move(poses);
+  return true;
+}
+
 bool PlannerNode::sliceObjectiveRouteWindow(
     const mgg::PlanningRequest& core, mgg::RouteCorridor& corridor,
     std::vector<mgg::StateVec>& global_objective_path,
@@ -4391,9 +4535,6 @@ void PlannerNode::onObjectiveRequest(
             core.objective == mgg::ObjectiveKind::kNavigate
                 ? partial_route_min_progress_m_
                 : 0.0;
-        mgg::TopologicalGoalPlanner objective_planner(
-            core.component_id, core.graph_revision, core.map_revision, 1.0,
-            explicit_minimum_progress);
         explicit_objective_planned = true;
         topological_retry.valid = true;
         topological_retry.graph = &graph;
@@ -4401,22 +4542,70 @@ void PlannerNode::onObjectiveRequest(
         topological_retry.request = graph_request;
         topological_retry.goal_tolerance = 1.0;
         topological_retry.minimum_partial_progress = explicit_minimum_progress;
-        corridor = objective_planner.plan(graph, graph_current, graph_request,
-                                          blockedCorridorView());
-        if (core.objective == mgg::ObjectiveKind::kNavigate &&
-            robot_params_.type == mgg::RobotType::kGroundRobot &&
-            !projected_goal_supported && corridor.poses.size() >= 2u &&
-            (corridor.poses.back().head<2>() - core.goal.pose.head<2>())
-                    .cwiseAbs().maxCoeff() <= 1e-6) {
-          // An unsupported UI goal owns an exact navigation-base pose, while
-          // graph vertices and rolling proxies use driving height.  Keep the
-          // optimistic connector on its preceding graph driving plane until a
-          // later local window observes terrain near the goal.  Interpolating
-          // the request's base Z here fabricates a long slope and a false step
-          // at the first horizon.  corridor.request below still retains the
-          // exact caller-owned XYZ and yaw for final-window binding.
-          corridor.poses.back().z() =
-              corridor.poses[corridor.poses.size() - 2u].z();
+        // The global route comes from the full-map traversability raster of
+        // the MOLA product when there is one: a route with one waypoint per
+        // cell that bends with the street, instead of the graph's lattice
+        // vertices and breadcrumbs followed by a straight line the bounded
+        // refinement window cannot detour (benchbot, 2026-09-19). The
+        // topological stage stays the fallback, and everything downstream
+        // (sections, refinement, validation) treats both alike.
+        std::string raster_failure;
+        bool raster_route = false;
+        if (map_backend_ == "mola_snapshot" && mola_map_ != nullptr) {
+          const auto raster_started = std::chrono::steady_clock::now();
+          const std::shared_ptr<const mgg::TraversabilityRaster> raster =
+              mola_map_->traversability(globalRasterParams());
+          const auto raster_elapsed =
+              std::chrono::duration_cast<std::chrono::milliseconds>(
+                  std::chrono::steady_clock::now() - raster_started);
+          if (raster == nullptr) {
+            raster_failure =
+                "no traversability raster for the active MOLA snapshot";
+            RCLCPP_INFO(get_logger(), "global raster route unavailable: %s",
+                        raster_failure.c_str());
+          } else {
+            if (raster_elapsed.count() > 0) {
+              RCLCPP_INFO(get_logger(),
+                          "traversability raster %zu x %zu at %.2f m ready "
+                          "in %lld ms",
+                          raster->width, raster->height, raster->cell_size,
+                          static_cast<long long>(raster_elapsed.count()));
+            }
+            mgg::RouteCorridor raster_corridor;
+            raster_corridor.request = graph_request;
+            raster_route = planGlobalRasterCorridor(
+                raster, graph_current, graph_request.goal.pose,
+                raster_corridor, raster_failure);
+            if (raster_route) corridor = std::move(raster_corridor);
+          }
+        }
+        if (!raster_route) {
+          mgg::TopologicalGoalPlanner objective_planner(
+              core.component_id, core.graph_revision, core.map_revision, 1.0,
+              explicit_minimum_progress);
+          corridor = objective_planner.plan(graph, graph_current,
+                                            graph_request,
+                                            blockedCorridorView());
+          if (core.objective == mgg::ObjectiveKind::kNavigate &&
+              robot_params_.type == mgg::RobotType::kGroundRobot &&
+              !projected_goal_supported && corridor.poses.size() >= 2u &&
+              (corridor.poses.back().head<2>() - core.goal.pose.head<2>())
+                      .cwiseAbs().maxCoeff() <= 1e-6) {
+            // An unsupported UI goal owns an exact navigation-base pose,
+            // while graph vertices and rolling proxies use driving height.
+            // Keep the optimistic connector on its preceding graph driving
+            // plane until a later local window observes terrain near the
+            // goal. Interpolating the request's base Z here fabricates a
+            // long slope and a false step at the first horizon.
+            // corridor.request below still retains the exact caller-owned
+            // XYZ and yaw for final-window binding.
+            corridor.poses.back().z() =
+                corridor.poses[corridor.poses.size() - 2u].z();
+          }
+          if (corridor.status != mgg::PlanningStatus::kSucceeded &&
+              !raster_failure.empty()) {
+            corridor.reason += " [global raster: " + raster_failure + "]";
+          }
         }
         // Graph lookup uses driving height, while refinement and the response
         // retain the caller's exact base-pose goal.

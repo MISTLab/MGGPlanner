@@ -277,6 +277,14 @@ struct MolaMap::Snapshot {
   // The geometry itself stays immutable.
   mutable std::atomic<std::int64_t> validated_at_ns{0};
   mutable std::atomic<std::size_t> reader_pins{0};
+  // The traversability raster derived from this geometry, built on first use
+  // and immutable afterwards like the geometry itself. A build that failed
+  // is cached as nullptr: it is a property of the geometry, not of the
+  // moment. Rebuilt only when asked for different parameters.
+  mutable std::mutex raster_mutex;
+  mutable bool raster_built = false;
+  mutable RasterParams raster_params;
+  mutable std::shared_ptr<const TraversabilityRaster> raster;
 
   void markValidated(const Clock::time_point when) const {
     validated_at_ns.store(
@@ -1085,6 +1093,38 @@ void MolaMap::setTransientDiscs(std::vector<Eigen::Vector2d> centres,
   }
   std::atomic_store(&transient_discs_,
                     std::shared_ptr<const TransientDiscs>(std::move(discs)));
+}
+
+MolaMap::TransientDiscSet MolaMap::transientDiscs() const {
+  TransientDiscSet result;
+  const auto discs = std::atomic_load(&transient_discs_);
+  if (discs == nullptr || discs->centres.empty() ||
+      Clock::now() > discs->expires) {
+    return result;
+  }
+  result.centres = discs->centres;
+  result.radius_m = discs->radius_m;
+  return result;
+}
+
+std::shared_ptr<const TraversabilityRaster> MolaMap::traversability(
+    const RasterParams& params) const {
+  const auto snapshot = current();
+  if (snapshot == nullptr) return nullptr;
+  const std::lock_guard<std::mutex> lock(snapshot->raster_mutex);
+  if (snapshot->raster_built && snapshot->raster_params == params) {
+    return snapshot->raster;
+  }
+  // The grid is in the component frame; the planner, the transient discs and
+  // the blocked-corridor marks are all in the navigation frame, so the raster
+  // is built there. The tilt bound is the same one the circle and cylinder
+  // queries apply: a vertical column of the grid must stay a column.
+  snapshot->raster = buildTraversabilityRaster(
+      *snapshot->map, params,
+      snapshot->request.component_from_navigation.inverse());
+  snapshot->raster_built = true;
+  snapshot->raster_params = params;
+  return snapshot->raster;
 }
 
 bool MolaMap::discsBlockSweep(const Eigen::Vector3d& start,

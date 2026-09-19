@@ -46,6 +46,7 @@
 
 #include "mgg_core/geofence_manager.h"
 #include "mgg_core/gain.h"
+#include "mgg_core/global_grid_planner.h"
 #include "mgg_core/graph_expansion.h"
 #include "mgg_core/graph_manager.h"
 #include "mgg_core/graph_merge.h"
@@ -106,6 +107,22 @@ class PlannerNode : public rclcpp::Node {
     double goal_tolerance = 1.0;
     double minimum_partial_progress = 0.0;
   };
+  /// Parameters of the full-map traversability raster for this platform:
+  /// the configured cell size, the body radius and the step and body bands.
+  mgg::RasterParams globalRasterParams() const;
+  /// Limits of the full-map grid planner: the platform's step and drop
+  /// limits, the driving offset, and the configured budget and deadline.
+  mgg::GlobalGridPlannerLimits globalRasterLimits() const;
+  /// The global stage of Navigate and ReturnHome over the MOLA product: a
+  /// full-map 2.5D A* from the driving-height `current` pose to the goal,
+  /// avoiding the live transient discs and preferring unmarked corridors. On
+  /// success `corridor` holds the raster route, one pose per cell, with the
+  /// first pose at `current` and the last at `goal`. On failure the corridor
+  /// is left untouched and `failure` names the reason.
+  bool planGlobalRasterCorridor(
+      const std::shared_ptr<const mgg::TraversabilityRaster>& raster,
+      const mgg::StateVec& current, const mgg::StateVec& goal,
+      mgg::RouteCorridor& corridor, std::string& failure) const;
   /// Slices a complete topological route into the next bounded local section
   /// and, when the route continues past it, prepares the continuation token.
   /// `corridor` carries the full route in and the local section out.
@@ -290,6 +307,13 @@ class PlannerNode : public rclcpp::Node {
   double objective_route_horizon_m_ = 8.0;
   double objective_route_progress_tolerance_m_ = 1.0;
   std::size_t objective_route_max_poses_ = 4096;
+  /// Full-map raster stage of Navigate and ReturnHome on the MOLA backend:
+  /// the raster cell size and the A* budget, deadline and blocked-edge
+  /// penalty. The topological stage remains the fallback.
+  double global_raster_cell_m_ = 0.5;
+  std::size_t global_raster_max_expansions_ = 200000;
+  std::chrono::milliseconds global_raster_timeout_{500};
+  double global_raster_blocked_penalty_m_ = 20.0;
   /// Corridors whose bounded refinement or execution has just been rejected.
   /// Bounded and expiring; it only steers corridor choice and never relaxes a
   /// terrain, body, step, drop or geofence veto.

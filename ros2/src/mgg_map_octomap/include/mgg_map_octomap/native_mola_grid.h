@@ -78,6 +78,13 @@ class NativeMolaGrid final : public MapInterface {
   void setRaycastingParams(bool, double) override {}
   void setRobotRadius(double) override {}
 
+  /// The ternary product, for readers that build derived products (the
+  /// traversability raster) from every voxel at once. Occupied and free are
+  /// sorted; surfaces hold the highest measured point per occupied voxel.
+  const std::vector<Cell>& occupiedCells() const { return occupied_; }
+  const std::vector<Cell>& freeCells() const { return free_; }
+  const std::map<Cell, double>& surfaceMaxZ() const { return surface_max_z_; }
+
  private:
   static constexpr std::uint64_t kMaxWork = 1u << 22;
   bool key(const Eigen::Vector3d&, Cell&) const;
