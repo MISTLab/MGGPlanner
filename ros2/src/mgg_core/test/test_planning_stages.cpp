@@ -198,6 +198,19 @@ TEST(PlanningStages, ReturnHomeConnectsFromInsideTheConnectorRadius) {
             "current pose is outside the graph tolerance 0.25 m at "
             "(2.00, 2.00, 0.00)");
 
+  // A far Navigate from beside the chain also joins the graph first: the
+  // corridor is live pose, nearest vertex, the graph towards the goal, and
+  // the exact goal, not a straight line handed to the grid stage.
+  auto far = request(ObjectiveKind::kNavigate);
+  far.goal.pose = StateVec(30.0, 0.0, 0.0, 0.0);
+  const auto joined = planner.plan(chain.graph, beside, far);
+  ASSERT_EQ(joined.status, PlanningStatus::kSucceeded);
+  ASSERT_GE(joined.poses.size(), 3u);
+  EXPECT_TRUE(joined.poses.front().isApprox(beside));
+  EXPECT_DOUBLE_EQ(joined.poses[1].x(), 2.0);
+  EXPECT_DOUBLE_EQ(joined.poses[1].y(), 0.0);
+  EXPECT_DOUBLE_EQ(joined.poses.back().x(), 30.0);
+
   // Explore keeps binding both ends to the graph.
   auto explore = request(ObjectiveKind::kExplore);
   explore.goal.pose = StateVec(3.0, 0.0, 0.0, 0.0);

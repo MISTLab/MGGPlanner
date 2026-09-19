@@ -142,6 +142,7 @@ class PlannerNode : public rclcpp::Node {
     Eigen::Vector3d center_offset = Eigen::Vector3d::Zero();
     mgg::RobotType robot_type = mgg::RobotType::kGroundRobot;
     double max_step_height = 0.0;
+    double max_drop_height = 0.0;
     double max_inclination = 0.0;
     double graph_to_base = 0.0;
     double max_provisional_ground_prefix = 0.0;

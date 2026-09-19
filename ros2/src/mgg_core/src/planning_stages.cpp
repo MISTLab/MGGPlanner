@@ -286,22 +286,26 @@ RouteCorridor TopologicalGoalPlanner::plan(
   // corridor's first segment is the unvalidated connector that the rolling
   // grid stage checks. Beyond the radius the refusal stands: a lone home
   // landmark must not become a one-segment route from anywhere.
+  // Navigate and ReturnHome share the connector: a Navigate whose start was
+  // off the graph used to abandon the graph altogether and hand a straight
+  // line to the bounded grid stage, so a 60 m goal down a bending street was
+  // planned as a straight line and refined window by window along it
+  // (benchbot, 2026-09-18). Explore stays bound to the graph at both ends.
   bool home_connector = false;
   if (!graph.getNearestVertexInRange(&current, goal_vertex_tolerance_,
                                      &source)) {
-    if (request.objective == ObjectiveKind::kNavigate) {
+    if (request.objective != ObjectiveKind::kExplore &&
+        return_home_connector_radius_ > goal_vertex_tolerance_ &&
+        graph.getNearestVertexInRange(&current, return_home_connector_radius_,
+                                      &source)) {
+      home_connector = true;
+    } else if (request.objective == ObjectiveKind::kNavigate) {
       result.status = PlanningStatus::kSucceeded;
       result.reason.clear();
       // Bootstrap an unvalidated global corridor from the live pose. The
       // rolling grid stage exposes and checks only its bounded first window.
       result.poses = {current, goal};
       return result;
-    }
-    if (request.objective == ObjectiveKind::kReturnHome &&
-        return_home_connector_radius_ > goal_vertex_tolerance_ &&
-        graph.getNearestVertexInRange(&current, return_home_connector_radius_,
-                                      &source)) {
-      home_connector = true;
     } else {
       char reason[192];
       std::snprintf(reason, sizeof(reason),
@@ -408,6 +412,7 @@ RouteCorridor TopologicalGoalPlanner::plan(
         !result.poses.back().head<3>().isApprox(goal.head<3>())) {
       result.poses.push_back(goal);
     }
+    if (home_connector) result.poses.insert(result.poses.begin(), current);
     result.status = PlanningStatus::kSucceeded;
     result.partial = false;
     result.reason.clear();

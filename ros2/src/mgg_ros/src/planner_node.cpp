@@ -1795,6 +1795,21 @@ mgg::GridProjectionStatus PlannerNode::objectiveFootprintTerrainStatus(
   // footprint_step_tolerance_m_.
   const double footprint_step_limit =
       planning_params_.max_step_height + footprint_step_tolerance_m_ + 1e-6;
+  // A drop is not a climb: a tracked or wheeled platform drives down a kerb
+  // it could not climb. Ground below the nominal plane is compatible up to
+  // the drop limit; ground above it stays bound by the step limit. Measured
+  // on Bistro (2026-09-18): curbstones stand 0.16 to 0.19 m above the gutter,
+  // robots were pushed onto sidewalks by the local controller, and every
+  // route back down was refused as `known drop 0.17 to 0.21 m`.
+  const double footprint_drop_limit =
+      std::max(planning_params_.max_drop_height,
+               planning_params_.max_step_height) +
+      footprint_step_tolerance_m_ + 1e-6;
+  const auto within_footprint_limits = [footprint_step_limit,
+                                        footprint_drop_limit](double delta) {
+    return delta >= 0.0 ? delta <= footprint_step_limit
+                        : -delta <= footprint_drop_limit;
+  };
   double first_unsupported_delta = 0.0;
 
   // getRayStatus(..., false) deliberately treats unobserved cells as
@@ -1836,8 +1851,7 @@ mgg::GridProjectionStatus PlannerNode::objectiveFootprintTerrainStatus(
         return mgg::GridProjectionStatus::kBodyUnknown;
       }
       const double delta = hit.z() - nominal_ground_z;
-      const bool center_compatible =
-          std::abs(delta) <= footprint_step_limit;
+      const bool center_compatible = within_footprint_limits(delta);
       if (!center_compatible && !needs_connected_support) {
         first_unsupported_delta = delta;
         needs_connected_support = true;
@@ -1889,18 +1903,22 @@ mgg::GridProjectionStatus PlannerNode::objectiveFootprintTerrainStatus(
       }
     }
     if (std::any_of(ground_hits.begin(), ground_hits.end(),
-                    [nominal_ground_z, footprint_step_limit](const FootprintGroundHit& hit) {
+                    [nominal_ground_z, &within_footprint_limits](
+                        const FootprintGroundHit& hit) {
                       return !hit.connected &&
-                             std::abs(hit.z - nominal_ground_z) >
-                                 footprint_step_limit;
+                             !within_footprint_limits(hit.z - nominal_ground_z);
                     })) {
       char detail[160];
+      const bool rise = first_unsupported_delta > 0.0;
       std::snprintf(detail, sizeof(detail),
-                    "known %s %.3f m exceeds step limit %.3f m plus %.3f m "
+                    "known %s %.3f m exceeds %s limit %.3f m plus %.3f m "
                     "measurement tolerance",
-                    first_unsupported_delta > 0.0 ? "rise" : "drop",
+                    rise ? "rise" : "drop",
                     std::abs(first_unsupported_delta),
-                    planning_params_.max_step_height,
+                    rise ? "step" : "drop",
+                    rise ? planning_params_.max_step_height
+                         : std::max(planning_params_.max_drop_height,
+                                    planning_params_.max_step_height),
                     footprint_step_tolerance_m_);
       record_failure(detail);
       return mgg::GridProjectionStatus::kNoGround;
@@ -2123,21 +2141,6 @@ void PlannerNode::updateGlobalGraph() {
   std::size_t drained = 0;
   while (!pending_global_breadcrumbs_.empty() &&
          drained < pending_global_drain_max_samples_) {
-    const PendingGlobalBreadcrumb& pending = pending_global_breadcrumbs_.front();
-    mgg::StateVec state = pending.state;
-    if (!projectStateToDrivingHeight(state)) {
-      global_backbone_blocked_on_map_ = true;
-      global_backbone_blocked_map_revision_ = map_revision_;
-      if (!global_backbone_blockage_reported_) {
-        RCLCPP_WARN(get_logger(),
-                    "global trajectory blocked on no ground at (%.2f, %.2f); "
-                    "retaining %zu chronological breadcrumb(s)",
-                    state.x(), state.y(), pending_global_breadcrumbs_.size());
-        global_backbone_blockage_reported_ = true;
-      }
-      break;
-    }
-
     auto parent_it =
         global_graph_->vertices_map_.find(last_own_global_vertex_id_);
     mgg::Vertex* parent_vertex =
@@ -2152,24 +2155,63 @@ void PlannerNode::updateGlobalGraph() {
                    global_backbone_history_lost_reason_.c_str());
       return;
     }
-
     const Eigen::Vector3d origin = parent_vertex->state.head<3>();
-    const Eigen::Vector3d here = state.head<3>();
+
+    // The chain admits the oldest breadcrumb whose ground is mapped and whose
+    // edge from the last vertex the map allows. A breadcrumb that stays
+    // unmappable (the robot's own footprint at a keyframe, a neighbour's
+    // masked footprint, a kerb the map measures over the limit) used to hold
+    // the whole queue: Return Home then found no vertex within reach of the
+    // robot and refused at once, even 60 m down a clear road (Spot, benchbot,
+    // 2026-09-18). Breadcrumbs before the admitted one are dropped; the edge
+    // that bridges them passed the same projected-edge checks as any other.
+    std::size_t admitted_index = pending_global_breadcrumbs_.size();
+    mgg::StateVec state;
     double edge_distance = 0.0;
-    const char* blocked_reason = "unknown";
-    if (!admitEdge(origin, here, edge_distance, blocked_reason)) {
+    const char* blocked_reason = "no ground";
+    Eigen::Vector3d blocked_at = Eigen::Vector3d::Zero();
+    for (std::size_t index = 0; index < pending_global_breadcrumbs_.size();
+         ++index) {
+      mgg::StateVec candidate = pending_global_breadcrumbs_[index].state;
+      if (!projectStateToDrivingHeight(candidate)) {
+        if (index == 0) blocked_at = candidate.head<3>();
+        continue;
+      }
+      const char* reason = "unknown";
+      double distance = 0.0;
+      if (!admitEdge(origin, candidate.head<3>(), distance, reason)) {
+        if (index == 0) {
+          blocked_reason = reason;
+          blocked_at = candidate.head<3>();
+        }
+        continue;
+      }
+      admitted_index = index;
+      state = candidate;
+      edge_distance = distance;
+      break;
+    }
+    if (admitted_index == pending_global_breadcrumbs_.size()) {
       global_backbone_blocked_on_map_ = true;
       global_backbone_blocked_map_revision_ = map_revision_;
       if (!global_backbone_blockage_reported_) {
         RCLCPP_WARN(get_logger(),
                     "global trajectory blocked on %s at (%.2f, %.2f); "
                     "retaining %zu chronological breadcrumb(s)",
-                    blocked_reason, here.x(), here.y(),
+                    blocked_reason, blocked_at.x(), blocked_at.y(),
                     pending_global_breadcrumbs_.size());
         global_backbone_blockage_reported_ = true;
       }
       break;
     }
+    for (std::size_t skipped = 0; skipped < admitted_index; ++skipped) {
+      pending_global_length_m_ = std::max(
+          0.0, pending_global_length_m_ -
+                   pending_global_breadcrumbs_.front().path_length);
+      pending_global_breadcrumbs_.pop_front();
+    }
+    const PendingGlobalBreadcrumb& pending = pending_global_breadcrumbs_.front();
+    const Eigen::Vector3d here = state.head<3>();
 
     // Repeated passes should reuse an owned vertex rather than grow the graph
     // forever. The chronological predecessor-to-head transition has already
@@ -2378,6 +2420,8 @@ PlannerNode::IndexedQueryContext PlannerNode::indexedQueryContext() const {
   context.center_offset = robot_params_.center_offset;
   context.robot_type = robot_params_.type;
   context.max_step_height = planning_params_.max_step_height;
+  context.max_drop_height = std::max(planning_params_.max_drop_height,
+                                     planning_params_.max_step_height);
   context.max_inclination = planning_params_.max_inclination;
   context.graph_to_base =
       planning_params_.max_ground_height - robot_params_.size.z() / 2.0;
@@ -2495,6 +2539,9 @@ bool PlannerNode::queryIndexedMap(mgg::FeasiblePath& path,
                context.component_from_navigation.matrix(), 1e-9);
   };
   constexpr std::size_t kMaxIndexedMapSamples = 4096;
+  // The least XY progress a validated prefix must make to be emitted as a
+  // section; anything shorter is refused with the rejection that cut it.
+  constexpr double kMinSectionProgressM = 0.3;
 
   while (true) {
     if (path.poses.size() >= kMaxIndexedMapSamples) {
@@ -2536,7 +2583,7 @@ bool PlannerNode::queryIndexedMap(mgg::FeasiblePath& path,
     request->body_size.y = component_body.y();
     request->body_size.z = component_body.z();
     request->max_step_m = context.max_step_height;
-    request->max_drop_m = context.max_step_height;
+    request->max_drop_m = context.max_drop_height;
     request->stop_at_unknown = !context.observed_ground_body_evidence;
 
     std::vector<mgg::StateVec> route;
@@ -3011,6 +3058,17 @@ bool PlannerNode::queryIndexedMap(mgg::FeasiblePath& path,
           (route_failure->unmeasured_ahead || hazard_standoff_prefix);
       if ((!prefix_truncation_allowed && !continuable) || !prefix_end ||
           !path.speed_limits.empty()) {
+        return fail(mgg::PlanningStatus::kBlocked, route_failure->reason);
+      }
+      // A prefix that makes no progress is not a section. Emitting it as a
+      // partial success sent the robot a route that ended where it stood,
+      // the controller completed it at once, the continuation found the
+      // robot short of the section goal and replanned, and the fresh plan
+      // emitted the same empty prefix: three replans a second with the
+      // robot standing on a kerb it could not descend (robot_0, benchbot,
+      // 2026-09-18). Refusing with the rejection reason lets the caller
+      // route around the marked hazard or report it.
+      if (sample_xy_progress[*prefix_end] < kMinSectionProgressM) {
         return fail(mgg::PlanningStatus::kBlocked, route_failure->reason);
       }
       accepted_count = *prefix_end + 1;
