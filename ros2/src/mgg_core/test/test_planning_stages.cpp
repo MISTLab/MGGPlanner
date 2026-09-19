@@ -172,52 +172,6 @@ TEST(PlanningStages, CurrentPoseMustResolveToTheActiveGraph) {
             "(30.00, 0.00, 0.00)");
 }
 
-TEST(PlanningStages, ReturnHomeConnectsFromInsideTheConnectorRadius) {
-  // The robot stands 2 m beside the chain (past the 0.25 m tolerance, inside
-  // the 10 m connector radius): the corridor starts at the live pose, joins
-  // the nearest vertex and follows the graph to the home landmark.
-  Chain chain;
-  TopologicalGoalPlanner planner("component-a", 12, 34, 0.25);
-  auto home = request(ObjectiveKind::kReturnHome);
-  home.goal.pose = StateVec::Zero();
-  const StateVec beside(2.0, 2.0, 0.0, 0.0);
-  const auto route = planner.plan(chain.graph, beside, home);
-  ASSERT_EQ(route.status, PlanningStatus::kSucceeded);
-  ASSERT_EQ(route.poses.size(), 4u);
-  EXPECT_TRUE(route.poses.front().isApprox(beside));
-  EXPECT_DOUBLE_EQ(route.poses[1].x(), 2.0);
-  EXPECT_DOUBLE_EQ(route.poses[1].y(), 0.0);
-  EXPECT_DOUBLE_EQ(route.poses.back().x(), 0.0);
-  EXPECT_FALSE(route.partial);
-
-  // A zero connector radius restores the strict binding.
-  TopologicalGoalPlanner strict("component-a", 12, 34, 0.25, 0.0, 0.0);
-  const auto refused = strict.plan(chain.graph, beside, home);
-  EXPECT_EQ(refused.status, PlanningStatus::kUnreachable);
-  EXPECT_EQ(refused.reason,
-            "current pose is outside the graph tolerance 0.25 m at "
-            "(2.00, 2.00, 0.00)");
-
-  // A far Navigate from beside the chain also joins the graph first: the
-  // corridor is live pose, nearest vertex, the graph towards the goal, and
-  // the exact goal, not a straight line handed to the grid stage.
-  auto far = request(ObjectiveKind::kNavigate);
-  far.goal.pose = StateVec(30.0, 0.0, 0.0, 0.0);
-  const auto joined = planner.plan(chain.graph, beside, far);
-  ASSERT_EQ(joined.status, PlanningStatus::kSucceeded);
-  ASSERT_GE(joined.poses.size(), 3u);
-  EXPECT_TRUE(joined.poses.front().isApprox(beside));
-  EXPECT_DOUBLE_EQ(joined.poses[1].x(), 2.0);
-  EXPECT_DOUBLE_EQ(joined.poses[1].y(), 0.0);
-  EXPECT_DOUBLE_EQ(joined.poses.back().x(), 30.0);
-
-  // Explore keeps binding both ends to the graph.
-  auto explore = request(ObjectiveKind::kExplore);
-  explore.goal.pose = StateVec(3.0, 0.0, 0.0, 0.0);
-  EXPECT_EQ(planner.plan(chain.graph, beside, explore).status,
-            PlanningStatus::kUnreachable);
-}
-
 TEST(PlanningStages, NonfiniteGoalIsRejectedBeforeGraphLookup) {
   Chain chain;
   TopologicalGoalPlanner planner("component-a", 12, 34, 0.25);

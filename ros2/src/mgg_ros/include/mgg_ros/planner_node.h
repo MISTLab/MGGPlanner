@@ -46,7 +46,6 @@
 
 #include "mgg_core/geofence_manager.h"
 #include "mgg_core/gain.h"
-#include "mgg_core/global_grid_planner.h"
 #include "mgg_core/graph_expansion.h"
 #include "mgg_core/graph_manager.h"
 #include "mgg_core/graph_merge.h"
@@ -107,22 +106,6 @@ class PlannerNode : public rclcpp::Node {
     double goal_tolerance = 1.0;
     double minimum_partial_progress = 0.0;
   };
-  /// Parameters of the full-map traversability raster for this platform:
-  /// the configured cell size, the body radius and the step and body bands.
-  mgg::RasterParams globalRasterParams() const;
-  /// Limits of the full-map grid planner: the platform's step and drop
-  /// limits, the driving offset, and the configured budget and deadline.
-  mgg::GlobalGridPlannerLimits globalRasterLimits() const;
-  /// The global stage of Navigate and ReturnHome over the MOLA product: a
-  /// full-map 2.5D A* from the driving-height `current` pose to the goal,
-  /// avoiding the live transient discs and preferring unmarked corridors. On
-  /// success `corridor` holds the raster route, one pose per cell, with the
-  /// first pose at `current` and the last at `goal`. On failure the corridor
-  /// is left untouched and `failure` names the reason.
-  bool planGlobalRasterCorridor(
-      const std::shared_ptr<const mgg::TraversabilityRaster>& raster,
-      const mgg::StateVec& current, const mgg::StateVec& goal,
-      mgg::RouteCorridor& corridor, std::string& failure) const;
   /// Slices a complete topological route into the next bounded local section
   /// and, when the route continues past it, prepares the continuation token.
   /// `corridor` carries the full route in and the local section out.
@@ -159,7 +142,6 @@ class PlannerNode : public rclcpp::Node {
     Eigen::Vector3d center_offset = Eigen::Vector3d::Zero();
     mgg::RobotType robot_type = mgg::RobotType::kGroundRobot;
     double max_step_height = 0.0;
-    double max_drop_height = 0.0;
     double max_inclination = 0.0;
     double graph_to_base = 0.0;
     double max_provisional_ground_prefix = 0.0;
@@ -214,11 +196,6 @@ class PlannerNode : public rclcpp::Node {
                                    bool preserve_xy = false,
                                    bool accept_ground_above_sample = false) const;
   bool resolveNavigateGoalDrivingHeight(mgg::StateVec& state) const;
-  /// Driving height from the mapped ground around `state` when its own
-  /// column is unobserved: the median of the footprint's ground hits, if
-  /// enough cells report ground within one step of each other. False when
-  /// the footprint is mostly unknown or the hits disagree.
-  bool footprintDrivingHeight(mgg::StateVec& state) const;
   mgg::StateVec physicalAnchorAtDrivingHeight(
       const mgg::StateVec& base_pose) const;
   /// `physical_anchor`: odometry proves the robot stands on `anchor`, so the
@@ -307,17 +284,6 @@ class PlannerNode : public rclcpp::Node {
   double objective_route_horizon_m_ = 8.0;
   double objective_route_progress_tolerance_m_ = 1.0;
   std::size_t objective_route_max_poses_ = 4096;
-  /// Full-map raster stage of Navigate and ReturnHome on the MOLA backend:
-  /// the raster cell size, the A* budget, deadline and blocked-edge penalty,
-  /// and the cost multiples of unobserved cells and of cells within the body
-  /// radius of an obstacle (zero refuses them). The topological stage
-  /// remains the fallback.
-  double global_raster_cell_m_ = 0.5;
-  std::size_t global_raster_max_expansions_ = 200000;
-  std::chrono::milliseconds global_raster_timeout_{500};
-  double global_raster_blocked_penalty_m_ = 20.0;
-  double global_raster_unknown_cost_factor_ = 3.0;
-  double global_raster_inflation_cost_factor_ = 3.0;
   /// Corridors whose bounded refinement or execution has just been rejected.
   /// Bounded and expiring; it only steers corridor choice and never relaxes a
   /// terrain, body, step, drop or geofence veto.

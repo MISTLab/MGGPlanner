@@ -442,53 +442,6 @@ PlannerNode::PlannerNode(const rclcpp::NodeOptions& options)
   objective_route_max_poses_ = static_cast<std::size_t>(std::clamp(
       declareOrGet<std::int64_t>(this, "objective_route_max_poses", 4096),
       std::int64_t{2}, std::int64_t{65536}));
-  // The full-map raster stage. Its cell size is the spacing of the global
-  // route's waypoints; the sections, refinement and validation behind it
-  // keep their own resolutions.
-  const double requested_raster_cell =
-      declareOrGet<double>(this, "global_raster_cell_m", global_raster_cell_m_);
-  global_raster_cell_m_ = std::isfinite(requested_raster_cell)
-                              ? std::clamp(requested_raster_cell, 0.1, 5.0)
-                              : 0.5;
-  global_raster_max_expansions_ = static_cast<std::size_t>(std::clamp(
-      declareOrGet<std::int64_t>(this, "global_raster_max_expansions",
-                                 static_cast<std::int64_t>(
-                                     global_raster_max_expansions_)),
-      std::int64_t{1}, std::int64_t{16777216}));
-  global_raster_timeout_ = std::chrono::milliseconds(std::clamp(
-      declareOrGet<std::int64_t>(this, "global_raster_timeout_ms",
-                                 static_cast<std::int64_t>(
-                                     global_raster_timeout_.count())),
-      std::int64_t{1}, std::int64_t{10000}));
-  const double requested_blocked_penalty = declareOrGet<double>(
-      this, "global_raster_blocked_penalty_m", global_raster_blocked_penalty_m_);
-  global_raster_blocked_penalty_m_ =
-      std::isfinite(requested_blocked_penalty)
-          ? std::clamp(requested_blocked_penalty, 0.0, 1000.0)
-          : 20.0;
-  // Zero refuses unobserved cells; one or more admits them at that multiple
-  // of their length. A lidar map is banded with unobserved ground between
-  // rings beyond a few metres and most goals lie past the observed map, so
-  // the default admits them and lets the rolling refinement judge them.
-  const double requested_unknown_factor = declareOrGet<double>(
-      this, "global_raster_unknown_cost_factor",
-      global_raster_unknown_cost_factor_);
-  global_raster_unknown_cost_factor_ =
-      std::isfinite(requested_unknown_factor) && requested_unknown_factor > 0.0
-          ? std::clamp(requested_unknown_factor, 1.0, 100.0)
-          : 0.0;
-  // Cells within the body radius of an obstacle are crossed at this multiple
-  // rather than refused: whether the body fits is the refinement's exact
-  // footprint question, and a robot parked beside a wall or a goal placed
-  // beside one must keep its route. Zero refuses them.
-  const double requested_inflation_factor = declareOrGet<double>(
-      this, "global_raster_inflation_cost_factor",
-      global_raster_inflation_cost_factor_);
-  global_raster_inflation_cost_factor_ =
-      std::isfinite(requested_inflation_factor) &&
-              requested_inflation_factor > 0.0
-          ? std::clamp(requested_inflation_factor, 1.0, 100.0)
-          : 0.0;
   geofence_ = std::make_unique<mgg::GeofenceManager>();
   local_graph_ = std::make_shared<mgg::GraphManager>();
   global_graph_ = std::make_shared<mgg::GraphManager>();
@@ -1462,57 +1415,6 @@ bool PlannerNode::projectStateToDrivingHeight(mgg::StateVec& state,
   return state.allFinite();
 }
 
-bool PlannerNode::footprintDrivingHeight(mgg::StateVec& state) const {
-  if (robot_params_.type != mgg::RobotType::kGroundRobot || !ground_ ||
-      !map_ || !state.allFinite() ||
-      !std::isfinite(planning_params_.max_ground_height) ||
-      !std::isfinite(planning_params_.max_step_height) ||
-      !std::isfinite(ground_->max_projection_length) ||
-      ground_->max_projection_length <= 0.0) {
-    return false;
-  }
-  const Eigen::Vector3d body = robot_params_.getPlanningSize();
-  const double radius = 0.5 * body.head<2>().norm();
-  const Eigen::Vector2d center =
-      state.head<2>() + robot_params_.center_offset.head<2>();
-  constexpr int kMaxFootprintSamples = 4096;
-  std::vector<mgg::XYCellCenter> cells;
-  if (!std::isfinite(radius) || radius <= 0.0 ||
-      !map_->getCircleIntersectingXYCellCenters(center, radius,
-                                                kMaxFootprintSamples, cells) ||
-      cells.empty()) {
-    return false;
-  }
-  // Cast from well above any plausible driving plane so a pose whose height
-  // is only provisional still finds the surface below it.
-  const double start_z = state.z() + ground_->max_projection_length;
-  std::vector<double> hits;
-  hits.reserve(cells.size());
-  for (const mgg::XYCellCenter& cell : cells) {
-    const Eigen::Vector3d start(cell.center.x(), cell.center.y(), start_z);
-    const Eigen::Vector3d end =
-        start - Eigen::Vector3d(0.0, 0.0, 2.0 * ground_->max_projection_length);
-    Eigen::Vector3d hit;
-    if (map_->getGroundRayStatus(start, end, false, hit) ==
-            mgg::VoxelStatus::kOccupied &&
-        hit.allFinite()) {
-      hits.push_back(hit.z());
-    }
-  }
-  // Half the footprint must report ground, and the hits must lie within one
-  // step of each other: a real rise or drop inside the footprint is not
-  // averaged away, it is left for the footprint check to refuse.
-  if (hits.size() * 2 < cells.size()) return false;
-  std::sort(hits.begin(), hits.end());
-  const double spread = hits.back() - hits.front();
-  if (spread > planning_params_.max_step_height + footprint_step_tolerance_m_) {
-    return false;
-  }
-  const double ground = hits[hits.size() / 2];
-  state[2] = ground + planning_params_.max_ground_height;
-  return state.allFinite();
-}
-
 bool PlannerNode::resolveNavigateGoalDrivingHeight(
     mgg::StateVec& state) const {
   if (robot_params_.type != mgg::RobotType::kGroundRobot) {
@@ -1842,21 +1744,6 @@ mgg::GridProjectionStatus PlannerNode::objectiveFootprintTerrainStatus(
   // footprint_step_tolerance_m_.
   const double footprint_step_limit =
       planning_params_.max_step_height + footprint_step_tolerance_m_ + 1e-6;
-  // A drop is not a climb: a tracked or wheeled platform drives down a kerb
-  // it could not climb. Ground below the nominal plane is compatible up to
-  // the drop limit; ground above it stays bound by the step limit. Measured
-  // on Bistro (2026-09-18): curbstones stand 0.16 to 0.19 m above the gutter,
-  // robots were pushed onto sidewalks by the local controller, and every
-  // route back down was refused as `known drop 0.17 to 0.21 m`.
-  const double footprint_drop_limit =
-      std::max(planning_params_.max_drop_height,
-               planning_params_.max_step_height) +
-      footprint_step_tolerance_m_ + 1e-6;
-  const auto within_footprint_limits = [footprint_step_limit,
-                                        footprint_drop_limit](double delta) {
-    return delta >= 0.0 ? delta <= footprint_step_limit
-                        : -delta <= footprint_drop_limit;
-  };
   double first_unsupported_delta = 0.0;
 
   // getRayStatus(..., false) deliberately treats unobserved cells as
@@ -1898,7 +1785,8 @@ mgg::GridProjectionStatus PlannerNode::objectiveFootprintTerrainStatus(
         return mgg::GridProjectionStatus::kBodyUnknown;
       }
       const double delta = hit.z() - nominal_ground_z;
-      const bool center_compatible = within_footprint_limits(delta);
+      const bool center_compatible =
+          std::abs(delta) <= footprint_step_limit;
       if (!center_compatible && !needs_connected_support) {
         first_unsupported_delta = delta;
         needs_connected_support = true;
@@ -1950,22 +1838,18 @@ mgg::GridProjectionStatus PlannerNode::objectiveFootprintTerrainStatus(
       }
     }
     if (std::any_of(ground_hits.begin(), ground_hits.end(),
-                    [nominal_ground_z, &within_footprint_limits](
-                        const FootprintGroundHit& hit) {
+                    [nominal_ground_z, footprint_step_limit](const FootprintGroundHit& hit) {
                       return !hit.connected &&
-                             !within_footprint_limits(hit.z - nominal_ground_z);
+                             std::abs(hit.z - nominal_ground_z) >
+                                 footprint_step_limit;
                     })) {
       char detail[160];
-      const bool rise = first_unsupported_delta > 0.0;
       std::snprintf(detail, sizeof(detail),
-                    "known %s %.3f m exceeds %s limit %.3f m plus %.3f m "
+                    "known %s %.3f m exceeds step limit %.3f m plus %.3f m "
                     "measurement tolerance",
-                    rise ? "rise" : "drop",
+                    first_unsupported_delta > 0.0 ? "rise" : "drop",
                     std::abs(first_unsupported_delta),
-                    rise ? "step" : "drop",
-                    rise ? planning_params_.max_step_height
-                         : std::max(planning_params_.max_drop_height,
-                                    planning_params_.max_step_height),
+                    planning_params_.max_step_height,
                     footprint_step_tolerance_m_);
       record_failure(detail);
       return mgg::GridProjectionStatus::kNoGround;
@@ -2188,6 +2072,21 @@ void PlannerNode::updateGlobalGraph() {
   std::size_t drained = 0;
   while (!pending_global_breadcrumbs_.empty() &&
          drained < pending_global_drain_max_samples_) {
+    const PendingGlobalBreadcrumb& pending = pending_global_breadcrumbs_.front();
+    mgg::StateVec state = pending.state;
+    if (!projectStateToDrivingHeight(state)) {
+      global_backbone_blocked_on_map_ = true;
+      global_backbone_blocked_map_revision_ = map_revision_;
+      if (!global_backbone_blockage_reported_) {
+        RCLCPP_WARN(get_logger(),
+                    "global trajectory blocked on no ground at (%.2f, %.2f); "
+                    "retaining %zu chronological breadcrumb(s)",
+                    state.x(), state.y(), pending_global_breadcrumbs_.size());
+        global_backbone_blockage_reported_ = true;
+      }
+      break;
+    }
+
     auto parent_it =
         global_graph_->vertices_map_.find(last_own_global_vertex_id_);
     mgg::Vertex* parent_vertex =
@@ -2202,63 +2101,24 @@ void PlannerNode::updateGlobalGraph() {
                    global_backbone_history_lost_reason_.c_str());
       return;
     }
-    const Eigen::Vector3d origin = parent_vertex->state.head<3>();
 
-    // The chain admits the oldest breadcrumb whose ground is mapped and whose
-    // edge from the last vertex the map allows. A breadcrumb that stays
-    // unmappable (the robot's own footprint at a keyframe, a neighbour's
-    // masked footprint, a kerb the map measures over the limit) used to hold
-    // the whole queue: Return Home then found no vertex within reach of the
-    // robot and refused at once, even 60 m down a clear road (Spot, benchbot,
-    // 2026-09-18). Breadcrumbs before the admitted one are dropped; the edge
-    // that bridges them passed the same projected-edge checks as any other.
-    std::size_t admitted_index = pending_global_breadcrumbs_.size();
-    mgg::StateVec state;
+    const Eigen::Vector3d origin = parent_vertex->state.head<3>();
+    const Eigen::Vector3d here = state.head<3>();
     double edge_distance = 0.0;
-    const char* blocked_reason = "no ground";
-    Eigen::Vector3d blocked_at = Eigen::Vector3d::Zero();
-    for (std::size_t index = 0; index < pending_global_breadcrumbs_.size();
-         ++index) {
-      mgg::StateVec candidate = pending_global_breadcrumbs_[index].state;
-      if (!projectStateToDrivingHeight(candidate)) {
-        if (index == 0) blocked_at = candidate.head<3>();
-        continue;
-      }
-      const char* reason = "unknown";
-      double distance = 0.0;
-      if (!admitEdge(origin, candidate.head<3>(), distance, reason)) {
-        if (index == 0) {
-          blocked_reason = reason;
-          blocked_at = candidate.head<3>();
-        }
-        continue;
-      }
-      admitted_index = index;
-      state = candidate;
-      edge_distance = distance;
-      break;
-    }
-    if (admitted_index == pending_global_breadcrumbs_.size()) {
+    const char* blocked_reason = "unknown";
+    if (!admitEdge(origin, here, edge_distance, blocked_reason)) {
       global_backbone_blocked_on_map_ = true;
       global_backbone_blocked_map_revision_ = map_revision_;
       if (!global_backbone_blockage_reported_) {
         RCLCPP_WARN(get_logger(),
                     "global trajectory blocked on %s at (%.2f, %.2f); "
                     "retaining %zu chronological breadcrumb(s)",
-                    blocked_reason, blocked_at.x(), blocked_at.y(),
+                    blocked_reason, here.x(), here.y(),
                     pending_global_breadcrumbs_.size());
         global_backbone_blockage_reported_ = true;
       }
       break;
     }
-    for (std::size_t skipped = 0; skipped < admitted_index; ++skipped) {
-      pending_global_length_m_ = std::max(
-          0.0, pending_global_length_m_ -
-                   pending_global_breadcrumbs_.front().path_length);
-      pending_global_breadcrumbs_.pop_front();
-    }
-    const PendingGlobalBreadcrumb& pending = pending_global_breadcrumbs_.front();
-    const Eigen::Vector3d here = state.head<3>();
 
     // Repeated passes should reuse an owned vertex rather than grow the graph
     // forever. The chronological predecessor-to-head transition has already
@@ -2467,8 +2327,6 @@ PlannerNode::IndexedQueryContext PlannerNode::indexedQueryContext() const {
   context.center_offset = robot_params_.center_offset;
   context.robot_type = robot_params_.type;
   context.max_step_height = planning_params_.max_step_height;
-  context.max_drop_height = std::max(planning_params_.max_drop_height,
-                                     planning_params_.max_step_height);
   context.max_inclination = planning_params_.max_inclination;
   context.graph_to_base =
       planning_params_.max_ground_height - robot_params_.size.z() / 2.0;
@@ -2586,9 +2444,6 @@ bool PlannerNode::queryIndexedMap(mgg::FeasiblePath& path,
                context.component_from_navigation.matrix(), 1e-9);
   };
   constexpr std::size_t kMaxIndexedMapSamples = 4096;
-  // The least XY progress a validated prefix must make to be emitted as a
-  // section; anything shorter is refused with the rejection that cut it.
-  constexpr double kMinSectionProgressM = 0.3;
 
   while (true) {
     if (path.poses.size() >= kMaxIndexedMapSamples) {
@@ -2630,7 +2485,7 @@ bool PlannerNode::queryIndexedMap(mgg::FeasiblePath& path,
     request->body_size.y = component_body.y();
     request->body_size.z = component_body.z();
     request->max_step_m = context.max_step_height;
-    request->max_drop_m = context.max_drop_height;
+    request->max_drop_m = context.max_step_height;
     request->stop_at_unknown = !context.observed_ground_body_evidence;
 
     std::vector<mgg::StateVec> route;
@@ -2913,14 +2768,9 @@ bool PlannerNode::queryIndexedMap(mgg::FeasiblePath& path,
           const std::string reason = "indexed map route is occupied or unknown";
           return occupied ? hazard(reason) : unmeasured(reason);
         }
-        // A sample the server could not fit terrain under (both ground and
-        // roughness missing) has no clearance either; whether that gap is a
-        // bounded connector or the horizon is the ground logic's question
-        // below, not a hazard: between two lidar rings the ground is
-        // unobserved while the body volume above it is ray-proven free.
         if (context.robot_type != mgg::RobotType::kAerialRobot &&
             !std::isfinite(response->clearance[i]) &&
-            !unknown_clearance_allowed && !paired_missing_terrain) {
+            !unknown_clearance_allowed) {
           return hazard(unsupported("clearance is unavailable"));
         }
         if (context.robot_type != mgg::RobotType::kAerialRobot &&
@@ -3110,17 +2960,6 @@ bool PlannerNode::queryIndexedMap(mgg::FeasiblePath& path,
           (route_failure->unmeasured_ahead || hazard_standoff_prefix);
       if ((!prefix_truncation_allowed && !continuable) || !prefix_end ||
           !path.speed_limits.empty()) {
-        return fail(mgg::PlanningStatus::kBlocked, route_failure->reason);
-      }
-      // A prefix that makes no progress is not a section. Emitting it as a
-      // partial success sent the robot a route that ended where it stood,
-      // the controller completed it at once, the continuation found the
-      // robot short of the section goal and replanned, and the fresh plan
-      // emitted the same empty prefix: three replans a second with the
-      // robot standing on a kerb it could not descend (robot_0, benchbot,
-      // 2026-09-18). Refusing with the rejection reason lets the caller
-      // route around the marked hazard or report it.
-      if (sample_xy_progress[*prefix_end] < kMinSectionProgressM) {
         return fail(mgg::PlanningStatus::kBlocked, route_failure->reason);
       }
       accepted_count = *prefix_end + 1;
@@ -3414,16 +3253,7 @@ mgg::FeasiblePath PlannerNode::refineCorridor(
               corridor.request.objective != mgg::ObjectiveKind::kNavigate) {
             state[2] = current_anchor[2];
           } else {
-            // The pose's own column is unobserved. Checking its footprint at
-            // an unprojected height reported the flat road around a
-            // neighbour's masked footprint as `known rise 0.30 m` (the
-            // requested navigation height minus the driving offset, against
-            // the mapped road) and refused the goal seven runs in a row on
-            // benchbot, 2026-09-18. Take the driving height from the mapped
-            // ground around the pose when that ground is flat; the height
-            // stays provisional and the centre cell stays unknown.
             provisional_unknown_height = true;
-            (void)footprintDrivingHeight(state);
           }
           physical_anchor_fallback = samePosition(state, current_anchor);
         } else {
@@ -4115,142 +3945,6 @@ void PlannerNode::blockRouteNear(const std::vector<mgg::StateVec>& route,
   blockCorridorSegment(route[best - 1], route[best]);
 }
 
-mgg::RasterParams PlannerNode::globalRasterParams() const {
-  mgg::RasterParams params;
-  params.cell_size_m = global_raster_cell_m_;
-  const Eigen::Vector3d body = robot_params_.getPlanningSize();
-  params.body_radius_m = 0.5 * body.head<2>().norm();
-  // Relief inside one cell up to the climb limit is terrain; between the
-  // climb and drop limits it is a step the raster marks like an inflated
-  // cell (crossed at a cost, the refinement's footprint checks judging the
-  // direction): a kerb whose lip and gutter share a cell must neither be a
-  // wall in both directions, sealing every sidewalk-to-road return the drop
-  // limit allows, nor free, which sent routes along kerb lines the footprint
-  // check then refused (benchbot, 2026-09-19).
-  params.max_step_height_m = std::max(0.0, planning_params_.max_step_height);
-  params.max_drop_height_m =
-      std::max({0.0, planning_params_.max_step_height,
-                planning_params_.max_drop_height});
-  // The planning box is centred max_ground_height above the ground, plus the
-  // centre offset, so its top is the height below which matter is an
-  // obstacle and above which the robot passes beneath.
-  params.body_height_m =
-      std::max(params.max_step_height_m,
-               planning_params_.max_ground_height + 0.5 * body.z() +
-                   robot_params_.center_offset.z());
-  // Clearance evidence stays with the refinement stage's body policy; the
-  // raster judges observed ground and observed obstacles only.
-  params.min_clearance_m = 0.0;
-  params.step_tolerance_m = footprint_step_tolerance_m_;
-  return params;
-}
-
-mgg::GlobalGridPlannerLimits PlannerNode::globalRasterLimits() const {
-  mgg::GlobalGridPlannerLimits limits;
-  limits.max_step_height = std::max(0.0, planning_params_.max_step_height);
-  // A zero drop limit means the step limit, as everywhere else in the node.
-  limits.max_drop_height = std::max(planning_params_.max_drop_height,
-                                    planning_params_.max_step_height);
-  limits.step_tolerance = footprint_step_tolerance_m_;
-  limits.driving_offset = planning_params_.max_ground_height;
-  limits.body_radius = 0.5 * robot_params_.getPlanningSize().head<2>().norm();
-  limits.blocked_penalty = global_raster_blocked_penalty_m_;
-  limits.unknown_cost_factor = global_raster_unknown_cost_factor_;
-  limits.inflated_cost_factor = global_raster_inflation_cost_factor_;
-  limits.max_expansions = global_raster_max_expansions_;
-  limits.timeout = global_raster_timeout_;
-  return limits;
-}
-
-bool PlannerNode::planGlobalRasterCorridor(
-    const std::shared_ptr<const mgg::TraversabilityRaster>& raster,
-    const mgg::StateVec& current, const mgg::StateVec& goal,
-    mgg::RouteCorridor& corridor, std::string& failure) const {
-  failure.clear();
-  if (raster == nullptr) {
-    failure = "no traversability raster for the active MOLA snapshot";
-    return false;
-  }
-  if (!current.allFinite() || !goal.allFinite()) {
-    failure = "current pose or goal is not finite";
-    return false;
-  }
-  const mgg::GlobalGridPlannerLimits limits = globalRasterLimits();
-  // Other robots stand in the world and in no map. Their discs are the
-  // neighbour's body radius; the cell test is on the cell centre, so the
-  // disc grows by this robot's body radius as the box queries do.
-  std::vector<mgg::TransientDisc> discs;
-  if (mola_map_ != nullptr) {
-    const mgg::MolaMap::TransientDiscSet live = mola_map_->transientDiscs();
-    const double reach = live.radius_m + limits.body_radius;
-    discs.reserve(live.centres.size());
-    for (const Eigen::Vector2d& centre : live.centres) {
-      discs.push_back({centre, reach});
-    }
-  }
-  // Marked corridors are a routing preference: the penalty steers the route
-  // away from a segment the refinement or the controller just rejected.
-  // Only consulted while a mark is live; the lookup is per expanded edge.
-  const mgg::BlockedCorridorView view = blockedCorridorView();
-  mgg::GlobalGridPlanner::BlockedEdge blocked;
-  if (view.active()) {
-    blocked = [view](const mgg::StateVec& a, const mgg::StateVec& b) {
-      return view.blocked(a, b);
-    };
-  }
-  const mgg::GlobalGridPlanner planner(raster, limits);
-  // The robot's own footprint is masked out of its map; when no observed
-  // cell within the body radius can lend the start its ground, the robot
-  // stands at driving height above the ground it reports.
-  const mgg::GlobalGridPlan plan =
-      planner.plan(current.head<2>(), goal.head<2>(), discs, blocked,
-                   current.z() - limits.driving_offset);
-  if (plan.status != mgg::GlobalGridPlanStatus::kSucceeded ||
-      plan.poses.empty()) {
-    failure = plan.reason.empty() ? mgg::toString(plan.status) : plan.reason;
-    RCLCPP_INFO(get_logger(),
-                "global raster route unavailable (%s) after %zu expansions "
-                "in %lld ms on a %zu x %zu raster: %s",
-                mgg::toString(plan.status), plan.expansions,
-                static_cast<long long>(plan.elapsed.count()), raster->width,
-                raster->height, failure.c_str());
-    return false;
-  }
-  // The raster route runs from cell centre to cell centre. The corridor
-  // starts at the robot itself and ends at the exact goal, like every other
-  // corridor the section machinery consumes; the goal keeps the raster's
-  // driving height for its cell and the request's yaw.
-  std::vector<mgg::StateVec> poses = plan.poses;
-  mgg::StateVec goal_pose = goal;
-  goal_pose.z() = poses.back().z();
-  if (poses.size() < 2u) {
-    poses = {current, goal_pose};
-  } else {
-    poses.front() = current;
-    poses.back() = goal_pose;
-  }
-  for (std::size_t i = 1; i < poses.size(); ++i) {
-    poses[i - 1][3] = std::atan2(poses[i].y() - poses[i - 1].y(),
-                                 poses[i].x() - poses[i - 1].x());
-  }
-  poses.back()[3] = goal[3];
-  double length = 0.0;
-  for (std::size_t i = 1; i < poses.size(); ++i) {
-    length += (poses[i].head<2>() - poses[i - 1].head<2>()).norm();
-  }
-  RCLCPP_INFO(get_logger(),
-              "global raster route: %.1f m over %zu cells (%zu expansions, "
-              "%lld ms search, %zu x %zu raster at %.2f m)",
-              length, plan.poses.size(), plan.expansions,
-              static_cast<long long>(plan.elapsed.count()), raster->width,
-              raster->height, raster->cell_size);
-  corridor.status = mgg::PlanningStatus::kSucceeded;
-  corridor.partial = false;
-  corridor.reason.clear();
-  corridor.poses = std::move(poses);
-  return true;
-}
-
 bool PlannerNode::sliceObjectiveRouteWindow(
     const mgg::PlanningRequest& core, mgg::RouteCorridor& corridor,
     std::vector<mgg::StateVec>& global_objective_path,
@@ -4579,6 +4273,9 @@ void PlannerNode::onObjectiveRequest(
             core.objective == mgg::ObjectiveKind::kNavigate
                 ? partial_route_min_progress_m_
                 : 0.0;
+        mgg::TopologicalGoalPlanner objective_planner(
+            core.component_id, core.graph_revision, core.map_revision, 1.0,
+            explicit_minimum_progress);
         explicit_objective_planned = true;
         topological_retry.valid = true;
         topological_retry.graph = &graph;
@@ -4586,70 +4283,22 @@ void PlannerNode::onObjectiveRequest(
         topological_retry.request = graph_request;
         topological_retry.goal_tolerance = 1.0;
         topological_retry.minimum_partial_progress = explicit_minimum_progress;
-        // The global route comes from the full-map traversability raster of
-        // the MOLA product when there is one: a route with one waypoint per
-        // cell that bends with the street, instead of the graph's lattice
-        // vertices and breadcrumbs followed by a straight line the bounded
-        // refinement window cannot detour (benchbot, 2026-09-19). The
-        // topological stage stays the fallback, and everything downstream
-        // (sections, refinement, validation) treats both alike.
-        std::string raster_failure;
-        bool raster_route = false;
-        if (map_backend_ == "mola_snapshot" && mola_map_ != nullptr) {
-          const auto raster_started = std::chrono::steady_clock::now();
-          const std::shared_ptr<const mgg::TraversabilityRaster> raster =
-              mola_map_->traversability(globalRasterParams());
-          const auto raster_elapsed =
-              std::chrono::duration_cast<std::chrono::milliseconds>(
-                  std::chrono::steady_clock::now() - raster_started);
-          if (raster == nullptr) {
-            raster_failure =
-                "no traversability raster for the active MOLA snapshot";
-            RCLCPP_INFO(get_logger(), "global raster route unavailable: %s",
-                        raster_failure.c_str());
-          } else {
-            if (raster_elapsed.count() > 0) {
-              RCLCPP_INFO(get_logger(),
-                          "traversability raster %zu x %zu at %.2f m ready "
-                          "in %lld ms",
-                          raster->width, raster->height, raster->cell_size,
-                          static_cast<long long>(raster_elapsed.count()));
-            }
-            mgg::RouteCorridor raster_corridor;
-            raster_corridor.request = graph_request;
-            raster_route = planGlobalRasterCorridor(
-                raster, graph_current, graph_request.goal.pose,
-                raster_corridor, raster_failure);
-            if (raster_route) corridor = std::move(raster_corridor);
-          }
-        }
-        if (!raster_route) {
-          mgg::TopologicalGoalPlanner objective_planner(
-              core.component_id, core.graph_revision, core.map_revision, 1.0,
-              explicit_minimum_progress);
-          corridor = objective_planner.plan(graph, graph_current,
-                                            graph_request,
-                                            blockedCorridorView());
-          if (core.objective == mgg::ObjectiveKind::kNavigate &&
-              robot_params_.type == mgg::RobotType::kGroundRobot &&
-              !projected_goal_supported && corridor.poses.size() >= 2u &&
-              (corridor.poses.back().head<2>() - core.goal.pose.head<2>())
-                      .cwiseAbs().maxCoeff() <= 1e-6) {
-            // An unsupported UI goal owns an exact navigation-base pose,
-            // while graph vertices and rolling proxies use driving height.
-            // Keep the optimistic connector on its preceding graph driving
-            // plane until a later local window observes terrain near the
-            // goal. Interpolating the request's base Z here fabricates a
-            // long slope and a false step at the first horizon.
-            // corridor.request below still retains the exact caller-owned
-            // XYZ and yaw for final-window binding.
-            corridor.poses.back().z() =
-                corridor.poses[corridor.poses.size() - 2u].z();
-          }
-          if (corridor.status != mgg::PlanningStatus::kSucceeded &&
-              !raster_failure.empty()) {
-            corridor.reason += " [global raster: " + raster_failure + "]";
-          }
+        corridor = objective_planner.plan(graph, graph_current, graph_request,
+                                          blockedCorridorView());
+        if (core.objective == mgg::ObjectiveKind::kNavigate &&
+            robot_params_.type == mgg::RobotType::kGroundRobot &&
+            !projected_goal_supported && corridor.poses.size() >= 2u &&
+            (corridor.poses.back().head<2>() - core.goal.pose.head<2>())
+                    .cwiseAbs().maxCoeff() <= 1e-6) {
+          // An unsupported UI goal owns an exact navigation-base pose, while
+          // graph vertices and rolling proxies use driving height.  Keep the
+          // optimistic connector on its preceding graph driving plane until a
+          // later local window observes terrain near the goal.  Interpolating
+          // the request's base Z here fabricates a long slope and a false step
+          // at the first horizon.  corridor.request below still retains the
+          // exact caller-owned XYZ and yaw for final-window binding.
+          corridor.poses.back().z() =
+              corridor.poses[corridor.poses.size() - 2u].z();
         }
         // Graph lookup uses driving height, while refinement and the response
         // retain the caller's exact base-pose goal.

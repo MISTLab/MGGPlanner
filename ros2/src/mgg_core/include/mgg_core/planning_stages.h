@@ -200,22 +200,15 @@ class GridPlanner {
 // vertex, and the resulting pose arrives here as the goal, so all three
 // objectives share one corridor stage, one terrain decision and one route
 // continuation. Only Navigate may bootstrap an optimistic connector towards a
-// goal that the graph cannot yet reach; Explore must bind both ends to the
-// active graph. ReturnHome binds its goal to the graph, and its start either
-// to a vertex within the tolerance or, within `return_home_connector_radius`,
-// to the nearest vertex through an unvalidated first segment that the rolling
-// grid stage checks like any other: the global backbone stops admitting
-// breadcrumbs whenever the map under one of them is unknown or occupied, so a
-// robot is routinely a few metres past its last admitted breadcrumb when it
-// is told to come home (every Return Home refused on benchbot, 2026-09-18).
+// goal that the graph cannot yet reach; Explore and ReturnHome must bind both
+// ends to the active graph.
 class TopologicalGoalPlanner {
  public:
   TopologicalGoalPlanner(std::string component_id,
                          std::uint64_t graph_revision,
                          std::uint64_t map_revision,
                          double goal_vertex_tolerance,
-                         double minimum_partial_progress = 0.0,
-                         double return_home_connector_radius = 10.0);
+                         double minimum_partial_progress = 0.0);
 
   RouteCorridor plan(GraphManager& graph, const StateVec& current,
                      const PlanningRequest& request,
@@ -227,7 +220,6 @@ class TopologicalGoalPlanner {
   std::uint64_t map_revision_;
   double goal_vertex_tolerance_;
   double minimum_partial_progress_;
-  double return_home_connector_radius_;
 };
 
 }  // namespace mgg

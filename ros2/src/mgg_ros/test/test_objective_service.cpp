@@ -160,33 +160,6 @@ class PlannerNodeTestPeer {
     node.robot_params_.type = mgg::RobotType::kAerialRobot;
   }
 
-  static mgg::RasterParams globalRasterParams(PlannerNode& node) {
-    const std::lock_guard<std::recursive_mutex> lock(node.planner_mutex_);
-    return node.globalRasterParams();
-  }
-  static mgg::GlobalGridPlannerLimits globalRasterLimits(PlannerNode& node) {
-    const std::lock_guard<std::recursive_mutex> lock(node.planner_mutex_);
-    return node.globalRasterLimits();
-  }
-  static bool planGlobalRasterCorridor(
-      PlannerNode& node,
-      const std::shared_ptr<const mgg::TraversabilityRaster>& raster,
-      const mgg::StateVec& current, const mgg::StateVec& goal,
-      mgg::RouteCorridor& corridor, std::string& failure) {
-    const std::lock_guard<std::recursive_mutex> lock(node.planner_mutex_);
-    return node.planGlobalRasterCorridor(raster, current, goal, corridor,
-                                         failure);
-  }
-  static void setDropHeight(PlannerNode& node, double height) {
-    const std::lock_guard<std::recursive_mutex> lock(node.planner_mutex_);
-    node.planning_params_.max_drop_height = height;
-  }
-  static void blockSegment(PlannerNode& node, const mgg::StateVec& from,
-                           const mgg::StateVec& to) {
-    const std::lock_guard<std::recursive_mutex> lock(node.planner_mutex_);
-    node.blockCorridorSegment(from, to);
-  }
-
   static void acceptOdometry(PlannerNode& node, double x, double y, double z) {
     auto msg = std::make_shared<nav_msgs::msg::Odometry>();
     msg->pose.pose.position.x = x;
@@ -4535,9 +4508,6 @@ TEST(IndexedObjectiveService, BatchedQueryIsBoundedAndUsesComponentFrame) {
   std::atomic<std::size_t> blind_clearance_prefix{0};
   std::atomic<std::size_t> blind_ground_sample{
       std::numeric_limits<std::size_t>::max()};
-  // When set, the blind sample reports no clearance either: the server had
-  // no terrain fit there at all, as between two lidar rings.
-  std::atomic<bool> blind_sample_clearance{false};
   std::atomic<std::size_t> step_sample{std::numeric_limits<std::size_t>::max()};
   std::atomic<std::size_t> drop_sample{std::numeric_limits<std::size_t>::max()};
   std::atomic<double> drop_at_or_after_x{
@@ -4580,7 +4550,7 @@ TEST(IndexedObjectiveService, BatchedQueryIsBoundedAndUsesComponentFrame) {
        &received_body_x, &received_body_y, &received_body_z,
        &received_max_step, &received_max_drop, &sample_occupancy,
        &sample_clearance, &blind_ground_prefix, &blind_clearance_prefix,
-       &blind_ground_sample, &blind_sample_clearance, &step_sample, &drop_sample,
+       &blind_ground_sample, &step_sample, &drop_sample,
        &drop_at_or_after_x, &occupied_from_sample,
        &terrain_case, &refinement_dip, &compatible_refinement_dip,
        &refinement_from_x, &query_count, &first_query_sample_count,
@@ -4701,10 +4671,6 @@ TEST(IndexedObjectiveService, BatchedQueryIsBoundedAndUsesComponentFrame) {
         for (std::size_t i = 0;
              i < std::min(n, blind_clearance_prefix.load()); ++i) {
           response->clearance[i] =
-              std::numeric_limits<double>::quiet_NaN();
-        }
-        if (blind_sample_clearance.load() && blind_ground_sample.load() < n) {
-          response->clearance[blind_ground_sample.load()] =
               std::numeric_limits<double>::quiet_NaN();
         }
         response->step.assign(n, false);
@@ -4971,18 +4937,6 @@ TEST(IndexedObjectiveService, BatchedQueryIsBoundedAndUsesComponentFrame) {
   blind_ground_sample = 3;
   EXPECT_TRUE(mgg_ros::PlannerNodeTestPeer::query(*planner, path));
   EXPECT_TRUE(path.indexed_map_validated);
-
-  // The ring gap of a sparse lidar: the ground between two rings is
-  // unobserved, the body volume above it is ray-proven free, and the server
-  // has no terrain fit there, so it reports no clearance either. That is
-  // the same bracketed gap, a horizon and not a hazard (benchbot,
-  // 2026-09-19: a 3 m goal was refused with "clearance is unavailable" at
-  // such a gap 2.4 m ahead of the Scout).
-  blind_sample_clearance = true;
-  path.status = mgg::PlanningStatus::kSucceeded;
-  EXPECT_TRUE(mgg_ros::PlannerNodeTestPeer::query(*planner, path)) << path.reason;
-  EXPECT_TRUE(path.indexed_map_validated);
-  blind_sample_clearance = false;
   blind_ground_sample = std::numeric_limits<std::size_t>::max();
   blind_ground_prefix = 2;
   blind_clearance_prefix = 2;
@@ -5652,169 +5606,6 @@ TEST(IndexedObjectiveService, BatchedQueryIsBoundedAndUsesComponentFrame) {
   EXPECT_EQ(path.status, mgg::PlanningStatus::kBlocked);
   executor.cancel();
   spinner.join();
-}
-
-std::shared_ptr<mgg::TraversabilityRaster> flatRoadRaster(
-    std::size_t width, std::size_t height, double ground) {
-  auto raster = std::make_shared<mgg::TraversabilityRaster>();
-  raster->cell_size = 0.5;
-  raster->origin = Eigen::Vector2d(-1.0, -2.0);
-  raster->width = width;
-  raster->height = height;
-  raster->ground_z.assign(width * height, ground);
-  raster->state.assign(width * height, mgg::RasterCellState::kFree);
-  return raster;
-}
-
-// The full-map raster stage of an explicit objective: the corridor it hands
-// the section machinery starts at the robot, ends at the exact goal, keeps
-// one pose per raster cell at the platform's driving height, and bends
-// around what the raster marks. The raster is hand-built here; the
-// production raster comes from MolaMap::traversability on a MOLA product.
-TEST(PlannerObjective, GlobalRasterCorridorRunsFromTheRobotToTheExactGoal) {
-  rclcpp::NodeOptions options;
-  options.parameter_overrides(
-      {rclcpp::Parameter("map.resolution", 0.05),
-       rclcpp::Parameter("global_raster_cell_m", 0.5),
-       rclcpp::Parameter("global_raster_max_expansions", 5000),
-       rclcpp::Parameter("global_raster_timeout_ms", 200),
-       rclcpp::Parameter("global_raster_blocked_penalty_m", 20.0),
-       rclcpp::Parameter("global_raster_unknown_cost_factor", 4.0),
-       rclcpp::Parameter("global_raster_inflation_cost_factor", 2.0)});
-  auto planner = std::make_shared<mgg_ros::PlannerNode>(options);
-  using Peer = mgg_ros::PlannerNodeTestPeer;
-  Peer::configureBackboneTest(*planner);
-  Peer::setDropHeight(*planner, 0.25);
-
-  // Platform limits reach the raster and the planner: a 0.20 by 0.20 m
-  // exact body, 0.30 m driving height, 0.10 m step, 0.25 m drop. The raster
-  // takes both bands (relief between them is a step crossed at a cost).
-  const mgg::RasterParams params = Peer::globalRasterParams(*planner);
-  EXPECT_NEAR(params.cell_size_m, 0.5, 1e-12);
-  EXPECT_NEAR(params.body_radius_m, 0.5 * std::hypot(0.20, 0.20), 1e-9);
-  EXPECT_NEAR(params.max_step_height_m, 0.10, 1e-12);
-  EXPECT_NEAR(params.max_drop_height_m, 0.25, 1e-12);
-  EXPECT_NEAR(params.body_height_m, 0.30 + 0.075, 1e-9);
-  EXPECT_NEAR(params.min_clearance_m, 0.0, 1e-12);
-  const mgg::GlobalGridPlannerLimits limits = Peer::globalRasterLimits(*planner);
-  EXPECT_NEAR(limits.max_step_height, 0.10, 1e-12);
-  EXPECT_NEAR(limits.max_drop_height, 0.25, 1e-12);
-  EXPECT_NEAR(limits.driving_offset, 0.30, 1e-12);
-  EXPECT_NEAR(limits.blocked_penalty, 20.0, 1e-12);
-  EXPECT_NEAR(limits.unknown_cost_factor, 4.0, 1e-12);
-  EXPECT_NEAR(limits.inflated_cost_factor, 2.0, 1e-12);
-  EXPECT_EQ(limits.max_expansions, 5000u);
-  EXPECT_EQ(limits.timeout, std::chrono::milliseconds(200));
-
-  // A 12 by 8 m road at 0.05 m with a wall across most of it at x in
-  // [4.0, 4.5), leaving one gap cell at y in [5.5, 6.0).
-  auto raster = flatRoadRaster(24, 16, 0.05);
-  for (std::size_t y = 0; y < 15; ++y) {
-    raster->state[raster->index(10, y)] = mgg::RasterCellState::kObstacle;
-  }
-  const mgg::StateVec current(0.10, 0.05, 0.35, 0.0);
-  const mgg::StateVec goal(9.30, -0.20, 0.35, 0.7);
-  mgg::RouteCorridor corridor;
-  corridor.status = mgg::PlanningStatus::kUnreachable;
-  std::string failure;
-  ASSERT_TRUE(Peer::planGlobalRasterCorridor(*planner, raster, current, goal,
-                                             corridor, failure))
-      << failure;
-  EXPECT_TRUE(failure.empty());
-  EXPECT_EQ(corridor.status, mgg::PlanningStatus::kSucceeded);
-  EXPECT_FALSE(corridor.partial);
-  EXPECT_TRUE(corridor.reason.empty());
-  ASSERT_GE(corridor.poses.size(), 3u);
-  // First pose: the robot itself. Last pose: the exact goal XY and yaw at
-  // the raster's driving height for its cell.
-  EXPECT_NEAR(corridor.poses.front().x(), current.x(), 1e-9);
-  EXPECT_NEAR(corridor.poses.front().y(), current.y(), 1e-9);
-  EXPECT_NEAR(corridor.poses.front().z(), current.z(), 1e-9);
-  EXPECT_NEAR(corridor.poses.back().x(), goal.x(), 1e-9);
-  EXPECT_NEAR(corridor.poses.back().y(), goal.y(), 1e-9);
-  EXPECT_NEAR(corridor.poses.back().z(), 0.05 + 0.30, 1e-9);
-  EXPECT_NEAR(corridor.poses.back()[3], 0.7, 1e-9);
-  // The interior poses are cell centres at driving height, one cell apart,
-  // none on the wall, and the route passes through the gap.
-  bool through_gap = false;
-  for (std::size_t i = 1; i + 1 < corridor.poses.size(); ++i) {
-    const mgg::StateVec& pose = corridor.poses[i];
-    std::size_t x = 0;
-    std::size_t y = 0;
-    ASSERT_TRUE(raster->cellOf(pose.head<2>(), x, y));
-    EXPECT_NEAR((raster->centre(x, y) - pose.head<2>()).norm(), 0.0, 1e-9);
-    EXPECT_NE(raster->state[raster->index(x, y)],
-              mgg::RasterCellState::kObstacle);
-    EXPECT_NEAR(pose.z(), 0.35, 1e-9);
-    const double step =
-        (pose.head<2>() - corridor.poses[i - 1].head<2>()).norm();
-    if (i >= 2) {
-      EXPECT_TRUE(std::abs(step - 0.5) < 1e-9 ||
-                  std::abs(step - 0.5 * std::sqrt(2.0)) < 1e-9)
-          << step;
-    }
-    const double yaw = std::atan2(
-        corridor.poses[i + 1].y() - pose.y(), corridor.poses[i + 1].x() - pose.x());
-    EXPECT_NEAR(pose[3], yaw, 1e-9);
-    if (x == 10 && y == 15) through_gap = true;
-  }
-  EXPECT_TRUE(through_gap);
-
-  // A marked segment on the route is a preference: with the gap's entry
-  // marked and no other way through, the same route is still returned.
-  const std::size_t gap_index = [&]() {
-    for (std::size_t i = 0; i < corridor.poses.size(); ++i) {
-      std::size_t x = 0;
-      std::size_t y = 0;
-      if (raster->cellOf(corridor.poses[i].head<2>(), x, y) && x == 10 &&
-          y == 15) {
-        return i;
-      }
-    }
-    return std::size_t{0};
-  }();
-  ASSERT_GT(gap_index, 0u);
-  Peer::blockSegment(*planner, corridor.poses[gap_index - 1],
-                     corridor.poses[gap_index]);
-  mgg::RouteCorridor marked;
-  ASSERT_TRUE(Peer::planGlobalRasterCorridor(*planner, raster, current, goal,
-                                             marked, failure))
-      << failure;
-  EXPECT_EQ(marked.poses.size(), corridor.poses.size());
-
-  // Sealing the gap leaves no route: the stage reports why and leaves the
-  // corridor alone, so the topological stage can take over.
-  raster->state[raster->index(10, 15)] = mgg::RasterCellState::kObstacle;
-  mgg::RouteCorridor untouched;
-  untouched.status = mgg::PlanningStatus::kUnreachable;
-  untouched.reason = "topological";
-  EXPECT_FALSE(Peer::planGlobalRasterCorridor(*planner, raster, current, goal,
-                                              untouched, failure));
-  EXPECT_NE(failure.find("no traversable route"), std::string::npos) << failure;
-  EXPECT_EQ(untouched.status, mgg::PlanningStatus::kUnreachable);
-  EXPECT_EQ(untouched.reason, "topological");
-  EXPECT_TRUE(untouched.poses.empty());
-
-  // A goal on an obstacle and a missing raster are reported the same way.
-  EXPECT_FALSE(Peer::planGlobalRasterCorridor(
-      *planner, raster, current, mgg::StateVec(4.25, 0.25, 0.35, 0.0),
-      untouched, failure));
-  EXPECT_NE(failure.find("obstacle"), std::string::npos) << failure;
-  EXPECT_FALSE(Peer::planGlobalRasterCorridor(*planner, nullptr, current, goal,
-                                              untouched, failure));
-  EXPECT_NE(failure.find("no traversability raster"), std::string::npos)
-      << failure;
-
-  // Start and goal in one cell: the corridor is the robot and the goal.
-  mgg::RouteCorridor same;
-  ASSERT_TRUE(Peer::planGlobalRasterCorridor(
-      *planner, raster, current, mgg::StateVec(0.20, 0.10, 0.35, 0.3), same,
-      failure))
-      << failure;
-  ASSERT_EQ(same.poses.size(), 2u);
-  EXPECT_NEAR(same.poses.front().x(), 0.10, 1e-9);
-  EXPECT_NEAR(same.poses.back().x(), 0.20, 1e-9);
-  EXPECT_NEAR(same.poses.back()[3], 0.3, 1e-9);
 }
 
 }  // namespace

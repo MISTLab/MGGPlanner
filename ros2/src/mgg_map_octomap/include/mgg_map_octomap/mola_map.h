@@ -18,9 +18,7 @@
 #include <Eigen/Dense>
 
 #include "mgg_core/map_interface.h"
-#include "mgg_core/traversability_raster.h"
 #include "mgg_map_octomap/native_mola_grid.h"
-#include "mgg_map_octomap/traversability_builder.h"
 
 namespace mgg {
 
@@ -139,25 +137,6 @@ class MolaMap : public MapInterface {
   /// cost per query is one distance test per disc.
   void setTransientDiscs(std::vector<Eigen::Vector2d> centres, double radius_m,
                          double ttl_s);
-  /// The live transient discs, in the navigation frame. Empty once the list
-  /// has expired or when none was set.
-  struct TransientDiscSet {
-    std::vector<Eigen::Vector2d> centres;
-    double radius_m = 0.0;
-  };
-  TransientDiscSet transientDiscs() const;
-
-  /// The 2.5D traversability raster of the active snapshot, in the navigation
-  /// frame, built lazily on first use for these parameters and cached with
-  /// the snapshot: the snapshot is immutable, so the raster is too, and a
-  /// successor snapshot builds its own. Returns nullptr without a snapshot
-  /// or when the raster cannot be built (see buildTraversabilityRaster). The
-  /// returned pointer keeps the raster alive independently of the snapshot.
-  /// Honours a read lease like every other query: within one lease every call
-  /// observes the same snapshot and hence the same raster.
-  std::shared_ptr<const TraversabilityRaster> traversability(
-      const RasterParams& params) const;
-
   VoxelStatus getVoxelStatus(const Eigen::Vector3d& position) const override;
   VoxelStatus getRayStatus(const Eigen::Vector3d& view_point,
                            const Eigen::Vector3d& voxel_to_test,

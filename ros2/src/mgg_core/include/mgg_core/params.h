@@ -161,9 +161,6 @@ struct PlanningParams {
   double robot_height = 1.0;
   double max_inclination = 0.52;
   double max_step_height = 0.0;
-  // Largest drop a ground robot may drive down (a kerb it need not climb).
-  // Zero means the same as max_step_height. Rises always use the step limit.
-  double max_drop_height = 0.0;
 
   // Free-space augmentation (deprecated upstream).
   double augment_free_voxels_time = 5.0;
