@@ -5382,7 +5382,24 @@ TEST(IndexedObjectiveService, BatchedQueryIsBoundedAndUsesComponentFrame) {
       *planner, path, /*allow_explore_height_refinement=*/true));
   EXPECT_NE(path.reason.find("does not support the emitted body height"),
             std::string::npos);
+  // A mismatch of the tolerance itself plus float32 rounding (0.1 arrives as
+  // 0.1000000015) is not a hazard: the whole route, not only the physical
+  // start, is a nanometre and a half over the limit here.
   leading_root_ground_offset = 0.0;
+  ground_offset = -(0.10 + 1.5e-9);
+  path.status = mgg::PlanningStatus::kSucceeded;
+  path.poses = {mgg::StateVec(0.0, 0.0, 0.0, 0.0),
+                mgg::StateVec(1.2, 0.0, 0.0, 0.0)};
+  EXPECT_TRUE(mgg_ros::PlannerNodeTestPeer::query(
+      *planner, path, /*allow_explore_height_refinement=*/true))
+      << path.reason;
+  ground_offset = -(0.10 + 1e-5);
+  path.status = mgg::PlanningStatus::kSucceeded;
+  path.poses = {mgg::StateVec(0.0, 0.0, 0.0, 0.0),
+                mgg::StateVec(1.2, 0.0, 0.0, 0.0)};
+  EXPECT_FALSE(mgg_ros::PlannerNodeTestPeer::query(
+      *planner, path, /*allow_explore_height_refinement=*/true));
+  ground_offset = 0.0;
   mgg_ros::PlannerNodeTestPeer::setMaxStep(*planner, 0.10);
 
   // A fully measured stationary route never consumes the provisional policy.

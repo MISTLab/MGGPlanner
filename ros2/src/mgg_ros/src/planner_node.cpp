@@ -3251,7 +3251,11 @@ bool PlannerNode::queryIndexedMap(mgg::FeasiblePath& path,
           // intervals remain NaN here and are interpolated between these
           // exact anchors below.
           refined_base_z[i] = dense_base_states[i].z();
-          if (ground_mismatch > indexed_map_ground_tolerance_m_ + 1e-9) {
+          // The samples travel as float32 and the heights are voxel-quantized,
+          // so a mismatch of exactly the tolerance arrives as 0.1000000015 and
+          // was refused ("mismatch 0.100000 m exceeds 0.100000 m", the Spot,
+          // 2026-09-20, twice). A micron is below anything the map measures.
+          if (ground_mismatch > indexed_map_ground_tolerance_m_ + 1e-6) {
             const bool physical_start_sample =
                 qualified_height_refinement_allowed &&
                 context.preserve_physical_start_height &&
