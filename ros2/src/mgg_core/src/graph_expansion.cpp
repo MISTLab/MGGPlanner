@@ -53,19 +53,21 @@ double averageInclination(const std::vector<Eigen::Vector3d>& edge) {
 }
 
 /// Can the robot travel the segment? Fills `projected_edge` for ground robots.
+/// `stop_at_unknown` makes unobserved space block the edge; the local lattice
+/// leaves it passable, the global roadmap does not.
 bool edgeTraversable(const ExpandContext& ctx, const Eigen::Vector3d& start,
                      const Eigen::Vector3d& end, bool is_hanging,
                      bool preserve_start_height,
                      std::vector<Eigen::Vector3d>& projected_edge,
-                     ExpandGraphReport& rep) {
+                     ExpandGraphReport& rep, bool stop_at_unknown = false) {
   if (ctx.robot->type == RobotType::kAerialRobot) {
-    return ctx.map->getPathStatus(start, end, ctx.robot_box_size, false) ==
-           VoxelStatus::kFree;
+    return ctx.map->getPathStatus(start, end, ctx.robot_box_size,
+                                  stop_at_unknown) == VoxelStatus::kFree;
   }
   // Ground robot: the edge has to follow the terrain.
   const ProjectedEdgeStatus es = ctx.ground->getProjectedEdgeStatus(
-      start, end, ctx.robot_box_size, false, projected_edge, is_hanging,
-      preserve_start_height);
+      start, end, ctx.robot_box_size, stop_at_unknown, projected_edge,
+      is_hanging, preserve_start_height);
   ++rep.edge_status[static_cast<int>(es)];
   if (es == ProjectedEdgeStatus::kAdmissible) return true;
   if (es == ProjectedEdgeStatus::kSteep) ++rep.steep_edges;
@@ -281,6 +283,60 @@ void expandGraph(GraphManager& graph, Vertex& new_vertex,
     }
   }
 
+  rep.status = ExpandGraphStatus::kSuccess;
+}
+
+void expandGraphEdges(GraphManager& graph, Vertex* new_vertex,
+                      ExpandGraphReport& rep, const ExpandContext& ctx) {
+  // rrg.cpp:867 Rrg::expandGraphEdges. The vertex is already in the graph;
+  // only edges are added, and only where the map already knows the way is
+  // clear (stop_at_unknown_voxel true at rrg.cpp:897 and 903), because the
+  // roadmap these edges join is routed over without a second look.
+  std::vector<Vertex*> nearest_vertices;
+  if (!graph.getNearestVertices(&new_vertex->state,
+                                ctx.planning->nearest_range,
+                                &nearest_vertices)) {
+    rep.status = ExpandGraphStatus::kErrorKdTree;
+    return;
+  }
+  const Eigen::Vector3d origin = new_vertex->state.head<3>();
+  for (Vertex* neighbour : nearest_vertices) {
+    if (neighbour == nullptr || neighbour == new_vertex) continue;
+    const Eigen::Vector3d direction = neighbour->state.head<3>() - origin;
+    const double d_norm = direction.norm();
+    if (d_norm <= ctx.planning->edge_length_min ||
+        d_norm >= ctx.planning->edge_length_max) {
+      continue;
+    }
+    // Boost's setS edge list already refuses a duplicate; skipping it here
+    // also keeps the adjacency map free of repeats.
+    if (graph.graph_->edgeExists(new_vertex->id, neighbour->id)) continue;
+    const Eigen::Vector3d p_overshoot =
+        direction / d_norm * ctx.planning->edge_overshoot;
+    const Eigen::Vector3d p_start =
+        origin + ctx.robot->center_offset - p_overshoot;
+    Eigen::Vector3d p_end = origin + ctx.robot->center_offset + direction;
+    if (neighbour->id != 0) p_end += p_overshoot;
+    if (geofenceBlocks(ctx, p_start, p_end)) continue;
+    std::vector<Eigen::Vector3d> projected_edge;
+    if (!edgeTraversable(ctx, p_start, p_end, false, false, projected_edge,
+                         rep, /*stop_at_unknown=*/true)) {
+      continue;
+    }
+    // rrg.cpp:907: a long way round the tree and a height change is a
+    // different floor, not a shortcut.
+    if (neighbour->distance > ctx.planning->nearest_range_max &&
+        std::fabs(neighbour->state[2] - new_vertex->state[2]) >
+            ctx.planning->nearest_range_z) {
+      continue;
+    }
+    graph.addEdge(new_vertex, neighbour, d_norm);
+    ++rep.num_edges_added;
+    if (ctx.inclinations != nullptr && !projected_edge.empty()) {
+      ctx.inclinations->set(new_vertex->id, neighbour->id,
+                            averageInclination(projected_edge));
+    }
+  }
   rep.status = ExpandGraphStatus::kSuccess;
 }
 

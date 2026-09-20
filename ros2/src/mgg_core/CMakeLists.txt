@@ -44,6 +44,7 @@ add_library(${PROJECT_NAME}
   src/trajectory.cpp
   src/path_selection.cpp
   src/planning_stages.cpp
+  src/global_graph.cpp
   src/grid_refinement.cpp
   src/log.cpp)
 target_include_directories(${PROJECT_NAME} PUBLIC
@@ -92,6 +93,8 @@ if(BUILD_TESTING)
   target_link_libraries(test_planning_stages ${PROJECT_NAME})
   ament_add_gtest(test_grid_refinement test/test_grid_refinement.cpp)
   target_link_libraries(test_grid_refinement ${PROJECT_NAME})
+  ament_add_gtest(test_global_graph test/test_global_graph.cpp)
+  target_link_libraries(test_global_graph ${PROJECT_NAME})
 endif()
 
 ament_package()

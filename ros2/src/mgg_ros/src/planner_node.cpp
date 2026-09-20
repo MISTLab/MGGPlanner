@@ -388,13 +388,15 @@ PlannerNode::PlannerNode(const rclcpp::NodeOptions& options)
       std::isfinite(hazard_prefix_standoff_m_)
           ? std::clamp(hazard_prefix_standoff_m_, 0.0, 10.0)
           : 0.0;
-  const double requested_step_tolerance = declareOrGet<double>(
+  // The parameter keeps its original name; see step_measurement_margin_m_ for
+  // what it now covers and why the default is 0.02 m.
+  const double requested_step_margin = declareOrGet<double>(
       this, "footprint_step_measurement_tolerance_m",
-      footprint_step_tolerance_m_);
-  footprint_step_tolerance_m_ =
-      std::isfinite(requested_step_tolerance)
-          ? std::clamp(requested_step_tolerance, 0.0, 0.05)
-          : 0.01;
+      step_measurement_margin_m_);
+  step_measurement_margin_m_ =
+      std::isfinite(requested_step_margin)
+          ? std::clamp(requested_step_margin, 0.0, 0.05)
+          : 0.02;
   const double requested_start_support = declareOrGet<double>(
       this, "objective_start_support_max_distance_m",
       objective_start_support_max_distance_m_);
@@ -728,6 +730,214 @@ mgg::ExpandContext PlannerNode::makeContext() {
   ctx.hanging_root_edge_length_max =
       objective_start_support_max_distance_m_;
   return ctx;
+}
+
+mgg::ExpandContext PlannerNode::makeGlobalContext() {
+  mgg::ExpandContext ctx = makeContext();
+  ctx.inclinations = nullptr;
+  return ctx;
+}
+
+std::vector<Eigen::Vector3d> PlannerNode::selectionExclusions() {
+  std::vector<Eigen::Vector3d> exclusions;
+  if (have_coordination_exclusions_ &&
+      std::chrono::duration<double>(std::chrono::steady_clock::now() -
+                                    coordination_exclusions_received_)
+              .count() <= reservation_exclusion_ttl_s_) {
+    exclusions = coordination_exclusions_;
+  }
+  const double now_s = steadyNowSeconds();
+  while (!rejected_explore_leaves_.empty() &&
+         now_s - rejected_explore_leaves_.front().second >
+             rejected_explore_leaf_ttl_s_) {
+    rejected_explore_leaves_.pop_front();
+  }
+  for (const auto& rejected : rejected_explore_leaves_) {
+    exclusions.push_back(rejected.first);
+  }
+  return exclusions;
+}
+
+mgg::RecomputeGainFn PlannerNode::globalFrontierGain() {
+  return [this](mgg::Vertex& vertex) {
+    // Upstream scored global frontiers against the world-fixed global bound
+    // (computeVolumetricGainRayModelNoBound, rrg.cpp:3767). This port centres
+    // its gain volume on the robot every cycle, so a frontier a street away
+    // would count nothing; centre it on the frontier while it is scored.
+    global_space_.setCenter(vertex.state, /*use_extension=*/true);
+    mgg::computeVolumetricGain(vertex.state, vertex.vol_gain,
+                               makeGainContext());
+  };
+}
+
+void PlannerNode::addRefPathToGraph(const std::vector<mgg::StateVec>& path) {
+  if (path.size() < 2) return;
+  // Upstream added the lattice vertices themselves when it could
+  // (rrg.cpp:4549), which carries the leaf's frontier mark and gain across.
+  // The corridor poses are lattice states, so look each one up.
+  std::vector<mgg::Vertex*> lattice;
+  lattice.reserve(path.size());
+  for (const mgg::StateVec& pose : path) {
+    mgg::Vertex* vertex = nullptr;
+    if (!local_graph_->getNearestVertexInRange(&pose, 1e-6, &vertex) ||
+        vertex == nullptr) {
+      lattice.clear();
+      break;
+    }
+    lattice.push_back(vertex);
+  }
+  const int before = global_graph_->getNumVertices();
+  const mgg::ExpandContext ctx = makeGlobalContext();
+  const bool added =
+      lattice.empty()
+          ? mgg::addRefPathToGraph(*global_graph_, path, ctx,
+                                   global_vertex_spacing_)
+          : mgg::addRefPathToGraph(*global_graph_, lattice, ctx,
+                                   global_vertex_spacing_);
+  if (!added) {
+    RCLCPP_WARN(get_logger(),
+                "exploration path not added to the global graph: its start "
+                "at (%.2f, %.2f, %.2f) could not be linked",
+                path.front().x(), path.front().y(), path.front().z());
+    return;
+  }
+  if (global_graph_->getNumVertices() != before) ++graph_revision_;
+  RCLCPP_INFO(get_logger(),
+              "global graph: +%d vertices from the exploration path (%d "
+              "vertices, %d edges)",
+              global_graph_->getNumVertices() - before,
+              global_graph_->getNumVertices(), global_graph_->getNumEdges());
+}
+
+void PlannerNode::addFrontiers() {
+  if (local_graph_->getNumVertices() < 2 ||
+      global_graph_->getNumVertices() == 0) {
+    return;
+  }
+  const int before = global_graph_->getNumVertices();
+  // Upstream's kRangeCheck and kUpdateRadius (rrg.cpp:2447) were 1 m and 3 m
+  // for an SMB whose trajectory was sampled every metre; scale them with the
+  // trajectory spacing so a foot-bot configuration keeps the same proportions.
+  const mgg::FrontierAdditionReport report = mgg::addFrontiers(
+      *global_graph_, *local_graph_, makeGlobalContext(), globalFrontierGain(),
+      global_vertex_spacing_, 1.0 * global_vertex_spacing_,
+      3.0 * global_vertex_spacing_);
+  global_space_.setCenter(current_state_, /*use_extension=*/true);
+  if (global_graph_->getNumVertices() != before) ++graph_revision_;
+  RCLCPP_INFO(get_logger(),
+              "global graph: %d frontier(s) re-checked, %d demoted; %d local "
+              "frontier(s) in %d cluster(s), %d path(s) added (%d vertices, "
+              "%d edges)",
+              report.global_frontiers_rechecked,
+              report.global_frontiers_demoted, report.local_frontiers,
+              report.clusters, report.paths_added,
+              global_graph_->getNumVertices(), global_graph_->getNumEdges());
+}
+
+mgg::RouteCorridor PlannerNode::runGlobalPlanner(mgg::PlanningRequest& core,
+                                                 TopologicalRetry& retry) {
+  mgg::RouteCorridor corridor;
+  corridor.request = core;
+  corridor.status = mgg::PlanningStatus::kUnreachable;
+  if (global_graph_->getNumVertices() <= 1) {
+    // rrg.cpp:5582.
+    corridor.reason = "exploration complete: the global graph holds no "
+                      "frontier to reposition to";
+    return corridor;
+  }
+  // Let's try to add the current state to the global graph (rrg.cpp:5643).
+  mgg::StateVec current = current_state_;
+  if (!projectStateToDrivingHeight(current)) {
+    current = physicalAnchorAtDrivingHeight(current_state_);
+  }
+  const int before = global_graph_->getNumVertices();
+  constexpr double kRadiusLimit = 1.5;  // rrg.cpp:5651
+  mgg::Vertex* link_vertex = mgg::connectStateToGraph(
+      *global_graph_, current, makeGlobalContext(), kRadiusLimit);
+  if (global_graph_->getNumVertices() != before) ++graph_revision_;
+  if (link_vertex == nullptr) {
+    corridor.reason = "current pose cannot be linked to the global graph";
+    return corridor;
+  }
+  const mgg::GlobalFrontierReport report = mgg::searchGlobalFrontier(
+      *global_graph_, link_vertex->id,
+      static_cast<int>(planning_params_.robot_id), globalFrontierGain(),
+      selectionExclusions(), reservation_exclusion_radius_m_);
+  global_space_.setCenter(current_state_, /*use_extension=*/true);
+  if (report.best_frontier == nullptr) {
+    // rrg.cpp:5628 and 5759: no frontier, or none the graph can reach.
+    char reason[192];
+    std::snprintf(reason, sizeof(reason),
+                  "exploration complete: %d global frontier(s), none "
+                  "reachable with gain (%d re-checked out)",
+                  report.frontiers, report.demoted);
+    corridor.reason = reason;
+    return corridor;
+  }
+  RCLCPP_INFO(get_logger(),
+              "global planner: %d frontier(s), %d feasible; repositioning to "
+              "(%.2f, %.2f, %.2f), gain %.1f over %.1f m",
+              report.frontiers, report.feasible,
+              report.best_frontier->state.x(), report.best_frontier->state.y(),
+              report.best_frontier->state.z(), report.best_gain,
+              report.best_distance);
+  // Route to it over the global graph with the shared topological stage
+  // (rrg.cpp:5846). The goal is a graph vertex, so the explicit objectives'
+  // binding tolerance resolves it exactly.
+  core.goal.pose = report.best_frontier->state;
+  core.goal.landmark_id.clear();
+  selected_explore_leaf_ = report.best_frontier->state.head<3>();
+  mgg::TopologicalGoalPlanner global_planner(
+      core.component_id, core.graph_revision, core.map_revision, 1.0);
+  retry.valid = true;
+  retry.graph = global_graph_.get();
+  retry.current = current;
+  retry.request = core;
+  retry.goal_tolerance = 1.0;
+  retry.minimum_partial_progress = 0.0;
+  corridor = global_planner.plan(*global_graph_, current, core,
+                                 blockedCorridorView());
+  corridor.request = core;
+  return corridor;
+}
+
+void PlannerNode::planExploreCorridor(mgg::PlanningRequest& core,
+                                      const std::string& summary,
+                                      mgg::RouteCorridor& corridor,
+                                      TopologicalRetry& retry,
+                                      bool& from_global_graph) {
+  from_global_graph = false;
+  if (have_explore_selection_) {
+    // The selector's leaf is the objective goal from here on, so the window,
+    // the response and the continuation token all agree on it.
+    core.goal.pose = explore_target_;
+    core.goal.landmark_id.clear();
+    // A lattice vertex is an exact graph state. Bind it tightly so the stage
+    // cannot substitute a neighbouring vertex for the chosen leaf.
+    const double explore_tolerance =
+        std::max(1e-3, 0.5 * map_->getResolution());
+    mgg::TopologicalGoalPlanner explore_planner(
+        core.component_id, core.graph_revision, core.map_revision,
+        explore_tolerance);
+    retry.valid = true;
+    retry.graph = local_graph_.get();
+    retry.current = explore_root_;
+    retry.request = core;
+    retry.goal_tolerance = explore_tolerance;
+    retry.minimum_partial_progress = 0.0;
+    corridor = explore_planner.plan(*local_graph_, explore_root_, core,
+                                    blockedCorridorView());
+    corridor.request = core;
+    return;
+  }
+  // No leaf with gain: every local path is blocked, excluded or sees nothing
+  // new. Upstream triggered the global planner here (rrg.cpp:2119 and
+  // mggplanner.cpp:217) rather than returning no path.
+  RCLCPP_INFO(get_logger(),
+              "no local gain (%s); asking the global graph for a frontier",
+              summary.empty() ? "no selection" : summary.c_str());
+  corridor = runGlobalPlanner(core, retry);
+  from_global_graph = corridor.status == mgg::PlanningStatus::kSucceeded;
 }
 
 void PlannerNode::refreshMolaRevision() {
@@ -1116,6 +1326,13 @@ std::string PlannerNode::buildLocalGraph(bool strict_projected_endpoints) {
   const auto t_start = Clock::now();
   updateGlobalGraph();
 
+  // The last local graph's frontier paths go into the global graph before
+  // that graph is thrown away (rrg.cpp:121, Rrg::reset).
+  if (add_frontiers_to_global_graph_) {
+    add_frontiers_to_global_graph_ = false;
+    addFrontiers();
+  }
+
   local_graph_->reset();
   have_explore_selection_ = false;
   // Inclinations are keyed by vertex id and the ids restart with the graph.
@@ -1216,25 +1433,9 @@ std::string PlannerNode::buildLocalGraph(bool strict_projected_endpoints) {
   }
 
   const auto t_gain = Clock::now();
-  std::vector<Eigen::Vector3d> exclusions;
-  if (have_coordination_exclusions_ &&
-      std::chrono::duration<double>(std::chrono::steady_clock::now() -
-                                    coordination_exclusions_received_)
-              .count() <= reservation_exclusion_ttl_s_) {
-    exclusions = coordination_exclusions_;
-  }
-  const double selection_now_s = steadyNowSeconds();
-  while (!rejected_explore_leaves_.empty() &&
-         selection_now_s - rejected_explore_leaves_.front().second >
-             rejected_explore_leaf_ttl_s_) {
-    rejected_explore_leaves_.pop_front();
-  }
-  for (const auto& rejected : rejected_explore_leaves_) {
-    exclusions.push_back(rejected.first);
-  }
   const mgg::PathSelectionResult sel = mgg::selectBestPath(
       *local_graph_, planning_params_, robot_params_, edge_inclinations_,
-      map_->getResolution(), exploring_direction_, exclusions,
+      map_->getResolution(), exploring_direction_, selectionExclusions(),
       reservation_exclusion_radius_m_);
 
   best_path_.clear();
@@ -1256,6 +1457,9 @@ std::string PlannerNode::buildLocalGraph(bool strict_projected_endpoints) {
   explore_root_ = root_state;
   explore_target_ = have_explore_selection_ ? selected_lattice_path.back()
                                             : root_state;
+  // A graph with a path worth taking has frontiers worth remembering
+  // (rrg.cpp:2147); they are added before this graph is rebuilt.
+  if (have_explore_selection_) add_frontiers_to_global_graph_ = true;
 
 
   // What comes out of the graph is a walk along lattice edges: it steps
@@ -1566,8 +1770,7 @@ bool PlannerNode::validateObjectiveStartSupport(
     // gradual elevation change. Any observed floor outside the platform step
     // cap therefore refuses the connector, even when the end-to-end chord
     // would make that change look like a shallow ramp.
-    if (std::abs(point.z() - anchor.z()) >
-        planning_params_.max_step_height + 1e-6) {
+    if (std::abs(point.z() - anchor.z()) > stepLimitWithMargin() + 1e-6) {
       checked.clear();
       if (objective_start_support_failure_.empty() ||
           objective_start_support_failure_ == "connector exceeds bounded distance")
@@ -1740,10 +1943,9 @@ mgg::GridProjectionStatus PlannerNode::objectiveFootprintTerrainStatus(
   std::vector<FootprintGroundHit> ground_hits;
   ground_hits.reserve(footprint_cells.size());
   bool needs_connected_support = false;
-  // The platform limit plus the map's measurement tolerance; see
-  // footprint_step_tolerance_m_.
-  const double footprint_step_limit =
-      planning_params_.max_step_height + footprint_step_tolerance_m_ + 1e-6;
+  // The platform limit plus the terrain measurement margin; see
+  // step_measurement_margin_m_.
+  const double footprint_step_limit = stepLimitWithMargin() + 1e-6;
   double first_unsupported_delta = 0.0;
 
   // getRayStatus(..., false) deliberately treats unobserved cells as
@@ -1850,7 +2052,7 @@ mgg::GridProjectionStatus PlannerNode::objectiveFootprintTerrainStatus(
                     first_unsupported_delta > 0.0 ? "rise" : "drop",
                     std::abs(first_unsupported_delta),
                     planning_params_.max_step_height,
-                    footprint_step_tolerance_m_);
+                    step_measurement_margin_m_);
       record_failure(detail);
       return mgg::GridProjectionStatus::kNoGround;
     }
@@ -1882,7 +2084,7 @@ bool PlannerNode::objectiveTerrainPathSupported(
     }
     if (i == 0) continue;
     if (std::abs(driving_path[i].z() - driving_path[i - 1].z()) >
-        planning_params_.max_step_height + 1e-6) {
+        stepLimitWithMargin() + 1e-6) {
       return false;
     }
     const Eigen::Vector3d from =
@@ -1932,6 +2134,7 @@ void PlannerNode::updateGlobalGraph() {
     }
     auto* root = new mgg::Vertex(0, root_state);
     root->robot_id = static_cast<int>(planning_params_.robot_id);
+    root->type = mgg::VertexType::kVisited;
     root->is_hanging = !initial_anchor_supported_;
     global_graph_->addVertex(root);
     last_own_global_vertex_id_ = 0;
@@ -2013,6 +2216,7 @@ void PlannerNode::updateGlobalGraph() {
       }
       auto* v = new mgg::Vertex(global_graph_->generateVertexID(), bridge_end);
       v->robot_id = static_cast<int>(planning_params_.robot_id);
+      v->type = mgg::VertexType::kVisited;
       v->parent = root;
       v->distance = bridge_length;
       root->children.push_back(v);
@@ -2149,11 +2353,20 @@ void PlannerNode::updateGlobalGraph() {
       }
     }
 
+    // A breadcrumb is a place the robot has stood, so its vertex is visited:
+    // a frontier the robot has driven onto is no frontier (upstream's event
+    // E1, rrg.cpp:5283), and addFrontiers reads these vertices as the robot
+    // state history upstream kept separately (rrg.cpp:2457). Only the vertex
+    // itself is marked; upstream also demoted everything within 3 m, which
+    // in a maze reaches through walls, and the gain re-check demotes a seen
+    // frontier anyway.
     if (reused_vertex != nullptr) {
+      reused_vertex->type = mgg::VertexType::kVisited;
       last_own_global_vertex_id_ = reused_vertex->id;
     } else {
       auto* v = new mgg::Vertex(global_graph_->generateVertexID(), state);
       v->robot_id = static_cast<int>(planning_params_.robot_id);
+      v->type = mgg::VertexType::kVisited;
       v->parent = parent_vertex;
       v->distance = parent_vertex->distance + edge_distance;
       parent_vertex->children.push_back(v);
@@ -2229,18 +2442,10 @@ void PlannerNode::onPlanRequest(
   // window is taken here.
   mgg::RouteCorridor corridor;
   corridor.request = core;
-  if (have_explore_selection_) {
-    core.goal.pose = explore_target_;
-    core.goal.landmark_id.clear();
-    mgg::TopologicalGoalPlanner explore_planner(
-        core.component_id, core.graph_revision, core.map_revision,
-        std::max(1e-3, 0.5 * map_->getResolution()));
-    corridor = explore_planner.plan(*local_graph_, explore_root_, core,
-                                    blockedCorridorView());
-    corridor.request = core;
-  } else {
-    corridor.status = mgg::PlanningStatus::kUnreachable;
-  }
+  TopologicalRetry explore_retry;
+  bool corridor_from_global_graph = false;
+  planExploreCorridor(core, summary, corridor, explore_retry,
+                      corridor_from_global_graph);
   mgg::FeasiblePath feasible =
       refineCorridor(corridor, &objective_grid_limits_);
   const bool allow_explore_height_refinement =
@@ -2295,6 +2500,13 @@ void PlannerNode::onPlanRequest(
     }
   }
 
+  if (feasible.status == mgg::PlanningStatus::kSucceeded &&
+      !corridor_from_global_graph) {
+    // The accepted exploration path joins the global graph (rrg.cpp:4549).
+    // A corridor taken from the global graph is already in it.
+    addRefPathToGraph(corridor.poses);
+  }
+
   const auto& response_path =
       feasible.status == mgg::PlanningStatus::kSucceeded ? feasible.poses
                                                          : best_path_;
@@ -2327,6 +2539,7 @@ PlannerNode::IndexedQueryContext PlannerNode::indexedQueryContext() const {
   context.center_offset = robot_params_.center_offset;
   context.robot_type = robot_params_.type;
   context.max_step_height = planning_params_.max_step_height;
+  context.step_measurement_margin = step_measurement_margin_m_;
   context.max_inclination = planning_params_.max_inclination;
   context.graph_to_base =
       planning_params_.max_ground_height - robot_params_.size.z() / 2.0;
@@ -2477,6 +2690,8 @@ bool PlannerNode::queryIndexedMap(mgg::FeasiblePath& path,
         !std::isfinite(indexed_map_ground_tolerance_m_) ||
         !std::isfinite(context.max_step_height) ||
         context.max_step_height < 0.0 ||
+        !std::isfinite(context.step_measurement_margin) ||
+        context.step_measurement_margin < 0.0 ||
         !std::isfinite(context.max_inclination) ||
         context.max_inclination < 0.0 ||
       !std::isfinite(context.graph_to_base)) {
@@ -2484,11 +2699,16 @@ bool PlannerNode::queryIndexedMap(mgg::FeasiblePath& path,
                   "indexed map body, terrain limits, or gravity alignment is "
                   "invalid");
     }
+    // The one number every measured rise or drop is judged against, here and
+    // in the indexed authority: the platform limit plus the terrain
+    // measurement margin (see step_measurement_margin_m_).
+    const double max_step_with_margin =
+        context.max_step_height + context.step_measurement_margin;
     request->body_size.x = component_body.x();
     request->body_size.y = component_body.y();
     request->body_size.z = component_body.z();
-    request->max_step_m = context.max_step_height;
-    request->max_drop_m = context.max_step_height;
+    request->max_step_m = max_step_with_margin;
+    request->max_drop_m = max_step_with_margin;
     request->stop_at_unknown = !context.observed_ground_body_evidence;
 
     std::vector<mgg::StateVec> route;
@@ -2675,6 +2895,10 @@ bool PlannerNode::queryIndexedMap(mgg::FeasiblePath& path,
               return std::abs(offset - bias) <=
                      indexed_map_ground_tolerance_m_ + 1e-9;
             });
+        // The plain limit, not the measured-terrain one: below it a uniform
+        // offset is absorbed by the ground tolerance band, above it it is
+        // odometry error, and a margin here would open a band in between
+        // where neither applies.
         if (uniform && std::abs(bias) > context.max_step_height &&
             std::abs(bias) <= odometry_height_error_max_m_) {
           for (double& expected : expected_ground_z) expected -= bias;
@@ -2845,10 +3069,10 @@ bool PlannerNode::queryIndexedMap(mgg::FeasiblePath& path,
                         .maxCoeff() <= 1e-6;
             const bool physical_start_mismatch =
                 physical_start_sample &&
-                ground_mismatch <= context.max_step_height + 1e-6;
+                ground_mismatch <= max_step_with_margin + 1e-6;
             const bool bounded_refinement =
                 height_refinement_available && dense_xy_progress[i] > 1e-9 &&
-                ground_mismatch <= context.max_step_height + 1e-6;
+                ground_mismatch <= max_step_with_margin + 1e-6;
             if (!physical_start_mismatch && !bounded_refinement) {
               char detail[192];
               std::snprintf(
@@ -2876,10 +3100,10 @@ bool PlannerNode::queryIndexedMap(mgg::FeasiblePath& path,
                 std::atan2(dz, (current_xy - previous_finite_xy).norm());
             const bool incompatible_gap_height =
                 closes_provisional_connector &&
-                dz > context.max_step_height + 1e-6;
+                dz > max_step_with_margin + 1e-6;
             const bool incompatible_observed_height =
                 !closes_provisional_connector &&
-                dz > context.max_step_height + 1e-6 &&
+                dz > max_step_with_margin + 1e-6 &&
                 inclination > context.max_inclination + 1e-6;
             if (incompatible_gap_height || incompatible_observed_height) {
               return hazard(
@@ -2890,7 +3114,7 @@ bool PlannerNode::queryIndexedMap(mgg::FeasiblePath& path,
                      (expected_ground_z.empty() ||
                       std::abs(response->ground_z[i] -
                                expected_ground_z.front()) >
-                          context.max_step_height + 1e-6)) {
+                          max_step_with_margin + 1e-6)) {
             return hazard(
                 "indexed map route exceeds platform step or inclination "
                 "limits");
@@ -3055,7 +3279,7 @@ bool PlannerNode::queryIndexedMap(mgg::FeasiblePath& path,
         const double run =
             (refined[i].head<2>() - refined[i - 1].head<2>()).norm();
         const double inclination = std::atan2(rise, run);
-        if (rise > context.max_step_height + 1e-6 &&
+        if (rise > max_step_with_margin + 1e-6 &&
             inclination > context.max_inclination + 1e-6) {
           return fail(mgg::PlanningStatus::kBlocked,
                       "indexed map refined route exceeds platform step or "
@@ -3485,7 +3709,7 @@ mgg::FeasiblePath PlannerNode::refineCorridor(
           // over one map sample exceeds the platform's step capability.
           if (observed_ground_body_evidence_ && !checked.empty() &&
               std::abs(driving_pose.z() - checked.back().z()) >
-                  planning_params_.max_step_height + 1e-6) {
+                  stepLimitWithMargin() + 1e-6) {
             checked.clear();
             return false;
           }
@@ -3763,7 +3987,7 @@ void PlannerNode::onValidateObjectiveRoute(
           std::atan2(std::abs(delta.z()), delta.head<2>().norm());
       if (!std::isfinite(length) || !std::isfinite(resolution) ||
           resolution <= 0.0 ||
-          (std::abs(delta.z()) > planning_params_.max_step_height + 1e-6 &&
+          (std::abs(delta.z()) > stepLimitWithMargin() + 1e-6 &&
            inclination > planning_params_.max_inclination + 1e-6)) {
         terrain = mgg::ProjectedEdgeStatus::kSteep;
       } else {
@@ -3853,8 +4077,7 @@ void PlannerNode::onValidateObjectiveRoute(
         return;
       }
       if (have_previous &&
-          std::abs(pose.z() - previous.z()) >
-              planning_params_.max_step_height + 1e-6) {
+          std::abs(pose.z() - previous.z()) > stepLimitWithMargin() + 1e-6) {
         invalid_at("remaining route exceeds the platform step limit", pose);
         return;
       }
@@ -4096,6 +4319,7 @@ void PlannerNode::onObjectiveRequest(
   corridor.request = core;
   bool explicit_objective_planned = false;
   bool provisional_physical_home = false;
+  bool explore_corridor_from_global_graph = false;
   TopologicalRetry topological_retry;
   const bool local_objective = core.objective == mgg::ObjectiveKind::kExplore;
   const std::uint64_t active_graph_revision =
@@ -4173,38 +4397,13 @@ void PlannerNode::onObjectiveRequest(
     core.map_revision = map_revision_;
     if (core.objective == mgg::ObjectiveKind::kExplore) {
       // Explore's utility/gain selector still chooses the target frontier.
-      // The corridor to it now comes from the same topological stage that
+      // The corridor to it comes from the same topological stage that
       // Navigate and ReturnHome use, so all three share terrain decisions,
-      // the bounded local window and route continuation.
-      if (!have_explore_selection_) {
-        corridor.request = core;
-        corridor.status = mgg::PlanningStatus::kUnreachable;
-        corridor.reason =
-            summary.empty()
-                ? "exploration selector produced no gain-bearing target"
-                : summary;
-      } else {
-        // The selector's leaf is the objective goal from here on, so the
-        // window, the response and the continuation token all agree on it.
-        core.goal.pose = explore_target_;
-        core.goal.landmark_id.clear();
-        // A lattice vertex is an exact graph state. Bind it tightly so the
-        // stage cannot substitute a neighbouring vertex for the chosen leaf.
-        const double explore_tolerance =
-            std::max(1e-3, 0.5 * map_->getResolution());
-        mgg::TopologicalGoalPlanner explore_planner(
-            core.component_id, core.graph_revision, core.map_revision,
-            explore_tolerance);
-        topological_retry.valid = true;
-        topological_retry.graph = local_graph_.get();
-        topological_retry.current = explore_root_;
-        topological_retry.request = core;
-        topological_retry.goal_tolerance = explore_tolerance;
-        topological_retry.minimum_partial_progress = 0.0;
-        corridor = explore_planner.plan(*local_graph_, explore_root_, core,
-                                        blockedCorridorView());
-        corridor.request = core;
-      }
+      // the bounded local window and route continuation. When the local
+      // graph has nothing worth going to, the same stage routes over the
+      // global graph to the best global frontier instead.
+      planExploreCorridor(core, summary, corridor, topological_retry,
+                          explore_corridor_from_global_graph);
     } else {
       // All explicit objectives use the persistent graph snapshot. Missing or
       // disconnected topology cannot suppress Navigate's bounded map A*.
@@ -4582,6 +4781,16 @@ void PlannerNode::onObjectiveRequest(
   } else if (objective_generation == objective_request_generation_) {
     if (!lock.owns_lock()) lock.lock();
     cached_objective_route_.reset();
+  }
+  if (objective_generation == objective_request_generation_ &&
+      core.objective == mgg::ObjectiveKind::kExplore &&
+      path.status == mgg::PlanningStatus::kSucceeded &&
+      !explore_corridor_from_global_graph && !global_objective_path.empty()) {
+    // The accepted exploration path joins the global graph (rrg.cpp:4549):
+    // the whole lattice corridor at driving height, not just the section
+    // returned now. A corridor taken from the global graph is already in it.
+    if (!lock.owns_lock()) lock.lock();
+    addRefPathToGraph(global_objective_path);
   }
   response->status = static_cast<std::uint8_t>(path.status);
   response->component_id = path.component_id;

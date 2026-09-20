@@ -87,6 +87,14 @@ void expandGraph(GraphManager& graph, Vertex& new_vertex,
                  ExpandGraphReport& rep, const ExpandContext& ctx,
                  bool allow_short_edge = false);
 
+/// Adds edges from `new_vertex`, already in `graph`, to every vertex within
+/// nearest_range whose straight connection is between edge_length_min and
+/// edge_length_max and runs through space the map knows to be free
+/// (rrg.cpp:867 Rrg::expandGraphEdges). Used to wire a verified path into the
+/// global roadmap; unknown space blocks, unlike the lattice's own edges.
+void expandGraphEdges(GraphManager& graph, Vertex* new_vertex,
+                      ExpandGraphReport& rep, const ExpandContext& ctx);
+
 }  // namespace mgg
 
 #endif  // MGG_CORE_GRAPH_EXPANSION_H_

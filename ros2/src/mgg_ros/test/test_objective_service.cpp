@@ -1113,7 +1113,10 @@ class PlannerNodeTestPeer {
                             const std::vector<std::pair<int, int>>& edges) {
     graph.reset();
     for (std::size_t i = 0; i < vertices.size(); ++i) {
-      graph.addVertex(new mgg::Vertex(static_cast<int>(i), vertices[i]));
+      // Ids 0, 1, 2, ... as before, but through the generator so a vertex
+      // added later (a link for the current pose, a path) gets a fresh id.
+      graph.addVertex(new mgg::Vertex(i == 0 ? 0 : graph.generateVertexID(),
+                                      vertices[i]));
     }
     for (const auto& edge : edges) {
       graph.addEdge(graph.getVertex(edge.first), graph.getVertex(edge.second),
@@ -1143,6 +1146,36 @@ class PlannerNodeTestPeer {
     buildTopology(*node.global_graph_, vertices, edges);
     node.last_own_global_vertex_id_ = static_cast<int>(vertices.size()) - 1;
     ++node.graph_revision_;
+  }
+  static void markGlobalFrontier(PlannerNode& node, int id, double gain) {
+    const std::lock_guard<std::recursive_mutex> lock(node.planner_mutex_);
+    mgg::Vertex* vertex = node.global_graph_->getVertex(id);
+    vertex->type = mgg::VertexType::kFrontier;
+    vertex->vol_gain.gain = gain;
+    vertex->vol_gain.is_frontier = true;
+  }
+  static mgg::VertexType globalVertexType(const PlannerNode& node, int id) {
+    return node.global_graph_->getVertex(id)->type;
+  }
+  static bool globalFrontierNear(const PlannerNode& node, double x, double y,
+                                 double tolerance) {
+    for (const auto& entry : node.global_graph_->vertices_map_) {
+      if (entry.second == nullptr ||
+          entry.second->type != mgg::VertexType::kFrontier) {
+        continue;
+      }
+      if (std::hypot(entry.second->state.x() - x,
+                     entry.second->state.y() - y) <= tolerance) {
+        return true;
+      }
+    }
+    return false;
+  }
+  static double stepMeasurementMargin(const PlannerNode& node) {
+    return node.step_measurement_margin_m_;
+  }
+  static bool frontiersPendingForGlobalGraph(const PlannerNode& node) {
+    return node.add_frontiers_to_global_graph_;
   }
   static void installCachedRoute(PlannerNode& node,
                                  const std::vector<mgg::StateVec>& global,
@@ -2020,6 +2053,141 @@ TEST(PlannerExplore, WithoutASelectedTargetExploreIsUnreachable) {
   EXPECT_EQ(response->status,
             mgg_msgs::srv::PlanObjective::Response::UNREACHABLE);
   EXPECT_TRUE(response->path.empty());
+}
+
+/// The explore scene FullSizeGroundRobotsExpandAtProjectedDrivingHeight uses
+/// for a Bunker-sized ground robot: floor and a free body corridor along +x.
+std::shared_ptr<mgg_ros::PlannerNode> makeBunkerExploreNode() {
+  using Peer = mgg_ros::PlannerNodeTestPeer;
+  rclcpp::NodeOptions options;
+  options.parameter_overrides(
+      {rclcpp::Parameter("use_sim_time", true),
+       rclcpp::Parameter("map.resolution", 0.15),
+       rclcpp::Parameter("objective_body_evidence_policy", "observed_ground"),
+       rclcpp::Parameter("objective_ground_evidence_policy",
+                         "provisional_unknown")});
+  auto node = std::make_shared<mgg_ros::PlannerNode>(options);
+  Peer::configureExploreServiceScene(*node, true);
+  Peer::observeGroundRectangle(*node, -0.6, 1.3, -0.6, 0.6);
+  Peer::observeFreeBodyBox(*node, Eigen::Vector3d(0.35, 0.0, 0.65),
+                           Eigen::Vector3d(2.2, 1.2, 0.60));
+  Peer::setPlanningBody(*node, Eigen::Vector3d(1.023, 0.778, 0.40));
+  Peer::setMaxGroundHeight(*node, 0.475);
+  Peer::acceptOdometry(*node, 0.0, 0.0, 0.20);
+  return node;
+}
+
+TEST(PlannerExplore, AcceptedExplorationPathJoinsTheGlobalGraph) {
+  using Peer = mgg_ros::PlannerNodeTestPeer;
+  auto node = makeBunkerExploreNode();
+  const int before = Peer::globalVertices(*node);
+  const auto response = Peer::requestObjective(
+      *node, mgg::ObjectiveKind::kExplore, mgg::StateVec::Zero());
+  ASSERT_EQ(response->status, mgg_msgs::srv::PlanObjective::Response::SUCCEEDED)
+      << response->reason;
+  ASSERT_GE(response->path.size(), 2u);
+  // rrg.cpp:4549: the accepted lattice corridor is roadmap now, up to and
+  // including the selected leaf.
+  EXPECT_GT(Peer::globalVertices(*node), before);
+  const mgg::StateVec target = Peer::exploreTarget(*node);
+  EXPECT_TRUE(Peer::hasGlobalVertexNear(*node, target.x(), target.y(), 1e-6))
+      << Peer::globalGraphDescription(*node);
+  // A graph with a path worth taking has frontier paths worth remembering;
+  // they are folded in before the next local graph replaces it.
+  EXPECT_TRUE(Peer::frontiersPendingForGlobalGraph(*node));
+  const int with_path = Peer::globalVertices(*node);
+  Peer::rebuildLocalGraph(*node);
+  EXPECT_GE(Peer::globalVertices(*node), with_path);
+}
+
+TEST(PlannerExplore, WithoutLocalGainExploreRoutesToTheBestGlobalFrontier) {
+  using Peer = mgg_ros::PlannerNodeTestPeer;
+  auto node = makeBunkerExploreNode();
+  Peer::rebuildLocalGraph(*node);
+  ASSERT_TRUE(Peer::haveExploreSelection(*node));
+  const mgg::StateVec root = Peer::localRootState(*node);
+  // A global roadmap with a reachable frontier ahead and an unreachable one
+  // behind that carries a far larger gain.
+  const mgg::StateVec island(-3.0, 0.0, root.z(), 0.0);
+  const mgg::StateVec frontier(1.0, 0.0, root.z(), 0.0);
+  Peer::setGlobalTopology(*node, {root, island, frontier}, {{0, 2}});
+  Peer::markGlobalFrontier(*node, 1, 1e6);
+  Peer::markGlobalFrontier(*node, 2, 100.0);
+  // The local graph offers no leaf worth going to.
+  Peer::clearExploreSelection(*node);
+
+  const auto response = Peer::requestPinnedExplore(*node);
+  ASSERT_EQ(response->status, mgg_msgs::srv::PlanObjective::Response::SUCCEEDED)
+      << response->reason;
+  // Routed over the global graph to the reachable frontier (rrg.cpp:5841),
+  // through the same section and refinement pipeline as any objective.
+  ASSERT_GE(response->global_path.size(), 2u);
+  EXPECT_NEAR(response->global_path.back().position.x, 1.0, 1e-6);
+  EXPECT_NEAR(response->global_path.back().position.y, 0.0, 1e-6);
+  ASSERT_GE(response->path.size(), 2u);
+  EXPECT_NEAR(response->path.back().position.x, 1.0, 0.05);
+  // The unreachable frontier is still a frontier; the reachable one is what
+  // the robot now drives to, and a refusal of it would exclude it next time.
+  EXPECT_EQ(Peer::globalVertexType(*node, 1), mgg::VertexType::kFrontier);
+  EXPECT_EQ(Peer::globalVertexType(*node, 2), mgg::VertexType::kFrontier);
+
+  // With no frontier the graph can reach, exploration is complete: this is
+  // the only case that says so, and it says so rather than "no target".
+  auto exhausted = makeBunkerExploreNode();
+  Peer::rebuildLocalGraph(*exhausted);
+  const mgg::StateVec exhausted_root = Peer::localRootState(*exhausted);
+  Peer::setGlobalTopology(*exhausted, {exhausted_root, island}, {});
+  Peer::markGlobalFrontier(*exhausted, 1, 1e6);
+  Peer::clearExploreSelection(*exhausted);
+  const auto done = Peer::requestPinnedExplore(*exhausted);
+  EXPECT_EQ(done->status, mgg_msgs::srv::PlanObjective::Response::UNREACHABLE);
+  EXPECT_TRUE(done->path.empty());
+  EXPECT_NE(done->reason.find("exploration complete"), std::string::npos)
+      << done->reason;
+}
+
+TEST(PlannerObjective, StepMeasurementMarginAdmitsBistroCurbAndRefusesBeyond) {
+  using Peer = mgg_ros::PlannerNodeTestPeer;
+  // Bistro's sidewalk curbs measure 0.151 to 0.165 m against a 0.15 m
+  // simulated step. The default margin admits them and still refuses a step
+  // that is genuinely higher.
+  const auto make = [](double margin) {
+    rclcpp::NodeOptions options;
+    std::vector<rclcpp::Parameter> parameters{
+        rclcpp::Parameter("use_sim_time", true),
+        rclcpp::Parameter("map.resolution", 0.05),
+        rclcpp::Parameter("objective_body_evidence_policy", "observed_ground")};
+    if (margin >= 0.0) {
+      parameters.emplace_back("footprint_step_measurement_tolerance_m", margin);
+    }
+    options.parameter_overrides(parameters);
+    auto node = std::make_shared<mgg_ros::PlannerNode>(options);
+    Peer::configureBackboneTest(*node);
+    Peer::setPlanningBody(*node, Eigen::Vector3d(0.40, 0.20, 0.15));
+    Peer::setMaxStep(*node, 0.15);
+    Peer::acceptOdometry(*node, 0.0, 0.0, 0.075);
+    Peer::observeGroundRectangle(*node, -1.5, 1.5, -1.0, 1.0);
+    return node;
+  };
+  const Eigen::Vector3d body(0.40, 0.20, 0.15);
+  const Eigen::Vector3d pose(0.5, 0.0, 0.30);
+
+  auto curb = make(-1.0);
+  EXPECT_NEAR(Peer::stepMeasurementMargin(*curb), 0.02, 1e-12);
+  Peer::addMeasuredSurface(*curb, 0.65, 0.0, 0.165);
+  Peer::finishMapRevision(*curb);
+  EXPECT_TRUE(Peer::footprintTerrainSupported(*curb, pose, body));
+
+  auto step = make(-1.0);
+  Peer::addMeasuredSurface(*step, 0.65, 0.0, 0.18);
+  Peer::finishMapRevision(*step);
+  EXPECT_FALSE(Peer::footprintTerrainSupported(*step, pose, body));
+
+  // It is the margin that admits the curb, not the limit.
+  auto exact = make(0.0);
+  Peer::addMeasuredSurface(*exact, 0.65, 0.0, 0.165);
+  Peer::finishMapRevision(*exact);
+  EXPECT_FALSE(Peer::footprintTerrainSupported(*exact, pose, body));
 }
 
 // A local diamond: the short upper leg is the default corridor, the longer
@@ -4768,8 +4936,11 @@ TEST(IndexedObjectiveService, BatchedQueryIsBoundedAndUsesComponentFrame) {
   EXPECT_TRUE(mgg_ros::PlannerNodeTestPeer::query(*planner, path));
   EXPECT_TRUE(path.indexed_map_validated);
   EXPECT_TRUE(received_stop_at_unknown.load());
-  EXPECT_NEAR(received_max_step.load(), 0.10, 1e-9);
-  EXPECT_NEAR(received_max_drop.load(), 0.10, 1e-9);
+  // The indexed authority receives the platform limit plus the default
+  // 0.02 m terrain measurement margin, the same number every native step
+  // comparison uses.
+  EXPECT_NEAR(received_max_step.load(), 0.12, 1e-9);
+  EXPECT_NEAR(received_max_drop.load(), 0.12, 1e-9);
   EXPECT_GE(received.size(), 2u);
   if (received.size() >= 2) {
     EXPECT_NEAR(received.front().x, 10.0, 1e-6);
@@ -5573,7 +5744,9 @@ TEST(IndexedObjectiveService, BatchedQueryIsBoundedAndUsesComponentFrame) {
   drop_at_or_after_x = std::numeric_limits<double>::infinity();
   drop_sample = std::numeric_limits<std::size_t>::max();
 
-  refinement_dip = 0.16;
+  // A dip beyond the 0.15 m limit plus the 0.02 m measurement margin is not
+  // a bounded correction; a 0.16 m one now is.
+  refinement_dip = 0.18;
   query_count = 0;
   path.status = mgg::PlanningStatus::kSucceeded;
   path.poses = {mgg::StateVec(0.0, 0.0, 0.0, 0.0),

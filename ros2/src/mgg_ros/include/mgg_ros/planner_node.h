@@ -46,6 +46,7 @@
 
 #include "mgg_core/geofence_manager.h"
 #include "mgg_core/gain.h"
+#include "mgg_core/global_graph.h"
 #include "mgg_core/graph_expansion.h"
 #include "mgg_core/graph_manager.h"
 #include "mgg_core/graph_merge.h"
@@ -106,6 +107,43 @@ class PlannerNode : public rclcpp::Node {
     double goal_tolerance = 1.0;
     double minimum_partial_progress = 0.0;
   };
+  /// The Explore corridor: the local lattice corridor to the gain selector's
+  /// leaf, or, when the local graph offers no leaf worth going to, the global
+  /// roadmap corridor to the best global frontier (runGlobalPlanner). Only
+  /// when neither exists is the corridor unreachable with an "exploration
+  /// complete" reason. Fills `retry` for the blocked-corridor retry and says
+  /// whether the corridor came from the global graph, since one that did
+  /// must not be folded back into it.
+  void planExploreCorridor(mgg::PlanningRequest& core,
+                           const std::string& summary,
+                           mgg::RouteCorridor& corridor,
+                           TopologicalRetry& retry, bool& from_global_graph);
+  /// Rrg::runGlobalPlanner (rrg.cpp:5559) in auto mode: links the current
+  /// pose into the global graph, ranks its frontiers (searchGlobalFrontier)
+  /// and routes to the best one with the shared topological stage.
+  mgg::RouteCorridor runGlobalPlanner(mgg::PlanningRequest& core,
+                                      TopologicalRetry& retry);
+  /// Rrg::addRefPathToGraph (rrg.cpp:4540 and 4549): an accepted exploration
+  /// path joins the global graph.
+  void addRefPathToGraph(const std::vector<mgg::StateVec>& path);
+  /// Rrg::addFrontiers (rrg.cpp:2397) on the last local graph, run before the
+  /// next local graph replaces it (rrg.cpp:121, Rrg::reset).
+  void addFrontiers();
+  /// Re-scores a global frontier with the gain volume centred on it, the
+  /// port's counterpart of Rrg::computeVolumetricGainRayModelNoBound
+  /// (rrg.cpp:3767). The volume is left centred on the robot afterwards.
+  mgg::RecomputeGainFn globalFrontierGain();
+  /// makeContext without the local inclination table, which is keyed by
+  /// local vertex ids and must not receive global ones.
+  mgg::ExpandContext makeGlobalContext();
+  /// Exclusion centres every target selection honours: peers' reservations
+  /// while fresh, and targets whose route was refused recently.
+  std::vector<Eigen::Vector3d> selectionExclusions();
+  /// The platform step limit plus the terrain measurement margin, the one
+  /// number every comparison against the step limit uses.
+  double stepLimitWithMargin() const {
+    return planning_params_.max_step_height + step_measurement_margin_m_;
+  }
   /// Slices a complete topological route into the next bounded local section
   /// and, when the route continues past it, prepares the continuation token.
   /// `corridor` carries the full route in and the local section out.
@@ -142,6 +180,9 @@ class PlannerNode : public rclcpp::Node {
     Eigen::Vector3d center_offset = Eigen::Vector3d::Zero();
     mgg::RobotType robot_type = mgg::RobotType::kGroundRobot;
     double max_step_height = 0.0;
+    /// Added to max_step_height wherever a measured height is judged against
+    /// it, including the limits sent to the indexed authority.
+    double step_measurement_margin = 0.0;
     double max_inclination = 0.0;
     double graph_to_base = 0.0;
     double max_provisional_ground_prefix = 0.0;
@@ -187,9 +228,10 @@ class PlannerNode : public rclcpp::Node {
   /// Extends the global topological graph with the robot's current pose.
   ///
   /// The global graph is the sparse, persistent one that robots exchange: a
-  /// root, the trajectory, and (once gain evaluation is ported) frontiers.
-  /// Without the trajectory backbone there is nothing to broadcast and no
-  /// geometry for a neighbour's graph to rendezvous with.
+  /// root, the trajectory backbone built here, the accepted exploration
+  /// paths (addRefPathToGraph) and the clustered frontier paths
+  /// (addFrontiers). Without the trajectory backbone there is nothing to
+  /// broadcast and no geometry for a neighbour's graph to rendezvous with.
   void updateGlobalGraph();
   void stageGlobalBreadcrumbs(const mgg::StateVec& state);
   bool projectStateToDrivingHeight(mgg::StateVec& state,
@@ -272,14 +314,20 @@ class PlannerNode : public rclcpp::Node {
   /// as odometry height error: the start keeps its physical height and later
   /// samples are refined onto the map. Terrain steps are judged separately.
   double odometry_height_error_max_m_ = 0.5;
-  /// Measurement tolerance added to the platform step limit when footprint
-  /// ground heights are compared. Map points are quantised at centimetre
-  /// scale, so a kerb exactly at the limit otherwise flips between admitted
-  /// and refused on noise (measured on Bistro: refusals at 0.151 m and
-  /// 0.152 m against a 0.150 m limit). It is a statement about measurement
-  /// resolution, not about what the platform can climb, and stays well below
-  /// the margin between the limit and a physically refused step.
-  double footprint_step_tolerance_m_ = 0.01;
+  /// Terrain measurement margin added to the platform step limit wherever a
+  /// measured rise or drop is compared against it: the footprint rise checks,
+  /// the per-sample step checks of the grid stage and the route validator,
+  /// and the max_step_m / max_drop_m sent to the indexed map query. One
+  /// number, through stepLimitWithMargin(); no per-terrain special cases.
+  ///
+  /// It is a statement about how well heights are measured, not about what
+  /// the platform can climb. Bistro's sidewalk curbs measure 0.151 to
+  /// 0.165 m against a 0.15 m simulated step: the map's 0.2 m voxels quantise
+  /// heights, so a curb exactly at the limit reads a few centimetres over it
+  /// and was refused (0.151 m and 0.152 m refusals at the old 0.01 m). At
+  /// 0.02 m a 0.165 m reading passes a 0.150 m limit and a 0.18 m one does
+  /// not, which keeps a genuinely higher step refused.
+  double step_measurement_margin_m_ = 0.02;
   double objective_start_support_max_distance_m_ = 3.0;
   double objective_route_horizon_m_ = 8.0;
   double objective_route_progress_tolerance_m_ = 1.0;
@@ -294,6 +342,10 @@ class PlannerNode : public rclcpp::Node {
   mgg::StateVec explore_root_ = mgg::StateVec::Zero();
   mgg::StateVec explore_target_ = mgg::StateVec::Zero();
   bool have_explore_selection_ = false;
+  /// The last local graph found a path worth taking, so its frontier paths
+  /// are worth remembering in the global graph before it is rebuilt
+  /// (rrg.cpp:2147, consumed at rrg.cpp:121).
+  bool add_frontiers_to_global_graph_ = false;
   mutable std::string objective_start_support_failure_;
   mutable std::string objective_footprint_failure_;
   mgg::BoundedSpaceParams global_space_;
