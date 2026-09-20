@@ -5521,6 +5521,23 @@ TEST(IndexedObjectiveService, BatchedQueryIsBoundedAndUsesComponentFrame) {
   // the last checked sample that keeps the 1.5 m standoff is at 3.0 m.
   EXPECT_NEAR(path.poses.back().x(), 3.0, 0.31);
   EXPECT_LE(path.poses.back().x(), 4.8 - 1.5 + 1e-6);
+
+  // A hazard so close that the standoff leaves no prefix worth driving is
+  // not a section: emitting the empty prefix as a partial success sent the
+  // controller a route that ended where the robot stood, it completed at
+  // once, and the continuation replanned the same prefix two to three
+  // times a second (benchbot 2026-09-18 and 2026-09-19). The rejection that
+  // cut the prefix is returned instead.
+  occupied_from_sample = 5;
+  truncated = true;
+  query_count = 0;
+  committed_section(6.0);
+  EXPECT_FALSE(mgg_ros::PlannerNodeTestPeer::queryContinuable(*planner, path,
+                                                              &truncated));
+  EXPECT_FALSE(path.partial);
+  EXPECT_TRUE(path.poses.empty());
+  EXPECT_NE(path.reason.find("occupied or unknown"), std::string::npos)
+      << path.reason;
   occupied_from_sample = std::numeric_limits<std::size_t>::max();
 
   // A measured floor that ends before the useful-progress bound leaves no

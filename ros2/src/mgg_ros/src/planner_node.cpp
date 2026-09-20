@@ -2444,6 +2444,9 @@ bool PlannerNode::queryIndexedMap(mgg::FeasiblePath& path,
                context.component_from_navigation.matrix(), 1e-9);
   };
   constexpr std::size_t kMaxIndexedMapSamples = 4096;
+  // The least XY progress a validated prefix must make to be emitted as a
+  // section; anything shorter is refused with the rejection that cut it.
+  constexpr double kMinSectionProgressM = 0.3;
 
   while (true) {
     if (path.poses.size() >= kMaxIndexedMapSamples) {
@@ -2960,6 +2963,18 @@ bool PlannerNode::queryIndexedMap(mgg::FeasiblePath& path,
           (route_failure->unmeasured_ahead || hazard_standoff_prefix);
       if ((!prefix_truncation_allowed && !continuable) || !prefix_end ||
           !path.speed_limits.empty()) {
+        return fail(mgg::PlanningStatus::kBlocked, route_failure->reason);
+      }
+      // A prefix that makes no progress is not a section. Emitting it as a
+      // partial success sent the robot a route that ended where it stood,
+      // the controller completed it at once, the continuation found the
+      // robot short of the section goal and replanned, and the fresh plan
+      // emitted the same empty prefix: two to three replans a second with
+      // the robot standing still (robot_0 and robot_1 on benchbot,
+      // 2026-09-18 and again 2026-09-19 after this was reverted with
+      // unrelated changes). Refusing with the rejection reason lets the
+      // caller route around the marked hazard or report it.
+      if (sample_xy_progress[*prefix_end] < kMinSectionProgressM) {
         return fail(mgg::PlanningStatus::kBlocked, route_failure->reason);
       }
       accepted_count = *prefix_end + 1;
