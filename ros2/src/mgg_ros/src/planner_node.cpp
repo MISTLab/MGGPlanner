@@ -941,6 +941,56 @@ void PlannerNode::ingestOdometryIntoGlobalGraph() {
   }
 }
 
+void PlannerNode::shortcutObjectiveCorridor(mgg::RouteCorridor& corridor) {
+  if (corridor.status != mgg::PlanningStatus::kSucceeded ||
+      corridor.poses.size() < 3) {
+    return;
+  }
+  const Eigen::Vector3d footprint = robot_params_.getPlanningSize();
+  const Eigen::Vector3d offset = robot_params_.center_offset;
+  const auto segment_free = [this, &footprint, &offset](
+                                const Eigen::Vector3d& from,
+                                const Eigen::Vector3d& to) {
+    // A shortcut may only cross space already seen traversable: unknown
+    // volume blocks it, and a ground robot's segment follows the terrain
+    // (steps, inclination) as every roadmap edge does.
+    if (robot_params_.type == mgg::RobotType::kGroundRobot) {
+      std::vector<Eigen::Vector3d> projected;
+      return ground_->getProjectedEdgeStatus(
+                 from + offset, to + offset, footprint,
+                 /*stop_at_unknown_voxel=*/true, projected,
+                 /*is_hanging=*/false) == mgg::ProjectedEdgeStatus::kAdmissible;
+    }
+    return map_->getPathStatus(from, to, footprint, true) ==
+           mgg::VoxelStatus::kFree;
+  };
+  mgg::PathType points;
+  points.reserve(corridor.poses.size());
+  for (const mgg::StateVec& pose : corridor.poses) points.push_back(pose.head<3>());
+  const mgg::PathType cut = mgg::shortcutPath(points, segment_free);
+  if (cut.size() >= points.size()) return;
+  // shortcutPath keeps a subsequence of its input, so each kept point maps
+  // back to the pose it came from; interior headings follow the new segments.
+  std::vector<mgg::StateVec> poses;
+  poses.reserve(cut.size());
+  std::size_t source = 0;
+  for (const Eigen::Vector3d& point : cut) {
+    while (source < corridor.poses.size() &&
+           (corridor.poses[source].head<3>() - point).norm() > 1e-9) {
+      ++source;
+    }
+    if (source >= corridor.poses.size()) return;  // not a subsequence: keep the route
+    poses.push_back(corridor.poses[source]);
+  }
+  for (std::size_t i = 1; i + 1 < poses.size(); ++i) {
+    const Eigen::Vector2d step = poses[i + 1].head<2>() - poses[i].head<2>();
+    if (step.norm() > 1e-6) poses[i][3] = std::atan2(step.y(), step.x());
+  }
+  RCLCPP_INFO(get_logger(), "objective route shortcut: %zu poses -> %zu",
+              corridor.poses.size(), poses.size());
+  corridor.poses = std::move(poses);
+}
+
 mgg::RouteCorridor PlannerNode::runGlobalPlanner(mgg::PlanningRequest& core,
                                                  TopologicalRetry& retry) {
   mgg::RouteCorridor corridor;
@@ -1005,6 +1055,7 @@ mgg::RouteCorridor PlannerNode::runGlobalPlanner(mgg::PlanningRequest& core,
   corridor = global_planner.plan(*global_graph_, current, core,
                                  blockedCorridorView());
   corridor.request = core;
+  shortcutObjectiveCorridor(corridor);
   return corridor;
 }
 
@@ -4662,6 +4713,7 @@ void PlannerNode::onObjectiveRequest(
         // Graph lookup uses driving height, while refinement and the response
         // retain the caller's exact base-pose goal.
         corridor.request = core;
+        shortcutObjectiveCorridor(corridor);
       }
     }
   }

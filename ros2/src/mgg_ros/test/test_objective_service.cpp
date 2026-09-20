@@ -869,6 +869,26 @@ class PlannerNodeTestPeer {
     node.last_own_global_vertex_id_ = length;
     ++node.graph_revision_;
   }
+  /// A chain home whose vertices alternate across the road centre line, the
+  /// shape a trail leaves when the robot wandered while exploring.
+  static void addZigzagHomeCorridor(PlannerNode& node, int length,
+                                    double amplitude) {
+    const std::lock_guard<std::recursive_mutex> lock(node.planner_mutex_);
+    auto* previous = node.global_graph_->getVertex(0);
+    for (int id = 1; id <= length; ++id) {
+      const double y = (id % 2 == 0) ? amplitude : -amplitude;
+      auto* vertex = new mgg::Vertex(id, mgg::StateVec(id, y, 0.30, 0.0));
+      vertex->robot_id = static_cast<int>(node.planning_params_.robot_id);
+      vertex->type = mgg::VertexType::kVisited;
+      node.global_graph_->addVertex(vertex);
+      node.global_graph_->addEdge(
+          previous, vertex,
+          (vertex->state.head<3>() - previous->state.head<3>()).norm());
+      previous = vertex;
+    }
+    node.last_own_global_vertex_id_ = length;
+    ++node.graph_revision_;
+  }
   static void addSparseHomeCorridor(PlannerNode& node, double length) {
     const std::lock_guard<std::recursive_mutex> lock(node.planner_mutex_);
     auto* current =
@@ -1674,6 +1694,53 @@ TEST(PlannerObjective, PhysicalHomeUsesPersistentGraphCorridor) {
                             return pose.position.y > 0.30;
                           }));
   EXPECT_NEAR(response->path.back().position.x, 0.0, 1e-9);
+}
+
+TEST(PlannerObjective, HomeRouteIsStraightenedAcrossKnownFreeRoad) {
+  // The roadmap home is a zigzag of one-metre hops alternating 0.4 m either
+  // side of the road centre. Driving that chain would cross the centre ten
+  // times; the route the robot is given is the straight line the map can
+  // vouch for (rrg.cpp:4164 improveFreePath on every homing path).
+  using Peer = mgg_ros::PlannerNodeTestPeer;
+  rclcpp::NodeOptions options;
+  options.parameter_overrides(
+      {rclcpp::Parameter("use_sim_time", true),
+       rclcpp::Parameter("map.resolution", 0.05),
+       rclcpp::Parameter("objective_route_horizon_m", 20.0),
+       rclcpp::Parameter("objective_body_evidence_policy", "observed_ground"),
+       rclcpp::Parameter("objective_ground_evidence_policy", "provisional_unknown")});
+  auto node = std::make_shared<mgg_ros::PlannerNode>(options);
+  Peer::configureLongKnownRoad(*node);
+  Peer::addZigzagHomeCorridor(*node, 10, 0.4);
+  // The robot stands on the chain's last vertex, as it does after driving it;
+  // the chain itself stands in for the breadcrumbs that drive would have left.
+  Peer::setCurrentStateWithoutExtendingBackbone(*node, 10.0, 0.4, 0.075);
+  Peer::setFreshMappingComponent(*node, "shared-component");
+  SCOPED_TRACE(Peer::globalGraphDescription(*node));
+
+  const auto response = Peer::requestMappedObjective(
+      *node, mgg::ObjectiveKind::kReturnHome,
+      mgg::StateVec(0.0, 0.0, 0.075, 0.0), "kf-home");
+  ASSERT_EQ(response->status,
+            mgg_msgs::srv::PlanObjective::Response::SUCCEEDED)
+      << response->reason;
+  ASSERT_FALSE(response->global_path.empty());
+  // The global route no longer visits the zigzag: at most a handful of poses,
+  // none of them off the centre line by the zigzag's amplitude.
+  EXPECT_LE(response->global_path.size(), 4u);
+  for (std::size_t i = 1; i < response->global_path.size(); ++i) {
+    EXPECT_LT(std::abs(response->global_path[i].position.y), 0.30)
+        << response->global_path[i].position.x;
+  }
+  EXPECT_NEAR(response->global_path.back().position.x, 0.0, 1e-6);
+  // And the section the controller receives leaves the start side once and
+  // never swings back across the centre line.
+  double previous_y = response->path.front().position.y;
+  for (const auto& pose : response->path) {
+    EXPECT_LE(std::abs(pose.position.y), std::abs(previous_y) + 1e-6)
+        << pose.position.x;
+    previous_y = pose.position.y;
+  }
 }
 
 TEST(PlannerObjective, LongHomeKeepsGlobalRouteAndRefinesBoundedWindows) {

@@ -121,6 +121,13 @@ class PlannerNode : public rclcpp::Node {
   /// Rrg::runGlobalPlanner (rrg.cpp:5559) in auto mode: links the current
   /// pose into the global graph, ranks its frontiers (searchGlobalFrontier)
   /// and routes to the best one with the shared topological stage.
+  /// Straightens a topological route across space the map has seen
+  /// traversable: from each kept pose the farthest later pose whose swept,
+  /// ground-projected segment is admissible (mgg::shortcutPath). Upstream ran
+  /// every homing and global route through improveFreePath (rrg.cpp:4164,
+  /// 4215, 4423, 5891); a route left as the roadmap's vertex chain retraces
+  /// the wobble of the trail that built it, kerb crossings included.
+  void shortcutObjectiveCorridor(mgg::RouteCorridor& corridor);
   mgg::RouteCorridor runGlobalPlanner(mgg::PlanningRequest& core,
                                       TopologicalRetry& retry);
   /// Rrg::addRefPathToGraph (rrg.cpp:4540 and 4549): an accepted exploration
