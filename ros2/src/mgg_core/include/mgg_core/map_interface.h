@@ -38,13 +38,19 @@
 namespace mgg {
 
 /// Largest tilt, in radians, between a map authority transform's Z axis and
-/// the navigation Z axis that XY footprint queries accept. Peer SLAM
-/// corrections between ground robots carry a few milliradians of pitch and
-/// roll, and the circle and cylinder contracts hold within this bound:
-/// cos(0.02) differs from one by two parts in ten thousand. Larger tilts still
-/// refuse, because a tilted footprint is no longer a circle in the map's XY
-/// plane.
-inline constexpr double kMaxAuthorityTiltRad = 0.02;
+/// the navigation Z axis that XY footprint queries accept. A single robot's
+/// peer SLAM correction carries a few milliradians of pitch and roll; an
+/// inter-robot merge is a 6 DoF registration between base frames and leaves
+/// up to 1.4 degrees (benchbot 2026-09-20, four robots merged: robot_0's
+/// frame tilted 1.174 degrees, 0.0205 rad, and at the earlier 0.02 rad bound
+/// every one of its plans was refused as "footprint cell grid unavailable").
+/// At 0.05 rad the circle and cylinder contracts still hold to well under a
+/// centimetre across a footprint (cos(0.05) differs from one by 0.13
+/// percent, 1.2 mm across a metre) and the ground of a distant cell is off
+/// by the tilt times the distance, a slope of 5 percent that adjacent-cell
+/// step checks see as 1 cm per 0.2 m cell. Larger tilts still refuse,
+/// because a tilted footprint is no longer a circle in the map's XY plane.
+inline constexpr double kMaxAuthorityTiltRad = 0.05;
 
 /// Angle, in radians, between the rotated Z axis and Z.
 inline double authorityTiltRad(const Eigen::Matrix3d& rotation) {

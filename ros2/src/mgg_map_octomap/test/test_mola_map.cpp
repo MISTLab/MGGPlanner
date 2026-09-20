@@ -615,8 +615,10 @@ TEST(NativeMolaGrid, RaySupercoverIncludesStartFaceInBothDirections) {
 TEST(MolaMap, OccupiedOnlyCylinderRejectsTiltedOrExcessiveQueries) {
   Publication publication;
   Eigen::Isometry3d component_from_navigation = Eigen::Isometry3d::Identity();
+  // Beyond kMaxAuthorityTiltRad (0.05): a merged frame tilts up to 1.4
+  // degrees, this one 5.7.
   component_from_navigation.linear() =
-      Eigen::AngleAxisd(0.05, Eigen::Vector3d::UnitX()).toRotationMatrix();
+      Eigen::AngleAxisd(0.10, Eigen::Vector3d::UnitX()).toRotationMatrix();
   const auto request = publication.publish(
       0, {{2, 1, 0}}, freeBlock(), true, component_from_navigation);
   MolaMap provider(config(publication));
@@ -660,6 +662,34 @@ TEST(MolaMap, SmallAuthorityTiltIsTolerated) {
   EXPECT_GT(mgg::authorityTiltRad(component_from_navigation.linear()), 0.004);
   EXPECT_LT(mgg::authorityTiltRad(component_from_navigation.linear()),
             mgg::kMaxAuthorityTiltRad);
+}
+
+TEST(MolaMap, MergedFrameTiltOfADegreeIsToleratedAndThreeDegreesIsNot) {
+  // An inter-robot merge is a 6 DoF registration between base frames and
+  // leaves up to 1.4 degrees of roll or pitch (benchbot 2026-09-20: robot_0's
+  // frame at 1.174 degrees, 0.0205 rad, refused every plan at the earlier
+  // 0.02 rad bound). Footprint queries accept it; a 3.4 degree tilt does not.
+  for (const auto& [tilt, accepted] :
+       {std::pair{0.0205, true}, std::pair{0.06, false}}) {
+    Publication publication;
+    Eigen::Isometry3d component_from_navigation = Eigen::Isometry3d::Identity();
+    component_from_navigation.linear() =
+        Eigen::AngleAxisd(tilt, Eigen::Vector3d::UnitY()).toRotationMatrix();
+    const auto request = publication.publish(
+        0, {{2, 1, 0}}, freeBlock(), true, component_from_navigation);
+    MolaMap provider(config(publication));
+    provider.requestSnapshot(request);
+    ASSERT_TRUE(waitFor([&]() { return provider.getStatus(); }))
+        << provider.lastError();
+    std::vector<mgg::XYCellCenter> centers;
+    EXPECT_EQ(provider.getCircleIntersectingXYCellCenters(
+                  Eigen::Vector2d(0.5, 0.3), 0.3, 64, centers),
+              accepted)
+        << "tilt " << tilt;
+    EXPECT_EQ(centers.empty(), !accepted);
+    EXPECT_EQ(mgg::authorityTiltAcceptable(component_from_navigation.linear()),
+              accepted);
+  }
 }
 
 TEST(MolaMap, IndexRacingBehindTheSnapshotResolvesWithinTheLoadBudget) {
