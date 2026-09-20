@@ -1541,6 +1541,41 @@ TEST(PlannerObjective, SectionProxyStepsBackFromAMeasuredKerb) {
   EXPECT_FALSE(response->route_id.empty());
 }
 
+TEST(PlannerObjective, SectionProxyThatBottomsOutIsRefusedNotEmitted) {
+  // Measured kerb samples at every half metre of the horizon: the proxy steps
+  // back from 7.5 m all the way to the robot. That section is empty, and an
+  // empty section completed at once by the controller was the 2.5 Hz replan
+  // loop; the plan is refused with the reach it tried instead.
+  using Peer = mgg_ros::PlannerNodeTestPeer;
+  rclcpp::NodeOptions options;
+  options.parameter_overrides(
+      {rclcpp::Parameter("use_sim_time", true),
+       rclcpp::Parameter("map.resolution", 0.15),
+       rclcpp::Parameter("objective_route_horizon_m", 7.5),
+       rclcpp::Parameter("objective_body_evidence_policy", "observed_ground"),
+       rclcpp::Parameter("objective_ground_evidence_policy",
+                         "provisional_unknown")});
+  auto node = std::make_shared<mgg_ros::PlannerNode>(options);
+  Peer::configureLongKnownRoad(*node);
+  Peer::addLinearHomeCorridor(*node, 12);
+  for (double x = 0.5; x <= 7.5; x += 0.5) {
+    Peer::addMeasuredSurface(*node, x, 0.0, 0.225);
+  }
+  Peer::finishMapRevision(*node);
+
+  const auto response = Peer::requestObjective(
+      *node, mgg::ObjectiveKind::kNavigate,
+      mgg::StateVec(12.0, 0.0, 0.30, 0.0));
+  ASSERT_NE(response, nullptr);
+  EXPECT_NE(response->status,
+            mgg_msgs::srv::PlanObjective::Response::SUCCEEDED);
+  EXPECT_TRUE(response->path.empty()) << response->path.size();
+  EXPECT_NE(response->reason.find("section proxy meets measured terrain at every reach"),
+            std::string::npos)
+      << response->reason;
+  EXPECT_TRUE(response->route_id.empty());
+}
+
 TEST(PlannerObjective, ExplicitObjectiveUsesBoundedWiderDetourWindow) {
   using Peer = mgg_ros::PlannerNodeTestPeer;
   const auto make = [](double maximum_margin,

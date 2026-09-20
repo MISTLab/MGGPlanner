@@ -4419,12 +4419,13 @@ bool PlannerNode::sliceObjectiveRouteWindow(
       const Eigen::Vector3d footprint = robot_params_.getPlanningSize();
       double reach = remaining;
       mgg::StateVec endpoint = previous;
+      bool measured_hazard = false;
       for (;;) {
         endpoint.head<3>() = previous.head<3>() + direction * reach;
         endpoint[3] = target[3];
         // Route poses already sit at driving height, like the graph they
         // come from, so the footprint is checked there directly.
-        bool measured_hazard = false;
+        measured_hazard = false;
         if (robot_params_.type == mgg::RobotType::kGroundRobot) {
           const Eigen::Vector3d driving = endpoint.head<3>();
           measured_hazard =
@@ -4443,6 +4444,25 @@ bool PlannerNode::sliceObjectiveRouteWindow(
           break;
         }
         reach = next;
+      }
+      if (measured_hazard) {
+        // Every reach down to the progress bound met measured terrain. A
+        // section that ends where the robot stands is not a section: the
+        // controller completed it at once, the continuation found the robot
+        // 8 m short of the cached endpoint and the fresh plan emitted the
+        // same empty section, 2.5 times a second (robot_1 and robot_2 at
+        // the Bistro start, 2026-09-20, "objective section: 2 poses ...
+        // 0.02 m from the robot"). Refuse instead, naming the route segment.
+        corridor.status = mgg::PlanningStatus::kBlocked;
+        char reason[192];
+        std::snprintf(reason, sizeof(reason),
+                      "section proxy meets measured terrain at every reach "
+                      "from %.1f m down to %.1f m along route segment %zu",
+                      remaining, reach, next_index);
+        corridor.reason = reason;
+        corridor.poses.clear();
+        global_objective_path.clear();
+        return false;
       }
       if (reach < remaining) {
         RCLCPP_INFO(get_logger(),
