@@ -129,6 +129,11 @@ class PlannerNode : public rclcpp::Node {
   /// Rrg::addFrontiers (rrg.cpp:2397) on the last local graph, run before the
   /// next local graph replaces it (rrg.cpp:121, Rrg::reset).
   void addFrontiers();
+  /// Rrg::expandGlobalGraphTimerCallback (rrg.cpp:2535): every
+  /// kGlobalGraphUpdateTimerPeriod, once a plan has been made, spends up to
+  /// kGlobalGraphUpdateTimeBudget growing the global graph around its
+  /// unvisited vertices (mgg::expandGlobalGraph).
+  void expandGlobalGraphTimerCallback();
   /// Re-scores a global frontier with the gain volume centred on it, the
   /// port's counterpart of Rrg::computeVolumetricGainRayModelNoBound
   /// (rrg.cpp:3767). The volume is left centred on the robot afterwards.
@@ -234,6 +239,13 @@ class PlannerNode : public rclcpp::Node {
   /// broadcast and no geometry for a neighbour's graph to rendezvous with.
   void updateGlobalGraph();
   void stageGlobalBreadcrumbs(const mgg::StateVec& state);
+  /// The odometry ingestion of Rrg::timerCallback that the trajectory
+  /// backbone does not cover (rrg.cpp:5247 to 5290): every kOdoUpdateMinLength
+  /// the robot's state joins the global graph through expandGraph, wired to
+  /// every reachable neighbour; every kMinLength it is recorded in the robot
+  /// state history and event E1 marks the roadmap within kUpdateRadius
+  /// visited. Bounded by distance, so a stationary robot costs no map work.
+  void ingestOdometryIntoGlobalGraph();
   bool projectStateToDrivingHeight(mgg::StateVec& state,
                                    bool preserve_xy = false,
                                    bool accept_ground_above_sample = false) const;
@@ -381,6 +393,19 @@ class PlannerNode : public rclcpp::Node {
 
   mgg::StateVec current_state_ = mgg::StateVec::Zero();
   bool have_odometry_ = false;
+  /// Local graph builds so far (rrg.h:501 planner_trigger_count_). The
+  /// global graph expansion waits for the first one (rrg.cpp:2548).
+  int planner_trigger_count_ = 0;
+  /// Where the robot stood when its state last joined the global graph and
+  /// when it was last recorded in the history (rrg.h:524 and 525).
+  mgg::StateVec last_state_marker_ = mgg::StateVec::Zero();
+  mgg::StateVec last_state_marker_global_ = mgg::StateVec::Zero();
+  /// One state per kMinLength of travel (rrg.h:528), consulted by the global
+  /// graph expansion so it does not sample where the robot has been.
+  mgg::RobotStateHistory robot_state_hist_;
+  /// Draws the global graph expansion's samples in the local box the lattice
+  /// is built in (rrg.h:457 random_sampler_).
+  mgg::RandomSampler random_sampler_;
   struct CachedObjectiveRoute {
     std::string id;
     std::string mission_id;
@@ -523,6 +548,8 @@ class PlannerNode : public rclcpp::Node {
       validate_objective_route_srv_;
   rclcpp::Client<mgg_msgs::srv::QueryMapBatch>::SharedPtr indexed_map_client_;
   rclcpp::TimerBase::SharedPtr graph_timer_;
+  /// rrg.h:367 global_graph_update_timer_.
+  rclcpp::TimerBase::SharedPtr global_graph_update_timer_;
   /// One-shot guard against use_sim_time with no /clock.
   rclcpp::TimerBase::SharedPtr sim_time_check_;
 

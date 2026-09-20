@@ -45,6 +45,7 @@ add_library(${PROJECT_NAME}
   src/path_selection.cpp
   src/planning_stages.cpp
   src/global_graph.cpp
+  src/random_sampler.cpp
   src/grid_refinement.cpp
   src/log.cpp)
 target_include_directories(${PROJECT_NAME} PUBLIC

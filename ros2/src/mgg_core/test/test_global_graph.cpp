@@ -1,7 +1,9 @@
 // Tests for the global roadmap: path ingestion (Rrg::addRefPathToGraph),
-// frontier ingestion (Rrg::addFrontiers) and the global frontier search
-// (Rrg::runGlobalPlanner's ranking). The ROS 1 versions ran only inside a
-// full planning cycle.
+// frontier ingestion (Rrg::addFrontiers), the global frontier search
+// (Rrg::runGlobalPlanner's ranking), the timed expansion into observed space
+// (Rrg::expandGlobalGraphTimerCallback) and the odometry ingestion of
+// Rrg::timerCallback. The ROS 1 versions ran only inside a full planning
+// cycle or a live timer.
 
 #include <cmath>
 #include <map>
@@ -556,6 +558,303 @@ TEST(SearchGlobalFrontier, NoReachableFrontierReportsNone) {
   EXPECT_EQ(mgg::searchGlobalFrontier(fixture.global, 99, 0, nullptr)
                 .best_frontier,
             nullptr);
+}
+
+/// A sampler over a square local box in the plane, seeded so a run repeats.
+mgg::RandomSampler boxSampler(double half_width, unsigned seed = 7) {
+  return mgg::RandomSampler(Eigen::Vector3d(-half_width, -half_width, 0.0),
+                            Eigen::Vector3d(half_width, half_width, 0.0),
+                            seed);
+}
+
+/// A visited root at the origin and one unvisited vertex 30 m east: one
+/// cluster, well clear of everything else.
+struct ExpansionScene {
+  ExpansionScene() {
+    fixture.global.getVertex(0)->type = VertexType::kVisited;
+    unvisited = fixture.add(fixture.global, StateVec(30.0, 0.0, 0.0, 0.0),
+                            nullptr);
+  }
+
+  int degree(int id) const {
+    const auto edges = fixture.global.edge_map_.find(id);
+    return edges == fixture.global.edge_map_.end()
+               ? 0
+               : static_cast<int>(edges->second.size());
+  }
+
+  Roadmap fixture;
+  Vertex* unvisited = nullptr;
+  mgg::RobotStateHistory history;
+};
+
+TEST(ExpandGlobalGraph, GrowsAroundUnvisitedClustersOnly) {
+  ExpansionScene scene;
+  mgg::RandomSampler sampler = boxSampler(10.0);
+  int scored = 0;
+  const auto gain = [&scored](Vertex& vertex) {
+    ++scored;
+    vertex.vol_gain.is_frontier = false;
+  };
+  const mgg::GlobalGraphExpansionReport report = mgg::expandGlobalGraph(
+      scene.fixture.global, scene.fixture.ctx, sampler, scene.history, gain,
+      0.02);
+  EXPECT_EQ(report.unvisited_vertices, 1);
+  EXPECT_EQ(report.clusters, 1);
+  EXPECT_GE(report.passes, 2);
+  EXPECT_GT(report.samples, 0);
+  EXPECT_GT(report.vertices_added, 0);
+  EXPECT_EQ(report.edges_added, report.vertices_added);
+  EXPECT_EQ(report.frontiers_added, 0);
+  EXPECT_EQ(scored, report.vertices_added);
+  EXPECT_EQ(scene.fixture.global.getNumVertices(), 2 + report.vertices_added);
+  // Every new vertex grew out of the cluster's box, wired into the graph and
+  // typed unvisited; nothing was sampled around the visited root.
+  for (const auto& entry : scene.fixture.global.vertices_map_) {
+    if (entry.first <= 1) continue;
+    EXPECT_GT(entry.second->state.x(), 15.0);
+    EXPECT_EQ(entry.second->type, VertexType::kUnvisited);
+    EXPECT_GE(scene.degree(entry.first), 1);
+  }
+
+  // With nothing unvisited there is no cluster and no pass: a frontier or a
+  // visited vertex is not sampled around.
+  Roadmap quiet;
+  quiet.global.getVertex(0)->type = VertexType::kVisited;
+  quiet.add(quiet.global, StateVec(30.0, 0.0, 0.0, 0.0), nullptr,
+            VertexType::kFrontier);
+  const mgg::GlobalGraphExpansionReport none = mgg::expandGlobalGraph(
+      quiet.global, quiet.ctx, sampler, scene.history, gain, 0.02);
+  EXPECT_EQ(none.unvisited_vertices, 0);
+  EXPECT_EQ(none.clusters, 0);
+  EXPECT_EQ(none.passes, 0);
+  EXPECT_EQ(quiet.global.getNumVertices(), 2);
+}
+
+TEST(ExpandGlobalGraph, ClustersUnvisitedVerticesByTheLocalBoxRadius) {
+  ExpansionScene scene;
+  // Within kLocalBoxRadius of the first unvisited vertex: the same cluster.
+  scene.fixture.add(scene.fixture.global, StateVec(36.0, 0.0, 0.0, 0.0),
+                    nullptr);
+  // Farther than that from both: a cluster of its own.
+  scene.fixture.add(scene.fixture.global, StateVec(30.0, 40.0, 0.0, 0.0),
+                    nullptr);
+  mgg::RandomSampler sampler = boxSampler(10.0);
+  const mgg::GlobalGraphExpansionReport report = mgg::expandGlobalGraph(
+      scene.fixture.global, scene.fixture.ctx, sampler, scene.history,
+      nullptr, 0.0);
+  EXPECT_EQ(report.unvisited_vertices, 3);
+  EXPECT_EQ(report.clusters, 2);
+}
+
+TEST(ExpandGlobalGraph, TypesNewVerticesAsFrontiersWhenTheirGainSaysSo) {
+  ExpansionScene scene;
+  mgg::RandomSampler sampler = boxSampler(10.0);
+  const auto gain = [](Vertex& vertex) {
+    vertex.vol_gain.gain = 12.0;
+    vertex.vol_gain.is_frontier = true;
+  };
+  const mgg::GlobalGraphExpansionReport report = mgg::expandGlobalGraph(
+      scene.fixture.global, scene.fixture.ctx, sampler, scene.history, gain,
+      0.02);
+  ASSERT_GT(report.vertices_added, 0);
+  EXPECT_EQ(report.frontiers_added, report.vertices_added);
+  for (const auto& entry : scene.fixture.global.vertices_map_) {
+    if (entry.first <= 1) continue;
+    EXPECT_EQ(entry.second->type, VertexType::kFrontier);
+    EXPECT_DOUBLE_EQ(entry.second->vol_gain.gain, 12.0);
+  }
+}
+
+TEST(ExpandGlobalGraph, SkipsSamplesNearVerticesRecordedStatesOrFrontiers) {
+  // A box small enough that every sample lies within kSparseRadius of the
+  // cluster's own vertex: nothing is offered to expandGraph.
+  {
+    ExpansionScene scene;
+    mgg::RandomSampler sampler = boxSampler(2.0);
+    const mgg::GlobalGraphExpansionReport report = mgg::expandGlobalGraph(
+        scene.fixture.global, scene.fixture.ctx, sampler, scene.history,
+        nullptr, 0.005);
+    EXPECT_GE(report.passes, 1);
+    EXPECT_EQ(report.samples, 0);
+    EXPECT_EQ(report.vertices_added, 0);
+    EXPECT_EQ(scene.fixture.global.getNumVertices(), 2);
+  }
+  // The robot has already driven through the box: states recorded every
+  // metre or so leave no sample farther than kSparseRadius from one.
+  {
+    ExpansionScene scene;
+    for (double x = 15.0; x <= 45.0 + 1e-9; x += 5.0) {
+      for (double y = -15.0; y <= 15.0 + 1e-9; y += 5.0) {
+        scene.history.addState(StateVec(x, y, 0.0, 0.0));
+      }
+    }
+    mgg::RandomSampler sampler = boxSampler(10.0);
+    const mgg::GlobalGraphExpansionReport report = mgg::expandGlobalGraph(
+        scene.fixture.global, scene.fixture.ctx, sampler, scene.history,
+        nullptr, 0.005);
+    EXPECT_GE(report.passes, 1);
+    EXPECT_EQ(report.samples, 0);
+    EXPECT_EQ(scene.fixture.global.getNumVertices(), 2);
+  }
+  // Frontiers around the box: no sample lies farther than
+  // kOverlappedFrontierRadius from one, so none is expanded and the
+  // frontiers keep the space to themselves.
+  {
+    ExpansionScene scene;
+    for (double x = 15.0; x <= 45.0 + 1e-9; x += 5.0) {
+      for (double y = -15.0; y <= 15.0 + 1e-9; y += 5.0) {
+        if (std::abs(x - 30.0) < 1e-9 && std::abs(y) < 1e-9) continue;
+        scene.fixture.add(scene.fixture.global, StateVec(x, y, 0.0, 0.0),
+                          nullptr, VertexType::kFrontier);
+      }
+    }
+    const int before = scene.fixture.global.getNumVertices();
+    mgg::RandomSampler sampler = boxSampler(10.0);
+    const mgg::GlobalGraphExpansionReport report = mgg::expandGlobalGraph(
+        scene.fixture.global, scene.fixture.ctx, sampler, scene.history,
+        nullptr, 0.005);
+    EXPECT_EQ(report.unvisited_vertices, 1);
+    EXPECT_GE(report.passes, 1);
+    EXPECT_EQ(report.samples, 0);
+    EXPECT_EQ(scene.fixture.global.getNumVertices(), before);
+  }
+}
+
+TEST(ExpandGlobalGraph, TimeBudgetBoundsTheWork) {
+  // Zero budget: the clusters are formed but no pass is made (rrg.cpp:2613).
+  {
+    ExpansionScene scene;
+    mgg::RandomSampler sampler = boxSampler(10.0);
+    const mgg::GlobalGraphExpansionReport report = mgg::expandGlobalGraph(
+        scene.fixture.global, scene.fixture.ctx, sampler, scene.history,
+        nullptr, 0.0);
+    EXPECT_EQ(report.clusters, 1);
+    EXPECT_EQ(report.passes, 0);
+    EXPECT_EQ(report.samples, 0);
+    EXPECT_EQ(scene.fixture.global.getNumVertices(), 2);
+  }
+  // A budget: passes are made while it lasts, and the run ends soon after.
+  // The bound is loose because a pass over one cluster in open space takes
+  // microseconds, so the run cannot be timed to the millisecond.
+  {
+    ExpansionScene scene;
+    mgg::RandomSampler sampler = boxSampler(10.0);
+    const double budget = 0.02;
+    const mgg::GlobalGraphExpansionReport report = mgg::expandGlobalGraph(
+        scene.fixture.global, scene.fixture.ctx, sampler, scene.history,
+        nullptr, budget);
+    EXPECT_GE(report.passes, 2);
+    EXPECT_GE(report.elapsed_s, budget);
+    EXPECT_LT(report.elapsed_s, 1.0);
+  }
+}
+
+TEST(ExpandGlobalGraph, HistoryAnswersRangeQueries) {
+  mgg::RobotStateHistory history;
+  std::vector<const StateVec*> found;
+  EXPECT_FALSE(history.getNearestStates(StateVec::Zero(), 100.0, &found));
+  for (int i = 0; i < 300; ++i) {
+    history.addState(StateVec(i * 1.0, 0.0, 0.0, 0.0));
+  }
+  EXPECT_EQ(history.size(), 300u);
+  ASSERT_TRUE(history.getNearestStates(StateVec(10.0, 0.0, 0.0, 0.0), 2.5,
+                                       &found));
+  EXPECT_EQ(found.size(), 5u);
+  for (const StateVec* state : found) {
+    EXPECT_LE(std::abs(state->x() - 10.0), 2.5);
+  }
+  EXPECT_FALSE(history.getNearestStates(StateVec(500.0, 0.0, 0.0, 0.0), 2.5,
+                                        &found));
+  history.reset();
+  EXPECT_EQ(history.size(), 0u);
+  EXPECT_FALSE(history.getNearestStates(StateVec(10.0, 0.0, 0.0, 0.0), 2.5,
+                                        &found));
+}
+
+TEST(SampleVertex, DrawsAFreeStateInTheBoxAroundTheRoot) {
+  Roadmap open;
+  mgg::RandomSampler sampler = boxSampler(3.0);
+  const StateVec root(30.0, 40.0, 0.0, 0.0);
+  for (int i = 0; i < 50; ++i) {
+    Vertex vertex(-1, StateVec::Zero());
+    ASSERT_TRUE(mgg::sampleVertex(sampler, root, open.ctx, vertex));
+    EXPECT_LE(std::abs(vertex.state.x() - root.x()), 3.0);
+    EXPECT_LE(std::abs(vertex.state.y() - root.y()), 3.0);
+    EXPECT_DOUBLE_EQ(vertex.state.z(), 0.0);
+    EXPECT_FALSE(vertex.is_hanging);
+  }
+  // Every draw of the box lands in occupied space: no vertex.
+  Roadmap blocked(0.0);
+  Vertex vertex(-1, StateVec::Zero());
+  EXPECT_FALSE(mgg::sampleVertex(sampler, StateVec(0.0, 10.0, 0.0, 0.0),
+                                 blocked.ctx, vertex));
+}
+
+TEST(OdometryIngestion, EventE1MarksVerticesWithinThreeMetresVisited) {
+  // rrg.cpp:5279 and 5285: every kMinLength of travel, the vertices within
+  // kUpdateRadius of the robot are visited, frontiers included.
+  Roadmap fixture;
+  Vertex* previous = fixture.global.getVertex(0);
+  for (int x = 1; x <= 6; ++x) {
+    previous = fixture.add(fixture.global, StateVec(x, 0.0, 0.0, 0.0),
+                           previous,
+                           x == 2 ? VertexType::kFrontier
+                                  : VertexType::kUnvisited);
+  }
+  StateVec robot(0.0, 0.0, 0.0, 0.0);
+  fixture.global.updateVertexTypeInRange(robot, 3.0);
+  for (int x = 0; x <= 6; ++x) {
+    const Vertex* vertex = fixture.nearest(Eigen::Vector3d(x, 0.0, 0.0));
+    ASSERT_NE(vertex, nullptr);
+    EXPECT_EQ(vertex->type, x <= 3 ? VertexType::kVisited
+                                   : VertexType::kUnvisited)
+        << "x = " << x;
+  }
+}
+
+TEST(OdometryIngestion, ExpandGraphWiresTheOdometryStateToEveryReachableNeighbour) {
+  // rrg.cpp:5263: the robot's state joins the global graph through
+  // expandGraph, which in graph mode adds an edge to every vertex within
+  // nearest_range it can reach, not only to the nearest one.
+  struct Wiring {
+    bool to_root = false;
+    bool to_side = false;
+  };
+  const auto run = [](Roadmap& fixture) {
+    fixture.planning.nearest_range = 1.5;
+    Vertex* root = fixture.global.getVertex(0);
+    Vertex* side = fixture.add(fixture.global, StateVec(0.0, 1.0, 0.0, 0.0),
+                               root);
+    mgg::ExpandGraphReport rep;
+    Vertex state(-1, StateVec(1.0, 0.4, 0.0, 0.0));
+    mgg::expandGraph(fixture.global, state, rep, fixture.ctx);
+    EXPECT_EQ(rep.status, mgg::ExpandGraphStatus::kSuccess);
+    EXPECT_EQ(rep.num_vertices_added, 1);
+    Wiring wiring;
+    if (rep.vertex_added != nullptr) {
+      EXPECT_EQ(rep.vertex_added->parent, root);
+      wiring.to_root =
+          fixture.global.graph_->edgeExists(rep.vertex_added->id, root->id);
+      wiring.to_side =
+          fixture.global.graph_->edgeExists(rep.vertex_added->id, side->id);
+    }
+    return wiring;
+  };
+  // Nearest is the root (1.08 m); the side vertex (1.17 m) is in range too.
+  Roadmap open;
+  const Wiring meshed = run(open);
+  EXPECT_TRUE(meshed.to_root);
+  EXPECT_TRUE(meshed.to_side);
+  EXPECT_EQ(open.global.getNumEdges(), 3);
+  // A thin wall between the state and the side vertex: only the root edge.
+  Roadmap walled;
+  SlabSpace wall(0.7, 0.8);
+  walled.ctx.map = &wall;
+  const Wiring chained = run(walled);
+  EXPECT_TRUE(chained.to_root);
+  EXPECT_FALSE(chained.to_side);
+  EXPECT_EQ(walled.global.getNumEdges(), 2);
 }
 
 }  // namespace

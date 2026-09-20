@@ -1,12 +1,53 @@
 #include "mgg_core/global_graph.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <limits>
 
 #include "mgg_core/trajectory.h"
 
 namespace mgg {
+
+RobotStateHistory::RobotStateHistory() { reset(); }
+
+RobotStateHistory::~RobotStateHistory() {
+  if (kd_tree_) kd_free(kd_tree_);
+}
+
+void RobotStateHistory::reset() {
+  if (kd_tree_) kd_free(kd_tree_);
+  kd_tree_ = kd_create(3);
+  state_hist_.clear();
+}
+
+void RobotStateHistory::addState(const StateVec& state) {
+  state_hist_.push_back(state);
+  StateVec* stored = &state_hist_.back();
+  kd_insert3(kd_tree_, stored->x(), stored->y(), stored->z(), stored);
+}
+
+bool RobotStateHistory::getNearestStates(
+    const StateVec& state, double range,
+    std::vector<const StateVec*>* s_res) const {
+  // The kd-tree library cannot deal with an empty tree (rrg.cpp:6245).
+  if (state_hist_.empty()) return false;
+  kdres* neighbors =
+      kd_nearest_range3(kd_tree_, state.x(), state.y(), state.z(), range);
+  const int neighbors_size = kd_res_size(neighbors);
+  if (neighbors_size <= 0) {
+    kd_res_free(neighbors);  // upstream returned without freeing (rrg.cpp:6249)
+    return false;
+  }
+  s_res->clear();
+  for (int i = 0; i < neighbors_size; ++i) {
+    s_res->push_back(static_cast<const StateVec*>(kd_res_item_data(neighbors)));
+    if (kd_res_next(neighbors) <= 0) break;
+  }
+  kd_res_free(neighbors);
+  return true;
+}
+
 namespace {
 
 /// rrg.cpp:4831 and 4832.
@@ -435,6 +476,163 @@ GlobalFrontierReport searchGlobalFrontier(
       report.best_distance = distance->second;
     }
   }
+  return report;
+}
+
+bool sampleVertex(RandomSampler& sampler, const StateVec& root_state,
+                  const ExpandContext& ctx, Vertex& vertex) {
+  // rrg.cpp:455 to 503, the RandomSampler overload.
+  StateVec state = StateVec::Zero();
+  bool hanging = false;
+  bool found = false;
+
+  int while_thres = 1000;  // magic number (rrg.cpp:461)
+  while (!found && while_thres--) {
+    hanging = false;
+    sampler.generate(root_state, state);
+    // rrg.cpp:468 rejected draws outside the world-fixed global bound, less
+    // half a robot. The port's local graph has no such bound (its global
+    // space is re-centred on the robot for gain scoring), so neither does
+    // this; the geofence still applies to every edge in expandGraph.
+
+    if (ctx.robot->type == RobotType::kGroundRobot) {
+      Eigen::Vector3d sample = state.head<3>() + ctx.robot->center_offset;
+      VoxelStatus vs;
+      const double ground_dist = ctx.ground->projectSample(sample, vs);
+      // Nothing within reach below the draw. The one-argument overload
+      // rejected this (rrg.cpp:426); the three-argument one shifted the state
+      // by the -1 sentinel, which no caller could use.
+      if (vs == VoxelStatus::kFree || !std::isfinite(ground_dist)) continue;
+      if (vs == VoxelStatus::kUnknown) hanging = true;
+      sample[2] -= (ground_dist - ctx.planning->max_ground_height);
+      state[0] = sample[0] - ctx.robot->center_offset[0];
+      state[1] = sample[1] - ctx.robot->center_offset[1];
+      state[2] -= (ground_dist - ctx.planning->max_ground_height);
+    }
+
+    // Check if the surrounding area is free (rrg.cpp:487). The unknown
+    // policy is the one the local lattice applies to its cells.
+    if (ctx.map->getBoxStatus(state.head<3>() + ctx.robot->center_offset,
+                              ctx.robot_box_size,
+                              !ctx.allow_unknown_lattice_body) ==
+        VoxelStatus::kFree) {
+      found = true;
+    }
+  }
+  vertex.state = state;
+  vertex.is_hanging = hanging;
+  return found;
+}
+
+GlobalGraphExpansionReport expandGlobalGraph(
+    GraphManager& global_graph, const ExpandContext& ctx,
+    RandomSampler& sampler, const RobotStateHistory& robot_state_hist,
+    const RecomputeGainFn& compute_gain, double time_budget_s) {
+  // rrg.cpp:2535 to 2671.
+  using Clock = std::chrono::steady_clock;
+  const Clock::time_point time_lim = Clock::now();
+  const auto elapsed = [time_lim]() {
+    return std::chrono::duration<double>(Clock::now() - time_lim).count();
+  };
+  GlobalGraphExpansionReport report;
+
+  // Extract unvisited vertices in the global graph (rrg.cpp:2565).
+  std::vector<Vertex*> unvisited_vertices;
+  for (auto& entry : global_graph.vertices_map_) {
+    Vertex* vertex = entry.second;
+    if (vertex != nullptr && vertex->type == VertexType::kUnvisited) {
+      unvisited_vertices.push_back(vertex);
+    }
+  }
+  report.unvisited_vertices = static_cast<int>(unvisited_vertices.size());
+  if (unvisited_vertices.empty()) {
+    report.elapsed_s = elapsed();
+    return report;
+  }
+
+  // Randomly choose a vertex, then group all nearby vertices within a local
+  // box; repeat until the boxes cover every unvisited vertex (rrg.cpp:2574
+  // to 2606). Each box is represented by the centroid of its vertices.
+  constexpr double kLocalBoxRadiusSq = kLocalBoxRadius * kLocalBoxRadius;
+  std::vector<Eigen::Vector3d> cluster_centroids;
+  std::vector<Vertex*> unvisited_vertices_remain;
+  while (!unvisited_vertices.empty()) {
+    unvisited_vertices_remain.clear();
+    const Eigen::Vector3d seed =
+        unvisited_vertices[sampler.index(unvisited_vertices.size())]
+            ->state.head<3>();
+    Eigen::Vector3d cluster_center = Eigen::Vector3d::Zero();
+    int num_vertices_in_cluster = 0;
+    for (Vertex* vertex : unvisited_vertices) {
+      if ((vertex->state.head<3>() - seed).squaredNorm() <=
+          kLocalBoxRadiusSq) {
+        cluster_center += vertex->state.head<3>();
+        ++num_vertices_in_cluster;
+      } else {
+        unvisited_vertices_remain.push_back(vertex);
+      }
+    }
+    cluster_centroids.push_back(cluster_center / num_vertices_in_cluster);
+    unvisited_vertices.swap(unvisited_vertices_remain);
+  }
+  report.clusters = static_cast<int>(cluster_centroids.size());
+
+  // Expand the global graph: one sample around each centroid per pass, for
+  // as long as the budget lasts (rrg.cpp:2608 to 2668).
+  while (elapsed() < time_budget_s) {
+    ++report.passes;
+    for (const Eigen::Vector3d& centroid : cluster_centroids) {
+      const StateVec centroid_state(centroid.x(), centroid.y(), centroid.z(),
+                                    0.0);
+      Vertex new_vertex(-1, StateVec::Zero());
+      if (!sampleVertex(sampler, centroid_state, ctx, new_vertex)) continue;
+      if (new_vertex.is_hanging) continue;
+      // rrg.cpp:2623 to 2631 dropped the sample onto the ground a second
+      // time; sampleVertex has already done so, and expandGraph does it
+      // again before checking the edge.
+
+      // Only expand samples in sparse areas, not yet passed by the robot and
+      // not close to any frontier (rrg.cpp:2632 to 2654).
+      std::vector<const StateVec*> s_res;
+      if (robot_state_hist.getNearestStates(new_vertex.state, kSparseRadius,
+                                            &s_res)) {
+        continue;
+      }
+      std::vector<Vertex*> v_res;
+      if (global_graph.getNearestVertices(&new_vertex.state, kSparseRadius,
+                                          &v_res)) {
+        continue;
+      }
+      std::vector<Vertex*> f_res;
+      if (global_graph.getNearestVertices(&new_vertex.state,
+                                          kOverlappedFrontierRadius, &f_res) &&
+          std::any_of(f_res.begin(), f_res.end(), [](const Vertex* vertex) {
+            return vertex != nullptr &&
+                   vertex->type == VertexType::kFrontier;
+          })) {
+        continue;
+      }
+
+      ++report.samples;
+      ExpandGraphReport rep;
+      expandGraph(global_graph, new_vertex, rep, ctx);
+      if (rep.status != ExpandGraphStatus::kSuccess ||
+          rep.vertex_added == nullptr) {
+        continue;
+      }
+      // rrg.cpp:2660: the volumetric gain says whether the new vertex looks
+      // into unknown space, which makes it a global frontier.
+      if (compute_gain) compute_gain(*rep.vertex_added);
+      if (rep.vertex_added->vol_gain.is_frontier) {
+        rep.vertex_added->type = VertexType::kFrontier;
+        ++report.frontiers_added;
+      }
+      report.vertices_added += rep.num_vertices_added;
+      report.edges_added += rep.num_edges_added;
+    }
+  }
+
+  report.elapsed_s = elapsed();
   return report;
 }
 

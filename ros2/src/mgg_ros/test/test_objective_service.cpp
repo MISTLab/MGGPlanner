@@ -3,6 +3,7 @@
 #include <cmath>
 #include <future>
 #include <memory>
+#include <set>
 #include <sstream>
 #include <stdexcept>
 #include <thread>
@@ -1227,6 +1228,58 @@ class PlannerNodeTestPeer {
     const std::lock_guard<std::recursive_mutex> lock(node.planner_mutex_);
     node.mapping_snapshot_received_ =
         std::chrono::steady_clock::now() - std::chrono::seconds(10);
+  }
+  static void setEdgeLengths(PlannerNode& node, double min_length,
+                             double max_length) {
+    const std::lock_guard<std::recursive_mutex> lock(node.planner_mutex_);
+    node.planning_params_.edge_length_min = min_length;
+    node.planning_params_.edge_length_max = max_length;
+  }
+  /// Distinct neighbours of a global vertex.
+  static int globalVertexNeighbours(const PlannerNode& node, int id) {
+    const auto edges = node.global_graph_->edge_map_.find(id);
+    if (edges == node.global_graph_->edge_map_.end()) return 0;
+    std::set<int> neighbours;
+    for (const auto& edge : edges->second) neighbours.insert(edge.first);
+    return static_cast<int>(neighbours.size());
+  }
+  static int maxGlobalVertexNeighbours(const PlannerNode& node) {
+    int most = 0;
+    for (const auto& entry : node.global_graph_->vertices_map_) {
+      most = std::max(most, globalVertexNeighbours(node, entry.first));
+    }
+    return most;
+  }
+  static bool allGlobalVerticesVisited(const PlannerNode& node) {
+    for (const auto& entry : node.global_graph_->vertices_map_) {
+      if (entry.second != nullptr &&
+          entry.second->type != mgg::VertexType::kVisited) {
+        return false;
+      }
+    }
+    return true;
+  }
+  static std::size_t robotStateHistorySize(const PlannerNode& node) {
+    return node.robot_state_hist_.size();
+  }
+  static int plannerTriggerCount(const PlannerNode& node) {
+    return node.planner_trigger_count_;
+  }
+  static void setPlannerTriggerCount(PlannerNode& node, int count) {
+    const std::lock_guard<std::recursive_mutex> lock(node.planner_mutex_);
+    node.planner_trigger_count_ = count;
+  }
+  static void seedRandomSampler(PlannerNode& node, unsigned seed) {
+    const std::lock_guard<std::recursive_mutex> lock(node.planner_mutex_);
+    node.random_sampler_.reset(seed);
+  }
+  static void setGlobalVertexType(PlannerNode& node, int id,
+                                  mgg::VertexType type) {
+    const std::lock_guard<std::recursive_mutex> lock(node.planner_mutex_);
+    node.global_graph_->getVertex(id)->type = type;
+  }
+  static void expandGlobalGraphOnce(PlannerNode& node) {
+    node.expandGlobalGraphTimerCallback();
   }
 };
 
@@ -3116,9 +3169,14 @@ TEST(PlannerBackbone, CapturesHomeBeforeMotionAndConnectsOnlyMappedTerrain) {
   EXPECT_NEAR(home.y(), 0.0, 0.11);
   EXPECT_NEAR(home.z(), 0.30, 0.11);
 
+  // One more breadcrumb at 1.5 m, and the robot's own state joins the graph
+  // through expandGraph as well (rrg.cpp:5263), so the graph gains two
+  // vertices here.
   mgg_ros::PlannerNodeTestPeer::acceptOdometry(*planner, 1.80, 0.0, 0.075);
-  ASSERT_EQ(mgg_ros::PlannerNodeTestPeer::globalVertices(*planner), 4);
-  ASSERT_EQ(mgg_ros::PlannerNodeTestPeer::globalEdges(*planner), 3);
+  ASSERT_EQ(mgg_ros::PlannerNodeTestPeer::globalVertices(*planner), 5);
+  ASSERT_GE(mgg_ros::PlannerNodeTestPeer::globalEdges(*planner), 4);
+  EXPECT_TRUE(mgg_ros::PlannerNodeTestPeer::hasGlobalVertexNear(
+      *planner, 1.5, 0.0, 0.05));
 
   // Authority home is a base pose, while graph vertices sit at driving
   // height.  The normal goal tolerance still selects the initial anchor.
@@ -4255,6 +4313,101 @@ TEST(PlannerBackbone, RepeatedOutAndBackReusesOwnedTrajectoryVertices) {
   EXPECT_FALSE(Peer::backboneHistoryLost(*planner));
 }
 
+TEST(PlannerBackbone, DrivingAKnownRoadMeshesTheGlobalGraphAndVisitsIt) {
+  // rrg.cpp:5247 to 5290: alongside the breadcrumb chain, the robot's state
+  // joins the global graph through expandGraph every half metre, wired to
+  // every reachable neighbour, and every metre event E1 marks the roadmap
+  // within 3 m visited. The result is a mesh, not a chain.
+  rclcpp::NodeOptions options;
+  options.parameter_overrides({rclcpp::Parameter("map.resolution", 0.05)});
+  auto planner = std::make_shared<mgg_ros::PlannerNode>(options);
+  using Peer = mgg_ros::PlannerNodeTestPeer;
+  Peer::configureLongKnownRoad(*planner);
+  Peer::setEdgeLengths(*planner, 0.10, 1.0);
+  ASSERT_EQ(Peer::maxGlobalVertexNeighbours(*planner), 0);
+  ASSERT_EQ(Peer::robotStateHistorySize(*planner), 0u);
+
+  // Odometry at 0.3 m steps, so the states that join the graph fall between
+  // the half-metre breadcrumbs rather than on them.
+  for (int i = 1; i <= 20; ++i) {
+    Peer::acceptOdometry(*planner, i * 0.30, 0.0, 0.075);
+  }
+  SCOPED_TRACE(Peer::globalGraphDescription(*planner));
+  EXPECT_EQ(Peer::pendingBreadcrumbs(*planner), 0u);
+  EXPECT_FALSE(Peer::backboneHistoryLost(*planner));
+  // More vertices than the twelve breadcrumbs, and a vertex wired to more
+  // than the one it was chained from.
+  EXPECT_GT(Peer::globalVertices(*planner), 13);
+  EXPECT_GT(Peer::globalEdges(*planner), Peer::globalVertices(*planner) - 1);
+  EXPECT_GE(Peer::maxGlobalVertexNeighbours(*planner), 2);
+  // One recorded state per metre of travel, and E1 has visited everything
+  // the robot passed within 3 m of, the odometry vertices included.
+  EXPECT_EQ(Peer::robotStateHistorySize(*planner), 5u);
+  EXPECT_TRUE(Peer::allGlobalVerticesVisited(*planner));
+  // The chain home is intact through the mesh.
+  const mgg::StateVec home(0.0, 0.0, 0.075, 0.0);
+  const mgg::RouteCorridor route = Peer::planHome(*planner, home);
+  EXPECT_EQ(route.status, mgg::PlanningStatus::kSucceeded) << route.reason;
+  EXPECT_GE(route.poses.size(), 2u);
+
+  // Standing still costs nothing: no state joins, none is recorded.
+  const int vertices = Peer::globalVertices(*planner);
+  const int edges = Peer::globalEdges(*planner);
+  for (int i = 0; i < 20; ++i) {
+    Peer::acceptOdometry(*planner, 6.0 + (i % 2 == 0 ? 0.01 : -0.01), 0.0,
+                         0.075);
+  }
+  EXPECT_EQ(Peer::globalVertices(*planner), vertices);
+  EXPECT_EQ(Peer::globalEdges(*planner), edges);
+  EXPECT_EQ(Peer::robotStateHistorySize(*planner), 5u);
+}
+
+TEST(PlannerBackbone, GlobalGraphExpansionGrowsIntoObservedSpaceAfterAPlan) {
+  // rrg.cpp:2535: the timer samples around the global graph's unvisited
+  // vertices and expands the graph into mapped space the robot has not
+  // driven, once a plan has been made.
+  rclcpp::NodeOptions options;
+  options.parameter_overrides({rclcpp::Parameter("map.resolution", 0.05)});
+  auto planner = std::make_shared<mgg_ros::PlannerNode>(options);
+  using Peer = mgg_ros::PlannerNodeTestPeer;
+  Peer::configureLongKnownRoad(*planner);
+  Peer::setEdgeLengths(*planner, 0.10, 1.0);
+  for (int i = 1; i <= 20; ++i) {
+    Peer::acceptOdometry(*planner, i * 0.30, 0.0, 0.075);
+  }
+  ASSERT_TRUE(Peer::allGlobalVerticesVisited(*planner));
+  // The vertex where the robot stands is left unvisited, as an exploration
+  // path's vertices are, so it seeds one cluster at the end of the driven
+  // road. The road continues to x = 30, mapped but not driven.
+  const int seed_id = Peer::globalVertices(*planner) - 1;
+  Peer::setGlobalVertexType(*planner, seed_id, mgg::VertexType::kUnvisited);
+  Peer::seedRandomSampler(*planner, 11u);
+  const int before = Peer::globalVertices(*planner);
+  const std::uint64_t revision = Peer::globalGraphRevision(*planner);
+
+  // Before the first plan the timer does nothing (rrg.cpp:2548).
+  ASSERT_EQ(Peer::plannerTriggerCount(*planner), 0);
+  Peer::expandGlobalGraphOnce(*planner);
+  EXPECT_EQ(Peer::globalVertices(*planner), before);
+  EXPECT_EQ(Peer::globalGraphRevision(*planner), revision);
+
+  Peer::setPlannerTriggerCount(*planner, 1);
+  Peer::expandGlobalGraphOnce(*planner);
+  SCOPED_TRACE(Peer::globalGraphDescription(*planner));
+  EXPECT_GT(Peer::globalVertices(*planner), before);
+  EXPECT_GT(Peer::globalGraphRevision(*planner), revision);
+  // The new vertices lie on the mapped road ahead of the robot, wired to it.
+  bool ahead = false;
+  for (int id = before; id < Peer::globalVertices(*planner); ++id) {
+    const mgg::StateVec state = Peer::globalVertexState(*planner, id);
+    EXPECT_LE(std::abs(state.y()), 0.5);
+    EXPECT_GT(state.x(), 6.0);
+    EXPECT_GE(Peer::globalVertexNeighbours(*planner, id), 1);
+    ahead = true;
+  }
+  EXPECT_TRUE(ahead);
+}
+
 TEST(PlannerBackbone, StationaryNoiseDoesNotFillBoundedQueueAndOverflowFailsHome) {
   rclcpp::NodeOptions options;
   options.parameter_overrides(
@@ -4618,15 +4771,19 @@ TEST_F(ObjectiveService, GridRejectsSingleUnknownBodyVoxelWithZeroOffset) {
 
   // This is one body-volume key between graph vertices. The legacy 25%
   // tolerance accepts it; explicit refinement must treat any unknown as
-  // blocked even when center_offset is zero. The graph waypoint it rejects
-  // is dropped as a hint, and the strict sweep then refuses the span that
-  // replaces it, so the route stays blocked with no margin to detour in.
+  // blocked even when center_offset is zero. The robot's own state joins
+  // the roadmap through expandGraph as well (rrg.cpp:5263), wired only to
+  // the breadcrumbs an observed edge reaches (a roadmap edge stops at
+  // unknown space), so the route's waypoints shift and the strict sweep
+  // refuses the span holding the unknown voxel, with no margin to detour
+  // in. (The dropping of a rejected waypoint as a hint is covered in
+  // test_grid_refinement.)
   ASSERT_TRUE(Peer::makeGridVoxelUnknown(*planner, 0.9, 0.025, 0.325));
   response = call(home);
   ASSERT_NE(response, nullptr);
   EXPECT_EQ(response->status, Service::Response::BLOCKED) << response->reason;
   EXPECT_TRUE(response->path.empty());
-  EXPECT_NE(response->reason.find("rejected waypoints: 0"),
+  EXPECT_NE(response->reason.find("no observed traversable grid detour"),
             std::string::npos)
       << response->reason;
 }

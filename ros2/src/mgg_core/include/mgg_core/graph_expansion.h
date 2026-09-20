@@ -60,6 +60,12 @@ struct ExpandContext {
   /// mandatory before it can enter the graph. False keeps the hardware and
   /// legacy strict-volume prefilter.
   bool allow_unknown_lattice_body = false;
+  /// Unobserved space blocks the candidate's edge and its neighbour edges,
+  /// as upstream's expandGraph always had it (stop_at_unknown_voxel true at
+  /// rrg.cpp:725, 813 and 820). The local lattice leaves this false and
+  /// keeps its own unknown policy; the global roadmap sets it, so a roadmap
+  /// edge is one the map has seen traversable, not one it has not seen.
+  bool stop_at_unknown = false;
   /// Qualified simulation bootstrap keeps the physical root at its odometry
   /// height while the first edge is projected. This applies only when vertex
   /// zero is the edge start; all later samples and endpoints remain projected.

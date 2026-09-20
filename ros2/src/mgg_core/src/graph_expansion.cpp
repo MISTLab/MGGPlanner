@@ -180,7 +180,8 @@ void expandGraph(GraphManager& graph, Vertex& new_vertex,
   bool admissible_edge = edgeTraversable(ctx, start_pos, end_pos, is_hanging,
                                          ctx.preserve_hanging_root_start_height &&
                                              nearest_vertex->id == 0,
-                                         projected_edge, rep);
+                                         projected_edge, rep,
+                                         ctx.stop_at_unknown);
   if (admissible_edge && ctx.projected_edge_admissible &&
       !ctx.projected_edge_admissible(projected_edge)) {
     admissible_edge = false;
@@ -265,7 +266,7 @@ void expandGraph(GraphManager& graph, Vertex& new_vertex,
 
     std::vector<Eigen::Vector3d> neighbour_edge;
     if (!edgeTraversable(ctx, p_start, p_end, false, false, neighbour_edge,
-                         rep)) {
+                         rep, ctx.stop_at_unknown)) {
       continue;
     }
     if (ctx.projected_edge_admissible &&

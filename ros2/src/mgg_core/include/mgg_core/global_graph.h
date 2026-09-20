@@ -11,24 +11,33 @@
 //     Rrg::performShortestPathsClustering (rrg.cpp:5369),
 //   * the frontier ranking of Rrg::runGlobalPlanner (rrg.cpp:5610 to 5834),
 //     here searchGlobalFrontier. Routing to the chosen frontier stays with
-//     TopologicalGoalPlanner, which every objective already uses.
+//     TopologicalGoalPlanner, which every objective already uses,
+//   * Rrg::expandGlobalGraphTimerCallback (rrg.cpp:2535), here
+//     expandGlobalGraph, with Rrg::sampleVertex (rrg.cpp:455) and the
+//     RobotStateHistory it consults (rrg.h:58, rrg.cpp:6210). This is what
+//     grows the roadmap into observed space between plans, so it spans
+//     explored and frontier space rather than tracing the robot's track.
 //
 // What upstream reached through Rrg members arrives here as arguments: the
 // ExpandContext for map and footprint, and a gain callback standing in for
-// computeVolumetricGainRayModelNoBound, so all three run in unit tests on a
-// synthetic map.
+// computeVolumetricGainRayModelNoBound, so all of them run in unit tests on
+// a synthetic map.
 
 #ifndef MGG_CORE_GLOBAL_GRAPH_H_
 #define MGG_CORE_GLOBAL_GRAPH_H_
 
+#include <deque>
 #include <functional>
 #include <vector>
 
 #include <Eigen/Dense>
 
+#include "mgg_kdtree/kdtree.h"
+
 #include "mgg_core/graph_base.h"
 #include "mgg_core/graph_expansion.h"
 #include "mgg_core/graph_manager.h"
+#include "mgg_core/random_sampler.h"
 #include "mgg_core/types.h"
 
 namespace mgg {
@@ -37,6 +46,87 @@ namespace mgg {
 /// Rrg::computeVolumetricGainRayModelNoBound (rrg.cpp:3767) did for global
 /// frontiers. Supplied by the caller, which owns the map, sensors and bounds.
 using RecomputeGainFn = std::function<void(Vertex&)>;
+
+/// Where the robot has been, one state per kMinLength of travel (rrg.h:58
+/// RobotStateHistory, rrg.cpp:6210 to 6275). Keeps a kd-tree for the range
+/// query the global graph expansion makes for every sample.
+class RobotStateHistory {
+ public:
+  RobotStateHistory();
+  ~RobotStateHistory();
+  RobotStateHistory(const RobotStateHistory&) = delete;
+  RobotStateHistory& operator=(const RobotStateHistory&) = delete;
+
+  void addState(const StateVec& state);
+  /// Every recorded state within `range` of `state` (rrg.cpp:6240
+  /// getNearestStates). Returns false when there is none.
+  bool getNearestStates(const StateVec& state, double range,
+                        std::vector<const StateVec*>* s_res) const;
+  void reset();
+  std::size_t size() const { return state_hist_.size(); }
+  const std::deque<StateVec>& states() const { return state_hist_; }
+
+ private:
+  /// A deque so the pointers the kd-tree holds stay valid as it grows.
+  std::deque<StateVec> state_hist_;
+  kdtree* kd_tree_ = nullptr;
+};
+
+/// rrg.h:364 and 366: how often the global graph expansion runs, and how
+/// long each run may spend sampling.
+inline constexpr double kGlobalGraphUpdateTimerPeriod = 0.5;
+inline constexpr double kGlobalGraphUpdateTimeBudget = 0.1;
+/// rrg.cpp:2574: unvisited vertices this close to a randomly chosen one form
+/// one cluster, sampled around its centroid.
+inline constexpr double kLocalBoxRadius = 10.0;
+/// rrg.cpp:2634 and 2635: a sample is only expanded in sparse areas, i.e.
+/// with no recorded robot state and no global vertex within kSparseRadius,
+/// and no frontier within kOverlappedFrontierRadius.
+inline constexpr double kSparseRadius = 5.0;
+inline constexpr double kOverlappedFrontierRadius = 5.0;
+
+/// Draws a collision-free state around `root_state` (rrg.cpp:455
+/// Rrg::sampleVertex): up to 1000 draws from `sampler`, ground robots dropped
+/// onto the terrain first, kept when the robot's box around it is free.
+/// `vertex.is_hanging` is set when the draw found no ground beneath it
+/// (rrg.cpp:477). Returns false when no draw was free.
+bool sampleVertex(RandomSampler& sampler, const StateVec& root_state,
+                  const ExpandContext& ctx, Vertex& vertex);
+
+struct GlobalGraphExpansionReport {
+  /// kUnvisited vertices the run started from and the clusters they formed.
+  int unvisited_vertices = 0;
+  int clusters = 0;
+  /// Passes over the clusters within the budget (rrg.cpp:2610 loop_count),
+  /// and samples that passed the sparsity checks and went to expandGraph
+  /// (loop_count_success).
+  int passes = 0;
+  int samples = 0;
+  int vertices_added = 0;
+  int edges_added = 0;
+  /// Added vertices whose gain made them frontiers.
+  int frontiers_added = 0;
+  double elapsed_s = 0.0;
+};
+
+/// Grows the global graph into the space around its unvisited vertices
+/// (rrg.cpp:2535 Rrg::expandGlobalGraphTimerCallback), in the steps its
+/// comment lists: collect the kUnvisited vertices; group them greedily, a
+/// random seed vertex and everything within kLocalBoxRadius of it forming
+/// one cluster with a centroid, until none is left; then, for as long as
+/// `time_budget_s` allows, sample one vertex around each centroid, skip it
+/// when it hangs, when a recorded robot state or any global vertex lies
+/// within kSparseRadius, or a frontier within kOverlappedFrontierRadius,
+/// otherwise expandGraph it and, on success, score the added vertex with
+/// `compute_gain` and type it kFrontier if it is one.
+///
+/// A budget of zero makes no pass at all, as upstream's loop condition did;
+/// otherwise every pass started is completed, so the run overshoots the
+/// budget by at most one pass.
+GlobalGraphExpansionReport expandGlobalGraph(
+    GraphManager& global_graph, const ExpandContext& ctx,
+    RandomSampler& sampler, const RobotStateHistory& robot_state_hist,
+    const RecomputeGainFn& compute_gain, double time_budget_s);
 
 /// Links `state` into `graph` (rrg.cpp:5468 Rrg::connectStateToGraph): the
 /// nearest vertex itself when within 0.1 m, a blind edge to it when within

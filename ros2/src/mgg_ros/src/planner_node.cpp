@@ -7,6 +7,7 @@
 #include <future>
 #include <limits>
 #include <map>
+#include <random>
 #include <regex>
 #include <stdexcept>
 #include <tuple>
@@ -651,6 +652,15 @@ PlannerNode::PlannerNode(const rclcpp::NodeOptions& options)
       std::chrono::duration<double>(publish_period),
       [this]() { publishOwnGraph(); publishMarkers(); }, callback_group_);
 
+  // The global graph expansion (rrg.cpp:80 to 82) samples in the local box
+  // the lattice is built in, seeded as upstream's sampler was
+  // (random_sampler.cpp:242).
+  random_sampler_.setBound(grid_params_.min_val, grid_params_.max_val);
+  random_sampler_.reset(std::random_device{}());
+  global_graph_update_timer_ = create_timer(
+      std::chrono::duration<double>(mgg::kGlobalGraphUpdateTimerPeriod),
+      [this]() { expandGlobalGraphTimerCallback(); }, callback_group_);
+
   // The one way that choice bites: use_sim_time true with nothing publishing
   // /clock leaves ROS time pinned at zero, so the timer never fires and the
   // node looks alive but silent. Deliberately a wall timer, since it has to
@@ -740,6 +750,8 @@ mgg::ExpandContext PlannerNode::makeContext() {
 mgg::ExpandContext PlannerNode::makeGlobalContext() {
   mgg::ExpandContext ctx = makeContext();
   ctx.inclinations = nullptr;
+  // A roadmap edge must have been seen traversable (rrg.cpp:725).
+  ctx.stop_at_unknown = true;
   return ctx;
 }
 
@@ -791,11 +803,33 @@ void PlannerNode::addRefPathToGraph(const std::vector<mgg::StateVec>& path) {
     }
     lattice.push_back(vertex);
   }
+  // A path that is not the lattice's own enters the roadmap at the height
+  // every other vertex has: max_ground_height above mapped ground, the
+  // projection expandGraph applies to a sample (rrg.cpp:4869 stopped at the
+  // first hanging vertex; a pose without mapped ground ends the path here).
+  // Route poses otherwise arrive at odometry base height or at base plus a
+  // constant offset, and a flat street then holds vertices 0.12 to 0.30 m
+  // above ground with false steps between consecutive route poses.
+  std::vector<mgg::StateVec> projected;
+  if (lattice.empty()) {
+    projected.reserve(path.size());
+    for (mgg::StateVec pose : path) {
+      if (!projectStateToDrivingHeight(pose, /*preserve_xy=*/true)) break;
+      projected.push_back(pose);
+    }
+    if (projected.size() < 2) {
+      RCLCPP_WARN(get_logger(),
+                  "exploration path not added to the global graph: no mapped "
+                  "ground under its start at (%.2f, %.2f, %.2f)",
+                  path.front().x(), path.front().y(), path.front().z());
+      return;
+    }
+  }
   const int before = global_graph_->getNumVertices();
   const mgg::ExpandContext ctx = makeGlobalContext();
   const bool added =
       lattice.empty()
-          ? mgg::addRefPathToGraph(*global_graph_, path, ctx,
+          ? mgg::addRefPathToGraph(*global_graph_, projected, ctx,
                                    global_vertex_spacing_)
           : mgg::addRefPathToGraph(*global_graph_, lattice, ctx,
                                    global_vertex_spacing_);
@@ -837,6 +871,74 @@ void PlannerNode::addFrontiers() {
               report.global_frontiers_demoted, report.local_frontiers,
               report.clusters, report.paths_added,
               global_graph_->getNumVertices(), global_graph_->getNumEdges());
+}
+
+void PlannerNode::expandGlobalGraphTimerCallback() {
+  // Reads the map and writes the global graph, like updateGlobalGraph.
+  const std::lock_guard<std::recursive_mutex> lock(planner_mutex_);
+  auto map_read = mola_map_ != nullptr ? mola_map_->acquireReadLease()
+                                       : mgg::MolaMap::ReadLease{};
+  refreshMolaRevision();
+  // rrg.cpp:2548: nothing to grow before the first plan.
+  if (planner_trigger_count_ == 0) return;
+  if (!have_odometry_ || !map_->getStatus()) return;
+
+  const mgg::GlobalGraphExpansionReport report = mgg::expandGlobalGraph(
+      *global_graph_, makeGlobalContext(), random_sampler_, robot_state_hist_,
+      globalFrontierGain(), mgg::kGlobalGraphUpdateTimeBudget);
+  global_space_.setCenter(current_state_, /*use_extension=*/true);
+  if (report.vertices_added > 0) ++graph_revision_;
+  if (report.vertices_added > 0 || report.edges_added > 0) {
+    RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 5000,
+                         "global graph expansion: +%d vertices, +%d edges "
+                         "(%d vertices, %d edges)",
+                         report.vertices_added, report.edges_added,
+                         global_graph_->getNumVertices(),
+                         global_graph_->getNumEdges());
+  }
+}
+
+void PlannerNode::ingestOdometryIntoGlobalGraph() {
+  if (!have_odometry_ || global_graph_->getNumVertices() == 0) return;
+  constexpr double kOdoUpdateMinLength = 0.5;  // rrg.cpp:5206 and 5252
+  constexpr double kMinLength = 1.0;           // rrg.cpp:5270
+  const bool add_state =
+      (current_state_.head<3>() - last_state_marker_.head<3>()).norm() >=
+      kOdoUpdateMinLength;
+  const bool record_state =
+      (current_state_.head<3>() - last_state_marker_global_.head<3>())
+          .norm() >= kMinLength;
+  if (!add_state && !record_state) return;
+
+  // Get position from odometry to add more vertices to the graph for homing
+  // (rrg.cpp:5247 to 5268). The trajectory backbone (updateGlobalGraph) is
+  // the chain of rrg.cpp:5204 to 5245; this is the checked expandGraph
+  // alongside it, which wires the state to every reachable neighbour. Not
+  // before the home anchor has mapped support: until then the root is a
+  // landmark no edge may attach to (updateGlobalGraph), and expandGraph's
+  // hanging-root allowance is a local lattice bootstrap, not a claim about
+  // the ground under home.
+  if (add_state && initial_anchor_supported_ && map_->getStatus()) {
+    auto map_read = mola_map_ != nullptr ? mola_map_->acquireReadLease()
+                                         : mgg::MolaMap::ReadLease{};
+    // rrg.cpp:5259: the state at driving height. expandGraph drops a ground
+    // robot's state onto the mapped terrain and refuses it where there is
+    // none, so the blind offset is only the starting point of that.
+    mgg::Vertex new_vertex(-1, physicalAnchorAtDrivingHeight(current_state_));
+    mgg::ExpandGraphReport rep;
+    mgg::expandGraph(*global_graph_, new_vertex, rep, makeGlobalContext());
+    if (rep.status == mgg::ExpandGraphStatus::kSuccess) ++graph_revision_;
+  }
+  if (add_state) last_state_marker_ = current_state_;
+
+  // rrg.cpp:5270 to 5290: record the state and apply event E1.
+  if (record_state) {
+    constexpr double kUpdateRadius = 3.0;
+    robot_state_hist_.addState(current_state_);
+    mgg::StateVec state = current_state_;
+    global_graph_->updateVertexTypeInRange(state, kUpdateRadius);  // E1
+    last_state_marker_global_ = current_state_;
+  }
 }
 
 mgg::RouteCorridor PlannerNode::runGlobalPlanner(mgg::PlanningRequest& core,
@@ -1098,6 +1200,7 @@ void PlannerNode::onOdometry(nav_msgs::msg::Odometry::ConstSharedPtr msg) {
   stageGlobalBreadcrumbs(state);
   refreshMolaRevision();
   updateGlobalGraph();
+  ingestOdometryIntoGlobalGraph();
 }
 
 std::string PlannerNode::staleOdometryReason() const {
@@ -1441,6 +1544,7 @@ std::string PlannerNode::buildLocalGraph(bool strict_projected_endpoints) {
       *local_graph_, root_state, grid_params_, ctx, current_state_[3]);
   ++local_graph_revision_;
   local_graph_map_revision_ = map_revision_;
+  ++planner_trigger_count_;  // rrg.cpp:1332
 
   if (r.status == mgg::GridGraphStatus::kInvalidBounds) {
     return "grid bounds invalid: min_val must be <= 0, max_val >= 0 and "
@@ -2386,12 +2490,11 @@ void PlannerNode::updateGlobalGraph() {
     }
 
     // A breadcrumb is a place the robot has stood, so its vertex is visited:
-    // a frontier the robot has driven onto is no frontier (upstream's event
-    // E1, rrg.cpp:5283), and addFrontiers reads these vertices as the robot
-    // state history upstream kept separately (rrg.cpp:2457). Only the vertex
-    // itself is marked; upstream also demoted everything within 3 m, which
-    // in a maze reaches through walls, and the gain re-check demotes a seen
-    // frontier anyway.
+    // a frontier the robot has driven onto is no frontier, and addFrontiers
+    // reads these vertices as the robot state history upstream kept
+    // separately (rrg.cpp:2457). Event E1 itself, which marks everything
+    // within 3 m of the robot visited every metre of travel (rrg.cpp:5285),
+    // runs in ingestOdometryIntoGlobalGraph.
     if (reused_vertex != nullptr) {
       reused_vertex->type = mgg::VertexType::kVisited;
       last_own_global_vertex_id_ = reused_vertex->id;
@@ -3023,8 +3126,15 @@ bool PlannerNode::queryIndexedMap(mgg::FeasiblePath& path,
                  std::to_string(i) + ": " + detail;
         };
         if (occupied || !occupancy_supported) {
-          // Unknown space is a horizon. Occupied space is a wall.
-          const std::string reason = "indexed map route is occupied or unknown";
+          // Unknown space is a horizon. Occupied space is a wall. The sample
+          // and its position make the verdict checkable against the map.
+          char reason[192];
+          std::snprintf(reason, sizeof(reason),
+                        "indexed map route is occupied or unknown: %s at "
+                        "sample %zu (%.2f, %.2f, %.2f)",
+                        occupied ? "occupied" : "unknown", i,
+                        request->samples[i].x, request->samples[i].y,
+                        request->samples[i].z);
           return occupied ? hazard(reason) : unmeasured(reason);
         }
         if (context.robot_type != mgg::RobotType::kAerialRobot &&
