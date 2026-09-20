@@ -441,6 +441,11 @@ PlannerNode::PlannerNode(const rclcpp::NodeOptions& options)
       std::isfinite(requested_route_progress_tolerance)
           ? std::clamp(requested_route_progress_tolerance, 0.1, 3.0)
           : 1.0;
+  const double requested_odometry_stale_s =
+      declareOrGet<double>(this, "odometry_stale_s", 5.0);
+  odometry_stale_s_ = std::isfinite(requested_odometry_stale_s)
+                          ? std::clamp(requested_odometry_stale_s, 0.1, 60.0)
+                          : 5.0;
   objective_route_max_poses_ = static_cast<std::size_t>(std::clamp(
       declareOrGet<std::int64_t>(this, "objective_route_max_poses", 4096),
       std::int64_t{2}, std::int64_t{65536}));
@@ -1074,6 +1079,7 @@ void PlannerNode::onOdometry(nav_msgs::msg::Odometry::ConstSharedPtr msg) {
   const std::lock_guard<std::recursive_mutex> lock(planner_mutex_);
   current_state_ = state;
   have_odometry_ = true;
+  last_odometry_received_ = now();
   if (!have_initial_state_) {
     initial_state_ = state;
     have_initial_state_ = true;
@@ -1081,6 +1087,21 @@ void PlannerNode::onOdometry(nav_msgs::msg::Odometry::ConstSharedPtr msg) {
   stageGlobalBreadcrumbs(state);
   refreshMolaRevision();
   updateGlobalGraph();
+}
+
+std::string PlannerNode::staleOdometryReason() const {
+  if (!have_odometry_ || !last_odometry_received_) return "";
+  const double age_s =
+      static_cast<double>(now().nanoseconds() -
+                          last_odometry_received_->nanoseconds()) *
+      1e-9;
+  if (!(age_s > odometry_stale_s_)) return "";
+  char reason[128];
+  std::snprintf(reason, sizeof(reason),
+                "odometry or planning map is unavailable: last odometry "
+                "%.1f s old",
+                age_s);
+  return reason;
 }
 
 void PlannerNode::onPointCloud(
@@ -4382,6 +4403,9 @@ void PlannerNode::onObjectiveRequest(
   } else if (!have_odometry_ || !map_->getStatus()) {
     corridor.status = mgg::PlanningStatus::kBlocked;
     corridor.reason = "odometry or planning map is unavailable";
+  } else if (const std::string stale = staleOdometryReason(); !stale.empty()) {
+    corridor.status = mgg::PlanningStatus::kBlocked;
+    corridor.reason = stale;
   } else {
     // A zero revision requests a fresh local snapshot. Explicit revisions bind
     // the already-built snapshot and never rebuild underneath the request.
@@ -4901,11 +4925,29 @@ void PlannerNode::onRefineObjectiveRoute(
            "odometry or planning map is unavailable");
     return;
   }
-  if ((current_state_.head<2>() -
-       cached_objective_route_->expected_endpoint.head<2>()).norm() >
-      objective_route_progress_tolerance_m_) {
-    finish(mgg::PlanningStatus::kBlocked,
-           "robot is outside the completed objective route window");
+  if (const std::string stale = staleOdometryReason(); !stale.empty()) {
+    finish(mgg::PlanningStatus::kBlocked, stale);
+    return;
+  }
+  const double endpoint_distance_m =
+      (current_state_.head<2>() -
+       cached_objective_route_->expected_endpoint.head<2>())
+          .norm();
+  if (endpoint_distance_m > objective_route_progress_tolerance_m_) {
+    // The distance and the odometry age tell a section that was driven from
+    // one the controller completed where the robot already stood.
+    const double odometry_age_s =
+        last_odometry_received_
+            ? static_cast<double>(now().nanoseconds() -
+                                  last_odometry_received_->nanoseconds()) *
+                  1e-9
+            : 0.0;
+    char detail[160];
+    std::snprintf(detail, sizeof(detail),
+                  "robot is outside the completed objective route window "
+                  "(%.2f m from the section endpoint, odometry %.1f s old)",
+                  endpoint_distance_m, odometry_age_s);
+    finish(mgg::PlanningStatus::kBlocked, detail);
     return;
   }
   if (cached_objective_route_->next_index >=

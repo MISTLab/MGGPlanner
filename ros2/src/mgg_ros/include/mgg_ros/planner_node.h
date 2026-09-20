@@ -332,6 +332,13 @@ class PlannerNode : public rclcpp::Node {
   double objective_route_horizon_m_ = 8.0;
   double objective_route_progress_tolerance_m_ = 1.0;
   std::size_t objective_route_max_poses_ = 4096;
+  /// Node-clock time the last odometry message arrived. current_state_ is
+  /// that message; a plan or continuation more than odometry_stale_s_ after
+  /// it would start from where the robot was, not where it is, so both are
+  /// refused with the age (staleOdometryReason).
+  std::optional<rclcpp::Time> last_odometry_received_;
+  double odometry_stale_s_ = 5.0;
+  std::string staleOdometryReason() const;
   /// Corridors whose bounded refinement or execution has just been rejected.
   /// Bounded and expiring; it only steers corridor choice and never relaxes a
   /// terrain, body, step, drop or geofence veto.

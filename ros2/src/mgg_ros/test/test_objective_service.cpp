@@ -3239,6 +3239,73 @@ TEST(PlannerObjective, NavigateReturnsBoundedWindowForThirtyMetreKnownRoad) {
   EXPECT_NEAR(response->global_path.back().position.y, exact_goal.y(), 1e-3);
 }
 
+TEST(PlannerObjective, StaleOdometryRefusesPlansAndContinuationsUntilItResumes) {
+  // A planner whose odometry stopped would plan from where the robot was:
+  // the controller completes such a section at once where the robot already
+  // stands, the continuation finds the planner's state outside the window,
+  // and the fresh plan repeats the same section (robot_1 on benchbot,
+  // 2026-09-20, 2.5 replans a second for 120 s). Both refuse with the age.
+  rclcpp::NodeOptions options;
+  options.parameter_overrides({rclcpp::Parameter("map.resolution", 0.05),
+                               rclcpp::Parameter("odometry_stale_s", 0.2)});
+  auto planner = std::make_shared<mgg_ros::PlannerNode>(options);
+  using Peer = mgg_ros::PlannerNodeTestPeer;
+  Peer::configureLongKnownRoad(*planner);
+
+  const mgg::StateVec exact_goal(30.0, 0.0, 0.075, 0.9);
+  auto response = Peer::requestObjective(
+      *planner, mgg::ObjectiveKind::kNavigate, exact_goal);
+  ASSERT_NE(response, nullptr);
+  ASSERT_EQ(response->status, Service::Response::SUCCEEDED)
+      << response->reason;
+  ASSERT_TRUE(response->partial);
+  const std::string route_id = response->route_id;
+
+  std::this_thread::sleep_for(std::chrono::milliseconds(300));
+  auto continuation =
+      std::make_shared<mgg_msgs::srv::RefineObjectiveRoute::Request>();
+  continuation->route_id = route_id;
+  continuation->component_id = response->component_id;
+  continuation->map_epoch = response->map_epoch;
+  continuation->mapping_graph_revision = response->mapping_graph_revision;
+  continuation->geometry_revision = response->geometry_revision;
+  continuation->map_source_stamp = response->map_source_stamp;
+  const auto stale = Peer::refineObjectiveRoute(*planner, continuation);
+  EXPECT_EQ(stale->status,
+            mgg_msgs::srv::RefineObjectiveRoute::Response::BLOCKED);
+  EXPECT_NE(stale->reason.find("odometry or planning map is unavailable"),
+            std::string::npos)
+      << stale->reason;
+  EXPECT_NE(stale->reason.find("s old"), std::string::npos) << stale->reason;
+
+  const auto replanned = Peer::requestObjective(
+      *planner, mgg::ObjectiveKind::kNavigate, exact_goal);
+  ASSERT_NE(replanned, nullptr);
+  EXPECT_EQ(replanned->status, Service::Response::BLOCKED);
+  EXPECT_NE(replanned->reason.find("last odometry"), std::string::npos)
+      << replanned->reason;
+
+  // Fresh odometry: planning resumes. A continuation asked while the robot
+  // still stands at the section start is refused for distance, and names
+  // the distance and the odometry age, not staleness.
+  Peer::acceptOdometry(*planner, 0.0, 0.0, 0.075);
+  const auto again = Peer::requestObjective(
+      *planner, mgg::ObjectiveKind::kNavigate, exact_goal);
+  ASSERT_NE(again, nullptr);
+  ASSERT_EQ(again->status, Service::Response::SUCCEEDED) << again->reason;
+  ASSERT_TRUE(again->partial);
+  continuation->route_id = again->route_id;
+  const auto early = Peer::refineObjectiveRoute(*planner, continuation);
+  EXPECT_EQ(early->status,
+            mgg_msgs::srv::RefineObjectiveRoute::Response::BLOCKED);
+  EXPECT_NE(early->reason.find("outside the completed objective route window"),
+            std::string::npos)
+      << early->reason;
+  EXPECT_NE(early->reason.find("m from the section endpoint, odometry"),
+            std::string::npos)
+      << early->reason;
+}
+
 TEST(PlannerObjective, RollingNavigateKeepsFixedGoalAcrossGraphGrowth) {
   using Peer = mgg_ros::PlannerNodeTestPeer;
   rclcpp::NodeOptions options;
