@@ -5005,6 +5005,20 @@ void PlannerNode::onObjectiveRequest(
       path.indexed_map_validated;
   response->reason = path.reason;
   for (const auto& pose : path.poses) response->path.push_back(toPoseMsg(pose));
+  if (path.status == mgg::PlanningStatus::kSucceeded && !path.poses.empty()) {
+    // What the caller is handed against what the continuation will expect:
+    // a section the controller completes where the robot stands (2026-09-20,
+    // three cycles) has to show up here as ending near the current state.
+    RCLCPP_INFO(get_logger(),
+                "objective section: %zu poses (%.2f, %.2f) -> (%.2f, %.2f), "
+                "%.2f m from the robot at (%.2f, %.2f), route %zu poses%s",
+                path.poses.size(), path.poses.front().x(),
+                path.poses.front().y(), path.poses.back().x(),
+                path.poses.back().y(),
+                (path.poses.back().head<2>() - current_state_.head<2>()).norm(),
+                current_state_.x(), current_state_.y(),
+                global_objective_path.size(), path.partial ? " (partial)" : "");
+  }
   if (!global_objective_path.empty()) {
     mgg::FeasiblePath display;
     display.poses = global_objective_path;
@@ -5289,6 +5303,17 @@ void PlannerNode::onRefineObjectiveRoute(
       path.status == mgg::PlanningStatus::kSucceeded && path.indexed_map_validated;
   response->reason = path.reason;
   for (const auto& pose : path.poses) response->path.push_back(toPoseMsg(pose));
+  if (path.status == mgg::PlanningStatus::kSucceeded && !path.poses.empty()) {
+    RCLCPP_INFO(get_logger(),
+                "objective continuation: %zu poses (%.2f, %.2f) -> (%.2f, %.2f), "
+                "%.2f m from the robot at (%.2f, %.2f)%s",
+                path.poses.size(), path.poses.front().x(),
+                path.poses.front().y(), path.poses.back().x(),
+                path.poses.back().y(),
+                (path.poses.back().head<2>() - current_state_.head<2>()).norm(),
+                current_state_.x(), current_state_.y(),
+                path.partial ? " (partial)" : "");
+  }
 }
 
 void PlannerNode::publishPath() {
