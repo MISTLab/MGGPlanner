@@ -169,6 +169,24 @@ class PlannerNodeTestPeer {
     node.onOdometry(msg);
   }
 
+  static void acceptStampedOdometry(PlannerNode& node, double x, double y,
+                                    double z, double stamp_s) {
+    auto msg = std::make_shared<nav_msgs::msg::Odometry>();
+    msg->header.stamp.sec = static_cast<std::int32_t>(stamp_s);
+    msg->header.stamp.nanosec = static_cast<std::uint32_t>(
+        (stamp_s - static_cast<double>(msg->header.stamp.sec)) * 1e9);
+    msg->pose.pose.position.x = x;
+    msg->pose.pose.position.y = y;
+    msg->pose.pose.position.z = z;
+    msg->pose.pose.orientation.w = 1.0;
+    node.onOdometry(msg);
+  }
+
+  static mgg::StateVec currentState(PlannerNode& node) {
+    const std::lock_guard<std::recursive_mutex> lock(node.planner_mutex_);
+    return node.current_state_;
+  }
+
   static void setCurrentStateWithoutExtendingBackbone(
       PlannerNode& node, double x, double y, double z) {
     const std::lock_guard<std::recursive_mutex> lock(node.planner_mutex_);
@@ -3304,6 +3322,27 @@ TEST(PlannerObjective, StaleOdometryRefusesPlansAndContinuationsUntilItResumes) 
   EXPECT_NE(early->reason.find("m from the section endpoint, odometry"),
             std::string::npos)
       << early->reason;
+}
+
+TEST(PlannerObjective, OlderOdometryNeverOverwritesANewerState) {
+  // The odometry callbacks run in the reentrant group and each waits on the
+  // planner mutex, so messages queued behind a long plan are released in no
+  // particular order. The state must follow the newest stamp, not the last
+  // callback to win the mutex.
+  rclcpp::NodeOptions options;
+  options.parameter_overrides({rclcpp::Parameter("map.resolution", 0.05)});
+  auto planner = std::make_shared<mgg_ros::PlannerNode>(options);
+  using Peer = mgg_ros::PlannerNodeTestPeer;
+  Peer::configureLongKnownRoad(*planner);
+
+  Peer::acceptStampedOdometry(*planner, 5.0, 0.0, 0.075, 20.0);
+  EXPECT_NEAR(Peer::currentState(*planner).x(), 5.0, 1e-9);
+  Peer::acceptStampedOdometry(*planner, 4.0, 0.0, 0.075, 19.9);
+  EXPECT_NEAR(Peer::currentState(*planner).x(), 5.0, 1e-9);
+  Peer::acceptStampedOdometry(*planner, 6.0, 0.0, 0.075, 20.0);
+  EXPECT_NEAR(Peer::currentState(*planner).x(), 6.0, 1e-9);
+  Peer::acceptStampedOdometry(*planner, 7.0, 0.0, 0.075, 20.1);
+  EXPECT_NEAR(Peer::currentState(*planner).x(), 7.0, 1e-9);
 }
 
 TEST(PlannerObjective, RollingNavigateKeepsFixedGoalAcrossGraphGrowth) {

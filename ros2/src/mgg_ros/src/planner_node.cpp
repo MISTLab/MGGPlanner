@@ -1077,6 +1077,17 @@ void PlannerNode::onOdometry(nav_msgs::msg::Odometry::ConstSharedPtr msg) {
   }
 
   const std::lock_guard<std::recursive_mutex> lock(planner_mutex_);
+  const std::int64_t stamp_ns =
+      static_cast<std::int64_t>(msg->header.stamp.sec) * 1000000000LL +
+      static_cast<std::int64_t>(msg->header.stamp.nanosec);
+  if (have_odometry_ && stamp_ns < last_odometry_stamp_ns_) {
+    RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 5000,
+                         "ignoring odometry %.3f s older than the current state",
+                         static_cast<double>(last_odometry_stamp_ns_ - stamp_ns) *
+                             1e-9);
+    return;
+  }
+  last_odometry_stamp_ns_ = stamp_ns;
   current_state_ = state;
   have_odometry_ = true;
   last_odometry_received_ = now();

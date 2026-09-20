@@ -337,6 +337,11 @@ class PlannerNode : public rclcpp::Node {
   /// it would start from where the robot was, not where it is, so both are
   /// refused with the age (staleOdometryReason).
   std::optional<rclcpp::Time> last_odometry_received_;
+  /// Header stamp of the odometry message current_state_ came from. The
+  /// subscription is in the reentrant group and every callback waits on
+  /// planner_mutex_, so messages queued behind a long plan are released in
+  /// no particular order; an older message must not overwrite a newer state.
+  std::int64_t last_odometry_stamp_ns_ = 0;
   double odometry_stale_s_ = 5.0;
   std::string staleOdometryReason() const;
   /// Corridors whose bounded refinement or execution has just been rejected.
