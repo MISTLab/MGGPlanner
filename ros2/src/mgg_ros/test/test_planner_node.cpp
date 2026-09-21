@@ -100,6 +100,20 @@ class PlannerNodeTestPeer {
     const std::lock_guard<std::recursive_mutex> lock(node.planner_mutex_);
     return node.global_graph_->getNumEdges();
   }
+  static void observeRaisedRing(PlannerNode& node, double inner, double outer,
+                                double z) {
+    const std::lock_guard<std::recursive_mutex> lock(node.planner_mutex_);
+    for (double x = -outer; x <= outer + 1e-9; x += 0.1) {
+      for (double y = -outer; y <= outer + 1e-9; y += 0.1) {
+        if (std::max(std::abs(x), std::abs(y)) < inner) continue;
+        for (int repeat = 0; repeat < 8; ++repeat) {
+          node.cloud_map_->insertPointCloud({Eigen::Vector3d(x, y, z)},
+                                            Eigen::Vector3d(x, y, 1.5));
+        }
+      }
+    }
+    ++node.map_revision_;
+  }
   static void setHangingRootReach(PlannerNode& node, double reach) {
     node.hanging_root_edge_length_max_ = reach;
   }
@@ -318,6 +332,21 @@ TEST_F(PlannerNodeTest, BlindStartPlansFromThePhysicalAnchor) {
   response = std::make_shared<mgg_msgs::srv::PlannerSrv::Response>();
   PlannerNodeTestPeer::plan(*strict, response);
   EXPECT_EQ(response->status, PlannerNode::kStatusNoPath);
+}
+
+TEST_F(PlannerNodeTest, ARobotRestingInADipStillPlans) {
+  // The floor around the robot is mapped a step higher than under it, so the
+  // robot's own body box overlaps occupied voxels. Where it stands is not an
+  // obstacle to it: the lattice still has admissible cells.
+  auto node = makeNode("dip");
+  PlannerNodeTestPeer::observeFloor(*node, -1.5, 4.0, -1.5, 1.5);
+  // A raised ring of floor 0.25 m up, from 0.3 m to 0.7 m out, all around.
+  PlannerNodeTestPeer::observeRaisedRing(*node, 0.3, 0.7, 0.25);
+  PlannerNodeTestPeer::acceptOdometry(*node, 0.0, 0.0, 1.0);
+  auto response = std::make_shared<mgg_msgs::srv::PlannerSrv::Response>();
+  PlannerNodeTestPeer::plan(*node, response);
+  ASSERT_EQ(response->status, mgg_msgs::srv::PlannerSrv::Response::FORWARD);
+  ASSERT_GE(response->path.size(), 2u);
 }
 
 }  // namespace mgg_ros

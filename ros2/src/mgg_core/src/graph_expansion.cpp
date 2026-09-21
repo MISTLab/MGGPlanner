@@ -168,6 +168,21 @@ void expandGraph(GraphManager& graph, Vertex& new_vertex,
   if (nearest_vertex->id != 0) start_pos -= overshoot;
   const Eigen::Vector3d end_pos =
       origin + ctx.robot->center_offset + direction + overshoot;
+  // The root is where the robot stands. The map cannot say the robot cannot
+  // be there: a floor mapped a step higher around a robot resting in a dip,
+  // or a wall's returns smeared into the footprint of a robot parked against
+  // it, put occupied voxels inside its own body box and every edge out of
+  // the lattice was refused (SubT hangar, 2026-09-21). The sweep out of the
+  // root therefore starts where the robot's own footprint ends; the rest of
+  // the edge, and every other edge, is checked in full.
+  if (nearest_vertex->id == 0 && ctx.root_footprint_exempt &&
+      direction_norm > 1e-9) {
+    const Eigen::Vector3d unit = direction / direction_norm;
+    const double footprint =
+        0.5 * (std::abs(unit.x()) * ctx.robot_box_size.x() +
+               std::abs(unit.y()) * ctx.robot_box_size.y());
+    if (footprint < direction_norm) start_pos += footprint * unit;
+  }
 
 
   if (geofenceBlocks(ctx, start_pos, end_pos)) {

@@ -364,6 +364,7 @@ mgg::ExpandContext PlannerNode::makeContext() {
   // A hanging root sits at the physical driving height by construction;
   // projecting it again onto absent ground would only fail.
   ctx.preserve_hanging_root_start_height = hanging_root_edge_length_max_ > 0.0;
+  ctx.root_footprint_exempt = true;
   return ctx;
 }
 
@@ -373,6 +374,8 @@ mgg::ExpandContext PlannerNode::makeGlobalContext() {
   ctx.inclinations = nullptr;
   // A roadmap edge must have been seen traversable (rrg.cpp:725).
   ctx.stop_at_unknown = true;
+  // Vertex zero of the roadmap is home, not the robot.
+  ctx.root_footprint_exempt = false;
   return ctx;
 }
 

@@ -70,6 +70,9 @@ struct ExpandContext {
   /// height while the first edge is projected. This applies only when vertex
   /// zero is the edge start; all later samples and endpoints remain projected.
   bool preserve_hanging_root_start_height = false;
+  /// Edges out of vertex zero (the robot) are swept from the edge of the
+  /// robot's own footprint: where the robot stands is not an obstacle to it.
+  bool root_footprint_exempt = false;
   /// Explicit-objective graph builds require a ground-projected candidate's
   /// final body box to be observed free. Explore leaves this false to retain
   /// its legacy frontier policy; explicit refinement still validates the full

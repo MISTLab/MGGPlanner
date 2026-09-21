@@ -57,6 +57,9 @@ ament_export_dependencies(mgg_core octomap Eigen3 nlohmann_json OpenSSL)
 ament_export_include_directories(include)
 
 if(BUILD_TESTING)
+  # A diagnostic, not a test: builds the lattice against a real product.
+  add_executable(lattice_probe test/lattice_probe.cpp)
+  target_link_libraries(lattice_probe ${PROJECT_NAME})
   find_package(ament_cmake_gtest REQUIRED)
   ament_add_gtest(test_octomap_map test/test_octomap_map.cpp)
   target_link_libraries(test_octomap_map ${PROJECT_NAME})
