@@ -21,6 +21,7 @@ find_package(rosidl_default_generators REQUIRED)
 find_package(std_msgs REQUIRED)
 find_package(geometry_msgs REQUIRED)
 find_package(sensor_msgs REQUIRED)
+find_package(builtin_interfaces REQUIRED)
 
 rosidl_generate_interfaces(${PROJECT_NAME}
   "msg/BehaviourPlannerLogger.msg"
@@ -64,10 +65,11 @@ rosidl_generate_interfaces(${PROJECT_NAME}
   "srv/PlannerSetSearchMode.srv"
   "srv/PlannerSetVel.srv"
   "srv/PlannerSrv.srv"
+  "srv/PlanObjective.srv"
   "srv/PlannerStringTrigger.srv"
 
   "action/PathFollower.action"
-  DEPENDENCIES std_msgs geometry_msgs sensor_msgs
+  DEPENDENCIES std_msgs geometry_msgs sensor_msgs builtin_interfaces
 )
 
 ament_export_dependencies(rosidl_default_runtime)

@@ -160,19 +160,21 @@ TEST(PciStatus, ReasonIsBoundedAndJsonEscaped) {
 
 class FakePlanner : public rclcpp::Node {
  public:
+  // `status` is what the planner reports alongside an empty path: -2 is a
+  // cycle that found none (PCI retries), -3 is exploration complete.
   FakePlanner(const std::string& ns,
-              std::vector<std::vector<double>> path_x)
+              std::vector<std::vector<double>> path_x, int status = -2)
       : rclcpp::Node(
             "fake_planner",
             rclcpp::NodeOptions().arguments(
                 {"--ros-args", "-r", "__ns:=" + ns})),
-        path_x_(std::move(path_x)) {
+        path_x_(std::move(path_x)), status_(status) {
     service_ = create_service<mgg_msgs::srv::PlannerSrv>(
         "mggplanner",
         [this](const std::shared_ptr<mgg_msgs::srv::PlannerSrv::Request>,
                std::shared_ptr<mgg_msgs::srv::PlannerSrv::Response> response) {
           const int call = calls_.fetch_add(1);
-          response->status = -3;
+          response->status = status_;
           const auto& points = path_x_.at(
               std::min(static_cast<size_t>(call), path_x_.size() - 1));
           for (double x : points) {
@@ -189,13 +191,15 @@ class FakePlanner : public rclcpp::Node {
  private:
   std::atomic<int> calls_{0};
   std::vector<std::vector<double>> path_x_;
+  int status_;
   rclcpp::Service<mgg_msgs::srv::PlannerSrv>::SharedPtr service_;
 };
 
 struct ExternalExecutionRig {
   explicit ExternalExecutionRig(const std::string& ns,
-                                std::vector<std::vector<double>> path_x)
-      : planner(std::make_shared<FakePlanner>(ns, std::move(path_x))),
+                                std::vector<std::vector<double>> path_x,
+                                int status = -2)
+      : planner(std::make_shared<FakePlanner>(ns, std::move(path_x), status)),
         pci(std::make_shared<mgg_pci::PciNode>(
             rclcpp::NodeOptions()
                 .arguments({"--ros-args", "-r", "__ns:=" + ns})
@@ -310,6 +314,24 @@ TEST(PciExternalExecution, OdometryProximityCannotReplaceAcceptedPath) {
   ASSERT_NE(replanned, nullptr);
   EXPECT_TRUE(replanned->success);
   EXPECT_EQ(rig.planner->calls(), 2);
+}
+
+TEST(PciExternalExecution, CompleteStatusEndsExplorationWithoutRetries) {
+  ExternalExecutionRig rig("/external_complete", {{}}, /*status=*/-3);
+  rig.publishOdometry();
+
+  const auto started = rig.call("pci_trigger");
+  ASSERT_NE(started, nullptr);
+  EXPECT_TRUE(started->success);
+  EXPECT_TRUE(rig.waitForStatus("\"state\":\"complete\""));
+  EXPECT_EQ(rig.planner->calls(), 1);
+
+  // Nothing is retried, and a replan after completion is refused.
+  std::this_thread::sleep_for(150ms);
+  EXPECT_EQ(rig.planner->calls(), 1);
+  const auto rejected = rig.call("pci_replan");
+  ASSERT_NE(rejected, nullptr);
+  EXPECT_FALSE(rejected->success);
 }
 
 TEST(PciExternalExecution, RepeatedEmptyPlansRemainWaitingUntilManualStop) {

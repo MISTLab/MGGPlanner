@@ -177,7 +177,11 @@
       augment_free_voxels_time: 1
       free_frustum_before_planning: false
       use_ray_model_for_volumetric_gain: true
-      path_length_penalty: 0.07
+      # Gain is discounted by exp(-penalty * route length). At 0.07 a leaf two
+      # metres away kept winning through a 10 m graph route around parked
+      # neighbours (robot_1, 2026-09-17); at 0.25 a 10 m route keeps 8 percent
+      # of its gain and a 3 m route 47 percent.
+      path_length_penalty: 0.25
       path_direction_penalty: 0.3
       hanging_vertex_penalty: 5.0
       exp_gain_voxel_size: 0.5
@@ -187,9 +191,13 @@
       nonuniform_ray_cast: true
       ray_cast_step_size_multiplier: 1.0
       freespace_cloud_enable: false
-      leafs_only_for_volumetric_gain: false
+      # Gain is what the planner spends its time on: ray casting from every
+      # vertex of a ~700-vertex lattice took 4.0 s of a 4.6 s request (Bistro,
+      # 2026-09-17). Leaves are where exploration goes next, and a 0.2 m
+      # cluster radius on a 0.5 m lattice clustered nothing.
+      leafs_only_for_volumetric_gain: true
       cluster_vertices_for_gain: true
-      clustering_radius: 0.2
+      clustering_radius: 1.0
       build_grid_local_graph: true
       # Not a clearance: this is the height at which the robot's collision
       # box rides above the ground. Vertices land here, and every edge is

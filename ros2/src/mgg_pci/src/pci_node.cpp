@@ -283,6 +283,19 @@ void PciNode::planAndPublish() {
   planning_in_progress_ = false;
   if (!running_ || generation != generation_) return;
 
+  // The planner says exploration is complete: the local lattice has no gain
+  // and the global graph holds no reachable frontier (rrg.cpp:5582 and
+  // 5628). Retrying would only ask the same question of the same map.
+  if (ok && path.empty() && plan_status_ == kPlannerStatusComplete) {
+    exploration_completed_ = true;
+    running_ = false;
+    path_in_progress_ = false;
+    waiting_for_plan_ = false;
+    publishPath({});
+    publishStatus("complete", "exploration complete");
+    RCLCPP_INFO(get_logger(), "exploration complete");
+    return;
+  }
   if (!ok) {
     if (!has_bootstrapped_ && bootstrap_distance_ > 0.0) {
       executeBootstrap();

@@ -89,6 +89,8 @@ class PciNode : public rclcpp::Node {
 
   std::mutex mutex_;
   rclcpp::Publisher<std_msgs::msg::String>::SharedPtr status_pub_;
+  /// mgg_ros::PlannerNode::kStatusComplete: nothing left to explore.
+  static constexpr int kPlannerStatusComplete = -3;
   int plan_status_ = -1;
   StallBudget stall_budget_;
   uint64_t generation_ = 0;
