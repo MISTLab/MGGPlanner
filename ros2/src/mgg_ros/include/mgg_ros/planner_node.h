@@ -236,6 +236,8 @@ class PlannerNode : public rclcpp::Node {
   bool global_exploration_ongoing_ = false;
   int current_global_vertex_id_ = -1;
   double global_frontier_reach_m_ = 5.0;
+  /// See the parameter's comment in the constructor.
+  bool allow_unknown_lattice_body_ = false;
   /// The last cycle's frontier paths join the global graph before that
   /// graph is rebuilt (rrg.cpp:121 Rrg::reset).
   bool add_frontiers_to_global_graph_ = false;

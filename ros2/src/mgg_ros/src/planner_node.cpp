@@ -232,6 +232,16 @@ PlannerNode::PlannerNode(const rclcpp::NodeOptions& options)
   global_frontier_reach_m_ = std::max(
       0.5, declareOrGet<double>(this, "global_frontier_reach_m",
                                 global_frontier_reach_m_));
+  // Upstream's lattice only admits a cell whose whole body volume is known
+  // free (rrg.cpp buildGridGraphExapnd, getBoxStatus with stop_at_unknown),
+  // on a map that carves free space from every scan. A map that carves it
+  // from keyframes only leaves a parked robot's surroundings largely
+  // unobserved, so it would never take the first step. This admits a cell
+  // whose body volume is partly unobserved; known occupied volume still
+  // rejects it, and mapped ground under it and along the edge stays
+  // mandatory. Off by default; simulation with a keyframe map turns it on.
+  allow_unknown_lattice_body_ = declareOrGet<bool>(
+      this, "allow_unknown_lattice_body", allow_unknown_lattice_body_);
 
   plan_srv_ = create_service<mgg_msgs::srv::PlannerSrv>(
       "mggplanner",
@@ -340,6 +350,7 @@ mgg::ExpandContext PlannerNode::makeContext() {
   ctx.projected_graph = nullptr;  // visualisation only; not built here
   ctx.robot_id = static_cast<int>(planning_params_.robot_id);
   ctx.robot_box_size = robot_params_.getPlanningSize();
+  ctx.allow_unknown_lattice_body = allow_unknown_lattice_body_;
   return ctx;
 }
 
@@ -1014,7 +1025,9 @@ std::string PlannerNode::buildLocalGraph() {
 
   // rrg.cpp:2098 to 2120: rounds without a frontier among the leaves count
   // towards the global planner; a round with one counts back.
-  if (frontiers == 0) {
+  if (local_graph_->getNumVertices() <= 1) {
+    // Nothing was scored; this round says nothing about the frontier.
+  } else if (frontiers == 0) {
     ++low_gain_rounds_;
   } else if (low_gain_rounds_ > 0) {
     --low_gain_rounds_;
@@ -1223,9 +1236,12 @@ void PlannerNode::onPlanRequest(
   }
   if (best_path_.empty()) {
     summary = buildLocalGraph();
-    if (best_path_.empty() &&
-        (low_gain_rounds_ >= auto_global_planner_low_gain_rounds_ ||
-         local_graph_->getNumVertices() <= 1)) {
+    // An empty lattice is a map that does not yet show the robot's
+    // surroundings, not an explored one: PCI retries as the map grows. The
+    // global planner is consulted once the lattice existed and saw nothing
+    // new for long enough.
+    if (best_path_.empty() && local_graph_->getNumVertices() > 1 &&
+        low_gain_rounds_ >= auto_global_planner_low_gain_rounds_) {
       // No leaf with gain for long enough: the global planner routes to the
       // best global frontier (rrg.cpp:2119, mggplanner.cpp:217).
       auto map_read = mapReadLease();
