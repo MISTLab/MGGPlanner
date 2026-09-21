@@ -95,6 +95,213 @@ OctomapMap buildScene() {
   return map;
 }
 
+TEST(OctomapMap, BoxesIncludePositiveFaceOccupiedKeys) {
+  OctomapConfig cfg;
+  cfg.resolution = 0.05;
+  OctomapMap map(cfg);
+  map.augmentFreeBox({0.9, 0.0, 0.625}, {0.8, 0.8, 0.8});
+  octomap::OcTreeKey key;
+  ASSERT_TRUE(map.tree()->coordToKeyChecked(octomap::point3d(0.9f, 0.0f, 0.675f), key));
+  map.tree()->setNodeValue(key, map.tree()->getClampingThresMaxLog());
+  const Eigen::Vector3d center(0.9, 0.0, 0.625), body(0.2, 0.2, 0.15);
+  ASSERT_EQ(map.getVoxelStatus({0.9, 0.0, 0.675}), VoxelStatus::kOccupied);
+  EXPECT_EQ(map.getBoxStatus(center, body, true), VoxelStatus::kOccupied);
+  EXPECT_EQ(map.getStrictBoxStatus(center, body), VoxelStatus::kOccupied);
+  EXPECT_EQ(map.getStrictPathStatus({1.2, 0, 0.625}, {0.6, 0, 0.625}, body),
+            VoxelStatus::kOccupied);
+}
+
+TEST(OctomapMap, StrictPathEnvelopeIncludesDiagonalCrossedVoxel) {
+  OctomapConfig cfg;
+  cfg.resolution = 0.05;
+  OctomapMap map(cfg);
+  map.augmentFreeBox({0.05, 0.025, 0.0}, {0.15, 0.15, 0.10});
+  octomap::OcTreeKey key;
+  ASSERT_TRUE(map.tree()->coordToKeyChecked(
+      octomap::point3d(0.075F, 0.025F, 0.0F), key));
+  map.tree()->setNodeValue(key, map.tree()->getClampingThresMaxLog());
+  EXPECT_EQ(map.getStrictPathStatus({0.045, 0.01, 0.0}, {0.055, 0.055, 0.0},
+                                    Eigen::Vector3d::Zero()),
+            VoxelStatus::kOccupied);
+}
+
+TEST(OctomapMap, OccupiedOnlySweepCoversEveryAabbFaceAndSegmentBoundary) {
+  const Eigen::Vector3d start(0.0, 0.0, 0.0);
+  const Eigen::Vector3d end(0.20, 0.0, 0.0);
+  const Eigen::Vector3d body(0.10, 0.10, 0.10);
+  const auto classify = [&](const Eigen::Vector3d& obstacle) {
+    OctomapConfig cfg;
+    cfg.resolution = 0.05;
+    OctomapMap map(cfg);
+    EXPECT_NE(map.tree()->updateNode(
+                  octomap::point3d(static_cast<float>(obstacle.x()),
+                                   static_cast<float>(obstacle.y()),
+                                   static_cast<float>(obstacle.z())),
+                  true),
+              nullptr);
+    return map.getOccupiedOnlyPathStatus(start, end, body);
+  };
+
+  // The continuously swept AABB is x=[-0.05, 0.25], y/z=[-0.05, 0.05].
+  // Pin both end faces, a boundary between resolution-sized segments, and a
+  // lateral face. Unknown space around each occupied key remains admissible.
+  EXPECT_EQ(classify({-0.05, 0.0, 0.0}), VoxelStatus::kOccupied);
+  EXPECT_EQ(classify({0.10, 0.0, 0.0}), VoxelStatus::kOccupied);
+  EXPECT_EQ(classify({0.25, 0.0, 0.0}), VoxelStatus::kOccupied);
+  EXPECT_EQ(classify({0.10, 0.05, 0.0}), VoxelStatus::kOccupied);
+  EXPECT_EQ(classify({0.10, 0.0, 0.05}), VoxelStatus::kOccupied);
+  EXPECT_EQ(classify({0.10, 0.15, 0.0}), VoxelStatus::kFree);
+}
+
+TEST(OctomapMap, OccupiedOnlyCylinderUsesVoxelAabbAgainstSweptCapsule) {
+  const Eigen::Vector3d start(0.0, 0.0, 0.0);
+  const Eigen::Vector3d end(1.0, 0.0, 0.0);
+  constexpr double radius = 0.20;
+  constexpr double height = 0.40;
+  const auto classify = [&](const Eigen::Vector3d& obstacle,
+                            const Eigen::Vector3d& from,
+                            const Eigen::Vector3d& to) {
+    OctomapConfig cfg;
+    cfg.resolution = 0.10;
+    OctomapMap map(cfg);
+    EXPECT_NE(map.tree()->updateNode(
+                  octomap::point3d(static_cast<float>(obstacle.x()),
+                                   static_cast<float>(obstacle.y()),
+                                   static_cast<float>(obstacle.z())),
+                  true),
+              nullptr);
+    return map.getOccupiedOnlyCylinderPathStatus(from, to, radius, height);
+  };
+
+  // Every obstacle below lies in the swept square prism. The first cell's
+  // closest XY corner is sqrt(0.2^2 + 0.2^2) from the endpoint, so the
+  // true circular end cap excludes it even though a swept AABB would not.
+  EXPECT_EQ(classify({1.25, 0.25, 0.05}, start, end), VoxelStatus::kFree);
+  EXPECT_EQ(classify({1.25, 0.25, 0.05}, end, start),
+            VoxelStatus::kFree);
+
+  // Cell boxes, rather than only cell centers, intersect the capsule. Cover
+  // its interior, a tangential side face, the terminal cap, and a point body.
+  EXPECT_EQ(classify({0.55, 0.15, 0.05}, start, end),
+            VoxelStatus::kOccupied);
+  EXPECT_EQ(classify({0.55, 0.25, 0.05}, start, end),
+            VoxelStatus::kOccupied);
+  EXPECT_EQ(classify({1.25, 0.05, 0.05}, start, end),
+            VoxelStatus::kOccupied);
+  EXPECT_EQ(classify({0.25, 0.05, 0.05}, start, start),
+            VoxelStatus::kOccupied);
+  EXPECT_EQ(classify({0.55, 0.15, 0.05}, end, start),
+            VoxelStatus::kOccupied);
+
+  // Height is the full cylinder height. Occupied cells touching either
+  // horizontal face conservatively block the sweep.
+  EXPECT_EQ(classify({0.55, 0.05, 0.25}, start, end),
+            VoxelStatus::kOccupied);
+  EXPECT_EQ(classify({0.55, 0.05, -0.25}, start, end),
+            VoxelStatus::kOccupied);
+
+  // Closed lower faces are symmetric with upper faces. These cells touch
+  // only the negative Y side or the start cap respectively.
+  EXPECT_EQ(classify({0.55, -0.25, 0.05}, start, end),
+            VoxelStatus::kOccupied);
+  EXPECT_EQ(classify({-0.25, 0.05, 0.05}, start, end),
+            VoxelStatus::kOccupied);
+}
+
+TEST(OctomapMap, ZeroCylinderIncludesEveryCellTouchingItsBoundaryPoint) {
+  OctomapConfig cfg;
+  cfg.resolution = 0.10;
+  OctomapMap map(cfg);
+  // The occupied cell [-0.1,0]^3 touches the degenerate cylinder only at
+  // its upper corner. Closed-cell collision semantics still reject it.
+  ASSERT_NE(map.tree()->updateNode(octomap::point3d(-0.05F, -0.05F, -0.05F),
+                                   true),
+            nullptr);
+  EXPECT_EQ(map.getOccupiedOnlyCylinderPathStatus(
+                Eigen::Vector3d::Zero(), Eigen::Vector3d::Zero(), 0.0, 0.0),
+            VoxelStatus::kOccupied);
+}
+
+TEST(OctomapMap, ProductionResolutionTangenciesRemainConservative) {
+  const Eigen::Vector3d start(0.0, 0.0, 0.0);
+  const Eigen::Vector3d end(0.8, 0.0, 0.0);
+  const auto classify = [&](const Eigen::Vector3d& obstacle) {
+    OctomapConfig cfg;
+    cfg.resolution = 0.20;
+    OctomapMap map(cfg);
+    EXPECT_NE(map.tree()->updateNode(
+                  octomap::point3d(static_cast<float>(obstacle.x()),
+                                   static_cast<float>(obstacle.y()),
+                                   static_cast<float>(obstacle.z())),
+                  true),
+              nullptr);
+    return map.getOccupiedOnlyCylinderPathStatus(start, end, 0.20, 0.40);
+  };
+
+  // At the production map resolution these cells have nominal centers 0.3
+  // and faces at 0.2. Float-valued key centers must not turn exact contact
+  // into a tiny positive clearance on either the radial or vertical face.
+  EXPECT_EQ(classify({0.3, 0.3, 0.1}), VoxelStatus::kOccupied);
+  EXPECT_EQ(classify({0.3, 0.1, 0.3}), VoxelStatus::kOccupied);
+  EXPECT_EQ(classify({0.3, 0.1, -0.3}), VoxelStatus::kOccupied);
+}
+
+TEST(OctomapMap, OccupiedOnlyCylinderAllowsUnknownAndBoundsItsWork) {
+  OctomapConfig cfg;
+  cfg.resolution = 0.10;
+  OctomapMap map(cfg);
+  const Eigen::Vector3d start(0.05, 0.05, 0.05);
+  const Eigen::Vector3d end(1.05, 0.05, 0.05);
+
+  // Occupied-only semantics deliberately admit a completely sparse map.
+  EXPECT_EQ(map.getOccupiedOnlyCylinderPathStatus(start, end, 0.20, 0.30),
+            VoxelStatus::kFree);
+  const double nan = std::numeric_limits<double>::quiet_NaN();
+  EXPECT_EQ(map.getOccupiedOnlyCylinderPathStatus({nan, 0, 0}, end, 0.20,
+                                                   0.30),
+            VoxelStatus::kUnknown);
+  EXPECT_EQ(map.getOccupiedOnlyCylinderPathStatus(start, end, -0.01, 0.30),
+            VoxelStatus::kUnknown);
+  EXPECT_EQ(map.getOccupiedOnlyCylinderPathStatus(start, end, 0.20, nan),
+            VoxelStatus::kUnknown);
+  EXPECT_EQ(map.getOccupiedOnlyCylinderPathStatus(start, end, 4000.0, 0.30),
+            VoxelStatus::kUnknown);
+  EXPECT_EQ(map.getOccupiedOnlyCylinderPathStatus(
+                start, {500000.05, 0.05, 0.05}, 0.20, 0.30),
+            VoxelStatus::kUnknown);
+}
+
+TEST(OctomapMap, ExplicitQueriesRejectEvenOneUnknownKey) {
+  OctomapConfig cfg;
+  cfg.resolution = 0.05;
+  OctomapMap map(cfg);
+  map.augmentFreeBox({0.0, 0.0, 0.0}, {0.4, 0.4, 0.4});
+  octomap::OcTreeKey key;
+  ASSERT_TRUE(map.tree()->coordToKeyChecked(octomap::point3d(0.075f, 0.025f, 0.025f), key));
+  // Force this pruned free branch to maximum depth before deleting one leaf.
+  ASSERT_NE(map.tree()->updateNode(key, true), nullptr);
+  // deleteNode's bool indicates that the recursive caller may delete its
+  // child, not whether a leaf disappeared from a non-empty tree.
+  map.tree()->deleteNode(key, map.tree()->getTreeDepth());
+  ASSERT_EQ(map.tree()->search(key), nullptr);
+  const Eigen::Vector3d center = Eigen::Vector3d::Zero(), body(0.2, 0.2, 0.2);
+  EXPECT_EQ(map.getBoxStatus(center, body, true), VoxelStatus::kFree);
+  EXPECT_EQ(map.getStrictBoxStatus(center, body), VoxelStatus::kUnknown);
+  EXPECT_EQ(map.getStrictPathStatus(center, {0.1, 0.0, 0.0}, body),
+            VoxelStatus::kUnknown);
+}
+
+TEST(OctomapMap, ExplicitQueryBoundsRejectInvalidOrExcessiveWork) {
+  OctomapMap map;
+  EXPECT_EQ(map.getStrictBoxStatus({1e300, 0, 0}, {0.2, 0.2, 0.2}),
+            VoxelStatus::kUnknown);
+  EXPECT_EQ(map.getStrictBoxStatus({0, 0, 0}, {-1, 1, 1}), VoxelStatus::kUnknown);
+  EXPECT_EQ(map.getStrictBoxStatus({0, 0, 0}, {1000, 1000, 1000}),
+            VoxelStatus::kUnknown);
+  EXPECT_EQ(map.getStrictPathStatus({0, 0, 0}, {1e300, 0, 0}, {0.2, 0.2, 0.2}),
+            VoxelStatus::kUnknown);
+}
+
 TEST(OctomapMap, ResolutionMatchesBaseline) {
   OctomapMap map = buildScene();
   EXPECT_DOUBLE_EQ(map.getResolution(), 0.2);  // baseline: resolution,...,0.2
@@ -157,6 +364,26 @@ TEST(OctomapMap, RayAndPathQueriesMatchBaselineVerdicts) {
                              end_voxel),
             VoxelStatus::kOccupied);
   EXPECT_NEAR(end_voxel.x(), 2.0, 0.5);  // obstacle near face
+}
+
+TEST(OctomapMap, PathStatusIsSymmetricAndIncludesBothEndpoints) {
+  OctomapMap map = buildScene();
+  const Eigen::Vector3d box(0.4, 0.4, 0.4);
+  const Eigen::Vector3d a(0.13, -3.07, 1.0);
+  const Eigen::Vector3d b(0.91, -3.07, 1.0);
+  EXPECT_EQ(map.getPathStatus(a, b, box, true),
+            map.getPathStatus(b, a, box, true));
+
+  // The obstacle surface is at x=2.0.  A segment ending there must be blocked
+  // even when its length is not an exact multiple of the map resolution.
+  const Eigen::Vector3d free(1.31, 0.0, 1.0);
+  const Eigen::Vector3d occupied_endpoint(2.0, 0.0, 1.0);
+  EXPECT_EQ(map.getPathStatus(free, occupied_endpoint,
+                              Eigen::Vector3d::Zero(), false),
+            VoxelStatus::kOccupied);
+  EXPECT_EQ(map.getPathStatus(occupied_endpoint, free,
+                              Eigen::Vector3d::Zero(), false),
+            VoxelStatus::kOccupied);
 }
 
 // Endpoints matching the baseline's VLP-16 model: 72 azimuth x 6 elevation
@@ -289,6 +516,19 @@ TEST(OctomapMap, AugmentFreeBoxClearsUnknownFootprint) {
   EXPECT_EQ(map.getVoxelStatus(p), VoxelStatus::kFree);
 }
 
+TEST(OctomapMap, AugmentFreeBoxFillsEveryKeyAcrossCoordinateBoundaries) {
+  OctomapConfig cfg;
+  cfg.resolution = 0.05;
+  OctomapMap map(cfg);
+  map.augmentFreeBox({0.60, 0.0, 0.40}, {2.40, 1.20, 0.60});
+
+  for (double x = 0.0; x <= 1.20; x += 0.10) {
+    EXPECT_EQ(map.getBoxStatus({x, 0.0, 0.325}, {0.20, 0.20, 0.15}, true),
+              VoxelStatus::kFree)
+        << "unknown key remained at x=" << x;
+  }
+}
+
 TEST(OctomapMap, LocalPointcloudReturnsNearbyOccupiedVoxels) {
   OctomapMap map = buildScene();
   std::vector<Eigen::Vector3d> pts;
@@ -296,6 +536,143 @@ TEST(OctomapMap, LocalPointcloudReturnsNearbyOccupiedVoxels) {
   ASSERT_FALSE(pts.empty());
   for (const auto& p : pts) {
     EXPECT_LE((p - Eigen::Vector3d(3.0, 0.0, 1.0)).norm(), 3.0 + 1e-6);
+  }
+}
+
+TEST(OctomapMap, GroundRayUsesMeasuredMaximumWithinCoarseVoxel) {
+  OctomapConfig cfg;
+  cfg.resolution = 0.15;
+  cfg.max_range = 20.0;
+  const Eigen::Vector3d origin(0.01, 0.01, 1.0);
+  const Eigen::Vector3d low(0.01, 0.01, 0.02);
+  const Eigen::Vector3d high(0.02, 0.02, 0.12);
+
+  OctomapMap fallback(cfg);
+  fallback.insertPointCloud({low}, origin);
+  Eigen::Vector3d fallback_hit;
+  ASSERT_EQ(fallback.getGroundRayStatus(origin, {0.01, 0.01, -1.0}, false,
+                                        fallback_hit),
+            VoxelStatus::kOccupied);
+  EXPECT_NEAR(fallback_hit.z(), 0.075, 1e-5);
+
+  OctomapMap measured(cfg);
+  measured.setTrackMeasuredSurfaceZ(true);
+  measured.insertPointCloud({low, high}, origin);
+  Eigen::Vector3d measured_hit;
+  ASSERT_EQ(measured.getGroundRayStatus(origin, {0.01, 0.01, -1.0}, false,
+                                        measured_hit),
+            VoxelStatus::kOccupied);
+  EXPECT_NEAR(measured_hit.z(), high.z(), 1e-6);
+  EXPECT_EQ(measured.measuredSurfaceCount(), 1u);
+}
+
+TEST(OctomapMap, ReportsItsAxisAlignedCellCentreAtNegativeCoordinates) {
+  OctomapConfig cfg;
+  cfg.resolution = 0.15;
+  OctomapMap map(cfg);
+  Eigen::Vector2d center;
+  ASSERT_TRUE(map.getAxisAlignedXYCellCenter({-0.01, -0.08}, center));
+  EXPECT_NEAR(center.x(), -0.075, 1e-6);
+  EXPECT_NEAR(center.y(), -0.075, 1e-6);
+  EXPECT_FALSE(map.getAxisAlignedXYCellCenter(
+      {std::numeric_limits<double>::quiet_NaN(), 0.0}, center));
+  EXPECT_FALSE(map.getAxisAlignedXYCellCenter({1e300, 0.0}, center));
+}
+
+TEST(OctomapMap, MeasuredSurfaceExcludesClippedFarEndpointsAndClears) {
+  OctomapConfig cfg;
+  cfg.resolution = 0.15;
+  cfg.max_range = 20.0;
+  OctomapMap map(cfg);
+  map.setTrackMeasuredSurfaceZ(true);
+  const Eigen::Vector3d origin(0.01, 0.01, 1.0);
+  const Eigen::Vector3d surface(0.01, 0.01, 0.12);
+  for (int i = 0; i < 8; ++i) map.insertPointCloud({surface}, origin);
+  ASSERT_EQ(map.measuredSurfaceCount(), 1u);
+
+  // ARGoS represents background at its finite 40 m far plane. With a 20 m
+  // map range this carves a bounded miss ray and must not create metadata.
+  map.insertPointCloud({Eigen::Vector3d(40.0, 0.01, 1.0)}, origin);
+  EXPECT_EQ(map.measuredSurfaceCount(), 1u);
+
+  // Repeated rays through the old hit eventually make its voxel free. The
+  // height must survive early misses, then disappear exactly with occupancy.
+  const Eigen::Vector3d through(0.01, 0.01, -2.0);
+  map.insertPointCloud({through}, origin);
+  EXPECT_EQ(map.measuredSurfaceCount(), 2u);
+  Eigen::Vector3d retained_hit;
+  ASSERT_EQ(map.getGroundRayStatus(origin, {0.01, 0.01, -1.0}, false,
+                                   retained_hit),
+            VoxelStatus::kOccupied);
+  EXPECT_NEAR(retained_hit.z(), surface.z(), 1e-6);
+  for (int i = 0; i < 30; ++i) map.insertPointCloud({through}, origin);
+  EXPECT_EQ(map.getVoxelStatus(surface), VoxelStatus::kFree);
+  EXPECT_EQ(map.measuredSurfaceCount(), 1u);  // the deeper endpoint remains
+
+  map.augmentFreeBox(through, {0.20, 0.20, 0.20});
+  EXPECT_EQ(map.measuredSurfaceCount(), 0u);
+  const Eigen::Vector3d replacement(0.01, 0.01, 0.02);
+  for (int i = 0; i < 8; ++i) map.insertPointCloud({replacement}, origin);
+  EXPECT_EQ(map.measuredSurfaceCount(), 1u);
+  Eigen::Vector3d replacement_hit;
+  ASSERT_EQ(map.getGroundRayStatus(origin, {0.01, 0.01, -1.0}, false,
+                                   replacement_hit),
+            VoxelStatus::kOccupied);
+  EXPECT_NEAR(replacement_hit.z(), replacement.z(), 1e-6);
+  map.resetMap();
+  EXPECT_EQ(map.measuredSurfaceCount(), 0u);
+}
+
+TEST(OctomapMap, ZeroMaxRangeClipsEveryNonzeroEndpointForMetadata) {
+  OctomapConfig cfg;
+  cfg.resolution = 0.15;
+  cfg.max_range = 0.0;
+  OctomapMap map(cfg);
+  map.setTrackMeasuredSurfaceZ(true);
+  const Eigen::Vector3d origin(0.01, 0.01, 0.01);
+  const Eigen::Vector3d same_voxel(0.02, 0.01, 0.01);
+  map.insertPointCloud({same_voxel}, origin);
+  EXPECT_NE(map.getVoxelStatus(same_voxel), VoxelStatus::kOccupied);
+  EXPECT_EQ(map.measuredSurfaceCount(), 0u);
+
+  // Zero distance satisfies OctoMap's <= maxrange endpoint condition.
+  map.insertPointCloud({origin}, origin);
+  EXPECT_EQ(map.getVoxelStatus(origin), VoxelStatus::kOccupied);
+  EXPECT_EQ(map.measuredSurfaceCount(), 1u);
+}
+
+TEST(OctomapMap, TrackedInsertionPreservesOccupancyUpdates) {
+  OctomapConfig cfg;
+  cfg.resolution = 0.15;
+  cfg.max_range = 3.0;
+  OctomapMap ordinary(cfg);
+  OctomapMap tracked(cfg);
+  tracked.setTrackMeasuredSurfaceZ(true);
+  const Eigen::Vector3d origin(0.01, 0.01, 1.0);
+  const std::vector<std::vector<Eigen::Vector3d>> scans{
+      {{0.01, 0.01, 0.02}, {0.61, 0.01, 0.12}},
+      {{0.01, 0.01, -2.0}, {4.0, 0.01, 1.0}},
+      {{0.01, 0.01, 0.02}, {0.61, 0.01, -2.0}}};
+  for (int repeat = 0; repeat < 8; ++repeat) {
+    for (const auto& scan : scans) {
+      ordinary.insertPointCloud(scan, origin);
+      tracked.insertPointCloud(scan, origin);
+    }
+  }
+  for (double x = -0.15; x <= 3.0; x += 0.15) {
+    for (double z = -2.1; z <= 1.05; z += 0.15) {
+      const Eigen::Vector3d sample(x, 0.01, z);
+      EXPECT_EQ(tracked.getVoxelStatus(sample),
+                ordinary.getVoxelStatus(sample));
+      const auto* a = ordinary.tree()->search(
+          octomap::point3d(sample.x(), sample.y(), sample.z()));
+      const auto* b = tracked.tree()->search(
+          octomap::point3d(sample.x(), sample.y(), sample.z()));
+      ASSERT_EQ(a == nullptr, b == nullptr);
+      if (a != nullptr && b != nullptr) {
+        EXPECT_FLOAT_EQ(a->getLogOdds(), b->getLogOdds());
+      }
+    }
   }
 }
 

@@ -6,13 +6,24 @@
 // exercises the shape directly rather than asserting it in a comment: the same
 // code deadlocks on one executor and succeeds on the other.
 
+#include <atomic>
 #include <chrono>
 #include <memory>
+#include <mutex>
+#include <string>
 #include <thread>
+#include <utility>
+#include <vector>
 
 #include <gtest/gtest.h>
+#include <mgg_msgs/srv/planner_srv.hpp>
+#include <nav_msgs/msg/odometry.hpp>
+#include <nlohmann/json.hpp>
 #include <rclcpp/rclcpp.hpp>
+#include <std_msgs/msg/string.hpp>
 #include <std_srvs/srv/trigger.hpp>
+
+#include "mgg_pci/pci_node.h"
 
 namespace {
 
@@ -101,6 +112,228 @@ TEST(PciExecutor, SingleThreadedExecutorDeadlocksOnANestedServiceCall) {
 // PciNode and its main() use.
 TEST(PciExecutor, MultiThreadedExecutorWithAReentrantGroupSucceeds) {
   EXPECT_TRUE(runNestedCall<rclcpp::executors::MultiThreadedExecutor>(true));
+}
+
+TEST(PciWatchdog, ThreeConsecutiveStallsExhaustTheBudget) {
+  mgg_pci::StallBudget budget(3);
+  EXPECT_FALSE(budget.noteStall());
+  EXPECT_FALSE(budget.noteStall());
+  EXPECT_TRUE(budget.noteStall());
+  EXPECT_EQ(budget.count(), 3);
+}
+
+TEST(PciWatchdog, ProgressResetsConsecutiveStalls) {
+  mgg_pci::StallBudget budget(3);
+  EXPECT_FALSE(budget.noteStall());
+  EXPECT_FALSE(budget.noteStall());
+  budget.noteProgress();
+  EXPECT_EQ(budget.count(), 0);
+  EXPECT_FALSE(budget.noteStall());
+}
+
+TEST(PciRetry, EmptyPlanDelayUsesBoundedExponentialBackoff) {
+  EXPECT_DOUBLE_EQ(mgg_pci::boundedRetryDelaySeconds(1, 1.0, 10.0), 1.0);
+  EXPECT_DOUBLE_EQ(mgg_pci::boundedRetryDelaySeconds(2, 1.0, 10.0), 2.0);
+  EXPECT_DOUBLE_EQ(mgg_pci::boundedRetryDelaySeconds(3, 1.0, 10.0), 4.0);
+  EXPECT_DOUBLE_EQ(mgg_pci::boundedRetryDelaySeconds(4, 1.0, 10.0), 8.0);
+  EXPECT_DOUBLE_EQ(mgg_pci::boundedRetryDelaySeconds(5, 1.0, 10.0), 10.0);
+  EXPECT_DOUBLE_EQ(mgg_pci::boundedRetryDelaySeconds(40, 1.0, 10.0), 10.0);
+}
+
+TEST(PciStatus, ReasonIsBoundedAndJsonEscaped) {
+  const auto controls = nlohmann::json::parse(
+      mgg_pci::statusJson("waiting", 42, "bad \"reason\"\n"));
+  EXPECT_EQ(controls["state"], "waiting");
+  EXPECT_EQ(controls["stamp_ns"], 42);
+  EXPECT_EQ(controls["reason"], "bad \"reason\"\n");
+
+  // The first byte of this two-byte UTF-8 code point lands exactly at the
+  // reason limit. The replacement policy must still produce valid JSON text.
+  const auto bounded = mgg_pci::statusJson(
+      "waiting", 42, std::string(255, 'x') + "\xc3\xa9" + std::string(1024, 'x'));
+  EXPECT_TRUE(nlohmann::json::accept(bounded));
+  EXPECT_LT(bounded.size(), 350u);
+
+  const auto retry = mgg_pci::retryStatusReason(std::string(1024, 'x'), 10.0);
+  EXPECT_EQ(retry.find("retrying automatically in 10.0 s"), 194u);
+}
+
+class FakePlanner : public rclcpp::Node {
+ public:
+  FakePlanner(const std::string& ns,
+              std::vector<std::vector<double>> path_x)
+      : rclcpp::Node(
+            "fake_planner",
+            rclcpp::NodeOptions().arguments(
+                {"--ros-args", "-r", "__ns:=" + ns})),
+        path_x_(std::move(path_x)) {
+    service_ = create_service<mgg_msgs::srv::PlannerSrv>(
+        "mggplanner",
+        [this](const std::shared_ptr<mgg_msgs::srv::PlannerSrv::Request>,
+               std::shared_ptr<mgg_msgs::srv::PlannerSrv::Response> response) {
+          const int call = calls_.fetch_add(1);
+          response->status = -3;
+          const auto& points = path_x_.at(
+              std::min(static_cast<size_t>(call), path_x_.size() - 1));
+          for (double x : points) {
+            geometry_msgs::msg::Pose pose;
+            pose.position.x = x;
+            pose.orientation.w = 1.0;
+            response->path.push_back(pose);
+          }
+        });
+  }
+
+  int calls() const { return calls_.load(); }
+
+ private:
+  std::atomic<int> calls_{0};
+  std::vector<std::vector<double>> path_x_;
+  rclcpp::Service<mgg_msgs::srv::PlannerSrv>::SharedPtr service_;
+};
+
+struct ExternalExecutionRig {
+  explicit ExternalExecutionRig(const std::string& ns,
+                                std::vector<std::vector<double>> path_x)
+      : planner(std::make_shared<FakePlanner>(ns, std::move(path_x))),
+        pci(std::make_shared<mgg_pci::PciNode>(
+            rclcpp::NodeOptions()
+                .arguments({"--ros-args", "-r", "__ns:=" + ns})
+                .parameter_overrides(
+                    {rclcpp::Parameter("external_path_execution", true),
+                     rclcpp::Parameter("auto_period_sec", 0.0),
+                     rclcpp::Parameter("bootstrap_distance", 0.0),
+                     rclcpp::Parameter("service_timeout_sec", 2.0)}))),
+        caller(std::make_shared<rclcpp::Node>(
+            "pci_test_caller",
+            rclcpp::NodeOptions().arguments(
+                {"--ros-args", "-r", "__ns:=" + ns}))) {
+    status_subscription = caller->create_subscription<std_msgs::msg::String>(
+        "status", rclcpp::QoS(1).transient_local(),
+        [this](std_msgs::msg::String::ConstSharedPtr message) {
+          std::lock_guard<std::mutex> lock(status_mutex);
+          last_status = message->data;
+        });
+    executor.add_node(planner);
+    executor.add_node(pci);
+    executor.add_node(caller);
+    spinner = std::thread([this]() { executor.spin(); });
+  }
+
+  bool waitForStatus(const std::string& fragment) {
+    const auto deadline = std::chrono::steady_clock::now() + 2s;
+    while (std::chrono::steady_clock::now() < deadline) {
+      {
+        std::lock_guard<std::mutex> lock(status_mutex);
+        if (last_status.find(fragment) != std::string::npos) return true;
+      }
+      std::this_thread::sleep_for(10ms);
+    }
+    return false;
+  }
+
+  ~ExternalExecutionRig() {
+    executor.cancel();
+    if (spinner.joinable()) spinner.join();
+  }
+
+  std::shared_ptr<std_srvs::srv::Trigger::Response> call(
+      const std::string& service_name) {
+    auto client = caller->create_client<std_srvs::srv::Trigger>(service_name);
+    if (!client->wait_for_service(2s)) return nullptr;
+    auto future = client->async_send_request(
+        std::make_shared<std_srvs::srv::Trigger::Request>());
+    if (future.wait_for(3s) != std::future_status::ready) return nullptr;
+    return future.get();
+  }
+
+  void publishOdometry(double x = 0.0) {
+    auto publisher = caller->create_publisher<nav_msgs::msg::Odometry>(
+        "odometry", rclcpp::QoS(10));
+    nav_msgs::msg::Odometry odometry;
+    odometry.pose.pose.position.x = x;
+    odometry.pose.pose.orientation.w = 1.0;
+    for (int n = 0; n < 5; ++n) {
+      publisher->publish(odometry);
+      std::this_thread::sleep_for(20ms);
+    }
+  }
+
+  std::shared_ptr<FakePlanner> planner;
+  std::shared_ptr<mgg_pci::PciNode> pci;
+  std::shared_ptr<rclcpp::Node> caller;
+  rclcpp::Subscription<std_msgs::msg::String>::SharedPtr status_subscription;
+  std::mutex status_mutex;
+  std::string last_status;
+  rclcpp::executors::MultiThreadedExecutor executor;
+  std::thread spinner;
+};
+
+TEST(PciExternalExecution, NearEndpointWaitsForExplicitReplan) {
+  ExternalExecutionRig rig("/external_near_endpoint", {{1.0, 0.1}, {1.0}});
+  rig.publishOdometry();
+
+  const auto started = rig.call("pci_trigger");
+  ASSERT_NE(started, nullptr);
+  EXPECT_TRUE(started->success);
+  EXPECT_NE(started->message.find("waiting for a path"), std::string::npos);
+  EXPECT_TRUE(rig.waitForStatus(
+      "\"reason\":\"planner path makes no progress beyond the controller "
+      "goal tolerance; retrying automatically in 1.0 s\""));
+  EXPECT_EQ(rig.planner->calls(), 1);
+
+  std::this_thread::sleep_for(150ms);
+  EXPECT_EQ(rig.planner->calls(), 1);
+  const auto replanned = rig.call("pci_replan");
+  ASSERT_NE(replanned, nullptr);
+  EXPECT_TRUE(replanned->success);
+  EXPECT_NE(replanned->message.find("published"), std::string::npos);
+  EXPECT_EQ(rig.planner->calls(), 2);
+}
+
+TEST(PciExternalExecution, OdometryProximityCannotReplaceAcceptedPath) {
+  ExternalExecutionRig rig("/external_arrival", {{1.0}, {2.0}});
+  rig.publishOdometry();
+
+  const auto started = rig.call("pci_trigger");
+  ASSERT_NE(started, nullptr);
+  ASSERT_TRUE(started->success);
+  ASSERT_EQ(rig.planner->calls(), 1);
+
+  // This is inside PCI's legacy 0.3 m reach distance. FollowPath has not yet
+  // reported success, so external mode must retain the accepted path.
+  rig.publishOdometry(0.9);
+  std::this_thread::sleep_for(150ms);
+  EXPECT_EQ(rig.planner->calls(), 1);
+
+  const auto replanned = rig.call("pci_replan");
+  ASSERT_NE(replanned, nullptr);
+  EXPECT_TRUE(replanned->success);
+  EXPECT_EQ(rig.planner->calls(), 2);
+}
+
+TEST(PciExternalExecution, RepeatedEmptyPlansRemainWaitingUntilManualStop) {
+  ExternalExecutionRig rig("/external_empty_plan", {{}});
+  rig.publishOdometry();
+
+  for (const char* service : {"pci_trigger", "pci_replan", "pci_replan",
+                              "pci_replan"}) {
+    const auto response = rig.call(service);
+    ASSERT_NE(response, nullptr);
+    EXPECT_TRUE(response->success);
+    EXPECT_NE(response->message.find("waiting for a path"), std::string::npos);
+  }
+  EXPECT_EQ(rig.planner->calls(), 4);
+  EXPECT_TRUE(rig.waitForStatus(
+      "\"reason\":\"planner returned no path; retrying automatically in "
+      "8.0 s\""));
+
+  const auto stopped = rig.call("pci_stop");
+  ASSERT_NE(stopped, nullptr);
+  EXPECT_TRUE(stopped->success);
+  const auto rejected = rig.call("pci_replan");
+  ASSERT_NE(rejected, nullptr);
+  EXPECT_FALSE(rejected->success);
 }
 
 }  // namespace

@@ -59,6 +59,20 @@ TEST(GraphManager, NearestInRangeRespectsTheRadius) {
   EXPECT_EQ(found->id, 0);
 }
 
+TEST(GraphManager, UpdatingVertexStateRebuildsNearestIndex) {
+  Chain c;
+  ASSERT_TRUE(c.gm.updateVertexState(0, StateVec(20.0, 0.0, 0.0, 0.0)));
+
+  Vertex* found = nullptr;
+  const StateVec moved(20.0, 0.0, 0.0, 0.0);
+  ASSERT_TRUE(c.gm.getNearestVertexInRange(&moved, 0.1, &found));
+  ASSERT_NE(found, nullptr);
+  EXPECT_EQ(found->id, 0);
+
+  const StateVec old_position = StateVec::Zero();
+  EXPECT_FALSE(c.gm.getNearestVertexInRange(&old_position, 0.1, &found));
+}
+
 TEST(GraphManager, NearestVerticesReturnsEveryoneInRange) {
   Chain c;
   const StateVec middle(1.5, 0.0, 0.0, 0.0);

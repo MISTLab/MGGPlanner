@@ -1,5 +1,6 @@
 #include "mgg_core/trajectory.h"
 
+#include <algorithm>
 #include <cmath>
 #include <limits>
 
@@ -52,6 +53,52 @@ double getPathLength(const PathType& path) {
     total_len += vec.norm();
   }
   return total_len;
+}
+
+void shortenPath(PathType& path, double max_len) {
+  double total_len = 0;
+  const int path_size = static_cast<int>(path.size());
+  for (int i = 0; i < (path_size - 1); ++i) {
+    total_len += (path[i + 1] - path[i]).norm();
+    if (total_len > max_len) {
+      // i+1 to make sure the path has at least 1 segment.
+      path.erase(path.begin() + i + 1, path.end());
+      break;
+    }
+  }
+}
+
+double computeDistanceBetweenTwoTrajectories(const PathType& path_1,
+                                             const PathType& path_2,
+                                             double discrete_length,
+                                             bool shorten_to_same_length,
+                                             bool scale_with_length) {
+  // Currently, only scale over length: spatial information only.
+  double dist_ret = std::numeric_limits<double>::infinity();
+  if (path_1.empty() || path_2.empty() || discrete_length <= 0) return dist_ret;
+
+  PathType path_1_intp;
+  if (!interpolatePath(path_1, discrete_length, path_1_intp)) return dist_ret;
+  PathType path_2_intp;
+  if (!interpolatePath(path_2, discrete_length, path_2_intp)) return dist_ret;
+
+  // Cut trajectories to the same length.
+  const double path_1_len = getPathLength(path_1_intp);
+  const double path_2_len = getPathLength(path_2_intp);
+  double common_length = std::min(path_1_len, path_2_len);
+  if (shorten_to_same_length) {
+    if (path_1_len > path_2_len) {
+      common_length = path_2_len;
+      shortenPath(path_1_intp, common_length);
+    } else if (path_1_len < path_2_len) {
+      common_length = path_1_len;
+      shortenPath(path_2_intp, common_length);
+    }
+  }
+
+  dist_ret = computeDTWDistance(path_1_intp, path_2_intp);
+  if (scale_with_length) dist_ret /= (common_length * common_length);
+  return dist_ret;
 }
 
 bool interpolatePath(const PathType& path, double discrete_length,

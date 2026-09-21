@@ -25,19 +25,21 @@ find_package(ament_cmake REQUIRED)
 find_package(mgg_core REQUIRED)
 find_package(octomap REQUIRED)
 find_package(Eigen3 REQUIRED)
+find_package(nlohmann_json REQUIRED)
+find_package(OpenSSL REQUIRED)
 find_package(rclcpp REQUIRED)
 find_package(sensor_msgs REQUIRED)
 find_package(tf2 REQUIRED)
 find_package(tf2_ros REQUIRED)
 find_package(tf2_geometry_msgs REQUIRED)
 
-add_library(${PROJECT_NAME} src/octomap_map.cpp)
+add_library(${PROJECT_NAME} src/octomap_map.cpp src/native_mola_grid.cpp src/mola_map.cpp)
 target_include_directories(${PROJECT_NAME} PUBLIC
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
   $<INSTALL_INTERFACE:include>
   ${OCTOMAP_INCLUDE_DIRS})
 target_link_libraries(${PROJECT_NAME} mgg_core::mgg_core ${OCTOMAP_LIBRARIES}
-  Eigen3::Eigen)
+  Eigen3::Eigen nlohmann_json::nlohmann_json OpenSSL::Crypto)
 
 install(DIRECTORY include/ DESTINATION include)
 install(TARGETS ${PROJECT_NAME} EXPORT export_${PROJECT_NAME}
@@ -51,13 +53,15 @@ ament_target_dependencies(octomap_map_node
 install(TARGETS octomap_map_node DESTINATION lib/${PROJECT_NAME})
 
 ament_export_targets(export_${PROJECT_NAME} HAS_LIBRARY_TARGET)
-ament_export_dependencies(mgg_core octomap Eigen3)
+ament_export_dependencies(mgg_core octomap Eigen3 nlohmann_json OpenSSL)
 ament_export_include_directories(include)
 
 if(BUILD_TESTING)
   find_package(ament_cmake_gtest REQUIRED)
   ament_add_gtest(test_octomap_map test/test_octomap_map.cpp)
   target_link_libraries(test_octomap_map ${PROJECT_NAME})
+  ament_add_gtest(test_mola_map test/test_mola_map.cpp)
+  target_link_libraries(test_mola_map ${PROJECT_NAME})
 endif()
 
 ament_package()

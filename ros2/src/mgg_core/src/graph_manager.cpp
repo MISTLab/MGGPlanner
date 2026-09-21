@@ -109,6 +109,22 @@ void GraphManager::removeEdge(Vertex* v, Vertex* u) {
   graph_->removeEdge(v->id, u->id);
 }
 
+bool GraphManager::updateVertexState(int id, const StateVec& state) {
+  const auto found = vertices_map_.find(id);
+  if (found == vertices_map_.end() || found->second == nullptr) return false;
+  found->second->state = state;
+
+  if (kd_tree_) kd_free(kd_tree_);
+  kd_tree_ = kd_create(3);
+  for (const auto& entry : vertices_map_) {
+    const Vertex* vertex = entry.second;
+    if (vertex == nullptr) continue;
+    kd_insert3(kd_tree_, vertex->state.x(), vertex->state.y(),
+               vertex->state.z(), entry.second);
+  }
+  return true;
+}
+
 bool GraphManager::getNearestVertex(const StateVec* state, Vertex** v_res) {
   if (getNumVertices() <= 0) return false;
   kdres* nearest = kd_nearest3(kd_tree_, state->x(), state->y(), state->z());
@@ -146,7 +162,10 @@ bool GraphManager::getNearestVertices(const StateVec* state, double range,
   kdres* neighbors =
       kd_nearest_range3(kd_tree_, state->x(), state->y(), state->z(), range);
   int neighbors_size = kd_res_size(neighbors);
-  if (neighbors_size <= 0) return false;
+  if (neighbors_size <= 0) {
+    kd_res_free(neighbors);
+    return false;
+  }
   v_res->clear();
   for (int i = 0; i < neighbors_size; ++i) {
     Vertex* new_neighbor = (Vertex*)kd_res_item_data(neighbors);

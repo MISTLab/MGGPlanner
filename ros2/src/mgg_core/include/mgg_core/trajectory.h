@@ -53,6 +53,21 @@ PathType shortcutPath(const PathType& path, const SegmentFreeFn& segment_free);
 /// Dynamic time warping distance between two paths.
 double computeDTWDistance(const PathType& a, const PathType& b);
 
+/// Cuts `path` after the first segment that takes its length past `max_len`,
+/// keeping at least one segment.
+void shortenPath(PathType& path, double max_len);
+
+/// DTW distance between two paths after resampling both at `discrete_length`
+/// and, with `shorten_to_same_length`, cutting the longer one down to the
+/// shorter one's length; `scale_with_length` divides by that length squared.
+/// The similarity the frontier path clustering groups by
+/// (rrg.cpp:5393, Trajectory::compareTwoTrajectories).
+double computeDistanceBetweenTwoTrajectories(const PathType& path_1,
+                                             const PathType& path_2,
+                                             double discrete_length = 0.2,
+                                             bool shorten_to_same_length = true,
+                                             bool scale_with_length = true);
+
 /// Heading implied by a path, weighted towards its early section.
 double estimateDirectionFromPath(const PathType& path);
 

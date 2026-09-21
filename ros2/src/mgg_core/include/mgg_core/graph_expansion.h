@@ -13,6 +13,9 @@
 
 #include <Eigen/Dense>
 
+#include <functional>
+#include <vector>
+
 #include "mgg_core/geofence_manager.h"
 #include "mgg_core/graph_base.h"
 #include "mgg_core/graph_manager.h"
@@ -47,6 +50,36 @@ struct ExpandContext {
   int robot_id = 0;
   /// Planning footprint, i.e. robot->getPlanningSize().
   Eigen::Vector3d robot_box_size = Eigen::Vector3d::Zero();
+  /// A hanging root may make one longer candidate connection across a
+  /// sensor's near-field ground blind spot. The edge is only topology here;
+  /// explicit objectives revalidate it with strict body/unknown checks.
+  double hanging_root_edge_length_max = 0.0;
+  /// Qualified simulation exploration may offer a lattice candidate whose
+  /// body volume is partly unobserved. Known occupied volume still rejects
+  /// the candidate, and ground projection plus the edge policy remain
+  /// mandatory before it can enter the graph. False keeps the hardware and
+  /// legacy strict-volume prefilter.
+  bool allow_unknown_lattice_body = false;
+  /// Unobserved space blocks the candidate's edge and its neighbour edges,
+  /// as upstream's expandGraph always had it (stop_at_unknown_voxel true at
+  /// rrg.cpp:725, 813 and 820). The local lattice leaves this false and
+  /// keeps its own unknown policy; the global roadmap sets it, so a roadmap
+  /// edge is one the map has seen traversable, not one it has not seen.
+  bool stop_at_unknown = false;
+  /// Qualified simulation bootstrap keeps the physical root at its odometry
+  /// height while the first edge is projected. This applies only when vertex
+  /// zero is the edge start; all later samples and endpoints remain projected.
+  bool preserve_hanging_root_start_height = false;
+  /// Explicit-objective graph builds require a ground-projected candidate's
+  /// final body box to be observed free. Explore leaves this false to retain
+  /// its legacy frontier policy; explicit refinement still validates the full
+  /// swept route independently.
+  bool strict_projected_endpoint = false;
+  /// Optional final policy check for a ground-projected edge. This is applied
+  /// before either its candidate vertex or a graph-mode neighbour edge is
+  /// admitted. The points use the same coordinates passed to GroundProjection.
+  std::function<bool(const std::vector<Eigen::Vector3d>&)>
+      projected_edge_admissible;
 };
 
 /// Attaches `new_vertex` to `graph`: finds the nearest existing vertex, checks
@@ -59,6 +92,14 @@ struct ExpandContext {
 void expandGraph(GraphManager& graph, Vertex& new_vertex,
                  ExpandGraphReport& rep, const ExpandContext& ctx,
                  bool allow_short_edge = false);
+
+/// Adds edges from `new_vertex`, already in `graph`, to every vertex within
+/// nearest_range whose straight connection is between edge_length_min and
+/// edge_length_max and runs through space the map knows to be free
+/// (rrg.cpp:867 Rrg::expandGraphEdges). Used to wire a verified path into the
+/// global roadmap; unknown space blocks, unlike the lattice's own edges.
+void expandGraphEdges(GraphManager& graph, Vertex* new_vertex,
+                      ExpandGraphReport& rep, const ExpandContext& ctx);
 
 }  // namespace mgg
 

@@ -53,17 +53,21 @@ double averageInclination(const std::vector<Eigen::Vector3d>& edge) {
 }
 
 /// Can the robot travel the segment? Fills `projected_edge` for ground robots.
+/// `stop_at_unknown` makes unobserved space block the edge; the local lattice
+/// leaves it passable, the global roadmap does not.
 bool edgeTraversable(const ExpandContext& ctx, const Eigen::Vector3d& start,
                      const Eigen::Vector3d& end, bool is_hanging,
+                     bool preserve_start_height,
                      std::vector<Eigen::Vector3d>& projected_edge,
-                     ExpandGraphReport& rep) {
+                     ExpandGraphReport& rep, bool stop_at_unknown = false) {
   if (ctx.robot->type == RobotType::kAerialRobot) {
-    return ctx.map->getPathStatus(start, end, ctx.robot_box_size, false) ==
-           VoxelStatus::kFree;
+    return ctx.map->getPathStatus(start, end, ctx.robot_box_size,
+                                  stop_at_unknown) == VoxelStatus::kFree;
   }
   // Ground robot: the edge has to follow the terrain.
   const ProjectedEdgeStatus es = ctx.ground->getProjectedEdgeStatus(
-      start, end, ctx.robot_box_size, false, projected_edge, is_hanging);
+      start, end, ctx.robot_box_size, stop_at_unknown, projected_edge,
+      is_hanging, preserve_start_height);
   ++rep.edge_status[static_cast<int>(es)];
   if (es == ProjectedEdgeStatus::kAdmissible) return true;
   if (es == ProjectedEdgeStatus::kSteep) ++rep.steep_edges;
@@ -92,8 +96,19 @@ void expandGraph(GraphManager& graph, Vertex& new_vertex,
                             new_state[2] - origin[2]);
   double direction_norm = direction.norm();
 
-  if (direction_norm > ctx.planning->edge_length_max) {
-    direction = ctx.planning->edge_length_max * direction.normalized();
+  const bool hanging_root =
+      nearest_vertex->id == 0 && nearest_vertex->is_hanging &&
+      std::isfinite(ctx.hanging_root_edge_length_max) &&
+      ctx.hanging_root_edge_length_max > 0.0;
+  // The physical root's blind-start allowance is an independent safety
+  // bound. It may extend a short ordinary edge limit to reach first support,
+  // or reduce a longer ordinary limit so configuration ordering can never
+  // turn the hanging exception into an unbounded edge.
+  const double effective_edge_length_max =
+      hanging_root ? ctx.hanging_root_edge_length_max
+                   : ctx.planning->edge_length_max;
+  if (direction_norm > effective_edge_length_max) {
+    direction = effective_edge_length_max * direction.normalized();
   } else if (!allow_short_edge &&
              direction_norm <= ctx.planning->edge_length_min) {
     rep.status = ExpandGraphStatus::kErrorShortEdge;
@@ -122,6 +137,24 @@ void expandGraph(GraphManager& graph, Vertex& new_vertex,
     new_state[2] = new_pos[2];
     direction = new_state.head<3>() - origin;
     direction_norm = direction.norm();
+    if (hanging_root &&
+        direction_norm > ctx.hanging_root_edge_length_max + 1e-9) {
+      rep.status = ExpandGraphStatus::kErrorCollisionEdge;
+      return;
+    }
+    // The lattice precheck happens before ground projection, so its Z may not
+    // describe the body box ultimately stored in the graph. Explicit
+    // objectives cannot admit a waypoint that their refiner must immediately
+    // reject at the projected driving height.
+    if (ctx.strict_projected_endpoint) {
+      rep.projected_endpoint_status = ctx.map->getStrictBoxStatus(
+          new_state.head<3>() + ctx.robot->center_offset,
+          ctx.robot_box_size);
+      if (rep.projected_endpoint_status != VoxelStatus::kFree) {
+        rep.status = ExpandGraphStatus::kErrorCollisionEdge;
+        return;
+      }
+    }
   }
 
   // Overshoot both ends, except at the root, so an edge that just grazes an
@@ -145,7 +178,14 @@ void expandGraph(GraphManager& graph, Vertex& new_vertex,
   std::vector<Eigen::Vector3d> projected_edge;
   const bool is_hanging = nearest_vertex->is_hanging || new_vertex.is_hanging;
   bool admissible_edge = edgeTraversable(ctx, start_pos, end_pos, is_hanging,
-                                         projected_edge, rep);
+                                         ctx.preserve_hanging_root_start_height &&
+                                             nearest_vertex->id == 0,
+                                         projected_edge, rep,
+                                         ctx.stop_at_unknown);
+  if (admissible_edge && ctx.projected_edge_admissible &&
+      !ctx.projected_edge_admissible(projected_edge)) {
+    admissible_edge = false;
+  }
   if (admissible_edge && ctx.robot->type == RobotType::kGroundRobot) {
     recordProjectedEdge(ctx.projected_graph, projected_edge, ctx.robot_id);
   }
@@ -162,7 +202,8 @@ void expandGraph(GraphManager& graph, Vertex& new_vertex,
   // be a behaviour change on a path this port cannot yet exercise end to end.
   for (size_t i = 1; i < projected_edge.size(); ++i) {
     const Eigen::Vector3d segment = projected_edge[i] - projected_edge[i - 1];
-    if (std::atan2(std::abs(segment(2)), segment.head(2).norm()) >
+    if (std::abs(segment(2)) > ctx.planning->max_step_height + 1e-6 &&
+        std::atan2(std::abs(segment(2)), segment.head(2).norm()) >
         ctx.planning->max_inclination) {
       admissible_edge = false;
     }
@@ -224,7 +265,12 @@ void expandGraph(GraphManager& graph, Vertex& new_vertex,
     if (geofenceBlocks(ctx, p_start, p_end)) continue;
 
     std::vector<Eigen::Vector3d> neighbour_edge;
-    if (!edgeTraversable(ctx, p_start, p_end, false, neighbour_edge, rep)) {
+    if (!edgeTraversable(ctx, p_start, p_end, false, false, neighbour_edge,
+                         rep, ctx.stop_at_unknown)) {
+      continue;
+    }
+    if (ctx.projected_edge_admissible &&
+        !ctx.projected_edge_admissible(neighbour_edge)) {
       continue;
     }
     if (ctx.robot->type == RobotType::kGroundRobot) {
@@ -238,6 +284,60 @@ void expandGraph(GraphManager& graph, Vertex& new_vertex,
     }
   }
 
+  rep.status = ExpandGraphStatus::kSuccess;
+}
+
+void expandGraphEdges(GraphManager& graph, Vertex* new_vertex,
+                      ExpandGraphReport& rep, const ExpandContext& ctx) {
+  // rrg.cpp:867 Rrg::expandGraphEdges. The vertex is already in the graph;
+  // only edges are added, and only where the map already knows the way is
+  // clear (stop_at_unknown_voxel true at rrg.cpp:897 and 903), because the
+  // roadmap these edges join is routed over without a second look.
+  std::vector<Vertex*> nearest_vertices;
+  if (!graph.getNearestVertices(&new_vertex->state,
+                                ctx.planning->nearest_range,
+                                &nearest_vertices)) {
+    rep.status = ExpandGraphStatus::kErrorKdTree;
+    return;
+  }
+  const Eigen::Vector3d origin = new_vertex->state.head<3>();
+  for (Vertex* neighbour : nearest_vertices) {
+    if (neighbour == nullptr || neighbour == new_vertex) continue;
+    const Eigen::Vector3d direction = neighbour->state.head<3>() - origin;
+    const double d_norm = direction.norm();
+    if (d_norm <= ctx.planning->edge_length_min ||
+        d_norm >= ctx.planning->edge_length_max) {
+      continue;
+    }
+    // Boost's setS edge list already refuses a duplicate; skipping it here
+    // also keeps the adjacency map free of repeats.
+    if (graph.graph_->edgeExists(new_vertex->id, neighbour->id)) continue;
+    const Eigen::Vector3d p_overshoot =
+        direction / d_norm * ctx.planning->edge_overshoot;
+    const Eigen::Vector3d p_start =
+        origin + ctx.robot->center_offset - p_overshoot;
+    Eigen::Vector3d p_end = origin + ctx.robot->center_offset + direction;
+    if (neighbour->id != 0) p_end += p_overshoot;
+    if (geofenceBlocks(ctx, p_start, p_end)) continue;
+    std::vector<Eigen::Vector3d> projected_edge;
+    if (!edgeTraversable(ctx, p_start, p_end, false, false, projected_edge,
+                         rep, /*stop_at_unknown=*/true)) {
+      continue;
+    }
+    // rrg.cpp:907: a long way round the tree and a height change is a
+    // different floor, not a shortcut.
+    if (neighbour->distance > ctx.planning->nearest_range_max &&
+        std::fabs(neighbour->state[2] - new_vertex->state[2]) >
+            ctx.planning->nearest_range_z) {
+      continue;
+    }
+    graph.addEdge(new_vertex, neighbour, d_norm);
+    ++rep.num_edges_added;
+    if (ctx.inclinations != nullptr && !projected_edge.empty()) {
+      ctx.inclinations->set(new_vertex->id, neighbour->id,
+                            averageInclination(projected_edge));
+    }
+  }
   rep.status = ExpandGraphStatus::kSuccess;
 }
 
