@@ -361,6 +361,9 @@ mgg::ExpandContext PlannerNode::makeContext() {
   ctx.robot_box_size = robot_params_.getPlanningSize();
   ctx.allow_unknown_lattice_body = allow_unknown_lattice_body_;
   ctx.hanging_root_edge_length_max = hanging_root_edge_length_max_;
+  // A hanging root sits at the physical driving height by construction;
+  // projecting it again onto absent ground would only fail.
+  ctx.preserve_hanging_root_start_height = hanging_root_edge_length_max_ > 0.0;
   return ctx;
 }
 
