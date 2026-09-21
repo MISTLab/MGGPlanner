@@ -135,6 +135,14 @@ class PlannerNode : public rclcpp::Node {
   /// A ground robot's state at driving height above mapped ground. False
   /// when the map shows no ground under it.
   bool projectToDrivingHeight(mgg::StateVec& state) const;
+  /// A ground robot's state at driving height above the floor its base
+  /// stands on, for where the map shows no ground yet.
+  mgg::StateVec physicalAnchorAtDrivingHeight(const mgg::StateVec& base_pose) const;
+  /// Dijkstra through a fresh local lattice from the robot to a goal inside
+  /// the lattice box, the goal linked in with checked edges.
+  bool routeOverLocalLattice(const mgg::StateVec& goal,
+                             std::vector<mgg::StateVec>& path,
+                             std::string& reason);
   /// Peer reservations and refused leaves, as points the selectors skip.
   std::vector<Eigen::Vector3d> selectionExclusions();
   mgg::RecomputeGainFn globalFrontierGain();
@@ -238,6 +246,7 @@ class PlannerNode : public rclcpp::Node {
   double global_frontier_reach_m_ = 5.0;
   /// See the parameter's comment in the constructor.
   bool allow_unknown_lattice_body_ = false;
+  double hanging_root_edge_length_max_ = 0.0;
   /// The last cycle's frontier paths join the global graph before that
   /// graph is rebuilt (rrg.cpp:121 Rrg::reset).
   bool add_frontiers_to_global_graph_ = false;

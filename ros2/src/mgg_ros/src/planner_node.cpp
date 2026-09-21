@@ -242,6 +242,15 @@ PlannerNode::PlannerNode(const rclcpp::NodeOptions& options)
   // mandatory. Off by default; simulation with a keyframe map turns it on.
   allow_unknown_lattice_body_ = declareOrGet<bool>(
       this, "allow_unknown_lattice_body", allow_unknown_lattice_body_);
+  // A lidar does not see the ground under the robot: within its blind radius
+  // a keyframe map holds no floor, so the graph root has no support until
+  // the robot has driven away from where it stands. The root then sits at
+  // the physical driving height (base height above the assumed floor) as a
+  // hanging vertex, and one edge from it may reach up to this far to the
+  // first supported vertex; every other check on that edge still applies.
+  hanging_root_edge_length_max_ = std::max(
+      0.0, declareOrGet<double>(this, "hanging_root_edge_length_max",
+                                hanging_root_edge_length_max_));
 
   plan_srv_ = create_service<mgg_msgs::srv::PlannerSrv>(
       "mggplanner",
@@ -351,6 +360,7 @@ mgg::ExpandContext PlannerNode::makeContext() {
   ctx.robot_id = static_cast<int>(planning_params_.robot_id);
   ctx.robot_box_size = robot_params_.getPlanningSize();
   ctx.allow_unknown_lattice_body = allow_unknown_lattice_body_;
+  ctx.hanging_root_edge_length_max = hanging_root_edge_length_max_;
   return ctx;
 }
 
@@ -391,6 +401,17 @@ bool PlannerNode::projectToDrivingHeight(mgg::StateVec& state) const {
   state[1] = pos[1];
   state[2] = pos[2] - (ground_height - planning_params_.max_ground_height);
   return true;
+}
+
+mgg::StateVec PlannerNode::physicalAnchorAtDrivingHeight(
+    const mgg::StateVec& base_pose) const {
+  // The base sits half the body height above the floor it stands on; the
+  // driving height is max_ground_height above that floor.
+  mgg::StateVec anchor = base_pose;
+  if (robot_params_.type == mgg::RobotType::kGroundRobot) {
+    anchor[2] += planning_params_.max_ground_height - robot_params_.size[2] / 2.0;
+  }
+  return anchor;
 }
 
 std::vector<Eigen::Vector3d> PlannerNode::selectionExclusions() {
@@ -658,6 +679,9 @@ void PlannerNode::seedGlobalGraph() {
     // Until the map shows ground under it no edge attaches to it.
     mgg::StateVec root_state = current_state_;
     global_root_supported_ = projectToDrivingHeight(root_state);
+    if (!global_root_supported_) {
+      root_state = physicalAnchorAtDrivingHeight(current_state_);
+    }
     auto* root = new mgg::Vertex(0, root_state);
     root->robot_id = static_cast<int>(planning_params_.robot_id);
     root->type = mgg::VertexType::kVisited;
@@ -872,6 +896,12 @@ void PlannerNode::shortcutAndResample(std::vector<mgg::StateVec>& path) {
       mgg::interpolatePath(points, planning_params_.path_interpolation_distance,
                            resampled) &&
       resampled.size() >= 2) {
+    // interpolatePath stops short of the last point by up to one step; the
+    // route ends where it was planned to, which for an objective is the
+    // exact goal.
+    if ((resampled.back() - points.back()).norm() > 1e-6) {
+      resampled.push_back(points.back());
+    }
     points = resampled;
   }
   path_shortcut_to_ = static_cast<int>(points.size());
@@ -931,6 +961,7 @@ std::string PlannerNode::buildLocalGraph() {
   edge_inclinations_.clear();
   mgg::StateVec root_state = current_state_;
   const bool root_hanging = !projectToDrivingHeight(root_state);
+  if (root_hanging) root_state = physicalAnchorAtDrivingHeight(current_state_);
   auto* root = new mgg::Vertex(0, root_state);
   root->robot_id = static_cast<int>(planning_params_.robot_id);
   root->is_hanging = root_hanging;
@@ -1045,10 +1076,12 @@ bool PlannerNode::routeOverGlobalGraph(const mgg::StateVec& goal,
     return false;
   }
   // Let's try to add the current state to the global graph (rrg.cpp:5643).
+  // Without mapped ground under the robot its state is the physical anchor,
+  // which links to a vertex it practically coincides with (the root at a
+  // standing start) and otherwise needs a checked edge.
   mgg::StateVec current = current_state_;
   if (!projectToDrivingHeight(current)) {
-    reason = "no mapped ground under the robot";
-    return false;
+    current = physicalAnchorAtDrivingHeight(current_state_);
   }
   const mgg::ExpandContext ctx = makeGlobalContext();
   const int before = global_graph_->getNumVertices();
@@ -1101,6 +1134,63 @@ bool PlannerNode::routeOverGlobalGraph(const mgg::StateVec& goal,
   return true;
 }
 
+bool PlannerNode::routeOverLocalLattice(const mgg::StateVec& goal,
+                                        std::vector<mgg::StateVec>& path,
+                                        std::string& reason) {
+  path.clear();
+  // The goal has to lie in the box the lattice is laid out in (heading
+  // aside: the box is square in the shipped configurations).
+  const Eigen::Vector3d offset = goal.head<3>() - current_state_.head<3>();
+  if (offset.x() < grid_params_.min_val.x() ||
+      offset.x() > grid_params_.max_val.x() ||
+      offset.y() < grid_params_.min_val.y() ||
+      offset.y() > grid_params_.max_val.y()) {
+    reason = "goal is outside the local lattice";
+    return false;
+  }
+  local_graph_->reset();
+  edge_inclinations_.clear();
+  mgg::StateVec root_state = current_state_;
+  const bool root_hanging = !projectToDrivingHeight(root_state);
+  if (root_hanging) root_state = physicalAnchorAtDrivingHeight(current_state_);
+  auto* root = new mgg::Vertex(0, root_state);
+  root->robot_id = static_cast<int>(planning_params_.robot_id);
+  root->is_hanging = root_hanging;
+  local_graph_->addVertex(root);
+  const mgg::ExpandContext ctx = makeContext();
+  const mgg::GridGraphResult r = buildGridGraph(
+      *local_graph_, root_state, grid_params_, ctx, current_state_[3]);
+  if (r.status == mgg::GridGraphStatus::kInvalidBounds ||
+      local_graph_->getNumVertices() <= 1) {
+    reason = "the local lattice holds no admissible cell";
+    return false;
+  }
+  mgg::StateVec goal_state = goal;
+  if (!projectToDrivingHeight(goal_state)) {
+    reason = "no mapped ground under the goal";
+    return false;
+  }
+  mgg::Vertex* goal_vertex = mgg::connectStateToGraph(
+      *local_graph_, goal_state, ctx, kGoalLinkRadius);
+  if (goal_vertex == nullptr) {
+    reason = "goal cannot be linked to the local lattice";
+    return false;
+  }
+  mgg::ShortestPathsReport rep;
+  if (!local_graph_->findShortestPaths(0, rep) || !rep.status ||
+      (goal_vertex->id != 0 &&
+       rep.parent_id_map.find(goal_vertex->id) == rep.parent_id_map.end())) {
+    reason = "no route through the local lattice reaches the goal";
+    return false;
+  }
+  local_graph_->getShortestPath(goal_vertex->id, rep, true, path);
+  if (path.size() < 2) {
+    reason = "already at the goal";
+    return false;
+  }
+  return true;
+}
+
 bool PlannerNode::runGlobalPlanner(int target_id, std::string& reason) {
   best_path_.clear();
   best_path_from_global_graph_ = false;
@@ -1120,8 +1210,7 @@ bool PlannerNode::runGlobalPlanner(int target_id, std::string& reason) {
   if (target == nullptr) {
     mgg::StateVec current = current_state_;
     if (!projectToDrivingHeight(current)) {
-      reason = "no mapped ground under the robot";
-      return false;
+      current = physicalAnchorAtDrivingHeight(current_state_);
     }
     const int before = global_graph_->getNumVertices();
     mgg::Vertex* link_vertex = mgg::connectStateToGraph(
@@ -1330,7 +1419,14 @@ void PlannerNode::onObjectiveRequest(
   seedGlobalGraph();
   std::vector<mgg::StateVec> route;
   std::string reason;
-  if (!routeOverGlobalGraph(goal, tolerance, route, reason)) {
+  // A goal within the local box is a local plan: the grid graph is the
+  // paper's local planner and is finer than the roadmap. Anything farther,
+  // or a goal the lattice cannot reach, routes over the global graph.
+  std::string local_reason;
+  const bool local = request->objective == Service::Request::NAVIGATE &&
+                     routeOverLocalLattice(goal, route, local_reason);
+  if (!local && !routeOverGlobalGraph(goal, tolerance, route, reason)) {
+    if (!local_reason.empty()) reason += "; local lattice: " + local_reason;
     response->status = Service::Response::UNREACHABLE;
     response->reason = reason;
     RCLCPP_WARN(get_logger(), "objective refused: %s", reason.c_str());
@@ -1340,9 +1436,10 @@ void PlannerNode::onObjectiveRequest(
   response->status = Service::Response::SUCCEEDED;
   for (const mgg::StateVec& s : route) response->path.push_back(toPoseMsg(s));
   RCLCPP_INFO(get_logger(),
-              "objective route: %zu poses to (%.2f, %.2f) over the global "
-              "graph (%d corners)",
-              route.size(), goal.x(), goal.y(), path_shortcut_corners_);
+              "objective route: %zu poses to (%.2f, %.2f) over the %s (%d "
+              "corners)",
+              route.size(), goal.x(), goal.y(),
+              local ? "local lattice" : "global graph", path_shortcut_corners_);
 }
 
 // ---------------------------------------------------------------------------

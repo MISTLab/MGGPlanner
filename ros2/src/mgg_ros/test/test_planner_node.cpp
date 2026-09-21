@@ -100,6 +100,9 @@ class PlannerNodeTestPeer {
     const std::lock_guard<std::recursive_mutex> lock(node.planner_mutex_);
     return node.global_graph_->getNumEdges();
   }
+  static void setHangingRootReach(PlannerNode& node, double reach) {
+    node.hanging_root_edge_length_max_ = reach;
+  }
   static void plan(PlannerNode& node,
                    std::shared_ptr<mgg_msgs::srv::PlannerSrv::Response> response) {
     node.onPlanRequest(std::make_shared<mgg_msgs::srv::PlannerSrv::Request>(),
@@ -264,6 +267,57 @@ TEST_F(PlannerNodeTest, NavigateRoutesToAGoalOnTheRoadmap) {
   EXPECT_EQ(response->status,
             mgg_msgs::srv::PlanObjective::Response::UNREACHABLE);
   EXPECT_TRUE(response->path.empty());
+}
+
+TEST_F(PlannerNodeTest, NavigateInsideTheLatticeNeedsNoRoadmap) {
+  auto node = makeNode("navigate_local");
+  PlannerNodeTestPeer::observeFloor(*node, -1.5, 4.0, -1.5, 1.5);
+  PlannerNodeTestPeer::acceptOdometry(*node, 0.0, 0.0, 1.0);
+  ASSERT_EQ(PlannerNodeTestPeer::globalVertices(*node), 1);
+
+  auto request = std::make_shared<mgg_msgs::srv::PlanObjective::Request>();
+  request->objective = mgg_msgs::srv::PlanObjective::Request::NAVIGATE;
+  request->goal.position.x = 2.3;
+  request->goal.position.y = 0.7;
+  request->goal.orientation.w = 1.0;
+  auto response = std::make_shared<mgg_msgs::srv::PlanObjective::Response>();
+  PlannerNodeTestPeer::objective(*node, request, response);
+
+  ASSERT_EQ(response->status,
+            mgg_msgs::srv::PlanObjective::Response::SUCCEEDED)
+      << response->reason;
+  ASSERT_GE(response->path.size(), 2u);
+  // The route ends at the exact goal, not at the nearest lattice cell.
+  EXPECT_NEAR(response->path.back().position.x, 2.3, 1e-3);
+  EXPECT_NEAR(response->path.back().position.y, 0.7, 1e-3);
+  EXPECT_NEAR(pathLength(response->path), std::hypot(2.3, 0.7), 0.8);
+}
+
+TEST_F(PlannerNodeTest, BlindStartPlansFromThePhysicalAnchor) {
+  // The lidar never sees the floor under the robot: the map holds ground
+  // from 1.2 m outwards only. The root hangs at the physical driving height
+  // and one edge may reach the first supported cell.
+  auto node = makeNode("blind_start");
+  PlannerNodeTestPeer::observeFloor(*node, 1.2, 5.0, -1.5, 1.5);
+  PlannerNodeTestPeer::setHangingRootReach(*node, 2.0);
+  PlannerNodeTestPeer::acceptOdometry(*node, 0.0, 0.0, 1.0);
+
+  auto response = std::make_shared<mgg_msgs::srv::PlannerSrv::Response>();
+  PlannerNodeTestPeer::plan(*node, response);
+  ASSERT_EQ(response->status, mgg_msgs::srv::PlannerSrv::Response::FORWARD);
+  ASSERT_GE(response->path.size(), 2u);
+  EXPECT_LT(std::hypot(response->path.front().position.x,
+                       response->path.front().position.y),
+            0.30);
+  EXPECT_GE(response->path.back().position.x, 1.2);
+
+  // Without the allowance the same start has no admissible edge.
+  auto strict = makeNode("blind_start_strict");
+  PlannerNodeTestPeer::observeFloor(*strict, 1.2, 5.0, -1.5, 1.5);
+  PlannerNodeTestPeer::acceptOdometry(*strict, 0.0, 0.0, 1.0);
+  response = std::make_shared<mgg_msgs::srv::PlannerSrv::Response>();
+  PlannerNodeTestPeer::plan(*strict, response);
+  EXPECT_EQ(response->status, PlannerNode::kStatusNoPath);
 }
 
 }  // namespace mgg_ros
