@@ -181,6 +181,19 @@ TEST_F(PlannerNodeTest, ExplorationReturnsTheWholeLatticePath) {
   EXPECT_LE(maxStep(response->path), 0.25);
   // The accepted path joined the global graph (rrg.cpp:4538).
   EXPECT_GT(PlannerNodeTestPeer::globalVertices(*node), 2);
+
+  // A second cycle plans afresh: it is answered from a new lattice, not by
+  // the previous path handed back again.
+  const auto first = response->path;
+  PlannerNodeTestPeer::acceptOdometry(*node, first.back().position.x,
+                                      first.back().position.y, 2.0);
+  response = std::make_shared<mgg_msgs::srv::PlannerSrv::Response>();
+  PlannerNodeTestPeer::plan(*node, response);
+  ASSERT_EQ(response->status, mgg_msgs::srv::PlannerSrv::Response::FORWARD);
+  ASSERT_GE(response->path.size(), 2u);
+  EXPECT_LT(std::hypot(response->path.front().position.x - first.back().position.x,
+                       response->path.front().position.y - first.back().position.y),
+            0.30);
 }
 
 TEST_F(PlannerNodeTest, ReturnHomeIsTheWholeRouteOverTheGlobalGraph) {

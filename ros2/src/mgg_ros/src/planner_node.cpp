@@ -1206,6 +1206,9 @@ void PlannerNode::onPlanRequest(
   const mgg::BoundModeType previous = robot_params_.bound_mode;
   robot_params_.bound_mode =
       static_cast<mgg::BoundModeType>(request->bound_mode);
+  // Every cycle plans afresh; the previous path was the previous answer.
+  best_path_.clear();
+  best_path_from_global_graph_ = false;
 
   std::string summary;
   std::string reason;
