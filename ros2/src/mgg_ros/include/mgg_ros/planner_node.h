@@ -106,7 +106,9 @@ class PlannerNode : public rclcpp::Node {
   /// when no route exists.
   bool runGlobalPlanner(int target_id, std::string& reason);
   /// Dijkstra over the global graph from the robot to `goal`, linking both
-  /// ends into the graph first. Returns the route in `path`.
+  /// ends into the graph first: the goal stands for the vertex within
+  /// `goal_tolerance` of it, or (tolerance zero, or none there) gets its own
+  /// checked vertex at the exact goal. Returns the route in `path`.
   bool routeOverGlobalGraph(const mgg::StateVec& goal, double goal_tolerance,
                             std::vector<mgg::StateVec>& path,
                             std::string& reason);
@@ -247,9 +249,6 @@ class PlannerNode : public rclcpp::Node {
   double reservation_exclusion_ttl_s_ = 3.0;
   double peer_body_radius_m_ = 0.6;
   double peer_body_ttl_s_ = 3.0;
-  /// Goal binding for explicit objectives: how far from a goal the nearest
-  /// global vertex may lie, and how far a goal may be linked into the graph.
-  double objective_goal_tolerance_m_ = 2.0;
 
   /// Heading the robot has been travelling, for the direction penalty.
   double exploring_direction_ = 0.0;

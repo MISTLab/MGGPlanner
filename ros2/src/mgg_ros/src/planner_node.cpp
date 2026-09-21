@@ -28,6 +28,9 @@ constexpr double kMinLength = 1.0;
 constexpr double kUpdateRadius = 3.0;
 // rrg.cpp:5651: the current state links blind to a global vertex this close.
 constexpr double kLinkRadius = 1.5;
+// A goal only stands for a vertex it practically coincides with; any farther
+// and it gets its own vertex with checked edges.
+constexpr double kGoalLinkRadius = 0.1;
 
 double secondsSince(const std::chrono::steady_clock::time_point& then) {
   return std::chrono::duration<double>(std::chrono::steady_clock::now() - then)
@@ -229,9 +232,6 @@ PlannerNode::PlannerNode(const rclcpp::NodeOptions& options)
   global_frontier_reach_m_ = std::max(
       0.5, declareOrGet<double>(this, "global_frontier_reach_m",
                                 global_frontier_reach_m_));
-  objective_goal_tolerance_m_ = std::max(
-      0.1, declareOrGet<double>(this, "objective_goal_tolerance_m",
-                                objective_goal_tolerance_m_));
 
   plan_srv_ = create_service<mgg_msgs::srv::PlannerSrv>(
       "mggplanner",
@@ -1046,9 +1046,13 @@ bool PlannerNode::routeOverGlobalGraph(const mgg::StateVec& goal,
     reason = "current pose cannot be linked to the global graph";
     return false;
   }
-  // The goal is a graph vertex, or is linked in as the robot's state was.
+  // The goal is the graph vertex within `goal_tolerance` (a frontier or the
+  // home root), or else the goal itself is linked into the graph with
+  // checked edges, exactly where it was asked for: a goal is never replaced
+  // by a nearby roadmap vertex.
   mgg::Vertex* goal_vertex = nullptr;
-  if (!global_graph_->getNearestVertexInRange(&goal, goal_tolerance,
+  if (goal_tolerance <= 0.0 ||
+      !global_graph_->getNearestVertexInRange(&goal, goal_tolerance,
                                               &goal_vertex) ||
       goal_vertex == nullptr) {
     mgg::StateVec goal_state = goal;
@@ -1058,7 +1062,7 @@ bool PlannerNode::routeOverGlobalGraph(const mgg::StateVec& goal,
     }
     const int before_goal = global_graph_->getNumVertices();
     goal_vertex = mgg::connectStateToGraph(*global_graph_, goal_state, ctx,
-                                           kLinkRadius);
+                                           kGoalLinkRadius);
     if (global_graph_->getNumVertices() != before_goal) ++graph_revision_;
     if (goal_vertex == nullptr) {
       reason = "goal cannot be linked to the global graph";
@@ -1282,7 +1286,7 @@ void PlannerNode::onObjectiveRequest(
     return;
   }
   mgg::StateVec goal;
-  double tolerance = objective_goal_tolerance_m_;
+  double tolerance = 0.0;
   if (request->objective == Service::Request::RETURN_HOME) {
     const mgg::Vertex* home = findGlobalVertex(0);
     if (home == nullptr) {
