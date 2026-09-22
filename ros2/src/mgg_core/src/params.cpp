@@ -60,14 +60,15 @@ void BoundedSpaceParams::setRotation(const Eigen::Vector3d& rotations_in) {
 
 bool BoundedSpaceParams::isInsideSpace(const Eigen::Vector3d& pos) const {
   if (type == BoundedSpaceType::kSphere) {
-    return (pos - root_pos_).norm() <= radius_total_;
+    const double r = radius_total_ > 0.0 ? radius_total_ : radius;
+    return (pos - root_pos_).norm() <= r;
   }
-  // kCuboid. Uses the totals, so min_extension/max_extension take effect
-  // when setCenter was called with use_extension. The ROS 1 code compared
-  // against min_val/max_val here and never read the totals at all.
+  // kCuboid. Uses the totals if setCenter was called, falling back to min_val/max_val.
   const Eigen::Vector3d pos_b = rot_b2w_ * (pos - root_pos_);
+  const Eigen::Vector3d min_b = (min_val_total_ != max_val_total_) ? min_val_total_ : min_val;
+  const Eigen::Vector3d max_b = (min_val_total_ != max_val_total_) ? max_val_total_ : max_val;
   for (int i = 0; i < 3; ++i) {
-    if (pos_b[i] < min_val_total_[i] || pos_b[i] > max_val_total_[i]) {
+    if (pos_b[i] < min_b[i] || pos_b[i] > max_b[i]) {
       return false;
     }
   }

@@ -89,7 +89,10 @@ void computeVolumetricGain(
 
     // Scaled to metres, as the ROS 1 code did, so the threshold is
     // resolution independent.
-    if (sensor.isFrontier(unknown * ctx.map->getResolution())) {
+    const double unknown_scaled = unknown * ctx.map->getResolution();
+    if (sensor.isFrontier(unknown_scaled) ||
+        (ctx.robot != nullptr && ctx.robot->type == RobotType::kGroundRobot &&
+         unknown_scaled >= 0.5)) {
       gain.is_frontier = true;
     }
   }

@@ -536,7 +536,7 @@ void BridgeNode::publish(std::uint32_t tick, std::uint32_t ticks_per_second,
       imu.linear_acceleration.z = obs.imu[5];
       robot.imu_pub->publish(imu);
     }
-    if (obs.has_scan) publishCloud(robot, obs, stamp);
+    if (obs.has_scan && obs.has_odometry) publishCloud(robot, obs, stamp);
   }
 }
 

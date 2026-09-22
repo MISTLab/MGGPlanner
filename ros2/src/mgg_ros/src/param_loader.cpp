@@ -177,6 +177,7 @@ bool loadBoundedSpace(const ParamLoader& p, const std::string& ns,
   p.get(ns + "/rotations", out.rotations);
   p.get(ns + "/radius", out.radius);
   p.get(ns + "/radius_extension", out.radius_extension);
+  out.setCenter(Eigen::Vector3d(0.0, 0.0, 0.0), false);
   return true;
 }
 

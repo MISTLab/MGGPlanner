@@ -985,9 +985,7 @@ std::string PlannerNode::buildLocalGraph() {
            "resolution non-zero";
   }
   const auto t_grid = Clock::now();
-  // The gain evaluation needs the sampling volume centred on the robot, since
-  // it rejects voxels outside it.
-  global_space_.setCenter(current_state_, /*use_extension=*/true);
+  // Global space is defined in world frame and must remain static at world origin.
   mgg::GainContext gain_ctx = makeGainContext();
   const int evaluated = mgg::computeExplorationGain(
       *local_graph_, gain_ctx, planning_params_.leafs_only_for_volumetric_gain,
