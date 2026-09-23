@@ -6,6 +6,7 @@
 #include <vector>
 
 #include "mgg_core/map_interface.h"
+#include "mgg_map_octomap/cell_index.h"
 
 namespace mgg {
 
@@ -91,6 +92,7 @@ class NativeMolaGrid final : public MapInterface {
   bool walk(const Eigen::Vector3d&, const Eigen::Vector3d&, F) const;
   double resolution_;
   std::vector<Cell> occupied_, free_;
+  CellIndex<Cell> cell_index_;
   std::map<Cell, double> surface_max_z_;
 };
 }  // namespace mgg

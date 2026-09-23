@@ -65,6 +65,8 @@ if(BUILD_TESTING)
   target_link_libraries(test_octomap_map ${PROJECT_NAME})
   ament_add_gtest(test_mola_map test/test_mola_map.cpp)
   target_link_libraries(test_mola_map ${PROJECT_NAME})
+  ament_add_gtest(test_native_mola_index test/test_native_mola_index.cpp)
+  target_link_libraries(test_native_mola_index ${PROJECT_NAME})
 endif()
 
 ament_package()

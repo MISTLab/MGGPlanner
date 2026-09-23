@@ -1409,6 +1409,28 @@ TEST(MolaMap, SparseMeasuredRayCorridorGrowsFootprintValidatedGroundGraph) {
   EXPECT_GT(result.vertices_added, 0)
       << "free=" << result.free_cells << " no_ground=" << result.no_ground
       << " edge_ok=" << result.edge_status[0];
+
+  // Synthetic tunnel lattice: pin every vertex pose and adjacency, not just
+  // the aggregate counts. No recorded live map is available in this package.
+  std::vector<int> ids;
+  for (const auto& entry : graph.vertices_map_) ids.push_back(entry.first);
+  std::sort(ids.begin(), ids.end());
+  std::ostringstream lattice;
+  lattice << std::setprecision(17);
+  for (int id : ids) {
+    const auto& state = graph.vertices_map_.at(id)->state;
+    lattice << id << ':';
+    for (int axis = 0; axis < state.size(); ++axis) lattice << state[axis] << ',';
+    lattice << ';';
+  }
+  for (const auto& [id, edges] : graph.edge_map_) {
+    auto sorted = edges;
+    std::sort(sorted.begin(), sorted.end());
+    for (const auto& [target, weight] : sorted)
+      lattice << id << '>' << target << ':' << weight << ';';
+  }
+  EXPECT_EQ(sha256(lattice.str()),
+            "71575e15563a8e4621af55c8cc1908a77b713ae0c3501cddd46a54c08d08a6ed");
 }
 
 }  // namespace

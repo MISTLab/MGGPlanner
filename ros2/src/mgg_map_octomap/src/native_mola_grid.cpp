@@ -51,6 +51,7 @@ NativeMolaGrid::NativeMolaGrid(double r, std::vector<Cell> o,
     : resolution_(r), occupied_(std::move(o)), free_(std::move(f)) {
   std::sort(occupied_.begin(), occupied_.end());
   std::sort(free_.begin(), free_.end());
+  cell_index_.build(occupied_, free_);
   for (const auto& v : s)
     if (std::isfinite(v.max_z)) {
       auto it = surface_max_z_.find(v.cell);
@@ -75,11 +76,11 @@ Eigen::Vector3d NativeMolaGrid::center(const Cell& k) const {
                         Eigen::Vector3d::Constant(.5));
 }
 VoxelStatus NativeMolaGrid::status(const Cell& k) const {
-  if (std::binary_search(occupied_.begin(), occupied_.end(), k))
-    return VoxelStatus::kOccupied;
-  if (std::binary_search(free_.begin(), free_.end(), k))
-    return VoxelStatus::kFree;
-  return VoxelStatus::kUnknown;
+  switch (cell_index_.status(k, occupied_, free_)) {
+    case 2: return VoxelStatus::kOccupied;
+    case 1: return VoxelStatus::kFree;
+    default: return VoxelStatus::kUnknown;
+  }
 }
 bool NativeMolaGrid::getAxisAlignedXYCellCenter(const Eigen::Vector2d& p,
                                                 Eigen::Vector2d& c) const {
