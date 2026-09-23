@@ -104,6 +104,17 @@ void expandGraph(GraphManager& graph, Vertex& new_vertex,
 void expandGraphEdges(GraphManager& graph, Vertex* new_vertex,
                       ExpandGraphReport& rep, const ExpandContext& ctx);
 
+/// The check expandGraphEdges applies to one candidate edge between two
+/// vertices already at driving height: the geofence, then a sweep through
+/// space the map has seen traversable (overshooting both ends, except into
+/// vertex zero). Length bounds and graph-distance rules stay with the caller.
+/// Adds nothing to any graph. `projected_edge`, when given, receives the
+/// ground-following polyline of an admissible edge.
+bool roadmapEdgeTraversable(const ExpandContext& ctx, const Vertex& from,
+                            const Vertex& to, ExpandGraphReport& rep,
+                            std::vector<Eigen::Vector3d>* projected_edge =
+                                nullptr);
+
 }  // namespace mgg
 
 #endif  // MGG_CORE_GRAPH_EXPANSION_H_

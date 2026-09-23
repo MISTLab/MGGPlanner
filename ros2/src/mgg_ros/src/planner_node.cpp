@@ -1102,11 +1102,13 @@ bool PlannerNode::routeOverGlobalGraph(const mgg::StateVec& goal,
   // checked edges, exactly where it was asked for: a goal is never replaced
   // by a nearby roadmap vertex.
   mgg::Vertex* goal_vertex = nullptr;
+  mgg::StateVec goal_state = goal;
+  bool exact_goal = false;
   if (goal_tolerance <= 0.0 ||
       !global_graph_->getNearestVertexInRange(&goal, goal_tolerance,
                                               &goal_vertex) ||
       goal_vertex == nullptr) {
-    mgg::StateVec goal_state = goal;
+    exact_goal = true;
     if (!projectToDrivingHeight(goal_state)) {
       reason = "no mapped ground under the goal";
       return false;
@@ -1115,25 +1117,70 @@ bool PlannerNode::routeOverGlobalGraph(const mgg::StateVec& goal,
     goal_vertex = mgg::connectStateToGraph(*global_graph_, goal_state, ctx,
                                            kGoalLinkRadius, /*exact_state=*/true);
     if (global_graph_->getNumVertices() != before_goal) ++graph_revision_;
+  }
+  // Dijkstra fills a parent for every vertex and leaves an unreached one as
+  // its own parent, so reachability is read from that, not from presence.
+  mgg::ShortestPathsReport rep;
+  const auto search = [this, &rep, link_vertex]() {
+    rep.status = false;
+    global_graph_->findShortestPaths(link_vertex->id, rep);
+  };
+  const auto reaches = [&rep, link_vertex](const mgg::Vertex& vertex) {
+    if (vertex.id == link_vertex->id) return true;
+    if (!rep.status) return false;
+    const auto parent = rep.parent_id_map.find(vertex.id);
+    return parent != rep.parent_id_map.end() && parent->second != vertex.id;
+  };
+  search();
+  // No single roadmap edge reaches the goal, or the one that does joins a
+  // part of the roadmap the robot cannot reach. Known space may still turn
+  // or narrow between the two: lay the local planner's lattice out around
+  // the goal and bridge from it to the roadmap the robot can use.
+  if (exact_goal && (goal_vertex == nullptr || !reaches(*goal_vertex))) {
+    const char* single_edge = goal_vertex == nullptr
+                                  ? "goal cannot be linked to the global graph"
+                                  : "the goal's roadmap link is not reachable";
+    mgg::GoalLatticeReport lattice;
+    const int before_lattice = global_graph_->getNumVertices();
+    goal_vertex = mgg::connectGoalThroughLattice(
+        *global_graph_, goal_state, grid_params_, ctx, current_state_[3],
+        reaches, &lattice);
+    if (global_graph_->getNumVertices() != before_lattice) ++graph_revision_;
     if (goal_vertex == nullptr) {
-      reason = "goal cannot be linked to the global graph";
+      char why[256];
+      std::snprintf(why, sizeof(why),
+                    "%s; goal lattice: %d vertices in %d sweep(s), %d "
+                    "reached from the goal, %d bridge checks%s, none onto "
+                    "the robot's roadmap",
+                    single_edge, lattice.lattice_vertices, lattice.passes,
+                    lattice.reachable_vertices, lattice.bridge_checks,
+                    lattice.hit_check_limit ? " (capped)" : "");
+      reason = why;
       return false;
     }
+    RCLCPP_INFO(get_logger(),
+                "goal linked through a lattice around it: %d lattice "
+                "vertices in %d sweep(s), %d bridge checks, %d joined the "
+                "roadmap",
+                lattice.lattice_vertices, lattice.passes,
+                lattice.bridge_checks, lattice.chain_vertices);
+    search();
   }
-  mgg::ShortestPathsReport rep;
-  if (!global_graph_->findShortestPaths(link_vertex->id, rep) ||
-      !rep.status) {
-    reason = "shortest paths over the global graph failed";
+  if (goal_vertex == nullptr) {
+    reason = "goal cannot be linked to the global graph";
     return false;
   }
-  if (rep.parent_id_map.find(goal_vertex->id) == rep.parent_id_map.end() &&
-      goal_vertex->id != link_vertex->id) {
+  if (goal_vertex->id == link_vertex->id) {
+    reason = "already at the goal";
+    return false;
+  }
+  if (!reaches(*goal_vertex)) {
     reason = "no route over the global graph reaches the goal";
     return false;
   }
   global_graph_->getShortestPath(goal_vertex->id, rep, true, path);
   if (path.size() < 2) {
-    reason = "already at the goal";
+    reason = "no route over the global graph reaches the goal";
     return false;
   }
   return true;

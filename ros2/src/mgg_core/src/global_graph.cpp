@@ -4,6 +4,7 @@
 #include <chrono>
 #include <cmath>
 #include <limits>
+#include <utility>
 
 #include "mgg_core/trajectory.h"
 
@@ -289,6 +290,119 @@ bool addRefPathToGraph(GraphManager& graph,
     poses.push_back({path[i]->state, path[i]});
   }
   return addRefPath(graph, poses, ctx, vertex_spacing, path_vertices);
+}
+
+Vertex* connectGoalThroughLattice(GraphManager& graph, const StateVec& goal,
+                                  const GridGraphParams& grid,
+                                  const ExpandContext& ctx, double heading,
+                                  const UsableVertexFn& usable,
+                                  GoalLatticeReport* report) {
+  GoalLatticeReport scratch_report;
+  GoalLatticeReport& out = report != nullptr ? *report : scratch_report;
+  out = GoalLatticeReport{};
+
+  // The lattice itself is scratch; only the path through it that reaches the
+  // roadmap is kept. Rooted at the goal, so every lattice vertex it reaches
+  // has a verified way back to the goal.
+  GraphManager lattice;
+  auto* root = new Vertex(0, goal);
+  root->robot_id = ctx.robot_id;
+  lattice.addVertex(root);
+  // One sweep offers every cell once, linked to whichever lattice vertex is
+  // nearest at that moment, so a cell round a corner from the goal is offered
+  // before anything that could reach it exists. Sweep again while the last
+  // sweep added vertices: a cell that already has one is refused as a short
+  // edge, so each pass only reaches round the next turn. The whole lattice
+  // stays within one sweep's num_vertices_max.
+  for (int pass = 0; pass < kMaxGoalLatticePasses; ++pass) {
+    const GridGraphResult built =
+        buildGridGraph(lattice, goal, grid, ctx, heading);
+    if (built.status != GridGraphStatus::kOk) return nullptr;
+    ++out.passes;
+    if (built.vertices_added == 0 ||
+        lattice.getNumVertices() >= ctx.planning->num_vertices_max) {
+      break;
+    }
+  }
+  out.lattice_vertices = lattice.getNumVertices();
+
+  // Nearest the goal first, by distance through the lattice.
+  ShortestPathsReport lattice_paths;
+  std::vector<std::pair<double, Vertex*>> reachable{{0.0, root}};
+  if (lattice.getNumVertices() > 1 &&
+      lattice.findShortestPaths(0, lattice_paths) && lattice_paths.status) {
+    for (const auto& entry : lattice.vertices_map_) {
+      Vertex* vertex = entry.second;
+      if (vertex == nullptr || vertex->id == 0) continue;
+      const auto parent = lattice_paths.parent_id_map.find(vertex->id);
+      // Dijkstra leaves an unreached vertex as its own parent.
+      if (parent == lattice_paths.parent_id_map.end() ||
+          parent->second == vertex->id) {
+        continue;
+      }
+      reachable.emplace_back(lattice_paths.distance_map.at(vertex->id),
+                             vertex);
+    }
+  }
+  std::stable_sort(reachable.begin(), reachable.end(),
+                   [](const auto& a, const auto& b) { return a.first < b.first; });
+  out.reachable_vertices = static_cast<int>(reachable.size());
+
+  const double reach = ctx.planning->edge_length_max;
+  for (const auto& [lattice_distance, vertex] : reachable) {
+    (void)lattice_distance;
+    std::vector<Vertex*> candidates;
+    if (!graph.getNearestVertices(&vertex->state, reach, &candidates)) continue;
+    const Eigen::Vector3d at = vertex->state.head<3>();
+    std::sort(candidates.begin(), candidates.end(),
+              [&at](const Vertex* a, const Vertex* b) {
+                return (a->state.head<3>() - at).squaredNorm() <
+                       (b->state.head<3>() - at).squaredNorm();
+              });
+    for (Vertex* candidate : candidates) {
+      if (candidate == nullptr || candidate->is_hanging) continue;
+      if (usable && !usable(*candidate)) continue;
+      const double gap = (candidate->state.head<3>() - at).norm();
+      if (gap >= reach) continue;
+      if (gap > 1e-9) {
+        if (out.bridge_checks >= kMaxGoalBridgeChecks) {
+          out.hit_check_limit = true;
+          return nullptr;
+        }
+        ++out.bridge_checks;
+        ExpandGraphReport rep;
+        if (!roadmapEdgeTraversable(ctx, *vertex, *candidate, rep)) continue;
+      }
+      // Roadmap vertex, bridge, then the lattice path back to the goal.
+      std::vector<StateVec> chain{candidate->state};
+      std::vector<StateVec> through;
+      if (vertex->id == 0) {
+        through.push_back(goal);
+      } else {
+        lattice.getShortestPath(vertex->id, lattice_paths,
+                                /*source_to_target_order=*/false, through);
+      }
+      chain.insert(chain.end(), through.begin(), through.end());
+      // A spacing of zero keeps every lattice vertex: dropping one would
+      // replace two checked lattice edges with an unchecked chord.
+      std::vector<Vertex*> added;
+      if (!addRefPathToGraph(graph, chain, ctx, /*vertex_spacing=*/0.0,
+                             &added) ||
+          added.empty()) {
+        return nullptr;
+      }
+      out.chain_vertices = static_cast<int>(added.size());
+      Vertex* goal_vertex = added.back();
+      // An own roadmap vertex within kDeltaLimit of the goal would have taken
+      // its place; that is not the requested endpoint.
+      if ((goal_vertex->state.head<3>() - goal.head<3>()).squaredNorm() >
+          1e-12) {
+        return nullptr;
+      }
+      return goal_vertex;
+    }
+  }
+  return nullptr;
 }
 
 std::vector<int> performShortestPathsClustering(

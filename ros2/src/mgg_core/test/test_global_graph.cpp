@@ -400,6 +400,134 @@ TEST(ConnectStateToGraph, ExactAttachmentRejectsClippedGoalExtension) {
             nullptr);
 }
 
+/// A wall y in [1.0, 1.4] everywhere except a gap at x >= 4.5.
+class WallWithGap : public OpenSpace {
+ public:
+  VoxelStatus getVoxelStatus(const Eigen::Vector3d& p) const override {
+    return p.y() >= 1.0 && p.y() <= 1.4 && p.x() < 4.5 ? VoxelStatus::kOccupied
+                                                       : VoxelStatus::kFree;
+  }
+};
+
+/// A roadmap along y = 0 from home to x = 4, as an odometry trail leaves it,
+/// checked with a roadmap context (unobserved space blocks), and the paper's
+/// lattice scaled to the fixture: +/-6 m in one layer at 0.5 m.
+struct GoalLatticeScene {
+  explicit GoalLatticeScene(const MapInterface& map_in) {
+    fixture.ctx.map = &map_in;
+    fixture.ctx.stop_at_unknown = true;
+    fixture.planning.num_vertices_max = 5000;
+    fixture.planning.num_edges_max = 50000;
+    Vertex* parent = fixture.global.getVertex(0);
+    for (double x = 1.0; x <= 4.0 + 1e-9; x += 1.0) {
+      parent = fixture.add(fixture.global, StateVec(x, 0.0, 0.0, 0.0), parent);
+    }
+    grid.min_val = Eigen::Vector3d(-6.0, -6.0, 0.0);
+    grid.max_val = Eigen::Vector3d(6.0, 6.0, 0.0);
+    grid.resolution = Eigen::Vector3d(0.5, 0.5, 0.5);
+  }
+
+  std::vector<StateVec> routeFromHome(const Vertex* goal) {
+    ShortestPathsReport rep;
+    std::vector<StateVec> path;
+    if (!fixture.global.findShortestPaths(0, rep)) return path;
+    fixture.global.getShortestPath(goal->id, rep, true, path);
+    return path;
+  }
+
+  Roadmap fixture;
+  mgg::GridGraphParams grid;
+};
+
+TEST(ConnectGoalThroughLattice, RoutesAroundAWallNoSingleEdgeCrosses) {
+  WallWithGap map;
+  GoalLatticeScene scene(map);
+  // Behind the wall and more than one edge from the trail: no single edge
+  // attaches the goal.
+  const StateVec goal(3.0, 2.5, 0.0, 0.0);
+  ASSERT_EQ(mgg::connectStateToGraph(scene.fixture.global, goal,
+                                     scene.fixture.ctx, 0.1, true),
+            nullptr);
+  const int before = scene.fixture.global.getNumVertices();
+
+  mgg::GoalLatticeReport report;
+  Vertex* linked = mgg::connectGoalThroughLattice(
+      scene.fixture.global, goal, scene.grid, scene.fixture.ctx, 0.0, nullptr,
+      &report);
+  ASSERT_NE(linked, nullptr);
+  EXPECT_DOUBLE_EQ(linked->state.x(), goal.x());
+  EXPECT_DOUBLE_EQ(linked->state.y(), goal.y());
+  EXPECT_DOUBLE_EQ(linked->state.z(), goal.z());
+  EXPECT_GE(report.passes, 1);
+  EXPECT_GT(report.lattice_vertices, 1);
+  EXPECT_GT(report.chain_vertices, 2);
+  EXPECT_GT(scene.fixture.global.getNumVertices(), before);
+
+  // The route from home ends exactly on the goal, turns through the gap,
+  // and no segment of it crosses the wall.
+  const std::vector<StateVec> path = scene.routeFromHome(linked);
+  ASSERT_GE(path.size(), 2u);
+  EXPECT_DOUBLE_EQ(path.back().x(), goal.x());
+  EXPECT_DOUBLE_EQ(path.back().y(), goal.y());
+  int crossings = 0;
+  for (std::size_t i = 0; i + 1 < path.size(); ++i) {
+    const StateVec& a = path[i];
+    const StateVec& b = path[i + 1];
+    EXPECT_EQ(map.getRayStatus(a.head<3>(), b.head<3>(), true),
+              VoxelStatus::kFree)
+        << "segment " << i << " crosses the wall";
+    // Where the route crosses the wall's centre line, it is in the gap.
+    if ((a.y() - 1.2) * (b.y() - 1.2) < 0.0) {
+      const double t = (1.2 - a.y()) / (b.y() - a.y());
+      EXPECT_GE(a.x() + t * (b.x() - a.x()), 4.5);
+      ++crossings;
+    }
+  }
+  EXPECT_EQ(crossings, 1);
+
+  // The lattice path stays in the roadmap: a goal beside it now attaches
+  // with a single edge.
+  EXPECT_NE(mgg::connectStateToGraph(scene.fixture.global,
+                                     StateVec(3.4, 2.5, 0.0, 0.0),
+                                     scene.fixture.ctx, 0.1, true),
+            nullptr);
+}
+
+TEST(ConnectGoalThroughLattice, UnobservedSpaceIsNotCrossed) {
+  // Everything from y = 1 on is unobserved: known space does not reach it.
+  OpenSpace map(/*blocked_y=*/1.0, /*unknown_instead=*/true);
+  GoalLatticeScene scene(map);
+  const int before = scene.fixture.global.getNumVertices();
+  EXPECT_EQ(mgg::connectGoalThroughLattice(
+                scene.fixture.global, StateVec(2.0, 2.5, 0.0, 0.0),
+                scene.grid, scene.fixture.ctx, 0.0, nullptr),
+            nullptr);
+  EXPECT_EQ(scene.fixture.global.getNumVertices(), before);
+}
+
+TEST(ConnectGoalThroughLattice, BridgesOnlyToUsableRoadmapVertices) {
+  WallWithGap map;
+  GoalLatticeScene scene(map);
+  const StateVec goal(3.0, 2.5, 0.0, 0.0);
+  const int before = scene.fixture.global.getNumVertices();
+  // Nothing the robot can reach: the goal stays unattached and the roadmap
+  // unchanged.
+  EXPECT_EQ(mgg::connectGoalThroughLattice(
+                scene.fixture.global, goal, scene.grid, scene.fixture.ctx, 0.0,
+                [](const Vertex&) { return false; }),
+            nullptr);
+  EXPECT_EQ(scene.fixture.global.getNumVertices(), before);
+  // Only home usable, 4.5 m west of the gap: a single sweep never reaches
+  // round the wall's end to it; the repeated sweeps do.
+  mgg::GoalLatticeReport report;
+  Vertex* linked = mgg::connectGoalThroughLattice(
+      scene.fixture.global, goal, scene.grid, scene.fixture.ctx, 0.0,
+      [](const Vertex& vertex) { return vertex.id == 0; }, &report);
+  ASSERT_NE(linked, nullptr);
+  EXPECT_GT(report.passes, 1);
+  EXPECT_GE(scene.routeFromHome(linked).size(), 2u);
+}
+
 /// A local grid graph with three frontier arms, plus a global graph whose
 /// existing vertices surround two of them.
 struct FrontierScene {

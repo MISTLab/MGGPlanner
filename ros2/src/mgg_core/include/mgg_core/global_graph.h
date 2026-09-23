@@ -37,6 +37,7 @@
 #include "mgg_core/graph_base.h"
 #include "mgg_core/graph_expansion.h"
 #include "mgg_core/graph_manager.h"
+#include "mgg_core/grid_graph.h"
 #include "mgg_core/random_sampler.h"
 #include "mgg_core/types.h"
 
@@ -158,6 +159,50 @@ bool addRefPathToGraph(GraphManager& graph,
                        const std::vector<Vertex*>& path,
                        const ExpandContext& ctx, double vertex_spacing,
                        std::vector<Vertex*>* path_vertices = nullptr);
+
+/// Roadmap vertices a goal lattice may bridge to, e.g. those the robot can
+/// reach. Null admits every vertex.
+using UsableVertexFn = std::function<bool(const Vertex&)>;
+
+/// Bounds the lattice-to-roadmap edge checks of one connectGoalThroughLattice.
+inline constexpr int kMaxGoalBridgeChecks = 4096;
+/// Bounds its lattice sweeps: each one reaches round one more turn.
+inline constexpr int kMaxGoalLatticePasses = 8;
+
+struct GoalLatticeReport {
+  /// Lattice sweeps made; vertices of the lattice laid out around the goal,
+  /// the goal included, and how many of them the goal reaches through it.
+  int passes = 0;
+  int lattice_vertices = 0;
+  int reachable_vertices = 0;
+  /// Lattice-to-roadmap edges checked, and whether the cap stopped the search.
+  int bridge_checks = 0;
+  bool hit_check_limit = false;
+  /// Lattice vertices folded into the roadmap, bridge and goal included.
+  int chain_vertices = 0;
+};
+
+/// Attaches `goal`, exactly where it is, to `graph` through a lattice laid
+/// out around it: the paper's local planner lattice, built with `grid` as
+/// around the robot, but rooted at the goal, checked with `ctx` (a roadmap
+/// context, so unobserved space blocks) and swept again while a sweep still
+/// adds vertices (at most kMaxGoalLatticePasses, and num_vertices_max in
+/// total), so it follows known space round turns. This is for a goal no
+/// single roadmap edge reaches, where known space turns or narrows between
+/// the roadmap and the goal.
+///
+/// Lattice vertices are visited by their lattice distance from the goal; the
+/// first one within edge_length_max of a usable, supported roadmap vertex
+/// with a traversable edge (roadmapEdgeTraversable) is the bridge. The
+/// lattice path from the bridge to the goal then joins the roadmap as a
+/// verified path (addRefPathToGraph, every lattice vertex kept), so later
+/// goals nearby attach directly. Returns the goal's roadmap vertex, or null
+/// when no lattice vertex bridges, leaving the roadmap untouched.
+Vertex* connectGoalThroughLattice(GraphManager& graph, const StateVec& goal,
+                                  const GridGraphParams& grid,
+                                  const ExpandContext& ctx, double heading,
+                                  const UsableVertexFn& usable,
+                                  GoalLatticeReport* report = nullptr);
 
 /// Groups root-to-leaf paths that run the same way (rrg.cpp:5369
 /// Rrg::performShortestPathsClustering) and returns the leaf id of each

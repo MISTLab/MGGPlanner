@@ -1,6 +1,7 @@
 #include "mgg_core/graph_expansion.h"
 
 #include <cmath>
+#include <utility>
 #include <vector>
 
 namespace mgg {
@@ -302,6 +303,30 @@ void expandGraph(GraphManager& graph, Vertex& new_vertex,
   rep.status = ExpandGraphStatus::kSuccess;
 }
 
+bool roadmapEdgeTraversable(const ExpandContext& ctx, const Vertex& from,
+                            const Vertex& to, ExpandGraphReport& rep,
+                            std::vector<Eigen::Vector3d>* projected_edge) {
+  const Eigen::Vector3d origin = from.state.head<3>();
+  const Eigen::Vector3d direction = to.state.head<3>() - origin;
+  const double d_norm = direction.norm();
+  const Eigen::Vector3d p_overshoot =
+      d_norm > 1e-12
+          ? Eigen::Vector3d(direction / d_norm * ctx.planning->edge_overshoot)
+          : Eigen::Vector3d::Zero();
+  const Eigen::Vector3d p_start =
+      origin + ctx.robot->center_offset - p_overshoot;
+  Eigen::Vector3d p_end = origin + ctx.robot->center_offset + direction;
+  if (to.id != 0) p_end += p_overshoot;
+  if (geofenceBlocks(ctx, p_start, p_end)) return false;
+  std::vector<Eigen::Vector3d> edge;
+  if (!edgeTraversable(ctx, p_start, p_end, false, false, edge, rep,
+                       /*stop_at_unknown=*/true)) {
+    return false;
+  }
+  if (projected_edge != nullptr) *projected_edge = std::move(edge);
+  return true;
+}
+
 void expandGraphEdges(GraphManager& graph, Vertex* new_vertex,
                       ExpandGraphReport& rep, const ExpandContext& ctx) {
   // rrg.cpp:867 Rrg::expandGraphEdges. The vertex is already in the graph;
@@ -327,16 +352,9 @@ void expandGraphEdges(GraphManager& graph, Vertex* new_vertex,
     // Boost's setS edge list already refuses a duplicate; skipping it here
     // also keeps the adjacency map free of repeats.
     if (graph.graph_->edgeExists(new_vertex->id, neighbour->id)) continue;
-    const Eigen::Vector3d p_overshoot =
-        direction / d_norm * ctx.planning->edge_overshoot;
-    const Eigen::Vector3d p_start =
-        origin + ctx.robot->center_offset - p_overshoot;
-    Eigen::Vector3d p_end = origin + ctx.robot->center_offset + direction;
-    if (neighbour->id != 0) p_end += p_overshoot;
-    if (geofenceBlocks(ctx, p_start, p_end)) continue;
     std::vector<Eigen::Vector3d> projected_edge;
-    if (!edgeTraversable(ctx, p_start, p_end, false, false, projected_edge,
-                         rep, /*stop_at_unknown=*/true)) {
+    if (!roadmapEdgeTraversable(ctx, *new_vertex, *neighbour, rep,
+                                &projected_edge)) {
       continue;
     }
     // rrg.cpp:907: a long way round the tree and a height change is a
