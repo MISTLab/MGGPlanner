@@ -20,7 +20,10 @@ class CellIndex {
 
   void build(const std::vector<Cell>& occupied, const std::vector<Cell>& free) {
     const std::size_t count = occupied.size() + free.size();
-    if (count == 0) return;
+    if (count == 0) {
+      slots_.clear();
+      return;
+    }
     std::size_t capacity = 2;
     // Keep at most half the slots occupied even with disjoint input cells.
     while (capacity / 2 < count) capacity *= 2;

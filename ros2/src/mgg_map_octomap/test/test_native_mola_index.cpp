@@ -63,6 +63,16 @@ TEST(NativeMolaIndex, MatchesBinarySearchOnRandomAndTunnelCells) {
   // exercise exact high-bit keys without rounding them through Eigen.
 }
 
+TEST(NativeMolaIndex, EmptyRebuildDiscardsOldSlots) {
+  const std::vector<Cell> occupied{{1, 2, 3}};
+  const std::vector<Cell> empty;
+  mgg::CellIndex<Cell> index(occupied, empty);
+  ASSERT_GT(index.bytes(), 0u);
+  index.build(empty, empty);
+  ASSERT_EQ(index.bytes(), 0u);
+  EXPECT_EQ(index.status({1, 2, 3}, empty, empty), 0);
+}
+
 TEST(NativeMolaIndex, RaysAndMeasuredSurfacesPreserveClosedCellResults) {
   Grid grid(1.0, {{0, 0, -1}, {3, 0, 0}, {1, 0, 0}},
             {{0, 0, 0}, {1, 0, 0}, {2, 0, 0}},
