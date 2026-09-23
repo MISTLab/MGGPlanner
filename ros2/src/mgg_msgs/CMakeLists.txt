@@ -59,6 +59,7 @@ rosidl_generate_interfaces(${PROJECT_NAME}
   "srv/PlannerRequestPath.srv"
   "srv/PlannerSearch.srv"
   "srv/PlannerSetExpMode.srv"
+  "srv/PlannerSetExplorationTarget.srv"
   "srv/PlannerSetGlobalBound.srv"
   "srv/PlannerSetHomingPos.srv"
   "srv/PlannerSetPlanningMode.srv"

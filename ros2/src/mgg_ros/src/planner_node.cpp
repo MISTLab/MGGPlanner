@@ -266,6 +266,16 @@ PlannerNode::PlannerNode(const rclcpp::NodeOptions& options)
         onObjectiveRequest(req, res);
       },
       rclcpp::ServicesQoS(), callback_group_);
+  exploration_target_srv_ =
+      create_service<mgg_msgs::srv::PlannerSetExplorationTarget>(
+          "set_exploration_target",
+          [this](const std::shared_ptr<
+                     mgg_msgs::srv::PlannerSetExplorationTarget::Request>
+                     req,
+                 std::shared_ptr<
+                     mgg_msgs::srv::PlannerSetExplorationTarget::Response>
+                     res) { onExplorationTargetRequest(req, res); },
+          rclcpp::ServicesQoS(), callback_group_);
 
   const double publish_period =
       declareOrGet<double>(this, "graph_publish_period_sec", 2.0);
@@ -1001,9 +1011,18 @@ std::string PlannerNode::buildLocalGraph() {
   add_frontiers_to_global_graph_ = local_graph_->getNumVertices() > 1;
 
   const auto t_gain = Clock::now();
+  // Toward a target the robot has no route to yet, the direction the paths
+  // are penalised for leaving is the one to the target, not the last path's.
+  // path_direction_penalty keeps it a preference: a path round an obstacle
+  // that first heads away is discounted, not refused.
+  const double selection_direction =
+      exploration_target_.has_value()
+          ? std::atan2(exploration_target_->y() - current_state_.y(),
+                       exploration_target_->x() - current_state_.x())
+          : exploring_direction_;
   const mgg::PathSelectionResult sel = mgg::selectBestPath(
       *local_graph_, planning_params_, robot_params_, edge_inclinations_,
-      map_->getResolution(), exploring_direction_, selectionExclusions(),
+      map_->getResolution(), selection_direction, selectionExclusions(),
       reservation_exclusion_radius_m_);
   for (const mgg::Vertex* v : sel.best_path) {
     if (v != nullptr) best_path_.push_back(v->state);
@@ -1276,7 +1295,8 @@ bool PlannerNode::runGlobalPlanner(int target_id, std::string& reason) {
     const mgg::GlobalFrontierReport report = mgg::searchGlobalFrontier(
         *global_graph_, link_vertex->id,
         static_cast<int>(planning_params_.robot_id), globalFrontierGain(),
-        selectionExclusions(), reservation_exclusion_radius_m_);
+        selectionExclusions(), reservation_exclusion_radius_m_,
+        exploration_target_.has_value() ? &*exploration_target_ : nullptr);
     global_space_.setCenter(current_state_, /*use_extension=*/true);
     if (report.best_frontier == nullptr) {
       // rrg.cpp:5628 and 5759: no frontier, or none the graph can reach.
@@ -1411,6 +1431,33 @@ void PlannerNode::onPlanRequest(
   publishPath();
   publishMarkers();
   RCLCPP_INFO(get_logger(), "plan request: %s", summary.c_str());
+}
+
+void PlannerNode::onExplorationTargetRequest(
+    const std::shared_ptr<mgg_msgs::srv::PlannerSetExplorationTarget::Request>
+        request,
+    std::shared_ptr<mgg_msgs::srv::PlannerSetExplorationTarget::Response>
+        response) {
+  const std::lock_guard<std::recursive_mutex> lock(planner_mutex_);
+  if (!request->active) {
+    if (exploration_target_.has_value()) {
+      RCLCPP_INFO(get_logger(), "exploration target cleared");
+    }
+    exploration_target_.reset();
+    response->success = true;
+    return;
+  }
+  const Eigen::Vector3d target(request->target.x, request->target.y,
+                               request->target.z);
+  if (!target.allFinite()) {
+    response->success = false;
+    response->message = "exploration target is not finite";
+    return;
+  }
+  exploration_target_ = target;
+  RCLCPP_INFO(get_logger(), "exploring toward (%.2f, %.2f, %.2f)", target.x(),
+              target.y(), target.z());
+  response->success = true;
 }
 
 void PlannerNode::onObjectiveRequest(

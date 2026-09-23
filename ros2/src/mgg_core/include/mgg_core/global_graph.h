@@ -256,6 +256,10 @@ inline constexpr double kGlobalDistancePenalty = 0.05;
 /// Factor applied to another robot's frontier (rrg.cpp:5799
 /// kGOtherRobotPenalty), so each robot prefers the frontiers it found.
 inline constexpr double kGlobalOtherRobotPenalty = 0.001;
+/// Toward an exploration target, a frontier is further discounted by its
+/// straight-line distance to the target, at the same rate as the distance
+/// the robot must travel to reach it: a soft preference, never a refusal.
+inline constexpr double kGlobalTargetPenalty = 0.05;
 
 struct GlobalFrontierReport {
   /// The best feasible frontier, or null when none exists.
@@ -280,11 +284,14 @@ struct GlobalFrontierReport {
 /// times kGlobalOtherRobotPenalty for another robot's frontier
 /// (rrg.cpp:5800 to 5808). Frontiers within `exclusion_radius` of an
 /// `excluded` point (a peer's reservation or a refused target) are skipped.
+/// With a `target` (exploring toward a goal with no known route), each
+/// frontier is also discounted by exp(-kGlobalTargetPenalty * its
+/// straight-line distance to the target).
 GlobalFrontierReport searchGlobalFrontier(
     GraphManager& graph, int source_id, int robot_id,
     const RecomputeGainFn& recompute_gain,
     const std::vector<Eigen::Vector3d>& excluded = {},
-    double exclusion_radius = 0.0);
+    double exclusion_radius = 0.0, const Eigen::Vector3d* target = nullptr);
 
 }  // namespace mgg
 

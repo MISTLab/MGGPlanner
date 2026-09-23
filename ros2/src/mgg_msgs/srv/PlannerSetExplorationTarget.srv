@@ -1,0 +1,10 @@
+# Bias exploration toward a target, softly: local paths heading toward it and
+# global frontiers nearer to it are preferred, nothing is excluded. For a goal
+# the robot has no known route to yet. The caller clears it (active = false)
+# once the goal is routable, given up or superseded.
+bool active
+# In the planner's world frame.
+geometry_msgs/Point target
+---
+bool success
+string message

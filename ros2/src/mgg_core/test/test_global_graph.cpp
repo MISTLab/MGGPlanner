@@ -690,6 +690,30 @@ TEST(SearchGlobalFrontier, PicksTheReachableFrontierWithTheBestDiscountedGain) {
   EXPECT_NEAR(report.best_distance, 10.0, 1e-9);
 }
 
+TEST(SearchGlobalFrontier, AnExplorationTargetPullsTowardTheNearerFrontier) {
+  FrontierGraph graph;
+  // Without a target the far frontier wins (the test above). Toward a goal
+  // beside the near one: 100 * exp(-0.05 * 5) * exp(-0.05 * 1) beats
+  // 150 * exp(-0.05 * 10) * exp(-0.05 * sqrt(26)).
+  const Eigen::Vector3d target(5.0, -1.0, 0.0);
+  const mgg::GlobalFrontierReport report = mgg::searchGlobalFrontier(
+      graph.fixture.global, 0, 0, graph.recompute(),
+      {Eigen::Vector3d(5.0, 5.0, 0.0)}, 1.0, &target);
+  ASSERT_NE(report.best_frontier, nullptr);
+  EXPECT_EQ(report.best_frontier, graph.near_);
+  EXPECT_NEAR(report.best_gain, 100.0 * std::exp(-0.25) * std::exp(-0.05),
+              1e-9);
+  // Soft: an unreachable frontier stays out however close it is to the
+  // target, and the ranking still covers every reachable one.
+  const Eigen::Vector3d beside_isolated(0.0, 5.0, 0.0);
+  const mgg::GlobalFrontierReport soft = mgg::searchGlobalFrontier(
+      graph.fixture.global, 0, 0, graph.recompute(),
+      {Eigen::Vector3d(5.0, 5.0, 0.0)}, 1.0, &beside_isolated);
+  EXPECT_EQ(soft.feasible, 3);
+  ASSERT_NE(soft.best_frontier, nullptr);
+  EXPECT_NE(soft.best_frontier, graph.isolated_);
+}
+
 TEST(SearchGlobalFrontier, OtherRobotsFrontierIsTakenOnlyWhenNothingElseIs) {
   FrontierGraph graph;
   graph.gains_[graph.near_->id] = 0.0;

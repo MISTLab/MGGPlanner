@@ -25,6 +25,7 @@
 #include <cstdint>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -42,6 +43,7 @@
 #include <mgg_msgs/msg/graph.hpp>
 #include <mgg_msgs/msg/mapping_snapshot.hpp>
 #include <mgg_msgs/srv/plan_objective.hpp>
+#include <mgg_msgs/srv/planner_set_exploration_target.hpp>
 #include <mgg_msgs/srv/planner_srv.hpp>
 
 #include "mgg_core/geofence_manager.h"
@@ -93,6 +95,12 @@ class PlannerNode : public rclcpp::Node {
   void onObjectiveRequest(
       const std::shared_ptr<mgg_msgs::srv::PlanObjective::Request> request,
       std::shared_ptr<mgg_msgs::srv::PlanObjective::Response> response);
+  /// Sets or clears exploration_target_.
+  void onExplorationTargetRequest(
+      const std::shared_ptr<mgg_msgs::srv::PlannerSetExplorationTarget::Request>
+          request,
+      std::shared_ptr<mgg_msgs::srv::PlannerSetExplorationTarget::Response>
+          response);
   void publishOwnGraph();
   void publishPath();
   void publishMarkers();
@@ -263,6 +271,11 @@ class PlannerNode : public rclcpp::Node {
 
   /// Heading the robot has been travelling, for the direction penalty.
   double exploring_direction_ = 0.0;
+  /// A goal the robot has no known route to yet, in the world frame. While
+  /// set, local path selection is biased toward it instead of along the last
+  /// path, and global frontiers nearer to it rank higher. Soft: nothing is
+  /// excluded, so a way round that first leads away stays open.
+  std::optional<Eigen::Vector3d> exploration_target_;
   mgg::EdgeInclinations edge_inclinations_;
   /// Last chosen path, in world coordinates.
   std::vector<mgg::StateVec> best_path_;
@@ -302,6 +315,8 @@ class PlannerNode : public rclcpp::Node {
   rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr build_srv_;
   rclcpp::Service<mgg_msgs::srv::PlannerSrv>::SharedPtr plan_srv_;
   rclcpp::Service<mgg_msgs::srv::PlanObjective>::SharedPtr objective_srv_;
+  rclcpp::Service<mgg_msgs::srv::PlannerSetExplorationTarget>::SharedPtr
+      exploration_target_srv_;
   rclcpp::TimerBase::SharedPtr graph_timer_;
   /// rrg.h:367 global_graph_update_timer_.
   rclcpp::TimerBase::SharedPtr global_graph_update_timer_;

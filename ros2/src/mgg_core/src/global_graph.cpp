@@ -548,7 +548,8 @@ FrontierAdditionReport addFrontiers(GraphManager& global_graph,
 GlobalFrontierReport searchGlobalFrontier(
     GraphManager& graph, int source_id, int robot_id,
     const RecomputeGainFn& recompute_gain,
-    const std::vector<Eigen::Vector3d>& excluded, double exclusion_radius) {
+    const std::vector<Eigen::Vector3d>& excluded, double exclusion_radius,
+    const Eigen::Vector3d* target) {
   GlobalFrontierReport report;
 
   // Re-check all frontiers against the current map (rrg.cpp:5612 to 5625).
@@ -593,6 +594,10 @@ GlobalFrontierReport searchGlobalFrontier(
     double exp_gain = frontier->vol_gain.gain *
                       std::exp(-kGlobalDistancePenalty * distance->second);
     if (frontier->robot_id != robot_id) exp_gain *= kGlobalOtherRobotPenalty;
+    if (target != nullptr) {
+      exp_gain *= std::exp(-kGlobalTargetPenalty *
+                           (frontier->state.head<3>() - *target).norm());
+    }
     if (exp_gain > report.best_gain) {
       report.best_gain = exp_gain;
       report.best_frontier = frontier;
