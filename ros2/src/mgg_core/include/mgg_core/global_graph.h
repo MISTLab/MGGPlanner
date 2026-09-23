@@ -128,13 +128,15 @@ GlobalGraphExpansionReport expandGlobalGraph(
     RandomSampler& sampler, const RobotStateHistory& robot_state_hist,
     const RecomputeGainFn& compute_gain, double time_budget_s);
 
-/// Links `state` into `graph` (rrg.cpp:5468 Rrg::connectStateToGraph): the
-/// nearest vertex itself when within 0.1 m, a blind edge to it when within
-/// `dist_ignore_collision_check` (or edge_length_min), otherwise a checked
-/// expandGraph. Returns the vertex now standing for `state`, or null.
+/// Links `state` into `graph` (rrg.cpp:5468 Rrg::connectStateToGraph).
+/// Approximate attachment may reuse a vertex within 0.1 m; exact attachment
+/// preserves the requested position and collision-checks even a short link.
+/// Nearby links reject known obstacles; farther links use expandGraph.
+/// Returns the attached vertex, or null.
 Vertex* connectStateToGraph(GraphManager& graph, const StateVec& state,
                             const ExpandContext& ctx,
-                            double dist_ignore_collision_check);
+                            double dist_ignore_collision_check,
+                            bool exact_state);
 
 /// Folds a verified path into `graph` (rrg.cpp:4808 Rrg::addRefPathToGraph):
 /// links the first pose to the nearest graph vertex, adds the remaining poses

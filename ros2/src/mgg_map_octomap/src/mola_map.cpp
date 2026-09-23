@@ -27,10 +27,10 @@ namespace {
 using Clock = std::chrono::steady_clock;
 using json = nlohmann::json;
 constexpr char kSnapshotSchema[] = "swarmdeck.autonomy.v1";
-constexpr char kGridSchema[] = "swarmdeck.mola_planner_grid.v1";
+constexpr char kGridSchema[] = "swarmdeck.mola_planner_grid.v2";
 constexpr std::size_t kMetadataLimit = 64u * 1024u;
 constexpr std::size_t kComponentLimit = 256u;
-constexpr std::size_t kSnapshotLimit = 4u * 1024u * 1024u;
+constexpr std::size_t kSnapshotLimit = 64u * 1024u * 1024u;
 constexpr std::size_t kIndexLimit = 4u * 1024u * 1024u;
 constexpr std::size_t kGridLimit = 256u * 1024u * 1024u;
 constexpr std::size_t kVoxelLimit = 2000000u;
@@ -773,7 +773,7 @@ std::shared_ptr<const MolaMap::Snapshot> MolaMap::loadOnce(
   static const std::unordered_set<std::string> metadata_fields{
       "schema", "graph_version", "identity", "source_stamp_ns",
       "resolution_m", "ray_angular_resolution_rad", "ray_step_fraction",
-      "point_count", "occupied_count", "free_count", "surface_count",
+      "point_count", "source_point_count", "occupied_count", "free_count", "surface_count",
       "retired_count", "ray_steps", "qualified_ray_keyframes"};
   if (metadata.size() != metadata_fields.size())
     throw std::runtime_error("MOLA planner metadata fields are invalid");
@@ -812,7 +812,7 @@ std::shared_ptr<const MolaMap::Snapshot> MolaMap::loadOnce(
         origins != submap.end() && origins->is_array() && origins->size() == 1)
       ++expected_qualified;
   }
-  if (asUint(metadata.at("point_count"), "grid point count") != expected_points ||
+  if (asUint(metadata.at("source_point_count"), "grid source point count") != expected_points ||
       asUint(metadata.at("source_stamp_ns"), "grid source stamp") !=
           expected_source_stamp || expected_source_stamp != pending.request.source_stamp_ns)
     throw std::runtime_error("MOLA planner source count or stamp is invalid");
@@ -832,13 +832,13 @@ std::shared_ptr<const MolaMap::Snapshot> MolaMap::loadOnce(
                                        std::numeric_limits<std::size_t>::max());
   if (qualified != expected_qualified)
     throw std::runtime_error("MOLA planner qualified-ray provenance is invalid");
-  // point_count stays the manifest's stored point count. Every stored point is
-  // either a surface sample or an endpoint the builder retired because later
-  // qualified rays saw through its voxel.
-  if (static_cast<std::uint64_t>(surface_count) +
-          static_cast<std::uint64_t>(retired_count) !=
-      expected_points)
-    throw std::runtime_error("MOLA planner surfaces do not match source points");
+  // Raw provenance stays exact while the product holds bounded surface extrema.
+  const auto materialized_points = asSize(
+      metadata.at("point_count"), "grid point count", config_.max_voxels);
+  if (materialized_points > expected_points ||
+      static_cast<std::uint64_t>(surface_count) +
+          static_cast<std::uint64_t>(retired_count) != materialized_points)
+    throw std::runtime_error("MOLA planner surfaces do not match materialized points");
   // Retirement rests on the same evidence free space does: only a qualified
   // capture's rays can prove an endpoint was seen through.
   if (qualified == 0 && (free_count != 0 || ray_steps != 0 || retired_count != 0))

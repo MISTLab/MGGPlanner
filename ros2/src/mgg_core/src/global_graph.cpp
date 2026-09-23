@@ -75,14 +75,15 @@ bool throughKnownObstacle(const ExpandContext& ctx, const StateVec& from,
 /// nearest vertex itself when the state sits on it, a blind edge when it is
 /// within `blind_radius`, otherwise a checked expandGraph.
 Vertex* linkStateToGraph(GraphManager& graph, const StateVec& state,
-                         const ExpandContext& ctx, double blind_radius) {
+                         const ExpandContext& ctx, double blind_radius,
+                         bool exact_state) {
   Vertex* nearest_vertex = nullptr;
   if (!graph.getNearestVertex(&state, &nearest_vertex) ||
       nearest_vertex == nullptr) {
     return nullptr;
   }
-  if ((state.head<3>() - nearest_vertex->state.head<3>()).norm() <=
-      kDeltaLimit) {
+  if ((state.head<3>() - nearest_vertex->state.head<3>()).squaredNorm() <=
+      (exact_state ? 0.0 : kDeltaLimit * kDeltaLimit)) {
     return nearest_vertex;
   }
   // "@TODO: find better way to do this. Blindly add a link/vertex to the
@@ -120,8 +121,15 @@ Vertex* linkStateToGraph(GraphManager& graph, const StateVec& state,
   ExpandGraphReport rep;
   Vertex candidate(-1, state);
   expandGraph(graph, candidate, rep, ctx);
-  return rep.status == ExpandGraphStatus::kSuccess ? rep.vertex_added
-                                                    : nullptr;
+  if (rep.status != ExpandGraphStatus::kSuccess) return nullptr;
+  // expandGraph may clip a long edge. A partial extension is not an exact
+  // objective endpoint, even though it remains useful roadmap geometry.
+  if (exact_state &&
+      (rep.vertex_added->state.head<3>() - state.head<3>()).squaredNorm() >
+          1e-12) {
+    return nullptr;
+  }
+  return rep.vertex_added;
 }
 
 /// A vertex of this robot already standing on `state`, if there is one: a
@@ -159,7 +167,7 @@ bool addRefPath(GraphManager& graph, const std::vector<RefPose>& poses,
   // vertex. Only the first vertex has to be linked to the existing graph
   // (rrg.cpp:4812).
   Vertex* parent_vertex =
-      linkStateToGraph(graph, kept.front().state, ctx, kRadiusLimit);
+      linkStateToGraph(graph, kept.front().state, ctx, kRadiusLimit, false);
   if (parent_vertex == nullptr) return false;
 
   // Add all remaining vertices of the path (rrg.cpp:4864).
@@ -246,9 +254,10 @@ bool addRefPath(GraphManager& graph, const std::vector<RefPose>& poses,
 
 Vertex* connectStateToGraph(GraphManager& graph, const StateVec& state,
                             const ExpandContext& ctx,
-                            double dist_ignore_collision_check) {
-  Vertex* linked =
-      linkStateToGraph(graph, state, ctx, dist_ignore_collision_check);
+                            double dist_ignore_collision_check,
+                            bool exact_state) {
+  Vertex* linked = linkStateToGraph(
+      graph, state, ctx, dist_ignore_collision_check, exact_state);
   if (linked == nullptr) return nullptr;
   // rrg.cpp:5484 and 5497: edges from the linked vertex to whatever else is
   // reachable around it, so the route out of here is not just the chain in.

@@ -79,8 +79,8 @@ PlannerNode::PlannerNode(const rclcpp::NodeOptions& options)
     map_cfg.snapshot_ttl_sec = std::clamp(
         declareOrGet<double>(this, "map.mola.snapshot_ttl_sec", 3.0), 0.1, 60.0);
     map_cfg.max_snapshot_bytes = static_cast<std::size_t>(std::clamp(
-        declareOrGet<std::int64_t>(this, "map.mola.max_snapshot_bytes", 4194304),
-        std::int64_t{1024}, std::int64_t{4 * 1024 * 1024}));
+        declareOrGet<std::int64_t>(this, "map.mola.max_snapshot_bytes", 67108864),
+        std::int64_t{1024}, std::int64_t{64 * 1024 * 1024}));
     map_cfg.max_index_bytes = static_cast<std::size_t>(std::clamp(
         declareOrGet<std::int64_t>(this, "map.mola.max_index_bytes", 4194304),
         std::int64_t{1024}, std::int64_t{4 * 1024 * 1024}));
@@ -1090,7 +1090,8 @@ bool PlannerNode::routeOverGlobalGraph(const mgg::StateVec& goal,
   const mgg::ExpandContext ctx = makeGlobalContext();
   const int before = global_graph_->getNumVertices();
   mgg::Vertex* link_vertex =
-      mgg::connectStateToGraph(*global_graph_, current, ctx, kLinkRadius);
+      mgg::connectStateToGraph(*global_graph_, current, ctx, kLinkRadius,
+                               /*exact_state=*/false);
   if (global_graph_->getNumVertices() != before) ++graph_revision_;
   if (link_vertex == nullptr) {
     reason = "current pose cannot be linked to the global graph";
@@ -1112,7 +1113,7 @@ bool PlannerNode::routeOverGlobalGraph(const mgg::StateVec& goal,
     }
     const int before_goal = global_graph_->getNumVertices();
     goal_vertex = mgg::connectStateToGraph(*global_graph_, goal_state, ctx,
-                                           kGoalLinkRadius);
+                                           kGoalLinkRadius, /*exact_state=*/true);
     if (global_graph_->getNumVertices() != before_goal) ++graph_revision_;
     if (goal_vertex == nullptr) {
       reason = "goal cannot be linked to the global graph";
@@ -1175,7 +1176,7 @@ bool PlannerNode::routeOverLocalLattice(const mgg::StateVec& goal,
     return false;
   }
   mgg::Vertex* goal_vertex = mgg::connectStateToGraph(
-      *local_graph_, goal_state, ctx, kGoalLinkRadius);
+      *local_graph_, goal_state, ctx, kGoalLinkRadius, /*exact_state=*/true);
   if (goal_vertex == nullptr) {
     reason = "goal cannot be linked to the local lattice";
     return false;
@@ -1218,7 +1219,8 @@ bool PlannerNode::runGlobalPlanner(int target_id, std::string& reason) {
     }
     const int before = global_graph_->getNumVertices();
     mgg::Vertex* link_vertex = mgg::connectStateToGraph(
-        *global_graph_, current, makeGlobalContext(), kLinkRadius);
+        *global_graph_, current, makeGlobalContext(), kLinkRadius,
+        /*exact_state=*/false);
     if (global_graph_->getNumVertices() != before) ++graph_revision_;
     if (link_vertex == nullptr) {
       reason = "current pose cannot be linked to the global graph";

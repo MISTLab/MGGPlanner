@@ -352,7 +352,7 @@ TEST(ConnectStateToGraph, LinksTheCurrentStateAndWiresItsNeighbours) {
   // within nearest_range, so it gets the extra edge.
   Vertex* side = fixture.add(fixture.global, StateVec(1.2, 1.3, 0.0, 0.0), root);
   Vertex* linked = mgg::connectStateToGraph(
-      fixture.global, StateVec(1.2, 0.0, 0.0, 0.0), fixture.ctx, 1.5);
+      fixture.global, StateVec(1.2, 0.0, 0.0, 0.0), fixture.ctx, 1.5, false);
   ASSERT_NE(linked, nullptr);
   EXPECT_EQ(linked->parent, root);
   // root-side, root-linked and the extra linked-side edge.
@@ -361,8 +361,43 @@ TEST(ConnectStateToGraph, LinksTheCurrentStateAndWiresItsNeighbours) {
   // On a vertex already: that vertex.
   EXPECT_EQ(mgg::connectStateToGraph(fixture.global,
                                      StateVec(1.2, 0.02, 0.0, 0.0),
-                                     fixture.ctx, 1.5),
+                                     fixture.ctx, 1.5, false),
             linked);
+}
+
+TEST(ConnectStateToGraph, ExactAttachmentRoutesToGoalBesideExistingVertex) {
+  Roadmap fixture;
+  Vertex* root = fixture.global.getVertex(0);
+  fixture.add(fixture.global, StateVec(1.2, 0.0, 0.0, 0.0), root);
+  const StateVec goal(1.2, 0.02, 0.0, 0.0);
+  Vertex* linked = mgg::connectStateToGraph(
+      fixture.global, goal, fixture.ctx, 1.5, true);
+  ASSERT_NE(linked, nullptr);
+  ShortestPathsReport report;
+  ASSERT_TRUE(fixture.global.findShortestPaths(0, report));
+  std::vector<StateVec> path;
+  fixture.global.getShortestPath(linked->id, report, true, path);
+  ASSERT_GE(path.size(), 2u);
+  EXPECT_DOUBLE_EQ(path.back().x(), goal.x());
+  EXPECT_DOUBLE_EQ(path.back().y(), goal.y());
+  EXPECT_DOUBLE_EQ(path.back().z(), goal.z());
+}
+
+TEST(ConnectStateToGraph, ExactAttachmentRejectsOccupiedShortLink) {
+  Roadmap fixture(/*blocked_y=*/0.0);
+  // A stale roadmap vertex is not proof that its vicinity remains clear.
+  EXPECT_EQ(mgg::connectStateToGraph(
+                fixture.global, StateVec(0.02, 0.0, 0.0, 0.0),
+                fixture.ctx, 1.5, true),
+            nullptr);
+}
+
+TEST(ConnectStateToGraph, ExactAttachmentRejectsClippedGoalExtension) {
+  Roadmap fixture;
+  EXPECT_EQ(mgg::connectStateToGraph(
+                fixture.global, StateVec(4.0, 0.0, 0.0, 0.0),
+                fixture.ctx, 1.5, true),
+            nullptr);
 }
 
 /// A local grid graph with three frontier arms, plus a global graph whose

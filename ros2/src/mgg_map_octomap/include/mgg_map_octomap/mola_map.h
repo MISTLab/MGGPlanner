@@ -30,7 +30,7 @@ struct MolaMapConfig {
   /// successor heartbeat that found no product for its revision yet.
   double snapshot_ttl_sec = 3.0;
   /// Bound on `<peer_root>/mola/source.json`.
-  std::size_t max_snapshot_bytes = 4u * 1024u * 1024u;
+  std::size_t max_snapshot_bytes = 64u * 1024u * 1024u;
   std::size_t max_index_bytes = 4u * 1024u * 1024u;
   std::size_t max_grid_bytes = 256u * 1024u * 1024u;
   std::size_t max_voxels = 2000000u;

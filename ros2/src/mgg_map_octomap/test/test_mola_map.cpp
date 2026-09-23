@@ -203,7 +203,7 @@ class Publication {
     if (artifact_source_digest.empty()) artifact_source_digest = source_digest;
 
     json metadata{
-        {"schema", "swarmdeck.mola_planner_grid.v1"},
+        {"schema", "swarmdeck.mola_planner_grid.v2"},
         {"graph_version", {{"component_id", "component:test"}, {"epoch", 1},
                            {"revision", revision}, {"digest", std::string(64, 'd')}}},
         {"identity", {{"geometry_revision", geometry},
@@ -217,6 +217,7 @@ class Publication {
         {"ray_angular_resolution_rad", 0.08726646259971647},
         {"ray_step_fraction", 0.75},
         {"point_count", points},
+        {"source_point_count", points},
         {"occupied_count", occupied.size()},
         {"free_count", free.size()},
         {"surface_count", occupied.size()},
@@ -413,8 +414,8 @@ TEST(MolaMap, TransientDiscsAreOccupiedUntilTheyExpire) {
 // Visibility retirement. A peer robot captured beside this one leaves an
 // occupied voxel and terrain surface samples that obstacle expiry alone cannot
 // disprove, so the builder drops both once later qualified rays have seen
-// through the voxel. The retired endpoint keeps its place in point_count, which
-// every reader still cross-checks against the manifest chunks.
+// through the voxel. Raw source provenance remains separate from bounded
+// materialized surface and retired-extrema counts.
 TEST(MolaMap, AcceptsVisibilityRetiredEndpointsAgainstStoredPointCount) {
   Publication publication;
   const Voxel endpoint{10, 0, 2};
@@ -429,22 +430,38 @@ TEST(MolaMap, AcceptsVisibilityRetiredEndpointsAgainstStoredPointCount) {
   EXPECT_EQ(provider.getVoxelStatus({0.1, 0.1, 0.1}), VoxelStatus::kFree);
 }
 
-TEST(MolaMap, RejectsSurfaceAndRetiredCountsBelowStoredPointCount) {
+TEST(MolaMap, AcceptsCompactedSurfacesWithExactRawProvenance) {
   Publication publication;
   const Voxel endpoint{10, 0, 2};
   const auto request = publication.publish(
       0, {endpoint}, freeBlockWithout(endpoint), true,
       Eigen::Isometry3d::Identity(), {}, {}, 0.5, 1);
-  // Claim nothing was retired while the manifest still stores two points.
+  rewriteGridMetadata(publication.root, [](json& metadata) {
+    metadata["point_count"] = 1;
+    metadata["retired_count"] = 0;
+  });
+  MolaMap provider(config(publication));
+  provider.requestSnapshot(request);
+  ASSERT_TRUE(waitFor([&]() { return provider.getStatus(); }))
+      << provider.lastError();
+  EXPECT_EQ(provider.getVoxelStatus({2.1, 0.1, 0.5}), VoxelStatus::kOccupied);
+  EXPECT_EQ(provider.getVoxelStatus({0.1, 0.1, 0.1}), VoxelStatus::kFree);
+}
+
+TEST(MolaMap, RejectsSurfaceAndRetiredCountsBelowMaterializedPointCount) {
+  Publication publication;
+  const Voxel endpoint{10, 0, 2};
+  const auto request = publication.publish(
+      0, {endpoint}, freeBlockWithout(endpoint), true,
+      Eigen::Isometry3d::Identity(), {}, {}, 0.5, 1);
+  // Claim nothing was retired while the materialized count still includes it.
   rewriteGridMetadata(publication.root,
                       [](json& metadata) { metadata["retired_count"] = 0; });
   MolaMap provider(config(publication));
   provider.requestSnapshot(request);
   ASSERT_TRUE(waitFor([&]() { return !provider.lastError().empty(); }));
   EXPECT_FALSE(provider.getStatus());
-  EXPECT_NE(provider.lastError().find("surfaces do not match source points"),
-            std::string::npos)
-      << provider.lastError();
+  EXPECT_EQ(provider.getVoxelStatus({2.1, 0.1, 0.5}), VoxelStatus::kUnknown);
 }
 
 TEST(MolaMap, RejectsAGridWithoutARetiredCount) {
