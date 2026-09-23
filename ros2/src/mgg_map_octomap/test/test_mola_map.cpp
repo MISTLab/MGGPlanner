@@ -27,6 +27,7 @@
 #include "mgg_core/grid_graph.h"
 #include "mgg_map_octomap/mola_map.h"
 #include "mgg_map_octomap/native_mola_grid.h"
+#include "reference_binary_grid.h"
 
 namespace {
 using json = nlohmann::json;
@@ -1361,18 +1362,18 @@ TEST(MolaMap, SparseMeasuredRayCorridorGrowsFootprintValidatedGroundGraph) {
   context.planning = &planning;
   context.ground = &ground;
   context.robot_box_size = robot.getPlanningSize();
-  context.projected_edge_admissible =
-      [&](const std::vector<Eigen::Vector3d>& edge) {
+  auto footprintAdmissible =
+      [&](const mgg::MapInterface& map, const std::vector<Eigen::Vector3d>& edge) {
         const double radius = 0.5 * context.robot_box_size.head<2>().norm();
         for (const Eigen::Vector3d& point : edge) {
           std::vector<mgg::XYCellCenter> footprint;
-          if (!provider.getCircleIntersectingXYCellCenters(
+          if (!map.getCircleIntersectingXYCellCenters(
                   point.head<2>(), radius, 4096, footprint)) {
             return false;
           }
           for (const mgg::XYCellCenter& cell : footprint) {
             Eigen::Vector3d hit;
-            const VoxelStatus status = provider.getGroundRayStatus(
+            const VoxelStatus status = map.getGroundRayStatus(
                 {cell.center.x(), cell.center.y(), point.z()},
                 {cell.center.x(), cell.center.y(), point.z() - 1.0}, false,
                 hit);
@@ -1386,6 +1387,10 @@ TEST(MolaMap, SparseMeasuredRayCorridorGrowsFootprintValidatedGroundGraph) {
           }
         }
         return true;
+      };
+  context.projected_edge_admissible =
+      [&](const std::vector<Eigen::Vector3d>& edge) {
+        return footprintAdmissible(provider, edge);
       };
   const Eigen::Vector3d component_root(0.1, 0.1, 0.495);
   const Eigen::Vector3d navigation_root =
@@ -1410,27 +1415,66 @@ TEST(MolaMap, SparseMeasuredRayCorridorGrowsFootprintValidatedGroundGraph) {
       << "free=" << result.free_cells << " no_ground=" << result.no_ground
       << " edge_ok=" << result.edge_status[0];
 
-  // Synthetic tunnel lattice: pin every vertex pose and adjacency, not just
-  // the aggregate counts. No recorded live map is available in this package.
-  std::vector<int> ids;
-  for (const auto& entry : graph.vertices_map_) ids.push_back(entry.first);
-  std::sort(ids.begin(), ids.end());
-  std::ostringstream lattice;
-  lattice << std::setprecision(17);
-  for (int id : ids) {
-    const auto& state = graph.vertices_map_.at(id)->state;
-    lattice << id << ':';
-    for (int axis = 0; axis < state.size(); ++axis) lattice << state[axis] << ',';
-    lattice << ';';
+  // No recorded live map is available: build the synthetic tunnel through
+  // the two index strategies on the same machine, then compare every vertex
+  // and edge, including their computed floating-point values.
+  std::vector<mgg::NativeMolaGrid::Cell> occupied_cells, free_cells;
+  std::vector<mgg::NativeMolaGrid::Surface> surfaces;
+  for (const Voxel& cell : floor) {
+    occupied_cells.push_back({cell.x, cell.y, cell.z});
+    surfaces.push_back({{cell.x, cell.y, cell.z}, 0.1});
   }
-  for (const auto& [id, edges] : graph.edge_map_) {
-    auto sorted = edges;
-    std::sort(sorted.begin(), sorted.end());
-    for (const auto& [target, weight] : sorted)
-      lattice << id << '>' << target << ':' << weight << ';';
+  for (const Voxel& cell : free)
+    free_cells.push_back({cell.x, cell.y, cell.z});
+  mgg::NativeMolaGrid indexed(0.2, occupied_cells, free_cells, surfaces);
+  auto reference = makeReferenceBinaryGrid(0.2, occupied_cells, free_cells, surfaces);
+  auto buildLattice = [&](mgg::MapInterface& map) {
+    mgg::GroundProjection projection(map, planning);
+    mgg::ExpandContext compared = context;
+    compared.map = &map;
+    compared.ground = &projection;
+    compared.projected_edge_admissible =
+        [&](const std::vector<Eigen::Vector3d>& edge) {
+          return footprintAdmissible(map, edge);
+        };
+    auto lattice = std::make_unique<mgg::GraphManager>();
+    const mgg::StateVec root(component_root.x(), component_root.y(),
+                             component_root.z(), 0.0);
+    lattice->addVertex(new mgg::Vertex(0, root));
+    const auto outcome = mgg::buildGridGraph(*lattice, root, grid, compared, 0.0);
+    EXPECT_EQ(outcome.status, mgg::GridGraphStatus::kOk);
+    EXPECT_GT(outcome.vertices_added, 0);
+    EXPECT_GT(outcome.edge_status[0], 0);
+    return lattice;
+  };
+  auto indexed_graph = buildLattice(indexed);
+  auto reference_graph = buildLattice(*reference);
+  ASSERT_EQ(indexed_graph->vertices_map_.size(), reference_graph->vertices_map_.size())
+      << "vertex count differs";
+  for (const auto& [id, vertex] : reference_graph->vertices_map_) {
+    const auto it = indexed_graph->vertices_map_.find(id);
+    ASSERT_NE(it, indexed_graph->vertices_map_.end()) << "missing vertex " << id;
+    for (int axis = 0; axis < vertex->state.size(); ++axis)
+      ASSERT_EQ(it->second->state[axis], vertex->state[axis])
+          << "vertex " << id << " axis " << axis;
   }
-  EXPECT_EQ(sha256(lattice.str()),
-            "71575e15563a8e4621af55c8cc1908a77b713ae0c3501cddd46a54c08d08a6ed");
+  ASSERT_EQ(indexed_graph->edge_map_.size(), reference_graph->edge_map_.size())
+      << "edge source count differs";
+  for (const auto& [id, edges] : reference_graph->edge_map_) {
+    const auto it = indexed_graph->edge_map_.find(id);
+    ASSERT_NE(it, indexed_graph->edge_map_.end()) << "missing edge source " << id;
+    auto actual = it->second;
+    auto expected = edges;
+    std::sort(actual.begin(), actual.end());
+    std::sort(expected.begin(), expected.end());
+    ASSERT_EQ(actual.size(), expected.size()) << "edge count at vertex " << id;
+    for (std::size_t i = 0; i < expected.size(); ++i) {
+      ASSERT_EQ(actual[i].first, expected[i].first)
+          << "edge from " << id << " at position " << i;
+      ASSERT_EQ(actual[i].second, expected[i].second)
+          << "edge " << id << " -> " << expected[i].first;
+    }
+  }
 }
 
 }  // namespace
