@@ -221,6 +221,12 @@
       traverse_time_max: 40.0
       path_safety_enhance_enable: true
       path_interpolation_distance: 0.25
+      # An exploration path ends where no known obstacle lies within the
+      # robot's inscribed radius plus this margin: a viewpoint closer to one
+      # is pulled back along its path, and a path with no such pose is taken
+      # only when no other path has one. Half a 0.2 m planner voxel, for
+      # where the controller's costmap places the same wall differently.
+      viewpoint_clearance_margin: 0.1
       auto_global_planner_enable: true
       relaxed_corridor_multiplier: 1.5
       homing_backward: false

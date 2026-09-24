@@ -25,6 +25,7 @@
 #include "mgg_core/graph_manager.h"
 #include "mgg_core/ground_projection.h"
 #include "mgg_core/grid_graph.h"
+#include "mgg_core/path_selection.h"
 #include "mgg_map_octomap/mola_map.h"
 #include "mgg_map_octomap/native_mola_grid.h"
 #include "reference_binary_grid.h"
@@ -511,6 +512,99 @@ TEST(MolaMap, InvalidAndUnrepresentableQueriesRemainUnknown) {
   EXPECT_EQ(provider.getRayStatus({0.1, 0.1, 0.1}, {1e12, 0.0, 0.0}, false,
                                   reached),
             VoxelStatus::kUnknown);
+}
+
+TEST(MolaMap, ViewpointBesideAnOccupiedColumnLacksClearanceThoughItsBoxIsFree) {
+  // An occupied column over x=[1.0,1.2], y=[0.0,0.2], z=[0.0,0.6].
+  Publication publication;
+  MolaMap provider(config(publication));
+  const auto request =
+      publication.publish(0, {{5, 0, 0}, {5, 0, 1}, {5, 0, 2}}, freeBlock(),
+                          true, Eigen::Isometry3d::Identity());
+  provider.requestSnapshot(request);
+  ASSERT_TRUE(waitFor([&]() { return provider.getStatus(); }))
+      << provider.lastError();
+  mgg::RobotParams robot;
+  robot.size = Eigen::Vector3d(0.6, 0.4, 0.3);
+  robot.bound_mode = mgg::BoundModeType::kExactBound;
+  mgg::PlanningParams planning;
+  planning.viewpoint_clearance_margin = 0.1;
+
+  // 0.25 m beside the column. The body box, 0.2 m to either side, is free;
+  // the inscribed radius plus margin, 0.3 m, reaches the column.
+  const mgg::StateVec beside(1.1, 0.45, 0.3, 0.0);
+  EXPECT_EQ(provider.getBoxStatus(beside.head<3>(), robot.getPlanningSize(),
+                                  true),
+            VoxelStatus::kFree);
+  EXPECT_FALSE(mgg::viewpointClear(provider, robot, planning, beside));
+  EXPECT_TRUE(mgg::viewpointClear(provider, robot, planning,
+                                  mgg::StateVec(1.1, 0.55, 0.3, 0.0)));
+  // The inscribed radius alone clears it.
+  planning.viewpoint_clearance_margin = 0.0;
+  EXPECT_TRUE(mgg::viewpointClear(provider, robot, planning, beside));
+  // Only the body's height counts: a body riding above the column clears it.
+  planning.viewpoint_clearance_margin = 0.1;
+  EXPECT_TRUE(mgg::viewpointClear(provider, robot, planning,
+                                  mgg::StateVec(1.1, 0.45, 0.9, 0.0)));
+}
+
+TEST(MolaMap, ExplorationInACorridorNarrowerThanTheClearanceStillHasAPath) {
+  // A corridor 0.6 m wide along x: walls over y=[-0.4,-0.2] and [0.4,0.6].
+  std::vector<Voxel> walls;
+  std::vector<Voxel> corridor;
+  for (std::int64_t x = 0; x <= 10; ++x) {
+    for (std::int64_t z = 0; z <= 3; ++z) {
+      walls.push_back({x, -2, z});
+      walls.push_back({x, 2, z});
+      for (std::int64_t y = -1; y <= 1; ++y) corridor.push_back({x, y, z});
+    }
+  }
+  Publication publication;
+  MolaMap provider(config(publication));
+  provider.requestSnapshot(publication.publish(0, walls, corridor));
+  ASSERT_TRUE(waitFor([&]() { return provider.getStatus(); }))
+      << provider.lastError();
+
+  // Inscribed radius 0.25 m plus 0.1 m margin: wider than the corridor's
+  // 0.3 m half-width, so no vertex along it has viewpoint clearance.
+  mgg::RobotParams robot;
+  robot.type = mgg::RobotType::kAerialRobot;
+  robot.size = Eigen::Vector3d(0.5, 0.5, 0.2);
+  mgg::PlanningParams planning;
+  planning.viewpoint_clearance_margin = 0.1;
+  planning.edge_length_min = 0.05;
+  planning.edge_length_max = 1.0;
+  planning.edge_overshoot = 0.0;
+  planning.nearest_range = 0.5;
+  planning.nearest_range_min = 0.05;
+  planning.nearest_range_max = 2.0;
+  planning.nearest_range_z = 1.0;
+  mgg::ExpandContext context;
+  context.map = &provider;
+  context.robot = &robot;
+  context.planning = &planning;
+  context.robot_box_size = Eigen::Vector3d(0.2, 0.2, 0.2);
+  const mgg::StateVec root(0.1, 0.1, 0.3, 0.0);
+  mgg::GraphManager graph;
+  graph.addVertex(new mgg::Vertex(0, root));
+  mgg::GridGraphParams grid;
+  grid.min_val = {0.0, 0.0, 0.0};
+  grid.max_val = {1.6, 0.0, 0.0};
+  grid.resolution = {0.2, 0.2, 0.2};
+  ASSERT_EQ(mgg::buildGridGraph(graph, root, grid, context, 0.0).status,
+            mgg::GridGraphStatus::kOk);
+  ASSERT_GT(graph.getNumVertices(), 2);
+  for (auto& entry : graph.vertices_map_) entry.second->vol_gain.gain = 1.0;
+
+  const auto selection = mgg::selectBestPath(
+      graph, planning, robot, mgg::EdgeInclinations(), 0.2, 0.0, {}, 0.0,
+      [&](const mgg::Vertex& v) {
+        return mgg::viewpointClear(provider, robot, planning, v.state);
+      });
+  ASSERT_FALSE(selection.best_path.empty());
+  EXPECT_TRUE(selection.unclear_viewpoint);
+  EXPECT_GT(selection.paths_without_clear_viewpoint, 0);
+  EXPECT_GT(selection.best_path.back()->state.x(), 1.0);
 }
 
 TEST(MolaMap, OccupiedOnlyCylinderPreservesRotatedCapsuleGeometry) {

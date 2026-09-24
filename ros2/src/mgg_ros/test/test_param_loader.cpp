@@ -25,6 +25,7 @@ class ParamFixture : public ::testing::Test {
         {"PlanningParams.build_grid_local_graph", true},
         {"PlanningParams.global_frame_id", std::string("R1/world")},
         {"PlanningParams.type", std::string("kAdaptiveExploration")},
+        {"PlanningParams.viewpoint_clearance_margin", 0.15},
         {"RobotParams.type", std::string("kGroundRobot")},
         {"RobotParams.size", std::vector<double>{0.8, 0.8, 0.2}},
         {"RobotParams.bound_mode", std::string("kExtendedBound")},
@@ -75,6 +76,7 @@ TEST_F(ParamFixture, LoadsPlanningParams) {
   EXPECT_TRUE(params.build_grid_local_graph);
   EXPECT_EQ(params.global_frame_id, "R1/world");
   EXPECT_EQ(params.type, mgg::PlanningModeType::kAdaptiveExploration);
+  EXPECT_DOUBLE_EQ(params.viewpoint_clearance_margin, 0.15);
   // Absent from the overrides, so the struct default survives.
   EXPECT_DOUBLE_EQ(params.v_max, 0.2);
 }

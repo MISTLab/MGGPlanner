@@ -7,6 +7,27 @@
 
 namespace mgg {
 
+bool viewpointClear(const MapInterface& map, const RobotParams& robot,
+                    const PlanningParams& planning,
+                    const StateVec& viewpoint) {
+  const double radius = 0.5 * std::min(robot.size.x(), robot.size.y()) +
+                        planning.viewpoint_clearance_margin;
+  const Eigen::Vector3d center = viewpoint.head<3>() + robot.center_offset;
+  return map.getOccupiedOnlyCylinderPathStatus(
+             center, center, radius, robot.getPlanningSize().z()) !=
+         VoxelStatus::kOccupied;
+}
+
+bool pullBackToClearViewpoint(
+    std::vector<StateVec>& route,
+    const std::function<bool(const StateVec&)>& clear) {
+  std::size_t end = route.empty() ? 0 : route.size() - 1;
+  while (end > 0 && !clear(route[end])) --end;
+  if (end == 0) return false;
+  route.resize(end + 1);
+  return true;
+}
+
 PathSelectionResult selectBestPath(GraphManager& graph,
                                    const PlanningParams& planning,
                                    const RobotParams& robot,
@@ -15,8 +36,16 @@ PathSelectionResult selectBestPath(GraphManager& graph,
                                    double exploring_direction,
                                    const std::vector<Eigen::Vector3d>&
                                        excluded_endpoints,
-                                   double exclusion_radius) {
+                                   double exclusion_radius,
+                                   const ViewpointClearFn& viewpoint_clear) {
   PathSelectionResult result;
+  // Leaves share their paths' inner vertices; check each vertex once.
+  std::unordered_map<int, bool> clear_by_id;
+  const auto clear = [&](const Vertex* v) {
+    const auto found = clear_by_id.find(v->id);
+    if (found != clear_by_id.end()) return found->second;
+    return clear_by_id[v->id] = viewpoint_clear(*v);
+  };
 
   ShortestPathsReport rep;
   if (!graph.findShortestPaths(rep)) return result;
@@ -24,22 +53,11 @@ PathSelectionResult selectBestPath(GraphManager& graph,
   std::vector<Vertex*> leaves;
   graph.getLeafVertices(leaves);
 
-  for (Vertex* leaf : leaves) {
-    if (leaf == nullptr) continue;
-    std::vector<Vertex*> path;
-    graph.getShortestPath(leaf->id, rep, true, path);
-    if (path.size() <= 1) continue;  // needs at least root and leaf
-    const bool excluded = std::any_of(
-        excluded_endpoints.begin(), excluded_endpoints.end(),
-        [leaf, exclusion_radius](const Eigen::Vector3d& center) {
-          return (leaf->state.head(3) - center).norm() <= exclusion_radius;
-        });
-    if (excluded) continue;
-    ++result.leaves_evaluated;
-
+  // Scores one root-to-viewpoint path: accumulated gain discounted for
+  // length and for heading away from the direction of travel. Returns false
+  // for a path that descends too steeply.
+  const auto score = [&](const std::vector<Vertex*>& path, double& gain) {
     double path_gain = 0.0;
-    bool inadmissible = false;
-
     for (size_t ind = 0; ind < path.size(); ++ind) {
       Vertex* v = path[ind];
       const double path_length = graph.getShortestDistance(v->id, rep);
@@ -61,8 +79,7 @@ PathSelectionResult selectBestPath(GraphManager& graph,
               std::atan2(std::abs(segment(2)), segment.head(2).norm());
           if (stored > planning.max_negative_inclination ||
               geometric > planning.max_negative_inclination) {
-            inadmissible = true;
-            break;
+            return false;
           }
         }
       }
@@ -75,23 +92,76 @@ PathSelectionResult selectBestPath(GraphManager& graph,
       }
     }
 
-    if (inadmissible) {
-      ++result.paths_rejected_steep;
-      continue;
-    }
-
     // Penalise paths that head away from the direction of travel.
     std::vector<Eigen::Vector3d> path_points;
-    graph.getShortestPath(leaf->id, rep, true, path_points);
+    graph.getShortestPath(path.back()->id, rep, true, path_points);
     const double deviation = computeDistanceBetweenTrajectoryAndDirection(
         path_points, exploring_direction, 0.2, true);
-    path_gain *= std::exp(-planning.path_direction_penalty * deviation);
+    gain = path_gain * std::exp(-planning.path_direction_penalty * deviation);
+    return true;
+  };
+  const auto excluded = [&](const Vertex* viewpoint) {
+    return std::any_of(
+        excluded_endpoints.begin(), excluded_endpoints.end(),
+        [viewpoint, exclusion_radius](const Eigen::Vector3d& center) {
+          return (viewpoint->state.head(3) - center).norm() <=
+                 exclusion_radius;
+        });
+  };
 
-    if (path_gain > result.best_gain) {
+  // Clearance is a preference that always wins while it can be had: the best
+  // path ending with room for the robot, pulled back to its last clear vertex
+  // where needed, is chosen whenever there is one. Only when no path ends
+  // clear, e.g. in a passage narrower than the robot plus twice the margin,
+  // is the best path chosen as without the check, so exploration goes on
+  // wherever it went on before.
+  double best_clear_gain = 0.0;
+  std::vector<Vertex*> best_clear_path;
+  for (Vertex* leaf : leaves) {
+    if (leaf == nullptr) continue;
+    std::vector<Vertex*> path;
+    graph.getShortestPath(leaf->id, rep, true, path);
+    if (path.size() <= 1) continue;  // needs at least root and leaf
+    if (excluded(leaf)) continue;
+    ++result.leaves_evaluated;
+
+    double path_gain = 0.0;
+    bool admissible = score(path, path_gain);
+    if (!admissible) {
+      ++result.paths_rejected_steep;
+    } else if (path_gain > result.best_gain) {
       result.best_gain = path_gain;
-      result.best_path_id = leaf->id;
       result.best_path = path;
     }
+    if (!viewpoint_clear) continue;
+
+    // The robot stops where the path ends; the root is where it stands.
+    std::size_t end = path.size() - 1;
+    while (end > 0 && !clear(path[end])) --end;
+    if (end == 0) {
+      ++result.paths_without_clear_viewpoint;
+      continue;
+    }
+    if (end + 1 < path.size()) {
+      path.resize(end + 1);
+      ++result.paths_pulled_back;
+      admissible = !excluded(path.back()) && score(path, path_gain);
+    }
+    if (admissible && path_gain > best_clear_gain) {
+      best_clear_gain = path_gain;
+      best_clear_path = path;
+    }
+  }
+  if (viewpoint_clear && !result.best_path.empty()) {
+    if (best_clear_path.empty()) {
+      result.unclear_viewpoint = true;
+    } else {
+      result.best_gain = best_clear_gain;
+      result.best_path = best_clear_path;
+    }
+  }
+  if (!result.best_path.empty()) {
+    result.best_path_id = result.best_path.back()->id;
   }
 
   // Re-parent along the winning path so the branch can be walked from the root.

@@ -175,6 +175,85 @@ TEST(PathSelection, InclinationIsFoundWhicheverWayTheEdgeWasRecorded) {
   EXPECT_EQ(r.paths_rejected_steep, 1);
 }
 
+TEST(PathSelection, ViewpointWithoutClearanceIsPulledBackAlongItsPath) {
+  Fork f;
+  for (Vertex* v : f.x_branch) v->vol_gain.gain = 100.0;
+  for (Vertex* v : f.y_branch) v->vol_gain.gain = 1.0;
+  EdgeInclinations flat;
+  // The +x leaf stands against a wall; the vertex before it has room.
+  const mgg::ViewpointClearFn clear = [](const Vertex& v) {
+    return v.state.x() < 2.5;
+  };
+  const auto r = mgg::selectBestPath(f.graph, makePlanning(), RobotParams(),
+                                     flat, 0.2, 0.0, {}, 0.0, clear);
+  EXPECT_EQ(r.best_path_id, 2);
+  ASSERT_EQ(r.best_path.size(), 3u);
+  EXPECT_EQ(r.best_path.back()->id, 2);
+  // Scored up to where it now ends.
+  EXPECT_DOUBLE_EQ(r.best_gain, 200.0);
+  EXPECT_EQ(r.paths_pulled_back, 1);
+  EXPECT_EQ(r.paths_without_clear_viewpoint, 0);
+  EXPECT_FALSE(r.unclear_viewpoint);
+}
+
+TEST(PathSelection, PathEndingClearWinsOverRicherPathsThatDoNot) {
+  Fork f;
+  for (Vertex* v : f.x_branch) v->vol_gain.gain = 100.0;
+  for (Vertex* v : f.y_branch) v->vol_gain.gain = 1.0;
+  EdgeInclinations flat;
+  // The whole +x branch runs along a wall. The root is not asked: the robot
+  // already stands there.
+  const mgg::ViewpointClearFn clear = [](const Vertex& v) {
+    EXPECT_NE(v.id, 0);
+    return v.state.x() < 0.5;
+  };
+  const auto r = mgg::selectBestPath(f.graph, makePlanning(), RobotParams(),
+                                     flat, 0.2, 0.0, {}, 0.0, clear);
+  EXPECT_EQ(r.best_path_id, 6);
+  EXPECT_DOUBLE_EQ(r.best_gain, 3.0);
+  EXPECT_EQ(r.paths_without_clear_viewpoint, 1);
+  EXPECT_EQ(r.paths_pulled_back, 0);
+  EXPECT_EQ(r.leaves_evaluated, 2);
+  EXPECT_FALSE(r.unclear_viewpoint);
+}
+
+TEST(PathSelection, WithNoPathEndingClearTheBestPathIsStillChosen) {
+  // A passage narrower than the robot plus twice the margin: clearance must
+  // not stop exploration where it went on before.
+  Fork f;
+  for (Vertex* v : f.x_branch) v->vol_gain.gain = 100.0;
+  for (Vertex* v : f.y_branch) v->vol_gain.gain = 1.0;
+  EdgeInclinations flat;
+  const mgg::ViewpointClearFn nowhere = [](const Vertex&) { return false; };
+  const auto r = mgg::selectBestPath(f.graph, makePlanning(), RobotParams(),
+                                     flat, 0.2, 0.0, {}, 0.0, nowhere);
+  EXPECT_EQ(r.best_path_id, 3);
+  EXPECT_EQ(r.best_path.size(), 4u);
+  EXPECT_DOUBLE_EQ(r.best_gain, 300.0);
+  EXPECT_EQ(r.paths_without_clear_viewpoint, 2);
+  EXPECT_TRUE(r.unclear_viewpoint);
+}
+
+TEST(PullBackToClearViewpoint, RouteEndsAtItsLastClearPose) {
+  std::vector<StateVec> route;
+  for (int i = 0; i <= 4; ++i) route.emplace_back(0.5 * i, 0.0, 0.0, 0.0);
+  // The last metre runs beside a wall.
+  const auto clear = [](const StateVec& pose) { return pose.x() < 1.2; };
+  ASSERT_TRUE(mgg::pullBackToClearViewpoint(route, clear));
+  ASSERT_EQ(route.size(), 3u);
+  EXPECT_DOUBLE_EQ(route.back().x(), 1.0);
+
+  // Nothing past the start has room: refused, and the route is kept whole
+  // for the caller to report.
+  std::vector<StateVec> walled = {StateVec(0.0, 0.0, 0.0, 0.0),
+                                  StateVec(0.5, 0.0, 0.0, 0.0)};
+  EXPECT_FALSE(mgg::pullBackToClearViewpoint(
+      walled, [](const StateVec& pose) { return pose.x() < 0.2; }));
+  EXPECT_EQ(walled.size(), 2u);
+  std::vector<StateVec> empty;
+  EXPECT_FALSE(mgg::pullBackToClearViewpoint(empty, clear));
+}
+
 TEST(PathSelection, EmptyGraphIsHandled) {
   GraphManager graph;
   EdgeInclinations flat;

@@ -284,6 +284,9 @@ class PlannerNode : public rclcpp::Node {
   /// rrg.cpp:2098 to 2120: rounds without a frontier among the local
   /// leaves; at the configured count the global planner runs.
   int low_gain_rounds_ = 0;
+  /// Exploration paths and global routes sent to end where no pose had
+  /// viewpoint clearance (mgg::viewpointClear), since the node started.
+  int unclear_viewpoints_selected_ = 0;
   int auto_global_planner_low_gain_rounds_ = 15;
   /// rrg.cpp:5838 to 5843 and 1229 to 1240: the global frontier being
   /// driven to, kept until the robot is within global_frontier_reach_m.

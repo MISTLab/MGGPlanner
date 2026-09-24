@@ -1159,9 +1159,21 @@ std::string PlannerNode::buildLocalGraph() {
   const mgg::PathSelectionResult sel = mgg::selectBestPath(
       *local_graph_, planning_params_, robot_params_, edge_inclinations_,
       map_->getResolution(), selection_direction, selectionExclusions(),
-      reservation_exclusion_radius_m_);
+      reservation_exclusion_radius_m_, [this](const mgg::Vertex& v) {
+        return mgg::viewpointClear(*map_, robot_params_, planning_params_,
+                                   v.state);
+      });
   for (const mgg::Vertex* v : sel.best_path) {
     if (v != nullptr) best_path_.push_back(v->state);
+  }
+  if (sel.unclear_viewpoint) {
+    ++unclear_viewpoints_selected_;
+    RCLCPP_WARN(get_logger(),
+                "exploration path ends without viewpoint clearance at (%.2f, "
+                "%.2f, %.2f): no path ends clear (%d unclear viewpoints so "
+                "far)",
+                best_path_.back().x(), best_path_.back().y(),
+                best_path_.back().z(), unclear_viewpoints_selected_);
   }
 
   // rrg.cpp:4538: the accepted lattice path joins the global graph as its
@@ -1205,13 +1217,16 @@ std::string PlannerNode::buildLocalGraph() {
       buf, sizeof(buf),
       "grid graph: %d free cells, %d vertices, %d edges%s%s; %d viewpoints, "
       "%d frontiers; best path %zu poses (%d lattice -> %d corners -> %d "
-      "resampled), gain %.1f%s, heading %.2f rad%s",
+      "resampled), gain %.1f%s; viewpoint clearance: %d paths pulled back, "
+      "%d without%s; heading %.2f rad%s",
       r.free_cells, r.vertices_added, r.edges_added,
       r.hit_limit ? " (hit a size limit)" : "", why, evaluated, frontiers,
       best_path_.size(), path_shortcut_from_, path_shortcut_corners_,
       path_shortcut_to_, sel.best_gain,
       sel.paths_rejected_steep > 0 ? " (some paths too steep)" : "",
-      exploring_direction_, timing);
+      sel.paths_pulled_back, sel.paths_without_clear_viewpoint,
+      sel.unclear_viewpoint ? ", none ends clear" : "", exploring_direction_,
+      timing);
 
   // rrg.cpp:2098 to 2120: rounds without a frontier among the leaves count
   // towards the global planner; a round with one counts back.
@@ -1523,6 +1538,23 @@ bool PlannerNode::runGlobalPlanner(int target_id, std::string& reason) {
     return false;
   }
   shortcutAndResample(best_path_);
+  // The frontier is a lattice leaf of an earlier cycle, which may stand
+  // against a wall: the route ends where the robot has room (viewpointClear)
+  // when any pose along it has, and at the frontier as before otherwise.
+  if (best_path_.size() >= 2 &&
+      !mgg::pullBackToClearViewpoint(
+          best_path_, [this](const mgg::StateVec& pose) {
+            return mgg::viewpointClear(*map_, robot_params_, planning_params_,
+                                       pose);
+          })) {
+    ++unclear_viewpoints_selected_;
+    RCLCPP_WARN(get_logger(),
+                "global route ends without viewpoint clearance at (%.2f, "
+                "%.2f, %.2f): no pose along it is clear (%d unclear "
+                "viewpoints so far)",
+                best_path_.back().x(), best_path_.back().y(),
+                best_path_.back().z(), unclear_viewpoints_selected_);
+  }
   best_path_from_global_graph_ = true;
   // rrg.cpp:5838 to 5843: this frontier is the target until it is reached.
   current_global_vertex_id_ = target->id;

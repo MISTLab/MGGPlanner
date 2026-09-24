@@ -190,6 +190,10 @@ struct PlanningParams {
   bool planning_backward = false;
   bool path_safety_enhance_enable = false;
   double path_interpolation_distance = 0.5;
+  /// Clearance beyond the robot's inscribed radius that an exploration
+  /// path's final pose keeps from known obstacles (viewpointClear), metres.
+  /// Not an upstream parameter.
+  double viewpoint_clearance_margin = 0.1;
 
   // Global planner.
   double relaxed_corridor_multiplier = 1.0;
