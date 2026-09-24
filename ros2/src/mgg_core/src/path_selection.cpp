@@ -111,11 +111,16 @@ PathSelectionResult selectBestPath(GraphManager& graph,
 
   // Clearance is a preference that always wins while it can be had: the best
   // path ending with room for the robot, pulled back to its last clear vertex
-  // where needed, is chosen whenever there is one. Only when no path ends
-  // clear, e.g. in a passage narrower than the robot plus twice the margin,
-  // is the best path chosen as without the check, so exploration goes on
-  // wherever it went on before.
+  // where needed, is chosen whenever there is one, even when the prefix it
+  // was pulled back to carries no gain of its own (with leaf-only gain it
+  // seldom does); between equal clear candidates, the one whose full path is
+  // worth more wins. Only when no path ends clear, e.g. in a passage narrower
+  // than the robot plus twice the margin, is the best path chosen as without
+  // the check, so exploration goes on wherever it went on before. With no
+  // gain anywhere there is still no path.
+  bool have_clear = false;
   double best_clear_gain = 0.0;
+  double best_clear_full_gain = 0.0;
   std::vector<Vertex*> best_clear_path;
   for (Vertex* leaf : leaves) {
     if (leaf == nullptr) continue;
@@ -133,6 +138,7 @@ PathSelectionResult selectBestPath(GraphManager& graph,
       result.best_gain = path_gain;
       result.best_path = path;
     }
+    const double full_gain = admissible ? path_gain : 0.0;
     if (!viewpoint_clear) continue;
 
     // The robot stops where the path ends; the root is where it stands.
@@ -147,13 +153,18 @@ PathSelectionResult selectBestPath(GraphManager& graph,
       ++result.paths_pulled_back;
       admissible = !excluded(path.back()) && score(path, path_gain);
     }
-    if (admissible && path_gain > best_clear_gain) {
+    if (admissible &&
+        (!have_clear || path_gain > best_clear_gain ||
+         (path_gain == best_clear_gain && full_gain > best_clear_full_gain))) {
+      have_clear = true;
       best_clear_gain = path_gain;
+      best_clear_full_gain = full_gain;
       best_clear_path = path;
     }
   }
-  if (viewpoint_clear && !result.best_path.empty()) {
-    if (best_clear_path.empty()) {
+  if (viewpoint_clear &&
+      (!result.best_path.empty() || best_clear_gain > 0.0)) {
+    if (!have_clear) {
       result.unclear_viewpoint = true;
     } else {
       result.best_gain = best_clear_gain;

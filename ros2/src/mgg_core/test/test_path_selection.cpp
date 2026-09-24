@@ -196,6 +196,42 @@ TEST(PathSelection, ViewpointWithoutClearanceIsPulledBackAlongItsPath) {
   EXPECT_FALSE(r.unclear_viewpoint);
 }
 
+TEST(PathSelection, ZeroGainClearPrefixWinsOverAnUnclearEndpoint) {
+  // With leaf-only gain the vertex a path is pulled back to carries none of
+  // its own; the pull-back must still happen (review r0, P1).
+  GraphManager graph;
+  auto* root = new Vertex(0, StateVec(0, 0, 0, 0));
+  graph.addVertex(root);
+  auto* inner = new Vertex(1, StateVec(1.0, 0.0, 0.0, 0.0));
+  graph.addVertex(inner);
+  graph.addEdge(inner, root, 1.0);
+  auto* leaf = new Vertex(2, StateVec(2.0, 0.0, 0.0, 0.0));
+  leaf->vol_gain.gain = 100.0;
+  graph.addVertex(leaf);
+  graph.addEdge(leaf, inner, 1.0);
+  EdgeInclinations flat;
+  const mgg::ViewpointClearFn clear = [](const Vertex& v) {
+    return v.id != 2;
+  };
+  const auto r = mgg::selectBestPath(graph, makePlanning(), RobotParams(),
+                                     flat, 0.2, 0.0, {}, 0.0, clear);
+  EXPECT_EQ(r.best_path_id, 1);
+  ASSERT_EQ(r.best_path.size(), 2u);
+  EXPECT_EQ(r.best_path.back(), inner);
+  EXPECT_EQ(r.paths_pulled_back, 1);
+  EXPECT_FALSE(r.unclear_viewpoint);
+}
+
+TEST(PathSelection, WithNoGainAnywhereThereIsStillNoPath) {
+  Fork f;
+  EdgeInclinations flat;
+  const mgg::ViewpointClearFn clear = [](const Vertex&) { return true; };
+  const auto r = mgg::selectBestPath(f.graph, makePlanning(), RobotParams(),
+                                     flat, 0.2, 0.0, {}, 0.0, clear);
+  EXPECT_EQ(r.best_path_id, -1);
+  EXPECT_TRUE(r.best_path.empty());
+}
+
 TEST(PathSelection, PathEndingClearWinsOverRicherPathsThatDoNot) {
   Fork f;
   for (Vertex* v : f.x_branch) v->vol_gain.gain = 100.0;
