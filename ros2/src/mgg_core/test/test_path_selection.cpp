@@ -222,6 +222,48 @@ TEST(PathSelection, ZeroGainClearPrefixWinsOverAnUnclearEndpoint) {
   EXPECT_FALSE(r.unclear_viewpoint);
 }
 
+TEST(PathSelection, ReservedGainIsNotPursuedThroughAClearPrefix) {
+  // The zero-gain-prefix fixture with its leaf reserved by a peer: the
+  // branch's only gain lies in the reservation, so no path at all (controller
+  // ruling on review r0, fix round 1), as before the clearance check.
+  GraphManager graph;
+  auto* root = new Vertex(0, StateVec(0, 0, 0, 0));
+  graph.addVertex(root);
+  auto* inner = new Vertex(1, StateVec(1.0, 0.0, 0.0, 0.0));
+  graph.addVertex(inner);
+  graph.addEdge(inner, root, 1.0);
+  auto* leaf = new Vertex(2, StateVec(2.0, 0.0, 0.0, 0.0));
+  leaf->vol_gain.gain = 100.0;
+  graph.addVertex(leaf);
+  graph.addEdge(leaf, inner, 1.0);
+  EdgeInclinations flat;
+  const std::vector<Eigen::Vector3d> exclusions{
+      Eigen::Vector3d(2.0, 0.0, 0.0)};
+  const mgg::ViewpointClearFn clear = [](const Vertex& v) {
+    return v.id != 2;
+  };
+  const auto r = mgg::selectBestPath(graph, makePlanning(), RobotParams(),
+                                     flat, 0.2, 0.0, exclusions, 0.5, clear);
+  EXPECT_EQ(r.best_path_id, -1);
+  EXPECT_TRUE(r.best_path.empty());
+  EXPECT_FALSE(r.unclear_viewpoint);
+
+  // Nor does that prefix win over another branch as a clear alternative:
+  // the other branch is taken as it is, flagged unclear.
+  Fork f;
+  f.x_branch.back()->vol_gain.gain = 100.0;
+  for (Vertex* v : f.y_branch) v->vol_gain.gain = 1.0;
+  const std::vector<Eigen::Vector3d> reserved{Eigen::Vector3d(3.0, 0.0, 0.0)};
+  const mgg::ViewpointClearFn x_prefix_clear = [](const Vertex& v) {
+    return v.id == 1 || v.id == 2;
+  };
+  const auto other = mgg::selectBestPath(f.graph, makePlanning(),
+                                         RobotParams(), flat, 0.2, 0.0,
+                                         reserved, 0.5, x_prefix_clear);
+  EXPECT_EQ(other.best_path_id, 6);
+  EXPECT_TRUE(other.unclear_viewpoint);
+}
+
 TEST(PathSelection, WithNoGainAnywhereThereIsStillNoPath) {
   Fork f;
   EdgeInclinations flat;

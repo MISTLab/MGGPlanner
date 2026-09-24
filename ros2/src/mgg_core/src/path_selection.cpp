@@ -156,6 +156,8 @@ PathSelectionResult selectBestPath(GraphManager& graph,
       path.resize(end + 1);
       ++result.paths_pulled_back;
       admissible = !excluded(path.back()) && score(path, path_gain);
+      // Toward a reserved leaf, only gain outside the reservation counts.
+      if (leaf_excluded && !(path_gain > 0.0)) continue;
     } else if (leaf_excluded) {
       continue;
     }
@@ -168,6 +170,8 @@ PathSelectionResult selectBestPath(GraphManager& graph,
       best_clear_path = path;
     }
   }
+  // A branch whose only gain lies in a peer's reservation is not pursued,
+  // not even through a clear prefix: that is what reservations prevent.
   if (viewpoint_clear &&
       (!result.best_path.empty() || best_clear_gain > 0.0)) {
     if (!have_clear) {
