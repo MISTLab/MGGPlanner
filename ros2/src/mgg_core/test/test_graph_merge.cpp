@@ -182,6 +182,110 @@ TEST(GraphMerge, ZOffsetIsCarriedThrough) {
   EXPECT_NEAR(gm.getNeighbourVertex(0, 2)->state[2], 0.5, 1e-9);
 }
 
+TEST(GraphMerge, ExchangedGroundHeightIsPlacedAtTheReceiversDrivingHeight) {
+  // A Spot drives 0.5 m above the floor, a Bunker 0.3 m: the neighbour sends
+  // ground height and each receiver adds its own driving height.
+  GraphManager gm;
+  buildOwnGraph(gm);
+  StaticPoseSource poses;
+  poses.setOffset(2, 0.0, 1.0, 0.2);
+  mgg::ReceiverPlatform bunker;
+  bunker.driving_height = 0.3;
+  const auto r = mergeNeighbourGraph(gm, neighbourGraph(), poses,
+                                     kAlwaysAdmissible, 5.0, bunker);
+  ASSERT_TRUE(r.merged);
+  EXPECT_NEAR(gm.getNeighbourVertex(1, 2)->state[2], 0.5, 1e-9);
+}
+
+TEST(GraphMerge, EdgesTooSteepForTheReceiverAreNotTakenOver) {
+  // The neighbour climbed a 0.3 m step its platform allows; ours does not.
+  GraphManager gm;
+  buildOwnGraph(gm);
+  StaticPoseSource poses;
+  poses.setOffset(2, 0.0, 1.0);
+  GraphExchange g = neighbourGraph();
+  g.vertices[2].state[2] = 0.3;
+  mgg::ReceiverPlatform scout;
+  scout.max_step_height = 0.15;
+  scout.max_inclination = 0.2;
+  const auto r =
+      mergeNeighbourGraph(gm, g, poses, kAlwaysAdmissible, 5.0, scout);
+  ASSERT_TRUE(r.merged);
+  EXPECT_EQ(r.edges_too_steep, 1);
+  EXPECT_EQ(r.edges_added, 1);
+
+  // A platform that takes the step keeps the edge.
+  GraphManager spot_graph;
+  buildOwnGraph(spot_graph);
+  mgg::ReceiverPlatform spot;
+  spot.max_step_height = 0.35;
+  spot.max_inclination = 0.2;
+  const auto s = mergeNeighbourGraph(spot_graph, g, poses, kAlwaysAdmissible,
+                                     5.0, spot);
+  EXPECT_EQ(s.edges_too_steep, 0);
+  EXPECT_EQ(s.edges_added, 2);
+}
+
+TEST(GraphMerge, MergedVerticesFollowAMovedTransform) {
+  GraphManager gm;
+  buildOwnGraph(gm);
+  StaticPoseSource poses;
+  poses.setOffset(2, 0.0, 1.0);
+  mergeNeighbourGraph(gm, neighbourGraph(), poses, kAlwaysAdmissible);
+  ASSERT_NEAR(gm.getNeighbourVertex(2, 2)->state[1], 1.0, 1e-9);
+
+  // Below the tolerance nothing moves.
+  poses.setOffset(2, 0.0, 1.02);
+  auto r = mergeNeighbourGraph(gm, neighbourGraph(), poses, kAlwaysAdmissible);
+  EXPECT_EQ(r.vertices_replaced, 0);
+  EXPECT_NEAR(gm.getNeighbourVertex(2, 2)->state[1], 1.0, 1e-9);
+
+  // C-SLAM corrected the estimate by 0.5 m: every merged vertex moves, and
+  // the nearest-neighbour index follows.
+  poses.setOffset(2, 0.0, 1.5);
+  r = mergeNeighbourGraph(gm, neighbourGraph(), poses, kAlwaysAdmissible);
+  EXPECT_EQ(r.vertices_replaced, 3);
+  EXPECT_FALSE(r.neighbour_restarted);
+  EXPECT_NEAR(gm.getNeighbourVertex(2, 2)->state[1], 1.5, 1e-9);
+  const StateVec probe(2.0, 1.5, 0.0, 0.0);
+  Vertex* nearest = nullptr;
+  ASSERT_TRUE(gm.getNearestVertexInRange(&probe, 0.01, &nearest));
+  EXPECT_EQ(nearest, gm.getNeighbourVertex(2, 2));
+}
+
+TEST(GraphMerge, ARestartedNeighbourIsCutOutAndMergedAfresh) {
+  GraphManager gm;
+  buildOwnGraph(gm);
+  StaticPoseSource poses;
+  poses.setOffset(2, 0.0, 1.0);
+  mergeNeighbourGraph(gm, neighbourGraph(), poses, kAlwaysAdmissible);
+  const int edges_before = gm.getNumEdges();
+  Vertex* old_two = gm.getNeighbourVertex(2, 2);
+  ASSERT_NE(old_two, nullptr);
+
+  // Its planner restarted elsewhere: the same ids now name a line along y.
+  GraphExchange restarted = neighbourGraph();
+  for (auto& v : restarted.vertices) {
+    v.state = StateVec(0.0, v.id * 1.0, 0.0, 0.0);
+  }
+  const auto r =
+      mergeNeighbourGraph(gm, restarted, poses, kAlwaysAdmissible);
+  EXPECT_TRUE(r.neighbour_restarted);
+  EXPECT_TRUE(r.merged);
+  EXPECT_TRUE(gm.isRetired(old_two->id));
+  // No edge of the old run survives, and the new vertices stand where the
+  // new run put them.
+  EXPECT_EQ(gm.edge_map_.count(old_two->id), 0u);
+  EXPECT_NEAR(gm.getNeighbourVertex(2, 2)->state[1], 3.0, 1e-9);
+  EXPECT_NE(gm.getNeighbourVertex(2, 2), old_two);
+  EXPECT_LE(gm.getNumEdges(), edges_before + 1);
+  // A retired vertex is never a nearest neighbour again.
+  const StateVec probe(2.0, 1.0, 0.0, 0.0);
+  Vertex* nearest = nullptr;
+  ASSERT_TRUE(gm.getNearestVertex(&probe, &nearest));
+  EXPECT_NE(nearest, old_two);
+}
+
 TEST(GraphMerge, TinyGraphsAreIgnored) {
   GraphManager gm;
   buildOwnGraph(gm, 1);

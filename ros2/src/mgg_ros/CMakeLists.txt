@@ -29,6 +29,7 @@ find_package(std_msgs REQUIRED)
 find_package(geometry_msgs REQUIRED)
 find_package(visualization_msgs REQUIRED)
 find_package(tf2 REQUIRED)
+find_package(tf2_msgs REQUIRED)
 find_package(tf2_ros REQUIRED)
 find_package(tf2_geometry_msgs REQUIRED)
 find_package(Eigen3 REQUIRED)
@@ -47,7 +48,7 @@ target_include_directories(${PROJECT_NAME} PUBLIC
 target_link_libraries(${PROJECT_NAME} mgg_core::mgg_core
   mgg_map_octomap::mgg_map_octomap Eigen3::Eigen)
 ament_target_dependencies(${PROJECT_NAME}
-  rclcpp std_msgs geometry_msgs visualization_msgs tf2 tf2_ros
+  rclcpp std_msgs geometry_msgs visualization_msgs tf2 tf2_msgs tf2_ros
   tf2_geometry_msgs mgg_msgs nav_msgs sensor_msgs std_srvs)
 
 add_executable(mggplanner_node src/planner_main.cpp)
@@ -62,7 +63,7 @@ install(TARGETS ${PROJECT_NAME} EXPORT export_${PROJECT_NAME}
 
 ament_export_targets(export_${PROJECT_NAME} HAS_LIBRARY_TARGET)
 ament_export_dependencies(mgg_core mgg_msgs mgg_map_octomap rclcpp
-  geometry_msgs visualization_msgs tf2_ros nav_msgs sensor_msgs std_srvs
+  geometry_msgs visualization_msgs tf2_msgs tf2_ros nav_msgs sensor_msgs std_srvs
   Eigen3)
 ament_export_include_directories(include)
 

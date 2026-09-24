@@ -11,9 +11,11 @@ namespace {
 
 /// Applies the inter-robot transform to a neighbour's state. Unlike the ROS 1
 /// version this carries z and yaw through the rotation, so robots need not
-/// share a heading.
-StateVec transformState(const StateVec& state,
-                        const Eigen::Isometry3d& t_ours_theirs) {
+/// share a heading. The state arrives at ground height and leaves at this
+/// robot's driving height above that ground.
+StateVec placeState(const StateVec& state,
+                    const Eigen::Isometry3d& t_ours_theirs,
+                    double driving_height) {
   const Eigen::Vector3d p_theirs(state[0], state[1], state[2]);
   const Eigen::Vector3d p_ours = t_ours_theirs * p_theirs;
   // Yaw of the composed rotation about z.
@@ -21,7 +23,17 @@ StateVec transformState(const StateVec& state,
       t_ours_theirs.linear() *
       Eigen::Matrix3d(Eigen::AngleAxisd(state[3], Eigen::Vector3d::UnitZ()));
   const double yaw = std::atan2(r(1, 0), r(0, 0));
-  return StateVec(p_ours.x(), p_ours.y(), p_ours.z(), yaw);
+  return StateVec(p_ours.x(), p_ours.y(), p_ours.z() + driving_height, yaw);
+}
+
+/// Within this robot's step and grade limits, the rule ground projection
+/// applies to its own edges (ground_projection.cpp).
+bool climbable(const Vertex& a, const Vertex& b,
+               const ReceiverPlatform& platform) {
+  const Eigen::Vector3d ray = b.state.head<3>() - a.state.head<3>();
+  const double rise = std::abs(ray.z());
+  return rise <= platform.max_step_height + 1e-6 ||
+         std::atan2(rise, ray.head<2>().norm()) <= platform.max_inclination;
 }
 
 Vertex* makeVertex(GraphManager& graph, const GraphExchangeVertex& v,
@@ -55,15 +67,21 @@ Vertex* findNeighbourVertex(GraphManager& graph, int robot_id, int vertex_id) {
   return vertex_it->second;
 }
 
-/// Adds the incoming edges, skipping any whose endpoints are not both present.
+/// Adds the incoming edges, skipping any whose endpoints are not both present
+/// and any this robot could not climb.
 int addEdges(GraphManager& graph, const GraphExchange& incoming, int robot_id,
-             bool dedupe, int& unresolved) {
+             bool dedupe, const ReceiverPlatform& platform, int& unresolved,
+             int& too_steep) {
   int added = 0;
   for (const GraphExchangeEdge& e : incoming.edges) {
     Vertex* source = findNeighbourVertex(graph, robot_id, e.source_id);
     Vertex* target = findNeighbourVertex(graph, robot_id, e.target_id);
     if (source == nullptr || target == nullptr) {
       ++unresolved;
+      continue;
+    }
+    if (!climbable(*source, *target, platform)) {
+      ++too_steep;
       continue;
     }
     if (dedupe) {
@@ -74,6 +92,56 @@ int addEdges(GraphManager& graph, const GraphExchange& incoming, int robot_id,
     ++added;
   }
   return added;
+}
+
+/// The neighbour restarted when a vertex it sent before is missing from this
+/// complete snapshot, or has moved in its own frame.
+bool neighbourRestarted(const GraphManager::NeighbourPlacement& placement,
+                        const GraphExchange& incoming) {
+  std::unordered_map<int, const GraphExchangeVertex*> by_id;
+  by_id.reserve(incoming.vertices.size());
+  for (const GraphExchangeVertex& v : incoming.vertices) by_id[v.id] = &v;
+  for (const auto& [id, sent] : placement.sent_states) {
+    const auto found = by_id.find(id);
+    if (found == by_id.end()) return true;
+    if ((found->second->state.head<2>() - sent.head<2>()).norm() >
+        kNeighbourRestartToleranceM) {
+      return true;
+    }
+  }
+  return false;
+}
+
+/// Moves the neighbour's merged vertices to where `t_ours_theirs` puts them,
+/// if it moves any by more than kNeighbourReplaceToleranceM. One pass over
+/// the neighbour's vertices; the index is rebuilt once, only on a move.
+int replaceNeighbourVertices(GraphManager& graph, int robot_id,
+                             GraphManager::NeighbourPlacement& placement,
+                             const Eigen::Isometry3d& t_ours_theirs,
+                             double driving_height) {
+  const auto merged = graph.vertex_by_robot_id_.find(robot_id);
+  if (merged == graph.vertex_by_robot_id_.end()) return 0;
+  bool moved = false;
+  for (const auto& [id, sent] : placement.sent_states) {
+    const auto vertex = merged->second.find(id);
+    if (vertex == merged->second.end() || vertex->second == nullptr) continue;
+    const StateVec placed = placeState(sent, t_ours_theirs, driving_height);
+    if ((placed.head<3>() - vertex->second->state.head<3>()).norm() >
+        kNeighbourReplaceToleranceM) {
+      moved = true;
+      break;
+    }
+  }
+  if (!moved) return 0;
+  int replaced = 0;
+  for (const auto& [id, sent] : placement.sent_states) {
+    const auto vertex = merged->second.find(id);
+    if (vertex == merged->second.end() || vertex->second == nullptr) continue;
+    vertex->second->state = placeState(sent, t_ours_theirs, driving_height);
+    ++replaced;
+  }
+  graph.rebuildNearestIndex();
+  return replaced;
 }
 
 }  // namespace
@@ -90,6 +158,10 @@ void StaticPoseSource::setOffset(int robot_id, double dx, double dy,
   transforms_[robot_id] = t;
 }
 
+void StaticPoseSource::clearTransform(int robot_id) {
+  transforms_.erase(robot_id);
+}
+
 bool StaticPoseSource::getRobotTransform(
     int robot_id, Eigen::Isometry3d& t_ours_theirs) const {
   auto it = transforms_.find(robot_id);
@@ -102,7 +174,8 @@ MergeResult mergeNeighbourGraph(GraphManager& global_graph,
                                 const GraphExchange& incoming,
                                 const PoseSource& poses,
                                 const EdgeAdmissibleFn& is_admissible,
-                                double rendezvous_radius) {
+                                double rendezvous_radius,
+                                const ReceiverPlatform& platform) {
   MergeResult result;
 
   // Same guard as the ROS 1 version: nothing useful to connect to yet.
@@ -120,13 +193,29 @@ MergeResult mergeNeighbourGraph(GraphManager& global_graph,
     return result;
   }
 
+  const double driving_height = platform.driving_height;
+  auto placement = global_graph.neighbour_placements_.find(neighbour_id);
+  if (placement != global_graph.neighbour_placements_.end() &&
+      neighbourRestarted(placement->second, incoming)) {
+    // Its vertex ids now name other places: what came from the old run is
+    // cut out before anything of the new one is merged.
+    global_graph.retireNeighbourGraph(neighbour_id);
+    result.neighbour_restarted = true;
+    placement = global_graph.neighbour_placements_.end();
+  }
+
   const bool already_merged = global_graph.merged_graphs_[neighbour_id];
+  if (already_merged && placement != global_graph.neighbour_placements_.end()) {
+    result.vertices_replaced = replaceNeighbourVertices(
+        global_graph, neighbour_id, placement->second, t_ours_theirs,
+        driving_height);
+  }
 
   if (!already_merged) {
     // Hunt for a rendezvous: an incoming vertex close enough to one of ours
     // that the robot could actually drive between them.
     for (const GraphExchangeVertex& v : incoming.vertices) {
-      StateVec state = transformState(v.state, t_ours_theirs);
+      StateVec state = placeState(v.state, t_ours_theirs, driving_height);
       Vertex* nearest = nullptr;
       if (!global_graph.getNearestVertexInRange(&state, rendezvous_radius,
                                                 &nearest) ||
@@ -154,22 +243,25 @@ MergeResult mergeNeighbourGraph(GraphManager& global_graph,
   result.newly_connected = !already_merged && result.merged;
   if (!result.merged) return result;
 
-
   // Connected: take everything else the neighbour knows.
+  auto& sent_states =
+      global_graph.neighbour_placements_[neighbour_id].sent_states;
   for (const GraphExchangeVertex& v : incoming.vertices) {
     Vertex* existing = findNeighbourVertex(global_graph, v.robot_id, v.id);
     if (existing == nullptr) {
-      StateVec state = transformState(v.state, t_ours_theirs);
+      StateVec state = placeState(v.state, t_ours_theirs, driving_height);
       global_graph.addNeighbourVertex(makeVertex(global_graph, v, state), v.id);
       ++result.vertices_added;
     } else {
       refreshVertex(existing, v);
       ++result.vertices_updated;
     }
+    sent_states[v.id] = v.state;
   }
 
-  result.edges_added = addEdges(global_graph, incoming, neighbour_id,
-                                already_merged, result.edges_unresolved);
+  result.edges_added =
+      addEdges(global_graph, incoming, neighbour_id, already_merged, platform,
+               result.edges_unresolved, result.edges_too_steep);
 
   if (result.edges_unresolved > 0) {
     char buf[160];

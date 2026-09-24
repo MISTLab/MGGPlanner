@@ -41,6 +41,7 @@
 #define MGG_CORE_GRAPH_MERGE_H_
 
 #include <functional>
+#include <limits>
 #include <map>
 #include <vector>
 
@@ -56,7 +57,9 @@ namespace mgg {
 struct GraphExchangeVertex {
   int id = 0;
   int robot_id = 0;
-  /// x, y, z, yaw, in the sending robot's frame.
+  /// x, y, z, yaw, in the sending robot's frame. z is the height of the
+  /// ground under the vertex, not the sender's driving height: robots of
+  /// different platforms drive at different heights above the same floor.
   StateVec state = StateVec::Zero();
   int num_unknown_voxels = 0;
   int num_free_voxels = 0;
@@ -94,6 +97,8 @@ class StaticPoseSource : public PoseSource {
   void setTransform(int robot_id, const Eigen::Isometry3d& t_ours_theirs);
   /// Convenience matching the ROS 1 table, which was a planar translation.
   void setOffset(int robot_id, double dx, double dy, double dz = 0.0);
+  /// Forgets the transform to `robot_id`, which then cannot be merged.
+  void clearTransform(int robot_id);
   bool getRobotTransform(int robot_id,
                          Eigen::Isometry3d& t_ours_theirs) const override;
 
@@ -119,7 +124,38 @@ struct MergeResult {
   int edges_unresolved = 0;
   /// Set when the neighbour's transform is not yet known.
   bool transform_unavailable = false;
+  /// Neighbour edges not taken over because they exceed this robot's step
+  /// and grade limits (ReceiverPlatform).
+  int edges_too_steep = 0;
+  /// Merged vertices moved because the transform to the neighbour moved.
+  int vertices_replaced = 0;
+  /// The neighbour's graph no longer matches what was merged from it (a
+  /// vertex it sent before is gone or moved in its own frame): its planner
+  /// restarted, and what was merged from the old run was cut out.
+  bool neighbour_restarted = false;
 };
+
+/// The receiving robot's platform, which a neighbour's roadmap is re-read for.
+struct ReceiverPlatform {
+  /// Height of this robot's driving plane above the ground. Exchanged vertex
+  /// states carry ground height (GraphExchangeVertex::state), so this is
+  /// added after the transform.
+  double driving_height = 0.0;
+  /// An edge rising more than max_step_height at a grade steeper than
+  /// max_inclination is not taken over, the rule ground projection applies to
+  /// this robot's own edges. A neighbour of another platform may drive what
+  /// this one cannot.
+  double max_step_height = std::numeric_limits<double>::infinity();
+  double max_inclination = std::numeric_limits<double>::infinity();
+};
+
+/// A merged neighbour's vertices are re-placed once the transform to it moves
+/// any of them by more than this, as C-SLAM adopts a frame change (5 cm).
+constexpr double kNeighbourReplaceToleranceM = 0.05;
+/// A vertex the neighbour sent before that is now this far from where it was,
+/// in the neighbour's own frame, means the neighbour restarted: a planner
+/// never moves a vertex horizontally once it is in its global graph.
+constexpr double kNeighbourRestartToleranceM = 0.05;
 
 
 /// Folds `incoming` into `global_graph`.
@@ -127,13 +163,18 @@ struct MergeResult {
 /// Until the two graphs are connected, every incoming vertex is a candidate
 /// rendezvous point: the nearest own vertex within `rendezvous_radius` is
 /// found and, if `is_admissible` says the robot could actually drive between
-/// them, the graphs are joined there. Once joined, subsequent calls simply add
-/// what is new and refresh what is not.
+/// them, the graphs are joined there. Once joined, subsequent calls add what
+/// is new, refresh what is not, re-place what was merged when the transform
+/// moved (kNeighbourReplaceToleranceM; one pass over the neighbour's vertices
+/// per call and one index rebuild only when something moves), and cut the
+/// old graph out when the neighbour restarted (kNeighbourRestartToleranceM).
+/// `incoming` is a complete snapshot of the neighbour's graph.
 MergeResult mergeNeighbourGraph(GraphManager& global_graph,
                                 const GraphExchange& incoming,
                                 const PoseSource& poses,
                                 const EdgeAdmissibleFn& is_admissible,
-                                double rendezvous_radius = 5.0);
+                                double rendezvous_radius = 5.0,
+                                const ReceiverPlatform& platform = {});
 
 }  // namespace mgg
 

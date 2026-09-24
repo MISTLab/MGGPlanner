@@ -36,6 +36,7 @@
 #include <sensor_msgs/msg/point_cloud2.hpp>
 #include <rclcpp/rclcpp.hpp>
 #include <std_srvs/srv/trigger.hpp>
+#include <tf2_msgs/msg/tf_message.hpp>
 #include <tf2_ros/buffer.h>
 #include <tf2_ros/transform_listener.h>
 #include <visualization_msgs/msg/marker_array.hpp>
@@ -81,6 +82,13 @@ class PlannerNode : public rclcpp::Node {
   void onPointCloud(sensor_msgs::msg::PointCloud2::ConstSharedPtr msg);
   void onMappingSnapshot(mgg_msgs::msg::MappingSnapshot::ConstSharedPtr msg);
   void onNeighbourGraph(mgg_msgs::msg::Graph::ConstSharedPtr msg);
+  void onNeighbourTransforms(tf2_msgs::msg::TFMessage::ConstSharedPtr msg);
+  /// Sets the merge's transform to `sender` from the latest one received for
+  /// its planning frame, or clears it when there is none within the TTL.
+  /// Always true for the static source.
+  bool refreshNeighbourTransform(int sender, const std::string& sender_frame);
+  /// This robot's platform as a neighbour's roadmap is re-read for it.
+  mgg::ReceiverPlatform receiverPlatform() const;
   void onCoordinationExclusions(
       geometry_msgs::msg::PoseArray::ConstSharedPtr msg);
   void onPeerBodies(geometry_msgs::msg::PoseArray::ConstSharedPtr msg);
@@ -101,6 +109,8 @@ class PlannerNode : public rclcpp::Node {
           request,
       std::shared_ptr<mgg_msgs::srv::PlannerSetExplorationTarget::Response>
           response);
+  /// This robot's global graph as broadcast on neighbour_graph_out.
+  mgg_msgs::msg::Graph ownGraphMessage();
   void publishOwnGraph();
   void publishPath();
   void publishMarkers();
@@ -174,6 +184,14 @@ class PlannerNode : public rclcpp::Node {
   std::shared_ptr<mgg::GraphManager> local_graph_;
   std::shared_ptr<mgg::GraphManager> global_graph_;
   std::unique_ptr<mgg::StaticPoseSource> poses_;
+  std::string neighbour_pose_source_ = "static";
+  double neighbour_transform_ttl_s_ = 5.0;
+  struct NeighbourTransform {
+    Eigen::Isometry3d t_ours_theirs = Eigen::Isometry3d::Identity();
+    std::chrono::steady_clock::time_point received{};
+  };
+  /// Keyed by the neighbour's planning frame.
+  std::unordered_map<std::string, NeighbourTransform> neighbour_transforms_;
   mgg::RandomSampler random_sampler_;
   mgg::RobotStateHistory robot_state_hist_;
 
@@ -304,6 +322,8 @@ class PlannerNode : public rclcpp::Node {
   rclcpp::Subscription<mgg_msgs::msg::MappingSnapshot>::SharedPtr
       mapping_snapshot_sub_;
   rclcpp::Subscription<mgg_msgs::msg::Graph>::SharedPtr neighbour_sub_;
+  rclcpp::Subscription<tf2_msgs::msg::TFMessage>::SharedPtr
+      neighbour_transforms_sub_;
   rclcpp::Subscription<geometry_msgs::msg::PoseArray>::SharedPtr
       coordination_exclusions_sub_;
   rclcpp::Subscription<geometry_msgs::msg::PoseArray>::SharedPtr

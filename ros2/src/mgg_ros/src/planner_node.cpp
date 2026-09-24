@@ -116,9 +116,19 @@ PlannerNode::PlannerNode(const rclcpp::NodeOptions& options)
   random_sampler_.setBound(grid_params_.min_val, grid_params_.max_val);
   random_sampler_.reset(std::random_device{}());
 
-  // Static inter-robot transforms for bring-up; the merge takes any
-  // PoseSource.
+  // Inter-robot transforms. `static` reads fixed ones from
+  // neighbour_offsets (bring-up with known spawn poses); `topic` takes live
+  // estimates on neighbour_transforms, each T_ours_theirs from our planning
+  // frame to a neighbour's, and holds them for neighbour_transform_ttl_sec.
   poses_ = std::make_unique<mgg::StaticPoseSource>();
+  neighbour_pose_source_ = declareOrGet<std::string>(
+      this, "neighbour_pose_source", neighbour_pose_source_);
+  if (neighbour_pose_source_ != "static" && neighbour_pose_source_ != "topic") {
+    throw std::invalid_argument("neighbour_pose_source must be static or topic");
+  }
+  neighbour_transform_ttl_s_ = std::max(
+      0.1, declareOrGet<double>(this, "neighbour_transform_ttl_sec",
+                                neighbour_transform_ttl_s_));
   const auto offsets = declareOrGet<std::vector<double>>(
       this, "neighbour_offsets", std::vector<double>{});
   if (offsets.size() % 4 != 0) {
@@ -173,6 +183,14 @@ PlannerNode::PlannerNode(const rclcpp::NodeOptions& options)
       "neighbour_graph_in", rclcpp::QoS(10),
       [this](mgg_msgs::msg::Graph::ConstSharedPtr m) { onNeighbourGraph(m); },
       sub_opts);
+  if (neighbour_pose_source_ == "topic") {
+    neighbour_transforms_sub_ = create_subscription<tf2_msgs::msg::TFMessage>(
+        "neighbour_transforms", rclcpp::QoS(10),
+        [this](tf2_msgs::msg::TFMessage::ConstSharedPtr m) {
+          onNeighbourTransforms(m);
+        },
+        sub_opts);
+  }
 
   // Fleet coordination: frontiers a peer has reserved are skipped by the
   // selectors (the other-robot penalty of rrg.cpp:5804, made exact), and a
@@ -615,6 +633,61 @@ void PlannerNode::onPeerBodies(
                                peer_body_ttl_s_);
 }
 
+void PlannerNode::onNeighbourTransforms(
+    tf2_msgs::msg::TFMessage::ConstSharedPtr msg) {
+  const std::lock_guard<std::recursive_mutex> lock(planner_mutex_);
+  const auto now = std::chrono::steady_clock::now();
+  for (const auto& t : msg->transforms) {
+    if (t.header.frame_id != world_frame_) {
+      RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 5000,
+                           "ignoring neighbour transform from '%s', not our "
+                           "planning frame '%s'",
+                           t.header.frame_id.c_str(), world_frame_.c_str());
+      continue;
+    }
+    const auto& p = t.transform.translation;
+    const auto& q = t.transform.rotation;
+    const Eigen::Quaterniond rotation(q.w, q.x, q.y, q.z);
+    if (!std::isfinite(p.x) || !std::isfinite(p.y) || !std::isfinite(p.z) ||
+        !rotation.coeffs().allFinite() ||
+        std::abs(rotation.norm() - 1.0) > 1e-3) {
+      RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 5000,
+                           "ignoring an invalid neighbour transform to '%s'",
+                           t.child_frame_id.c_str());
+      continue;
+    }
+    Eigen::Isometry3d t_ours_theirs = Eigen::Isometry3d::Identity();
+    t_ours_theirs.linear() = rotation.normalized().toRotationMatrix();
+    t_ours_theirs.translation() = Eigen::Vector3d(p.x, p.y, p.z);
+    neighbour_transforms_[t.child_frame_id] = {t_ours_theirs, now};
+  }
+}
+
+bool PlannerNode::refreshNeighbourTransform(int sender,
+                                            const std::string& sender_frame) {
+  if (neighbour_pose_source_ != "topic") return true;
+  const auto found = neighbour_transforms_.find(sender_frame);
+  if (found == neighbour_transforms_.end() ||
+      std::chrono::duration<double>(std::chrono::steady_clock::now() -
+                                    found->second.received)
+              .count() > neighbour_transform_ttl_s_) {
+    poses_->clearTransform(sender);
+    return false;
+  }
+  poses_->setTransform(sender, found->second.t_ours_theirs);
+  return true;
+}
+
+mgg::ReceiverPlatform PlannerNode::receiverPlatform() const {
+  mgg::ReceiverPlatform platform;
+  if (robot_params_.type == mgg::RobotType::kGroundRobot) {
+    platform.driving_height = planning_params_.max_ground_height;
+    platform.max_step_height = planning_params_.max_step_height;
+    platform.max_inclination = planning_params_.max_inclination;
+  }
+  return platform;
+}
+
 void PlannerNode::onNeighbourGraph(mgg_msgs::msg::Graph::ConstSharedPtr msg) {
   if (msg->vertices.empty()) return;
   const int sender = msg->vertices.front().robot_id;
@@ -623,6 +696,8 @@ void PlannerNode::onNeighbourGraph(mgg_msgs::msg::Graph::ConstSharedPtr msg) {
   // Merging reads the map to decide reachability and writes the global graph.
   const std::lock_guard<std::recursive_mutex> lock(planner_mutex_);
   auto map_read = mapReadLease();
+  // The graph is in the sender's planning frame, which names the transform.
+  refreshNeighbourTransform(sender, msg->header.frame_id);
 
   // Communication range filter: robots must be within direct radio range.
   Eigen::Isometry3d t_ours_theirs = Eigen::Isometry3d::Identity();
@@ -655,14 +730,37 @@ void PlannerNode::onNeighbourGraph(mgg_msgs::msg::Graph::ConstSharedPtr msg) {
   };
 
   const mgg::MergeResult r = mgg::mergeNeighbourGraph(
-      *global_graph_, incoming, *poses_, admissible);
-  if (r.vertices_added > 0 || r.edges_added > 0) ++graph_revision_;
+      *global_graph_, incoming, *poses_, admissible, 5.0, receiverPlatform());
+  if (r.vertices_added > 0 || r.edges_added > 0 || r.vertices_replaced > 0 ||
+      r.neighbour_restarted) {
+    ++graph_revision_;
+  }
 
   if (r.transform_unavailable) {
     RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 5000,
-                         "no transform for robot %d; set neighbour_offsets or "
-                         "supply a SLAM-backed PoseSource", sender);
+                         "roadmap from robot %d ('%s') dropped: no %s "
+                         "transform to it",
+                         sender, msg->header.frame_id.c_str(),
+                         neighbour_pose_source_ == "topic"
+                             ? "current neighbour_transforms"
+                             : "neighbour_offsets");
     return;
+  }
+  if (r.neighbour_restarted) {
+    RCLCPP_INFO(get_logger(),
+                "robot %d restarted its roadmap; the old one was cut out",
+                sender);
+  }
+  if (r.vertices_replaced > 0) {
+    RCLCPP_INFO(get_logger(),
+                "robot %d's transform moved: %d merged vertices re-placed",
+                sender, r.vertices_replaced);
+  }
+  if (r.edges_too_steep > 0) {
+    RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 30000,
+                         "robot %d: %d roadmap edge(s) beyond this robot's "
+                         "step and grade limits not taken over",
+                         sender, r.edges_too_steep);
   }
   if (r.newly_connected) {
     if (poses_->getRobotTransform(sender, t_ours_theirs) &&
@@ -1558,16 +1656,24 @@ void PlannerNode::publishPath() {
   path_pub_->publish(msg);
 }
 
-void PlannerNode::publishOwnGraph() {
-  // Runs on a timer, so it can land in the middle of a planning cycle
-  // rewriting the very graph it is serialising.
+mgg_msgs::msg::Graph PlannerNode::ownGraphMessage() {
   const std::lock_guard<std::recursive_mutex> lock(planner_mutex_);
-  if (global_graph_->getNumVertices() == 0) return;
+  if (global_graph_->getNumVertices() == 0) return {};
+  // Exchanged at ground height: a neighbour of another platform drives at
+  // its own height above the same floor (mergeNeighbourGraph).
   auto msg = toGraphMsg(*global_graph_,
-                        static_cast<int>(planning_params_.robot_id));
-  if (msg.vertices.empty()) return;
+                        static_cast<int>(planning_params_.robot_id),
+                        receiverPlatform().driving_height);
   msg.header.stamp = now();
   msg.header.frame_id = world_frame_;
+  return msg;
+}
+
+void PlannerNode::publishOwnGraph() {
+  // Runs on a timer, so it can land in the middle of a planning cycle
+  // rewriting the very graph it is serialising; ownGraphMessage locks.
+  const auto msg = ownGraphMessage();
+  if (msg.vertices.empty()) return;
   graph_pub_->publish(msg);
 }
 

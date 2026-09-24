@@ -51,7 +51,8 @@ mgg::GraphExchange fromGraphMsg(const mgg_msgs::msg::Graph& msg) {
   return out;
 }
 
-mgg_msgs::msg::Graph toGraphMsg(mgg::GraphManager& graph, int robot_id) {
+mgg_msgs::msg::Graph toGraphMsg(mgg::GraphManager& graph, int robot_id,
+                                double driving_height) {
   mgg_msgs::msg::Graph msg;
 
   auto own = graph.vertex_by_robot_id_.find(robot_id);
@@ -63,6 +64,7 @@ mgg_msgs::msg::Graph toGraphMsg(mgg::GraphManager& graph, int robot_id) {
     mgg_msgs::msg::Vertex vertex;
     vertex.id = entry.first;
     vertex.pose = toPoseMsg(v->state);
+    vertex.pose.position.z -= driving_height;
     vertex.num_unknown_voxels = v->vol_gain.num_unknown_voxels;
     vertex.num_occupied_voxels = v->vol_gain.num_occupied_voxels;
     vertex.num_free_voxels = v->vol_gain.num_free_voxels;

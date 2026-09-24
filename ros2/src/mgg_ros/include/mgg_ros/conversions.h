@@ -33,7 +33,10 @@ mgg::GraphExchange fromGraphMsg(const mgg_msgs::msg::Graph& msg);
 /// convertThisRobotGraphNodesToMsg. Note the consequence: the emitted ids are
 /// a subset of the sender's id space once any neighbour graph has been merged,
 /// so a receiver must not assume they are contiguous.
-mgg_msgs::msg::Graph toGraphMsg(mgg::GraphManager& graph, int robot_id);
+/// z is lowered by `driving_height`, to the ground under each vertex
+/// (GraphExchangeVertex).
+mgg_msgs::msg::Graph toGraphMsg(mgg::GraphManager& graph, int robot_id,
+                                double driving_height = 0.0);
 
 }  // namespace mgg_ros
 

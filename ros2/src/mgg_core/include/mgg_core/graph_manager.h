@@ -23,6 +23,7 @@
 #include <memory>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -71,6 +72,19 @@ class GraphManager {
   /// nearest-neighbour queries consistent with the corrected state.
   bool updateVertexState(int id, const StateVec& state);
 
+  /// Rebuild the nearest-neighbour index after vertex states were changed in
+  /// place, once for the whole batch.
+  void rebuildNearestIndex();
+
+  /// Cut a neighbour's merged graph out: every edge touching its vertices is
+  /// removed, its vertices leave the nearest-neighbour index for good and its
+  /// id map and merged flag are forgotten, so its next message merges afresh.
+  /// Vertex ids are Boost indices and must stay dense, so the vertices
+  /// themselves remain as isolated, visited entries. Returns how many were
+  /// retired.
+  int retireNeighbourGraph(int robot_id);
+  bool isRetired(int id) const { return retired_vertex_ids_.count(id) > 0; }
+
   int getNumVertices() { return graph_->getNumVertices(); }
   int getNumEdges() { return graph_->getNumEdges(); }
 
@@ -118,6 +132,14 @@ class GraphManager {
   std::unordered_map<int, std::unordered_map<int, Vertex*>> vertex_by_robot_id_;
   /// Which neighbours' graphs have been merged already.
   std::unordered_map<int, bool> merged_graphs_;
+  /// Each merged neighbour vertex's state as the neighbour sent it (its own
+  /// frame, ground height), keyed by the neighbour's vertex id. Lets the
+  /// merge re-place them when the transform moves and notice when the
+  /// neighbour restarted.
+  struct NeighbourPlacement {
+    std::unordered_map<int, StateVec> sent_states;
+  };
+  std::unordered_map<int, NeighbourPlacement> neighbour_placements_;
 
  private:
   /// Nearest-neighbour index over the vertices.
@@ -125,6 +147,9 @@ class GraphManager {
   int subgraph_ind_ = -1;
   int id_count_ = -1;
   int robot_id_ = 0;
+
+  /// Vertices of a neighbour graph cut out by retireNeighbourGraph.
+  std::unordered_set<int> retired_vertex_ids_;
 
   /// Boost-local id to <subgraph id, vertex id>. Debug aid.
   std::unordered_map<int, std::pair<int, int>> local_id_map_;

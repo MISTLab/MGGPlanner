@@ -55,6 +55,9 @@ void GraphManager::reset() {
   vertices_map_.clear();
   edge_map_.clear();
   vertex_by_robot_id_.clear();
+  merged_graphs_.clear();
+  neighbour_placements_.clear();
+  retired_vertex_ids_.clear();
 
   // Other params.
   subgraph_ind_ = -1;
@@ -113,16 +116,66 @@ bool GraphManager::updateVertexState(int id, const StateVec& state) {
   const auto found = vertices_map_.find(id);
   if (found == vertices_map_.end() || found->second == nullptr) return false;
   found->second->state = state;
+  rebuildNearestIndex();
+  return true;
+}
 
+void GraphManager::rebuildNearestIndex() {
   if (kd_tree_) kd_free(kd_tree_);
   kd_tree_ = kd_create(3);
   for (const auto& entry : vertices_map_) {
     const Vertex* vertex = entry.second;
-    if (vertex == nullptr) continue;
+    if (vertex == nullptr || isRetired(entry.first)) continue;
     kd_insert3(kd_tree_, vertex->state.x(), vertex->state.y(),
                vertex->state.z(), entry.second);
   }
-  return true;
+}
+
+int GraphManager::retireNeighbourGraph(int robot_id) {
+  merged_graphs_.erase(robot_id);
+  neighbour_placements_.erase(robot_id);
+  const auto found = vertex_by_robot_id_.find(robot_id);
+  if (found == vertex_by_robot_id_.end()) return 0;
+  int retired = 0;
+  for (const auto& entry : found->second) {
+    Vertex* vertex = entry.second;
+    if (vertex == nullptr) continue;
+    const auto edges = edge_map_.find(vertex->id);
+    if (edges != edge_map_.end()) {
+      for (const auto& [other, weight] : edges->second) {
+        (void)weight;
+        graph_->removeEdge(vertex->id, other);
+        auto& back = edge_map_[other];
+        back.erase(std::remove_if(back.begin(), back.end(),
+                                  [vertex](const auto& e) {
+                                    return e.first == vertex->id;
+                                  }),
+                   back.end());
+      }
+      edge_map_.erase(edges);
+    }
+    vertex->type = VertexType::kVisited;
+    vertex->vol_gain.is_frontier = false;
+    vertex->parent = nullptr;
+    vertex->children.clear();
+    retired_vertex_ids_.insert(vertex->id);
+    ++retired;
+  }
+  // Our vertices may have adopted a retired one as a tree child.
+  for (auto& entry : vertices_map_) {
+    Vertex* vertex = entry.second;
+    if (vertex == nullptr) continue;
+    auto& children = vertex->children;
+    children.erase(std::remove_if(children.begin(), children.end(),
+                                  [this](const Vertex* child) {
+                                    return child != nullptr &&
+                                           isRetired(child->id);
+                                  }),
+                   children.end());
+  }
+  vertex_by_robot_id_.erase(found);
+  rebuildNearestIndex();
+  return retired;
 }
 
 bool GraphManager::getNearestVertex(const StateVec* state, Vertex** v_res) {

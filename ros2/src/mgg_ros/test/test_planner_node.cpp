@@ -11,7 +11,9 @@
 #include <string>
 #include <vector>
 
+#include <geometry_msgs/msg/transform_stamped.hpp>
 #include <rclcpp/rclcpp.hpp>
+#include <tf2_msgs/msg/tf_message.hpp>
 
 #include "mgg_ros/planner_node.h"
 
@@ -122,6 +124,40 @@ class PlannerNodeTestPeer {
     node.onPlanRequest(std::make_shared<mgg_msgs::srv::PlannerSrv::Request>(),
                        response);
   }
+  static void setDrivingHeight(PlannerNode& node, double height) {
+    node.planning_params_.max_ground_height = height;
+  }
+  /// T_ours_theirs as a planar translation, as robot_poses.py sends it.
+  static void receiveTransform(PlannerNode& node, const std::string& ours,
+                               const std::string& theirs, double x, double y) {
+    auto msg = std::make_shared<tf2_msgs::msg::TFMessage>();
+    geometry_msgs::msg::TransformStamped t;
+    t.header.frame_id = ours;
+    t.child_frame_id = theirs;
+    t.transform.translation.x = x;
+    t.transform.translation.y = y;
+    t.transform.rotation.w = 1.0;
+    msg->transforms.push_back(t);
+    node.onNeighbourTransforms(msg);
+  }
+  static mgg_msgs::msg::Graph ownGraph(PlannerNode& node) {
+    return node.ownGraphMessage();
+  }
+  static void receiveGraph(PlannerNode& node, const mgg_msgs::msg::Graph& g) {
+    node.onNeighbourGraph(std::make_shared<mgg_msgs::msg::Graph>(g));
+  }
+  /// The heights of the merged vertices of `robot_id`.
+  static std::vector<double> neighbourHeights(PlannerNode& node,
+                                              int robot_id) {
+    const std::lock_guard<std::recursive_mutex> lock(node.planner_mutex_);
+    std::vector<double> heights;
+    const auto found = node.global_graph_->vertex_by_robot_id_.find(robot_id);
+    if (found == node.global_graph_->vertex_by_robot_id_.end()) return heights;
+    for (const auto& entry : found->second) {
+      if (entry.second != nullptr) heights.push_back(entry.second->state.z());
+    }
+    return heights;
+  }
   static void objective(
       PlannerNode& node,
       std::shared_ptr<mgg_msgs::srv::PlanObjective::Request> request,
@@ -132,14 +168,20 @@ class PlannerNodeTestPeer {
 
 namespace {
 
-std::shared_ptr<PlannerNode> makeNode(const std::string& name) {
+std::shared_ptr<PlannerNode> makeNode(
+    const std::string& name, const std::string& frame = "world",
+    std::vector<rclcpp::Parameter> extra = {}) {
   rclcpp::NodeOptions options;
   options.arguments({"--ros-args", "-r", "__node:=" + name});
-  options.parameter_overrides({
+  std::vector<rclcpp::Parameter> parameters{
       rclcpp::Parameter("map.backend", "cloud_octomap"),
       rclcpp::Parameter("map.resolution", 0.10),
-      rclcpp::Parameter("PlanningParams.global_frame_id", "world"),
-  });
+      rclcpp::Parameter("PlanningParams.global_frame_id", frame),
+  };
+  parameters.insert(parameters.end(), extra.begin(), extra.end());
+  options.parameter_overrides(parameters);
+  // As mggplanner_node does: the nested PlanningParams are read undeclared.
+  options.automatically_declare_parameters_from_overrides(true);
   auto node = std::make_shared<PlannerNode>(options);
   PlannerNodeTestPeer::configureGroundRobot(*node);
   return node;
@@ -332,6 +374,66 @@ TEST_F(PlannerNodeTest, BlindStartPlansFromThePhysicalAnchor) {
   response = std::make_shared<mgg_msgs::srv::PlannerSrv::Response>();
   PlannerNodeTestPeer::plan(*strict, response);
   EXPECT_EQ(response->status, PlannerNode::kStatusNoPath);
+}
+
+namespace {
+
+/// Two planners in separate odometry frames: robot 1 at the origin of
+/// robot_0/odom, robot 2 five metres east, at the origin of robot_1/odom.
+/// Each has mapped and driven its own four metres of one floor; robot 2 is a
+/// taller platform. Shared over neighbour_transforms, as robot_poses.py
+/// publishes them.
+struct TwoPlanners {
+  std::shared_ptr<PlannerNode> a;
+  std::shared_ptr<PlannerNode> b;
+
+  explicit TwoPlanners(const std::string& name) {
+    const std::vector<rclcpp::Parameter> topic{
+        rclcpp::Parameter("neighbour_pose_source", "topic")};
+    auto with_id = [&topic](int id) {
+      auto parameters = topic;
+      parameters.emplace_back("PlanningParams.robot_id", id);
+      return parameters;
+    };
+    a = makeNode(name + "_a", "robot_0/odom", with_id(1));
+    b = makeNode(name + "_b", "robot_1/odom", with_id(2));
+    PlannerNodeTestPeer::setDrivingHeight(*b, 0.45);
+    PlannerNodeTestPeer::observeFloor(*a, -1.5, 6.0, -1.5, 1.5);
+    PlannerNodeTestPeer::observeFloor(*b, -1.5, 6.0, -1.5, 1.5);
+    double stamp = 1.0;
+    for (double x = 0.0; x <= 4.0 + 1e-9; x += 0.5) {
+      PlannerNodeTestPeer::acceptOdometry(*a, x, 0.0, stamp);
+      PlannerNodeTestPeer::acceptOdometry(*b, x, 0.0, stamp);
+      stamp += 1.0;
+    }
+    PlannerNodeTestPeer::acceptOdometry(*a, 0.0, 0.0, stamp);
+  }
+
+  void share() {
+    PlannerNodeTestPeer::receiveTransform(*a, "robot_0/odom", "robot_1/odom",
+                                          5.0, 0.0);
+    PlannerNodeTestPeer::receiveGraph(*a, PlannerNodeTestPeer::ownGraph(*b));
+  }
+};
+
+}  // namespace
+
+TEST_F(PlannerNodeTest, NeighbourRoadmapMergesAtTheReceiversDrivingHeight) {
+  TwoPlanners fleet("share");
+  // Without a transform the roadmap is dropped, not merged at identity.
+  PlannerNodeTestPeer::receiveGraph(*fleet.a,
+                                    PlannerNodeTestPeer::ownGraph(*fleet.b));
+  EXPECT_TRUE(PlannerNodeTestPeer::neighbourHeights(*fleet.a, 2).empty());
+
+  // Sent at ground height by the taller robot, placed at this one's 0.30 m.
+  const auto sent = PlannerNodeTestPeer::ownGraph(*fleet.b);
+  ASSERT_GT(sent.vertices.size(), 4u);
+  EXPECT_EQ(sent.header.frame_id, "robot_1/odom");
+  for (const auto& v : sent.vertices) EXPECT_NEAR(v.pose.position.z, 0.0, 0.11);
+  fleet.share();
+  const auto heights = PlannerNodeTestPeer::neighbourHeights(*fleet.a, 2);
+  ASSERT_EQ(heights.size(), sent.vertices.size());
+  for (double z : heights) EXPECT_NEAR(z, 0.30, 0.11);
 }
 
 TEST_F(PlannerNodeTest, ARobotRestingInADipStillPlans) {
