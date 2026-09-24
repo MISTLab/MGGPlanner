@@ -312,6 +312,26 @@ TEST(GraphMerge, RepeatedReplacementKeepsOneAdjacencyEntryPerEdge) {
   EXPECT_LE(adjacencyEntries(gm), entries + 4u);
 }
 
+TEST(GraphMerge, AnEdgeListedTwiceInASnapshotIsAddedOnce) {
+  // Isolates the deduplication: no re-placement or withdrawal cuts edges
+  // here, so only addEdges can keep the adjacency lists single. Another
+  // sender may list an undirected edge in both directions.
+  GraphManager gm;
+  buildOwnGraph(gm);
+  StaticPoseSource poses;
+  poses.setOffset(2, 0.0, 1.0);
+  GraphExchange g = neighbourGraph();
+  g.edges.push_back(GraphExchangeEdge{1, 0, 1.0});
+  g.edges.push_back(GraphExchangeEdge{1, 2, 1.0});
+  const auto r = mergeNeighbourGraph(gm, g, poses, kAlwaysAdmissible);
+  ASSERT_TRUE(r.merged);
+  EXPECT_EQ(adjacencyEntries(gm),
+            2u * static_cast<std::size_t>(gm.getNumEdges()));
+  mergeNeighbourGraph(gm, g, poses, kAlwaysAdmissible);
+  EXPECT_EQ(adjacencyEntries(gm),
+            2u * static_cast<std::size_t>(gm.getNumEdges()));
+}
+
 TEST(GraphMerge, AnEdgeATiltedTransformMakesTooSteepIsDropped) {
   GraphManager gm;
   buildOwnGraph(gm);
