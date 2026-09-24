@@ -106,7 +106,8 @@ struct PathSelectionResult {
 /// `exploring_direction` is the heading the robot has been travelling, used to
 /// penalise paths that double back. Gain must already have been computed, for
 /// instance by computeExplorationGain. Paths ending within
-/// `exclusion_radius` of an `excluded_endpoints` point are skipped.
+/// `exclusion_radius` of an `excluded_endpoints` point are skipped; a path
+/// pulled back is checked where it now ends.
 ///
 /// With `viewpoint_clear`, a path whose leaf fails it ends at the last vertex
 /// along it that passes, and is scored up to there. The best path ending

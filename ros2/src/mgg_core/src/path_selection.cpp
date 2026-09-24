@@ -127,16 +127,20 @@ PathSelectionResult selectBestPath(GraphManager& graph,
     std::vector<Vertex*> path;
     graph.getShortestPath(leaf->id, rep, true, path);
     if (path.size() <= 1) continue;  // needs at least root and leaf
-    if (excluded(leaf)) continue;
-    ++result.leaves_evaluated;
-
+    // Reservations are checked where each candidate ends: the leaf for the
+    // path as it is, the vertex it is pulled back to for the clear one.
+    const bool leaf_excluded = excluded(leaf);
     double path_gain = 0.0;
-    bool admissible = score(path, path_gain);
-    if (!admissible) {
-      ++result.paths_rejected_steep;
-    } else if (path_gain > result.best_gain) {
-      result.best_gain = path_gain;
-      result.best_path = path;
+    bool admissible = false;
+    if (!leaf_excluded) {
+      ++result.leaves_evaluated;
+      admissible = score(path, path_gain);
+      if (!admissible) {
+        ++result.paths_rejected_steep;
+      } else if (path_gain > result.best_gain) {
+        result.best_gain = path_gain;
+        result.best_path = path;
+      }
     }
     const double full_gain = admissible ? path_gain : 0.0;
     if (!viewpoint_clear) continue;
@@ -152,6 +156,8 @@ PathSelectionResult selectBestPath(GraphManager& graph,
       path.resize(end + 1);
       ++result.paths_pulled_back;
       admissible = !excluded(path.back()) && score(path, path_gain);
+    } else if (leaf_excluded) {
+      continue;
     }
     if (admissible &&
         (!have_clear || path_gain > best_clear_gain ||

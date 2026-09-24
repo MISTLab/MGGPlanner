@@ -232,6 +232,28 @@ TEST(PathSelection, WithNoGainAnywhereThereIsStillNoPath) {
   EXPECT_TRUE(r.best_path.empty());
 }
 
+TEST(PathSelection, PulledBackEndpointOutsideAReservationIsKept) {
+  // A peer has reserved the +x leaf. The branch pulled back to vertex 2 ends
+  // outside the reservation and is the only clear path, so it must not be
+  // dropped with the leaf (review r0, P1).
+  Fork f;
+  for (Vertex* v : f.x_branch) v->vol_gain.gain = 100.0;
+  for (Vertex* v : f.y_branch) v->vol_gain.gain = 1.0;
+  EdgeInclinations flat;
+  const std::vector<Eigen::Vector3d> exclusions{
+      Eigen::Vector3d(3.0, 0.0, 0.0)};
+  const mgg::ViewpointClearFn clear = [](const Vertex& v) {
+    return v.id == 2;
+  };
+  const auto r = mgg::selectBestPath(f.graph, makePlanning(), RobotParams(),
+                                     flat, 0.2, 0.0, exclusions, 0.5, clear);
+  EXPECT_EQ(r.best_path_id, 2);
+  EXPECT_FALSE(r.unclear_viewpoint);
+  EXPECT_EQ(r.paths_pulled_back, 1);
+  // The reserved leaf itself stays out, as without the clearance check.
+  EXPECT_EQ(r.leaves_evaluated, 1);
+}
+
 TEST(PathSelection, PathEndingClearWinsOverRicherPathsThatDoNot) {
   Fork f;
   for (Vertex* v : f.x_branch) v->vol_gain.gain = 100.0;
