@@ -76,6 +76,12 @@ class GraphManager {
   /// place, once for the whole batch.
   void rebuildNearestIndex();
 
+  /// Removes the edges touching a neighbour's merged vertices; with
+  /// `cross_only`, only those joining them to another robot's vertices (the
+  /// rendezvous links and links this robot added), keeping the neighbour's own
+  /// edges. Returns how many were removed.
+  int cutNeighbourEdges(int robot_id, bool cross_only);
+
   /// Cut a neighbour's merged graph out: every edge touching its vertices is
   /// removed, its vertices leave the nearest-neighbour index for good and its
   /// id map and merged flag are forgotten, so its next message merges afresh.

@@ -21,11 +21,13 @@ using mgg::StateVec;
 using mgg::StaticPoseSource;
 using mgg::Vertex;
 
-/// Our own graph: a chain along +x at y=0.
+/// Our own graph: a chain along +x at y=0. Ids come from the manager, as the
+/// planner's do, so merged vertices never reuse one.
 void buildOwnGraph(GraphManager& gm, int n = 4) {
   Vertex* prev = nullptr;
   for (int i = 0; i < n; ++i) {
-    auto* v = new Vertex(i, StateVec(i * 1.0, 0.0, 0.0, 0.0));
+    const int id = i == 0 ? 0 : gm.generateVertexID();
+    auto* v = new Vertex(id, StateVec(i * 1.0, 0.0, 0.0, 0.0));
     v->robot_id = 1;
     gm.addVertex(v);
     if (prev != nullptr) gm.addEdge(v, prev, 1.0);
@@ -251,6 +253,37 @@ TEST(GraphMerge, MergedVerticesFollowAMovedTransform) {
   Vertex* nearest = nullptr;
   ASSERT_TRUE(gm.getNearestVertexInRange(&probe, 0.01, &nearest));
   EXPECT_EQ(nearest, gm.getNeighbourVertex(2, 2));
+}
+
+TEST(GraphMerge, LinksAreJudgedAgainWhereTheTransformMovedTheRoadmap) {
+  GraphManager gm;
+  buildOwnGraph(gm);
+  StaticPoseSource poses;
+  poses.setOffset(2, 0.0, 1.0);
+  mergeNeighbourGraph(gm, neighbourGraph(), poses, kAlwaysAdmissible);
+  mgg::ShortestPathsReport rep;
+  const auto reaches = [&gm, &rep](const Vertex* v) {
+    gm.findShortestPaths(0, rep);
+    const auto parent = rep.parent_id_map.find(v->id);
+    return parent != rep.parent_id_map.end() && parent->second != v->id;
+  };
+  ASSERT_TRUE(reaches(gm.getNeighbourVertex(2, 2)));
+
+  // The corrected transform puts robot 2's roadmap behind a wall: the old
+  // links would now cross it, so none survives, and none is made.
+  poses.setOffset(2, 0.0, 3.0);
+  auto r = mergeNeighbourGraph(gm, neighbourGraph(), poses, kNeverAdmissible);
+  EXPECT_EQ(r.vertices_replaced, 3);
+  EXPECT_FALSE(r.merged);
+  EXPECT_FALSE(reaches(gm.getNeighbourVertex(2, 2)));
+
+  // Once a link is drivable again the roadmap rejoins without duplicates.
+  const int vertices = gm.getNumVertices();
+  r = mergeNeighbourGraph(gm, neighbourGraph(), poses, kAlwaysAdmissible);
+  EXPECT_TRUE(r.merged);
+  EXPECT_EQ(r.vertices_added, 0);
+  EXPECT_EQ(gm.getNumVertices(), vertices);
+  EXPECT_TRUE(reaches(gm.getNeighbourVertex(2, 2)));
 }
 
 TEST(GraphMerge, ARestartedNeighbourIsCutOutAndMergedAfresh) {

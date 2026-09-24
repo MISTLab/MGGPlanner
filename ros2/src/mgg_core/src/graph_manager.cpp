@@ -131,29 +131,53 @@ void GraphManager::rebuildNearestIndex() {
   }
 }
 
+int GraphManager::cutNeighbourEdges(int robot_id, bool cross_only) {
+  const auto found = vertex_by_robot_id_.find(robot_id);
+  if (found == vertex_by_robot_id_.end()) return 0;
+  int cut = 0;
+  for (const auto& entry : found->second) {
+    Vertex* vertex = entry.second;
+    if (vertex == nullptr) continue;
+    const auto edges = edge_map_.find(vertex->id);
+    if (edges == edge_map_.end()) continue;
+    std::vector<std::pair<int, double>> kept;
+    const std::vector<std::pair<int, double>> adjacent = edges->second;
+    for (const auto& [other, weight] : adjacent) {
+      const auto other_vertex = vertices_map_.find(other);
+      if (cross_only && other_vertex != vertices_map_.end() &&
+          other_vertex->second != nullptr &&
+          other_vertex->second->robot_id == robot_id) {
+        kept.emplace_back(other, weight);
+        continue;
+      }
+      graph_->removeEdge(vertex->id, other);
+      auto& back = edge_map_[other];
+      back.erase(std::remove_if(back.begin(), back.end(),
+                                [vertex](const auto& e) {
+                                  return e.first == vertex->id;
+                                }),
+                 back.end());
+      ++cut;
+    }
+    if (kept.empty()) {
+      edge_map_.erase(vertex->id);
+    } else {
+      edge_map_[vertex->id] = std::move(kept);
+    }
+  }
+  return cut;
+}
+
 int GraphManager::retireNeighbourGraph(int robot_id) {
   merged_graphs_.erase(robot_id);
   neighbour_placements_.erase(robot_id);
+  cutNeighbourEdges(robot_id, /*cross_only=*/false);
   const auto found = vertex_by_robot_id_.find(robot_id);
   if (found == vertex_by_robot_id_.end()) return 0;
   int retired = 0;
   for (const auto& entry : found->second) {
     Vertex* vertex = entry.second;
     if (vertex == nullptr) continue;
-    const auto edges = edge_map_.find(vertex->id);
-    if (edges != edge_map_.end()) {
-      for (const auto& [other, weight] : edges->second) {
-        (void)weight;
-        graph_->removeEdge(vertex->id, other);
-        auto& back = edge_map_[other];
-        back.erase(std::remove_if(back.begin(), back.end(),
-                                  [vertex](const auto& e) {
-                                    return e.first == vertex->id;
-                                  }),
-                   back.end());
-      }
-      edge_map_.erase(edges);
-    }
     vertex->type = VertexType::kVisited;
     vertex->vol_gain.is_frontier = false;
     vertex->parent = nullptr;

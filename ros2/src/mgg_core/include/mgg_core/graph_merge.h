@@ -166,8 +166,9 @@ constexpr double kNeighbourRestartToleranceM = 0.05;
 /// them, the graphs are joined there. Once joined, subsequent calls add what
 /// is new, refresh what is not, re-place what was merged when the transform
 /// moved (kNeighbourReplaceToleranceM; one pass over the neighbour's vertices
-/// per call and one index rebuild only when something moves), and cut the
-/// old graph out when the neighbour restarted (kNeighbourRestartToleranceM).
+/// per call and one index rebuild only when something moves) and then judge
+/// its links to the rest of the graph again, and cut the old graph out when
+/// the neighbour restarted (kNeighbourRestartToleranceM).
 /// `incoming` is a complete snapshot of the neighbour's graph.
 MergeResult mergeNeighbourGraph(GraphManager& global_graph,
                                 const GraphExchange& incoming,

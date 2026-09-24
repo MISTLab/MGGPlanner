@@ -94,6 +94,24 @@ int addEdges(GraphManager& graph, const GraphExchange& incoming, int robot_id,
   return added;
 }
 
+/// The nearest vertex within `radius` that is not `robot_id`'s.
+Vertex* nearestOtherRobotVertex(GraphManager& graph, const StateVec& state,
+                                int robot_id, double radius) {
+  std::vector<Vertex*> candidates;
+  if (!graph.getNearestVertices(&state, radius, &candidates)) return nullptr;
+  Vertex* nearest = nullptr;
+  double best = radius;
+  for (Vertex* candidate : candidates) {
+    if (candidate == nullptr || candidate->robot_id == robot_id) continue;
+    const double d = (candidate->state.head<3>() - state.head<3>()).norm();
+    if (d <= best) {
+      best = d;
+      nearest = candidate;
+    }
+  }
+  return nearest;
+}
+
 /// The neighbour restarted when a vertex it sent before is missing from this
 /// complete snapshot, or has moved in its own frame.
 bool neighbourRestarted(const GraphManager::NeighbourPlacement& placement,
@@ -204,30 +222,51 @@ MergeResult mergeNeighbourGraph(GraphManager& global_graph,
     placement = global_graph.neighbour_placements_.end();
   }
 
-  const bool already_merged = global_graph.merged_graphs_[neighbour_id];
-  if (already_merged && placement != global_graph.neighbour_placements_.end()) {
+  if (placement != global_graph.neighbour_placements_.end()) {
     result.vertices_replaced = replaceNeighbourVertices(
         global_graph, neighbour_id, placement->second, t_ours_theirs,
         driving_height);
+    if (result.vertices_replaced > 0) {
+      // The links joining its roadmap to the rest were judged where its
+      // vertices stood before; they are dropped and the rendezvous is
+      // looked for again where they stand now.
+      global_graph.cutNeighbourEdges(neighbour_id, /*cross_only=*/true);
+      global_graph.merged_graphs_[neighbour_id] = false;
+    }
   }
 
+  const bool already_merged = global_graph.merged_graphs_[neighbour_id];
   if (!already_merged) {
     // Hunt for a rendezvous: an incoming vertex close enough to one of ours
     // that the robot could actually drive between them.
     for (const GraphExchangeVertex& v : incoming.vertices) {
-      StateVec state = placeState(v.state, t_ours_theirs, driving_height);
-      Vertex* nearest = nullptr;
-      if (!global_graph.getNearestVertexInRange(&state, rendezvous_radius,
-                                                &nearest) ||
-          nearest == nullptr) {
+      Vertex* existing = findNeighbourVertex(global_graph, v.robot_id, v.id);
+      const StateVec state =
+          existing != nullptr ? existing->state
+                              : placeState(v.state, t_ours_theirs,
+                                           driving_height);
+      Vertex* nearest = existing != nullptr
+                            ? nearestOtherRobotVertex(global_graph, state,
+                                                      neighbour_id,
+                                                      rendezvous_radius)
+                            : nullptr;
+      if (existing == nullptr &&
+          !global_graph.getNearestVertexInRange(&state, rendezvous_radius,
+                                                &nearest)) {
         continue;
       }
+      if (nearest == nullptr) continue;
       const Eigen::Vector3d origin(nearest->state[0], nearest->state[1],
                                    nearest->state[2]);
       const Eigen::Vector3d target(state[0], state[1], state[2]);
       if (!is_admissible(origin, target)) continue;
 
       global_graph.merged_graphs_[neighbour_id] = true;
+      if (existing != nullptr) {
+        global_graph.addNeighbourEdge(existing, nearest,
+                                      (target - origin).norm());
+        continue;
+      }
       Vertex* new_vertex = makeVertex(global_graph, v, state);
       global_graph.addNeighbourVertex(new_vertex, v.id);
       // Form a tree as the first step, as the original did.
