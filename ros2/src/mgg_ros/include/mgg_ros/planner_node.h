@@ -97,8 +97,11 @@ class PlannerNode : public rclcpp::Node {
   /// another robot's roadmap within kLinkRadius in xy: that robot drove
   /// there, which is the evidence of traversable ground. The goal keeps its
   /// x and y and takes the vertex's height; the edge is refused only through
-  /// space this robot's map knows to be occupied.
-  mgg::Vertex* attachGoalToNeighbourRoadmap(const mgg::StateVec& goal);
+  /// space this robot's map knows to be occupied. Only `reachable` vertices
+  /// (from where the robot joins the graph) are candidates, so a nearer
+  /// disconnected part of a roadmap cannot hide a reachable one.
+  mgg::Vertex* attachGoalToNeighbourRoadmap(const mgg::StateVec& goal,
+                                            const mgg::UsableVertexFn& reachable);
   void onCoordinationExclusions(
       geometry_msgs::msg::PoseArray::ConstSharedPtr msg);
   void onPeerBodies(geometry_msgs::msg::PoseArray::ConstSharedPtr msg);

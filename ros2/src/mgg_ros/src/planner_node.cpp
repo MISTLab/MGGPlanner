@@ -1233,6 +1233,19 @@ bool PlannerNode::routeOverGlobalGraph(const mgg::StateVec& goal,
     reason = "current pose cannot be linked to the global graph";
     return false;
   }
+  // Dijkstra fills a parent for every vertex and leaves an unreached one as
+  // its own parent, so reachability is read from that, not from presence.
+  mgg::ShortestPathsReport rep;
+  const auto search = [this, &rep, link_vertex]() {
+    rep.status = false;
+    global_graph_->findShortestPaths(link_vertex->id, rep);
+  };
+  const auto reaches = [&rep, link_vertex](const mgg::Vertex& vertex) {
+    if (vertex.id == link_vertex->id) return true;
+    if (!rep.status) return false;
+    const auto parent = rep.parent_id_map.find(vertex.id);
+    return parent != rep.parent_id_map.end() && parent->second != vertex.id;
+  };
   // The goal is the graph vertex within `goal_tolerance` (a frontier or the
   // home root), or else the goal itself is linked into the graph with
   // checked edges, exactly where it was asked for: a goal is never replaced
@@ -1252,8 +1265,11 @@ bool PlannerNode::routeOverGlobalGraph(const mgg::StateVec& goal,
           /*exact_state=*/true);
     } else {
       // Another robot may have driven there: its roadmap is the evidence of
-      // ground this robot's map does not have.
-      goal_vertex = attachGoalToNeighbourRoadmap(goal);
+      // ground this robot's map does not have. Only a part of it the robot
+      // can reach will do; the lattice below cannot bridge to unmapped
+      // ground.
+      search();
+      goal_vertex = attachGoalToNeighbourRoadmap(goal, reaches);
       if (goal_vertex == nullptr) {
         reason = "no mapped ground under the goal";
         return false;
@@ -1262,19 +1278,6 @@ bool PlannerNode::routeOverGlobalGraph(const mgg::StateVec& goal,
     }
     if (global_graph_->getNumVertices() != before_goal) ++graph_revision_;
   }
-  // Dijkstra fills a parent for every vertex and leaves an unreached one as
-  // its own parent, so reachability is read from that, not from presence.
-  mgg::ShortestPathsReport rep;
-  const auto search = [this, &rep, link_vertex]() {
-    rep.status = false;
-    global_graph_->findShortestPaths(link_vertex->id, rep);
-  };
-  const auto reaches = [&rep, link_vertex](const mgg::Vertex& vertex) {
-    if (vertex.id == link_vertex->id) return true;
-    if (!rep.status) return false;
-    const auto parent = rep.parent_id_map.find(vertex.id);
-    return parent != rep.parent_id_map.end() && parent->second != vertex.id;
-  };
   search();
   // No single roadmap edge reaches the goal, or the one that does joins a
   // part of the roadmap the robot cannot reach. Known space may still turn
@@ -1331,7 +1334,7 @@ bool PlannerNode::routeOverGlobalGraph(const mgg::StateVec& goal,
 }
 
 mgg::Vertex* PlannerNode::attachGoalToNeighbourRoadmap(
-    const mgg::StateVec& goal) {
+    const mgg::StateVec& goal, const mgg::UsableVertexFn& reachable) {
   const int own_id = static_cast<int>(planning_params_.robot_id);
   std::vector<std::pair<double, mgg::Vertex*>> candidates;
   for (const auto& [robot_id, vertices] : global_graph_->vertex_by_robot_id_) {
@@ -1343,7 +1346,7 @@ mgg::Vertex* PlannerNode::attachGoalToNeighbourRoadmap(
     for (const auto& entry : vertices) {
       mgg::Vertex* vertex = entry.second;
       if (vertex == nullptr || vertex->is_hanging ||
-          global_graph_->isRetired(vertex->id)) {
+          global_graph_->isRetired(vertex->id) || !reachable(*vertex)) {
         continue;
       }
       const Eigen::Vector3d gap = vertex->state.head<3>() - goal.head<3>();

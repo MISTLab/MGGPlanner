@@ -130,6 +130,16 @@ class PlannerNodeTestPeer {
     }
     ++node.map_revision_;
   }
+  /// A vertex of `robot_id`'s merged roadmap joined to nothing, as a part of
+  /// it cut off by the merge's step and grade filter would be.
+  static void addDisconnectedNeighbourVertex(PlannerNode& node, int robot_id,
+                                             double x, double y, double z) {
+    const std::lock_guard<std::recursive_mutex> lock(node.planner_mutex_);
+    auto* vertex = new mgg::Vertex(node.global_graph_->generateVertexID(),
+                                   mgg::StateVec(x, y, z, 0.0));
+    vertex->robot_id = robot_id;
+    node.global_graph_->addNeighbourVertex(vertex, 1000000);
+  }
   static void setHangingRootReach(PlannerNode& node, double reach) {
     node.hanging_root_edge_length_max_ = reach;
   }
@@ -485,6 +495,27 @@ TEST_F(PlannerNodeTest, GoalInANeighboursMapRoutesOverItsRoadmap) {
   for (const auto& pose : response->path) {
     EXPECT_NEAR(pose.position.z, 0.30, 0.11);
   }
+}
+
+TEST_F(PlannerNodeTest, ADisconnectedNearerVertexDoesNotHideAReachableOne) {
+  TwoPlanners fleet("attach_reachable");
+  fleet.share();
+  // A stranded vertex of robot 2's roadmap right beside the goal; its track,
+  // reachable, passes 0.3 m away.
+  PlannerNodeTestPeer::addDisconnectedNeighbourVertex(*fleet.a, 2, 8.7, 0.35,
+                                                      0.30);
+  auto request = std::make_shared<mgg_msgs::srv::PlanObjective::Request>();
+  request->objective = mgg_msgs::srv::PlanObjective::Request::NAVIGATE;
+  request->goal.position.x = 8.7;
+  request->goal.position.y = 0.3;
+  request->goal.orientation.w = 1.0;
+  auto response = std::make_shared<mgg_msgs::srv::PlanObjective::Response>();
+  PlannerNodeTestPeer::objective(*fleet.a, request, response);
+  ASSERT_EQ(response->status,
+            mgg_msgs::srv::PlanObjective::Response::SUCCEEDED)
+      << response->reason;
+  EXPECT_NEAR(response->path.back().position.x, 8.7, 1e-3);
+  EXPECT_NEAR(response->path.back().position.y, 0.3, 1e-3);
 }
 
 TEST_F(PlannerNodeTest, AWithdrawnTransformMakesTheOldRoadmapUnusable) {
