@@ -68,9 +68,11 @@ Vertex* findNeighbourVertex(GraphManager& graph, int robot_id, int vertex_id) {
 }
 
 /// Adds the incoming edges, skipping any whose endpoints are not both present
-/// and any this robot could not climb.
+/// and any this robot could not climb. Always deduplicated: an edge may
+/// already be in the graph from an earlier snapshot, and GraphManager::addEdge
+/// would append a second adjacency entry for it.
 int addEdges(GraphManager& graph, const GraphExchange& incoming, int robot_id,
-             bool dedupe, const ReceiverPlatform& platform, int& unresolved,
+             const ReceiverPlatform& platform, int& unresolved,
              int& too_steep) {
   int added = 0;
   for (const GraphExchangeEdge& e : incoming.edges) {
@@ -84,11 +86,7 @@ int addEdges(GraphManager& graph, const GraphExchange& incoming, int robot_id,
       ++too_steep;
       continue;
     }
-    if (dedupe) {
-      graph.addNeighbourEdge(source, target, e.weight);
-    } else {
-      graph.addEdge(source, target, e.weight);
-    }
+    graph.addNeighbourEdge(source, target, e.weight);
     ++added;
   }
   return added;
@@ -302,7 +300,7 @@ MergeResult mergeNeighbourGraph(GraphManager& global_graph,
   }
 
   result.edges_added =
-      addEdges(global_graph, incoming, neighbour_id, already_merged, platform,
+      addEdges(global_graph, incoming, neighbour_id, platform,
                result.edges_unresolved, result.edges_too_steep);
 
   if (result.edges_unresolved > 0) {

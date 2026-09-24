@@ -286,6 +286,32 @@ TEST(GraphMerge, LinksAreJudgedAgainWhereTheTransformMovedTheRoadmap) {
   EXPECT_TRUE(reaches(gm.getNeighbourVertex(2, 2)));
 }
 
+/// Adjacency entries over the whole graph, both directions of every edge.
+std::size_t adjacencyEntries(const GraphManager& gm) {
+  std::size_t entries = 0;
+  for (const auto& entry : gm.edge_map_) entries += entry.second.size();
+  return entries;
+}
+
+TEST(GraphMerge, RepeatedReplacementKeepsOneAdjacencyEntryPerEdge) {
+  GraphManager gm;
+  buildOwnGraph(gm);
+  StaticPoseSource poses;
+  poses.setOffset(2, 0.0, 1.0);
+  mergeNeighbourGraph(gm, neighbourGraph(), poses, kAlwaysAdmissible);
+  const std::size_t entries = adjacencyEntries(gm);
+  ASSERT_EQ(entries, 2u * static_cast<std::size_t>(gm.getNumEdges()));
+  for (int i = 0; i < 4; ++i) {
+    poses.setOffset(2, 0.0, i % 2 == 0 ? 1.5 : 1.0);
+    const auto r =
+        mergeNeighbourGraph(gm, neighbourGraph(), poses, kAlwaysAdmissible);
+    ASSERT_EQ(r.vertices_replaced, 3);
+    EXPECT_EQ(adjacencyEntries(gm),
+              2u * static_cast<std::size_t>(gm.getNumEdges()));
+  }
+  EXPECT_LE(adjacencyEntries(gm), entries + 4u);
+}
+
 TEST(GraphMerge, ARestartedNeighbourIsCutOutAndMergedAfresh) {
   GraphManager gm;
   buildOwnGraph(gm);
