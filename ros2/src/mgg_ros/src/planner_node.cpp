@@ -948,24 +948,31 @@ void PlannerNode::addRefPathToGraph(const std::vector<mgg::StateVec>& path) {
   }
   const int before = global_graph_->getNumVertices();
   const mgg::ExpandContext ctx = makeGlobalContext();
+  std::vector<mgg::Vertex*> added_vertices;
   const bool added =
       lattice.empty()
           ? mgg::addRefPathToGraph(*global_graph_, path, ctx,
-                                   global_vertex_spacing_)
+                                   global_vertex_spacing_, &added_vertices)
           : mgg::addRefPathToGraph(*global_graph_, lattice, ctx,
-                                   global_vertex_spacing_);
+                                   global_vertex_spacing_, &added_vertices);
   if (!added) {
     RCLCPP_WARN(get_logger(),
-                "exploration path not added to the global graph: its start "
-                "at (%.2f, %.2f, %.2f) could not be linked",
-                path.front().x(), path.front().y(), path.front().z());
+                "exploration path not added to the global graph: none of its "
+                "%zu poses from (%.2f, %.2f, %.2f) could be linked",
+                path.size(), path.front().x(), path.front().y(),
+                path.front().z());
     return;
   }
   if (global_graph_->getNumVertices() != before) ++graph_revision_;
+  // Where the path joined: at its start, or farther along when the start
+  // could not be linked.
+  const double joined_from_start_m =
+      (added_vertices.front()->state.head<2>() - path.front().head<2>())
+          .norm();
   RCLCPP_INFO(get_logger(),
-              "global graph: +%d vertices from the exploration path (%d "
-              "vertices, %d edges)",
-              global_graph_->getNumVertices() - before,
+              "global graph: +%d vertices from the exploration path, joined "
+              "%.2f m from its start (%d vertices, %d edges)",
+              global_graph_->getNumVertices() - before, joined_from_start_m,
               global_graph_->getNumVertices(), global_graph_->getNumEdges());
 }
 

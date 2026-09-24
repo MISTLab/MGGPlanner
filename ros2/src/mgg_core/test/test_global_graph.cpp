@@ -121,6 +121,24 @@ class SlabSpace : public OpenSpace {
   double y1_;
 };
 
+/// A column: the square |x - x0|, |y - y0| < half_width is occupied.
+class ColumnSpace : public OpenSpace {
+ public:
+  ColumnSpace(double x0, double y0, double half_width)
+      : x0_(x0), y0_(y0), half_width_(half_width) {}
+  VoxelStatus getVoxelStatus(const Eigen::Vector3d& p) const override {
+    return std::abs(p.x() - x0_) < half_width_ &&
+                   std::abs(p.y() - y0_) < half_width_
+               ? VoxelStatus::kOccupied
+               : VoxelStatus::kFree;
+  }
+
+ private:
+  double x0_;
+  double y0_;
+  double half_width_;
+};
+
 /// An aerial robot keeps ground projection out of the picture; the roadmap
 /// logic under test is the same for both robot types.
 struct Roadmap {
@@ -320,6 +338,102 @@ TEST(AddRefPathToGraph, LinkSkipsANearerVertexBehindAThinWall) {
   EXPECT_EQ(vertices.front()->parent, root);
   EXPECT_FALSE(fixture.global.graph_->edgeExists(vertices.front()->id,
                                                   behind->id));
+}
+
+TEST(AddRefPathToGraph, StartThatCannotBeLinkedLinksAtTheFirstReachablePose) {
+  // The planner's start is where the robot stood: pinned against a wall or
+  // tilted on a ramp crest, its body box overlaps mapped geometry and no link
+  // to the graph's tip is free (robot_2 and robot_1 on the SubT finals,
+  // 2026-09-23). The path's later poses are free, so the path joins there.
+  Roadmap fixture;
+  ColumnSpace column(1.3, 0.0, 0.1);
+  fixture.ctx.map = &column;
+  Vertex* tip = fixture.add(fixture.global, StateVec(1.0, 0.0, 0.0, 0.0),
+                            fixture.global.getVertex(0));
+  const std::vector<StateVec> path = {StateVec(1.3, 0.0, 0.0, 0.0),
+                                      StateVec(1.3, 0.8, 0.0, 0.0),
+                                      StateVec(1.3, 1.6, 0.0, 0.0)};
+  std::vector<Vertex*> vertices;
+  ASSERT_TRUE(mgg::addRefPathToGraph(fixture.global, path, fixture.ctx, 0.5,
+                                     &vertices));
+  // The unlinked start stays out; the rest is a chain off the tip.
+  EXPECT_EQ(fixture.nearest(Eigen::Vector3d(1.3, 0.0, 0.0)), nullptr);
+  ASSERT_EQ(vertices.size(), 2u);
+  EXPECT_EQ(vertices.front(), fixture.nearest(Eigen::Vector3d(1.3, 0.8, 0.0)));
+  EXPECT_EQ(vertices.front()->parent, tip);
+  EXPECT_EQ(vertices.back(), fixture.nearest(Eigen::Vector3d(1.3, 1.6, 0.0)));
+  EXPECT_EQ(fixture.global.getNumVertices(), 4);
+  EXPECT_GT(fixture.distanceFromRoot(vertices.back()->id), 0.0);
+
+  // The next start, free and 1.5 m from the tip, links as well.
+  ASSERT_TRUE(mgg::addRefPathToGraph(
+      fixture.global,
+      {StateVec(1.0, -1.5, 0.0, 0.0), StateVec(1.0, -2.5, 0.0, 0.0)},
+      fixture.ctx, 1.0));
+  EXPECT_EQ(fixture.global.getNumVertices(), 6);
+
+  // Joined at a lattice vertex, that vertex keeps its frontier mark.
+  GraphManager local;
+  local.addVertex(new Vertex(0, StateVec(1.3, 0.0, 0.0, 0.0)));
+  Vertex* leaf = fixture.add(local, StateVec(2.0, 0.8, 0.0, 0.0),
+                             local.getVertex(0), VertexType::kFrontier);
+  leaf->vol_gain.gain = 7.0;
+  std::vector<Vertex*> added;
+  ASSERT_TRUE(mgg::addRefPathToGraph(
+      fixture.global, std::vector<Vertex*>{local.getVertex(0), leaf},
+      fixture.ctx, 1.0, &added));
+  ASSERT_EQ(added.size(), 1u);
+  EXPECT_EQ(added.front()->type, VertexType::kFrontier);
+  EXPECT_DOUBLE_EQ(added.front()->vol_gain.gain, 7.0);
+}
+
+TEST(AddRefPathToGraph, StartRaisedOnARampCrestLinksWhereThePathLevelsOut) {
+  // bistro.yaml's bounds on a link's height change: away from home (graph
+  // distance over nearest_range_max) a link may not climb more than
+  // nearest_range_z. A start raised on a ramp crest, 0.3 m above the graph's
+  // tip, does not link (robot_2 at 16:14:03 on the SubT finals); the path's
+  // next pose, level with the tip again, does.
+  Roadmap fixture;
+  fixture.planning.nearest_range_z = 0.15;
+  fixture.planning.nearest_range_max = 1.0;
+  Vertex* tip = fixture.add(fixture.global, StateVec(1.0, 0.0, 0.0, 0.0),
+                            fixture.global.getVertex(0));
+  tip->distance = 5.0;
+  const std::vector<StateVec> path = {StateVec(1.8, 0.0, 0.3, 0.0),
+                                      StateVec(1.8, 0.7, 0.1, 0.0),
+                                      StateVec(1.8, 1.5, 0.1, 0.0)};
+  std::vector<Vertex*> vertices;
+  ASSERT_TRUE(mgg::addRefPathToGraph(fixture.global, path, fixture.ctx, 0.5,
+                                     &vertices));
+  EXPECT_EQ(fixture.nearest(Eigen::Vector3d(1.8, 0.0, 0.3)), nullptr);
+  ASSERT_EQ(vertices.size(), 2u);
+  EXPECT_EQ(vertices.front()->parent, tip);
+  EXPECT_EQ(fixture.global.getNumVertices(), 4);
+}
+
+TEST(AddRefPathToGraph, PathOutOfReachIsRefusedUntilItComesBackWithinReach) {
+  Roadmap fixture;
+  fixture.add(fixture.global, StateVec(1.0, 0.0, 0.0, 0.0),
+              fixture.global.getVertex(0));
+  // Every pose is farther from the graph than one edge. A link clipped short
+  // of the start would leave the chain's first edge, from the clipped vertex
+  // to the next pose, unchecked; nothing is added instead.
+  EXPECT_FALSE(mgg::addRefPathToGraph(fixture.global,
+                                      Roadmap::line(10.0, 12.0, 1.0),
+                                      fixture.ctx, 1.0));
+  EXPECT_EQ(fixture.global.getNumVertices(), 2);
+
+  // A path that returns within reach joins where it arrives.
+  std::vector<Vertex*> vertices;
+  ASSERT_TRUE(mgg::addRefPathToGraph(
+      fixture.global,
+      {StateVec(10.0, 0.0, 0.0, 0.0), StateVec(6.0, 0.0, 0.0, 0.0),
+       StateVec(2.5, 0.0, 0.0, 0.0)},
+      fixture.ctx, 1.0, &vertices));
+  ASSERT_EQ(vertices.size(), 1u);
+  EXPECT_EQ(vertices.front(), fixture.nearest(Eigen::Vector3d(2.5, 0.0, 0.0)));
+  EXPECT_EQ(fixture.nearest(Eigen::Vector3d(6.0, 0.0, 0.0)), nullptr);
+  EXPECT_EQ(fixture.global.getNumVertices(), 3);
 }
 
 TEST(AddRefPathToGraph, VertexOverloadCarriesTypeAndStopsAtHangingVertices) {

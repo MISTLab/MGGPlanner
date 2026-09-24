@@ -140,15 +140,22 @@ Vertex* connectStateToGraph(GraphManager& graph, const StateVec& state,
                             bool exact_state);
 
 /// Folds a verified path into `graph` (rrg.cpp:4808 Rrg::addRefPathToGraph):
-/// links the first pose to the nearest graph vertex, adds the remaining poses
-/// as a chain with edges along it, wires every chain vertex to its reachable
+/// links the first pose it can to the graph, adds the poses after it as a
+/// chain with edges along it, wires every chain vertex to its reachable
 /// neighbours (expandGraphEdges) and densifies long segments.
+///
+/// A pose links when the graph reaches it: a vertex within 0.1 m, a link
+/// within 0.5 m not known to cross an obstacle, or a checked expandGraph
+/// edge no longer than edge_length_max. Upstream linked only the first pose
+/// and dropped the path when that failed; here the poses before the first
+/// linked one stay out of the graph.
 ///
 /// Poses closer than `vertex_spacing` to the last kept pose are dropped, so
 /// the roadmap holds about one vertex per spacing as upstream's lattice path
 /// did at grid resolution; the final pose is always kept. Returns false when
-/// the path is empty or its first pose cannot be linked. `path_vertices`,
-/// when given, receives the chain vertices in path order.
+/// the path is empty or none of its poses can be linked. `path_vertices`,
+/// when given, receives the chain vertices in path order, the linked vertex
+/// first.
 bool addRefPathToGraph(GraphManager& graph, const std::vector<StateVec>& path,
                        const ExpandContext& ctx, double vertex_spacing,
                        std::vector<Vertex*>* path_vertices = nullptr);

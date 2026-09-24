@@ -133,6 +133,22 @@ Vertex* linkStateToGraph(GraphManager& graph, const StateVec& state,
   return rep.vertex_added;
 }
 
+/// Links one pose of a verified path where the graph reaches it: within one
+/// edge of a vertex, through linkStateToGraph. Farther away, expandGraph
+/// would clip its edge short of the pose and the chain would continue from
+/// the clipped vertex over an unchecked edge, so the pose is not tried.
+Vertex* linkPathPose(GraphManager& graph, const StateVec& state,
+                     const ExpandContext& ctx) {
+  Vertex* nearest_vertex = nullptr;
+  if (!graph.getNearestVertex(&state, &nearest_vertex) ||
+      nearest_vertex == nullptr ||
+      (state.head<3>() - nearest_vertex->state.head<3>()).norm() >
+          ctx.planning->edge_length_max) {
+    return nullptr;
+  }
+  return linkStateToGraph(graph, state, ctx, kRadiusLimit, false);
+}
+
 /// A vertex of this robot already standing on `state`, if there is one: a
 /// replan from the same place repeats the same lattice, and upstream re-added
 /// it every cycle (rrg.cpp:4882). Not applied to other robots' vertices,
@@ -165,16 +181,33 @@ bool addRefPath(GraphManager& graph, const std::vector<RefPose>& poses,
   }
 
   // The whole path is collision free already and starts from the root
-  // vertex. Only the first vertex has to be linked to the existing graph
-  // (rrg.cpp:4812).
-  Vertex* parent_vertex =
-      linkStateToGraph(graph, kept.front().state, ctx, kRadiusLimit, false);
+  // vertex. Only its first vertex has to be linked to the existing graph
+  // (rrg.cpp:4812). Upstream dropped the path when that failed. But the root
+  // is where the robot stood, and a robot resting against a wall or tilted
+  // on a ramp crest stands where its body box overlaps the map: the start
+  // then links nowhere, the graph stops growing, every later start is
+  // farther from it and none links again (SubT finals, 2026-09-23). The
+  // poses after the root are lattice states whose bodies were checked, so
+  // the path joins at the first pose the graph reaches, and the unlinked
+  // prefix stays out of the graph.
+  std::size_t first = 0;
+  Vertex* parent_vertex = nullptr;
+  for (; first < kept.size(); ++first) {
+    parent_vertex = linkPathPose(graph, kept[first].state, ctx);
+    if (parent_vertex != nullptr) break;
+  }
   if (parent_vertex == nullptr) return false;
+  if (first > 0 && kept[first].source != nullptr &&
+      parent_vertex->robot_id == ctx.robot_id &&
+      parent_vertex->type != VertexType::kVisited) {
+    parent_vertex->type = kept[first].source->type;
+    parent_vertex->vol_gain = kept[first].source->vol_gain;
+  }
 
   // Add all remaining vertices of the path (rrg.cpp:4864).
   std::vector<Vertex*> vertex_list;
   vertex_list.push_back(parent_vertex);
-  for (std::size_t i = 1; i < kept.size(); ++i) {
+  for (std::size_t i = first + 1; i < kept.size(); ++i) {
     const double direction_norm =
         (kept[i].state.head<3>() - parent_vertex->state.head<3>()).norm();
     Vertex* new_vertex = ownVertexAt(graph, kept[i].state, ctx.robot_id);
