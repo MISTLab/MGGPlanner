@@ -678,6 +678,24 @@ bool PlannerNode::refreshNeighbourTransform(int sender,
   return true;
 }
 
+void PlannerNode::withdrawUnplacedNeighbours() {
+  for (const auto& [robot, frame] : neighbour_frames_) {
+    if (refreshNeighbourTransform(robot, frame)) continue;
+    const auto merged = global_graph_->merged_graphs_.find(robot);
+    if (merged == global_graph_->merged_graphs_.end() || !merged->second) {
+      continue;
+    }
+    // Its roadmap was placed with a transform that is no longer current:
+    // unusable until a current one places it again.
+    const int cut = global_graph_->disconnectNeighbourGraph(robot);
+    ++graph_revision_;
+    RCLCPP_INFO(get_logger(),
+                "robot %d's transform was withdrawn: its roadmap is "
+                "disconnected (%d edges) until it is placed again",
+                robot, cut);
+  }
+}
+
 mgg::ReceiverPlatform PlannerNode::receiverPlatform() const {
   mgg::ReceiverPlatform platform;
   if (robot_params_.type == mgg::RobotType::kGroundRobot) {
@@ -697,7 +715,8 @@ void PlannerNode::onNeighbourGraph(mgg_msgs::msg::Graph::ConstSharedPtr msg) {
   const std::lock_guard<std::recursive_mutex> lock(planner_mutex_);
   auto map_read = mapReadLease();
   // The graph is in the sender's planning frame, which names the transform.
-  refreshNeighbourTransform(sender, msg->header.frame_id);
+  neighbour_frames_[sender] = msg->header.frame_id;
+  withdrawUnplacedNeighbours();
 
   // Communication range filter: robots must be within direct radio range.
   Eigen::Isometry3d t_ours_theirs = Eigen::Isometry3d::Identity();
@@ -1317,6 +1336,10 @@ mgg::Vertex* PlannerNode::attachGoalToNeighbourRoadmap(
   std::vector<std::pair<double, mgg::Vertex*>> candidates;
   for (const auto& [robot_id, vertices] : global_graph_->vertex_by_robot_id_) {
     if (robot_id == own_id) continue;
+    const auto merged = global_graph_->merged_graphs_.find(robot_id);
+    if (merged == global_graph_->merged_graphs_.end() || !merged->second) {
+      continue;
+    }
     for (const auto& entry : vertices) {
       mgg::Vertex* vertex = entry.second;
       if (vertex == nullptr || vertex->is_hanging ||
@@ -1505,6 +1528,7 @@ void PlannerNode::onPlanRequest(
     const std::shared_ptr<mgg_msgs::srv::PlannerSrv::Request> request,
     std::shared_ptr<mgg_msgs::srv::PlannerSrv::Response> response) {
   const std::lock_guard<std::recursive_mutex> lock(planner_mutex_);
+  withdrawUnplacedNeighbours();
   response->planning_bound_mode = request->bound_mode;
   if (!have_odometry_ || !map_->getStatus()) {
     response->status = kStatusNotReady;
@@ -1623,6 +1647,7 @@ void PlannerNode::onObjectiveRequest(
     std::shared_ptr<mgg_msgs::srv::PlanObjective::Response> response) {
   using Service = mgg_msgs::srv::PlanObjective;
   const std::lock_guard<std::recursive_mutex> lock(planner_mutex_);
+  withdrawUnplacedNeighbours();
   auto map_read = mapReadLease();
   refreshMapRevision();
   // The route is planned on the map the caller names; a request for another

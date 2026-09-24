@@ -156,6 +156,11 @@ int GraphManager::cutNeighbourEdges(int robot_id) {
   return cut;
 }
 
+int GraphManager::disconnectNeighbourGraph(int robot_id) {
+  merged_graphs_[robot_id] = false;
+  return cutNeighbourEdges(robot_id);
+}
+
 int GraphManager::retireNeighbourGraph(int robot_id) {
   merged_graphs_.erase(robot_id);
   neighbour_placements_.erase(robot_id);

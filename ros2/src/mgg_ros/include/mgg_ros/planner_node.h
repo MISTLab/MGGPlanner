@@ -87,6 +87,10 @@ class PlannerNode : public rclcpp::Node {
   /// its planning frame, or clears it when there is none within the TTL.
   /// Always true for the static source.
   bool refreshNeighbourTransform(int sender, const std::string& sender_frame);
+  /// Disconnects every merged roadmap whose transform is no longer current,
+  /// before a plan uses the graph and before a merge: a withdrawn or expired
+  /// placement must not keep an old roadmap routable.
+  void withdrawUnplacedNeighbours();
   /// This robot's platform as a neighbour's roadmap is re-read for it.
   mgg::ReceiverPlatform receiverPlatform() const;
   /// Attaches a goal with no mapped ground under it to the nearest vertex of
@@ -198,6 +202,8 @@ class PlannerNode : public rclcpp::Node {
   };
   /// Keyed by the neighbour's planning frame.
   std::unordered_map<std::string, NeighbourTransform> neighbour_transforms_;
+  /// Each neighbour robot id's planning frame, from its graph messages.
+  std::unordered_map<int, std::string> neighbour_frames_;
   mgg::RandomSampler random_sampler_;
   mgg::RobotStateHistory robot_state_hist_;
 

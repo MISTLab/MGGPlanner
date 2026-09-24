@@ -79,6 +79,10 @@ class GraphManager {
   /// Removes every edge touching a neighbour's merged vertices, its own and
   /// those joining it to other robots' vertices. Returns how many.
   int cutNeighbourEdges(int robot_id);
+  /// Cuts a neighbour's roadmap off and clears its merged flag, keeping its
+  /// vertices and placement: a later merge with a current transform re-places
+  /// it and joins it again. Returns the edges cut.
+  int disconnectNeighbourGraph(int robot_id);
 
   /// Cut a neighbour's merged graph out: every edge touching its vertices is
   /// removed, its vertices leave the nearest-neighbour index for good and its

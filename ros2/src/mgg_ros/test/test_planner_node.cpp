@@ -9,6 +9,7 @@
 #include <memory>
 #include <mutex>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include <geometry_msgs/msg/transform_stamped.hpp>
@@ -400,9 +401,10 @@ struct TwoPlanners {
   std::shared_ptr<PlannerNode> a;
   std::shared_ptr<PlannerNode> b;
 
-  explicit TwoPlanners(const std::string& name) {
+  explicit TwoPlanners(const std::string& name, double transform_ttl_s = 5.0) {
     const std::vector<rclcpp::Parameter> topic{
-        rclcpp::Parameter("neighbour_pose_source", "topic")};
+        rclcpp::Parameter("neighbour_pose_source", "topic"),
+        rclcpp::Parameter("neighbour_transform_ttl_sec", transform_ttl_s)};
     auto with_id = [&topic](int id) {
       auto parameters = topic;
       parameters.emplace_back("PlanningParams.robot_id", id);
@@ -483,6 +485,40 @@ TEST_F(PlannerNodeTest, GoalInANeighboursMapRoutesOverItsRoadmap) {
   for (const auto& pose : response->path) {
     EXPECT_NEAR(pose.position.z, 0.30, 0.11);
   }
+}
+
+TEST_F(PlannerNodeTest, AWithdrawnTransformMakesTheOldRoadmapUnusable) {
+  TwoPlanners fleet("withdrawn", /*transform_ttl_s=*/0.2);
+  fleet.share();
+  auto request = std::make_shared<mgg_msgs::srv::PlanObjective::Request>();
+  request->objective = mgg_msgs::srv::PlanObjective::Request::NAVIGATE;
+  request->goal.position.x = 8.7;
+  request->goal.position.y = 0.3;
+  request->goal.orientation.w = 1.0;
+  auto response = std::make_shared<mgg_msgs::srv::PlanObjective::Response>();
+  PlannerNodeTestPeer::objective(*fleet.a, request, response);
+  ASSERT_EQ(response->status,
+            mgg_msgs::srv::PlanObjective::Response::SUCCEEDED)
+      << response->reason;
+
+  // robot_poses stopped publishing (C-SLAM separated the robots, or the
+  // source went quiet): no graph arrives, but the next plan must not use the
+  // roadmap placed with the expired transform.
+  std::this_thread::sleep_for(std::chrono::milliseconds(300));
+  response = std::make_shared<mgg_msgs::srv::PlanObjective::Response>();
+  PlannerNodeTestPeer::objective(*fleet.a, request, response);
+  EXPECT_EQ(response->status,
+            mgg_msgs::srv::PlanObjective::Response::UNREACHABLE);
+  EXPECT_TRUE(response->path.empty());
+
+  // Placed again, it is joined again.
+  fleet.share();
+  response = std::make_shared<mgg_msgs::srv::PlanObjective::Response>();
+  PlannerNodeTestPeer::objective(*fleet.a, request, response);
+  EXPECT_EQ(response->status,
+            mgg_msgs::srv::PlanObjective::Response::SUCCEEDED)
+      << response->reason;
+  EXPECT_NEAR(response->path.back().position.x, 8.7, 1e-3);
 }
 
 TEST_F(PlannerNodeTest, NeighbourRoadmapDoesNotReachThroughAKnownWall) {
