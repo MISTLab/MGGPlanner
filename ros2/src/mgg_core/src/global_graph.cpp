@@ -167,19 +167,6 @@ bool addRefPath(GraphManager& graph, const std::vector<RefPose>& poses,
                 std::vector<Vertex*>* path_vertices) {
   if (poses.empty()) return false;
 
-  // Keep about one pose per vertex_spacing. Upstream's path was the lattice
-  // walk itself, one vertex per grid cell (rrg.cpp:4867); the port's corridor
-  // may have been resampled more densely than the roadmap needs. The final
-  // pose is the viewpoint the path was chosen for and is always kept.
-  std::vector<RefPose> kept;
-  kept.push_back(poses.front());
-  for (std::size_t i = 1; i < poses.size(); ++i) {
-    const double gap =
-        (poses[i].state.head<3>() - kept.back().state.head<3>()).norm();
-    const bool last = i + 1 == poses.size();
-    if (gap >= vertex_spacing || (last && gap > 1e-9)) kept.push_back(poses[i]);
-  }
-
   // The whole path is collision free already and starts from the root
   // vertex. Only its first vertex has to be linked to the existing graph
   // (rrg.cpp:4812). Upstream dropped the path when that failed. But the root
@@ -189,25 +176,40 @@ bool addRefPath(GraphManager& graph, const std::vector<RefPose>& poses,
   // farther from it and none links again (SubT finals, 2026-09-23). The
   // poses after the root are lattice states whose bodies were checked, so
   // the path joins at the first pose the graph reaches, and the unlinked
-  // prefix stays out of the graph.
+  // prefix stays out of the graph. Every pose is tried before spacing
+  // drops any: the only pose that links may be one spacing would drop.
   std::size_t first = 0;
   Vertex* parent_vertex = nullptr;
-  for (; first < kept.size(); ++first) {
-    parent_vertex = linkPathPose(graph, kept[first].state, ctx);
+  for (; first < poses.size(); ++first) {
+    parent_vertex = linkPathPose(graph, poses[first].state, ctx);
     if (parent_vertex != nullptr) break;
   }
   if (parent_vertex == nullptr) return false;
-  if (first > 0 && kept[first].source != nullptr &&
+  if (first > 0 && poses[first].source != nullptr &&
       parent_vertex->robot_id == ctx.robot_id &&
       parent_vertex->type != VertexType::kVisited) {
-    parent_vertex->type = kept[first].source->type;
-    parent_vertex->vol_gain = kept[first].source->vol_gain;
+    parent_vertex->type = poses[first].source->type;
+    parent_vertex->vol_gain = poses[first].source->vol_gain;
+  }
+
+  // From the linked pose on, keep about one pose per vertex_spacing.
+  // Upstream's path was the lattice walk itself, one vertex per grid cell
+  // (rrg.cpp:4867); the port's corridor may have been resampled more densely
+  // than the roadmap needs. The final pose is the viewpoint the path was
+  // chosen for and is always kept.
+  std::vector<RefPose> kept;
+  kept.push_back(poses[first]);
+  for (std::size_t i = first + 1; i < poses.size(); ++i) {
+    const double gap =
+        (poses[i].state.head<3>() - kept.back().state.head<3>()).norm();
+    const bool last = i + 1 == poses.size();
+    if (gap >= vertex_spacing || (last && gap > 1e-9)) kept.push_back(poses[i]);
   }
 
   // Add all remaining vertices of the path (rrg.cpp:4864).
   std::vector<Vertex*> vertex_list;
   vertex_list.push_back(parent_vertex);
-  for (std::size_t i = first + 1; i < kept.size(); ++i) {
+  for (std::size_t i = 1; i < kept.size(); ++i) {
     const double direction_norm =
         (kept[i].state.head<3>() - parent_vertex->state.head<3>()).norm();
     Vertex* new_vertex = ownVertexAt(graph, kept[i].state, ctx.robot_id);

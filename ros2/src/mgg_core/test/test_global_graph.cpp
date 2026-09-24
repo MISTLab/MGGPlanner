@@ -411,6 +411,30 @@ TEST(AddRefPathToGraph, StartRaisedOnARampCrestLinksWhereThePathLevelsOut) {
   EXPECT_EQ(fixture.global.getNumVertices(), 4);
 }
 
+TEST(AddRefPathToGraph, LinkablePoseIsFoundBeforeSpacingDropsIt) {
+  // The ramp crest again, with the path's only linkable pose closer than
+  // the spacing to the start: the start fails the height rule and the last
+  // pose is beyond reach, so the middle one must be tried (review r0, P1).
+  Roadmap fixture;
+  fixture.planning.nearest_range_z = 0.15;
+  fixture.planning.nearest_range_max = 1.0;
+  Vertex* tip = fixture.add(fixture.global, StateVec(1.0, 0.0, 0.0, 0.0),
+                            fixture.global.getVertex(0));
+  tip->distance = 5.0;
+  const std::vector<StateVec> path = {StateVec(1.8, 0.0, 0.3, 0.0),
+                                      StateVec(1.8, 0.7, 0.1, 0.0),
+                                      StateVec(3.0, 0.0, 0.3, 0.0)};
+  std::vector<Vertex*> vertices;
+  ASSERT_TRUE(mgg::addRefPathToGraph(fixture.global, path, fixture.ctx, 1.0,
+                                     &vertices));
+  ASSERT_EQ(vertices.size(), 2u);
+  EXPECT_EQ(vertices.front(), fixture.nearest(Eigen::Vector3d(1.8, 0.7, 0.1)));
+  EXPECT_EQ(vertices.front()->parent, tip);
+  EXPECT_EQ(vertices.back(), fixture.nearest(Eigen::Vector3d(3.0, 0.0, 0.3)));
+  EXPECT_EQ(fixture.nearest(Eigen::Vector3d(1.8, 0.0, 0.3)), nullptr);
+  EXPECT_EQ(fixture.global.getNumVertices(), 4);
+}
+
 TEST(AddRefPathToGraph, PathOutOfReachIsRefusedUntilItComesBackWithinReach) {
   Roadmap fixture;
   fixture.add(fixture.global, StateVec(1.0, 0.0, 0.0, 0.0),
