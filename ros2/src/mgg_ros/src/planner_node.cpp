@@ -15,6 +15,9 @@
 #include "mgg_core/trajectory.h"
 #include "mgg_ros/conversions.h"
 #include "mgg_ros/param_loader.h"
+#ifdef MGG_WITH_OCTOMAP
+#include "mgg_map_octomap/octomap_map.h"
+#endif
 
 namespace mgg_ros {
 
@@ -66,12 +69,18 @@ PlannerNode::PlannerNode(const rclcpp::NodeOptions& options)
   const double map_resolution = declareOrGet<double>(this, "map.resolution", 0.2);
   map_backend_ = declareOrGet<std::string>(this, "map.backend", map_backend_);
   if (map_backend_ == "cloud_octomap") {
+#ifdef MGG_WITH_OCTOMAP
     mgg::OctomapConfig map_cfg;
     map_cfg.resolution = map_resolution;
     map_cfg.max_range = declareOrGet<double>(this, "map.max_range", 20.0);
     auto backend = std::make_unique<mgg::OctomapMap>(map_cfg);
     cloud_map_ = backend.get();
     map_ = std::move(backend);
+#else
+    throw std::invalid_argument(
+        "map.backend cloud_octomap is not available: mgg_map_octomap was "
+        "built with MGG_WITH_OCTOMAP=OFF; use mola_snapshot");
+#endif
   } else if (map_backend_ == "mola_snapshot") {
     mgg::MolaMapConfig map_cfg;
     map_cfg.resolution = map_resolution;
@@ -547,8 +556,10 @@ void PlannerNode::onPointCloud(
   }
   if (!points.empty()) {
     const std::lock_guard<std::recursive_mutex> lock(planner_mutex_);
+#ifdef MGG_WITH_OCTOMAP
     cloud_map_->insertPointCloud(points, origin);
     ++map_revision_;
+#endif
   }
 }
 

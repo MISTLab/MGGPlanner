@@ -47,6 +47,10 @@ target_include_directories(${PROJECT_NAME} PUBLIC
   $<INSTALL_INTERFACE:include>)
 target_link_libraries(${PROJECT_NAME} mgg_core::mgg_core
   mgg_map_octomap::mgg_map_octomap Eigen3::Eigen)
+# The cloud_octomap map backend exists only if mgg_map_octomap has OctoMap.
+if(mgg_map_octomap_WITH_OCTOMAP)
+  target_compile_definitions(${PROJECT_NAME} PRIVATE MGG_WITH_OCTOMAP)
+endif()
 ament_target_dependencies(${PROJECT_NAME}
   rclcpp std_msgs geometry_msgs visualization_msgs tf2 tf2_msgs tf2_ros
   tf2_geometry_msgs mgg_msgs nav_msgs sensor_msgs std_srvs)
@@ -75,9 +79,16 @@ if(BUILD_TESTING)
   ament_add_gtest(test_conversions test/test_conversions.cpp)
   target_link_libraries(test_conversions ${PROJECT_NAME})
   ament_target_dependencies(test_conversions rclcpp mgg_msgs)
-  ament_add_gtest(test_planner_node test/test_planner_node.cpp)
-  target_link_libraries(test_planner_node ${PROJECT_NAME})
-  ament_target_dependencies(test_planner_node rclcpp mgg_msgs)
+  ament_add_gtest(test_map_backend test/test_map_backend.cpp)
+  target_link_libraries(test_map_backend ${PROJECT_NAME})
+  ament_target_dependencies(test_map_backend rclcpp)
+  if(mgg_map_octomap_WITH_OCTOMAP)
+    target_compile_definitions(test_map_backend PRIVATE MGG_WITH_OCTOMAP)
+    # These scenes are built by inserting points into the OctoMap backend.
+    ament_add_gtest(test_planner_node test/test_planner_node.cpp)
+    target_link_libraries(test_planner_node ${PROJECT_NAME})
+    ament_target_dependencies(test_planner_node rclcpp mgg_msgs)
+  endif()
 endif()
 
 ament_package()

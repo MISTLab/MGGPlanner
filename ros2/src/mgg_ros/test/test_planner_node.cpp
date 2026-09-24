@@ -16,6 +16,7 @@
 #include <rclcpp/rclcpp.hpp>
 #include <tf2_msgs/msg/tf_message.hpp>
 
+#include "mgg_map_octomap/octomap_map.h"
 #include "mgg_ros/planner_node.h"
 
 namespace mgg_ros {

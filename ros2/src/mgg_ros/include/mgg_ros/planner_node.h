@@ -60,7 +60,12 @@
 #include "mgg_core/random_sampler.h"
 #include "mgg_core/sensor_params.h"
 #include "mgg_map_octomap/mola_map.h"
-#include "mgg_map_octomap/octomap_map.h"
+
+namespace mgg {
+// Declared only: the OctoMap backend is compiled in only when mgg_map_octomap
+// was built with MGG_WITH_OCTOMAP.
+class OctomapMap;
+}  // namespace mgg
 
 namespace mgg_ros {
 
