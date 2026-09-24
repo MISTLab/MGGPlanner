@@ -116,6 +116,19 @@ class PlannerNodeTestPeer {
     }
     ++node.map_revision_;
   }
+  /// A wall this robot has seen, across y = `y` from x0 to x1.
+  static void observeWall(PlannerNode& node, double x0, double x1, double y) {
+    const std::lock_guard<std::recursive_mutex> lock(node.planner_mutex_);
+    for (double x = x0; x <= x1 + 1e-9; x += 0.1) {
+      for (double z = 0.1; z <= 0.6 + 1e-9; z += 0.1) {
+        for (int repeat = 0; repeat < 6; ++repeat) {
+          node.cloud_map_->insertPointCloud({Eigen::Vector3d(x, y, z)},
+                                            Eigen::Vector3d(x, y - 1.0, z));
+        }
+      }
+    }
+    ++node.map_revision_;
+  }
   static void setHangingRootReach(PlannerNode& node, double reach) {
     node.hanging_root_edge_length_max_ = reach;
   }
@@ -434,6 +447,65 @@ TEST_F(PlannerNodeTest, NeighbourRoadmapMergesAtTheReceiversDrivingHeight) {
   const auto heights = PlannerNodeTestPeer::neighbourHeights(*fleet.a, 2);
   ASSERT_EQ(heights.size(), sent.vertices.size());
   for (double z : heights) EXPECT_NEAR(z, 0.30, 0.11);
+}
+
+TEST_F(PlannerNodeTest, GoalInANeighboursMapRoutesOverItsRoadmap) {
+  TwoPlanners fleet("goal_attach");
+  auto request = std::make_shared<mgg_msgs::srv::PlanObjective::Request>();
+  request->objective = mgg_msgs::srv::PlanObjective::Request::NAVIGATE;
+  // Beyond this robot's map, 0.3 m beside the ground robot 2 drove.
+  request->goal.position.x = 8.7;
+  request->goal.position.y = 0.3;
+  request->goal.orientation.w = 1.0;
+
+  // Alone, the goal has no mapped ground under it.
+  auto response = std::make_shared<mgg_msgs::srv::PlanObjective::Response>();
+  PlannerNodeTestPeer::objective(*fleet.a, request, response);
+  ASSERT_EQ(response->status,
+            mgg_msgs::srv::PlanObjective::Response::UNREACHABLE);
+  EXPECT_NE(response->reason.find("no mapped ground under the goal"),
+            std::string::npos);
+
+  // With robot 2's roadmap the route runs over it and ends on the goal.
+  fleet.share();
+  response = std::make_shared<mgg_msgs::srv::PlanObjective::Response>();
+  PlannerNodeTestPeer::objective(*fleet.a, request, response);
+  ASSERT_EQ(response->status,
+            mgg_msgs::srv::PlanObjective::Response::SUCCEEDED)
+      << response->reason;
+  ASSERT_GE(response->path.size(), 2u);
+  EXPECT_NEAR(response->path.front().position.x, 0.0, 0.30);
+  EXPECT_NEAR(response->path.back().position.x, 8.7, 1e-3);
+  EXPECT_NEAR(response->path.back().position.y, 0.3, 1e-3);
+  EXPECT_NEAR(pathLength(response->path), 8.7, 1.0);
+  // Over robot 2's edges the path stays at this robot's driving height:
+  // the step and grade gate a controller applies passes it.
+  for (const auto& pose : response->path) {
+    EXPECT_NEAR(pose.position.z, 0.30, 0.11);
+  }
+}
+
+TEST_F(PlannerNodeTest, NeighbourRoadmapDoesNotReachThroughAKnownWall) {
+  TwoPlanners fleet("goal_wall");
+  fleet.share();
+  auto request = std::make_shared<mgg_msgs::srv::PlanObjective::Request>();
+  request->objective = mgg_msgs::srv::PlanObjective::Request::NAVIGATE;
+  request->goal.position.x = 8.5;
+  request->goal.position.y = 1.2;
+  request->goal.orientation.w = 1.0;
+  auto response = std::make_shared<mgg_msgs::srv::PlanObjective::Response>();
+  PlannerNodeTestPeer::objective(*fleet.a, request, response);
+  ASSERT_EQ(response->status,
+            mgg_msgs::srv::PlanObjective::Response::SUCCEEDED)
+      << response->reason;
+
+  // Robot 1 has since seen a wall between robot 2's track and the goal.
+  PlannerNodeTestPeer::observeWall(*fleet.a, 7.0, 10.0, 0.6);
+  response = std::make_shared<mgg_msgs::srv::PlanObjective::Response>();
+  PlannerNodeTestPeer::objective(*fleet.a, request, response);
+  EXPECT_EQ(response->status,
+            mgg_msgs::srv::PlanObjective::Response::UNREACHABLE);
+  EXPECT_TRUE(response->path.empty());
 }
 
 TEST_F(PlannerNodeTest, ARobotRestingInADipStillPlans) {

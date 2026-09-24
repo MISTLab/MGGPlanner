@@ -1226,13 +1226,21 @@ bool PlannerNode::routeOverGlobalGraph(const mgg::StateVec& goal,
                                               &goal_vertex) ||
       goal_vertex == nullptr) {
     exact_goal = true;
-    if (!projectToDrivingHeight(goal_state)) {
-      reason = "no mapped ground under the goal";
-      return false;
-    }
     const int before_goal = global_graph_->getNumVertices();
-    goal_vertex = mgg::connectStateToGraph(*global_graph_, goal_state, ctx,
-                                           kGoalLinkRadius, /*exact_state=*/true);
+    if (projectToDrivingHeight(goal_state)) {
+      goal_vertex = mgg::connectStateToGraph(
+          *global_graph_, goal_state, ctx, kGoalLinkRadius,
+          /*exact_state=*/true);
+    } else {
+      // Another robot may have driven there: its roadmap is the evidence of
+      // ground this robot's map does not have.
+      goal_vertex = attachGoalToNeighbourRoadmap(goal);
+      if (goal_vertex == nullptr) {
+        reason = "no mapped ground under the goal";
+        return false;
+      }
+      goal_state = goal_vertex->state;
+    }
     if (global_graph_->getNumVertices() != before_goal) ++graph_revision_;
   }
   // Dijkstra fills a parent for every vertex and leaves an unreached one as
@@ -1301,6 +1309,58 @@ bool PlannerNode::routeOverGlobalGraph(const mgg::StateVec& goal,
     return false;
   }
   return true;
+}
+
+mgg::Vertex* PlannerNode::attachGoalToNeighbourRoadmap(
+    const mgg::StateVec& goal) {
+  const int own_id = static_cast<int>(planning_params_.robot_id);
+  std::vector<std::pair<double, mgg::Vertex*>> candidates;
+  for (const auto& [robot_id, vertices] : global_graph_->vertex_by_robot_id_) {
+    if (robot_id == own_id) continue;
+    for (const auto& entry : vertices) {
+      mgg::Vertex* vertex = entry.second;
+      if (vertex == nullptr || vertex->is_hanging ||
+          global_graph_->isRetired(vertex->id)) {
+        continue;
+      }
+      const Eigen::Vector3d gap = vertex->state.head<3>() - goal.head<3>();
+      if (gap.head<2>().norm() > kLinkRadius) continue;
+      // Planar reach first; height only separates floors.
+      candidates.emplace_back(gap.norm(), vertex);
+    }
+  }
+  std::sort(candidates.begin(), candidates.end(),
+            [](const auto& a, const auto& b) { return a.first < b.first; });
+  const mgg::ExpandContext ctx = makeGlobalContext();
+  for (const auto& [distance, vertex] : candidates) {
+    (void)distance;
+    // The goal where it was asked for, on the ground that robot drove.
+    const mgg::StateVec state(goal[0], goal[1], vertex->state[2], goal[3]);
+    // Refused only through space this robot knows to be occupied, as a
+    // blind link is (linkStateToGraph): unknown space is what it lacks.
+    const Eigen::Vector3d& offset = ctx.robot->center_offset;
+    if (map_->getPathStatus(vertex->state.head<3>() + offset,
+                            state.head<3>() + offset, ctx.robot_box_size,
+                            false) == mgg::VoxelStatus::kOccupied) {
+      continue;
+    }
+    const double length = (state.head<3>() - vertex->state.head<3>()).norm();
+    if (length < 1e-9) return vertex;
+    auto* goal_vertex =
+        new mgg::Vertex(global_graph_->generateVertexID(), state);
+    goal_vertex->robot_id = own_id;
+    goal_vertex->parent = vertex;
+    goal_vertex->distance = vertex->distance + length;
+    vertex->children.push_back(goal_vertex);
+    global_graph_->addVertex(goal_vertex);
+    global_graph_->addEdge(goal_vertex, vertex, length);
+    RCLCPP_INFO(get_logger(),
+                "goal (%.2f, %.2f) has no mapped ground here; attached to "
+                "robot %d's roadmap %.2f m away",
+                goal[0], goal[1], vertex->robot_id, length);
+    return goal_vertex;
+  }
+  return nullptr;
 }
 
 bool PlannerNode::routeOverLocalLattice(const mgg::StateVec& goal,

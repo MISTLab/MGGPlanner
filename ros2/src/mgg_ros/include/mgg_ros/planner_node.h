@@ -89,6 +89,12 @@ class PlannerNode : public rclcpp::Node {
   bool refreshNeighbourTransform(int sender, const std::string& sender_frame);
   /// This robot's platform as a neighbour's roadmap is re-read for it.
   mgg::ReceiverPlatform receiverPlatform() const;
+  /// Attaches a goal with no mapped ground under it to the nearest vertex of
+  /// another robot's roadmap within kLinkRadius in xy: that robot drove
+  /// there, which is the evidence of traversable ground. The goal keeps its
+  /// x and y and takes the vertex's height; the edge is refused only through
+  /// space this robot's map knows to be occupied.
+  mgg::Vertex* attachGoalToNeighbourRoadmap(const mgg::StateVec& goal);
   void onCoordinationExclusions(
       geometry_msgs::msg::PoseArray::ConstSharedPtr msg);
   void onPeerBodies(geometry_msgs::msg::PoseArray::ConstSharedPtr msg);
