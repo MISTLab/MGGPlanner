@@ -681,17 +681,18 @@ bool PlannerNode::refreshNeighbourTransform(int sender,
 void PlannerNode::withdrawUnplacedNeighbours() {
   for (const auto& [robot, frame] : neighbour_frames_) {
     if (refreshNeighbourTransform(robot, frame)) continue;
-    const auto merged = global_graph_->merged_graphs_.find(robot);
-    if (merged == global_graph_->merged_graphs_.end() || !merged->second) {
+    if (global_graph_->isQuarantined(robot) ||
+        global_graph_->vertex_by_robot_id_.count(robot) == 0) {
       continue;
     }
-    // Its roadmap was placed with a transform that is no longer current:
-    // unusable until a current one places it again.
+    // Its roadmap was placed with a transform that is no longer current,
+    // whether or not it is joined to ours: quarantined until a current one
+    // places it again.
     const int cut = global_graph_->disconnectNeighbourGraph(robot);
     ++graph_revision_;
     RCLCPP_INFO(get_logger(),
                 "robot %d's transform was withdrawn: its roadmap is "
-                "disconnected (%d edges) until it is placed again",
+                "quarantined (%d edges cut) until it is placed again",
                 robot, cut);
   }
 }
@@ -1339,10 +1340,7 @@ mgg::Vertex* PlannerNode::attachGoalToNeighbourRoadmap(
   std::vector<std::pair<double, mgg::Vertex*>> candidates;
   for (const auto& [robot_id, vertices] : global_graph_->vertex_by_robot_id_) {
     if (robot_id == own_id) continue;
-    const auto merged = global_graph_->merged_graphs_.find(robot_id);
-    if (merged == global_graph_->merged_graphs_.end() || !merged->second) {
-      continue;
-    }
+    if (global_graph_->isQuarantined(robot_id)) continue;
     for (const auto& entry : vertices) {
       mgg::Vertex* vertex = entry.second;
       if (vertex == nullptr || vertex->is_hanging ||

@@ -284,6 +284,8 @@ MergeResult mergeNeighbourGraph(GraphManager& global_graph,
   result.merged = global_graph.merged_graphs_[neighbour_id];
   result.newly_connected = !already_merged && result.merged;
   if (!result.merged) return result;
+  // Joined again with a current transform: a quarantine ends here.
+  global_graph.releaseNeighbourGraph(neighbour_id);
 
   // Connected: take everything else the neighbour knows.
   auto& sent_states =

@@ -140,6 +140,20 @@ class PlannerNodeTestPeer {
     vertex->robot_id = robot_id;
     node.global_graph_->addNeighbourVertex(vertex, 1000000);
   }
+  /// Edges touching `robot_id`'s merged vertices.
+  static std::size_t neighbourEdges(PlannerNode& node, int robot_id) {
+    const std::lock_guard<std::recursive_mutex> lock(node.planner_mutex_);
+    std::size_t edges = 0;
+    const auto found = node.global_graph_->vertex_by_robot_id_.find(robot_id);
+    if (found == node.global_graph_->vertex_by_robot_id_.end()) return 0;
+    for (const auto& entry : found->second) {
+      const auto adjacent = node.global_graph_->edge_map_.find(entry.second->id);
+      if (adjacent != node.global_graph_->edge_map_.end()) {
+        edges += adjacent->second.size();
+      }
+    }
+    return edges;
+  }
   static void setHangingRootReach(PlannerNode& node, double reach) {
     node.hanging_root_edge_length_max_ = reach;
   }
@@ -519,7 +533,8 @@ TEST_F(PlannerNodeTest, ADisconnectedNearerVertexDoesNotHideAReachableOne) {
 }
 
 TEST_F(PlannerNodeTest, AWithdrawnTransformMakesTheOldRoadmapUnusable) {
-  TwoPlanners fleet("withdrawn", /*transform_ttl_s=*/0.2);
+  // Long enough for the first plan to finish inside it on a slow host.
+  TwoPlanners fleet("withdrawn", /*transform_ttl_s=*/1.0);
   fleet.share();
   auto request = std::make_shared<mgg_msgs::srv::PlanObjective::Request>();
   request->objective = mgg_msgs::srv::PlanObjective::Request::NAVIGATE;
@@ -535,7 +550,7 @@ TEST_F(PlannerNodeTest, AWithdrawnTransformMakesTheOldRoadmapUnusable) {
   // robot_poses stopped publishing (C-SLAM separated the robots, or the
   // source went quiet): no graph arrives, but the next plan must not use the
   // roadmap placed with the expired transform.
-  std::this_thread::sleep_for(std::chrono::milliseconds(300));
+  std::this_thread::sleep_for(std::chrono::milliseconds(1200));
   response = std::make_shared<mgg_msgs::srv::PlanObjective::Response>();
   PlannerNodeTestPeer::objective(*fleet.a, request, response);
   EXPECT_EQ(response->status,
@@ -550,6 +565,50 @@ TEST_F(PlannerNodeTest, AWithdrawnTransformMakesTheOldRoadmapUnusable) {
             mgg_msgs::srv::PlanObjective::Response::SUCCEEDED)
       << response->reason;
   EXPECT_NEAR(response->path.back().position.x, 8.7, 1e-3);
+}
+
+TEST_F(PlannerNodeTest, AWithdrawnRoadmapIsQuarantinedFromOrdinaryAttachment) {
+  TwoPlanners fleet("quarantine", /*transform_ttl_s=*/1.0);
+  fleet.share();
+  ASSERT_GT(PlannerNodeTestPeer::neighbourEdges(*fleet.a, 2), 0u);
+  std::this_thread::sleep_for(std::chrono::milliseconds(1200));
+
+  // A goal on robot 2's track, where this robot has no ground: refused once
+  // the transform has expired, and the refusal withdraws the roadmap.
+  auto request = std::make_shared<mgg_msgs::srv::PlanObjective::Request>();
+  request->objective = mgg_msgs::srv::PlanObjective::Request::NAVIGATE;
+  request->goal.position.x = 8.5;
+  request->goal.orientation.w = 1.0;
+  auto response = std::make_shared<mgg_msgs::srv::PlanObjective::Response>();
+  PlannerNodeTestPeer::objective(*fleet.a, request, response);
+  ASSERT_EQ(response->status,
+            mgg_msgs::srv::PlanObjective::Response::UNREACHABLE);
+  EXPECT_EQ(PlannerNodeTestPeer::neighbourEdges(*fleet.a, 2), 0u);
+
+  // This robot now drives onto the stale roadmap's vertices: odometry joins
+  // its states to the global graph (expandGraph), and the next objective
+  // links the current state to it (connectStateToGraph). Neither may join a
+  // quarantined vertex, and nothing routes over one.
+  double stamp = 100.0;
+  for (double x = 4.5; x <= 5.5 + 1e-9; x += 0.5) {
+    PlannerNodeTestPeer::acceptOdometry(*fleet.a, x, 0.0, stamp);
+    stamp += 1.0;
+  }
+  response = std::make_shared<mgg_msgs::srv::PlanObjective::Response>();
+  PlannerNodeTestPeer::objective(*fleet.a, request, response);
+  EXPECT_EQ(response->status,
+            mgg_msgs::srv::PlanObjective::Response::UNREACHABLE);
+  EXPECT_EQ(PlannerNodeTestPeer::neighbourEdges(*fleet.a, 2), 0u);
+
+  // The transform returns: the next merge joins the roadmap again.
+  fleet.share();
+  EXPECT_GT(PlannerNodeTestPeer::neighbourEdges(*fleet.a, 2), 0u);
+  response = std::make_shared<mgg_msgs::srv::PlanObjective::Response>();
+  PlannerNodeTestPeer::objective(*fleet.a, request, response);
+  EXPECT_EQ(response->status,
+            mgg_msgs::srv::PlanObjective::Response::SUCCEEDED)
+      << response->reason;
+  EXPECT_NEAR(response->path.back().position.x, 8.5, 1e-3);
 }
 
 TEST_F(PlannerNodeTest, NeighbourRoadmapDoesNotReachThroughAKnownWall) {

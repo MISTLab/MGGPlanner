@@ -58,6 +58,7 @@ void GraphManager::reset() {
   merged_graphs_.clear();
   neighbour_placements_.clear();
   retired_vertex_ids_.clear();
+  quarantined_robots_.clear();
 
   // Other params.
   subgraph_ind_ = -1;
@@ -125,7 +126,7 @@ void GraphManager::rebuildNearestIndex() {
   kd_tree_ = kd_create(3);
   for (const auto& entry : vertices_map_) {
     const Vertex* vertex = entry.second;
-    if (vertex == nullptr || isRetired(entry.first)) continue;
+    if (vertex == nullptr || !inService(*vertex)) continue;
     kd_insert3(kd_tree_, vertex->state.x(), vertex->state.y(),
                vertex->state.z(), entry.second);
   }
@@ -158,7 +159,13 @@ int GraphManager::cutNeighbourEdges(int robot_id) {
 
 int GraphManager::disconnectNeighbourGraph(int robot_id) {
   merged_graphs_[robot_id] = false;
-  return cutNeighbourEdges(robot_id);
+  const int cut = cutNeighbourEdges(robot_id);
+  if (quarantined_robots_.insert(robot_id).second) rebuildNearestIndex();
+  return cut;
+}
+
+void GraphManager::releaseNeighbourGraph(int robot_id) {
+  if (quarantined_robots_.erase(robot_id) > 0) rebuildNearestIndex();
 }
 
 int GraphManager::retireNeighbourGraph(int robot_id) {

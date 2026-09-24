@@ -79,10 +79,22 @@ class GraphManager {
   /// Removes every edge touching a neighbour's merged vertices, its own and
   /// those joining it to other robots' vertices. Returns how many.
   int cutNeighbourEdges(int robot_id);
-  /// Cuts a neighbour's roadmap off and clears its merged flag, keeping its
-  /// vertices and placement: a later merge with a current transform re-places
-  /// it and joins it again. Returns the edges cut.
+  /// Quarantines a neighbour's roadmap whose transform was withdrawn: its
+  /// edges are cut, its merged flag cleared, and its vertices leave the
+  /// nearest-neighbour index and every search (inService) until a merge with
+  /// a current transform joins it again (releaseNeighbourGraph). Its vertices
+  /// and placement are kept for that merge. Returns the edges cut.
   int disconnectNeighbourGraph(int robot_id);
+  /// Ends a quarantine: the neighbour's vertices return to the index.
+  void releaseNeighbourGraph(int robot_id);
+  bool isQuarantined(int robot_id) const {
+    return quarantined_robots_.count(robot_id) > 0;
+  }
+  /// Neither retired nor quarantined: a vertex attachment, expansion and
+  /// search may use.
+  bool inService(const Vertex& vertex) const {
+    return !isRetired(vertex.id) && !isQuarantined(vertex.robot_id);
+  }
 
   /// Cut a neighbour's merged graph out: every edge touching its vertices is
   /// removed, its vertices leave the nearest-neighbour index for good and its
@@ -158,6 +170,8 @@ class GraphManager {
 
   /// Vertices of a neighbour graph cut out by retireNeighbourGraph.
   std::unordered_set<int> retired_vertex_ids_;
+  /// Neighbours whose roadmap is quarantined by disconnectNeighbourGraph.
+  std::unordered_set<int> quarantined_robots_;
 
   /// Boost-local id to <subgraph id, vertex id>. Debug aid.
   std::unordered_map<int, std::pair<int, int>> local_id_map_;

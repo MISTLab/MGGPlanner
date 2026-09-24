@@ -479,7 +479,10 @@ FrontierAdditionReport addFrontiers(GraphManager& global_graph,
   // now surrounded by known space (rrg.cpp:2411 to 2426).
   for (auto& entry : global_graph.vertices_map_) {
     Vertex* vertex = entry.second;
-    if (vertex == nullptr || vertex->type != VertexType::kFrontier) continue;
+    if (vertex == nullptr || vertex->type != VertexType::kFrontier ||
+        !global_graph.inService(*vertex)) {
+      continue;
+    }
     ++report.global_frontiers_rechecked;
     if (recompute_gain) recompute_gain(*vertex);
     if (!vertex->vol_gain.is_frontier) {
@@ -556,7 +559,10 @@ GlobalFrontierReport searchGlobalFrontier(
   std::vector<Vertex*> global_frontiers;
   for (auto& entry : graph.vertices_map_) {
     Vertex* vertex = entry.second;
-    if (vertex == nullptr || vertex->type != VertexType::kFrontier) continue;
+    if (vertex == nullptr || vertex->type != VertexType::kFrontier ||
+        !graph.inService(*vertex)) {
+      continue;
+    }
     if (recompute_gain) recompute_gain(*vertex);
     if (!vertex->vol_gain.is_frontier) {
       vertex->type = VertexType::kUnvisited;
@@ -668,7 +674,8 @@ GlobalGraphExpansionReport expandGlobalGraph(
   std::vector<Vertex*> unvisited_vertices;
   for (auto& entry : global_graph.vertices_map_) {
     Vertex* vertex = entry.second;
-    if (vertex != nullptr && vertex->type == VertexType::kUnvisited) {
+    if (vertex != nullptr && vertex->type == VertexType::kUnvisited &&
+        global_graph.inService(*vertex)) {
       unvisited_vertices.push_back(vertex);
     }
   }
