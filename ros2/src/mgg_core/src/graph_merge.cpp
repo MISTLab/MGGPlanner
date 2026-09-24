@@ -228,10 +228,12 @@ MergeResult mergeNeighbourGraph(GraphManager& global_graph,
         global_graph, neighbour_id, placement->second, t_ours_theirs,
         driving_height);
     if (result.vertices_replaced > 0) {
-      // The links joining its roadmap to the rest were judged where its
-      // vertices stood before; they are dropped and the rendezvous is
-      // looked for again where they stand now.
-      global_graph.cutNeighbourEdges(neighbour_id, /*cross_only=*/true);
+      // Every edge was judged where its vertices stood before: the links
+      // joining its roadmap to the rest against this robot's map, its own
+      // edges against this robot's step and grade limits, which a tilted
+      // transform changes. All are dropped; the rendezvous is looked for
+      // again and its edges re-read from this complete snapshot.
+      global_graph.cutNeighbourEdges(neighbour_id);
       global_graph.merged_graphs_[neighbour_id] = false;
     }
   }

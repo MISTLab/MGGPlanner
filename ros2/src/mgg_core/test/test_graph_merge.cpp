@@ -312,6 +312,41 @@ TEST(GraphMerge, RepeatedReplacementKeepsOneAdjacencyEntryPerEdge) {
   EXPECT_LE(adjacencyEntries(gm), entries + 4u);
 }
 
+TEST(GraphMerge, AnEdgeATiltedTransformMakesTooSteepIsDropped) {
+  GraphManager gm;
+  buildOwnGraph(gm);
+  StaticPoseSource poses;
+  poses.setOffset(2, 0.0, 1.0);
+  // Robot 2's edge 1-2 rises 0.1 m over 1 m (0.10 rad): within our limits.
+  GraphExchange g = neighbourGraph();
+  g.vertices[2].state[2] = 0.1;
+  mgg::ReceiverPlatform platform;
+  platform.max_step_height = 0.05;
+  platform.max_inclination = 0.2;
+  auto r = mergeNeighbourGraph(gm, g, poses, kAlwaysAdmissible, 5.0, platform);
+  ASSERT_TRUE(r.merged);
+  ASSERT_EQ(r.edges_too_steep, 0);
+  Vertex* one = gm.getNeighbourVertex(1, 2);
+  Vertex* two = gm.getNeighbourVertex(2, 2);
+  ASSERT_TRUE(gm.graph_->edgeExists(one->id, two->id));
+
+  // C-SLAM's corrected estimate pitches robot 2's frame by 0.15 rad: the
+  // same edge now climbs at 0.25 rad, which this robot cannot.
+  Eigen::Isometry3d pitched = Eigen::Isometry3d::Identity();
+  pitched.linear() =
+      Eigen::Matrix3d(Eigen::AngleAxisd(-0.15, Eigen::Vector3d::UnitY()));
+  pitched.translation() = Eigen::Vector3d(0.0, 1.0, 0.0);
+  poses.setTransform(2, pitched);
+  r = mergeNeighbourGraph(gm, g, poses, kAlwaysAdmissible, 5.0, platform);
+  EXPECT_GT(r.vertices_replaced, 0);
+  EXPECT_EQ(r.edges_too_steep, 1);
+  EXPECT_FALSE(gm.graph_->edgeExists(one->id, two->id));
+  for (const auto& [other, weight] : gm.edge_map_[one->id]) {
+    (void)weight;
+    EXPECT_NE(other, two->id);
+  }
+}
+
 TEST(GraphMerge, ARestartedNeighbourIsCutOutAndMergedAfresh) {
   GraphManager gm;
   buildOwnGraph(gm);
