@@ -319,6 +319,24 @@ TEST(GraphMerge, ARestartedNeighbourIsCutOutAndMergedAfresh) {
   EXPECT_NE(nearest, old_two);
 }
 
+TEST(GraphMerge, ARestartedNeighboursRootOnlySnapshotRetiresItsOldGraph) {
+  GraphManager gm;
+  buildOwnGraph(gm);
+  StaticPoseSource poses;
+  poses.setOffset(2, 0.0, 1.0);
+  mergeNeighbourGraph(gm, neighbourGraph(), poses, kAlwaysAdmissible);
+  Vertex* old_two = gm.getNeighbourVertex(2, 2);
+  ASSERT_NE(old_two, nullptr);
+
+  // Restarted and parked: its snapshot is its new root alone.
+  const auto r = mergeNeighbourGraph(gm, neighbourGraph(1), poses,
+                                     kAlwaysAdmissible);
+  EXPECT_TRUE(r.neighbour_restarted);
+  EXPECT_FALSE(r.merged);
+  EXPECT_TRUE(gm.isRetired(old_two->id));
+  EXPECT_EQ(gm.edge_map_.count(old_two->id), 0u);
+}
+
 TEST(GraphMerge, TinyGraphsAreIgnored) {
   GraphManager gm;
   buildOwnGraph(gm, 1);

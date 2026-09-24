@@ -195,13 +195,25 @@ MergeResult mergeNeighbourGraph(GraphManager& global_graph,
                                 double rendezvous_radius,
                                 const ReceiverPlatform& platform) {
   MergeResult result;
+  if (incoming.vertices.empty()) return result;
+  const int neighbour_id = incoming.vertices.front().robot_id;
+
+  // Before any guard: a restarted planner's first snapshots hold only its new
+  // root, and must still cut out what was merged from its old run.
+  auto placement = global_graph.neighbour_placements_.find(neighbour_id);
+  if (placement != global_graph.neighbour_placements_.end() &&
+      neighbourRestarted(placement->second, incoming)) {
+    // Its vertex ids now name other places: what came from the old run is
+    // cut out before anything of the new one is merged.
+    global_graph.retireNeighbourGraph(neighbour_id);
+    result.neighbour_restarted = true;
+    placement = global_graph.neighbour_placements_.end();
+  }
 
   // Same guard as the ROS 1 version: nothing useful to connect to yet.
   if (global_graph.vertices_map_.size() < 2 || incoming.vertices.size() < 2) {
     return result;
   }
-
-  const int neighbour_id = incoming.vertices.front().robot_id;
 
   Eigen::Isometry3d t_ours_theirs;
   if (!poses.getRobotTransform(neighbour_id, t_ours_theirs)) {
@@ -212,15 +224,6 @@ MergeResult mergeNeighbourGraph(GraphManager& global_graph,
   }
 
   const double driving_height = platform.driving_height;
-  auto placement = global_graph.neighbour_placements_.find(neighbour_id);
-  if (placement != global_graph.neighbour_placements_.end() &&
-      neighbourRestarted(placement->second, incoming)) {
-    // Its vertex ids now name other places: what came from the old run is
-    // cut out before anything of the new one is merged.
-    global_graph.retireNeighbourGraph(neighbour_id);
-    result.neighbour_restarted = true;
-    placement = global_graph.neighbour_placements_.end();
-  }
 
   if (placement != global_graph.neighbour_placements_.end()) {
     result.vertices_replaced = replaceNeighbourVertices(
