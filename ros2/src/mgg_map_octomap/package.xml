@@ -19,6 +19,9 @@
   <buildtool_depend>ament_cmake</buildtool_depend>
 
   <depend>mgg_core</depend>
+  <!-- Only with -DMGG_WITH_OCTOMAP=ON (the default). octomap is not a
+       workspace package, so it never orders colcon's build; an OFF build
+       simply does not look for it. -->
   <depend>octomap</depend>
   <depend>eigen</depend>
   <depend>nlohmann_json</depend>
