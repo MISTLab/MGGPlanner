@@ -10,8 +10,13 @@ namespace mgg {
 bool viewpointClear(const MapInterface& map, const RobotParams& robot,
                     const PlanningParams& planning,
                     const StateVec& viewpoint) {
-  const double radius = 0.5 * std::min(robot.size.x(), robot.size.y()) +
-                        planning.viewpoint_clearance_margin;
+  // A ground robot stops only where it can turn: a clear viewpoint passes
+  // turnClear, which asks for the same cylinder at the turning radius.
+  const double needed =
+      robot.type == RobotType::kGroundRobot
+          ? robot.turningRadius() + kViewpointArrivalSlack
+          : 0.5 * std::min(robot.size.x(), robot.size.y());
+  const double radius = needed + planning.viewpoint_clearance_margin;
   const Eigen::Vector3d center = viewpoint.head<3>() + robot.center_offset;
   return map.getOccupiedOnlyCylinderPathStatus(
              center, center, radius, robot.getPlanningSize().z()) !=

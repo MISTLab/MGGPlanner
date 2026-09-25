@@ -282,7 +282,7 @@ TurnCompliantRoutes findTurnCompliantRoutes(
 
 bool turnClear(const MapInterface& map, const RobotParams& robot,
                const StateVec& state) {
-  const double radius = 0.5 * robot.size.head<2>().norm();
+  const double radius = robot.turningRadius();
   const Eigen::Vector3d center = state.head<3>() + robot.center_offset;
   return map.getOccupiedOnlyCylinderPathStatus(
              center, center, radius, robot.getPlanningSize().z()) !=

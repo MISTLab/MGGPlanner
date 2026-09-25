@@ -58,16 +58,26 @@ class EdgeInclinations {
   std::unordered_map<uint64_t, double> values_;
 };
 
+/// How much farther from an obstacle than its turning radius a ground
+/// robot's path may end, metres: where a controller stops the robot within
+/// its goal tolerance, it still has room to turn.
+inline constexpr double kViewpointArrivalSlack = 0.05;
+
 /// Whether the robot, stopped at `viewpoint`, keeps its footprint clear of
-/// known obstacles: no occupied voxel within its inscribed radius (half the
-/// smaller of RobotParams::size x and y) plus
-/// PlanningParams::viewpoint_clearance_margin, in the xy plane, over the
-/// height of its collision box. The lattice's body check is a box aligned with
-/// the map and only size_extension larger than the robot, so a vertex it
-/// admits can still end a path with the robot's flank or corner against a
-/// wall: routes on the SubT finals ended 0.08 and 0.11 m from a lethal cell
-/// of the controller's costmap (2026-09-23). Unknown space passes, as it does
-/// for the lattice's body check, and so does a query the map cannot answer.
+/// known obstacles: no occupied voxel within a radius, in the xy plane, over
+/// the height of its collision box. For a ground robot the radius is its
+/// turning radius (RobotParams::turningRadius) plus kViewpointArrivalSlack
+/// plus PlanningParams::viewpoint_clearance_margin, so a robot that reaches
+/// a clear path end can turn there (turnClear): in run 5 (2026-09-25) path
+/// ends allowed 0.49 m from a wall left Bunkers, whose corners reach
+/// 0.64 m, boxed in. For an aerial robot it is its inscribed radius (half
+/// the smaller of RobotParams::size x and y) plus the margin. The lattice's
+/// body check is a box aligned with the map and only size_extension larger
+/// than the robot, so a vertex it admits can still end a path with the
+/// robot's flank or corner against a wall: routes on the SubT finals ended
+/// 0.08 and 0.11 m from a lethal cell of the controller's costmap
+/// (2026-09-23). Unknown space passes, as it does for the lattice's body
+/// check, and so does a query the map cannot answer.
 bool viewpointClear(const MapInterface& map, const RobotParams& robot,
                     const PlanningParams& planning, const StateVec& viewpoint);
 

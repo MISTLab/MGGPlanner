@@ -569,17 +569,20 @@ TEST(MolaMap, ViewpointBesideAnOccupiedColumnLacksClearanceThoughItsBoxIsFree) {
   planning.viewpoint_clearance_margin = 0.1;
 
   // 0.25 m beside the column. The body box, 0.2 m to either side, is free;
-  // the inscribed radius plus margin, 0.3 m, reaches the column.
+  // the turning radius, 0.36 m, plus the arrival slack and the margin,
+  // 0.51 m, reaches the column.
   const mgg::StateVec beside(1.1, 0.45, 0.3, 0.0);
   EXPECT_EQ(provider.getBoxStatus(beside.head<3>(), robot.getPlanningSize(),
                                   true),
             VoxelStatus::kFree);
   EXPECT_FALSE(mgg::viewpointClear(provider, robot, planning, beside));
   EXPECT_TRUE(mgg::viewpointClear(provider, robot, planning,
-                                  mgg::StateVec(1.1, 0.55, 0.3, 0.0)));
-  // The inscribed radius alone clears it.
+                                  mgg::StateVec(1.1, 0.75, 0.3, 0.0)));
+  // 0.45 m from the column: the margin is on top of the room to turn.
+  const mgg::StateVec near(1.1, 0.65, 0.3, 0.0);
+  EXPECT_FALSE(mgg::viewpointClear(provider, robot, planning, near));
   planning.viewpoint_clearance_margin = 0.0;
-  EXPECT_TRUE(mgg::viewpointClear(provider, robot, planning, beside));
+  EXPECT_TRUE(mgg::viewpointClear(provider, robot, planning, near));
   // Only the body's height counts: a body riding above the column clears it.
   planning.viewpoint_clearance_margin = 0.1;
   EXPECT_TRUE(mgg::viewpointClear(provider, robot, planning,

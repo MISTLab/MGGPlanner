@@ -330,6 +330,42 @@ TEST(TurnClear, NeedsTheCircleThroughTheRobotsCorners) {
   EXPECT_TRUE(mgg::turnClear(narrow, robot(), StateVec(0.1, 0.0, 2.5, 0.0)));
 }
 
+TEST(ViewpointClear, AGroundRobotsPathEndsOnlyWhereItCanTurn) {
+  // Run 5: path ends 0.49 to 0.64 m from a wall were clear for a Bunker,
+  // whose corners reach 0.643 m, and it was boxed in on arriving there. A
+  // wall's face at y = 0.6.
+  const Walls wall([](double, double y) { return y > 0.65; });
+  RobotParams bunker;
+  bunker.type = mgg::RobotType::kGroundRobot;
+  bunker.size = Eigen::Vector3d(1.023, 0.778, 0.4);
+  mgg::PlanningParams planning;
+  planning.viewpoint_clearance_margin = 0.0;
+  // 0.55 m from the wall: no room to turn, so not a path end.
+  const StateVec at_055(0.1, 0.05, 0.5, 0.0);
+  EXPECT_FALSE(mgg::turnClear(wall, bunker, at_055));
+  EXPECT_FALSE(mgg::viewpointClear(wall, bunker, planning, at_055));
+  // 0.67 m: room to turn, but not the arrival slack past it.
+  const StateVec at_067(0.1, -0.07, 0.5, 0.0);
+  EXPECT_TRUE(mgg::turnClear(wall, bunker, at_067));
+  EXPECT_FALSE(mgg::viewpointClear(wall, bunker, planning, at_067));
+  // 0.70 m: both; and the margin is on top of them.
+  const StateVec at_070(0.1, -0.1, 0.5, 0.0);
+  EXPECT_TRUE(mgg::viewpointClear(wall, bunker, planning, at_070));
+  planning.viewpoint_clearance_margin = 0.1;
+  EXPECT_FALSE(mgg::viewpointClear(wall, bunker, planning, at_070));
+  // No clear path end fails turnClear.
+  planning.viewpoint_clearance_margin = 0.0;
+  for (double y = -0.5; y <= 0.5; y += 0.01) {
+    const StateVec end(0.1, y, 0.5, 0.0);
+    if (mgg::viewpointClear(wall, bunker, planning, end)) {
+      EXPECT_TRUE(mgg::turnClear(wall, bunker, end)) << "y " << y;
+    }
+  }
+  // An aerial robot keeps its inscribed radius: 0.389 m.
+  bunker.type = mgg::RobotType::kAerialRobot;
+  EXPECT_TRUE(mgg::viewpointClear(wall, bunker, planning, at_055));
+}
+
 /// Open space over ground at `height`(x, y), where it has a value; the
 /// map has no ground elsewhere. Only the ground below a point is answered.
 class Ground : public Walls {

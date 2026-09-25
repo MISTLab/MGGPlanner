@@ -232,9 +232,11 @@
       traverse_time_max: 40.0
       path_safety_enhance_enable: true
       path_interpolation_distance: 0.25
-      # An exploration path ends where no known obstacle lies within the
-      # robot's inscribed radius plus this margin: a viewpoint closer to one
-      # is pulled back along its path, and a path with no such pose is taken
+      # An exploration path ends where no known obstacle lies within this
+      # margin beyond the room the robot needs there: for a ground robot its
+      # turning radius (half its diagonal) plus 0.05 m of arrival slack, for
+      # an aerial one its inscribed radius. A viewpoint closer to one is
+      # pulled back along its path, and a path with no such pose is taken
       # only when no other path has one. Half a 0.2 m planner voxel, for
       # where the controller's costmap places the same wall differently.
       viewpoint_clearance_margin: 0.1

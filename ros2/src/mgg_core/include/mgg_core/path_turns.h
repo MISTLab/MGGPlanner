@@ -74,10 +74,10 @@ double groundSlope(const GroundProjection& ground,
                    const Eigen::Vector3d& position, double radius);
 
 /// Whether the robot has room to turn in place at `state`: no occupied voxel
-/// within its circumscribed radius, half the diagonal of RobotParams::size x
-/// and y, over the height of its collision box. viewpointClear asks for the
-/// inscribed radius, which is room to stand, not to turn. Unknown space
-/// passes, as it does there, and so does a query the map cannot answer.
+/// within its turning radius (RobotParams::turningRadius), over the height
+/// of its collision box. A ground robot's viewpointClear asks for more, so
+/// every path end it allows passes. Unknown space passes, as it does there,
+/// and so does a query the map cannot answer.
 bool turnClear(const MapInterface& map, const RobotParams& robot,
                const StateVec& state);
 

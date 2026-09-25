@@ -46,6 +46,9 @@ struct RobotParams {
 
   /// Planning footprint implied by bound_mode.
   Eigen::Vector3d getPlanningSize() const;
+  /// Radius of the circle the robot's corners sweep turning in place: half
+  /// the diagonal of size x and y.
+  double turningRadius() const { return 0.5 * size.head<2>().norm(); }
 };
 
 enum class BoundedSpaceType { kCuboid = 0, kSphere };
@@ -213,9 +216,10 @@ struct PlanningParams {
   bool planning_backward = false;
   bool path_safety_enhance_enable = false;
   double path_interpolation_distance = 0.5;
-  /// Clearance beyond the robot's inscribed radius that an exploration
-  /// path's final pose keeps from known obstacles (viewpointClear), metres.
-  /// Not an upstream parameter.
+  /// Clearance that an exploration path's final pose keeps from known
+  /// obstacles (viewpointClear), metres, beyond what the robot needs: for a
+  /// ground robot, room to turn there and kViewpointArrivalSlack; for an
+  /// aerial one, its inscribed radius. Not an upstream parameter.
   double viewpoint_clearance_margin = 0.1;
   /// Whether a ground robot boxed in where it stands, with no room to turn
   /// in place, may be sent straight back out along its heading when there is
