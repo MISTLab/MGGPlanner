@@ -191,4 +191,52 @@ TEST(FootprintPlane, SpotKeepsTheRamp) {
   run("rock_field_now.txt", kSpot);
 }
 
+TEST(FootprintPlane, APlanCacheGivesTheSameVerdictsAsNoCache) {
+  // Every lattice-style edge, 0.4 m in 8 directions, from every 0.4 m point
+  // along the ramp, checked by one projection that caches its footprint
+  // lookups and by one that does not.
+  const TerrainFixture map(std::string(MGG_TEST_DATA_DIR) + "/subt_ramp.txt");
+  for (const Platform* platform : {&kScout, &kBunker, &kSpot}) {
+    PlanningParams params = planningFor(*platform);
+    params.max_footprint_tilt = deg(platform->max_footprint_tilt_deg);
+    params.max_footprint_step = platform->max_footprint_step;
+    const GroundProjection plain(map, params);
+    const GroundProjection cached(map, params, true);
+    const Eigen::Vector3d box = boxFor(*platform);
+    int compared = 0, refused = 0;
+    for (const Eigen::Vector3d& pose : map.poses()) {
+      std::vector<Eigen::Vector3d> vertices;
+      for (int dx = -1; dx <= 1; ++dx) {
+        for (int dy = -1; dy <= 1; ++dy) {
+          Eigen::Vector3d point = pose + Eigen::Vector3d(0.4 * dx, 0.4 * dy,
+                                                         0.3);
+          VoxelStatus status;
+          const double drop = plain.projectSample(point, status);
+          if (status != VoxelStatus::kOccupied) continue;
+          point.z() -= drop - params.max_ground_height;
+          vertices.push_back(point);
+        }
+      }
+      for (const Eigen::Vector3d& a : vertices) {
+        for (const Eigen::Vector3d& b : vertices) {
+          if ((a - b).head<2>().norm() > 0.6 || (a - b).norm() < 1e-9) {
+            continue;
+          }
+          std::vector<Eigen::Vector3d> p1, p2;
+          const ProjectedEdgeStatus s1 =
+              plain.getProjectedEdgeStatus(a, b, box, false, p1, false);
+          const ProjectedEdgeStatus s2 =
+              cached.getProjectedEdgeStatus(a, b, box, false, p2, false);
+          ASSERT_EQ(s1, s2);
+          ++compared;
+          if (s1 == ProjectedEdgeStatus::kFootprintPlane) ++refused;
+        }
+      }
+    }
+    EXPECT_GT(compared, 1000);
+    std::printf("%s: %d edges compared, %d refused by the footprint plane\n",
+                platform->name, compared, refused);
+  }
+}
+
 }  // namespace

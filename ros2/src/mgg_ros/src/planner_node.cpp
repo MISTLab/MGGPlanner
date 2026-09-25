@@ -1148,7 +1148,13 @@ std::string PlannerNode::buildLocalGraph() {
   local_graph_->addVertex(root);
   ++planner_trigger_count_;
 
-  const mgg::ExpandContext ctx = makeContext();
+  // The lattice checks each vertex's footprint from every edge that meets
+  // it. Its ground lookups are shared for this plan only: the map is held
+  // still by the lease above and the lock, and the cache goes with the plan.
+  const mgg::GroundProjection plan_ground(*map_, planning_params_,
+                                          /*cache_footprint_ground=*/true);
+  mgg::ExpandContext ctx = makeContext();
+  ctx.ground = &plan_ground;
   const auto t_global = Clock::now();
   // The lattice is laid out around the root at driving height, where the
   // root vertex is; a ground robot's odometry origin sits lower than that.
@@ -1546,7 +1552,11 @@ bool PlannerNode::routeOverLocalLattice(const mgg::StateVec& goal,
   root->robot_id = static_cast<int>(planning_params_.robot_id);
   root->is_hanging = root_hanging;
   local_graph_->addVertex(root);
-  const mgg::ExpandContext ctx = makeContext();
+  // One plan's shared footprint lookups, as in buildLocalGraph.
+  const mgg::GroundProjection plan_ground(*map_, planning_params_,
+                                          /*cache_footprint_ground=*/true);
+  mgg::ExpandContext ctx = makeContext();
+  ctx.ground = &plan_ground;
   const mgg::GridGraphResult r = buildGridGraph(
       *local_graph_, root_state, grid_params_, ctx, current_state_[3]);
   if (r.status == mgg::GridGraphStatus::kInvalidBounds ||

@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <functional>
 
 namespace mgg {
 
@@ -308,7 +309,66 @@ double GroundProjection::crossSlope(const std::vector<Eigen::Vector3d>& edge,
   return std::atan(steepest);
 }
 
+namespace {
+
+/// A length or angle as a whole number of millionths, for a cache key.
+std::int64_t micro(double value) {
+  return static_cast<std::int64_t>(std::llround(value * 1e6));
+}
+
+}  // namespace
+
+bool GroundProjection::footprintGroundBelow(const Eigen::Vector3d& point,
+                                            Eigen::Vector3d& ground) const {
+  if (!cache_footprint_ground_) return groundBelow(point, ground);
+  std::vector<GroundFromHeight>& column =
+      ground_below_column_[ColumnKey{micro(point.x()), micro(point.y())}];
+  for (const GroundFromHeight& earlier : column) {
+    // A ray that starts between an earlier ray's start and the ground it
+    // found crosses only cells that ray found empty, then that ground; its
+    // end, 5 m below its start, is still below that ground. The ground
+    // point lies in the cell that stopped the ray, so a start at or above
+    // it is not past that cell. With no ground found, only the same start
+    // gives the same answer: a lower ray reaches further down.
+    const bool same = earlier.found ? earlier.ground.z() <= point.z() &&
+                                          point.z() <= earlier.from_z
+                                    : point.z() == earlier.from_z;
+    if (same) {
+      ground = earlier.ground;
+      return earlier.found;
+    }
+  }
+  GroundFromHeight cast;
+  cast.from_z = point.z();
+  cast.found = groundBelow(point, cast.ground);
+  column.push_back(cast);
+  ground = cast.ground;
+  return cast.found;
+}
+
 FootprintPlane GroundProjection::footprintPlane(
+    const Eigen::Vector3d& point, const Eigen::Vector2d& heading,
+    const Eigen::Vector3d& box_size) const {
+  if (!cache_footprint_ground_ || !point.allFinite() ||
+      !(heading.norm() > 1e-9)) {
+    return measureFootprintPlane(point, heading, box_size);
+  }
+  // The body's axis, folded into [0, pi): a heading and its reverse put the
+  // footprint on the same cells.
+  double axis = std::atan2(heading.y(), heading.x());
+  if (axis < 0.0) axis += M_PI;
+  if (axis >= M_PI) axis -= M_PI;
+  const PlaneKey key{micro(point.x()), micro(point.y()), micro(point.z()),
+                     micro(axis),      micro(box_size.x()),
+                     micro(box_size.y())};
+  const auto found = footprint_planes_.find(key);
+  if (found != footprint_planes_.end()) return found->second;
+  const FootprintPlane plane = measureFootprintPlane(point, heading, box_size);
+  footprint_planes_.emplace(key, plane);
+  return plane;
+}
+
+FootprintPlane GroundProjection::measureFootprintPlane(
     const Eigen::Vector3d& point, const Eigen::Vector2d& heading,
     const Eigen::Vector3d& box_size) const {
   FootprintPlane plane;
@@ -341,9 +401,9 @@ FootprintPlane GroundProjection::footprintPlane(
     }
     ++cells_under;
     Eigen::Vector3d ground;
-    if (groundBelow(Eigen::Vector3d(cell.center.x(), cell.center.y(),
-                                    point.z()),
-                    ground)) {
+    if (footprintGroundBelow(Eigen::Vector3d(cell.center.x(),
+                                             cell.center.y(), point.z()),
+                             ground)) {
       ground_points.push_back(ground);
     }
   }

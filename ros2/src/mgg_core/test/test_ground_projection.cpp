@@ -621,4 +621,129 @@ TEST(GroundProjection, FootprintPlaneFindsARockInEveryCellUnderAnAngledBody) {
             ProjectedEdgeStatus::kFootprintPlane);
 }
 
+/// Level 0.2 m cells that count the ground rays cast into them.
+class CountingSurface : public mgg_test::TerrainFixture {
+ public:
+  CountingSurface() : TerrainFixture(0.2, level()) {}
+  using TerrainFixture::getRayStatus;
+  VoxelStatus getRayStatus(const Eigen::Vector3d& a, const Eigen::Vector3d& b,
+                           bool stop_at_unknown,
+                           Eigen::Vector3d& end_voxel) const override {
+    ++rays;
+    return TerrainFixture::getRayStatus(a, b, stop_at_unknown, end_voxel);
+  }
+  mutable int rays = 0;
+
+ private:
+  static std::map<std::pair<std::int64_t, std::int64_t>, double> level() {
+    std::map<std::pair<std::int64_t, std::int64_t>, double> tops;
+    for (std::int64_t x = -10; x < 10; ++x) {
+      for (std::int64_t y = -10; y < 10; ++y) tops[{x, y}] = 0.0;
+    }
+    return tops;
+  }
+};
+
+TEST(GroundProjection, APlanCacheReusesFootprintLookupsAcrossEdges) {
+  CountingSurface map;
+  PlanningParams params = makeParams();
+  const Eigen::Vector3d box(0.662, 0.630, 0.295);
+  const Eigen::Vector3d here(0.0, 0.0, 0.5);
+  const Eigen::Vector3d next(0.4, 0.0, 0.5);
+
+  const GroundProjection plain(map, params);
+  const mgg::FootprintPlane first = plain.footprintPlane(here, {1, 0}, box);
+  const int per_plane = map.rays;
+  ASSERT_TRUE(first.measured);
+  EXPECT_EQ(per_plane, first.cells);  // one ray per cell
+  plain.footprintPlane(here, {-1, 0}, box);
+  EXPECT_EQ(map.rays, 2 * per_plane);  // no cache: every ray again
+
+  map.rays = 0;
+  const GroundProjection cached(map, params, true);
+  const mgg::FootprintPlane again = cached.footprintPlane(here, {1, 0}, box);
+  EXPECT_EQ(map.rays, per_plane);
+  EXPECT_EQ(again.cells, first.cells);
+  EXPECT_DOUBLE_EQ(again.tilt, first.tilt);
+  // The same body the other way round, from an edge coming back: no ray.
+  cached.footprintPlane(here, {-1, 0}, box);
+  EXPECT_EQ(map.rays, per_plane);
+  // A neighbour's footprint shares all but its new cells.
+  cached.footprintPlane(next, {1, 0}, box);
+  EXPECT_LT(map.rays, 2 * per_plane);
+  EXPECT_GT(map.rays, per_plane);
+
+  // From lower down, still above the ground: those rays would cross only
+  // cells the first ones found empty, so none is cast.
+  const int before_lower = map.rays;
+  const mgg::FootprintPlane lower =
+      cached.footprintPlane({0.0, 0.0, 0.35}, {1, 0}, box);
+  EXPECT_EQ(map.rays, before_lower);
+  EXPECT_EQ(lower.cells, first.cells);
+  // From higher up, the rays cross cells nobody has looked at: all cast.
+  cached.footprintPlane({0.0, 0.0, 0.8}, {1, 0}, box);
+  EXPECT_EQ(map.rays, before_lower + per_plane);
+}
+
+/// Level ground at z = 0 for x < 0.2; for x >= 0.2 a solid wall up to
+/// z = 0.5 whose voxels are offset from the caller's: [0.1, 0.3],
+/// [0.3, 0.5], as in a MOLA snapshot whose frame is raised 0.1 m. A ray
+/// that starts inside the wall stops in the voxel it starts in.
+class OffsetVoxelWall : public mgg_test::TerrainFixture {
+ public:
+  OffsetVoxelWall() : TerrainFixture(0.2, level()) {}
+  using TerrainFixture::getRayStatus;
+  VoxelStatus getRayStatus(const Eigen::Vector3d& a, const Eigen::Vector3d& b,
+                           bool stop_at_unknown,
+                           Eigen::Vector3d& end_voxel) const override {
+    if (a.x() < 0.2) {
+      return TerrainFixture::getRayStatus(a, b, stop_at_unknown, end_voxel);
+    }
+    const double from = std::min(a.z(), 0.5 - 1e-9);
+    if (b.z() > from) {
+      end_voxel = b;
+      return VoxelStatus::kFree;
+    }
+    const double bottom = 0.1 + 0.2 * std::floor((from - 0.1) / 0.2);
+    end_voxel = Eigen::Vector3d(a.x(), a.y(), bottom + 0.1);
+    return VoxelStatus::kOccupied;
+  }
+
+ private:
+  static std::map<std::pair<std::int64_t, std::int64_t>, double> level() {
+    std::map<std::pair<std::int64_t, std::int64_t>, double> tops;
+    for (std::int64_t x = -10; x < 10; ++x) {
+      for (std::int64_t y = -10; y < 10; ++y) tops[{x, y}] = 0.0;
+    }
+    return tops;
+  }
+};
+
+TEST(GroundProjection, APlanCacheCastsAgainFromInsideAWall) {
+  // A body half against the wall, from two heights in the same 0.2 m layer
+  // of the caller's frame but in different voxels of the map's. The rays
+  // into the wall stop at 0.4 m from the higher start and at 0.2 m from
+  // the lower one, so the two planes differ; the cache must not hand the
+  // first one's ground to the second.
+  const OffsetVoxelWall map;
+  PlanningParams params = makeParams();
+  const Eigen::Vector3d box(0.8, 0.6, 0.3);
+  const Eigen::Vector3d high(0.2, 0.0, 0.35);
+  const Eigen::Vector3d low(0.2, 0.0, 0.25);
+
+  const GroundProjection plain(map, params);
+  const mgg::FootprintPlane plain_high = plain.footprintPlane(high, {1, 0}, box);
+  const mgg::FootprintPlane plain_low = plain.footprintPlane(low, {1, 0}, box);
+  ASSERT_TRUE(plain_high.measured);
+  ASSERT_TRUE(plain_low.measured);
+  ASSERT_GT(plain_high.max_residual, plain_low.max_residual + 0.01);
+
+  const GroundProjection cached(map, params, true);
+  cached.footprintPlane(high, {1, 0}, box);
+  const mgg::FootprintPlane cached_low =
+      cached.footprintPlane(low, {1, 0}, box);
+  EXPECT_DOUBLE_EQ(cached_low.max_residual, plain_low.max_residual);
+  EXPECT_DOUBLE_EQ(cached_low.tilt, plain_low.tilt);
+}
+
 }  // namespace

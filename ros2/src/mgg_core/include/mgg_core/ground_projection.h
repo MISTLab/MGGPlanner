@@ -16,6 +16,10 @@
 #ifndef MGG_CORE_GROUND_PROJECTION_H_
 #define MGG_CORE_GROUND_PROJECTION_H_
 
+#include <array>
+#include <cstdint>
+#include <functional>
+#include <unordered_map>
 #include <vector>
 
 #include <Eigen/Dense>
@@ -55,8 +59,24 @@ inline constexpr double kMaxGoalGroundRise = 6.0;
 
 class GroundProjection {
  public:
-  GroundProjection(const MapInterface& map, const PlanningParams& params)
-      : map_(map), params_(params) {}
+  /// With `cache_footprint_ground`, footprintPlane remembers two things and
+  /// reuses them for every later edge:
+  ///   * the ground found under each map cell, with the height its ray
+  ///     started from. A later ray down the same column that starts no
+  ///     higher, and not below that ground, passes only cells the first
+  ///     one found empty before it reached the ground, so it is not cast;
+  ///   * the plane at each point for each body axis (a heading and its
+  ///     reverse cover the same cells).
+  /// A lattice checks each vertex's footprint from every edge that meets
+  /// it, so this is most of the check's cost. The cache is only valid while
+  /// the map stays the same. Build such a GroundProjection for one plan,
+  /// while holding the map's read lease, and discard it with the plan. It
+  /// is not thread-safe.
+  GroundProjection(const MapInterface& map, const PlanningParams& params,
+                   bool cache_footprint_ground = false)
+      : map_(map),
+        params_(params),
+        cache_footprint_ground_(cache_footprint_ground) {}
 
   /// How far below `sample` the ground lies.
   ///
@@ -145,8 +165,40 @@ class GroundProjection {
   double max_projection_length = 5.0;
 
  private:
+  using ColumnKey = std::array<std::int64_t, 2>;
+  using PlaneKey = std::array<std::int64_t, 6>;
+  struct CacheKeyHash {
+    template <std::size_t N>
+    std::size_t operator()(const std::array<std::int64_t, N>& key) const {
+      std::size_t hash = 0;
+      for (const std::int64_t part : key) {
+        hash ^= std::hash<std::int64_t>()(part) + 0x9e3779b97f4a7c15ULL +
+                (hash << 6) + (hash >> 2);
+      }
+      return hash;
+    }
+  };
+  /// One ground ray cast down a map cell's column.
+  struct GroundFromHeight {
+    double from_z = 0.0;  ///< where the ray started
+    bool found = false;
+    Eigen::Vector3d ground = Eigen::Vector3d::Zero();
+  };
+  /// groundBelow, through the cache when there is one.
+  bool footprintGroundBelow(const Eigen::Vector3d& point,
+                            Eigen::Vector3d& ground) const;
+  FootprintPlane measureFootprintPlane(const Eigen::Vector3d& point,
+                                       const Eigen::Vector2d& heading,
+                                       const Eigen::Vector3d& box_size) const;
+
   const MapInterface& map_;
   const PlanningParams& params_;
+  const bool cache_footprint_ground_ = false;
+  mutable std::unordered_map<ColumnKey, std::vector<GroundFromHeight>,
+                             CacheKeyHash>
+      ground_below_column_;
+  mutable std::unordered_map<PlaneKey, FootprintPlane, CacheKeyHash>
+      footprint_planes_;
 };
 
 }  // namespace mgg
