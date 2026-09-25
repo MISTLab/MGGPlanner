@@ -147,10 +147,26 @@ class PlannerNode : public rclcpp::Node {
   /// Dijkstra over the global graph from the robot to `goal`, linking both
   /// ends into the graph first: the goal stands for the vertex within
   /// `goal_tolerance` of it, or (tolerance zero, or none there) gets its own
-  /// checked vertex at the exact goal. Returns the route in `path`.
+  /// checked vertex at the exact goal. Returns the route in `path`, under
+  /// the turn rule (applyRouteTurnRule), and in `turns_ok` the check its
+  /// shortcut must keep passing.
   bool routeOverGlobalGraph(const mgg::StateVec& goal, double goal_tolerance,
                             std::vector<mgg::StateVec>& path,
-                            std::string& reason);
+                            mgg::PathOkFn& turns_ok, std::string& reason);
+  /// A ground robot's route to a goal turns sharply only where it may, as an
+  /// exploration path does (mgg::chooseTurnCompliantRoute): `route` runs
+  /// through `graph` from where the robot joins it to the goal, after
+  /// `lead_in`, the robot's pose when it is off the first vertex. The slope
+  /// is measured from the map's ground with `slope_from_map` (the global
+  /// graph, whose vertices a metre apart seldom span a plane within the
+  /// robot's length), and from `graph`'s vertices otherwise (a lattice).
+  /// `route_name` names the route in the log. Returns the check the
+  /// route's shortcut must keep passing; empty for other robots.
+  mgg::PathOkFn applyRouteTurnRule(mgg::GraphManager& graph,
+                                   bool slope_from_map,
+                                   const std::vector<mgg::StateVec>& lead_in,
+                                   std::vector<mgg::Vertex*>& route,
+                                   const char* route_name);
   /// Straightens a route where the map vouches for the straight segment and
   /// resamples it at path_interpolation_distance (rrg.cpp:4160 and 4176).
   /// With `turns_ok`, a route that passes it still passes afterwards: the
@@ -185,10 +201,11 @@ class PlannerNode : public rclcpp::Node {
   /// stands on, for where the map shows no ground yet.
   mgg::StateVec physicalAnchorAtDrivingHeight(const mgg::StateVec& base_pose) const;
   /// Dijkstra through a fresh local lattice from the robot to a goal inside
-  /// the lattice box, the goal linked in with checked edges.
+  /// the lattice box, the goal linked in with checked edges; under the turn
+  /// rule as routeOverGlobalGraph.
   bool routeOverLocalLattice(const mgg::StateVec& goal,
                              std::vector<mgg::StateVec>& path,
-                             std::string& reason);
+                             mgg::PathOkFn& turns_ok, std::string& reason);
   /// Peer reservations and refused leaves, as points the selectors skip.
   std::vector<Eigen::Vector3d> selectionExclusions();
   mgg::RecomputeGainFn globalFrontierGain();
@@ -301,6 +318,10 @@ class PlannerNode : public rclcpp::Node {
   /// without room to turn (mgg::PathTurnCheck), because no path complied,
   /// since the node started.
   int sharp_turn_fallbacks_ = 0;
+  /// Routes to a goal (objectives and global repositioning) sent although
+  /// they turn sharply on a slope or without room to turn, because no route
+  /// complied (applyRouteTurnRule), since the node started.
+  int route_sharp_turn_fallbacks_ = 0;
   /// Exploration paths sent unshortcut because the shortcut, once resampled,
   /// turned where the lattice path did not, since the node started.
   int shortcut_turn_reverts_ = 0;

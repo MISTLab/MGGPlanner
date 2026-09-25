@@ -206,6 +206,10 @@ class PlannerNodeTestPeer {
     node.shortcutAndResample(path, turns_ok);
     return node.shortcut_turn_reverts_;
   }
+  /// Routes to a goal sent although no route complied with the turn rule.
+  static int routeSharpTurnFallbacks(PlannerNode& node) {
+    return node.route_sharp_turn_fallbacks_;
+  }
   /// Corners the last shortcut left, before resampling.
   static int shortcutCorners(PlannerNode& node) {
     return node.path_shortcut_corners_;
@@ -339,6 +343,11 @@ TEST_F(PlannerNodeTest, ReturnHomeIsTheWholeRouteOverTheGlobalGraph) {
   // The whole way home, straightened where the map vouches for it.
   EXPECT_NEAR(pathLength(response->path), 4.0, 0.60);
   EXPECT_LE(maxStep(response->path), 0.25);
+  // The robot faces away from home: the route starts with a turn about, on
+  // mapped level floor with room, which the turn rule allows. The slope is
+  // measured from the map; the global graph's vertices along the track are
+  // in a line and would say nothing about it.
+  EXPECT_EQ(PlannerNodeTestPeer::routeSharpTurnFallbacks(*node), 0);
 }
 
 TEST_F(PlannerNodeTest, ReturnHomeRoutesToTheHomeTheCallerSends) {

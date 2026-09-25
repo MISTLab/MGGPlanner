@@ -1339,8 +1339,10 @@ std::string PlannerNode::buildLocalGraph() {
 bool PlannerNode::routeOverGlobalGraph(const mgg::StateVec& goal,
                                        double goal_tolerance,
                                        std::vector<mgg::StateVec>& path,
+                                       mgg::PathOkFn& turns_ok,
                                        std::string& reason) {
   path.clear();
+  turns_ok = nullptr;
   if (global_graph_->getNumVertices() == 0) {
     reason = "the global graph is empty";
     return false;
@@ -1457,12 +1459,18 @@ bool PlannerNode::routeOverGlobalGraph(const mgg::StateVec& goal,
     reason = "no route over the global graph reaches the goal";
     return false;
   }
+  std::vector<mgg::Vertex*> route;
   if (goal_vertex->id == link_vertex->id) {
-    path.push_back(goal_vertex->state);
+    route.push_back(goal_vertex);
   } else {
-    global_graph_->getShortestPath(goal_vertex->id, rep, true, path);
+    global_graph_->getShortestPath(goal_vertex->id, rep, true, route);
   }
-  if (departure.query_local) path.insert(path.begin(), current);
+  if (departure.query_local) path.push_back(current);
+  if (!route.empty()) {
+    turns_ok = applyRouteTurnRule(*global_graph_, /*slope_from_map=*/true,
+                                  path, route, "global route");
+  }
+  for (const mgg::Vertex* v : route) path.push_back(v->state);
   if (path.size() < 2) {
     reason = "no route over the global graph reaches the goal";
     return false;
@@ -1525,8 +1533,10 @@ mgg::Vertex* PlannerNode::attachGoalToNeighbourRoadmap(
 
 bool PlannerNode::routeOverLocalLattice(const mgg::StateVec& goal,
                                         std::vector<mgg::StateVec>& path,
+                                        mgg::PathOkFn& turns_ok,
                                         std::string& reason) {
   path.clear();
+  turns_ok = nullptr;
   // The goal has to lie in the box the lattice is laid out in (heading
   // aside: the box is square in the shipped configurations).
   const Eigen::Vector3d offset = goal.head<3>() - current_state_.head<3>();
@@ -1572,12 +1582,69 @@ bool PlannerNode::routeOverLocalLattice(const mgg::StateVec& goal,
     reason = "no route through the local lattice reaches the goal";
     return false;
   }
-  local_graph_->getShortestPath(goal_vertex->id, rep, true, path);
-  if (path.size() < 2) {
+  std::vector<mgg::Vertex*> route;
+  local_graph_->getShortestPath(goal_vertex->id, rep, true, route);
+  if (route.size() < 2) {
     reason = "already at the goal";
     return false;
   }
+  turns_ok = applyRouteTurnRule(*local_graph_, /*slope_from_map=*/false, {},
+                                route, "local lattice route");
+  for (const mgg::Vertex* v : route) path.push_back(v->state);
   return true;
+}
+
+mgg::PathOkFn PlannerNode::applyRouteTurnRule(
+    mgg::GraphManager& graph, bool slope_from_map,
+    const std::vector<mgg::StateVec>& lead_in,
+    std::vector<mgg::Vertex*>& route, const char* route_name) {
+  if (robot_params_.type != mgg::RobotType::kGroundRobot || route.empty()) {
+    return nullptr;
+  }
+  mgg::SlopeFn slope;
+  if (slope_from_map) {
+    // Over the robot's length, the radius terrainSlope fits a lattice over.
+    const double radius =
+        std::max(robot_params_.size.x(), robot_params_.size.y());
+    slope = [this, radius](const Eigen::Vector3d& position) {
+      return mgg::groundSlope(*ground_, position, radius);
+    };
+  }
+  const auto check = std::make_shared<mgg::PathTurnCheck>(
+      graph, robot_params_,
+      [this](const mgg::StateVec& pose) {
+        return mgg::turnClear(*map_, robot_params_, pose);
+      },
+      slope);
+  const double start_heading = current_state_[3];
+  std::vector<Eigen::Vector3d> lead_in_points;
+  for (const mgg::StateVec& s : lead_in) lead_in_points.push_back(s.head<3>());
+  const mgg::RouteTurnChoice choice = mgg::chooseTurnCompliantRoute(
+      graph, *check, lead_in_points, start_heading, route,
+      mgg::kMaxDetourSearchStates);
+  const Eigen::Vector3d end = route.back()->state.head<3>();
+  if (choice.detour) {
+    RCLCPP_INFO(get_logger(),
+                "%s to (%.2f, %.2f, %.2f) goes the long way round: the "
+                "shortest turns on a slope or without room (%d search "
+                "states)",
+                route_name, end.x(), end.y(), end.z(),
+                choice.states_expanded);
+  } else if (choice.fallback) {
+    ++route_sharp_turn_fallbacks_;
+    RCLCPP_WARN(get_logger(),
+                "%s to (%.2f, %.2f, %.2f) turns sharply on a slope or "
+                "without room to turn: no route turns only where it may; "
+                "route search %s in %d states (%d such routes so far)",
+                route_name, end.x(), end.y(), end.z(),
+                choice.capped ? "stopped at its cap, a compliant route may "
+                                "exist,"
+                              : "completed",
+                choice.states_expanded, route_sharp_turn_fallbacks_);
+  }
+  return [check, start_heading](const mgg::PathType& points) {
+    return check->admissible(points, start_heading);
+  };
 }
 
 bool PlannerNode::runGlobalPlanner(int target_id, std::string& reason) {
@@ -1638,10 +1705,12 @@ bool PlannerNode::runGlobalPlanner(int target_id, std::string& reason) {
     target = report.best_frontier;
   }
   // Route to it over the global graph (rrg.cpp:5846), whole.
-  if (!routeOverGlobalGraph(target->state, 1e-3, best_path_, reason)) {
+  mgg::PathOkFn turns_ok;
+  if (!routeOverGlobalGraph(target->state, 1e-3, best_path_, turns_ok,
+                            reason)) {
     return false;
   }
-  shortcutAndResample(best_path_);
+  shortcutAndResample(best_path_, turns_ok);
   // The frontier is a lattice leaf of an earlier cycle, which may stand
   // against a wall: the route ends where the robot has room (viewpointClear)
   // when any pose along it has, and at the frontier as before otherwise.
@@ -1869,16 +1938,19 @@ void PlannerNode::onObjectiveRequest(
   // paper's local planner and is finer than the roadmap. Anything farther,
   // or a goal the lattice cannot reach, routes over the global graph.
   std::string local_reason;
-  const bool local = request->objective == Service::Request::NAVIGATE &&
-                     routeOverLocalLattice(goal, route, local_reason);
-  if (!local && !routeOverGlobalGraph(goal, tolerance, route, reason)) {
+  mgg::PathOkFn turns_ok;
+  const bool local =
+      request->objective == Service::Request::NAVIGATE &&
+      routeOverLocalLattice(goal, route, turns_ok, local_reason);
+  if (!local &&
+      !routeOverGlobalGraph(goal, tolerance, route, turns_ok, reason)) {
     if (!local_reason.empty()) reason += "; local lattice: " + local_reason;
     response->status = Service::Response::UNREACHABLE;
     response->reason = reason;
     RCLCPP_WARN(get_logger(), "objective refused: %s", reason.c_str());
     return;
   }
-  shortcutAndResample(route);
+  shortcutAndResample(route, turns_ok);
   response->status = Service::Response::SUCCEEDED;
   for (const mgg::StateVec& s : route) response->path.push_back(toPoseMsg(s));
   RCLCPP_INFO(get_logger(),

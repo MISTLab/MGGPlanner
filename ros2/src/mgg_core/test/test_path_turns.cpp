@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cmath>
 #include <functional>
+#include <optional>
 #include <utility>
 #include <vector>
 
@@ -327,6 +328,134 @@ TEST(TurnClear, NeedsTheCircleThroughTheRobotsCorners) {
   EXPECT_TRUE(mgg::turnClear(wide, robot(), centre));
   // Only the body's height counts: riding above the walls clears them.
   EXPECT_TRUE(mgg::turnClear(narrow, robot(), StateVec(0.1, 0.0, 2.5, 0.0)));
+}
+
+/// Open space over ground at `height`(x, y), where it has a value; the
+/// map has no ground elsewhere. Only the ground below a point is answered.
+class Ground : public Walls {
+ public:
+  explicit Ground(std::function<std::optional<double>(double, double)> height)
+      : Walls([](double, double) { return false; }),
+        height_(std::move(height)) {}
+  VoxelStatus getGroundRayStatus(const Eigen::Vector3d& from,
+                                 const Eigen::Vector3d&, bool,
+                                 Eigen::Vector3d& end) const override {
+    const std::optional<double> h = height_(from.x(), from.y());
+    if (!h) return VoxelStatus::kUnknown;
+    end = Eigen::Vector3d(from.x(), from.y(), *h);
+    return VoxelStatus::kOccupied;
+  }
+
+ private:
+  std::function<std::optional<double>(double, double)> height_;
+};
+
+TEST(GroundSlope, FitsTheMappedGroundAndFailsClosedWithoutIt) {
+  const Ground ramp([](double x, double) { return rampGround(x); });
+  const mgg::PlanningParams planning;
+  const mgg::GroundProjection ground(ramp, planning);
+  const auto above = [](double x) {
+    return Eigen::Vector3d(x, 0.3, rampGround(x) + 0.5);
+  };
+  EXPECT_NEAR(mgg::groundSlope(ground, above(1.5), 0.8), 16.0 * kDeg,
+              1e-6);
+  EXPECT_NEAR(mgg::groundSlope(ground, above(5.0), 0.8), 0.0, 1e-9);
+
+  // Ground mapped only along a line, or not at all: unknown, so steep.
+  const Ground strip([](double, double y) -> std::optional<double> {
+    if (std::abs(y) < 0.1) return 0.0;
+    return std::nullopt;
+  });
+  const mgg::GroundProjection strip_ground(strip, planning);
+  EXPECT_DOUBLE_EQ(
+      mgg::groundSlope(strip_ground, Eigen::Vector3d(0, 0, 0.5), 0.8),
+      mgg::kUnknownSlopeRad);
+  const Ground none([](double, double) { return std::nullopt; });
+  const mgg::GroundProjection no_ground(none, planning);
+  EXPECT_DOUBLE_EQ(
+      mgg::groundSlope(no_ground, Eigen::Vector3d(0, 0, 0.5), 0.8),
+      mgg::kUnknownSlopeRad);
+}
+
+TEST(ChooseTurnCompliantRoute, RouteHomeTurnsOnLevelGroundRatherThanOnTheRamp) {
+  // Run 4, robot_0: the route home over the global graph turned on the 16
+  // degree SubT ramp and the Bunker stalled there. The global graph's
+  // vertices lie a metre apart. The robot R stands on the level top, x 4,
+  // facing down the ramp; home H is on the level ground below, off to the
+  // side. The shortest way goes down the ramp's axis and turns across it at
+  // x 2; the other turns on the level top and runs down the fall line.
+  GraphManager graph;
+  const auto at = [&graph](double x, double y) {
+    auto* v = new Vertex(graph.generateVertexID(),
+                         StateVec(x, y, rampGround(x) + 0.5, M_PI));
+    graph.addVertex(v);
+    return v;
+  };
+  const auto link = [&graph](Vertex* u, Vertex* v) {
+    graph.addEdge(u, v, (u->state - v->state).head<3>().norm());
+  };
+  Vertex* home = at(-1, 3);
+  std::vector<Vertex*> row = {home};  // y 3, from x -1 to 4
+  for (int x = 0; x <= 4; ++x) {
+    row.push_back(at(x, 3));
+    link(row[row.size() - 2], row.back());
+  }
+  Vertex* robot_at = at(4, 0);
+  std::vector<Vertex*> side = {robot_at, at(4, 1), at(4, 2), row.back()};
+  link(side[0], side[1]);
+  link(side[1], side[2]);
+  link(side[2], side[3]);
+  Vertex* axis3 = at(3, 0);
+  Vertex* axis2 = at(2, 0);
+  Vertex* across1 = at(2, 1);
+  Vertex* across2 = at(2, 2);
+  link(robot_at, axis3);
+  link(axis3, axis2);
+  link(axis2, across1);
+  link(across1, across2);
+  link(across2, row[2]);  // (1, 3), diagonally
+
+  mgg::ShortestPathsReport rep;
+  ASSERT_TRUE(graph.findShortestPaths(robot_at->id, rep));
+  std::vector<Vertex*> shortest;
+  graph.getShortestPath(home->id, rep, true, shortest);
+  ASSERT_EQ(shortest,
+            (std::vector<Vertex*>{robot_at, axis3, axis2, across1, across2,
+                                  row[2], row[1], home}));
+
+  const Ground ramp([](double x, double) { return rampGround(x); });
+  const mgg::PlanningParams planning;
+  const mgg::GroundProjection ground(ramp, planning);
+  const mgg::SlopeFn slope = [&ground](const Eigen::Vector3d& p) {
+    return mgg::groundSlope(ground, p, 0.8);
+  };
+  PathTurnCheck check(graph, robot(), nullptr, slope);
+  std::vector<Vertex*> route = shortest;
+  const mgg::RouteTurnChoice choice =
+      mgg::chooseTurnCompliantRoute(graph, check, {}, M_PI, route, 1000);
+  EXPECT_TRUE(choice.searched);
+  EXPECT_TRUE(choice.detour);
+  EXPECT_FALSE(choice.fallback);
+  EXPECT_FALSE(choice.capped);
+  std::vector<Vertex*> expected = side;
+  expected.insert(expected.end(), row.rbegin() + 1, row.rend());
+  EXPECT_EQ(route, expected);
+
+  // Measured from the graph's own vertices, a metre apart, the slope is
+  // unknown even on the level top: no turn would be allowed anywhere.
+  PathTurnCheck from_vertices(graph, robot());
+  EXPECT_FALSE(from_vertices.sharpTurnAllowedAt(robot_at->state.head<3>()));
+
+  // With no room to turn on the top either, no route complies, and the
+  // shortest is kept as it was.
+  PathTurnCheck boxed(graph, robot(), [](const StateVec&) { return false; },
+                      slope);
+  route = shortest;
+  const mgg::RouteTurnChoice kept =
+      mgg::chooseTurnCompliantRoute(graph, boxed, {}, M_PI, route, 1000);
+  EXPECT_TRUE(kept.fallback);
+  EXPECT_FALSE(kept.detour);
+  EXPECT_EQ(route, shortest);
 }
 
 /// A corridor 0.8 m wide along +x, x in [-1, 4.4], opening into a room
