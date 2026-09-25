@@ -448,6 +448,18 @@ bool PlannerNode::projectToDrivingHeight(mgg::StateVec& state) const {
   return true;
 }
 
+bool PlannerNode::projectGoalToDrivingHeight(mgg::StateVec& state) const {
+  if (robot_params_.type != mgg::RobotType::kGroundRobot) return true;
+  Eigen::Vector3d pos(state[0], state[1], state[2]);
+  mgg::VoxelStatus status;
+  const double ground_height = ground_->projectGoal(pos, status);
+  if (status != mgg::VoxelStatus::kOccupied) return false;
+  state[0] = pos[0];
+  state[1] = pos[1];
+  state[2] = pos[2] - (ground_height - planning_params_.max_ground_height);
+  return true;
+}
+
 mgg::StateVec PlannerNode::physicalAnchorAtDrivingHeight(
     const mgg::StateVec& base_pose) const {
   // The base sits half the body height above the floor it stands on; the
@@ -1377,7 +1389,7 @@ bool PlannerNode::routeOverGlobalGraph(const mgg::StateVec& goal,
       goal_vertex == nullptr) {
     exact_goal = true;
     const int before_goal = global_graph_->getNumVertices();
-    if (projectToDrivingHeight(goal_state)) {
+    if (projectGoalToDrivingHeight(goal_state)) {
       goal_vertex = mgg::connectStateToGraph(
           *global_graph_, goal_state, ctx, kGoalLinkRadius,
           /*exact_state=*/true);
@@ -1536,7 +1548,7 @@ bool PlannerNode::routeOverLocalLattice(const mgg::StateVec& goal,
     return false;
   }
   mgg::StateVec goal_state = goal;
-  if (!projectToDrivingHeight(goal_state)) {
+  if (!projectGoalToDrivingHeight(goal_state)) {
     reason = "no mapped ground under the goal";
     return false;
   }

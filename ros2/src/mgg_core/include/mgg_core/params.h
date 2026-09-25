@@ -167,6 +167,12 @@ struct PlanningParams {
   /// max_inclination; pi/2 or more disables it. Not an upstream parameter.
   double max_cross_slope = 0.3141592653589793;  // 18 degrees
   double max_step_height = 0.0;
+  /// How far above a goal's requested height its ground may lie, metres.
+  /// A 2-D goal is seeded at the robot's altitude, which on another level
+  /// is metres from the floor the goal is on; GroundProjection::projectGoal
+  /// looks this far up as well as down. Bounded to kMaxGoalGroundRise; zero
+  /// looks down only. Not an upstream parameter.
+  double max_goal_ground_rise = 6.0;
 
   // Free-space augmentation (deprecated upstream).
   double augment_free_voxels_time = 5.0;

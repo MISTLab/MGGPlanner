@@ -35,6 +35,10 @@ enum class ProjectedEdgeStatus {
   kCrossSlope,  ///< its ground slopes sideways past max_cross_slope
 };
 
+/// The most PlanningParams::max_goal_ground_rise may reach, metres: about
+/// two storeys, so a goal never snaps to a floor far above it.
+inline constexpr double kMaxGoalGroundRise = 6.0;
+
 class GroundProjection {
  public:
   GroundProjection(const MapInterface& map, const PlanningParams& params)
@@ -50,6 +54,17 @@ class GroundProjection {
   /// `sample` is updated to the x,y of whichever offset found ground, matching
   /// the original.
   double projectSample(Eigen::Vector3d& sample, VoxelStatus& status) const;
+
+  /// The ground for a goal, whose height is only a hint: a 2-D goal is
+  /// seeded at the robot's altitude, which may be on another level.
+  ///
+  /// The ground projectSample finds below `sample` and the lowest ground
+  /// above it within max_goal_ground_rise (bounded to kMaxGoalGroundRise)
+  /// are the candidates; the one nearer `sample` wins, the one below on a
+  /// tie. Ground above is looked for straight above `sample`, on top of each
+  /// solid a downward ray meets. Same contract as projectSample: returns
+  /// how far below `sample` the ground lies, negative when above.
+  double projectGoal(Eigen::Vector3d& sample, VoxelStatus& status) const;
 
   /// Whether a robot could drive from `start` to `end` once both are dropped
   /// onto the ground, filling `projected_edge_out` with the ground-following

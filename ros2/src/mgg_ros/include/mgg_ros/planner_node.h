@@ -178,6 +178,9 @@ class PlannerNode : public rclcpp::Node {
   /// A ground robot's state at driving height above mapped ground. False
   /// when the map shows no ground under it.
   bool projectToDrivingHeight(mgg::StateVec& state) const;
+  /// As projectToDrivingHeight for a goal, whose height is only a hint: the
+  /// ground nearest it above or below (GroundProjection::projectGoal).
+  bool projectGoalToDrivingHeight(mgg::StateVec& state) const;
   /// A ground robot's state at driving height above the floor its base
   /// stands on, for where the map shows no ground yet.
   mgg::StateVec physicalAnchorAtDrivingHeight(const mgg::StateVec& base_pose) const;

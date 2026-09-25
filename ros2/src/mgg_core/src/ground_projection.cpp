@@ -5,6 +5,19 @@
 
 namespace mgg {
 
+namespace {
+
+/// How far above the sample projectSample's rays start.
+double probeOffset(const MapInterface& map) {
+  return std::max(0.20, 2.0 * map.getResolution());
+}
+
+/// Solids a goal's upward search steps through before giving up; each has
+/// free space above it, so a column this tall is never met in practice.
+constexpr int kMaxGoalGroundLayers = 32;
+
+}  // namespace
+
 double GroundProjection::projectSample(Eigen::Vector3d& sample,
                                        VoxelStatus& status) const {
   int unknown_count = 0;
@@ -12,7 +25,7 @@ double GroundProjection::projectSample(Eigen::Vector3d& sample,
 
   // The centre plus four local offsets, so a sample straddling a small hole
   // still finds ground without probing onto distant sidewalks or kerbs.
-  const double probe_offset = std::max(0.20, 2.0 * map_.getResolution());
+  const double probe_offset = probeOffset(map_);
   const std::vector<Eigen::Vector3d> extra_samples = {
       {0.0, 0.0, probe_offset},
       {probe_offset, 0.0, probe_offset},
@@ -61,6 +74,55 @@ double GroundProjection::projectSample(Eigen::Vector3d& sample,
   }
   status = VoxelStatus::kFree;
   return -1.0;
+}
+
+double GroundProjection::projectGoal(Eigen::Vector3d& sample,
+                                     VoxelStatus& status) const {
+  Eigen::Vector3d below_sample = sample;
+  VoxelStatus below_status = VoxelStatus::kFree;
+  const double below = projectSample(below_sample, below_status);
+  const bool have_below = below_status == VoxelStatus::kOccupied;
+
+  // projectSample covers everything up to where its rays start; look above
+  // that, up to the bounded rise. From the top of the window down, each ray
+  // from free space stops on top of the next solid; step through that solid
+  // and look again, so the last top found is the lowest above the sample.
+  const double rise = params_.max_goal_ground_rise;
+  const double reach =
+      std::isfinite(rise) ? std::clamp(rise, 0.0, kMaxGoalGroundRise) : 0.0;
+  const double resolution = map_.getResolution();
+  const double floor_z = sample.z() + probeOffset(map_);
+  Eigen::Vector3d probe(sample.x(), sample.y(), sample.z() + reach);
+  const Eigen::Vector3d end(sample.x(), sample.y(), floor_z);
+  bool have_above = false;
+  double above_z = 0.0;
+  for (int layer = 0; layer < kMaxGoalGroundLayers && resolution > 0.0;
+       ++layer) {
+    while (probe.z() > floor_z &&
+           map_.getVoxelStatus(probe) == VoxelStatus::kOccupied) {
+      probe.z() -= resolution;
+    }
+    if (probe.z() <= floor_z) break;
+    Eigen::Vector3d hit;
+    if (map_.getGroundRayStatus(probe, end, false, hit) !=
+            VoxelStatus::kOccupied ||
+        !(hit.z() > floor_z)) {
+      break;
+    }
+    have_above = true;
+    above_z = hit.z();
+    // Just under the reported top, which a backend's measured surface may
+    // put on the solid's upper face, so the step down starts inside it.
+    probe.z() = hit.z() - 1e-6;
+  }
+
+  if (have_above && (!have_below || above_z - sample.z() < std::abs(below))) {
+    status = VoxelStatus::kOccupied;
+    return sample.z() - above_z;
+  }
+  sample = below_sample;
+  status = below_status;
+  return below;
 }
 
 ProjectedEdgeStatus GroundProjection::getProjectedEdgeStatus(

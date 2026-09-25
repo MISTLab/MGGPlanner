@@ -442,6 +442,40 @@ TEST_F(PlannerNodeTest, NavigateInsideTheLatticeNeedsNoRoadmap) {
   EXPECT_NEAR(pathLength(response->path), std::hypot(2.3, 0.7), 0.8);
 }
 
+TEST_F(PlannerNodeTest, AGoalSeededOnALowerLevelFindsTheFloorAboveIt) {
+  // A 2-D goal is seeded at the robot's altitude. From a lower level that is
+  // metres below the floor the goal is on (robot_0 at z -5.5 asking for a
+  // goal near home, SubT 2026-09-23), and nothing is mapped below it.
+  auto node = makeNode("goal_above");
+  PlannerNodeTestPeer::observeFloor(*node, -1.5, 6.0, -1.5, 1.5);
+  PlannerNodeTestPeer::acceptOdometry(*node, 0.0, 0.0, 1.0);
+  double stamp = 2.0;
+  for (double x = 0.5; x <= 4.0 + 1e-9; x += 0.5) {
+    PlannerNodeTestPeer::acceptOdometry(*node, x, 0.0, stamp);
+    stamp += 1.0;
+  }
+
+  for (const double x : {0.7, 5.5}) {
+    // One goal routed over the roadmap, one inside the local lattice.
+    auto request = std::make_shared<mgg_msgs::srv::PlanObjective::Request>();
+    request->objective = mgg_msgs::srv::PlanObjective::Request::NAVIGATE;
+    request->goal.position.x = x;
+    request->goal.position.y = 0.3;
+    request->goal.position.z = 0.075 - 5.5;
+    request->goal.orientation.w = 1.0;
+    auto response = std::make_shared<mgg_msgs::srv::PlanObjective::Response>();
+    PlannerNodeTestPeer::objective(*node, request, response);
+    ASSERT_EQ(response->status,
+              mgg_msgs::srv::PlanObjective::Response::SUCCEEDED)
+        << "goal x " << x << ": " << response->reason;
+    ASSERT_GE(response->path.size(), 2u);
+    EXPECT_NEAR(response->path.back().position.x, x, 1e-3);
+    EXPECT_NEAR(response->path.back().position.y, 0.3, 1e-3);
+    // At driving height over the floor at z = 0, not down where it was asked.
+    EXPECT_NEAR(response->path.back().position.z, 0.30, 0.15);
+  }
+}
+
 TEST_F(PlannerNodeTest, BlindStartPlansFromThePhysicalAnchor) {
   // The lidar never sees the floor under the robot: the map holds ground
   // from 1.2 m outwards only. The root hangs at the physical driving height

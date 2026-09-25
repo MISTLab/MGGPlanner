@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <limits>
 #include <utility>
 #include <vector>
 
@@ -365,6 +366,92 @@ TEST(GroundProjection, CrossSlopeIsAveragedOverTheBodyLength) {
                                          kBox, true, path, false),
             ProjectedEdgeStatus::kAdmissible);
   EXPECT_DOUBLE_EQ(level.crossSlope(path, kBox), 0.0);
+}
+
+/// Level floors, each the solid z in [bottom, top] everywhere. Vertical rays
+/// are answered exactly, so heights read back without a voxel's error.
+class Floors : public Terrain {
+ public:
+  explicit Floors(std::vector<std::pair<double, double>> slabs)
+      : slabs_(std::move(slabs)) {}
+  VoxelStatus getVoxelStatus(const Eigen::Vector3d& p) const override {
+    for (const auto& [bottom, top] : slabs_) {
+      if (p.z() >= bottom && p.z() <= top) return VoxelStatus::kOccupied;
+    }
+    return VoxelStatus::kFree;
+  }
+  VoxelStatus getRayStatus(const Eigen::Vector3d& a, const Eigen::Vector3d& b,
+                           bool, Eigen::Vector3d& end_voxel) const override {
+    // Downward only, as ground rays are: the highest solid the ray meets.
+    double hit = -std::numeric_limits<double>::infinity();
+    for (const auto& [bottom, top] : slabs_) {
+      if (top >= b.z() && bottom <= a.z()) hit = std::max(hit, std::min(top, a.z()));
+    }
+    if (!std::isfinite(hit)) {
+      end_voxel = b;
+      return VoxelStatus::kFree;
+    }
+    end_voxel = Eigen::Vector3d(a.x(), a.y(), hit);
+    return VoxelStatus::kOccupied;
+  }
+
+ private:
+  std::vector<std::pair<double, double>> slabs_;
+};
+
+TEST(GroundProjection, AGoalFindsTheFloorAboveItsSeedHeight) {
+  // A 2-D goal is seeded at the robot's altitude, here 5.5 m below the only
+  // floor at the goal (robot_0 on the level below home, SubT 2026-09-23).
+  Floors map({{5.3, 5.5}});
+  PlanningParams params = makeParams();
+  GroundProjection gp(map, params);
+  Eigen::Vector3d below(1.0, 2.0, 0.0);
+  VoxelStatus status;
+  gp.projectSample(below, status);
+  EXPECT_NE(status, VoxelStatus::kOccupied);  // downward only
+
+  Eigen::Vector3d goal(1.0, 2.0, 0.0);
+  EXPECT_DOUBLE_EQ(gp.projectGoal(goal, status), -5.5);
+  EXPECT_EQ(status, VoxelStatus::kOccupied);
+  EXPECT_DOUBLE_EQ(goal.x(), 1.0);
+  EXPECT_DOUBLE_EQ(goal.y(), 2.0);
+}
+
+TEST(GroundProjection, AGoalLooksUpOnlyWithinTheBoundedRise) {
+  Floors map({{6.8, 7.0}});
+  PlanningParams params = makeParams();
+  params.max_goal_ground_rise = 100.0;  // bounded to kMaxGoalGroundRise
+  GroundProjection gp(map, params);
+  Eigen::Vector3d goal(0.0, 0.0, 0.0);
+  VoxelStatus status;
+  gp.projectGoal(goal, status);
+  EXPECT_NE(status, VoxelStatus::kOccupied);
+
+  // Zero turns the search upward off.
+  Floors near_above({{0.8, 1.0}});
+  params.max_goal_ground_rise = 0.0;
+  GroundProjection off(near_above, params);
+  off.projectGoal(goal, status);
+  EXPECT_NE(status, VoxelStatus::kOccupied);
+}
+
+TEST(GroundProjection, AGoalTakesTheFloorNearestItsHeight) {
+  Floors map({{-0.2, 0.0}, {1.8, 2.0}, {3.8, 4.0}});
+  PlanningParams params = makeParams();
+  GroundProjection gp(map, params);
+  VoxelStatus status;
+  // 0.8 m below the floor at 2 m and 1.2 m above the one at 0: the upper.
+  Eigen::Vector3d goal(0.0, 0.0, 1.2);
+  EXPECT_DOUBLE_EQ(gp.projectGoal(goal, status), -0.8);
+  EXPECT_EQ(status, VoxelStatus::kOccupied);
+  // The other way round: the lower.
+  goal = Eigen::Vector3d(0.0, 0.0, 0.8);
+  EXPECT_DOUBLE_EQ(gp.projectGoal(goal, status), 0.8);
+  EXPECT_EQ(status, VoxelStatus::kOccupied);
+  // Halfway: the floor below.
+  goal = Eigen::Vector3d(0.0, 0.0, 1.0);
+  EXPECT_DOUBLE_EQ(gp.projectGoal(goal, status), 1.0);
+  EXPECT_EQ(status, VoxelStatus::kOccupied);
 }
 
 }  // namespace
