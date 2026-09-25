@@ -120,6 +120,12 @@ class OctomapMap : public MapInterface {
       const std::vector<Eigen::Vector3d>& multiray_endpoints, GainCounts& gain,
       std::vector<std::pair<Eigen::Vector3d, VoxelStatus>>& voxel_log,
       const SensorModel& sensor) override;
+  void getVisibleScanStatus(
+      const Eigen::Vector3d& pos,
+      const std::vector<Eigen::Vector3d>& multiray_endpoints,
+      const WallBand& wall, GainCounts& gain,
+      std::vector<std::pair<Eigen::Vector3d, VoxelStatus>>& voxel_log,
+      const SensorModel& sensor) override;
 
   bool augmentFreeBox(const Eigen::Vector3d& position,
                       const Eigen::Vector3d& box_size) override;
@@ -168,6 +174,11 @@ class OctomapMap : public MapInterface {
   VoxelStatus centreLinePathStatus(const Eigen::Vector3d& start,
                                    const Eigen::Vector3d& end,
                                    bool stop_at_unknown_voxel) const;
+  void scanUnique(const Eigen::Vector3d& pos,
+                  const std::vector<Eigen::Vector3d>& multiray_endpoints,
+                  const WallBand* wall, GainCounts& gain,
+                  std::vector<std::pair<Eigen::Vector3d, VoxelStatus>>&
+                      voxel_log) const;
   VoxelStatus queryBox(const Eigen::Vector3d& center,
                        const Eigen::Vector3d& size,
                        double unknown_fraction) const;

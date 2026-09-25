@@ -5,6 +5,7 @@
 #include <cmath>
 #include <cstdint>
 #include <limits>
+#include <unordered_map>
 
 namespace mgg {
 namespace {
@@ -653,17 +654,60 @@ void OctomapMap::getScanStatusIterative(
     const Eigen::Vector3d& pos,
     const std::vector<Eigen::Vector3d>& multiray_endpoints, GainCounts& gain,
     std::vector<std::pair<Eigen::Vector3d, VoxelStatus>>& voxel_log,
-    const SensorModel& sensor) {
+    const SensorModel& /*sensor*/) {
+  scanUnique(pos, multiray_endpoints, nullptr, gain, voxel_log);
+}
+
+void OctomapMap::getVisibleScanStatus(
+    const Eigen::Vector3d& pos,
+    const std::vector<Eigen::Vector3d>& multiray_endpoints,
+    const WallBand& wall, GainCounts& gain,
+    std::vector<std::pair<Eigen::Vector3d, VoxelStatus>>& voxel_log,
+    const SensorModel& /*sensor*/) {
+  scanUnique(pos, multiray_endpoints, &wall, gain, voxel_log);
+}
+
+void OctomapMap::scanUnique(
+    const Eigen::Vector3d& pos,
+    const std::vector<Eigen::Vector3d>& multiray_endpoints,
+    const WallBand* wall, GainCounts& gain,
+    std::vector<std::pair<Eigen::Vector3d, VoxelStatus>>& voxel_log) const {
   // The voxblox "iterative" variant skipped rays whose voxels a neighbouring
   // ray had already covered, using the sensor's angular resolution. OctoMap's
   // key-based traversal makes the equivalent saving available far more
   // cheaply: dedupe on voxel keys instead of reasoning about ray geometry.
   gain = GainCounts{};
+  // The wall band as key rows; see NativeMolaGrid::scanUnique.
+  constexpr int kMaxWallBandCells = 64;
+  octomap::key_type band_low = 0, band_high = 0;
+  const bool walls = wall != nullptr && wall->min_z <= wall->max_z &&
+                     tree_->coordToKeyChecked(wall->min_z, band_low) &&
+                     tree_->coordToKeyChecked(wall->max_z, band_high) &&
+                     int(band_high) - int(band_low) < kMaxWallBandCells;
+  std::unordered_map<std::uint32_t, bool> wall_columns;
+  const auto isWallColumn = [&](const octomap::OcTreeKey& key) {
+    const std::uint32_t column = (std::uint32_t(key[0]) << 16) | key[1];
+    const auto known = wall_columns.find(column);
+    if (known != wall_columns.end()) return known->second;
+    bool occupied = false;
+    for (int z = band_low; z <= int(band_high) && !occupied; ++z) {
+      const octomap::OcTreeKey cell(key[0], key[1],
+                                    static_cast<octomap::key_type>(z));
+      occupied = statusAt(tree_->keyToCoord(cell)) == VoxelStatus::kOccupied;
+    }
+    wall_columns.emplace(column, occupied);
+    return occupied;
+  };
   octomap::KeySet seen;
   for (const Eigen::Vector3d& endpoint : multiray_endpoints) {
     walkRay(pos, endpoint, [&](const octomap::point3d& centre, VoxelStatus s) {
       octomap::OcTreeKey key;
-      if (tree_->coordToKeyChecked(centre, key) && !seen.insert(key).second) {
+      const bool keyed = tree_->coordToKeyChecked(centre, key);
+      // A gap in a wall hides what is behind it, for every ray.
+      if (walls && keyed && s == VoxelStatus::kUnknown && isWallColumn(key)) {
+        return false;
+      }
+      if (keyed && !seen.insert(key).second) {
         // Already counted through another ray; keep walking but do not
         // double-count.
         return s != VoxelStatus::kOccupied;
@@ -677,7 +721,6 @@ void OctomapMap::getScanStatusIterative(
       return true;
     });
   }
-  (void)sensor;
 }
 
 bool OctomapMap::augmentFreeBox(const Eigen::Vector3d& position,

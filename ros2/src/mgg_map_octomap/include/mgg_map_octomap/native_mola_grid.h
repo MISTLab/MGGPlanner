@@ -59,6 +59,11 @@ class NativeMolaGrid final : public MapInterface {
       const Eigen::Vector3d&, const std::vector<Eigen::Vector3d>&, GainCounts&,
       std::vector<std::pair<Eigen::Vector3d, VoxelStatus>>&,
       const SensorModel&) override;
+  void getVisibleScanStatus(
+      const Eigen::Vector3d&, const std::vector<Eigen::Vector3d>&,
+      const WallBand&, GainCounts&,
+      std::vector<std::pair<Eigen::Vector3d, VoxelStatus>>&,
+      const SensorModel&) override;
   bool augmentFreeBox(const Eigen::Vector3d&, const Eigen::Vector3d&) override {
     return false;
   }
@@ -88,6 +93,9 @@ class NativeMolaGrid final : public MapInterface {
                   bool) const;
   VoxelStatus path(const Eigen::Vector3d&, const Eigen::Vector3d&,
                    const Eigen::Vector3d&, bool, bool) const;
+  void scanUnique(const Eigen::Vector3d&, const std::vector<Eigen::Vector3d>&,
+                  const WallBand*, GainCounts&,
+                  std::vector<std::pair<Eigen::Vector3d, VoxelStatus>>&) const;
   template <class F>
   bool walk(const Eigen::Vector3d&, const Eigen::Vector3d&, F) const;
   double resolution_;

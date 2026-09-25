@@ -51,8 +51,21 @@ void computeVolumetricGain(
     // unique on the captured Bistro grids, diag-viewpoint 2026-09-24).
     GainCounts raw;
     std::vector<std::pair<Eigen::Vector3d, VoxelStatus>> visited;
-    ctx.map->getScanStatusIterative(origin, endpoints, raw, visited,
+    if (ctx.robot != nullptr && ctx.robot->type == RobotType::kGroundRobot) {
+      // A lidar leaves unknown gaps in walls, and rays through them counted
+      // the space behind: 0.39 of the count at the captured plan ends. A
+      // column occupied at the height the robot's body rides at (its
+      // collision box at this vertex) is a wall; an opening with nothing
+      // there, such as a doorway, is not.
+      const double body = ctx.robot->getPlanningSize().z();
+      const double body_z = origin.z() + ctx.robot->center_offset.z();
+      const WallBand wall{body_z - 0.5 * body, body_z + 0.5 * body};
+      ctx.map->getVisibleScanStatus(origin, endpoints, wall, raw, visited,
                                     sensor.model());
+    } else {
+      ctx.map->getScanStatusIterative(origin, endpoints, raw, visited,
+                                      sensor.model());
+    }
 
     int unknown = 0, free = 0, occupied = 0;
     for (const auto& entry : visited) {

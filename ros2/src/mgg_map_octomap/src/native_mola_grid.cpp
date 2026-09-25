@@ -4,6 +4,7 @@
 #include <array>
 #include <cmath>
 #include <limits>
+#include <unordered_map>
 #include <unordered_set>
 
 namespace mgg {
@@ -435,7 +436,40 @@ void NativeMolaGrid::getScanStatusIterative(
     const Eigen::Vector3d& p, const std::vector<Eigen::Vector3d>& ends,
     GainCounts& g, std::vector<std::pair<Eigen::Vector3d, VoxelStatus>>& log,
     const SensorModel&) {
+  scanUnique(p, ends, nullptr, g, log);
+}
+void NativeMolaGrid::getVisibleScanStatus(
+    const Eigen::Vector3d& p, const std::vector<Eigen::Vector3d>& ends,
+    const WallBand& wall, GainCounts& g,
+    std::vector<std::pair<Eigen::Vector3d, VoxelStatus>>& log,
+    const SensorModel&) {
+  scanUnique(p, ends, &wall, g, log);
+}
+void NativeMolaGrid::scanUnique(
+    const Eigen::Vector3d& p, const std::vector<Eigen::Vector3d>& ends,
+    const WallBand* wall, GainCounts& g,
+    std::vector<std::pair<Eigen::Vector3d, VoxelStatus>>& log) const {
   g = {};
+  // The wall band as cell rows. A band that is not finite, inverted or
+  // taller than kMaxWallBandCells turns the wall rule off rather than
+  // making every column a wall or none.
+  constexpr std::int64_t kMaxWallBandCells = 64;
+  Cell band_low, band_high;
+  const bool walls = wall != nullptr && wall->min_z <= wall->max_z &&
+                     key({0.0, 0.0, wall->min_z}, band_low) &&
+                     key({0.0, 0.0, wall->max_z}, band_high) &&
+                     band_high.z - band_low.z < kMaxWallBandCells;
+  std::unordered_map<Cell, bool, CellHash, CellEqual> wall_columns;
+  const auto isWallColumn = [&](const Cell& k) {
+    const Cell column{k.x, k.y, 0};
+    const auto known = wall_columns.find(column);
+    if (known != wall_columns.end()) return known->second;
+    bool occupied = false;
+    for (auto z = band_low.z; z <= band_high.z && !occupied; ++z)
+      occupied = status({k.x, k.y, z}) == VoxelStatus::kOccupied;
+    wall_columns.emplace(column, occupied);
+    return occupied;
+  };
   // Hashed rather than ordered: every cell the scan visits goes through it,
   // about 65k for the 648-ray, 20 m simulated VLP16.
   std::unordered_set<Cell, CellHash, CellEqual> seen;
@@ -443,6 +477,8 @@ void NativeMolaGrid::getScanStatusIterative(
   for (const auto& e : ends) {
     const bool valid = walk(p, e, [&](const Cell& k) {
       const auto s = status(k);
+      // A gap in a wall hides what is behind it, for every ray.
+      if (walls && s == VoxelStatus::kUnknown && isWallColumn(k)) return false;
       if (seen.insert(k).second) {
         log.emplace_back(center(k), s);
         if (s == VoxelStatus::kOccupied)

@@ -66,6 +66,13 @@ inline bool authorityTiltAcceptable(const Eigen::Matrix3d& rotation) {
   return std::isfinite(tilt) && tilt <= kMaxAuthorityTiltRad;
 }
 
+/// Height band, in the caller's frame, that makes an XY column a wall for
+/// getVisibleScanStatus: the column holds an occupied voxel overlapping it.
+struct WallBand {
+  double min_z = 0.0;
+  double max_z = 0.0;
+};
+
 struct XYCellCenter {
   Eigen::Vector2d center = Eigen::Vector2d::Zero();
   std::int64_t grid_x = 0;
@@ -336,6 +343,24 @@ class MapInterface {
       GainCounts& gain, std::vector<std::pair<Eigen::Vector3d, VoxelStatus>>&
                             voxel_log,
       const SensorModel& sensor) = 0;
+
+  /// getScanStatusIterative for rays that see only what the sensor could.
+  /// A lidar leaves unknown gaps in a wall between the voxels its returns
+  /// landed in, and a ray through such a gap counts the space behind the
+  /// wall. So an unknown voxel whose XY column holds an occupied voxel
+  /// overlapping `wall` ends the ray, as an occupied voxel does, and is
+  /// neither counted nor logged. An opening whose column holds no occupied
+  /// voxel in the band, such as a doorway, still lets rays through.
+  /// Backends without this override scan as getScanStatusIterative does.
+  virtual void getVisibleScanStatus(
+      const Eigen::Vector3d& pos,
+      const std::vector<Eigen::Vector3d>& multiray_endpoints,
+      const WallBand& wall, GainCounts& gain,
+      std::vector<std::pair<Eigen::Vector3d, VoxelStatus>>& voxel_log,
+      const SensorModel& sensor) {
+    (void)wall;
+    getScanStatusIterative(pos, multiray_endpoints, gain, voxel_log, sensor);
+  }
 
   // ----------------------------------------------------------- mutation
 

@@ -705,6 +705,39 @@ TEST(MolaMap, MeasuredGroundBelowBodyDoesNotInheritVoxelTop) {
             VoxelStatus::kOccupied);
 }
 
+TEST(MolaMap, VisibleScanLiftsTheWallBandIntoTheComponentFrame) {
+  // The component frame sits 1 m above navigation. A wall column over
+  // x = [2.0, 2.2) holds one return at component z = [1.4, 1.6), navigation
+  // z = [0.4, 0.6), and unknown gaps above it.
+  Publication publication;
+  MolaMap provider(config(publication));
+  Eigen::Isometry3d component_from_navigation = Eigen::Isometry3d::Identity();
+  component_from_navigation.translation() = Eigen::Vector3d(0.0, 0.0, 1.0);
+  const auto request = publication.publish(0, {{10, 2, 7}}, freeBlock(), true,
+                                           component_from_navigation);
+  provider.requestSnapshot(request);
+  ASSERT_TRUE(waitFor([&]() { return provider.getStatus(); }))
+      << provider.lastError();
+
+  // One ray, in navigation, rising through the gap at z = [0.6, 0.8).
+  const Eigen::Vector3d origin(0.1, 0.5, 0.5);
+  const std::vector<Eigen::Vector3d> ray{Eigen::Vector3d(10.1, 0.5, 1.3)};
+  const auto behindTheWall = [&](const mgg::WallBand& wall) {
+    mgg::GainCounts counts;
+    std::vector<std::pair<Eigen::Vector3d, VoxelStatus>> log;
+    provider.getVisibleScanStatus(origin, ray, wall, counts, log, {});
+    int behind = 0;
+    for (const auto& entry : log)
+      if (entry.second == VoxelStatus::kUnknown && entry.first.x() > 2.2)
+        ++behind;
+    return behind;
+  };
+  // The body band around the return, in navigation: the column is a wall.
+  EXPECT_EQ(behindTheWall({0.35, 0.65}), 0);
+  // A band below it: the ray passes the gap.
+  EXPECT_GT(behindTheWall({-0.25, 0.05}), 30);
+}
+
 TEST(NativeMolaGrid, HighAndUnmeasuredReturnsRemainBlockingOnSlopedSweep) {
   using Grid = mgg::NativeMolaGrid;
   const Eigen::Vector3d start(0.1, 0.1, 0.1343);
