@@ -435,6 +435,32 @@ TEST(GroundProjection, AGoalLooksUpOnlyWithinTheBoundedRise) {
   EXPECT_NE(status, VoxelStatus::kOccupied);
 }
 
+TEST(GroundProjection, AGoalFindsASupportExactlyAtTheBoundedRise) {
+  // The bound is inclusive: a floor whose top is exactly max_goal_ground_rise
+  // above the goal supports it (review r0), wherever the search starts.
+  PlanningParams params = makeParams();
+  params.max_goal_ground_rise = 6.0;
+  VoxelStatus status;
+  Floors at_bound({{5.8, 6.0}});
+  GroundProjection gp(at_bound, params);
+  Eigen::Vector3d goal(0.0, 0.0, 0.0);
+  EXPECT_DOUBLE_EQ(gp.projectGoal(goal, status), -6.0);
+  EXPECT_EQ(status, VoxelStatus::kOccupied);
+
+  // A solid reaching past the bound has its top out of reach; the floor
+  // under it is the support.
+  Floors past_bound({{5.8, 6.1}, {2.8, 3.0}});
+  GroundProjection past(past_bound, params);
+  goal = Eigen::Vector3d(0.0, 0.0, 0.0);
+  EXPECT_DOUBLE_EQ(past.projectGoal(goal, status), -3.0);
+  EXPECT_EQ(status, VoxelStatus::kOccupied);
+  Floors only_past({{5.8, 6.1}});
+  GroundProjection none(only_past, params);
+  goal = Eigen::Vector3d(0.0, 0.0, 0.0);
+  none.projectGoal(goal, status);
+  EXPECT_NE(status, VoxelStatus::kOccupied);
+}
+
 TEST(GroundProjection, AGoalTakesTheFloorNearestItsHeight) {
   Floors map({{-0.2, 0.0}, {1.8, 2.0}, {3.8, 4.0}});
   PlanningParams params = makeParams();

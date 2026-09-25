@@ -84,19 +84,23 @@ double GroundProjection::projectGoal(Eigen::Vector3d& sample,
   const bool have_below = below_status == VoxelStatus::kOccupied;
 
   // projectSample covers everything up to where its rays start; look above
-  // that, up to the bounded rise. From the top of the window down, each ray
-  // from free space stops on top of the next solid; step through that solid
-  // and look again, so the last top found is the lowest above the sample.
+  // that, up to the bounded rise. From above the window down, each ray from
+  // free space stops on top of the next solid; step through that solid and
+  // look again, so the last top found is the lowest above the sample. The
+  // walk starts a voxel above the bound so a top exactly at the bound is
+  // met from free space; a top past the bound is stepped through unrecorded.
   const double rise = params_.max_goal_ground_rise;
   const double reach =
       std::isfinite(rise) ? std::clamp(rise, 0.0, kMaxGoalGroundRise) : 0.0;
   const double resolution = map_.getResolution();
   const double floor_z = sample.z() + probeOffset(map_);
-  Eigen::Vector3d probe(sample.x(), sample.y(), sample.z() + reach);
+  const double bound_z = sample.z() + reach;
+  Eigen::Vector3d probe(sample.x(), sample.y(), bound_z + resolution);
   const Eigen::Vector3d end(sample.x(), sample.y(), floor_z);
   bool have_above = false;
   double above_z = 0.0;
-  for (int layer = 0; layer < kMaxGoalGroundLayers && resolution > 0.0;
+  for (int layer = 0;
+       layer < kMaxGoalGroundLayers && resolution > 0.0 && floor_z < bound_z;
        ++layer) {
     while (probe.z() > floor_z &&
            map_.getVoxelStatus(probe) == VoxelStatus::kOccupied) {
@@ -109,8 +113,10 @@ double GroundProjection::projectGoal(Eigen::Vector3d& sample,
         !(hit.z() > floor_z)) {
       break;
     }
-    have_above = true;
-    above_z = hit.z();
+    if (hit.z() <= bound_z + 1e-9) {
+      have_above = true;
+      above_z = hit.z();
+    }
     // Just under the reported top, which a backend's measured surface may
     // put on the solid's upper face, so the step down starts inside it.
     probe.z() = hit.z() - 1e-6;

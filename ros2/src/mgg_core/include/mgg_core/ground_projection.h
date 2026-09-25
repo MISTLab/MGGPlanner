@@ -59,8 +59,8 @@ class GroundProjection {
   /// seeded at the robot's altitude, which may be on another level.
   ///
   /// The ground projectSample finds below `sample` and the lowest ground
-  /// above it within max_goal_ground_rise (bounded to kMaxGoalGroundRise)
-  /// are the candidates; the one nearer `sample` wins, the one below on a
+  /// above it within max_goal_ground_rise (bounded to kMaxGoalGroundRise,
+  /// a top exactly at the bound included) are the candidates; the one nearer `sample` wins, the one below on a
   /// tie. Ground above is looked for straight above `sample`, on top of each
   /// solid a downward ray meets. Same contract as projectSample: returns
   /// how far below `sample` the ground lies, negative when above.
