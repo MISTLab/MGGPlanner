@@ -1762,6 +1762,31 @@ TEST_F(PlannerNodeTest, AFrontierARebuildCannotCarryKeepsExplorationOpen) {
   EXPECT_EQ(PlannerNodeTestPeer::frontiersLostInRebuild(*node), 1);
 }
 
+TEST_F(PlannerNodeTest, ReturnHomeWithNoGoalRoutesToTheRebuiltHome) {
+  // Review r0, M-3: the planner restarted away from home and seeded its
+  // graph at (0.5, -1); Return Home with no finite goal routes to vertex 0.
+  // The request rebuilds the graph, whose vertex 0 is the home keyframe
+  // at (0, 0): the route goes there, not to the old seed.
+  auto node = makeNode("rebuild_home_fallback");
+  PlannerNodeTestPeer::observeFloor(*node, -1.5, 6.0, -1.5, 1.5);
+  PlannerNodeTestPeer::observeWallAlongY(*node, -1.5, 0.6, 1.35);
+  PlannerNodeTestPeer::acceptOdometry(*node, 0.5, -1.0, 1.0);
+  PlannerNodeTestPeer::addGlobalChainToFrontier(*node, {{0.5, -0.5}});
+  PlannerNodeTestPeer::acceptOdometry(*node, 4.5, 0.0, 2.0);
+  PlannerNodeTestPeer::serveMap(*node, "component:test", 0);
+  auto source = std::make_unique<TrajectoryInMemory>();
+  source->trajectory = keyframesAlong(kRoundTheWall);
+  PlannerNodeTestPeer::setKeyframeSource(*node, std::move(source));
+
+  const auto response = returnHome(*node, std::nan(""), std::nan(""));
+  ASSERT_EQ(response->status,
+            mgg_msgs::srv::PlanObjective::Response::SUCCEEDED)
+      << response->reason;
+  EXPECT_EQ(PlannerNodeTestPeer::roadmapRebuilds(*node), 1);
+  EXPECT_NEAR(response->path.back().position.x, 0.0, 1e-3);
+  EXPECT_NEAR(response->path.back().position.y, 0.0, 1e-3);
+}
+
 TEST_F(PlannerNodeTest, AnExplorationPathThatCannotBeLinkedRebuildsTheGraph) {
   auto node = makeNode("rebuild_path_unlinked");
   PlannerNodeTestPeer::observeFloor(*node, -1.5, 6.0, -1.5, 1.5);

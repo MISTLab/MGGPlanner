@@ -2455,6 +2455,9 @@ void PlannerNode::onObjectiveRequest(
   }
   mgg::StateVec goal;
   double tolerance = 0.0;
+  // Return Home with no finite goal routes to vertex 0, which a rebuild
+  // (the robot's pose not linking) moves to the home keyframe.
+  bool home_is_vertex_zero = false;
   if (request->objective == Service::Request::RETURN_HOME) {
     // The caller's home is the home keyframe through its current map
     // correction, and it refuses a route that does not end there. Vertex 0
@@ -2471,6 +2474,7 @@ void PlannerNode::onObjectiveRequest(
       }
       goal = home->state;
       tolerance = 1e-3;
+      home_is_vertex_zero = true;
     }
   } else if (request->objective == Service::Request::NAVIGATE) {
     goal = fromPoseMsg(request->goal);
@@ -2495,8 +2499,16 @@ void PlannerNode::onObjectiveRequest(
   const bool local =
       request->objective == Service::Request::NAVIGATE &&
       routeOverLocalLattice(goal, route, turns_ok, local_reason);
-  if (!local &&
-      !routeOverGlobalGraph(goal, tolerance, route, turns_ok, reason)) {
+  const int rebuilds_before = roadmap_rebuilds_;
+  bool routed =
+      local || routeOverGlobalGraph(goal, tolerance, route, turns_ok, reason);
+  if (home_is_vertex_zero && roadmap_rebuilds_ != rebuilds_before) {
+    // The goal was the old vertex 0 (the seed where the planner started);
+    // the rebuilt graph's vertex 0 is the home keyframe.
+    goal = findGlobalVertex(0)->state;
+    routed = routeOverGlobalGraph(goal, tolerance, route, turns_ok, reason);
+  }
+  if (!routed) {
     if (!local_reason.empty()) reason += "; local lattice: " + local_reason;
     response->status = Service::Response::UNREACHABLE;
     response->reason = reason;
