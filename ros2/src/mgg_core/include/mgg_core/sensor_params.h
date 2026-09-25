@@ -80,16 +80,19 @@ class SensorParams {
                            std::vector<Eigen::Vector3d>& endpoints,
                            double range_scale) const;
 
-  /// Frontier test: is the unknown volume seen from a viewpoint a large
-  /// enough fraction of what the sensor could see in total?
-  bool isFrontier(double num_unknown_voxels_normalized) const;
+  /// Frontier test: are the distinct unknown voxels seen from a viewpoint a
+  /// large enough fraction, frontier_percentage_threshold, of the distinct
+  /// voxels the sensor's rays reach in space that is all unknown? False
+  /// until update().
+  bool isFrontier(int num_unknown_voxels, double voxel_size) const;
+
+  /// Distinct voxels of edge `voxel_size` that the ray table crosses from
+  /// the centre of a voxel: the denominator of the frontier test. Computed
+  /// once per sensor geometry and voxel size. Zero until update().
+  double uniqueVoxelsFullFov(double voxel_size) const;
 
   /// The subset of this description the map layer needs.
   SensorModel model() const { return SensorModel{width, height, resolution}; }
-
-  /// Voxel count a full field of view would sweep; the denominator of the
-  /// frontier test. Zero until update().
-  double numVoxelsFullFov() const { return num_voxels_full_fov_; }
 
  private:
   // Every one of these is initialised. The ROS 1 original left the rotations
@@ -100,7 +103,6 @@ class SensorParams {
   Eigen::Matrix<double, 3, 4> normal_vectors_ =
       Eigen::Matrix<double, 3, 4>::Zero();
   std::vector<Eigen::Vector3d> frustum_endpoints_body_;
-  double num_voxels_full_fov_ = 0.0;
 };
 
 }  // namespace mgg

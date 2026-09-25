@@ -1,6 +1,13 @@
 #include "mgg_core/sensor_params.h"
 
+#include <algorithm>
 #include <cmath>
+#include <cstdint>
+#include <limits>
+#include <map>
+#include <mutex>
+#include <unordered_set>
+#include <vector>
 
 namespace mgg {
 namespace {
@@ -68,8 +75,6 @@ void SensorParams::update() {
                                         center_offset);
     }
   }
-
-  num_voxels_full_fov_ = (fov[0] / h_res) * (fov[1] / v_res) * max_range;
 }
 
 bool SensorParams::isInsideFOV(const StateVec& state,
@@ -116,10 +121,72 @@ void SensorParams::getFrustumEndpoints(
   }
 }
 
-bool SensorParams::isFrontier(double num_unknown_voxels_normalized) const {
-  if (num_voxels_full_fov_ <= 0.0) return false;
-  return (num_unknown_voxels_normalized / num_voxels_full_fov_) >=
-         frontier_percentage_threshold;
+double SensorParams::uniqueVoxelsFullFov(double voxel_size) const {
+  if (frustum_endpoints_body_.empty() || !std::isfinite(voxel_size) ||
+      voxel_size <= 0.0) {
+    return 0.0;
+  }
+  // Cells are packed into 21 bits per axis, offset to stay positive.
+  constexpr std::int64_t kHalfSpan = std::int64_t(1) << 20;
+  double reach = 0.0;
+  for (const Eigen::Vector3d& p : frustum_endpoints_body_)
+    reach = std::max(reach, p.cwiseAbs().maxCoeff());
+  if (!(reach / voxel_size < double(kHalfSpan - 2))) return 0.0;
+
+  // The ray table and the voxel size decide the count, and the planner asks
+  // for it on every gain evaluation, so it is computed once per geometry.
+  std::vector<double> key{voxel_size};
+  key.reserve(1 + 3 * frustum_endpoints_body_.size());
+  for (const Eigen::Vector3d& p : frustum_endpoints_body_)
+    key.insert(key.end(), {p.x(), p.y(), p.z()});
+  static std::mutex mutex;
+  static std::map<std::vector<double>, double> counts;
+  {
+    const std::lock_guard<std::mutex> lock(mutex);
+    const auto found = counts.find(key);
+    if (found != counts.end()) return found->second;
+  }
+
+  // A 3-D DDA of each ray from the centre of voxel (0, 0, 0).
+  std::unordered_set<std::uint64_t> cells;
+  const auto pack = [&](const Eigen::Matrix<std::int64_t, 3, 1>& c) {
+    return (std::uint64_t(c.x() + kHalfSpan) << 42) |
+           (std::uint64_t(c.y() + kHalfSpan) << 21) |
+           std::uint64_t(c.z() + kHalfSpan);
+  };
+  const Eigen::Vector3d origin = Eigen::Vector3d::Constant(0.5 * voxel_size);
+  for (const Eigen::Vector3d& p : frustum_endpoints_body_) {
+    Eigen::Matrix<std::int64_t, 3, 1> cell(0, 0, 0), step(0, 0, 0), last;
+    Eigen::Vector3d next = Eigen::Vector3d::Constant(
+        std::numeric_limits<double>::infinity());
+    Eigen::Vector3d delta = next;
+    for (int axis = 0; axis < 3; ++axis) {
+      last[axis] = std::int64_t(std::floor((origin[axis] + p[axis]) / voxel_size));
+      if (p[axis] == 0.0) continue;
+      step[axis] = p[axis] > 0.0 ? 1 : -1;
+      next[axis] = 0.5 * voxel_size / std::abs(p[axis]);
+      delta[axis] = voxel_size / std::abs(p[axis]);
+    }
+    cells.insert(pack(cell));
+    while (cell != last) {
+      int axis = 0;
+      next.minCoeff(&axis);
+      if (next[axis] > 1.0) break;
+      cell[axis] += step[axis];
+      next[axis] += delta[axis];
+      cells.insert(pack(cell));
+    }
+  }
+  const double count = double(cells.size());
+  const std::lock_guard<std::mutex> lock(mutex);
+  counts.emplace(std::move(key), count);
+  return count;
+}
+
+bool SensorParams::isFrontier(int num_unknown_voxels, double voxel_size) const {
+  const double full = uniqueVoxelsFullFov(voxel_size);
+  if (full <= 0.0) return false;
+  return num_unknown_voxels / full >= frontier_percentage_threshold;
 }
 
 }  // namespace mgg

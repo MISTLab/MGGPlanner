@@ -175,12 +175,15 @@ void computeVolumetricGain(
                  free * ctx.planning->free_voxel_gain +
                  occupied * ctx.planning->occupied_voxel_gain;
 
-    // Scaled to metres, as the ROS 1 code did, so the threshold is
-    // resolution independent.
-    const double unknown_scaled = unknown * ctx.map->getResolution();
-    if (sensor.isFrontier(unknown_scaled) ||
-        (ctx.robot != nullptr && ctx.robot->type == RobotType::kGroundRobot &&
-         unknown_scaled >= 0.5)) {
+    // A ground robot's vertex is a frontier with 0.5 m of unknown, in
+    // voxels times their edge. Otherwise the distinct unknown voxels are
+    // measured against the distinct voxels the sensor's rays reach in space
+    // that is all unknown. The ray-length denominator of the ROS 1 code
+    // suited a count of every voxel of every ray; against distinct voxels it
+    // can deny a frontier even in space that is all unknown.
+    const double resolution = ctx.map->getResolution();
+    if ((ground_robot && unknown * resolution >= 0.5) ||
+        sensor.isFrontier(unknown, resolution)) {
       gain.is_frontier = true;
     }
   }

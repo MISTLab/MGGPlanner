@@ -281,4 +281,41 @@ TEST(NativeGain, UnderFloorGainDropsOnlyUnderMappedGround) {
   EXPECT_GT(beyondBetween(groundGain(stairwell, viewpoint), -0.5, -0.15), 30);
 }
 
+// Review r0 (P1): with distinct voxels counted, the frontier test still
+// divided by rays x range. At 0.5 degree steps and 1 m range that is 64800,
+// and every distinct voxel within 1 m, times 0.2, came to under 0.006 of
+// it: no frontier in space that is all unknown. Each voxel is now measured
+// against the distinct voxels the rays can reach.
+TEST(NativeGain, AnAerialViewOfUnknownSpaceIsAFrontierAtAnyResolution) {
+  mgg::NativeMolaGrid unknown_space(kResolution, {}, {}, {});
+  std::vector<Cell> free;
+  for (std::int64_t x = -8; x < 8; ++x)
+    for (std::int64_t y = -8; y < 8; ++y)
+      for (std::int64_t z = -8; z < 8; ++z) free.push_back({x, y, z});
+  mgg::NativeMolaGrid mapped_space(kResolution, {}, free, {});
+  for (const double degrees : {0.5, 1.0, 2.0, 5.0, 10.0}) {
+    for (const double range : {1.0, 5.0}) {
+      if (degrees < 1.0 && range > 1.0) continue;  // 64800 rays: slow
+      GainSetup unknown_setup(unknown_space);
+      mgg::SensorParams& sensor = unknown_setup.sensors["VLP16"];
+      sensor.max_range = range;
+      sensor.resolution = Eigen::Vector2d::Constant(degrees * M_PI / 180.0);
+      sensor.frontier_percentage_threshold = 0.05;
+      sensor.update();
+      mgg::VolumetricGain gain;
+      mgg::computeVolumetricGain(mgg::StateVec(0.1, 0.1, 0.1, 0.0), gain,
+                                 unknown_setup.ctx);
+      EXPECT_TRUE(gain.is_frontier) << degrees << " degrees, " << range << " m";
+
+      if (range > 1.0) continue;  // the mapped block is 3.2 m across
+      GainSetup mapped_setup(mapped_space);
+      mapped_setup.sensors["VLP16"] = sensor;
+      mgg::VolumetricGain mapped;
+      mgg::computeVolumetricGain(mgg::StateVec(0.1, 0.1, 0.1, 0.0), mapped,
+                                 mapped_setup.ctx);
+      EXPECT_FALSE(mapped.is_frontier) << degrees << " degrees";
+    }
+  }
+}
+
 }  // namespace

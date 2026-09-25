@@ -44,7 +44,8 @@ TEST(SensorParams, UnupdatedSensorIsInertNotGarbage) {
   EXPECT_TRUE(endpoints.empty());
 
   // Must not divide by an uninitialised denominator either.
-  EXPECT_FALSE(s.isFrontier(1000.0));
+  EXPECT_DOUBLE_EQ(s.uniqueVoxelsFullFov(0.2), 0.0);
+  EXPECT_FALSE(s.isFrontier(1000, 0.2));
 }
 
 TEST(SensorParams, RayCountMatchesTheRos1Implementation) {
@@ -113,10 +114,26 @@ TEST(SensorParams, LidarFovAcceptsNearbyAndRejectsDistant) {
 
 TEST(SensorParams, FrontierTestUsesTheConfiguredThreshold) {
   const SensorParams s = makeVlp16();
-  ASSERT_GT(s.numVoxelsFullFov(), 0.0);
-  // Threshold is 5% of the full field of view.
-  EXPECT_TRUE(s.isFrontier(0.10 * s.numVoxelsFullFov()));
-  EXPECT_FALSE(s.isFrontier(0.01 * s.numVoxelsFullFov()));
+  const double full = s.uniqueVoxelsFullFov(0.2);
+  ASSERT_GT(full, 0.0);
+  // Threshold is 5% of the distinct voxels the full field of view reaches.
+  EXPECT_TRUE(s.isFrontier(static_cast<int>(0.10 * full), 0.2));
+  EXPECT_FALSE(s.isFrontier(static_cast<int>(0.01 * full), 0.2));
+}
+
+// Each ray of 20 m crosses at least 100 voxels of 0.2 m; the rays share the
+// voxels near the sensor, so the distinct count is below rays x 170, the
+// most voxels a 20 m segment can cross.
+TEST(SensorParams, UniqueVoxelsFullFovCountsDistinctVoxelsOnce) {
+  const SensorParams s = makeVlp16();
+  std::vector<Eigen::Vector3d> endpoints;
+  s.getFrustumEndpoints(StateVec(0, 0, 0, 0), endpoints);
+  const double rays = static_cast<double>(endpoints.size());
+  const double full = s.uniqueVoxelsFullFov(0.2);
+  EXPECT_GT(full, 0.5 * rays * 100.0);
+  EXPECT_LT(full, rays * 170.0);
+  // Coarser voxels, fewer of them.
+  EXPECT_LT(s.uniqueVoxelsFullFov(0.4), full);
 }
 
 TEST(SensorParams, ModelExposesWhatTheMapLayerNeeds) {

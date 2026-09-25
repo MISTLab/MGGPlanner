@@ -92,6 +92,27 @@ class HalfMapped : public MapInterface {
   double frontier_x_;
 };
 
+/// Reports `count` distinct unknown voxels along +x from the viewpoint and
+/// nothing else, whatever the rays.
+class CountedUnknown : public HalfMapped {
+ public:
+  explicit CountedUnknown(int count) : count_(count) {}
+  void getScanStatusIterative(
+      const Eigen::Vector3d& pos, const std::vector<Eigen::Vector3d>&,
+      GainCounts& gain,
+      std::vector<std::pair<Eigen::Vector3d, VoxelStatus>>& log,
+      const SensorModel&) override {
+    gain = GainCounts{};
+    for (int i = 0; i < count_; ++i) {
+      log.emplace_back(pos + Eigen::Vector3d(0.2 * (i + 1), 0.0, 0.0),
+                       VoxelStatus::kUnknown);
+      ++gain.unknown;
+    }
+  }
+ private:
+  int count_;
+};
+
 struct Fixture {
   Fixture() {
     sensor.type = SensorType::kLidar;
@@ -190,6 +211,23 @@ TEST(Gain, FrontierIsFlaggedWhenEnoughUnknownIsVisible) {
   VolumetricGain deep;
   computeVolumetricGain(StateVec(-50.0, 0, 0, 0), deep, f.ctx);
   EXPECT_FALSE(deep.is_frontier);
+}
+
+// A ground robot's vertex is a frontier with 0.5 m of unknown: three voxels
+// of 0.2 m, as before the frontier test counted distinct voxels.
+TEST(Gain, AGroundRobotsFrontierNeedsHalfAMetreOfUnknown) {
+  for (const int count : {2, 3}) {
+    Fixture f;
+    CountedUnknown map(count);
+    f.ctx.map = &map;
+    mgg::RobotParams robot;
+    robot.type = mgg::RobotType::kGroundRobot;
+    f.ctx.robot = &robot;
+    VolumetricGain g;
+    computeVolumetricGain(StateVec(0, 0, 0, 0), g, f.ctx);
+    EXPECT_EQ(g.num_unknown_voxels, count);
+    EXPECT_EQ(g.is_frontier, count >= 3) << count << " voxels";
+  }
 }
 
 TEST(Gain, MissingSensorIsReportedNotCrashed) {
