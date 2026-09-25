@@ -451,19 +451,19 @@ void NativeMolaGrid::scanUnique(
     const WallBand* wall, GainCounts& g,
     std::vector<std::pair<Eigen::Vector3d, VoxelStatus>>& log) const {
   g = {};
-  // The wall band as cell rows. A band that is not finite, inverted or
-  // taller than kMaxWallBandCells turns the wall rule off rather than
-  // making every column a wall or none.
-  constexpr std::int64_t kMaxWallBandCells = 64;
-  Cell band_low, band_high;
+  // The wall band. It is a band of heights along wall->up, the caller's
+  // vertical in this grid's frame, which a tilted frame makes lean; each
+  // column holds the rows whose centres' heights lie in it. A band that is
+  // not finite, inverted, taller than kMaxWallBandCells or along a vertical
+  // tilted more than 60 degrees turns the wall rule off rather than making
+  // every column a wall or none.
+  constexpr double kMaxWallBandCells = 64.0;
   const bool walls =
-      wall != nullptr && wall->min_z <= wall->max_z &&
-      key({0.0, 0.0, wall->min_z - 0.5 * resolution_}, band_low) &&
-      key({0.0, 0.0, wall->max_z - 0.5 * resolution_}, band_high) &&
-      band_high.z - band_low.z < kMaxWallBandCells;
-  // A voxel belongs to the band when its centre does: the first row whose
-  // centre is at or above min_z, the last at or below max_z.
-  if (walls && center(band_low).z() < wall->min_z) ++band_low.z;
+      wall != nullptr && std::isfinite(wall->min_z) &&
+      std::isfinite(wall->max_z) && wall->min_z <= wall->max_z &&
+      wall->up.allFinite() && wall->up.z() > 0.5 * wall->up.norm() &&
+      (wall->max_z - wall->min_z) / (wall->up.z() * resolution_) <
+          kMaxWallBandCells;
   // Occupied rows of the band, per column, in ascending order.
   std::unordered_map<Cell, std::vector<std::int64_t>, CellHash, CellEqual>
       wall_rows;
@@ -472,9 +472,22 @@ void NativeMolaGrid::scanUnique(
     auto rows = wall_rows.find(column);
     if (rows == wall_rows.end()) {
       std::vector<std::int64_t> occupied;
-      for (auto z = band_low.z; z <= band_high.z; ++z)
-        if (status({k.x, k.y, z}) == VoxelStatus::kOccupied)
-          occupied.push_back(z);
+      const Eigen::Vector3d base = center({k.x, k.y, 0});
+      const double across = wall->up.x() * base.x() + wall->up.y() * base.y();
+      // Rows whose centre z satisfies min <= across + up.z z <= max, and one
+      // either side for rounding; each is checked on its own centre.
+      const double low = (wall->min_z - across) / wall->up.z();
+      const double high = (wall->max_z - across) / wall->up.z();
+      Cell first, last;
+      if (key({base.x(), base.y(), low}, first) &&
+          key({base.x(), base.y(), high}, last)) {
+        for (auto z = first.z - 1; z <= last.z + 1; ++z) {
+          const Cell cell{k.x, k.y, z};
+          const double height = wall->up.dot(center(cell));
+          if (height < wall->min_z || height > wall->max_z) continue;
+          if (status(cell) == VoxelStatus::kOccupied) occupied.push_back(z);
+        }
+      }
       rows = wall_rows.emplace(column, std::move(occupied)).first;
     }
     const auto& occupied = rows->second;

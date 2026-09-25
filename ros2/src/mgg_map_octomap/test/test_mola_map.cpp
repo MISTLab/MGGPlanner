@@ -740,6 +740,52 @@ TEST(MolaMap, VisibleScanLiftsTheWallBandIntoTheComponentFrame) {
   EXPECT_GT(behindTheWall({-0.25, 0.05}), 30);
 }
 
+// Review r0 (P2): the wall band went into the component frame lifted but
+// level. Under a merged frame's 0.04 rad pitch it is then off by 0.4 m 10 m
+// away: wall returns fall out of it, and floor returns into it.
+TEST(MolaMap, VisibleScanKeepsTheWallBandLevelInNavigationUnderTilt) {
+  Publication publication;
+  MolaMap provider(config(publication));
+  Eigen::Isometry3d component_from_navigation = Eigen::Isometry3d::Identity();
+  component_from_navigation.linear() =
+      Eigen::AngleAxisd(0.04, Eigen::Vector3d::UnitY()).toRotationMatrix();
+  // A component point p is at navigation height p.z + 0.04 p.x, about.
+  // At x = 10.1: returns in component rows 0 and 2, navigation 0.50 and
+  // 0.90, a wall's, with a gap in row 1. At x = -10.1: returns in rows 2
+  // and 4, navigation 0.10, a floor return below the band, and 0.50.
+  const auto request = publication.publish(
+      0, {{50, 2, 0}, {50, 2, 2}, {-51, 2, 2}, {-51, 2, 4}}, freeBlock(), true,
+      component_from_navigation);
+  provider.requestSnapshot(request);
+  ASSERT_TRUE(waitFor([&]() { return provider.getStatus(); }))
+      << provider.lastError();
+
+  // The navigation band of a vertex at z = 0.5 over a floor at 0.05.
+  const mgg::WallBand band{0.25, 1.7};
+  const Eigen::Vector3d origin(0.1, 0.5, 0.5);
+  const Eigen::Isometry3d navigation_from_component =
+      component_from_navigation.inverse();
+  // One ray through the middle of a gap, on to twice as far, and the
+  // unknown voxels it counted beyond the wall column.
+  const auto beyondTheGap = [&](const Eigen::Vector3d& gap_in_component) {
+    const Eigen::Vector3d gap = navigation_from_component * gap_in_component;
+    const std::vector<Eigen::Vector3d> ray{origin + 2.0 * (gap - origin)};
+    mgg::GainCounts counts;
+    std::vector<std::pair<Eigen::Vector3d, VoxelStatus>> log;
+    provider.getVisibleScanStatus(origin, ray, band, counts, log, {});
+    int beyond = 0;
+    for (const auto& entry : log)
+      if (entry.second == VoxelStatus::kUnknown &&
+          std::abs(entry.first.x()) > std::abs(gap.x()) + 0.2)
+        ++beyond;
+    return beyond;
+  };
+  // The wall's gap hides what is behind it.
+  EXPECT_EQ(beyondTheGap({10.1, 0.5, 0.3}), 0);
+  // A floor return and a return over it do not make a wall.
+  EXPECT_GT(beyondTheGap({-10.1, 0.5, 0.7}), 30);
+}
+
 TEST(NativeMolaGrid, HighAndUnmeasuredReturnsRemainBlockingOnSlopedSweep) {
   using Grid = mgg::NativeMolaGrid;
   const Eigen::Vector3d start(0.1, 0.1, 0.1343);

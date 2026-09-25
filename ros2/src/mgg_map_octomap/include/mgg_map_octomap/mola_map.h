@@ -180,10 +180,10 @@ class MolaMap : public MapInterface {
       const std::vector<Eigen::Vector3d>& multiray_endpoints, GainCounts& gain,
       std::vector<std::pair<Eigen::Vector3d, VoxelStatus>>& voxel_log,
       const SensorModel& sensor) override;
-  /// The wall band moves with the viewpoint into the component frame. The
-  /// frames differ by at most kMaxAuthorityTiltRad of tilt, which shifts the
-  /// band by the tilt times the distance from the viewpoint: 0.1 m at 5 m
-  /// for a 0.02 rad (1.1 degree) merged frame.
+  /// The wall band goes into the component frame as a band of navigation
+  /// heights: under a merged frame's tilt, up to kMaxAuthorityTiltRad, a
+  /// band that is level in the component frame would be off by the tilt
+  /// times the distance, 0.4 m at 10 m for 0.04 rad.
   void getVisibleScanStatus(
       const Eigen::Vector3d& pos,
       const std::vector<Eigen::Vector3d>& multiray_endpoints,

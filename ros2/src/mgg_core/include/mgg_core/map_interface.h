@@ -66,13 +66,17 @@ inline bool authorityTiltAcceptable(const Eigen::Matrix3d& rotation) {
   return std::isfinite(tilt) && tilt <= kMaxAuthorityTiltRad;
 }
 
-/// Heights, in the caller's frame, at which an occupied voxel is evidence of
-/// a wall for getVisibleScanStatus. The band starts above the floor, so that
-/// floor returns are never taken for a wall. A voxel belongs to the band
-/// when its centre does.
+/// Heights at which an occupied voxel is evidence of a wall for
+/// getVisibleScanStatus. The band starts above the floor, so that floor
+/// returns are never taken for a wall. A voxel belongs to the band when its
+/// centre's height, `up` dotted with it, lies in [min_z, max_z]. `up` is the
+/// caller's vertical, in the frame of the scan: a backend whose grid is
+/// tilted from the caller's frame passes the band on with its own
+/// coordinates of that vertical.
 struct WallBand {
   double min_z = 0.0;
   double max_z = 0.0;
+  Eigen::Vector3d up = Eigen::Vector3d::UnitZ();
 };
 
 /// Most voxels, stacked in a column between two wall returns, that

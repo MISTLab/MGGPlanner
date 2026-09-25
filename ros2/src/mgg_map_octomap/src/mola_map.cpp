@@ -1304,8 +1304,11 @@ void MolaMap::getVisibleScanStatus(
   std::vector<Eigen::Vector3d> endpoints = multiray_endpoints;
   transformPoints(transform, endpoints);
   const Eigen::Vector3d origin = transform * pos;
-  const double lift = origin.z() - pos.z();
-  const WallBand component_wall{wall.min_z + lift, wall.max_z + lift};
+  // A navigation point n is p = R n + t in the component frame, so its
+  // height up . n is (R up) . p - (R up) . t.
+  const Eigen::Vector3d up = transform.linear() * wall.up;
+  const double lift = up.dot(transform.translation());
+  const WallBand component_wall{wall.min_z + lift, wall.max_z + lift, up};
   snapshot->map->getVisibleScanStatus(origin, endpoints, component_wall, gain,
                                       voxel_log, sensor);
   const Eigen::Isometry3d inverse = transform.inverse();

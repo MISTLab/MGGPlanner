@@ -678,17 +678,16 @@ void OctomapMap::scanUnique(
   // key-based traversal makes the equivalent saving available far more
   // cheaply: dedupe on voxel keys instead of reasoning about ray geometry.
   gain = GainCounts{};
-  // The wall band as key rows; see NativeMolaGrid::scanUnique.
-  constexpr int kMaxWallBandCells = 64;
+  // The wall band, a band of heights along wall->up; see
+  // NativeMolaGrid::scanUnique.
+  constexpr double kMaxWallBandCells = 64.0;
   const double resolution = tree_->getResolution();
-  octomap::key_type band_low = 0, band_high = 0;
   const bool walls =
-      wall != nullptr && wall->min_z <= wall->max_z &&
-      tree_->coordToKeyChecked(wall->min_z - 0.5 * resolution, band_low) &&
-      tree_->coordToKeyChecked(wall->max_z - 0.5 * resolution, band_high) &&
-      int(band_high) - int(band_low) < kMaxWallBandCells;
-  int first_row = band_low, last_row = band_high;
-  if (walls && tree_->keyToCoord(band_low) < wall->min_z) ++first_row;
+      wall != nullptr && std::isfinite(wall->min_z) &&
+      std::isfinite(wall->max_z) && wall->min_z <= wall->max_z &&
+      wall->up.allFinite() && wall->up.z() > 0.5 * wall->up.norm() &&
+      (wall->max_z - wall->min_z) / (wall->up.z() * resolution) <
+          kMaxWallBandCells;
   // Occupied rows of the band, per column, in ascending order.
   std::unordered_map<std::uint32_t, std::vector<int>> wall_rows;
   const auto isWallGap = [&](const octomap::OcTreeKey& key) {
@@ -696,11 +695,22 @@ void OctomapMap::scanUnique(
     auto rows = wall_rows.find(column);
     if (rows == wall_rows.end()) {
       std::vector<int> occupied;
-      for (int z = first_row; z <= last_row; ++z) {
-        const octomap::OcTreeKey cell(key[0], key[1],
-                                      static_cast<octomap::key_type>(z));
-        if (statusAt(tree_->keyToCoord(cell)) == VoxelStatus::kOccupied)
-          occupied.push_back(z);
+      const octomap::point3d base = tree_->keyToCoord(key);
+      const double across = wall->up.x() * base.x() + wall->up.y() * base.y();
+      octomap::key_type first = 0, last = 0;
+      if (tree_->coordToKeyChecked((wall->min_z - across) / wall->up.z(),
+                                   first) &&
+          tree_->coordToKeyChecked((wall->max_z - across) / wall->up.z(),
+                                   last)) {
+        for (int z = int(first) - 1; z <= int(last) + 1; ++z) {
+          if (z < 0 || z > 0xffff) continue;
+          const octomap::OcTreeKey cell(key[0], key[1],
+                                        static_cast<octomap::key_type>(z));
+          const octomap::point3d centre = tree_->keyToCoord(cell);
+          const double height = wall->up.dot(toEigen(centre));
+          if (height < wall->min_z || height > wall->max_z) continue;
+          if (statusAt(centre) == VoxelStatus::kOccupied) occupied.push_back(z);
+        }
       }
       rows = wall_rows.emplace(column, std::move(occupied)).first;
     }
