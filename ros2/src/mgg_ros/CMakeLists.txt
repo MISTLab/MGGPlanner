@@ -37,16 +37,18 @@ find_package(mgg_map_octomap REQUIRED)
 find_package(nav_msgs REQUIRED)
 find_package(sensor_msgs REQUIRED)
 find_package(std_srvs REQUIRED)
+find_package(nlohmann_json REQUIRED)
 
 add_library(${PROJECT_NAME}
   src/param_loader.cpp
   src/conversions.cpp
+  src/keyframe_trajectory.cpp
   src/planner_node.cpp)
 target_include_directories(${PROJECT_NAME} PUBLIC
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
   $<INSTALL_INTERFACE:include>)
 target_link_libraries(${PROJECT_NAME} mgg_core::mgg_core
-  mgg_map_octomap::mgg_map_octomap Eigen3::Eigen)
+  mgg_map_octomap::mgg_map_octomap Eigen3::Eigen nlohmann_json::nlohmann_json)
 # The cloud_octomap map backend exists only if mgg_map_octomap has OctoMap.
 if(mgg_map_octomap_WITH_OCTOMAP)
   target_compile_definitions(${PROJECT_NAME} PRIVATE MGG_WITH_OCTOMAP)
@@ -68,7 +70,7 @@ install(TARGETS ${PROJECT_NAME} EXPORT export_${PROJECT_NAME}
 ament_export_targets(export_${PROJECT_NAME} HAS_LIBRARY_TARGET)
 ament_export_dependencies(mgg_core mgg_msgs mgg_map_octomap rclcpp
   geometry_msgs visualization_msgs tf2_msgs tf2_ros nav_msgs sensor_msgs std_srvs
-  Eigen3)
+  Eigen3 nlohmann_json)
 ament_export_include_directories(include)
 
 if(BUILD_TESTING)
@@ -79,6 +81,8 @@ if(BUILD_TESTING)
   ament_add_gtest(test_conversions test/test_conversions.cpp)
   target_link_libraries(test_conversions ${PROJECT_NAME})
   ament_target_dependencies(test_conversions rclcpp mgg_msgs)
+  ament_add_gtest(test_keyframe_trajectory test/test_keyframe_trajectory.cpp)
+  target_link_libraries(test_keyframe_trajectory ${PROJECT_NAME})
   ament_add_gtest(test_map_backend test/test_map_backend.cpp)
   target_link_libraries(test_map_backend ${PROJECT_NAME})
   ament_target_dependencies(test_map_backend rclcpp)
