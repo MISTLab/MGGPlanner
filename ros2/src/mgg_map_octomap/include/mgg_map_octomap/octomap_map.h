@@ -162,6 +162,12 @@ class OctomapMap : public MapInterface {
                Visitor visit) const;
 
   VoxelStatus statusAt(const octomap::point3d& p) const;
+  /// getPathStatus for a zero-size box: every voxel the segment crosses,
+  /// both endpoint voxels and, where it passes exactly through a voxel edge
+  /// or corner, every voxel meeting there (a 3-D DDA).
+  VoxelStatus centreLinePathStatus(const Eigen::Vector3d& start,
+                                   const Eigen::Vector3d& end,
+                                   bool stop_at_unknown_voxel) const;
   VoxelStatus queryBox(const Eigen::Vector3d& center,
                        const Eigen::Vector3d& size,
                        double unknown_fraction) const;

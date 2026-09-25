@@ -413,6 +413,39 @@ TEST(MolaMap, TransientDiscsAreOccupiedUntilTheyExpire) {
 }
 
 
+TEST(MolaMap, ZeroSizePathVisitsEveryVoxelTheSegmentCrossesAndHonoursDiscs) {
+  // The robot's own-pose link is checked along its centre line: a zero-size
+  // sweep. It must still meet every voxel the segment crosses, here
+  // [0,0.2) x [0.2,0.4) x [0,0.2), which it enters between fractions 0.8 and
+  // 0.9 (review r0), and a neighbour's transient disc.
+  Publication publication;
+  const Voxel wall{0, 1, 0};
+  const auto request = publication.publish(
+      0, {wall}, freeBlockWithout(wall), true, Eigen::Isometry3d::Identity(),
+      {}, {}, /*surface_fraction=*/0.9);
+  MolaMap provider(config(publication));
+  mgg::MapInterface* map = &provider;
+  provider.requestSnapshot(request);
+  ASSERT_TRUE(waitFor([&]() { return map->getStatus(); }))
+      << provider.lastError();
+  const Eigen::Vector3d a(0.02, 0.04, 0.10);
+  const Eigen::Vector3d b(0.22, 0.24, 0.10);
+  const Eigen::Vector3d zero = Eigen::Vector3d::Zero();
+  for (const bool stop_at_unknown : {false, true}) {
+    EXPECT_EQ(map->getPathStatus(a, b, zero, stop_at_unknown),
+              VoxelStatus::kOccupied);
+    EXPECT_EQ(map->getPathStatus(b, a, zero, stop_at_unknown),
+              VoxelStatus::kOccupied);
+  }
+  // Away from the wall the centre line is free, until a neighbour stands on
+  // it.
+  const Eigen::Vector3d c(0.5, 0.1, 0.1);
+  const Eigen::Vector3d d(1.3, 0.1, 0.1);
+  ASSERT_EQ(map->getPathStatus(c, d, zero, true), VoxelStatus::kFree);
+  provider.setTransientDiscs({Eigen::Vector2d(0.9, 0.3)}, 0.25, 60.0);
+  EXPECT_EQ(map->getPathStatus(c, d, zero, true), VoxelStatus::kOccupied);
+}
+
 // Visibility retirement. A peer robot captured beside this one leaves an
 // occupied voxel and terrain surface samples that obstacle expiry alone cannot
 // disprove, so the builder drops both once later qualified rays have seen

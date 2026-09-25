@@ -1,6 +1,7 @@
 #include "mgg_map_octomap/octomap_map.h"
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstdint>
 #include <limits>
@@ -359,6 +360,10 @@ VoxelStatus OctomapMap::getPathStatus(const Eigen::Vector3d& start,
   const double r = tree_->getResolution();
   const double len = (end - start).norm();
   if (len < 1e-9) return getBoxStatus(start, box_size, stop_at_unknown_voxel);
+  // Point samples a resolution apart cut corners a zero-size segment crosses.
+  if (box_size.allFinite() && (box_size.array() == 0.0).all()) {
+    return centreLinePathStatus(start, end, stop_at_unknown_voxel);
+  }
   const int steps = std::max(1, static_cast<int>(std::ceil(len / r)));
 
   bool saw_unknown = false;
@@ -374,6 +379,97 @@ VoxelStatus OctomapMap::getPathStatus(const Eigen::Vector3d& start,
     if (s == VoxelStatus::kUnknown) saw_unknown = true;
   }
   return saw_unknown ? VoxelStatus::kUnknown : VoxelStatus::kFree;
+}
+
+VoxelStatus OctomapMap::centreLinePathStatus(
+    const Eigen::Vector3d& start, const Eigen::Vector3d& end,
+    const bool stop_at_unknown_voxel) const {
+  if (!start.allFinite() || !end.allFinite()) return VoxelStatus::kUnknown;
+  const double resolution = tree_->getResolution();
+  std::array<octomap::key_type, 3> current{};
+  std::array<octomap::key_type, 3> target{};
+  for (int axis = 0; axis < 3; ++axis) {
+    if (!tree_->coordToKeyChecked(start[axis], current[axis]) ||
+        !tree_->coordToKeyChecked(end[axis], target[axis])) {
+      return VoxelStatus::kUnknown;
+    }
+  }
+  // Bounded work in a non-preemptible callback: at most seven voxels meet
+  // the segment at each crossing.
+  constexpr std::uint64_t kMaxCrossings = 1u << 20;
+  std::uint64_t crossings = 0;
+  for (int axis = 0; axis < 3; ++axis) {
+    crossings += static_cast<std::uint64_t>(
+        std::abs(int(target[axis]) - int(current[axis])));
+  }
+  if (crossings > kMaxCrossings) return VoxelStatus::kUnknown;
+
+  bool saw_unknown = false;
+  // True when the voxel is occupied, which ends the walk.
+  const auto occupied = [&](const std::array<int, 3>& key) {
+    for (int axis = 0; axis < 3; ++axis) {
+      if (key[axis] < 0 || key[axis] > 0xFFFF) {
+        saw_unknown = true;
+        return false;
+      }
+    }
+    const octomap::OcTreeKey voxel(static_cast<octomap::key_type>(key[0]),
+                                   static_cast<octomap::key_type>(key[1]),
+                                   static_cast<octomap::key_type>(key[2]));
+    const VoxelStatus status = statusAt(tree_->keyToCoord(voxel));
+    if (status == VoxelStatus::kUnknown) saw_unknown = true;
+    return status == VoxelStatus::kOccupied;
+  };
+
+  std::array<int, 3> key{current[0], current[1], current[2]};
+  if (occupied(key)) return VoxelStatus::kOccupied;
+  const Eigen::Vector3d direction = end - start;
+  std::array<int, 3> step{};
+  Eigen::Vector3d next =
+      Eigen::Vector3d::Constant(std::numeric_limits<double>::infinity());
+  Eigen::Vector3d delta = next;
+  for (int axis = 0; axis < 3; ++axis) {
+    if (direction[axis] == 0.0) continue;
+    step[axis] = direction[axis] > 0.0 ? 1 : -1;
+    const double boundary = tree_->keyToCoord(current[axis]) +
+                            0.5 * resolution * double(step[axis]);
+    next[axis] = (boundary - start[axis]) / direction[axis];
+    delta[axis] = resolution / std::abs(direction[axis]);
+  }
+  // Each pass crosses at least one boundary; the target voxel is checked
+  // after the loop whether or not rounding lets the walk reach it.
+  for (std::uint64_t pass = 0;
+       pass <= crossings &&
+       (key[0] != target[0] || key[1] != target[1] || key[2] != target[2]);
+       ++pass) {
+    const double crossing = next.minCoeff();
+    if (!(crossing <= 1.0)) break;
+    const double tolerance = 16.0 * std::numeric_limits<double>::epsilon() *
+                             std::max(1.0, std::abs(crossing));
+    unsigned mask = 0;
+    for (int axis = 0; axis < 3; ++axis) {
+      if (std::abs(next[axis] - crossing) <= tolerance) mask |= 1u << axis;
+    }
+    // Through an edge or a corner: every voxel meeting there.
+    for (unsigned subset = mask; subset != 0; subset = (subset - 1) & mask) {
+      std::array<int, 3> touched = key;
+      for (int axis = 0; axis < 3; ++axis) {
+        if (subset & (1u << axis)) touched[axis] += step[axis];
+      }
+      if (occupied(touched)) return VoxelStatus::kOccupied;
+    }
+    for (int axis = 0; axis < 3; ++axis) {
+      if (mask & (1u << axis)) {
+        key[axis] += step[axis];
+        next[axis] += delta[axis];
+      }
+    }
+  }
+  if (occupied({target[0], target[1], target[2]})) {
+    return VoxelStatus::kOccupied;
+  }
+  return stop_at_unknown_voxel && saw_unknown ? VoxelStatus::kUnknown
+                                              : VoxelStatus::kFree;
 }
 
 VoxelStatus OctomapMap::getOccupiedOnlyCylinderPathStatus(

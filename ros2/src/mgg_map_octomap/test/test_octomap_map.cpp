@@ -125,6 +125,58 @@ TEST(OctomapMap, StrictPathEnvelopeIncludesDiagonalCrossedVoxel) {
             VoxelStatus::kOccupied);
 }
 
+TEST(OctomapMap, ZeroSizePathVisitsEveryVoxelTheSegmentCrosses) {
+  // Sampled at resolution steps, this diagonal's three points miss the voxel
+  // [0,0.2) x [0.2,0.4) x [0,0.2), which it crosses between fractions 0.8
+  // and 0.9 (review r0). A robot's own-pose link is checked this way.
+  OctomapConfig cfg;
+  cfg.resolution = 0.2;
+  OctomapMap map(cfg);
+  map.augmentFreeBox({0.2, 0.2, 0.1}, {0.8, 0.8, 0.2});
+  octomap::OcTreeKey key;
+  ASSERT_TRUE(map.tree()->coordToKeyChecked(
+      octomap::point3d(0.1F, 0.3F, 0.1F), key));
+  map.tree()->setNodeValue(key, map.tree()->getClampingThresMaxLog());
+  const Eigen::Vector3d a(0.02, 0.04, 0.10);
+  const Eigen::Vector3d b(0.22, 0.24, 0.10);
+  const Eigen::Vector3d zero = Eigen::Vector3d::Zero();
+  for (const bool stop_at_unknown : {false, true}) {
+    EXPECT_EQ(map.getPathStatus(a, b, zero, stop_at_unknown),
+              VoxelStatus::kOccupied);
+    EXPECT_EQ(map.getPathStatus(b, a, zero, stop_at_unknown),
+              VoxelStatus::kOccupied);
+  }
+  // Parallel to it one voxel down, the segment crosses only free voxels.
+  EXPECT_EQ(map.getPathStatus(a - Eigen::Vector3d(0.0, 0.2, 0.0) +
+                                  Eigen::Vector3d(0.2, 0.2, 0.0),
+                              b + Eigen::Vector3d(0.2, 0.0, 0.0), zero, true),
+            VoxelStatus::kFree);
+
+  // Both endpoint voxels count, even one the segment barely enters.
+  OctomapMap ends(cfg);
+  ends.augmentFreeBox({0.2, 0.2, 0.1}, {0.8, 0.8, 0.2});
+  ASSERT_TRUE(ends.tree()->coordToKeyChecked(
+      octomap::point3d(0.3F, 0.1F, 0.1F), key));
+  ends.tree()->setNodeValue(key, ends.tree()->getClampingThresMaxLog());
+  const Eigen::Vector3d inside(0.201, 0.1, 0.1);
+  const Eigen::Vector3d outside(0.1, 0.1, 0.1);
+  EXPECT_EQ(ends.getPathStatus(outside, inside, zero, false),
+            VoxelStatus::kOccupied);
+  EXPECT_EQ(ends.getPathStatus(inside, outside, zero, false),
+            VoxelStatus::kOccupied);
+
+  // An unknown voxel on the way is unknown only when the caller asks.
+  OctomapMap gap(cfg);
+  // Voxels (0,0), (1,1) and (1,0) free; (0,1), which the segment crosses,
+  // never observed.
+  gap.augmentFreeBox({0.1, 0.1, 0.1}, {0.1, 0.1, 0.1});
+  gap.augmentFreeBox({0.3, 0.3, 0.1}, {0.1, 0.1, 0.1});
+  gap.augmentFreeBox({0.3, 0.1, 0.1}, {0.1, 0.1, 0.1});
+  ASSERT_EQ(gap.getVoxelStatus({0.1, 0.3, 0.1}), VoxelStatus::kUnknown);
+  EXPECT_EQ(gap.getPathStatus(a, b, zero, true), VoxelStatus::kUnknown);
+  EXPECT_EQ(gap.getPathStatus(a, b, zero, false), VoxelStatus::kFree);
+}
+
 TEST(OctomapMap, OccupiedOnlySweepCoversEveryAabbFaceAndSegmentBoundary) {
   const Eigen::Vector3d start(0.0, 0.0, 0.0);
   const Eigen::Vector3d end(0.20, 0.0, 0.0);
