@@ -254,6 +254,39 @@ class PlannerNodeTestPeer {
     const std::lock_guard<std::recursive_mutex> lock(node.planner_mutex_);
     return node.straightDeparture(start, path, reverse);
   }
+  /// A chain of this robot's roadmap from the global graph's root through
+  /// `points`, at driving height; its last vertex a frontier. Returns that
+  /// vertex's id.
+  static int addGlobalChainToFrontier(
+      PlannerNode& node, const std::vector<Eigen::Vector2d>& points) {
+    const std::lock_guard<std::recursive_mutex> lock(node.planner_mutex_);
+    node.seedGlobalGraph();
+    mgg::Vertex* previous = node.global_graph_->getVertex(0);
+    for (const Eigen::Vector2d& p : points) {
+      auto* v = new mgg::Vertex(node.global_graph_->generateVertexID(),
+                                mgg::StateVec(p.x(), p.y(),
+                                              previous->state.z(), 0.0));
+      v->robot_id = static_cast<int>(node.planning_params_.robot_id);
+      node.global_graph_->addVertex(v);
+      node.global_graph_->addEdge(
+          v, previous, (v->state - previous->state).head<3>().norm());
+      previous = v;
+    }
+    previous->type = mgg::VertexType::kFrontier;
+    ++node.graph_revision_;
+    return previous->id;
+  }
+  /// The global planner runs as soon as the lattice has no frontier.
+  static void consultGlobalPlannerAtOnce(PlannerNode& node) {
+    node.auto_global_planner_low_gain_rounds_ = 0;
+  }
+  /// A global repositioning to `target_id` under way, and resumed while
+  /// the robot is more than a metre from it.
+  static void repositionTowards(PlannerNode& node, int target_id) {
+    node.global_frontier_reach_m_ = 1.0;
+    node.global_exploration_ongoing_ = true;
+    node.current_global_vertex_id_ = target_id;
+  }
   static int boxedInWithoutDeparture(PlannerNode& node) {
     return node.boxed_in_without_departure_;
   }
@@ -1017,6 +1050,43 @@ TEST_F(PlannerNodeTest, ExplorationBoxedInSendsNoPathThatStartsWithATurn) {
   EXPECT_TRUE(response->path.empty())
       << "path of " << response->path.size() << " poses";
   EXPECT_EQ(PlannerNodeTestPeer::boxedInWithoutDeparture(*node), 1);
+  // A path may come on a later cycle: not exploration complete.
+  EXPECT_EQ(response->status, PlannerNode::kStatusNoPath);
+}
+
+TEST_F(PlannerNodeTest, ABoxedInRobotGetsNoGlobalRouteThatStartsWithATurn) {
+  // Review r0: with no local frontier for long enough the global planner is
+  // consulted, and its route to a global frontier is kept when it turns
+  // where it may not. Boxed in facing across the corridor, a route along it
+  // to a frontier starts with a turn the robot has no room for, the very
+  // path the boxed-in rule withholds. Neither the low-gain repositioning
+  // nor one already under way may send it, and the robot is not told
+  // exploration is complete: it gets no path, and its adapter's recovery
+  // runs.
+  auto node = boxedIn("boxed_global", -2.5, 2.5);
+  auto msg = std::make_shared<nav_msgs::msg::Odometry>();
+  msg->header.stamp.sec = 1;
+  msg->pose.pose.position.z = 0.075;
+  msg->pose.pose.orientation.z = std::sin(M_PI / 4.0);
+  msg->pose.pose.orientation.w = std::cos(M_PI / 4.0);
+  PlannerNodeTestPeer::acceptOdometry(*node, msg);
+  const int frontier = PlannerNodeTestPeer::addGlobalChainToFrontier(
+      *node, {{0.5, 0.0}, {1.0, 0.0}, {1.5, 0.0}, {2.0, 0.0}, {2.5, 0.0},
+              {3.0, 0.0}, {3.5, 0.0}});
+  PlannerNodeTestPeer::consultGlobalPlannerAtOnce(*node);
+
+  auto response = std::make_shared<mgg_msgs::srv::PlannerSrv::Response>();
+  PlannerNodeTestPeer::plan(*node, response);
+  EXPECT_TRUE(response->path.empty())
+      << "path of " << response->path.size() << " poses";
+  EXPECT_EQ(response->status, PlannerNode::kStatusNoPath);
+
+  PlannerNodeTestPeer::repositionTowards(*node, frontier);
+  response = std::make_shared<mgg_msgs::srv::PlannerSrv::Response>();
+  PlannerNodeTestPeer::plan(*node, response);
+  EXPECT_TRUE(response->path.empty())
+      << "path of " << response->path.size() << " poses";
+  EXPECT_EQ(response->status, PlannerNode::kStatusNoPath);
 }
 
 }  // namespace mgg_ros

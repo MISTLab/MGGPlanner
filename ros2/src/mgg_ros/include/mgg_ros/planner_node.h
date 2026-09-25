@@ -343,6 +343,13 @@ class PlannerNode : public rclcpp::Node {
   /// started.
   int boxed_in_departures_ = 0;
   int boxed_in_without_departure_ = 0;
+  /// This cycle's exploration selection found the robot boxed in with no
+  /// straight departure: no global repositioning is tried in its place.
+  bool boxed_in_without_departure_now_ = false;
+  /// The last route to a goal kept although it turns sharply where it may
+  /// not, and its first turn, from the robot's heading, is sharp where the
+  /// robot has no room to turn (applyRouteTurnRule): a turn it cannot make.
+  bool last_route_starts_with_turn_without_room_ = false;
   /// Exploration paths sent unshortcut because the shortcut, once resampled,
   /// turned where the lattice path did not, since the node started.
   int shortcut_turn_reverts_ = 0;
