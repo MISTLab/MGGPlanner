@@ -43,6 +43,7 @@ add_library(${PROJECT_NAME}
   src/gain.cpp
   src/trajectory.cpp
   src/path_selection.cpp
+  src/path_turns.cpp
   src/global_graph.cpp
   src/random_sampler.cpp
   src/log.cpp)
@@ -88,6 +89,8 @@ if(BUILD_TESTING)
   target_link_libraries(test_trajectory ${PROJECT_NAME})
   ament_add_gtest(test_path_selection test/test_path_selection.cpp)
   target_link_libraries(test_path_selection ${PROJECT_NAME})
+  ament_add_gtest(test_path_turns test/test_path_turns.cpp)
+  target_link_libraries(test_path_turns ${PROJECT_NAME})
   ament_add_gtest(test_global_graph test/test_global_graph.cpp)
   target_link_libraries(test_global_graph ${PROJECT_NAME})
 endif()

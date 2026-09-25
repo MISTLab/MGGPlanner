@@ -334,6 +334,45 @@ TEST(PathSelection, WithNoPathEndingClearTheBestPathIsStillChosen) {
   EXPECT_TRUE(r.unclear_viewpoint);
 }
 
+TEST(PathSelection, PathThatTurnsOnlyWhereItMayOutranksRicherOnes) {
+  Fork f;
+  for (Vertex* v : f.x_branch) v->vol_gain.gain = 100.0;
+  for (Vertex* v : f.y_branch) v->vol_gain.gain = 1.0;
+  EdgeInclinations flat;
+  // The +x branch turns sharply on a slope; the +y branch ends against a
+  // wall. Turning outranks clearance.
+  const mgg::PathTurnsFn turns = [](const std::vector<Vertex*>& path) {
+    return path.back()->state.x() < 0.5;
+  };
+  const mgg::ViewpointClearFn clear = [](const Vertex& v) {
+    return v.state.y() < 0.5;
+  };
+  const auto r = mgg::selectBestPath(f.graph, makePlanning(), RobotParams(),
+                                     flat, 0.2, 0.0, {}, 0.0, clear, turns);
+  EXPECT_EQ(r.best_path_id, 6);
+  EXPECT_TRUE(r.unclear_viewpoint);
+  EXPECT_FALSE(r.sharp_turn_fallback);
+  EXPECT_EQ(r.paths_with_sharp_turns, 1);
+}
+
+TEST(PathSelection, WithNoPathTurningWhereItMayTheBestPathIsStillChosen) {
+  Fork f;
+  for (Vertex* v : f.x_branch) v->vol_gain.gain = 100.0;
+  for (Vertex* v : f.y_branch) v->vol_gain.gain = 1.0;
+  EdgeInclinations flat;
+  const mgg::PathTurnsFn nowhere = [](const std::vector<Vertex*>&) {
+    return false;
+  };
+  const auto r = mgg::selectBestPath(f.graph, makePlanning(), RobotParams(),
+                                     flat, 0.2, 0.0, {}, 0.0, nullptr,
+                                     nowhere);
+  EXPECT_EQ(r.best_path_id, 3);
+  EXPECT_DOUBLE_EQ(r.best_gain, 300.0);
+  EXPECT_TRUE(r.sharp_turn_fallback);
+  EXPECT_EQ(r.paths_with_sharp_turns, 2);
+  EXPECT_EQ(r.leaves_evaluated, 2);
+}
+
 TEST(PullBackToClearViewpoint, RouteEndsAtItsLastClearPose) {
   std::vector<StateVec> route;
   for (int i = 0; i <= 4; ++i) route.emplace_back(0.5 * i, 0.0, 0.0, 0.0);

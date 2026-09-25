@@ -20,6 +20,7 @@
 #include "mgg_core/graph_manager.h"
 #include "mgg_core/map_interface.h"
 #include "mgg_core/params.h"
+#include "mgg_core/path_turns.h"
 #include "mgg_core/types.h"
 
 namespace mgg {
@@ -99,6 +100,12 @@ struct PathSelectionResult {
   /// No admissible path ended clear, so the best path was chosen without
   /// the clearance check.
   bool unclear_viewpoint = false;
+  /// Candidate paths, as they are or pulled back, that failed
+  /// `turns_admissible`.
+  int paths_with_sharp_turns = 0;
+  /// No path that passes `turns_admissible` could be chosen, so the best
+  /// path was chosen without the check.
+  bool sharp_turn_fallback = false;
 };
 
 /// Scores every root-to-leaf path and returns the best.
@@ -114,6 +121,12 @@ struct PathSelectionResult {
 /// clear wins; only when there is none is the best path chosen without the
 /// check, flagged unclear_viewpoint, so that clearance never stops
 /// exploration where it would have gone on.
+///
+/// With `turns_admissible` (PathTurnCheck), a candidate that fails it is not
+/// admissible, and outranks clearance: a path that turns only where it may
+/// is chosen, clear or not, over one that ends clear. When no such path is
+/// chosen at all, the selection is made again without the check and
+/// flagged sharp_turn_fallback.
 PathSelectionResult selectBestPath(GraphManager& graph,
                                    const PlanningParams& planning,
                                    const RobotParams& robot,
@@ -124,6 +137,8 @@ PathSelectionResult selectBestPath(GraphManager& graph,
                                        excluded_endpoints = {},
                                    double exclusion_radius = 0.0,
                                    const ViewpointClearFn& viewpoint_clear =
+                                       nullptr,
+                                   const PathTurnsFn& turns_admissible =
                                        nullptr);
 
 }  // namespace mgg

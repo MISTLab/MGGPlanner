@@ -287,6 +287,9 @@ class PlannerNode : public rclcpp::Node {
   /// Exploration paths and global routes sent to end where no pose had
   /// viewpoint clearance (mgg::viewpointClear), since the node started.
   int unclear_viewpoints_selected_ = 0;
+  /// Exploration paths sent although they turn sharply where they may not
+  /// (mgg::PathTurnCheck), because no path complied, since the node started.
+  int sharp_turn_fallbacks_ = 0;
   int auto_global_planner_low_gain_rounds_ = 15;
   /// rrg.cpp:5838 to 5843 and 1229 to 1240: the global frontier being
   /// driven to, kept until the robot is within global_frontier_reach_m.
