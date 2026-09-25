@@ -433,4 +433,92 @@ TEST(PathTurnCheck, ShortcutMakesNoTurnTheChosenPathDidNotHave) {
   EXPECT_EQ(kept.back(), points.back());
 }
 
+TEST(PathTurnCheck, LongerRouteToTheSameFrontierWinsOverATurnOnTheRamp) {
+  // Review r0, P1 2. The frontier F lies up the ramp to the left. The short
+  // way turns left across the ramp from its axis; the long way carries on
+  // to the level top, turns there, and comes back down onto F. The detour's
+  // vertices carry no gain, so every leaf's shortest path to gain turns on
+  // the ramp.
+  GraphManager ground;
+  addRampLattice(ground);
+  GraphManager graph;
+  const auto trunk = rampPath(line({-1.2, 0.0}, {0.4, 0.0}, 7), 0.0);
+  const auto left = rampPath(line({1.2, 0.4}, {0.0, 0.4}, 4), 0.0, 7);
+  const auto axis = rampPath(line({1.6, 0.0}, {0.4, 0.0}, 6), 0.0, 11);
+  const auto top = rampPath(line({3.6, 0.4}, {0.0, 0.4}, 4), 0.0, 17);
+  const auto back = rampPath(line({3.2, 1.6}, {-0.4, 0.0}, 5), 0.0, 21);
+  const auto chain = [&graph](Vertex* from, const std::vector<Vertex*>& to) {
+    for (Vertex* v : to) {
+      graph.addVertex(v);
+      graph.addEdge(v, from, (v->state - from->state).head<3>().norm());
+      from = v;
+    }
+  };
+  graph.addVertex(trunk.front());
+  chain(trunk.front(), std::vector<Vertex*>(trunk.begin() + 1, trunk.end()));
+  chain(trunk.back(), left);
+  chain(trunk.back(), axis);
+  chain(axis.back(), top);
+  chain(top.back(), back);
+  Vertex* frontier = left.back();  // (1.2, 1.6)
+  graph.addEdge(frontier, back.back(),
+                (frontier->state - back.back()->state).head<3>().norm());
+  frontier->vol_gain.gain = 100.0;
+
+  mgg::PlanningParams planning;
+  planning.path_length_penalty = 0.0;
+  planning.path_direction_penalty = 0.0;
+  mgg::EdgeInclinations flat;
+  PathTurnCheck check(ground, robot());
+  const mgg::SharpTurnAllowedFn allowed = [&check](const Vertex& v) {
+    return check.sharpTurnAllowedAt(v.state.head<3>());
+  };
+
+  // Without the search, the only paths to the frontier's gain turn on the
+  // ramp, and one of them is taken as the fallback.
+  const auto before = mgg::selectBestPath(graph, planning, robot(), flat, 0.2,
+                                          0.0, {}, 0.0, nullptr,
+                                          std::ref(check));
+  EXPECT_TRUE(before.sharp_turn_fallback);
+
+  const auto r = mgg::selectBestPath(graph, planning, robot(), flat, 0.2, 0.0,
+                                     {}, 0.0, nullptr, std::ref(check),
+                                     allowed);
+  EXPECT_FALSE(r.sharp_turn_fallback);
+  EXPECT_TRUE(r.sharp_turn_detour);
+  EXPECT_FALSE(r.detour_search_capped);
+  EXPECT_GT(r.detour_states_expanded, 0);
+  EXPECT_EQ(r.best_path_id, frontier->id);
+  ASSERT_GE(r.best_path.size(), 2u);
+  // The long way round: over the level top, and into F from (1.6, 1.6).
+  EXPECT_NE(std::find(r.best_path.begin(), r.best_path.end(), top.back()),
+            r.best_path.end());
+  EXPECT_EQ(r.best_path[r.best_path.size() - 2], back.back());
+  EXPECT_TRUE(check(r.best_path));
+  // Re-parented along the route it takes.
+  EXPECT_EQ(frontier->parent, back.back());
+}
+
+TEST(FindTurnCompliantRoutes, StopsAtItsBound) {
+  GraphManager graph;
+  const auto path = rampPath(line({-1.2, 0.0}, {0.4, 0.0}, 6), 0.0);
+  graph.addVertex(path.front());
+  for (std::size_t i = 1; i < path.size(); ++i) {
+    graph.addVertex(path[i]);
+    graph.addEdge(path[i], path[i - 1], 0.4);
+  }
+  const mgg::SharpTurnAllowedFn anywhere = [](const Vertex&) { return true; };
+  const auto all = mgg::findTurnCompliantRoutes(graph, 0.0, 0.8, {5}, anywhere,
+                                                100);
+  ASSERT_EQ(all.to.count(5), 1u);
+  EXPECT_EQ(all.to.at(5).path.size(), 6u);
+  EXPECT_NEAR(all.to.at(5).along.back(), 2.0, 1e-9);
+  EXPECT_FALSE(all.capped);
+  const auto bounded =
+      mgg::findTurnCompliantRoutes(graph, 0.0, 0.8, {5}, anywhere, 3);
+  EXPECT_TRUE(bounded.capped);
+  EXPECT_EQ(bounded.states_expanded, 3);
+  EXPECT_EQ(bounded.to.count(5), 0u);
+}
+
 }  // namespace

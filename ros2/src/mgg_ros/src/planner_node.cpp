@@ -1180,8 +1180,12 @@ std::string PlannerNode::buildLocalGraph() {
         return mgg::turnClear(*map_, robot_params_, pose);
       });
   mgg::PathTurnsFn turns_admissible;
+  mgg::SharpTurnAllowedFn sharp_turn_allowed;
   if (robot_params_.type == mgg::RobotType::kGroundRobot) {
     turns_admissible = std::ref(turn_check);
+    sharp_turn_allowed = [&turn_check](const mgg::Vertex& v) {
+      return turn_check.sharpTurnAllowedAt(v.state.head<3>());
+    };
   }
   const mgg::PathSelectionResult sel = mgg::selectBestPath(
       *local_graph_, planning_params_, robot_params_, edge_inclinations_,
@@ -1191,9 +1195,18 @@ std::string PlannerNode::buildLocalGraph() {
         return mgg::viewpointClear(*map_, robot_params_, planning_params_,
                                    v.state);
       },
-      turns_admissible);
+      turns_admissible, sharp_turn_allowed);
   for (const mgg::Vertex* v : sel.best_path) {
     if (v != nullptr) best_path_.push_back(v->state);
+  }
+  if (sel.sharp_turn_detour) {
+    RCLCPP_INFO(get_logger(),
+                "exploration path to (%.2f, %.2f, %.2f) goes the long way "
+                "round: every shortest path turns on a slope or without room "
+                "(%d search states%s)",
+                best_path_.back().x(), best_path_.back().y(),
+                best_path_.back().z(), sel.detour_states_expanded,
+                sel.detour_search_capped ? ", capped" : "");
   }
   if (sel.sharp_turn_fallback) {
     ++sharp_turn_fallbacks_;
@@ -1267,7 +1280,7 @@ std::string PlannerNode::buildLocalGraph() {
       "%d frontiers; best path %zu poses (%d lattice -> %d corners -> %d "
       "resampled), gain %.1f%s; viewpoint clearance: %d paths pulled back, "
       "%d without%s; sharp turns: %d paths refused (%d on a slope, %d "
-      "without room)%s; "
+      "without room)%s%s; "
       "heading %.2f rad%s",
       r.free_cells, r.vertices_added, r.edges_added,
       r.hit_limit ? " (hit a size limit)" : "", why, evaluated, frontiers,
@@ -1278,6 +1291,7 @@ std::string PlannerNode::buildLocalGraph() {
       sel.unclear_viewpoint ? ", none ends clear" : "",
       sel.paths_with_sharp_turns, turn_check.refused_on_slope,
       turn_check.refused_without_room,
+      sel.sharp_turn_detour ? ", detour" : "",
       sel.sharp_turn_fallback ? ", none complies" : "", exploring_direction_,
       timing);
 

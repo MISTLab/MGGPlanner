@@ -38,7 +38,9 @@ PathSelectionResult selectBestPath(GraphManager& graph,
                                        excluded_endpoints,
                                    double exclusion_radius,
                                    const ViewpointClearFn& viewpoint_clear,
-                                   const PathTurnsFn& turns_admissible) {
+                                   const PathTurnsFn& turns_admissible,
+                                   const SharpTurnAllowedFn&
+                                       sharp_turn_allowed) {
   // Leaves share their paths' inner vertices; check each vertex once.
   std::unordered_map<int, bool> clear_by_id;
   const auto clear = [&](const Vertex* v) {
@@ -53,9 +55,25 @@ PathSelectionResult selectBestPath(GraphManager& graph,
   std::vector<Vertex*> leaves;
   graph.getLeafVertices(leaves);
 
-  // One selection over every leaf; with `check_turns`, a candidate that
+  // A candidate is a route from the root with the edge cost to each of its
+  // vertices: every leaf's shortest path and, before a fallback, the routes
+  // findTurnCompliantRoutes finds.
+  using Candidate = TurnCompliantRoutes::Route;
+  std::vector<Candidate> shortest;
+  for (Vertex* leaf : leaves) {
+    if (leaf == nullptr) continue;
+    Candidate candidate;
+    graph.getShortestPath(leaf->id, rep, true, candidate.path);
+    for (const Vertex* v : candidate.path) {
+      candidate.along.push_back(graph.getShortestDistance(v->id, rep));
+    }
+    shortest.push_back(std::move(candidate));
+  }
+
+  // One selection over `candidates`; with `check_turns`, a candidate that
   // fails turns_admissible is not admissible.
-  const auto choose = [&](bool check_turns) {
+  const auto choose = [&](bool check_turns,
+                          const std::vector<Candidate>& candidates) {
     PathSelectionResult result;
     const auto turns_ok = [&](const std::vector<Vertex*>& path) {
       if (!check_turns || turns_admissible(path)) return true;
@@ -65,11 +83,12 @@ PathSelectionResult selectBestPath(GraphManager& graph,
     // Scores one root-to-viewpoint path: accumulated gain discounted for
     // length and for heading away from the direction of travel. Returns false
     // for a path that descends too steeply.
-    const auto score = [&](const std::vector<Vertex*>& path, double& gain) {
+    const auto score = [&](const std::vector<Vertex*>& path,
+                           const std::vector<double>& along, double& gain) {
       double path_gain = 0.0;
       for (size_t ind = 0; ind < path.size(); ++ind) {
         Vertex* v = path[ind];
-        const double path_length = graph.getShortestDistance(v->id, rep);
+        const double path_length = along[ind];
         // Hanging vertices are worth less: there is no ground under them.
         const double vol_gain =
             v->vol_gain.gain *
@@ -103,7 +122,8 @@ PathSelectionResult selectBestPath(GraphManager& graph,
 
       // Penalise paths that head away from the direction of travel.
       std::vector<Eigen::Vector3d> path_points;
-      graph.getShortestPath(path.back()->id, rep, true, path_points);
+      path_points.reserve(path.size());
+      for (const Vertex* v : path) path_points.push_back(v->state.head(3));
       const double deviation = computeDistanceBetweenTrajectoryAndDirection(
           path_points, exploring_direction, 0.2, true);
       gain = path_gain * std::exp(-planning.path_direction_penalty * deviation);
@@ -131,11 +151,10 @@ PathSelectionResult selectBestPath(GraphManager& graph,
     double best_clear_gain = 0.0;
     double best_clear_full_gain = 0.0;
     std::vector<Vertex*> best_clear_path;
-    for (Vertex* leaf : leaves) {
-      if (leaf == nullptr) continue;
-      std::vector<Vertex*> path;
-      graph.getShortestPath(leaf->id, rep, true, path);
+    for (const Candidate& candidate : candidates) {
+      std::vector<Vertex*> path = candidate.path;
       if (path.size() <= 1) continue;  // needs at least root and leaf
+      const Vertex* leaf = path.back();
       // Reservations are checked where each candidate ends: the leaf for the
       // path as it is, the vertex it is pulled back to for the clear one.
       const bool leaf_excluded = excluded(leaf);
@@ -143,7 +162,7 @@ PathSelectionResult selectBestPath(GraphManager& graph,
       bool admissible = false;
       if (!leaf_excluded) {
         ++result.leaves_evaluated;
-        admissible = score(path, path_gain);
+        admissible = score(path, candidate.along, path_gain);
         if (!admissible) {
           ++result.paths_rejected_steep;
         } else if (!turns_ok(path)) {
@@ -166,7 +185,7 @@ PathSelectionResult selectBestPath(GraphManager& graph,
       if (end + 1 < path.size()) {
         path.resize(end + 1);
         ++result.paths_pulled_back;
-        admissible = !excluded(path.back()) && score(path, path_gain) &&
+        admissible = !excluded(path.back()) && score(path, candidate.along, path_gain) &&
                      turns_ok(path);
         // Toward a reserved leaf, only gain outside the reservation counts.
         if (leaf_excluded && !(path_gain > 0.0)) continue;
@@ -200,26 +219,56 @@ PathSelectionResult selectBestPath(GraphManager& graph,
   // path would be chosen at all, and then as the selection without the
   // check makes it, so that the rule never stops exploration where it
   // would have gone on.
-  PathSelectionResult result = choose(static_cast<bool>(turns_admissible));
+  PathSelectionResult result =
+      choose(static_cast<bool>(turns_admissible), shortest);
   if (result.best_path.empty() && result.paths_with_sharp_turns > 0) {
     const int refused = result.paths_with_sharp_turns;
-    result = choose(false);
+    // Before giving up on the rule: the gain the refused paths lead to may
+    // be reached another way, turning where it may.
+    PathSelectionResult detour;
+    int states = 0;
+    bool capped = false;
+    if (sharp_turn_allowed) {
+      std::vector<int> destinations;
+      for (const auto& [id, v] : graph.vertices_map_) {
+        if (id != 0 && v != nullptr && v->vol_gain.gain > 0.0) {
+          destinations.push_back(id);
+        }
+      }
+      const Vertex* root = graph.getVertex(0);
+      const TurnCompliantRoutes routes = findTurnCompliantRoutes(
+          graph, root != nullptr ? root->state[3] : 0.0,
+          std::max(robot.size.x(), robot.size.y()), destinations,
+          sharp_turn_allowed, kMaxDetourSearchStates);
+      states = routes.states_expanded;
+      capped = routes.capped;
+      std::vector<Candidate> candidates;
+      candidates.reserve(routes.to.size());
+      for (const int id : destinations) {
+        const auto found = routes.to.find(id);
+        if (found != routes.to.end()) candidates.push_back(found->second);
+      }
+      detour = choose(true, candidates);
+    }
+    if (!detour.best_path.empty()) {
+      result = detour;
+      result.sharp_turn_detour = true;
+    } else {
+      result = choose(false, shortest);
+      result.sharp_turn_fallback = !result.best_path.empty();
+    }
     result.paths_with_sharp_turns = refused;
-    result.sharp_turn_fallback = !result.best_path.empty();
+    result.detour_states_expanded = states;
+    result.detour_search_capped = capped;
   }
   if (!result.best_path.empty()) {
     result.best_path_id = result.best_path.back()->id;
   }
 
-  // Re-parent along the winning path so the branch can be walked from the root.
-  if (result.best_path_id >= 0) {
-    std::vector<int> ids;
-    graph.getShortestPath(result.best_path_id, rep, false, ids);
-    for (size_t i = 0; i + 1 < ids.size(); ++i) {
-      Vertex* child = graph.getVertex(ids[i]);
-      Vertex* parent = graph.getVertex(ids[i + 1]);
-      if (child != nullptr && parent != nullptr) child->parent = parent;
-    }
+  // Re-parent along the winning path so the branch can be walked from the
+  // root. The path is the leaf's shortest path, or a detour.
+  for (size_t i = 1; i < result.best_path.size(); ++i) {
+    result.best_path[i]->parent = result.best_path[i - 1];
   }
   return result;
 }

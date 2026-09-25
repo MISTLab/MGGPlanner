@@ -22,6 +22,7 @@
 #include <array>
 #include <functional>
 #include <map>
+#include <unordered_map>
 #include <vector>
 
 #include <Eigen/Dense>
@@ -71,6 +72,40 @@ using PathTurnsFn = std::function<bool(const std::vector<Vertex*>&)>;
 /// Whether the robot has room to turn in place at a pose, e.g. turnClear.
 using TurnRoomFn = std::function<bool(const StateVec&)>;
 
+/// Whether the robot may turn sharply at a vertex: see
+/// PathTurnCheck::sharpTurnAllowedAt.
+using SharpTurnAllowedFn = std::function<bool(const Vertex&)>;
+
+/// Routes from graph vertex 0, found by findTurnCompliantRoutes.
+struct TurnCompliantRoutes {
+  struct Route {
+    std::vector<Vertex*> path;  ///< vertex 0 first
+    std::vector<double> along;  ///< edge cost from vertex 0 to each vertex
+  };
+  /// By destination id; a destination with no route is absent.
+  std::unordered_map<int, Route> to;
+  /// Search states (vertex, vertex it was reached from) expanded.
+  int states_expanded = 0;
+  /// The search stopped at its bound; routes found by then are kept.
+  bool capped = false;
+};
+
+/// The cheapest route from vertex 0 of `graph` to each of `destinations`
+/// that turns sharply (kSharpTurnRad) only at vertices where
+/// `sharp_turn_allowed`. The search runs over directed edges, a vertex
+/// together with the one it was reached from, so a vertex whose shortest
+/// route turns where it may not is reached the longer way round: up a ramp
+/// to its level top and back, rather than across it. A route passes each
+/// vertex once. The turn onto an edge is measured as pathTurns measures it
+/// looking back, from the first vertex at least `window` back along the
+/// route, and at vertex 0 from `start_heading`; the window ahead is not yet
+/// known, so the caller checks a route with PathTurnCheck before using it.
+/// At most `max_states` states are expanded.
+TurnCompliantRoutes findTurnCompliantRoutes(
+    GraphManager& graph, double start_heading, double window,
+    const std::vector<int>& destinations,
+    const SharpTurnAllowedFn& sharp_turn_allowed, int max_states);
+
 /// The check selectBestPath applies to a ground robot's candidate paths
 /// through `graph`: a sharp turn (kSharpTurnRad) is refused where the
 /// terrain slopes more than kLevelGroundSlopeRad, and, with `room_to_turn`,
@@ -92,6 +127,10 @@ class PathTurnCheck {
   /// first point turns from `start_heading`. Counts nothing.
   bool admissible(const std::vector<Eigen::Vector3d>& points,
                   double start_heading);
+
+  /// Whether a sharp turn may be made at `position`: the ground is level
+  /// there and, with `room_to_turn`, the robot has room to turn.
+  bool sharpTurnAllowedAt(const Eigen::Vector3d& position);
 
   /// Candidate paths refused for a sharp turn on a slope, and for one
   /// without room to turn.

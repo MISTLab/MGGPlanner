@@ -106,7 +106,18 @@ struct PathSelectionResult {
   /// No path that passes `turns_admissible` could be chosen, so the best
   /// path was chosen without the check.
   bool sharp_turn_fallback = false;
+  /// No leaf's shortest path passed `turns_admissible`, and the path chosen
+  /// is a longer route to gain that does (findTurnCompliantRoutes).
+  bool sharp_turn_detour = false;
+  /// What looking for that route cost, when it was looked for.
+  int detour_states_expanded = 0;
+  bool detour_search_capped = false;
 };
+
+/// Bound on findTurnCompliantRoutes in selectBestPath, in states: one per
+/// directed edge at most; a Bunker lattice of 979 vertices on a ramp had
+/// 18973 edges, 37946 directed.
+constexpr int kMaxDetourSearchStates = 100000;
 
 /// Scores every root-to-leaf path and returns the best.
 ///
@@ -125,8 +136,13 @@ struct PathSelectionResult {
 /// With `turns_admissible` (PathTurnCheck), a candidate that fails it is not
 /// admissible, and outranks clearance: a path that turns only where it may
 /// is chosen, clear or not, over one that ends clear. When no such path is
-/// chosen at all, the selection is made again without the check and
-/// flagged sharp_turn_fallback.
+/// chosen at all, and `sharp_turn_allowed` is given, the selection is made
+/// again over the cheapest routes to every vertex with gain that turn
+/// sharply only where it allows (findTurnCompliantRoutes), still subject to
+/// the check, flagged sharp_turn_detour; a longer route round to the same
+/// frontier then wins over the short one that turns where it may not.
+/// Only when that too chooses nothing is the selection made without the
+/// check, flagged sharp_turn_fallback.
 PathSelectionResult selectBestPath(GraphManager& graph,
                                    const PlanningParams& planning,
                                    const RobotParams& robot,
@@ -139,7 +155,9 @@ PathSelectionResult selectBestPath(GraphManager& graph,
                                    const ViewpointClearFn& viewpoint_clear =
                                        nullptr,
                                    const PathTurnsFn& turns_admissible =
-                                       nullptr);
+                                       nullptr,
+                                   const SharpTurnAllowedFn&
+                                       sharp_turn_allowed = nullptr);
 
 }  // namespace mgg
 

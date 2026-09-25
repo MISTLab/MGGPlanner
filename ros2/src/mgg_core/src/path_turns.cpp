@@ -2,6 +2,9 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdint>
+#include <functional>
+#include <queue>
 #include <utility>
 
 namespace mgg {
@@ -76,6 +79,150 @@ double terrainSlope(GraphManager& graph, const Vertex& vertex, double radius) {
   return std::atan(std::hypot(plane.x(), plane.y()));
 }
 
+TurnCompliantRoutes findTurnCompliantRoutes(
+    GraphManager& graph, double start_heading, double window,
+    const std::vector<int>& destinations,
+    const SharpTurnAllowedFn& sharp_turn_allowed, int max_states) {
+  TurnCompliantRoutes out;
+  const auto vertex = [&graph](int id) -> Vertex* {
+    const auto it = graph.vertices_map_.find(id);
+    return it == graph.vertices_map_.end() ? nullptr : it->second;
+  };
+  if (vertex(0) == nullptr || destinations.empty()) return out;
+
+  struct State {
+    int at;
+    int from;  // -1 at vertex 0
+    double cost;
+    int parent;  // index into states, -1 at vertex 0
+  };
+  std::vector<State> states = {{0, -1, 0.0, -1}};
+  std::vector<bool> settled = {false};
+  const auto key = [](int at, int from) {
+    return (static_cast<std::uint64_t>(static_cast<std::uint32_t>(at)) << 32) |
+           static_cast<std::uint32_t>(from);
+  };
+  std::unordered_map<std::uint64_t, int> index = {{key(0, -1), 0}};
+  std::unordered_map<int, int> first_settled;  // vertex -> cheapest state
+  std::unordered_map<int, bool> allowed;
+  using Entry = std::pair<double, int>;
+  std::priority_queue<Entry, std::vector<Entry>, std::greater<Entry>> open;
+  open.push({0.0, 0});
+
+  std::vector<const Vertex*> route;
+  std::vector<double> back;
+  std::size_t destinations_left = destinations.size();
+  std::unordered_map<int, bool> wanted;
+  for (int id : destinations) wanted.emplace(id, true);
+
+  while (!open.empty() && destinations_left > 0) {
+    const auto [cost, si] = open.top();
+    open.pop();
+    if (settled[si] || cost > states[si].cost) continue;
+    if (out.states_expanded >= max_states) {
+      out.capped = true;
+      break;
+    }
+    settled[si] = true;
+    ++out.states_expanded;
+    const State s = states[si];
+    if (first_settled.emplace(s.at, si).second && wanted.count(s.at) > 0) {
+      --destinations_left;
+    }
+    const Vertex* u = vertex(s.at);
+    const auto edges = graph.edge_map_.find(s.at);
+    if (u == nullptr || edges == graph.edge_map_.end()) continue;
+    // The route back from `u`, with the planar distance back to each of
+    // its vertices.
+    route.clear();
+    back.clear();
+    for (int p = si; p >= 0; p = states[p].parent) {
+      const Vertex* v = vertex(states[p].at);
+      if (v == nullptr) break;
+      back.push_back(route.empty() ? 0.0
+                                   : back.back() + (route.back()->state -
+                                                    v->state)
+                                                       .head<2>()
+                                                       .norm());
+      route.push_back(v);
+    }
+    const auto far = [window](double d) {
+      return d >= window && d > kMinMove;
+    };
+    // The heading into route[k] as pathTurns measures it: from the first
+    // vertex at least `window` back, or vertex 0 when the route is shorter,
+    // and at vertex 0 the robot's heading.
+    const auto heading_into = [&](std::size_t k) {
+      for (std::size_t j = k + 1; j < route.size(); ++j) {
+        if (far(back[j] - back[k]) ||
+            (j + 1 == route.size() && back[j] - back[k] > kMinMove)) {
+          return headingBetween(route[j]->state.head<3>(),
+                                route[k]->state.head<3>());
+        }
+      }
+      return start_heading;
+    };
+    for (const auto& [w, weight] : edges->second) {
+      if (w == s.from) continue;
+      const Vertex* next = vertex(w);
+      if (next == nullptr) continue;
+      // A route passes each vertex once: it is sent as a path, and walked
+      // back through parents.
+      if (std::find(route.begin(), route.end(), next) != route.end()) {
+        continue;
+      }
+      // Every vertex of the route whose turn `next` now settles, being the
+      // first vertex at least `window` ahead of it, turns sharply only where
+      // it may.
+      const double step = (next->state - u->state).head<2>().norm();
+      bool refused = false;
+      for (std::size_t k = 0; k < route.size() && !far(back[k]) && !refused;
+           ++k) {
+        if (!far(back[k] + step)) continue;
+        const Vertex* at = route[k];
+        const double out =
+            headingBetween(at->state.head<3>(), next->state.head<3>());
+        if (headingChange(heading_into(k), out) <= kSharpTurnRad + 1e-9) {
+          continue;
+        }
+        auto found = allowed.find(at->id);
+        if (found == allowed.end()) {
+          found = allowed.emplace(at->id, sharp_turn_allowed(*at)).first;
+        }
+        refused = !found->second;
+      }
+      if (refused) continue;
+      const double next_cost = cost + weight;
+      const auto [it, added] = index.emplace(key(w, s.at), states.size());
+      if (added) {
+        states.push_back({w, s.at, next_cost, si});
+        settled.push_back(false);
+      } else if (next_cost < states[it->second].cost &&
+                 !settled[it->second]) {
+        states[it->second].cost = next_cost;
+        states[it->second].parent = si;
+      } else {
+        continue;
+      }
+      open.push({next_cost, it->second});
+    }
+  }
+
+  for (int id : destinations) {
+    const auto found = first_settled.find(id);
+    if (found == first_settled.end()) continue;
+    TurnCompliantRoutes::Route route;
+    for (int si = found->second; si >= 0; si = states[si].parent) {
+      route.path.push_back(vertex(states[si].at));
+      route.along.push_back(states[si].cost);
+    }
+    std::reverse(route.path.begin(), route.path.end());
+    std::reverse(route.along.begin(), route.along.end());
+    out.to.emplace(id, std::move(route));
+  }
+  return out;
+}
+
 bool turnClear(const MapInterface& map, const RobotParams& robot,
                const StateVec& state) {
   const double radius = 0.5 * robot.size.head<2>().norm();
@@ -128,6 +275,10 @@ PathTurnCheck::Refusal PathTurnCheck::firstRefusal(
     if (!roomAt(points[i])) return Refusal::kRoom;
   }
   return Refusal::kNone;
+}
+
+bool PathTurnCheck::sharpTurnAllowedAt(const Eigen::Vector3d& position) {
+  return slopeAt(position) <= kLevelGroundSlopeRad && roomAt(position);
 }
 
 bool PathTurnCheck::admissible(const std::vector<Eigen::Vector3d>& points,
