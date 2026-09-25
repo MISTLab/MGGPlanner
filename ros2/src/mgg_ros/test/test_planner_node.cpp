@@ -389,9 +389,12 @@ class PlannerNodeTestPeer {
   static int roadmapRebuilds(PlannerNode& node) {
     return node.roadmap_rebuilds_;
   }
-  static bool rebuildRoadmap(PlannerNode& node) {
+  static bool rebuildRoadmap(
+      PlannerNode& node,
+      PlannerNode::RoadmapRebuildTrigger trigger =
+          PlannerNode::RoadmapRebuildTrigger::kSeedOnly) {
     const std::lock_guard<std::recursive_mutex> lock(node.planner_mutex_);
-    return node.rebuildGlobalGraphFromKeyframes("test");
+    return node.rebuildGlobalGraphFromKeyframes(trigger, "test");
   }
   static mgg::StateVec globalVertexState(PlannerNode& node, int id) {
     const std::lock_guard<std::recursive_mutex> lock(node.planner_mutex_);
@@ -412,6 +415,34 @@ class PlannerNodeTestPeer {
       }
     }
     return false;
+  }
+  /// A frontier of this robot's global graph within `within` of (x, y).
+  static bool globalFrontierNear(PlannerNode& node, double x, double y,
+                                 double within) {
+    const std::lock_guard<std::recursive_mutex> lock(node.planner_mutex_);
+    for (const auto& entry : node.global_graph_->vertices_map_) {
+      const mgg::Vertex* v = entry.second;
+      if (v != nullptr && v->type == mgg::VertexType::kFrontier &&
+          std::hypot(v->state.x() - x, v->state.y() - y) <= within) {
+        return true;
+      }
+    }
+    return false;
+  }
+  /// An own frontier at (x, y), at driving height, joined to nothing.
+  static void addLoneGlobalFrontier(PlannerNode& node, double x, double y) {
+    const std::lock_guard<std::recursive_mutex> lock(node.planner_mutex_);
+    mgg::StateVec state(x, y, 0.075, 0.0);
+    EXPECT_TRUE(node.projectToDrivingHeight(state));
+    auto* v = new mgg::Vertex(node.global_graph_->generateVertexID(), state);
+    v->robot_id = static_cast<int>(node.planning_params_.robot_id);
+    v->type = mgg::VertexType::kFrontier;
+    node.global_graph_->addVertex(v);
+    ++node.graph_revision_;
+  }
+  static int frontiersLostInRebuild(PlannerNode& node) {
+    const std::lock_guard<std::recursive_mutex> lock(node.planner_mutex_);
+    return node.frontiersLostInRebuild();
   }
   static bool repositioningOngoing(PlannerNode& node) {
     return node.global_exploration_ongoing_;
@@ -1640,6 +1671,97 @@ TEST_F(PlannerNodeTest, ARebuildWhileResumingARepositioningGivesItUp) {
   EXPECT_NE(response->status, PlannerNode::kStatusComplete);
 }
 
+/// The robot 3.5 m off its graph behind a wall (as in
+/// APoseTheGraphCannotReachRebuildsItAndRoutesHome), its keyframes
+/// running from home along `corners`.
+std::shared_ptr<PlannerNode> robotBehindAWall(
+    const std::string& name, const std::vector<Eigen::Vector2d>& corners,
+    const std::vector<Eigen::Vector2d>& chain = {{0.5, 0.0}, {1.0, 0.0}}) {
+  auto node = makeNode(name);
+  PlannerNodeTestPeer::observeFloor(*node, -1.5, 6.0, -1.5, 1.5);
+  PlannerNodeTestPeer::observeWallAlongY(*node, -1.5, 0.6, 1.35);
+  PlannerNodeTestPeer::acceptOdometry(*node, 0.0, 0.0, 1.0);
+  PlannerNodeTestPeer::addGlobalChainToFrontier(*node, chain);
+  PlannerNodeTestPeer::acceptOdometry(*node, 4.5, 0.0, 2.0);
+  PlannerNodeTestPeer::serveMap(*node, "component:test", 0);
+  auto source = std::make_unique<TrajectoryInMemory>();
+  source->trajectory = keyframesAlong(corners);
+  PlannerNodeTestPeer::setKeyframeSource(*node, std::move(source));
+  return node;
+}
+
+const std::vector<Eigen::Vector2d> kRoundTheWall{
+    {0.0, 0.0}, {0.8, 0.0}, {0.8, 1.1}, {2.0, 1.1}, {4.5, 0.0}};
+
+TEST_F(PlannerNodeTest, ARobotBesideAGraphThatReachesItKeepsTheGraph) {
+  // Review r0, I-1a: the robot stands 0.5 m from its graph with a wall
+  // between (as a robot wedged against a wall beside its roadmap). Its
+  // pose does not link, but the graph reaches there: no rebuild, and the
+  // graph stays as it is.
+  auto node = makeNode("rebuild_not_beside_graph");
+  PlannerNodeTestPeer::observeFloor(*node, -1.5, 6.0, -1.5, 1.5);
+  PlannerNodeTestPeer::observeWall(*node, -1.5, 6.0, 0.25);
+  PlannerNodeTestPeer::acceptOdometry(*node, 0.0, 0.0, 1.0);
+  PlannerNodeTestPeer::addGlobalChainToFrontier(
+      *node, {{0.5, 0.0}, {1.0, 0.0}, {1.5, 0.0}});
+  PlannerNodeTestPeer::acceptOdometry(*node, 1.0, 0.5, 2.0);
+  const int vertices = PlannerNodeTestPeer::globalVertices(*node);
+  PlannerNodeTestPeer::serveMap(*node, "component:test", 0);
+  auto source = std::make_unique<TrajectoryInMemory>();
+  source->trajectory = keyframesAlong({{0.0, 0.5}, {1.0, 0.5}});
+  PlannerNodeTestPeer::setKeyframeSource(*node, std::move(source));
+
+  const auto response = returnHome(*node, 0.0, 0.0);
+  EXPECT_NE(response->status,
+            mgg_msgs::srv::PlanObjective::Response::SUCCEEDED);
+  EXPECT_EQ(PlannerNodeTestPeer::roadmapRebuilds(*node), 0);
+  EXPECT_EQ(PlannerNodeTestPeer::globalVertices(*node), vertices);
+}
+
+TEST_F(PlannerNodeTest, ARebuiltGraphThatDoesNotLinkThePoseIsNotSwappedIn) {
+  // Review r0, I-1c: the keyframes stop short of where the robot is: the
+  // rebuilt graph would not link it either, so the old graph is kept.
+  auto node = robotBehindAWall("rebuild_not_linking",
+                               {{0.0, 0.0}, {0.8, 0.0}});
+  const int vertices = PlannerNodeTestPeer::globalVertices(*node);
+  const auto response = returnHome(*node, 0.0, 0.0);
+  EXPECT_NE(response->status,
+            mgg_msgs::srv::PlanObjective::Response::SUCCEEDED);
+  EXPECT_EQ(PlannerNodeTestPeer::roadmapRebuilds(*node), 0);
+  EXPECT_EQ(PlannerNodeTestPeer::globalVertices(*node), vertices);
+}
+
+TEST_F(PlannerNodeTest, FrontiersSurviveARebuild) {
+  // Review r0, I-1b: the old graph leads south from home to a frontier
+  // off the robot's track. The rebuild carries it over with its path, so
+  // the global planner can still reposition to it.
+  auto node = robotBehindAWall("rebuild_keeps_frontiers", kRoundTheWall,
+                               {{0.5, 0.0}, {0.5, -0.5}, {0.5, -1.0}});
+  ASSERT_TRUE(PlannerNodeTestPeer::globalFrontierNear(*node, 0.5, -1.0, 1e-6));
+  const auto response = returnHome(*node, 0.0, 0.0);
+  ASSERT_EQ(response->status,
+            mgg_msgs::srv::PlanObjective::Response::SUCCEEDED)
+      << response->reason;
+  EXPECT_EQ(PlannerNodeTestPeer::roadmapRebuilds(*node), 1);
+  EXPECT_TRUE(PlannerNodeTestPeer::globalFrontierNear(*node, 0.5, -1.0, 1e-6));
+  EXPECT_EQ(PlannerNodeTestPeer::frontiersLostInRebuild(*node), 0);
+}
+
+TEST_F(PlannerNodeTest, AFrontierARebuildCannotCarryKeepsExplorationOpen) {
+  // Review r0, I-1: a frontier joined to nothing the rebuilt graph meets is
+  // lost by the rebuild. While it still looks into unknown space it is
+  // remembered, and a failed global search is not exploration complete.
+  auto node = robotBehindAWall("rebuild_lost_frontier", kRoundTheWall);
+  PlannerNodeTestPeer::addLoneGlobalFrontier(*node, -1.2, -1.2);
+  const auto response = returnHome(*node, 0.0, 0.0);
+  ASSERT_EQ(response->status,
+            mgg_msgs::srv::PlanObjective::Response::SUCCEEDED)
+      << response->reason;
+  ASSERT_EQ(PlannerNodeTestPeer::roadmapRebuilds(*node), 1);
+  EXPECT_FALSE(PlannerNodeTestPeer::globalFrontierNear(*node, -1.2, -1.2, 0.1));
+  EXPECT_EQ(PlannerNodeTestPeer::frontiersLostInRebuild(*node), 1);
+}
+
 TEST_F(PlannerNodeTest, AnExplorationPathThatCannotBeLinkedRebuildsTheGraph) {
   auto node = makeNode("rebuild_path_unlinked");
   PlannerNodeTestPeer::observeFloor(*node, -1.5, 6.0, -1.5, 1.5);
@@ -1675,6 +1797,25 @@ TEST_F(PlannerNodeTest, RebuildsAreRateLimitedAndSkipUnchangedKeyframes) {
   EXPECT_FALSE(PlannerNodeTestPeer::rebuildRoadmap(*node));
   keyframes->trajectory = keyframesAlongX(0.0, 5.0, 2);
   EXPECT_TRUE(PlannerNodeTestPeer::rebuildRoadmap(*node));
+  EXPECT_EQ(PlannerNodeTestPeer::roadmapRebuilds(*node), 2);
+}
+
+TEST_F(PlannerNodeTest, EachRebuildTriggerHasItsOwnRateLimit) {
+  // Review r0, M-7: a seed-only attempt does not hold back a rebuild for a
+  // pose that cannot be linked within its interval.
+  auto node = makeNode("rebuild_trigger_slots");
+  PlannerNodeTestPeer::observeFloor(*node, -1.5, 6.0, -1.5, 1.5);
+  PlannerNodeTestPeer::acceptOdometry(*node, 0.0, 0.0, 1.0);
+  PlannerNodeTestPeer::serveMap(*node, "component:test", 0);
+  auto source = std::make_unique<TrajectoryInMemory>();
+  source->trajectory = keyframesAlongX(0.0, 4.0);
+  PlannerNodeTestPeer::setKeyframeSource(*node, std::move(source));
+  EXPECT_TRUE(PlannerNodeTestPeer::rebuildRoadmap(*node));
+  EXPECT_FALSE(PlannerNodeTestPeer::rebuildRoadmap(*node));
+  EXPECT_TRUE(PlannerNodeTestPeer::rebuildRoadmap(
+      *node, PlannerNode::RoadmapRebuildTrigger::kPoseUnlinkable));
+  EXPECT_FALSE(PlannerNodeTestPeer::rebuildRoadmap(
+      *node, PlannerNode::RoadmapRebuildTrigger::kPoseUnlinkable));
   EXPECT_EQ(PlannerNodeTestPeer::roadmapRebuilds(*node), 2);
 }
 

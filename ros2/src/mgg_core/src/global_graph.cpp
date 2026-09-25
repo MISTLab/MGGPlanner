@@ -3,7 +3,9 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <functional>
 #include <limits>
+#include <queue>
 #include <unordered_map>
 #include <utility>
 
@@ -713,6 +715,108 @@ RoadmapRebuildReport rebuildRoadmapFromTrajectory(
     if (start == home) report.home_component_vertices = size;
   }
   return finish();
+}
+
+FrontierCarryReport carryFrontiersOver(GraphManager& graph,
+                                       GraphManager& old_graph,
+                                       const ExpandContext& ctx,
+                                       double vertex_spacing) {
+  FrontierCarryReport report;
+  const auto own = [&old_graph, &ctx](const Vertex* vertex) {
+    return vertex != nullptr && vertex->robot_id == ctx.robot_id &&
+           old_graph.inService(*vertex);
+  };
+  // Dijkstra over the old roadmap's own vertices from every one that lies
+  // within an edge of the new roadmap.
+  using Entry = std::pair<double, int>;
+  std::priority_queue<Entry, std::vector<Entry>, std::greater<Entry>> open;
+  std::unordered_map<int, double> distance;
+  std::unordered_map<int, int> parent;
+  std::vector<Vertex*> frontiers;
+  for (const auto& [id, vertex] : old_graph.vertices_map_) {
+    if (!own(vertex)) continue;
+    if (vertex->type == VertexType::kFrontier) frontiers.push_back(vertex);
+    Vertex* near = nullptr;
+    if (graph.getNearestVertex(&vertex->state, &near) && near != nullptr &&
+        (near->state.head<3>() - vertex->state.head<3>()).norm() <=
+            ctx.planning->edge_length_max) {
+      distance[id] = 0.0;
+      parent[id] = id;
+      open.emplace(0.0, id);
+    }
+  }
+  report.frontiers = static_cast<int>(frontiers.size());
+  if (frontiers.empty()) return report;
+  while (!open.empty()) {
+    const auto [d, id] = open.top();
+    open.pop();
+    if (d > distance.at(id)) continue;
+    const auto edges = old_graph.edge_map_.find(id);
+    if (edges == old_graph.edge_map_.end()) continue;
+    for (const auto& [next, cost] : edges->second) {
+      const auto found = old_graph.vertices_map_.find(next);
+      if (found == old_graph.vertices_map_.end() || !own(found->second) ||
+          !old_graph.graph_->edgeExists(id, next)) {
+        continue;
+      }
+      const auto known = distance.find(next);
+      if (known != distance.end() && known->second <= d + cost) continue;
+      distance[next] = d + cost;
+      parent[next] = id;
+      open.emplace(d + cost, next);
+    }
+  }
+
+  // Nearest first, so a nearer frontier's path is in place for a farther
+  // one that shares it.
+  std::sort(frontiers.begin(), frontiers.end(),
+            [&distance](const Vertex* a, const Vertex* b) {
+              const auto da = distance.find(a->id);
+              const auto db = distance.find(b->id);
+              const double va = da == distance.end()
+                                    ? std::numeric_limits<double>::infinity()
+                                    : da->second;
+              const double vb = db == distance.end()
+                                    ? std::numeric_limits<double>::infinity()
+                                    : db->second;
+              return va < vb;
+            });
+  const int before = graph.getNumVertices();
+  for (Vertex* frontier : frontiers) {
+    bool carried = false;
+    if (distance.count(frontier->id) > 0) {
+      std::vector<Vertex*> path;
+      for (int id = frontier->id;; id = parent.at(id)) {
+        path.push_back(old_graph.vertices_map_.at(id));
+        if (parent.at(id) == id) break;
+      }
+      std::reverse(path.begin(), path.end());
+      if (path.size() == 1) {
+        // The frontier itself lies within an edge of the new roadmap.
+        Vertex* linked = connectStateToGraph(graph, frontier->state, ctx,
+                                             kRadiusLimit,
+                                             /*exact_state=*/true);
+        if (linked != nullptr) {
+          linked->type = VertexType::kFrontier;
+          linked->vol_gain = frontier->vol_gain;
+          carried = true;
+        }
+      } else {
+        std::vector<Vertex*> added;
+        carried = addRefPathToGraph(graph, path, ctx, vertex_spacing,
+                                    &added) &&
+                  !added.empty() &&
+                  added.back()->type == VertexType::kFrontier;
+      }
+    }
+    if (carried) {
+      ++report.carried;
+    } else {
+      report.lost.push_back(frontier->state.head<3>());
+    }
+  }
+  report.vertices_added = graph.getNumVertices() - before;
+  return report;
 }
 
 Vertex* connectGoalThroughLattice(GraphManager& graph, const StateVec& goal,

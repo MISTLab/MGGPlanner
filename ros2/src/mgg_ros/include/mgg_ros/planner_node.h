@@ -23,6 +23,7 @@
 
 #include <chrono>
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -83,6 +84,16 @@ class PlannerNode : public rclcpp::Node {
   static constexpr int kStatusNotReady = -1;      // no odometry or no map
   static constexpr int kStatusNoPath = -2;        // this cycle found none
   static constexpr int kStatusComplete = -3;      // nothing left to explore
+
+
+  /// What set a rebuild of the global graph off; each has its own rate
+  /// limit, so one kind failing does not hold another back.
+  enum class RoadmapRebuildTrigger {
+    kSeedOnly = 0,
+    kPoseUnlinkable = 1,
+    kPathUnlinkable = 2,
+  };
+  static constexpr int kRoadmapRebuildTriggers = 3;
 
  private:
   void loadParameters();
@@ -206,10 +217,28 @@ class PlannerNode : public rclcpp::Node {
   /// Replaces the global graph with one rebuilt from the robot's keyframe
   /// trajectory (mgg::rebuildRoadmapFromTrajectory), vertex 0 at its home
   /// keyframe, when the trajectory is for the map in service and home has
-  /// mapped ground. `why`, for the log, is what triggered it. At most once
-  /// per roadmap_rebuild_min_interval_s_, and not again on the same
-  /// trajectory revision and map. Returns true when the graph was replaced.
-  bool rebuildGlobalGraphFromKeyframes(const char* why);
+  /// mapped ground. The old graph's own frontiers, with the roadmap paths
+  /// to them, are carried over (mgg::carryFrontiersOver); those that are
+  /// not, and merged neighbours' frontiers, are remembered as lost
+  /// (frontiers_lost_in_rebuild_). With `links_what_failed`, the rebuilt
+  /// graph replaces the old one only when it links what the old one could
+  /// not (the robot's pose, an exploration path), which it may add to it;
+  /// otherwise the old graph is kept. `why`, for the log, says what
+  /// triggered it. At most once per roadmap_rebuild_min_interval_s_ for
+  /// each trigger, and not again on the same trajectory revision and map.
+  /// Returns true when the graph was replaced.
+  bool rebuildGlobalGraphFromKeyframes(
+      RoadmapRebuildTrigger trigger, const char* why,
+      const std::function<bool(mgg::GraphManager&)>& links_what_failed =
+          nullptr);
+  /// Whether an own in-service vertex of the global graph lies within
+  /// edge_length_max of `state`: the graph reaches there, and a link
+  /// refused there (a wedged robot's box) is no reason to rebuild it.
+  bool globalGraphReaches(const mgg::StateVec& state) const;
+  /// Frontiers a rebuild could not carry over that still look into unknown
+  /// space and are not back in the graph (re-merged or re-found). While
+  /// any remain, a failed global search is not exploration complete.
+  int frontiersLostInRebuild();
   /// This robot's own vertices in the global graph.
   std::size_t ownGlobalVertices() const;
   /// rrg.cpp:2535 expandGlobalGraphTimerCallback, idle while its inputs
@@ -330,10 +359,15 @@ class PlannerNode : public rclcpp::Node {
   std::unique_ptr<KeyframeTrajectorySource> keyframe_source_;
   mgg::RoadmapRebuildParams roadmap_rebuild_params_;
   double roadmap_rebuild_min_interval_s_ = 10.0;
-  bool roadmap_rebuild_attempted_ = false;
-  std::chrono::steady_clock::time_point last_roadmap_rebuild_attempt_{};
-  /// The trajectory revision and map revision of the last attempt.
-  std::string last_roadmap_rebuild_inputs_;
+  /// Per trigger: whether and when it last tried, and the trajectory
+  /// revision and map revision it tried with.
+  bool roadmap_rebuild_attempted_[kRoadmapRebuildTriggers] = {false, false,
+                                                              false};
+  std::chrono::steady_clock::time_point
+      last_roadmap_rebuild_attempt_[kRoadmapRebuildTriggers] = {};
+  std::string last_roadmap_rebuild_inputs_[kRoadmapRebuildTriggers];
+  /// See frontiersLostInRebuild().
+  std::vector<Eigen::Vector3d> frontiers_lost_in_rebuild_;
   /// Global graphs rebuilt from the trajectory since the node started.
   int roadmap_rebuilds_ = 0;
 

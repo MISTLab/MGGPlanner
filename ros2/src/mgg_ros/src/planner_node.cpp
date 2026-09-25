@@ -564,7 +564,8 @@ void PlannerNode::onOdometry(nav_msgs::msg::Odometry::ConstSharedPtr msg) {
   seedGlobalGraph();
   // On start, or after the graph was lost, it holds only its seed.
   if (ownGlobalVertices() <= 1) {
-    rebuildGlobalGraphFromKeyframes("the global graph holds only its seed");
+    rebuildGlobalGraphFromKeyframes(RoadmapRebuildTrigger::kSeedOnly,
+                                    "the global graph holds only its seed");
   }
   ingestOdometryIntoGlobalGraph();
 }
@@ -923,19 +924,65 @@ std::size_t PlannerNode::ownGlobalVertices() const {
                                                           : own->second.size();
 }
 
-bool PlannerNode::rebuildGlobalGraphFromKeyframes(const char* why) {
+bool PlannerNode::globalGraphReaches(const mgg::StateVec& state) const {
+  std::vector<mgg::Vertex*> near;
+  mgg::StateVec query = state;
+  if (!global_graph_->getNearestVertices(
+          &query, planning_params_.edge_length_max, &near)) {
+    return false;
+  }
+  const int own = static_cast<int>(planning_params_.robot_id);
+  return std::any_of(near.begin(), near.end(),
+                     [this, own](const mgg::Vertex* vertex) {
+                       return vertex != nullptr && vertex->robot_id == own &&
+                              global_graph_->inService(*vertex);
+                     });
+}
+
+int PlannerNode::frontiersLostInRebuild() {
+  if (frontiers_lost_in_rebuild_.empty()) return 0;
+  const mgg::RecomputeGainFn gain = globalFrontierGain();
+  std::vector<Eigen::Vector3d> remaining;
+  for (const Eigen::Vector3d& at : frontiers_lost_in_rebuild_) {
+    // Back in the graph (re-merged from a neighbour, or re-found by
+    // exploration within a vertex spacing), or no longer looking into
+    // unknown space: no longer lost.
+    std::vector<mgg::Vertex*> near;
+    const mgg::StateVec state(at.x(), at.y(), at.z(), 0.0);
+    mgg::StateVec query = state;
+    if (global_graph_->getNearestVertices(&query, global_vertex_spacing_,
+                                          &near) &&
+        std::any_of(near.begin(), near.end(), [](const mgg::Vertex* v) {
+          return v != nullptr && v->type == mgg::VertexType::kFrontier;
+        })) {
+      continue;
+    }
+    mgg::Vertex probe(-1, state);
+    if (gain) gain(probe);
+    if (!probe.vol_gain.is_frontier) continue;
+    remaining.push_back(at);
+  }
+  global_space_.setCenter(current_state_, /*use_extension=*/true);
+  frontiers_lost_in_rebuild_ = std::move(remaining);
+  return static_cast<int>(frontiers_lost_in_rebuild_.size());
+}
+
+bool PlannerNode::rebuildGlobalGraphFromKeyframes(
+    RoadmapRebuildTrigger trigger, const char* why,
+    const std::function<bool(mgg::GraphManager&)>& links_what_failed) {
   if (keyframe_source_ == nullptr || !have_mapping_snapshot_ ||
       !map_->getStatus()) {
     return false;
   }
+  const int slot = static_cast<int>(trigger);
   const auto now = std::chrono::steady_clock::now();
-  if (roadmap_rebuild_attempted_ &&
-      secondsSince(last_roadmap_rebuild_attempt_) <
+  if (roadmap_rebuild_attempted_[slot] &&
+      secondsSince(last_roadmap_rebuild_attempt_[slot]) <
           roadmap_rebuild_min_interval_s_) {
     return false;
   }
-  roadmap_rebuild_attempted_ = true;
-  last_roadmap_rebuild_attempt_ = now;
+  roadmap_rebuild_attempted_[slot] = true;
+  last_roadmap_rebuild_attempt_[slot] = now;
   KeyframeTrajectory trajectory;
   std::string error;
   if (!keyframe_source_->read(trajectory, error)) {
@@ -961,8 +1008,8 @@ bool PlannerNode::rebuildGlobalGraphFromKeyframes(const char* why) {
                              std::to_string(trajectory.epoch) + "/" +
                              std::to_string(trajectory.revision) + "/" +
                              std::to_string(map_revision_);
-  if (inputs == last_roadmap_rebuild_inputs_) return false;
-  last_roadmap_rebuild_inputs_ = inputs;
+  if (inputs == last_roadmap_rebuild_inputs_[slot]) return false;
+  last_roadmap_rebuild_inputs_[slot] = inputs;
 
   // T_navigation_keyframe = T_component_navigation^-1 T_component_keyframe,
   // the same transform that places the map in the planning frame.
@@ -1005,6 +1052,31 @@ bool PlannerNode::rebuildGlobalGraphFromKeyframes(const char* why) {
                          keyframes.front().pose.y(), keyframes.front().pose.z());
     return false;
   }
+  // Where exploration was to go next survives the rebuild.
+  const mgg::ExpandContext global_ctx = makeGlobalContext();
+  const mgg::FrontierCarryReport carried = mgg::carryFrontiersOver(
+      *rebuilt, *global_graph_, global_ctx, global_vertex_spacing_);
+  if (links_what_failed && !links_what_failed(*rebuilt)) {
+    RCLCPP_WARN(get_logger(),
+                "global graph kept (%s): the graph rebuilt from %d keyframes "
+                "does not link it either (%d vertices, %d components)",
+                why, report.keyframes, rebuilt->getNumVertices(),
+                report.components);
+    return false;
+  }
+  // Frontiers not carried over, and merged neighbours' (back with their
+  // next broadcast), must not let exploration end before they are.
+  frontiers_lost_in_rebuild_.insert(frontiers_lost_in_rebuild_.end(),
+                                    carried.lost.begin(), carried.lost.end());
+  const int own = static_cast<int>(planning_params_.robot_id);
+  for (const auto& entry : global_graph_->vertices_map_) {
+    const mgg::Vertex* vertex = entry.second;
+    if (vertex != nullptr && vertex->robot_id != own &&
+        vertex->type == mgg::VertexType::kFrontier &&
+        global_graph_->inService(*vertex)) {
+      frontiers_lost_in_rebuild_.push_back(vertex->state.head<3>());
+    }
+  }
   global_graph_ = rebuilt;
   global_root_supported_ = true;
   global_exploration_ongoing_ = false;
@@ -1033,7 +1105,8 @@ bool PlannerNode::rebuildGlobalGraphFromKeyframes(const char* why) {
               "keyframes without ground, %d tipped, %d spots without room), "
               "%d edges; "
               "along the track %d kept, %d refused%s%s%s, %d gaps; %d "
-              "links; %d components, home's %d vertices; revision %lu; "
+              "links; %d components, home's %d vertices; %d of %d "
+              "frontiers carried over (+%d vertices); revision %lu; "
               "%.0f ms",
               report.keyframes, why, home->state.x(), home->state.y(),
               home->state.z(), report.vertices, report.offset_vertices,
@@ -1043,7 +1116,8 @@ bool PlannerNode::rebuildGlobalGraphFromKeyframes(const char* why) {
               report.chain_edges_refused, refusals.empty() ? "" : " (",
               refusals.c_str(), refusals.empty() ? "" : ")",
               report.chain_gaps, report.link_edges, report.components,
-              report.home_component_vertices,
+              report.home_component_vertices, carried.carried,
+              carried.frontiers, carried.vertices_added,
               static_cast<unsigned long>(trajectory.revision),
               1000.0 * report.elapsed_s);
   return true;
@@ -1148,10 +1222,34 @@ void PlannerNode::addRefPathToGraph(const std::vector<mgg::StateVec>& path) {
   };
   int before = global_graph_->getNumVertices();
   bool added = add();
-  if (!added && rebuildGlobalGraphFromKeyframes(
-                    "an exploration path could not be linked")) {
-    before = global_graph_->getNumVertices();
-    added = add();
+  // Only when the graph reaches none of the path's poses: a path it
+  // reaches but refused to link (a wedged start) is no reason to replace
+  // it. The rebuilt graph replaces it only if the path joins it.
+  if (!added &&
+      std::none_of(path.begin(), path.end(),
+                   [this](const mgg::StateVec& pose) {
+                     return globalGraphReaches(pose);
+                   })) {
+    int rebuilt_before = 0;
+    std::vector<mgg::Vertex*> rebuilt_added;
+    const bool rebuilt = rebuildGlobalGraphFromKeyframes(
+        RoadmapRebuildTrigger::kPathUnlinkable,
+        "an exploration path could not be linked",
+        [&](mgg::GraphManager& graph) {
+          rebuilt_before = graph.getNumVertices();
+          return lattice.empty()
+                     ? mgg::addRefPathToGraph(graph, path, ctx,
+                                              global_vertex_spacing_,
+                                              &rebuilt_added)
+                     : mgg::addRefPathToGraph(graph, lattice, ctx,
+                                              global_vertex_spacing_,
+                                              &rebuilt_added);
+        });
+    if (rebuilt) {
+      before = rebuilt_before;
+      added_vertices = rebuilt_added;
+      added = true;
+    }
   }
   if (!added) {
     RCLCPP_WARN(get_logger(),
@@ -1659,8 +1757,17 @@ bool PlannerNode::routeOverGlobalGraph(const mgg::StateVec goal,
   // nothing else: the route starts at the robot, then that vertex.
   mgg::DepartureLink departure =
       mgg::linkDeparture(*global_graph_, current, ctx, kLinkRadius);
-  if (departure.vertex == nullptr &&
-      rebuildGlobalGraphFromKeyframes("the current pose cannot be linked")) {
+  // Only when no vertex of the graph is within an edge of the robot: a
+  // robot wedged beside a healthy graph (its box refused) keeps it. The
+  // rebuilt graph replaces it only if the robot's pose links to it.
+  if (departure.vertex == nullptr && !globalGraphReaches(current) &&
+      rebuildGlobalGraphFromKeyframes(
+          RoadmapRebuildTrigger::kPoseUnlinkable,
+          "the current pose cannot be linked",
+          [&current, &ctx](mgg::GraphManager& graph) {
+            return mgg::linkDeparture(graph, current, ctx, kLinkRadius)
+                       .vertex != nullptr;
+          })) {
     departure = mgg::linkDeparture(*global_graph_, current, ctx, kLinkRadius);
   }
   mgg::Vertex* link_vertex = departure.vertex;
@@ -2190,11 +2297,19 @@ void PlannerNode::onPlanRequest(
       low_gain_rounds_ = 0;
       std::string departure;
       if (!runGlobalPlanner(-1, reason)) {
+        int lost = 0;
         if (local_gain_remains_now_) {
           // The lattice still sees gain it cannot send a path to; that is
           // not a finished exploration. No path, and PCI retries.
           summary += "; no global route (" + reason +
                      "), but local gain remains: no path";
+        } else if ((lost = frontiersLostInRebuild()) > 0) {
+          // A rebuild of the global graph dropped frontiers that still see
+          // unknown space: exploration is not complete while they do.
+          summary += "; no global route (" + reason + "), but " +
+                     std::to_string(lost) +
+                     " frontier(s) a graph rebuild could not carry over "
+                     "still see unknown space: no path";
         } else {
           complete = true;
           summary += "; exploration complete: " + reason;
