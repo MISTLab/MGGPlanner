@@ -133,6 +133,9 @@ GlobalGraphExpansionReport expandGlobalGraph(
 /// Approximate attachment may reuse a vertex within 0.1 m; exact attachment
 /// preserves the requested position and collision-checks even a short link.
 /// Nearby links reject known obstacles; farther links use expandGraph.
+/// Approximate attachment is for the pose the robot stands on, so its nearby
+/// links are checked along their centre line, not with the robot's box: a
+/// robot whose box touches a wall still links out, but not through it.
 /// Returns the attached vertex, or null.
 Vertex* connectStateToGraph(GraphManager& graph, const StateVec& state,
                             const ExpandContext& ctx,

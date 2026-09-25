@@ -538,6 +538,88 @@ TEST(ConnectStateToGraph, ExactAttachmentRejectsClippedGoalExtension) {
             nullptr);
 }
 
+/// A thin wall, the slab y in [wall_y0, wall_y1], whose sweep check honours
+/// the box: a swept box is blocked when any part of it touches the slab.
+class BoxSweptSlab : public SlabSpace {
+ public:
+  BoxSweptSlab(double wall_y0, double wall_y1)
+      : SlabSpace(wall_y0, wall_y1), y0_(wall_y0), y1_(wall_y1) {}
+  VoxelStatus getPathStatus(const Eigen::Vector3d& a, const Eigen::Vector3d& b,
+                            const Eigen::Vector3d& box,
+                            bool) const override {
+    const double half = 0.5 * box.y();
+    for (double t = 0.0; t <= 1.0 + 1e-9; t += 0.01) {
+      const double y = a.y() + std::min(t, 1.0) * (b.y() - a.y());
+      if (y + half >= y0_ && y - half <= y1_) return VoxelStatus::kOccupied;
+    }
+    return VoxelStatus::kFree;
+  }
+
+ private:
+  double y0_;
+  double y1_;
+};
+
+TEST(ConnectStateToGraph, ARobotAgainstAWallLinksToAVertexBehindIt) {
+  // The robot stopped with its box touching a wall (robot_1 on the SubT
+  // return, 2026-09-23). Where it stands is not in question; the link out is
+  // checked along its centre line, so the free vertex behind it links.
+  Roadmap fixture;
+  BoxSweptSlab wall(0.25, 0.35);
+  fixture.ctx.map = &wall;
+  Vertex* root = fixture.global.getVertex(0);
+  root->state = StateVec(0.0, -0.9, 0.0, 0.0);
+  fixture.global.updateVertexState(0, root->state);
+  // The 0.4 m box at the robot reaches y = 0.3, into the wall.
+  const StateVec robot(0.0, 0.1, 0.0, 0.0);
+  ASSERT_EQ(wall.getPathStatus(root->state.head<3>(), robot.head<3>(),
+                               fixture.ctx.robot_box_size, false),
+            VoxelStatus::kOccupied);
+  Vertex* linked = mgg::connectStateToGraph(fixture.global, robot,
+                                            fixture.ctx, 1.5, false);
+  ASSERT_NE(linked, nullptr);
+  EXPECT_EQ(linked->parent, root);
+  EXPECT_DOUBLE_EQ(linked->state.y(), robot.y());
+}
+
+TEST(ConnectStateToGraph, ARobotAgainstAWallDoesNotLinkThroughIt) {
+  Roadmap fixture;
+  BoxSweptSlab wall(0.25, 0.35);
+  fixture.ctx.map = &wall;
+  // The only vertex in reach is on the far side of the wall.
+  Vertex* root = fixture.global.getVertex(0);
+  root->state = StateVec(0.0, 0.6, 0.0, 0.0);
+  fixture.global.updateVertexState(0, root->state);
+  EXPECT_EQ(mgg::connectStateToGraph(fixture.global,
+                                     StateVec(0.0, 0.1, 0.0, 0.0),
+                                     fixture.ctx, 1.5, false),
+            nullptr);
+
+  // With a free vertex behind the robot as well, that one is the link and
+  // the far one gets no edge.
+  Vertex* behind = fixture.add(fixture.global, StateVec(0.0, -0.9, 0.0, 0.0),
+                               nullptr);
+  Vertex* linked = mgg::connectStateToGraph(
+      fixture.global, StateVec(0.0, 0.1, 0.0, 0.0), fixture.ctx, 1.5, false);
+  ASSERT_NE(linked, nullptr);
+  EXPECT_EQ(linked->parent, behind);
+  EXPECT_FALSE(fixture.global.graph_->edgeExists(linked->id, root->id));
+}
+
+TEST(ConnectStateToGraph, AnExactGoalLinkStillSweepsTheBox) {
+  // A goal is somewhere the robot has yet to fit; its link keeps the box.
+  Roadmap fixture;
+  BoxSweptSlab wall(0.25, 0.35);
+  fixture.ctx.map = &wall;
+  Vertex* root = fixture.global.getVertex(0);
+  root->state = StateVec(0.0, -0.9, 0.0, 0.0);
+  fixture.global.updateVertexState(0, root->state);
+  EXPECT_EQ(mgg::connectStateToGraph(fixture.global,
+                                     StateVec(0.0, 0.1, 0.0, 0.0),
+                                     fixture.ctx, 1.5, true),
+            nullptr);
+}
+
 /// A wall y in [1.0, 1.4] everywhere except a gap at x >= 4.5.
 class WallWithGap : public OpenSpace {
  public:

@@ -61,23 +61,26 @@ struct RefPose {
   const Vertex* source = nullptr;
 };
 
-/// The straight segment between two driving-height states runs through
-/// space the map knows to be occupied.
+/// `box_size` swept along the straight segment between two driving-height
+/// states runs through space the map knows to be occupied.
 bool throughKnownObstacle(const ExpandContext& ctx, const StateVec& from,
-                          const StateVec& to) {
+                          const StateVec& to,
+                          const Eigen::Vector3d& box_size) {
   return ctx.map->getPathStatus(from.head<3>() + ctx.robot->center_offset,
                                 to.head<3>() + ctx.robot->center_offset,
-                                ctx.robot_box_size, false) ==
-         VoxelStatus::kOccupied;
+                                box_size, false) == VoxelStatus::kOccupied;
 }
 
 /// rrg.cpp:4817 to 4862, the "add root vertex first" block shared by
 /// addRefPathToGraph and connectStateToGraph (rrg.cpp:5471 to 5510): the
 /// nearest vertex itself when the state sits on it, a blind edge when it is
 /// within `blind_radius`, otherwise a checked expandGraph.
+///
+/// With `centre_line_link` the nearby links are checked along their centre
+/// line rather than with the robot's box, for the pose the robot stands on.
 Vertex* linkStateToGraph(GraphManager& graph, const StateVec& state,
                          const ExpandContext& ctx, double blind_radius,
-                         bool exact_state) {
+                         bool exact_state, bool centre_line_link) {
   Vertex* nearest_vertex = nullptr;
   if (!graph.getNearestVertex(&state, &nearest_vertex) ||
       nearest_vertex == nullptr) {
@@ -94,6 +97,14 @@ Vertex* linkStateToGraph(GraphManager& graph, const StateVec& state,
   // segment is not known to cross an obstacle, so a vertex on the far side
   // of a thin wall cannot become the link. Unknown space still passes, as
   // it does for every lattice edge.
+  //
+  // The robot's own pose is where it stands, even when its box touches a
+  // wall it stopped against: every box sweep out of there was refused and
+  // the robot could not be routed anywhere (robot_1 and robot_2 on the SubT
+  // return, 2026-09-23). Its link is checked along the centre line, which
+  // still refuses a vertex behind a wall.
+  const Eigen::Vector3d link_box =
+      centre_line_link ? Eigen::Vector3d::Zero() : ctx.robot_box_size;
   const double radius = std::max(blind_radius, ctx.planning->edge_length_min);
   std::vector<Vertex*> candidates;
   if (graph.getNearestVertices(&state, radius, &candidates)) {
@@ -104,7 +115,7 @@ Vertex* linkStateToGraph(GraphManager& graph, const StateVec& state,
               });
     for (Vertex* candidate : candidates) {
       if (candidate == nullptr ||
-          throughKnownObstacle(ctx, candidate->state, state)) {
+          throughKnownObstacle(ctx, candidate->state, state, link_box)) {
         continue;
       }
       const double direction_norm =
@@ -146,7 +157,8 @@ Vertex* linkPathPose(GraphManager& graph, const StateVec& state,
           ctx.planning->edge_length_max) {
     return nullptr;
   }
-  return linkStateToGraph(graph, state, ctx, kRadiusLimit, false);
+  return linkStateToGraph(graph, state, ctx, kRadiusLimit, false,
+                          /*centre_line_link=*/false);
 }
 
 /// A vertex of this robot already standing on `state`, if there is one: a
@@ -292,8 +304,9 @@ Vertex* connectStateToGraph(GraphManager& graph, const StateVec& state,
                             const ExpandContext& ctx,
                             double dist_ignore_collision_check,
                             bool exact_state) {
-  Vertex* linked = linkStateToGraph(
-      graph, state, ctx, dist_ignore_collision_check, exact_state);
+  Vertex* linked =
+      linkStateToGraph(graph, state, ctx, dist_ignore_collision_check,
+                       exact_state, /*centre_line_link=*/!exact_state);
   if (linked == nullptr) return nullptr;
   // rrg.cpp:5484 and 5497: edges from the linked vertex to whatever else is
   // reachable around it, so the route out of here is not just the chain in.
