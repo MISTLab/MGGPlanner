@@ -62,6 +62,7 @@
 #include "mgg_core/sensor_params.h"
 #include "mgg_core/trajectory.h"
 #include "mgg_map_octomap/mola_map.h"
+#include "mgg_ros/keyframe_trajectory.h"
 
 namespace mgg {
 // Declared only: the OctoMap backend is compiled in only when mgg_map_octomap
@@ -200,6 +201,15 @@ class PlannerNode : public rclcpp::Node {
   /// The root of the global graph is home: the first odometry, dropped onto
   /// the terrain once the map shows ground under it.
   void seedGlobalGraph();
+  /// Replaces the global graph with one rebuilt from the robot's keyframe
+  /// trajectory (mgg::rebuildRoadmapFromTrajectory), vertex 0 at its home
+  /// keyframe, when the trajectory is for the map in service and home has
+  /// mapped ground. `why`, for the log, is what triggered it. At most once
+  /// per roadmap_rebuild_min_interval_s_, and not again on the same
+  /// trajectory revision and map. Returns true when the graph was replaced.
+  bool rebuildGlobalGraphFromKeyframes(const char* why);
+  /// This robot's own vertices in the global graph.
+  std::size_t ownGlobalVertices() const;
   /// rrg.cpp:2535 expandGlobalGraphTimerCallback, idle while its inputs
   /// (graph, map, robot position) are unchanged.
   void expandGlobalGraphTimerCallback();
@@ -311,6 +321,19 @@ class PlannerNode : public rclcpp::Node {
   mgg::StateVec last_state_marker_ = mgg::StateVec::Zero();
   mgg::StateVec last_state_marker_global_ = mgg::StateVec::Zero();
   bool global_root_supported_ = false;
+
+  /// The robot's keyframe trajectory the global graph is rebuilt from, or
+  /// null when there is none (a map backend without one, or rebuilding
+  /// turned off).
+  std::unique_ptr<KeyframeTrajectorySource> keyframe_source_;
+  mgg::RoadmapRebuildParams roadmap_rebuild_params_;
+  double roadmap_rebuild_min_interval_s_ = 10.0;
+  bool roadmap_rebuild_attempted_ = false;
+  std::chrono::steady_clock::time_point last_roadmap_rebuild_attempt_{};
+  /// The trajectory revision and map revision of the last attempt.
+  std::string last_roadmap_rebuild_inputs_;
+  /// Global graphs rebuilt from the trajectory since the node started.
+  int roadmap_rebuilds_ = 0;
 
   /// Below this displacement the robot is standing still for the expansion
   /// sampler: its other inputs are the graph and map revisions.

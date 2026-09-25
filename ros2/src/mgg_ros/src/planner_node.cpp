@@ -4,6 +4,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstdio>
+#include <filesystem>
 #include <functional>
 #include <geometry_msgs/msg/transform_stamped.hpp>
 #include <random>
@@ -282,6 +283,39 @@ PlannerNode::PlannerNode(const rclcpp::NodeOptions& options)
   hanging_root_edge_length_max_ = std::max(
       0.0, declareOrGet<double>(this, "hanging_root_edge_length_max",
                                 hanging_root_edge_length_max_));
+  // The global graph lives only in memory: a restarted planner, or a robot
+  // driven far off its graph, is left with a graph that cannot reach where
+  // the robot is or home (run 5, 2026-09-25). It is rebuilt from the
+  // robot's keyframe trajectory: on start and whenever it holds only its
+  // seed, and when neither the robot's pose nor an exploration path links
+  // to it. The trajectory is the MOLA backend's graph solution, in the
+  // robot's peer root beside the products the map is read from, whose last
+  // path component is the robot's id there.
+  roadmap_rebuild_min_interval_s_ = std::max(
+      0.0, declareOrGet<double>(this, "roadmap_rebuild.min_interval_s",
+                                roadmap_rebuild_min_interval_s_));
+  roadmap_rebuild_params_.max_offset = std::clamp(
+      declareOrGet<double>(this, "roadmap_rebuild.max_offset_m",
+                           roadmap_rebuild_params_.max_offset),
+      0.0, 2.0);
+  roadmap_rebuild_params_.link_radius = std::max(
+      0.0, declareOrGet<double>(this, "roadmap_rebuild.link_radius_m",
+                                roadmap_rebuild_params_.link_radius));
+  if (mola_map_ != nullptr &&
+      declareOrGet<bool>(this, "roadmap_rebuild.enable", true)) {
+    const std::filesystem::path peer_root(
+        get_parameter("map.mola.peer_root").as_string());
+    const std::string robot = declareOrGet<std::string>(
+        this, "roadmap_rebuild.robot_id", peer_root.filename().string());
+    if (!peer_root.empty() && !robot.empty()) {
+      keyframe_source_ = std::make_unique<GraphSolutionFile>(
+          (peer_root / "graph_solution.json").string(), robot,
+          std::size_t{64} * 1024 * 1024);
+      RCLCPP_INFO(get_logger(),
+                  "global graph rebuilds read %s's keyframes from %s",
+                  robot.c_str(), (peer_root / "graph_solution.json").c_str());
+    }
+  }
 
   plan_srv_ = create_service<mgg_msgs::srv::PlannerSrv>(
       "mggplanner",
@@ -528,6 +562,10 @@ void PlannerNode::onOdometry(nav_msgs::msg::Odometry::ConstSharedPtr msg) {
   auto map_read = mapReadLease();
   refreshMapRevision();
   seedGlobalGraph();
+  // On start, or after the graph was lost, it holds only its seed.
+  if (ownGlobalVertices() <= 1) {
+    rebuildGlobalGraphFromKeyframes("the global graph holds only its seed");
+  }
   ingestOdometryIntoGlobalGraph();
 }
 
@@ -878,6 +916,127 @@ void PlannerNode::seedGlobalGraph() {
               supported_root[0], supported_root[1], supported_root[2]);
 }
 
+std::size_t PlannerNode::ownGlobalVertices() const {
+  const auto own = global_graph_->vertex_by_robot_id_.find(
+      static_cast<int>(planning_params_.robot_id));
+  return own == global_graph_->vertex_by_robot_id_.end() ? 0
+                                                          : own->second.size();
+}
+
+bool PlannerNode::rebuildGlobalGraphFromKeyframes(const char* why) {
+  if (keyframe_source_ == nullptr || !have_mapping_snapshot_ ||
+      !map_->getStatus()) {
+    return false;
+  }
+  const auto now = std::chrono::steady_clock::now();
+  if (roadmap_rebuild_attempted_ &&
+      secondsSince(last_roadmap_rebuild_attempt_) <
+          roadmap_rebuild_min_interval_s_) {
+    return false;
+  }
+  roadmap_rebuild_attempted_ = true;
+  last_roadmap_rebuild_attempt_ = now;
+  KeyframeTrajectory trajectory;
+  std::string error;
+  if (!keyframe_source_->read(trajectory, error)) {
+    RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 30000,
+                         "global graph not rebuilt (%s): %s", why,
+                         error.c_str());
+    return false;
+  }
+  if (trajectory.component_id != mapping_snapshot_.component_id ||
+      trajectory.epoch != mapping_snapshot_.epoch) {
+    RCLCPP_WARN_THROTTLE(
+        get_logger(), *get_clock(), 30000,
+        "global graph not rebuilt (%s): the keyframes are of %s epoch %lu, "
+        "the map in service is %s epoch %lu",
+        why, trajectory.component_id.c_str(),
+        static_cast<unsigned long>(trajectory.epoch),
+        mapping_snapshot_.component_id.c_str(),
+        static_cast<unsigned long>(mapping_snapshot_.epoch));
+    return false;
+  }
+  // The same keyframes on the same map rebuild the same graph.
+  const std::string inputs = trajectory.component_id + "/" +
+                             std::to_string(trajectory.epoch) + "/" +
+                             std::to_string(trajectory.revision) + "/" +
+                             std::to_string(map_revision_);
+  if (inputs == last_roadmap_rebuild_inputs_) return false;
+  last_roadmap_rebuild_inputs_ = inputs;
+
+  // T_navigation_keyframe = T_component_navigation^-1 T_component_keyframe,
+  // the same transform that places the map in the planning frame.
+  const auto& t = mapping_snapshot_.component_from_navigation.translation;
+  const auto& q = mapping_snapshot_.component_from_navigation.rotation;
+  Eigen::Isometry3d component_from_navigation = Eigen::Isometry3d::Identity();
+  component_from_navigation.linear() =
+      Eigen::Quaterniond(q.w, q.x, q.y, q.z).normalized().toRotationMatrix();
+  component_from_navigation.translation() = Eigen::Vector3d(t.x, t.y, t.z);
+  const Eigen::Isometry3d navigation_from_component =
+      component_from_navigation.inverse();
+  std::vector<mgg::StateVec> keyframes;
+  keyframes.reserve(trajectory.poses.size());
+  for (const Eigen::Isometry3d& pose : trajectory.poses) {
+    const Eigen::Isometry3d keyframe = navigation_from_component * pose;
+    const Eigen::Matrix3d r = keyframe.linear();
+    keyframes.emplace_back(keyframe.translation().x(),
+                           keyframe.translation().y(),
+                           keyframe.translation().z(),
+                           std::atan2(r(1, 0), r(0, 0)));
+  }
+
+  auto rebuilt = std::make_shared<mgg::GraphManager>();
+  rebuilt->setRobotId(static_cast<int>(planning_params_.robot_id));
+  mgg::RoadmapRebuildParams params = roadmap_rebuild_params_;
+  params.vertex_spacing = global_vertex_spacing_;
+  const mgg::RoadmapRebuildReport report = mgg::rebuildRoadmapFromTrajectory(
+      *rebuilt, keyframes, makeGlobalContext(), params);
+  if (!report.home_supported) {
+    RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 30000,
+                         "global graph not rebuilt (%s): no mapped ground "
+                         "under the home keyframe at (%.2f, %.2f, %.2f)",
+                         why, keyframes.front().x(), keyframes.front().y(),
+                         keyframes.front().z());
+    return false;
+  }
+  global_graph_ = rebuilt;
+  global_root_supported_ = true;
+  global_exploration_ongoing_ = false;
+  current_global_vertex_id_ = -1;
+  last_state_marker_ = current_state_;
+  ++graph_revision_;
+  ++roadmap_rebuilds_;
+  static const char* const kRefusals[8] = {
+      "", "steep", "occupied", "unknown", "hanging", "cross slope",
+      "footprint plane", "ground unobserved"};
+  std::string refusals;
+  for (int s = 1; s < 8; ++s) {
+    if (report.chain_refusals_by_status[s] == 0) continue;
+    if (!refusals.empty()) refusals += ", ";
+    refusals += std::to_string(report.chain_refusals_by_status[s]) + " " +
+                kRefusals[s];
+  }
+  const mgg::Vertex* home = global_graph_->getVertex(0);
+  RCLCPP_INFO(get_logger(),
+              "global graph rebuilt from %d keyframes (%s): home at (%.2f, "
+              "%.2f, %.2f); %d vertices (%d beside their keyframe, %d "
+              "keyframes without ground, %d spots without room), %d edges; "
+              "along the track %d kept, %d refused%s%s%s, %d gaps; %d "
+              "links; %d components, home's %d vertices; revision %lu; "
+              "%.0f ms",
+              report.keyframes, why, home->state.x(), home->state.y(),
+              home->state.z(), report.vertices, report.offset_vertices,
+              report.unsupported_keyframes, report.boxed_vertices,
+              global_graph_->getNumEdges(), report.chain_edges,
+              report.chain_edges_refused, refusals.empty() ? "" : " (",
+              refusals.c_str(), refusals.empty() ? "" : ")",
+              report.chain_gaps, report.link_edges, report.components,
+              report.home_component_vertices,
+              static_cast<unsigned long>(trajectory.revision),
+              1000.0 * report.elapsed_s);
+  return true;
+}
+
 void PlannerNode::ingestOdometryIntoGlobalGraph() {
   if (!have_odometry_ || global_graph_->getNumVertices() == 0) return;
   const bool add_state =
@@ -964,15 +1123,24 @@ void PlannerNode::addRefPathToGraph(const std::vector<mgg::StateVec>& path) {
     }
     lattice.push_back(vertex);
   }
-  const int before = global_graph_->getNumVertices();
   const mgg::ExpandContext ctx = makeGlobalContext();
   std::vector<mgg::Vertex*> added_vertices;
-  const bool added =
-      lattice.empty()
-          ? mgg::addRefPathToGraph(*global_graph_, path, ctx,
-                                   global_vertex_spacing_, &added_vertices)
-          : mgg::addRefPathToGraph(*global_graph_, lattice, ctx,
-                                   global_vertex_spacing_, &added_vertices);
+  const auto add = [&]() {
+    return lattice.empty()
+               ? mgg::addRefPathToGraph(*global_graph_, path, ctx,
+                                        global_vertex_spacing_,
+                                        &added_vertices)
+               : mgg::addRefPathToGraph(*global_graph_, lattice, ctx,
+                                        global_vertex_spacing_,
+                                        &added_vertices);
+  };
+  int before = global_graph_->getNumVertices();
+  bool added = add();
+  if (!added && rebuildGlobalGraphFromKeyframes(
+                    "an exploration path could not be linked")) {
+    before = global_graph_->getNumVertices();
+    added = add();
+  }
   if (!added) {
     RCLCPP_WARN(get_logger(),
                 "exploration path not added to the global graph: none of its "
@@ -1477,8 +1645,12 @@ bool PlannerNode::routeOverGlobalGraph(const mgg::StateVec& goal,
   const int before = global_graph_->getNumVertices();
   // A departure clear only along its centre line joins this route and
   // nothing else: the route starts at the robot, then that vertex.
-  const mgg::DepartureLink departure =
+  mgg::DepartureLink departure =
       mgg::linkDeparture(*global_graph_, current, ctx, kLinkRadius);
+  if (departure.vertex == nullptr &&
+      rebuildGlobalGraphFromKeyframes("the current pose cannot be linked")) {
+    departure = mgg::linkDeparture(*global_graph_, current, ctx, kLinkRadius);
+  }
   mgg::Vertex* link_vertex = departure.vertex;
   if (global_graph_->getNumVertices() != before) ++graph_revision_;
   if (link_vertex == nullptr) {

@@ -6,6 +6,7 @@
 #include <gtest/gtest.h>
 
 #include <cmath>
+#include <cstdint>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -365,6 +366,58 @@ class PlannerNodeTestPeer {
       std::shared_ptr<mgg_msgs::srv::PlanObjective::Request> request,
       std::shared_ptr<mgg_msgs::srv::PlanObjective::Response> response) {
     node.onObjectiveRequest(request, response);
+  }
+  /// The robot's keyframe trajectory comes from `source` from now on.
+  static void setKeyframeSource(
+      PlannerNode& node, std::unique_ptr<KeyframeTrajectorySource> source) {
+    const std::lock_guard<std::recursive_mutex> lock(node.planner_mutex_);
+    node.keyframe_source_ = std::move(source);
+  }
+  /// The map in service is `component` at `epoch`, its component frame the
+  /// planning frame.
+  static void serveMap(PlannerNode& node, const std::string& component,
+                       std::uint64_t epoch) {
+    const std::lock_guard<std::recursive_mutex> lock(node.planner_mutex_);
+    node.mapping_snapshot_.component_id = component;
+    node.mapping_snapshot_.epoch = epoch;
+    node.mapping_snapshot_.component_from_navigation.rotation.w = 1.0;
+    node.have_mapping_snapshot_ = true;
+  }
+  static void setRoadmapRebuildInterval(PlannerNode& node, double seconds) {
+    node.roadmap_rebuild_min_interval_s_ = seconds;
+  }
+  static int roadmapRebuilds(PlannerNode& node) {
+    return node.roadmap_rebuilds_;
+  }
+  static bool rebuildRoadmap(PlannerNode& node) {
+    const std::lock_guard<std::recursive_mutex> lock(node.planner_mutex_);
+    return node.rebuildGlobalGraphFromKeyframes("test");
+  }
+  static mgg::StateVec globalVertexState(PlannerNode& node, int id) {
+    const std::lock_guard<std::recursive_mutex> lock(node.planner_mutex_);
+    const mgg::Vertex* vertex = node.findGlobalVertex(id);
+    return vertex == nullptr ? mgg::StateVec::Constant(std::nan(""))
+                             : vertex->state;
+  }
+  /// Whether this robot's global graph has a vertex within `within` of
+  /// (x, y).
+  static bool hasGlobalVertexNear(PlannerNode& node, double x, double y,
+                                  double within) {
+    const std::lock_guard<std::recursive_mutex> lock(node.planner_mutex_);
+    for (const auto& entry : node.global_graph_->vertices_map_) {
+      if (entry.second != nullptr &&
+          std::hypot(entry.second->state.x() - x,
+                     entry.second->state.y() - y) <= within) {
+        return true;
+      }
+    }
+    return false;
+  }
+  /// An accepted exploration path joins the global graph.
+  static void addExplorationPath(PlannerNode& node,
+                                 const std::vector<mgg::StateVec>& path) {
+    const std::lock_guard<std::recursive_mutex> lock(node.planner_mutex_);
+    node.addRefPathToGraph(path);
   }
 };
 
@@ -1430,6 +1483,165 @@ TEST_F(PlannerNodeTest, AResumedRouteWithheldWithNoWayOutIsNotExplorationComplet
   EXPECT_EQ(response->status, PlannerNode::kStatusNoPath);
   EXPECT_EQ(PlannerNodeTestPeer::boxedInWithoutDeparture(*node), 1);
   EXPECT_EQ(PlannerNodeTestPeer::routeSharpTurnFallbacks(*node), 1);
+}
+
+/// A keyframe trajectory held in memory; `trajectory` may change between
+/// reads.
+struct TrajectoryInMemory : public KeyframeTrajectorySource {
+  bool read(KeyframeTrajectory& out, std::string&) override {
+    ++reads;
+    out = trajectory;
+    return true;
+  }
+  KeyframeTrajectory trajectory;
+  int reads = 0;
+};
+
+/// Keyframes about every 0.25 m along `corners`, home first, on map
+/// "component:test" epoch 0.
+KeyframeTrajectory keyframesAlong(const std::vector<Eigen::Vector2d>& corners,
+                                  std::uint64_t revision = 1) {
+  KeyframeTrajectory trajectory;
+  trajectory.component_id = "component:test";
+  trajectory.revision = revision;
+  const auto add = [&trajectory](const Eigen::Vector2d& p) {
+    Eigen::Isometry3d pose = Eigen::Isometry3d::Identity();
+    pose.translation() = Eigen::Vector3d(p.x(), p.y(), 0.075);
+    trajectory.poses.push_back(pose);
+  };
+  add(corners.front());
+  for (std::size_t i = 1; i < corners.size(); ++i) {
+    const Eigen::Vector2d leg = corners[i] - corners[i - 1];
+    const int steps = std::max(1, static_cast<int>(std::round(leg.norm() / 0.25)));
+    for (int k = 1; k <= steps; ++k) add(corners[i - 1] + leg * k / steps);
+  }
+  return trajectory;
+}
+
+KeyframeTrajectory keyframesAlongX(double x0, double x1,
+                                   std::uint64_t revision = 1) {
+  return keyframesAlong({{x0, 0.0}, {x1, 0.0}}, revision);
+}
+
+std::shared_ptr<mgg_msgs::srv::PlanObjective::Response> returnHome(
+    PlannerNode& node, double x, double y) {
+  auto request = std::make_shared<mgg_msgs::srv::PlanObjective::Request>();
+  request->objective = mgg_msgs::srv::PlanObjective::Request::RETURN_HOME;
+  request->goal.position.x = x;
+  request->goal.position.y = y;
+  request->goal.position.z = 0.075;
+  request->goal.orientation.w = 1.0;
+  auto response = std::make_shared<mgg_msgs::srv::PlanObjective::Response>();
+  PlannerNodeTestPeer::objective(node, request, response);
+  return response;
+}
+
+TEST_F(PlannerNodeTest, AGraphHoldingOnlyItsSeedIsRebuiltFromTheKeyframes) {
+  // Run 5: the planner restarted 4 m from home and seeded its graph where
+  // the robot stood, and Return Home had nothing to route over. With the
+  // robot's keyframes the graph is rebuilt at once: vertex 0 is the home
+  // keyframe, and the track leads back to it.
+  auto node = makeNode("rebuild_seed_only");
+  PlannerNodeTestPeer::observeFloor(*node, -1.5, 6.0, -1.5, 1.5);
+  PlannerNodeTestPeer::serveMap(*node, "component:test", 0);
+  auto source = std::make_unique<TrajectoryInMemory>();
+  source->trajectory = keyframesAlongX(0.0, 4.0);
+  PlannerNodeTestPeer::setKeyframeSource(*node, std::move(source));
+
+  PlannerNodeTestPeer::acceptOdometry(*node, 4.0, 0.0, 1.0);
+  EXPECT_EQ(PlannerNodeTestPeer::roadmapRebuilds(*node), 1);
+  const mgg::StateVec home = PlannerNodeTestPeer::globalVertexState(*node, 0);
+  EXPECT_NEAR(home.x(), 0.0, 1e-9);
+  EXPECT_NEAR(home.y(), 0.0, 1e-9);
+  EXPECT_GT(PlannerNodeTestPeer::globalVertices(*node), 4);
+
+  const auto response = returnHome(*node, 0.0, 0.0);
+  ASSERT_EQ(response->status,
+            mgg_msgs::srv::PlanObjective::Response::SUCCEEDED)
+      << response->reason;
+  EXPECT_NEAR(response->path.front().position.x, 4.0, 0.30);
+  EXPECT_NEAR(response->path.back().position.x, 0.0, 1e-3);
+  EXPECT_NEAR(response->path.back().position.y, 0.0, 1e-3);
+}
+
+TEST_F(PlannerNodeTest, KeyframesOfAnotherMapDoNotReplaceTheGraph) {
+  auto node = makeNode("rebuild_other_map");
+  PlannerNodeTestPeer::observeFloor(*node, -1.5, 6.0, -1.5, 1.5);
+  PlannerNodeTestPeer::serveMap(*node, "component:other", 0);
+  auto source = std::make_unique<TrajectoryInMemory>();
+  source->trajectory = keyframesAlongX(0.0, 4.0);
+  PlannerNodeTestPeer::setKeyframeSource(*node, std::move(source));
+  PlannerNodeTestPeer::acceptOdometry(*node, 4.0, 0.0, 1.0);
+  EXPECT_EQ(PlannerNodeTestPeer::roadmapRebuilds(*node), 0);
+  EXPECT_EQ(PlannerNodeTestPeer::globalVertices(*node), 1);
+  EXPECT_NEAR(PlannerNodeTestPeer::globalVertexState(*node, 0).x(), 4.0,
+              1e-9);
+}
+
+TEST_F(PlannerNodeTest, APoseTheGraphCannotReachRebuildsItAndRoutesHome) {
+  // The robot was driven round a wall, 3.5 m off its graph, with no
+  // exploration path to grow it (run 5, robot_1 and robot_3 after the
+  // restart): its pose links nowhere. The Return Home request rebuilds the
+  // graph from its keyframes and routes back round the wall.
+  auto node = makeNode("rebuild_unlinkable");
+  PlannerNodeTestPeer::observeFloor(*node, -1.5, 6.0, -1.5, 1.5);
+  PlannerNodeTestPeer::observeWallAlongY(*node, -1.5, 0.6, 1.35);
+  PlannerNodeTestPeer::acceptOdometry(*node, 0.0, 0.0, 1.0);
+  PlannerNodeTestPeer::addGlobalChainToFrontier(*node, {{0.5, 0.0}, {1.0, 0.0}});
+  PlannerNodeTestPeer::acceptOdometry(*node, 4.5, 0.0, 2.0);
+  PlannerNodeTestPeer::serveMap(*node, "component:test", 0);
+  auto source = std::make_unique<TrajectoryInMemory>();
+  source->trajectory = keyframesAlong(
+      {{0.0, 0.0}, {0.8, 0.0}, {0.8, 1.1}, {2.0, 1.1}, {4.5, 0.0}});
+  PlannerNodeTestPeer::setKeyframeSource(*node, std::move(source));
+  // More than a seed: no rebuild on odometry.
+  PlannerNodeTestPeer::acceptOdometry(*node, 4.5, 0.0, 3.0);
+  ASSERT_EQ(PlannerNodeTestPeer::roadmapRebuilds(*node), 0);
+
+  const auto response = returnHome(*node, 0.0, 0.0);
+  ASSERT_EQ(response->status,
+            mgg_msgs::srv::PlanObjective::Response::SUCCEEDED)
+      << response->reason;
+  EXPECT_EQ(PlannerNodeTestPeer::roadmapRebuilds(*node), 1);
+  EXPECT_NEAR(response->path.back().position.x, 0.0, 1e-3);
+}
+
+TEST_F(PlannerNodeTest, AnExplorationPathThatCannotBeLinkedRebuildsTheGraph) {
+  auto node = makeNode("rebuild_path_unlinked");
+  PlannerNodeTestPeer::observeFloor(*node, -1.5, 6.0, -1.5, 1.5);
+  PlannerNodeTestPeer::acceptOdometry(*node, 0.0, 0.0, 1.0);
+  PlannerNodeTestPeer::addGlobalChainToFrontier(*node, {{0.5, 0.0}, {1.0, 0.0}});
+  PlannerNodeTestPeer::serveMap(*node, "component:test", 0);
+  auto source = std::make_unique<TrajectoryInMemory>();
+  source->trajectory = keyframesAlongX(0.0, 4.0);
+  PlannerNodeTestPeer::setKeyframeSource(*node, std::move(source));
+  const mgg::StateVec start = PlannerNodeTestPeer::drivingState(*node, 4.0, 0.0, 0.0);
+  const mgg::StateVec end = PlannerNodeTestPeer::drivingState(*node, 5.5, 0.0, 0.0);
+  PlannerNodeTestPeer::addExplorationPath(*node, {start, end});
+  EXPECT_EQ(PlannerNodeTestPeer::roadmapRebuilds(*node), 1);
+  EXPECT_TRUE(PlannerNodeTestPeer::hasGlobalVertexNear(*node, 5.5, 0.0, 1e-6));
+}
+
+TEST_F(PlannerNodeTest, RebuildsAreRateLimitedAndSkipUnchangedKeyframes) {
+  auto node = makeNode("rebuild_rate_limit");
+  PlannerNodeTestPeer::observeFloor(*node, -1.5, 6.0, -1.5, 1.5);
+  PlannerNodeTestPeer::acceptOdometry(*node, 0.0, 0.0, 1.0);
+  PlannerNodeTestPeer::serveMap(*node, "component:test", 0);
+  auto source = std::make_unique<TrajectoryInMemory>();
+  source->trajectory = keyframesAlongX(0.0, 4.0);
+  TrajectoryInMemory* keyframes = source.get();
+  PlannerNodeTestPeer::setKeyframeSource(*node, std::move(source));
+
+  EXPECT_TRUE(PlannerNodeTestPeer::rebuildRoadmap(*node));
+  // Within the interval: not even read.
+  EXPECT_FALSE(PlannerNodeTestPeer::rebuildRoadmap(*node));
+  EXPECT_EQ(keyframes->reads, 1);
+  PlannerNodeTestPeer::setRoadmapRebuildInterval(*node, 0.0);
+  // The same keyframes on the same map: the same graph.
+  EXPECT_FALSE(PlannerNodeTestPeer::rebuildRoadmap(*node));
+  keyframes->trajectory = keyframesAlongX(0.0, 5.0, 2);
+  EXPECT_TRUE(PlannerNodeTestPeer::rebuildRoadmap(*node));
+  EXPECT_EQ(PlannerNodeTestPeer::roadmapRebuilds(*node), 2);
 }
 
 }  // namespace mgg_ros
