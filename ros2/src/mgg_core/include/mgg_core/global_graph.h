@@ -186,6 +186,15 @@ bool addRefPathToGraph(GraphManager& graph,
                        const ExpandContext& ctx, double vertex_spacing,
                        std::vector<Vertex*>* path_vertices = nullptr);
 
+/// One keyframe of the robot's trajectory.
+struct TrajectoryKeyframe {
+  /// The robot's base pose: x, y, z and yaw.
+  StateVec pose = StateVec::Zero();
+  /// The base's roll and pitch, radians: how far the robot was tipped.
+  double roll = 0.0;
+  double pitch = 0.0;
+};
+
 /// How rebuildRoadmapFromTrajectory lays a trajectory out.
 struct RoadmapRebuildParams {
   /// About one vertex per this much travel (the roadmap's spacing).
@@ -204,6 +213,9 @@ struct RoadmapRebuildReport {
   /// Keyframes offered, and those with no mapped ground under them.
   int keyframes = 0;
   int unsupported_keyframes = 0;
+  /// Keyframes where the robot was tipped past max_inclination, left out
+  /// (the latest aside).
+  int tilted_keyframes = 0;
   /// Vertices that found no spot with room for the robot's box at or
   /// beside their keyframe (a robot against a wall or wedged) and were
   /// left out.
@@ -218,8 +230,12 @@ struct RoadmapRebuildReport {
   int chain_edges = 0;
   int chain_edges_refused = 0;
   int chain_gaps = 0;
-  /// The refusals by ProjectedEdgeStatus (ground robots; index 0 unused).
+  /// The refusals: by ProjectedEdgeStatus (ground robots; index 0
+  /// unused), by the geofence, and across a stretch where the robot was
+  /// tipped.
   int chain_refusals_by_status[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+  int chain_refusals_geofence = 0;
+  int chain_refusals_tilted = 0;
   /// Edges added between other vertices within link_radius.
   int link_edges = 0;
   /// Connected parts of the rebuilt graph, and the vertices in home's.
@@ -245,8 +261,16 @@ struct RoadmapRebuildReport {
 /// the robot tipped, climbed a rock or went over a ledge is dropped and
 /// splits the graph there. Then vertices within link_radius are joined by
 /// the same check.
+///
+/// A keyframe whose roll or pitch exceeds max_inclination is where the
+/// robot tipped, whatever the map shows under it (an obstacle it tipped on
+/// may lie in space the map never observed). It gets no vertex, the chain
+/// does not continue across it, and no chain or link edge passes within
+/// the robot's half diagonal of it. The latest keyframe keeps its vertex
+/// even when tipped, with no chain edge into it but its links, so the
+/// robot's pose can link and leave from there.
 RoadmapRebuildReport rebuildRoadmapFromTrajectory(
-    GraphManager& graph, const std::vector<StateVec>& keyframes,
+    GraphManager& graph, const std::vector<TrajectoryKeyframe>& keyframes,
     const ExpandContext& ctx, const RoadmapRebuildParams& params);
 
 /// The edge check of a roadmap rebuilt from the robot's trajectory, the
@@ -254,6 +278,7 @@ RoadmapRebuildReport rebuildRoadmapFromTrajectory(
 /// because the robot drove this trajectory: unobserved space does not
 /// block, and the body swept is the robot's planning box turned along the
 /// edge (orientedBoxPathStatus), not the map-aligned box grown to hold it.
+/// A geofence refusal sets rep.status to kErrorGeofenceViolated.
 bool drivenEdgeTraversable(const ExpandContext& ctx, const Vertex& from,
                            const Vertex& to, ExpandGraphReport& rep);
 

@@ -28,6 +28,7 @@ using mgg::RobotType;
 using mgg::SensorModel;
 using mgg::ShortestPathsReport;
 using mgg::StateVec;
+using mgg::TrajectoryKeyframe;
 using mgg::Vertex;
 using mgg::VertexType;
 using mgg::VoxelStatus;
@@ -1357,16 +1358,19 @@ struct TrajectoryScene {
     return p;
   }
 
-  /// Base poses every 0.3 m from (x0, y) to (x1, y).
-  static void drive(std::vector<StateVec>& keyframes, double x0, double x1,
-                    double y) {
+  /// Base poses every 0.3 m from (x0, y) to (x1, y), level.
+  static void drive(std::vector<TrajectoryKeyframe>& keyframes, double x0,
+                    double x1, double y) {
     const int steps = static_cast<int>(std::round(std::abs(x1 - x0) / 0.3));
     for (int i = 0; i <= steps; ++i) {
-      keyframes.emplace_back(x0 + (x1 - x0) * i / steps, y, 0.1, 0.0);
+      TrajectoryKeyframe keyframe;
+      keyframe.pose = StateVec(x0 + (x1 - x0) * i / steps, y, 0.1, 0.0);
+      keyframes.push_back(keyframe);
     }
   }
 
-  mgg::RoadmapRebuildReport rebuild(const std::vector<StateVec>& keyframes) {
+  mgg::RoadmapRebuildReport rebuild(
+      const std::vector<TrajectoryKeyframe>& keyframes) {
     mgg::RoadmapRebuildParams params;
     params.vertex_spacing = 1.0;
     params.max_offset = 0.8;
@@ -1414,7 +1418,7 @@ TEST(RebuildRoadmapFromTrajectory, AChainFromHomeWithVertexZeroAtHome) {
   // track to where the robot is now, a vertex per metre or so: keyframes
   // 0.3 m apart are kept at x = 0, 1.2, 2.4, ... 8.4 and at 9.0.
   TrajectoryScene scene;
-  std::vector<StateVec> keyframes;
+  std::vector<TrajectoryKeyframe> keyframes;
   TrajectoryScene::drive(keyframes, 0.0, 9.0, 0.0);
   const mgg::RoadmapRebuildReport report = scene.rebuild(keyframes);
 
@@ -1445,16 +1449,18 @@ TEST(RebuildRoadmapFromTrajectory, ASegmentOverARockIsDroppedAndSplitsTheGraph) 
   // room beside it, so the graph splits there and the far side is not
   // reachable from home.
   TrajectoryScene scene(rockUpToY08);
-  std::vector<StateVec> keyframes;
+  std::vector<TrajectoryKeyframe> keyframes;
   TrajectoryScene::drive(keyframes, 0.0, 9.0, 0.0);
-  for (StateVec& keyframe : keyframes) {
-    if (keyframe.x() >= 4.0 && keyframe.x() < 4.4) keyframe.z() = 0.4;
+  for (TrajectoryKeyframe& keyframe : keyframes) {
+    if (keyframe.pose.x() >= 4.0 && keyframe.pose.x() < 4.4) {
+      keyframe.pose.z() = 0.4;
+    }
   }
   const mgg::RoadmapRebuildReport report = scene.rebuild(keyframes);
 
   EXPECT_TRUE(report.home_supported);
   EXPECT_GE(report.chain_edges_refused, 1);
-  int refusals = 0;
+  int refusals = report.chain_refusals_geofence + report.chain_refusals_tilted;
   for (int s = 1; s < 8; ++s) refusals += report.chain_refusals_by_status[s];
   EXPECT_EQ(refusals, report.chain_edges_refused);
   EXPECT_GE(report.components, 2);
@@ -1473,12 +1479,13 @@ TEST(RebuildRoadmapFromTrajectory, APassBackBesideARockJoinsTheTrackRoundIt) {
   // within link_radius are joined where their edge passes, so the far side
   // of the rock is reachable from home by the way back.
   TrajectoryScene scene(rockUpToY08);
-  std::vector<StateVec> keyframes;
+  std::vector<TrajectoryKeyframe> keyframes;
   TrajectoryScene::drive(keyframes, 0.0, 8.0, 0.0);
   TrajectoryScene::drive(keyframes, 8.0, 0.0, 1.8);
-  for (StateVec& keyframe : keyframes) {
-    if (keyframe.x() >= 4.0 && keyframe.x() < 4.4 && keyframe.y() < 1.0) {
-      keyframe.z() = 0.4;
+  for (TrajectoryKeyframe& keyframe : keyframes) {
+    if (keyframe.pose.x() >= 4.0 && keyframe.pose.x() < 4.4 &&
+        keyframe.pose.y() < 1.0) {
+      keyframe.pose.z() = 0.4;
     }
   }
   const mgg::RoadmapRebuildReport report = scene.rebuild(keyframes);
@@ -1498,7 +1505,7 @@ TEST(RebuildRoadmapFromTrajectory, AVertexAgainstAWallMovesOutToWhereTheBoxHasRo
   TrajectoryScene scene([](std::int64_t x, std::int64_t y) {
     return x >= 10 && y >= 1 ? 0.6 : 0.0;
   });
-  std::vector<StateVec> keyframes;
+  std::vector<TrajectoryKeyframe> keyframes;
   TrajectoryScene::drive(keyframes, 0.0, 9.0, 0.0);
   const mgg::RoadmapRebuildReport report = scene.rebuild(keyframes);
   EXPECT_GT(report.offset_vertices, 0);
@@ -1510,11 +1517,118 @@ TEST(RebuildRoadmapFromTrajectory, AVertexAgainstAWallMovesOutToWhereTheBoxHasRo
   EXPECT_TRUE(scene.reachable(0, now->id));
 }
 
+TEST(RebuildRoadmapFromTrajectory, WhereTheRobotTippedNoEdgePassesThoughTheMapIsLevel) {
+  // Review r0, I-2: the robot tipped 34 degrees nose-up over something the
+  // map never observed; the map shows level floor there. The keyframes'
+  // pitch is the evidence: they get no vertex, the chain breaks, and no
+  // link joins the two sides across that stretch.
+  TrajectoryScene scene;
+  std::vector<TrajectoryKeyframe> keyframes;
+  TrajectoryScene::drive(keyframes, 0.0, 9.0, 0.0);
+  int tipped = 0;
+  for (TrajectoryKeyframe& keyframe : keyframes) {
+    if (keyframe.pose.x() >= 4.0 && keyframe.pose.x() < 4.7) {
+      keyframe.pitch = 0.6;
+      ++tipped;
+    }
+  }
+  const mgg::RoadmapRebuildReport report = scene.rebuild(keyframes);
+  EXPECT_EQ(report.tilted_keyframes, tipped);
+  EXPECT_GE(report.chain_refusals_tilted, 1);
+  EXPECT_GE(report.components, 2);
+  EXPECT_EQ(scene.vertexNear(4.35, 0.0, 0.35), nullptr);
+  Vertex* now = scene.vertexNear(9.0, 0.0, 1e-6);
+  ASSERT_NE(now, nullptr);
+  EXPECT_FALSE(scene.reachable(0, now->id));
+  // Level, the same trajectory is one piece.
+  for (TrajectoryKeyframe& keyframe : keyframes) keyframe.pitch = 0.0;
+  TrajectoryScene level;
+  EXPECT_EQ(level.rebuild(keyframes).components, 1);
+}
+
+TEST(RebuildRoadmapFromTrajectory, ARobotTippedNowKeepsItsVertexToLeaveFrom) {
+  // The latest keyframe is tipped (the robot is tilted where it stands):
+  // its vertex stays, with no chain edge into it, and joins the track by
+  // its links so the robot's pose can link there.
+  TrajectoryScene scene;
+  std::vector<TrajectoryKeyframe> keyframes;
+  TrajectoryScene::drive(keyframes, 0.0, 6.0, 0.0);
+  keyframes.back().roll = 0.55;
+  const mgg::RoadmapRebuildReport report = scene.rebuild(keyframes);
+  EXPECT_EQ(report.tilted_keyframes, 1);
+  EXPECT_EQ(report.chain_refusals_tilted, 1);
+  Vertex* now = scene.vertexNear(6.0, 0.0, 1e-6);
+  ASSERT_NE(now, nullptr);
+  EXPECT_TRUE(scene.reachable(0, now->id));
+}
+
+TEST(RebuildRoadmapFromTrajectory, GroundMoreThanAStepAboveTheBaseIsNotTheRobotsGround) {
+  // Review r0, M-4: over x in [4.0, 4.4) the ground the probes find is a
+  // 0.3 m top, 0.2 m above the keyframes' base: the robot's base was not
+  // standing on it (a probe starting inside a table or wall beside it).
+  // Those keyframes are left out rather than put on top of it.
+  TrajectoryScene scene(rockUpToY08);
+  std::vector<TrajectoryKeyframe> keyframes;
+  TrajectoryScene::drive(keyframes, 0.0, 9.0, 0.0);
+  int under = 0;
+  for (const TrajectoryKeyframe& keyframe : keyframes) {
+    if (keyframe.pose.x() >= 4.0 && keyframe.pose.x() < 4.4) ++under;
+  }
+  ASSERT_GT(under, 0);
+  const mgg::RoadmapRebuildReport report = scene.rebuild(keyframes);
+  EXPECT_EQ(report.unsupported_keyframes, under);
+  for (const auto& [id, vertex] : scene.graph.vertices_map_) {
+    (void)id;
+    EXPECT_LT(vertex->state.z(), 0.6) << "a vertex on top of the rock";
+  }
+}
+
+TEST(RebuildRoadmapFromTrajectory, ASegmentOverALedgeIsDropped) {
+  // Review r0, M-4: from x = 5 the floor is 1 m lower, and the robot went
+  // over the edge (robot_0 in run 5, into a pit). The keyframes below are
+  // real poses, but no edge joins them to the track above.
+  TrajectoryScene scene([](std::int64_t x, std::int64_t) {
+    return x >= 25 ? -1.0 : 0.0;
+  });
+  std::vector<TrajectoryKeyframe> keyframes;
+  TrajectoryScene::drive(keyframes, 0.0, 8.0, 0.0);
+  for (TrajectoryKeyframe& keyframe : keyframes) {
+    if (keyframe.pose.x() >= 5.0) keyframe.pose.z() = -0.9;
+  }
+  const mgg::RoadmapRebuildReport report = scene.rebuild(keyframes);
+  EXPECT_GE(report.chain_edges_refused, 1);
+  EXPECT_GE(report.components, 2);
+  Vertex* below = scene.vertexNear(8.0, 0.0, 1e-6);
+  ASSERT_NE(below, nullptr);
+  EXPECT_LT(below->state.z(), 0.0);
+  EXPECT_FALSE(scene.reachable(0, below->id));
+}
+
+TEST(RebuildRoadmapFromTrajectory, GeofenceRefusalsAreCountedAsSuch) {
+  // Review r0, M-5: a keep-out zone across the track refuses the chain
+  // there, and the refusals by reason add up to the refusals.
+  TrajectoryScene scene;
+  mgg::GeofenceManager geofence;
+  mgg::Polygon2d zone(std::vector<Eigen::Vector2d>{
+      {4.0, -2.5}, {4.6, -2.5}, {4.6, 2.5}, {4.0, 2.5}});
+  geofence.addGeofenceArea(zone);
+  scene.planning.geofence_checking_enable = true;
+  scene.ctx.geofence = &geofence;
+  std::vector<TrajectoryKeyframe> keyframes;
+  TrajectoryScene::drive(keyframes, 0.0, 9.0, 0.0);
+  const mgg::RoadmapRebuildReport report = scene.rebuild(keyframes);
+  EXPECT_GE(report.chain_refusals_geofence, 1);
+  int by_reason = report.chain_refusals_geofence + report.chain_refusals_tilted;
+  for (int s = 1; s < 8; ++s) by_reason += report.chain_refusals_by_status[s];
+  EXPECT_EQ(by_reason, report.chain_edges_refused);
+}
+
 TEST(RebuildRoadmapFromTrajectory, NothingIsBuiltWithoutGroundUnderHome) {
   // Home off the mapped ground: vertex 0 cannot be placed, so the caller
   // keeps the graph it has.
   TrajectoryScene scene;
-  std::vector<StateVec> keyframes{StateVec(-5.0, 0.0, 0.1, 0.0)};
+  std::vector<TrajectoryKeyframe> keyframes(1);
+  keyframes[0].pose = StateVec(-5.0, 0.0, 0.1, 0.0);
   TrajectoryScene::drive(keyframes, 0.0, 3.0, 0.0);
   const mgg::RoadmapRebuildReport report = scene.rebuild(keyframes);
   EXPECT_FALSE(report.home_supported);

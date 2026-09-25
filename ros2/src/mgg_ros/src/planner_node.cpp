@@ -974,15 +974,21 @@ bool PlannerNode::rebuildGlobalGraphFromKeyframes(const char* why) {
   component_from_navigation.translation() = Eigen::Vector3d(t.x, t.y, t.z);
   const Eigen::Isometry3d navigation_from_component =
       component_from_navigation.inverse();
-  std::vector<mgg::StateVec> keyframes;
+  // Roll and pitch are kept: where the robot tipped, the map may show
+  // nothing to tip on.
+  std::vector<mgg::TrajectoryKeyframe> keyframes;
   keyframes.reserve(trajectory.poses.size());
   for (const Eigen::Isometry3d& pose : trajectory.poses) {
     const Eigen::Isometry3d keyframe = navigation_from_component * pose;
     const Eigen::Matrix3d r = keyframe.linear();
-    keyframes.emplace_back(keyframe.translation().x(),
-                           keyframe.translation().y(),
-                           keyframe.translation().z(),
-                           std::atan2(r(1, 0), r(0, 0)));
+    mgg::TrajectoryKeyframe entry;
+    entry.pose = mgg::StateVec(keyframe.translation().x(),
+                               keyframe.translation().y(),
+                               keyframe.translation().z(),
+                               std::atan2(r(1, 0), r(0, 0)));
+    entry.roll = std::atan2(r(2, 1), r(2, 2));
+    entry.pitch = std::atan2(-r(2, 0), std::hypot(r(2, 1), r(2, 2)));
+    keyframes.push_back(entry);
   }
 
   auto rebuilt = std::make_shared<mgg::GraphManager>();
@@ -995,8 +1001,8 @@ bool PlannerNode::rebuildGlobalGraphFromKeyframes(const char* why) {
     RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 30000,
                          "global graph not rebuilt (%s): no mapped ground "
                          "under the home keyframe at (%.2f, %.2f, %.2f)",
-                         why, keyframes.front().x(), keyframes.front().y(),
-                         keyframes.front().z());
+                         why, keyframes.front().pose.x(),
+                         keyframes.front().pose.y(), keyframes.front().pose.z());
     return false;
   }
   global_graph_ = rebuilt;
@@ -1010,23 +1016,29 @@ bool PlannerNode::rebuildGlobalGraphFromKeyframes(const char* why) {
       "", "steep", "occupied", "unknown", "hanging", "cross slope",
       "footprint plane", "ground unobserved"};
   std::string refusals;
-  for (int s = 1; s < 8; ++s) {
-    if (report.chain_refusals_by_status[s] == 0) continue;
+  const auto add_refusals = [&refusals](int count, const char* reason) {
+    if (count == 0) return;
     if (!refusals.empty()) refusals += ", ";
-    refusals += std::to_string(report.chain_refusals_by_status[s]) + " " +
-                kRefusals[s];
+    refusals += std::to_string(count) + " " + reason;
+  };
+  for (int s = 1; s < 8; ++s) {
+    add_refusals(report.chain_refusals_by_status[s], kRefusals[s]);
   }
+  add_refusals(report.chain_refusals_geofence, "geofence");
+  add_refusals(report.chain_refusals_tilted, "tipped");
   const mgg::Vertex* home = global_graph_->getVertex(0);
   RCLCPP_INFO(get_logger(),
               "global graph rebuilt from %d keyframes (%s): home at (%.2f, "
               "%.2f, %.2f); %d vertices (%d beside their keyframe, %d "
-              "keyframes without ground, %d spots without room), %d edges; "
+              "keyframes without ground, %d tipped, %d spots without room), "
+              "%d edges; "
               "along the track %d kept, %d refused%s%s%s, %d gaps; %d "
               "links; %d components, home's %d vertices; revision %lu; "
               "%.0f ms",
               report.keyframes, why, home->state.x(), home->state.y(),
               home->state.z(), report.vertices, report.offset_vertices,
-              report.unsupported_keyframes, report.boxed_vertices,
+              report.unsupported_keyframes, report.tilted_keyframes,
+              report.boxed_vertices,
               global_graph_->getNumEdges(), report.chain_edges,
               report.chain_edges_refused, refusals.empty() ? "" : " (",
               refusals.c_str(), refusals.empty() ? "" : ")",

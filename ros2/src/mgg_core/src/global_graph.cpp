@@ -418,6 +418,7 @@ bool drivenEdgeTraversable(const ExpandContext& ctx, const Vertex& from,
       ctx.geofence->getPathStatus(
           start.head<2>(), end.head<2>(), ctx.robot_box_size.head<2>()) ==
           GeofenceManager::CoordinateStatus::kViolated) {
+    rep.status = ExpandGraphStatus::kErrorGeofenceViolated;
     return false;
   }
   OrientedBox body;
@@ -441,7 +442,7 @@ bool drivenEdgeTraversable(const ExpandContext& ctx, const Vertex& from,
 }
 
 RoadmapRebuildReport rebuildRoadmapFromTrajectory(
-    GraphManager& graph, const std::vector<StateVec>& keyframes,
+    GraphManager& graph, const std::vector<TrajectoryKeyframe>& keyframes,
     const ExpandContext& ctx, const RoadmapRebuildParams& params) {
   using Clock = std::chrono::steady_clock;
   const Clock::time_point started = Clock::now();
@@ -458,11 +459,11 @@ RoadmapRebuildReport rebuildRoadmapFromTrajectory(
   // vertex is dropped onto the ground from the robot's base, not from its
   // driving height, which for a tall robot can lie above an overhang it
   // drove under.
-  std::vector<StateVec> supported;
+  std::vector<TrajectoryKeyframe> supported;
   supported.reserve(keyframes.size());
   StateVec home_state = StateVec::Zero();
   for (std::size_t i = 0; i < keyframes.size(); ++i) {
-    StateVec state = keyframes[i];
+    StateVec state = keyframes[i].pose;
     if (!keyframeAtDrivingHeight(ctx, state)) {
       ++report.unsupported_keyframes;
       if (i == 0) return finish();
@@ -473,6 +474,33 @@ RoadmapRebuildReport rebuildRoadmapFromTrajectory(
   }
   report.home_supported = true;
 
+  // Where the robot tipped past max_inclination, the latest keyframe
+  // aside: no edge may pass within the robot's half diagonal of them.
+  const auto tipped = [&ctx](const TrajectoryKeyframe& keyframe) {
+    return std::max(std::abs(keyframe.roll), std::abs(keyframe.pitch)) >
+           ctx.planning->max_inclination;
+  };
+  std::vector<Eigen::Vector2d> tipped_at;
+  for (std::size_t i = 1; i + 1 < supported.size(); ++i) {
+    if (tipped(supported[i])) tipped_at.push_back(supported[i].pose.head<2>());
+  }
+  const double tipped_clearance =
+      0.5 * ctx.robot_box_size.head<2>().norm();
+  const auto passes_tipping = [&tipped_at, tipped_clearance](
+                                  const StateVec& a, const StateVec& b) {
+    const Eigen::Vector2d from = a.head<2>();
+    const Eigen::Vector2d along = b.head<2>() - from;
+    const double length_sq = along.squaredNorm();
+    for (const Eigen::Vector2d& p : tipped_at) {
+      const double t =
+          length_sq > 1e-12
+              ? std::clamp((p - from).dot(along) / length_sq, 0.0, 1.0)
+              : 0.0;
+      if ((from + t * along - p).norm() < tipped_clearance) return true;
+    }
+    return false;
+  };
+
   auto* home = new Vertex(0, home_state);
   home->robot_id = ctx.robot_id;
   home->type = VertexType::kVisited;
@@ -480,7 +508,7 @@ RoadmapRebuildReport rebuildRoadmapFromTrajectory(
   std::vector<Vertex*> vertices{home};
   Vertex* previous = home;
   // The base pose the previous vertex was placed from.
-  StateVec previous_base = supported.front();
+  StateVec previous_base = supported.front().pose;
 
   // Offsets across the direction of travel, nearest first.
   std::vector<double> offsets{0.0};
@@ -497,11 +525,12 @@ RoadmapRebuildReport rebuildRoadmapFromTrajectory(
                                  ctx.robot_box_size,
                                  false) != VoxelStatus::kOccupied;
   };
-  // A vertex at `target` or beside it, chained to `previous`. A robot
-  // against a wall or wedged stood where its box overlaps the map's
-  // obstacles; beside that spot there may be room, and every edge is
-  // checked in full wherever the vertex goes.
-  const auto place = [&](const StateVec& target) {
+  // A vertex at `target` or beside it, chained to `previous` unless
+  // `chain` is false (the robot tipped since). A robot against a wall or
+  // wedged stood where its box overlaps the map's obstacles; beside that
+  // spot there may be room, and every edge is checked in full wherever the
+  // vertex goes.
+  const auto place = [&](const StateVec& target, bool chain) {
     Eigen::Vector2d across(previous_base.y() - target.y(),
                            target.x() - previous_base.x());
     across = across.norm() > 1e-9 ? Eigen::Vector2d(across.normalized())
@@ -509,6 +538,7 @@ RoadmapRebuildReport rebuildRoadmapFromTrajectory(
     bool placed = false;
     bool linked = false;
     bool tried = false;
+    bool near_tipping = false;
     StateVec chosen = target;
     ExpandGraphReport first_refusal;
     for (const double offset : offsets) {
@@ -522,10 +552,15 @@ RoadmapRebuildReport rebuildRoadmapFromTrajectory(
         chosen = candidate;
         placed = true;
       }
+      if (!chain) break;
       const double d =
           (candidate.head<3>() - previous->state.head<3>()).norm();
       if (d > ctx.planning->edge_length_max ||
           d <= ctx.planning->edge_length_min) {
+        continue;
+      }
+      if (passes_tipping(previous->state, candidate)) {
+        near_tipping = true;
         continue;
       }
       const Vertex probe(-1, candidate);
@@ -561,10 +596,16 @@ RoadmapRebuildReport rebuildRoadmapFromTrajectory(
       previous->children.push_back(vertex);
       graph.addEdge(vertex, previous, d);
       ++report.chain_edges;
+    } else if (!chain || (near_tipping && !tried)) {
+      ++report.chain_edges_refused;
+      ++report.chain_refusals_tilted;
     } else if (!tried) {
       ++report.chain_gaps;
     } else {
       ++report.chain_edges_refused;
+      if (first_refusal.status == ExpandGraphStatus::kErrorGeofenceViolated) {
+        ++report.chain_refusals_geofence;
+      }
       for (int s = 1; s < 8; ++s) {
         report.chain_refusals_by_status[s] += first_refusal.edge_status[s];
       }
@@ -572,10 +613,26 @@ RoadmapRebuildReport rebuildRoadmapFromTrajectory(
     previous = vertex;
   };
 
+  // The robot tipped since the previous vertex: the chain breaks there.
+  bool tipped_since = false;
   for (std::size_t i = 1; i < supported.size(); ++i) {
-    const StateVec& state = supported[i];
-    const double gap = (state.head<3>() - previous_base.head<3>()).norm();
+    const StateVec& state = supported[i].pose;
     const bool latest = i + 1 == supported.size();
+    if (tipped(supported[i])) {
+      ++report.tilted_keyframes;
+      if (!latest) {
+        tipped_since = true;
+        continue;
+      }
+      place(state, false);
+      break;
+    }
+    const double gap = (state.head<3>() - previous_base.head<3>()).norm();
+    if (tipped_since) {
+      tipped_since = false;
+      place(state, false);
+      continue;
+    }
     if ((gap < params.vertex_spacing && !latest) ||
         gap <= ctx.planning->edge_length_min) {
       continue;
@@ -593,9 +650,9 @@ RoadmapRebuildReport rebuildRoadmapFromTrajectory(
     for (int k = 1; k < pieces; ++k) {
       StateVec between = from + (state - from) * (double(k) / pieces);
       between[3] = state[3];
-      place(between);
+      place(between, true);
     }
-    place(state);
+    place(state, true);
   }
 
   // Every vertex to the others within link_radius, nearest first.
@@ -623,6 +680,7 @@ RoadmapRebuildReport rebuildRoadmapFromTrajectory(
               ctx.planning->nearest_range_z) {
         continue;
       }
+      if (passes_tipping(vertex->state, other->state)) continue;
       ExpandGraphReport rep;
       if (!drivenEdgeTraversable(ctx, *vertex, *other, rep)) continue;
       graph.addEdge(vertex, other, d);
