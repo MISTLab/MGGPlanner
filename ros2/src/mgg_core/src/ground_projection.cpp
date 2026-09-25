@@ -1,5 +1,6 @@
 #include "mgg_core/ground_projection.h"
 
+#include <algorithm>
 #include <cmath>
 
 namespace mgg {
@@ -154,8 +155,68 @@ ProjectedEdgeStatus GroundProjection::getProjectedEdgeStatus(
     if (path == VoxelStatus::kOccupied) return ProjectedEdgeStatus::kOccupied;
   }
 
+  // After the sweep, so the side probes start inside a footprint known not
+  // to be occupied rather than inside a wall.
+  if (params_.max_cross_slope < M_PI_2 &&
+      crossSlope(projected_edge, box_size) > params_.max_cross_slope) {
+    return ProjectedEdgeStatus::kCrossSlope;
+  }
+
   projected_edge_out = projected_edge;
   return ProjectedEdgeStatus::kAdmissible;
+}
+
+bool GroundProjection::groundBelow(const Eigen::Vector3d& point,
+                                   Eigen::Vector3d& ground) const {
+  const Eigen::Vector3d end =
+      point - Eigen::Vector3d(0.0, 0.0, max_projection_length);
+  return map_.getGroundRayStatus(point, end, false, ground) ==
+         VoxelStatus::kOccupied;
+}
+
+double GroundProjection::crossSlope(const std::vector<Eigen::Vector3d>& edge,
+                                    const Eigen::Vector3d& box_size) const {
+  if (edge.size() < 2) return 0.0;
+  const Eigen::Vector2d travel = (edge.back() - edge.front()).head<2>();
+  const double half_track = 0.5 * std::min(box_size.x(), box_size.y());
+  if (travel.norm() < 1e-9 || !(half_track > 0.0)) return 0.0;
+  const Eigen::Vector2d unit = travel.normalized();
+  const Eigen::Vector2d left_unit(-unit.y(), unit.x());
+  const Eigen::Vector3d side(half_track * left_unit.x(),
+                             half_track * left_unit.y(), 0.0);
+
+  // The gradient from the right side to the left, per point that has ground
+  // under both. It is taken between the ground points the map returns, not
+  // the probes: a voxel map reports its cell's centre, and the cells either
+  // side of a 0.83 m track may be 0.8 or 1.0 m apart.
+  std::vector<Eigen::Vector2d> positions;
+  std::vector<double> gradients;
+  for (const Eigen::Vector3d& point : edge) {
+    Eigen::Vector3d left;
+    Eigen::Vector3d right;
+    if (!groundBelow(point + side, left) || !groundBelow(point - side, right)) {
+      continue;
+    }
+    const double across = (left - right).head<2>().dot(left_unit);
+    if (across < half_track) continue;  // both sides in one cell
+    positions.push_back(point.head<2>());
+    gradients.push_back((left.z() - right.z()) / across);
+  }
+  const double body = std::max(box_size.x(), box_size.y());
+  double steepest = 0.0;
+  for (std::size_t first = 0; first < gradients.size(); ++first) {
+    double sum = 0.0;
+    std::size_t next = first;
+    while (next < gradients.size() &&
+           (positions[next] - positions[first]).norm() <= body + 1e-9) {
+      sum += gradients[next++];
+    }
+    steepest = std::max(
+        steepest, std::abs(sum / static_cast<double>(next - first)));
+    // Every later run is part of this one.
+    if (next == gradients.size()) break;
+  }
+  return std::atan(steepest);
 }
 
 }  // namespace mgg

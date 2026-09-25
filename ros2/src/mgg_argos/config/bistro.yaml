@@ -216,6 +216,11 @@
       max_ground_height: 0.3
       robot_height: 0.2
       max_inclination: 1.6580627893946132
+      # 18 degrees: an edge whose ground falls away sideways more steeply,
+      # measured under the robot's two sides, is refused like one that climbs
+      # past max_inclination. Launch files lower it per platform for tall,
+      # narrow robots.
+      max_cross_slope: 0.3141592653589793
       yaw_tangent_correction: true
       traverse_length_max: 10.0
       traverse_time_max: 40.0

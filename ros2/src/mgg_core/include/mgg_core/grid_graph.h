@@ -65,7 +65,7 @@ struct GridGraphResult {
   int projected_endpoint_unknown = 0;
   /// Edge verdicts summed over every candidate, indexed by
   /// ProjectedEdgeStatus.
-  int edge_status[5] = {0, 0, 0, 0, 0};
+  int edge_status[6] = {0, 0, 0, 0, 0, 0};
 };
 
 /// Sweeps the lattice around `state` and grows `graph` through it.

@@ -168,11 +168,11 @@ struct ExpandGraphReport {
   /// same kErrorCollisionEdge bucket.
   VoxelStatus projected_endpoint_status = VoxelStatus::kFree;
   /// How the first blocked edge was blocked, indexed by ProjectedEdgeStatus.
-  /// Ground robots reject a candidate for four quite different reasons and
-  /// all four surface as kErrorCollisionEdge; without this, a lattice that
+  /// Ground robots reject a candidate for five quite different reasons and
+  /// all five surface as kErrorCollisionEdge; without this, a lattice that
   /// produces no vertices gives no clue whether the terrain is too steep, the
   /// space is unmapped, or something is genuinely in the way.
-  int edge_status[5] = {0, 0, 0, 0, 0};
+  int edge_status[6] = {0, 0, 0, 0, 0, 0};
 };
 
 struct RandomSamplingParams {

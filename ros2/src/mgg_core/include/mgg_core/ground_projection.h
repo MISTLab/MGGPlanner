@@ -32,6 +32,7 @@ enum class ProjectedEdgeStatus {
   kOccupied,   ///< hits an obstacle
   kUnknown,    ///< passes through unmapped space
   kHanging,    ///< no ground beneath it
+  kCrossSlope,  ///< its ground slopes sideways past max_cross_slope
 };
 
 class GroundProjection {
@@ -61,11 +62,32 @@ class GroundProjection {
   /// it raw endpoints and the final segment jumps by whatever the height
   /// mismatch is, and the edge is rejected as kSteep. Rrg::expandGraph
   /// satisfies this by projecting the new state before calling in.
+  ///
+  /// Once the edge is known to be clear, the ground under the robot's two
+  /// sides is compared: see crossSlope. An edge whose cross slope exceeds
+  /// max_cross_slope is kCrossSlope.
   ProjectedEdgeStatus getProjectedEdgeStatus(
       const Eigen::Vector3d& start, const Eigen::Vector3d& end,
       const Eigen::Vector3d& box_size, bool stop_at_unknown_voxel,
       std::vector<Eigen::Vector3d>& projected_edge_out, bool is_hanging,
       bool preserve_start_height = false) const;
+
+  /// Sideways slope of the ground under a ground-following polyline at
+  /// driving height, relative to its heading from first to last point,
+  /// radians. At each point the ground is found straight below the robot's
+  /// two sides, half the smaller of `box_size` x and y out from the centre
+  /// line, so both probes stay inside the footprint the edge was checked
+  /// free for, and the gradient between the two ground points is taken;
+  /// points where either side has no ground are skipped. The gradient is
+  /// averaged over every run of points within the box's larger side, as the
+  /// robot's body averages it, and the steepest run is returned. Zero when
+  /// nothing can be measured.
+  double crossSlope(const std::vector<Eigen::Vector3d>& edge,
+                    const Eigen::Vector3d& box_size) const;
+
+  /// The ground straight below `point`, false when none is mapped within
+  /// max_projection_length.
+  bool groundBelow(const Eigen::Vector3d& point, Eigen::Vector3d& ground) const;
 
   /// How far down projectSample looks. Was a bare 5.0 in the original.
   double max_projection_length = 5.0;

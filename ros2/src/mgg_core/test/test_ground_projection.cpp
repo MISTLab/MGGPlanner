@@ -1,6 +1,7 @@
 // Tests for ground projection. The ROS 1 versions had none: exercising them
 // meant driving a simulated ground robot over terrain.
 
+#include <algorithm>
 #include <cmath>
 #include <utility>
 #include <vector>
@@ -213,5 +214,157 @@ TEST(GroundProjection, ProjectsEndpointHeightToDrivingHeight) {
   EXPECT_NEAR(path.back().z(), 0.5, 1e-3);
 }
 
-}  // namespace
+/// A 16 degree ramp rising along +y from y = 0 to y = 4, level before and
+/// after it. Rays are marched finely, so heights read back within a
+/// few millimetres.
+class Ramp : public Terrain {
+ public:
+  static double slope() { return std::tan(16.0 * M_PI / 180.0); }
+  static double height(double y) {
+    return slope() * std::min(std::max(y, 0.0), 4.0);
+  }
+  VoxelStatus getVoxelStatus(const Eigen::Vector3d& p) const override {
+    return p.z() <= height(p.y()) ? VoxelStatus::kOccupied
+                                   : VoxelStatus::kFree;
+  }
+  VoxelStatus getRayStatus(const Eigen::Vector3d& a, const Eigen::Vector3d& b,
+                           bool stop_at_unknown,
+                           Eigen::Vector3d& end_voxel) const override {
+    (void)stop_at_unknown;
+    const double len = (b - a).norm();
+    const Eigen::Vector3d dir = len > 1e-12 ? Eigen::Vector3d((b - a) / len)
+                                            : Eigen::Vector3d::Zero();
+    for (double d = 0.0; d <= len; d += 0.002) {
+      const Eigen::Vector3d p = a + d * dir;
+      if (getVoxelStatus(p) == VoxelStatus::kOccupied) {
+        end_voxel = p;
+        return VoxelStatus::kOccupied;
+      }
+    }
+    end_voxel = b;
+    return VoxelStatus::kFree;
+  }
+};
 
+/// A point `max_ground_height` (0.5) above the ramp, where edges start.
+Eigen::Vector3d onRamp(double x, double y) {
+  return {x, y, Ramp::height(y) + 0.5};
+}
+
+const Eigen::Vector3d kBox(0.8, 0.6, 0.4);
+
+TEST(GroundProjection, RampDrivenAlongItsAxisHasNoCrossSlope) {
+  Ramp map;
+  PlanningParams params = makeParams();
+  params.max_cross_slope = 10.0 * M_PI / 180.0;
+  GroundProjection gp(map, params);
+
+  std::vector<Eigen::Vector3d> path;
+  const auto s = gp.getProjectedEdgeStatus(onRamp(0.0, 0.5), onRamp(0.0, 3.5),
+                                           kBox, true, path, false);
+  EXPECT_EQ(s, ProjectedEdgeStatus::kAdmissible);
+  EXPECT_NEAR(gp.crossSlope(path, kBox), 0.0, 0.5 * M_PI / 180.0);
+}
+
+TEST(GroundProjection, EdgeAcrossARampPastTheCrossSlopeLimitIsRefused) {
+  Ramp map;
+  PlanningParams params = makeParams();
+  params.max_cross_slope = 10.0 * M_PI / 180.0;
+  GroundProjection gp(map, params);
+
+  std::vector<Eigen::Vector3d> path;
+  const auto across = gp.getProjectedEdgeStatus(
+      onRamp(-1.5, 2.0), onRamp(1.5, 2.0), kBox, true, path, false);
+  EXPECT_EQ(across, ProjectedEdgeStatus::kCrossSlope);
+  EXPECT_TRUE(path.empty());  // only an admissible edge is handed back
+
+  // The same edge is fine for a platform allowed 18 degrees, and measures
+  // the ramp's 16.
+  params.max_cross_slope = 18.0 * M_PI / 180.0;
+  ASSERT_EQ(gp.getProjectedEdgeStatus(onRamp(-1.5, 2.0), onRamp(1.5, 2.0),
+                                      kBox, true, path, false),
+            ProjectedEdgeStatus::kAdmissible);
+  EXPECT_NEAR(gp.crossSlope(path, kBox), 16.0 * M_PI / 180.0,
+              0.5 * M_PI / 180.0);
+
+  // Diagonally, 45 degrees off the axis, the side slope is
+  // atan(tan 16 * sin 45), about 11.4 degrees: past 10, under 18.
+  params.max_cross_slope = 10.0 * M_PI / 180.0;
+  EXPECT_EQ(gp.getProjectedEdgeStatus(onRamp(-1.0, 1.0), onRamp(1.0, 3.0),
+                                      kBox, true, path, false),
+            ProjectedEdgeStatus::kCrossSlope);
+
+  // pi/2 disables the check.
+  params.max_cross_slope = M_PI / 2.0;
+  EXPECT_EQ(gp.getProjectedEdgeStatus(onRamp(-1.5, 2.0), onRamp(1.5, 2.0),
+                                      kBox, true, path, false),
+            ProjectedEdgeStatus::kAdmissible);
+}
+
+/// The ramp as a 0.2 m voxel map reports it: a ray stops in a cell and
+/// returns the cell's centre, at the height of the highest ground in it.
+class VoxelRamp : public Ramp {
+ public:
+  VoxelStatus getRayStatus(const Eigen::Vector3d& a, const Eigen::Vector3d& b,
+                           bool stop_at_unknown,
+                           Eigen::Vector3d& end_voxel) const override {
+    const VoxelStatus s = Ramp::getRayStatus(a, b, stop_at_unknown, end_voxel);
+    if (s == VoxelStatus::kOccupied) {
+      const double cx = (std::floor(end_voxel.x() / 0.2) + 0.5) * 0.2;
+      const double cy = (std::floor(end_voxel.y() / 0.2) + 0.5) * 0.2;
+      end_voxel = {cx, cy, height(cy + 0.1)};
+    }
+    return s;
+  }
+};
+
+TEST(GroundProjection, CrossSlopeIsMeasuredBetweenTheCellsTheMapReturns) {
+  // Probes 0.7 m apart, at y = 0.75 and 1.45, stop in cells whose centres
+  // are 0.8 m apart: the rise over the probes' spacing would read 18.1
+  // degrees on the 16 degree ramp, over the cells' it reads 16.
+  VoxelRamp map;
+  PlanningParams params = makeParams();
+  params.max_cross_slope = 17.0 * M_PI / 180.0;
+  GroundProjection gp(map, params);
+  const Eigen::Vector3d box(0.8, 0.7, 0.4);
+  std::vector<Eigen::Vector3d> path;
+  ASSERT_EQ(gp.getProjectedEdgeStatus(onRamp(-1.5, 1.1), onRamp(1.5, 1.1), box,
+                                      true, path, false),
+            ProjectedEdgeStatus::kAdmissible);
+  EXPECT_NEAR(gp.crossSlope(path, box), 16.0 * M_PI / 180.0,
+              0.1 * M_PI / 180.0);
+}
+
+/// Level ground with a 0.2 m kerb, 0.1 m long, under the left side only.
+class Kerb : public Terrain {
+ public:
+  VoxelStatus getVoxelStatus(const Eigen::Vector3d& p) const override {
+    const bool kerb = p.x() >= 0.75 && p.x() <= 0.85 && p.y() > 0.0;
+    return p.z() <= (kerb ? 0.2 : 0.0) ? VoxelStatus::kOccupied
+                                       : VoxelStatus::kFree;
+  }
+};
+
+TEST(GroundProjection, CrossSlopeIsAveragedOverTheBodyLength) {
+  // One point of the edge has its left side on the kerb: 0.2 m over the
+  // 0.6 m track is 18 degrees there, but the robot's 0.8 m body spans three
+  // points and rolls by about a third of that.
+  Kerb map;
+  PlanningParams params = makeParams();
+  GroundProjection gp(map, params);
+  std::vector<Eigen::Vector3d> edge;
+  for (int i = 0; i <= 5; ++i) edge.emplace_back(0.4 * i, 0.0, 0.5);
+  const double roll = gp.crossSlope(edge, kBox);
+  EXPECT_NEAR(roll, std::atan2(0.2 / 3.0, 0.6), 1e-6);
+
+  // Along a level floor nothing is measured at all.
+  Terrain flat;
+  GroundProjection level(flat, params);
+  std::vector<Eigen::Vector3d> path;
+  ASSERT_EQ(level.getProjectedEdgeStatus({0.0, 0.0, 0.5}, {3.0, 0.0, 0.5},
+                                         kBox, true, path, false),
+            ProjectedEdgeStatus::kAdmissible);
+  EXPECT_DOUBLE_EQ(level.crossSlope(path, kBox), 0.0);
+}
+
+}  // namespace

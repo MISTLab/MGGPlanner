@@ -1193,15 +1193,17 @@ std::string PlannerNode::buildLocalGraph() {
   // lattice is finding space but every candidate is being turned away. The
   // reason breakdown is the only thing that separates a geometry mistake from
   // a genuinely blocked robot, so report it whenever it happens.
-  char why[128] = "";
+  char why[160] = "";
   if (r.vertices_added == 0 && r.free_cells > 0) {
     std::snprintf(why, sizeof(why),
                   " (rejected: %d collision, %d no ground; edges: %d ok, "
-                  "%d steep, %d occupied, %d unmapped, %d hanging)",
+                  "%d steep, %d occupied, %d unmapped, %d hanging, %d "
+                  "cross-slope)",
                   r.rejected[static_cast<int>(mgg::ExpandGraphStatus::
                                                   kErrorCollisionEdge)],
                   r.no_ground, r.edge_status[0], r.edge_status[1],
-                  r.edge_status[2], r.edge_status[3], r.edge_status[4]);
+                  r.edge_status[2], r.edge_status[3], r.edge_status[4],
+                  r.edge_status[5]);
   }
   const auto t_end = Clock::now();
   const auto ms = [](Clock::time_point a, Clock::time_point b) {

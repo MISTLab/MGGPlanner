@@ -160,6 +160,12 @@ struct PlanningParams {
   double max_ground_height = 1.2;
   double robot_height = 1.0;
   double max_inclination = 0.52;
+  /// Steepest sideways slope of the ground under an edge, relative to the
+  /// edge's heading, radians. Where max_inclination bounds the climb along
+  /// an edge, this bounds the roll a robot driving it takes: an edge across a
+  /// 16 degree ramp rolled a tall robot over (SubT, 2026-09-23). Refused like
+  /// max_inclination; pi/2 or more disables it. Not an upstream parameter.
+  double max_cross_slope = 0.3141592653589793;  // 18 degrees
   double max_step_height = 0.0;
 
   // Free-space augmentation (deprecated upstream).
