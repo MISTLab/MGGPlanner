@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <limits>
 #include <unordered_map>
+#include <vector>
 
 namespace mgg {
 namespace {
@@ -679,24 +680,35 @@ void OctomapMap::scanUnique(
   gain = GainCounts{};
   // The wall band as key rows; see NativeMolaGrid::scanUnique.
   constexpr int kMaxWallBandCells = 64;
+  const double resolution = tree_->getResolution();
   octomap::key_type band_low = 0, band_high = 0;
-  const bool walls = wall != nullptr && wall->min_z <= wall->max_z &&
-                     tree_->coordToKeyChecked(wall->min_z, band_low) &&
-                     tree_->coordToKeyChecked(wall->max_z, band_high) &&
-                     int(band_high) - int(band_low) < kMaxWallBandCells;
-  std::unordered_map<std::uint32_t, bool> wall_columns;
-  const auto isWallColumn = [&](const octomap::OcTreeKey& key) {
+  const bool walls =
+      wall != nullptr && wall->min_z <= wall->max_z &&
+      tree_->coordToKeyChecked(wall->min_z - 0.5 * resolution, band_low) &&
+      tree_->coordToKeyChecked(wall->max_z - 0.5 * resolution, band_high) &&
+      int(band_high) - int(band_low) < kMaxWallBandCells;
+  int first_row = band_low, last_row = band_high;
+  if (walls && tree_->keyToCoord(band_low) < wall->min_z) ++first_row;
+  // Occupied rows of the band, per column, in ascending order.
+  std::unordered_map<std::uint32_t, std::vector<int>> wall_rows;
+  const auto isWallGap = [&](const octomap::OcTreeKey& key) {
     const std::uint32_t column = (std::uint32_t(key[0]) << 16) | key[1];
-    const auto known = wall_columns.find(column);
-    if (known != wall_columns.end()) return known->second;
-    bool occupied = false;
-    for (int z = band_low; z <= int(band_high) && !occupied; ++z) {
-      const octomap::OcTreeKey cell(key[0], key[1],
-                                    static_cast<octomap::key_type>(z));
-      occupied = statusAt(tree_->keyToCoord(cell)) == VoxelStatus::kOccupied;
+    auto rows = wall_rows.find(column);
+    if (rows == wall_rows.end()) {
+      std::vector<int> occupied;
+      for (int z = first_row; z <= last_row; ++z) {
+        const octomap::OcTreeKey cell(key[0], key[1],
+                                      static_cast<octomap::key_type>(z));
+        if (statusAt(tree_->keyToCoord(cell)) == VoxelStatus::kOccupied)
+          occupied.push_back(z);
+      }
+      rows = wall_rows.emplace(column, std::move(occupied)).first;
     }
-    wall_columns.emplace(column, occupied);
-    return occupied;
+    const auto& occupied = rows->second;
+    const auto above =
+        std::upper_bound(occupied.begin(), occupied.end(), int(key[2]));
+    if (above == occupied.begin() || above == occupied.end()) return false;
+    return *above - *(above - 1) - 1 <= kMaxWallGapVoxels;
   };
   octomap::KeySet seen;
   for (const Eigen::Vector3d& endpoint : multiray_endpoints) {
@@ -704,7 +716,7 @@ void OctomapMap::scanUnique(
       octomap::OcTreeKey key;
       const bool keyed = tree_->coordToKeyChecked(centre, key);
       // A gap in a wall hides what is behind it, for every ray.
-      if (walls && keyed && s == VoxelStatus::kUnknown && isWallColumn(key)) {
+      if (walls && keyed && s == VoxelStatus::kUnknown && isWallGap(key)) {
         return false;
       }
       if (keyed && !seen.insert(key).second) {

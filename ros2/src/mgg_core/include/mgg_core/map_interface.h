@@ -66,12 +66,20 @@ inline bool authorityTiltAcceptable(const Eigen::Matrix3d& rotation) {
   return std::isfinite(tilt) && tilt <= kMaxAuthorityTiltRad;
 }
 
-/// Height band, in the caller's frame, that makes an XY column a wall for
-/// getVisibleScanStatus: the column holds an occupied voxel overlapping it.
+/// Heights, in the caller's frame, at which an occupied voxel is evidence of
+/// a wall for getVisibleScanStatus. The band starts above the floor, so that
+/// floor returns are never taken for a wall. A voxel belongs to the band
+/// when its centre does.
 struct WallBand {
   double min_z = 0.0;
   double max_z = 0.0;
 };
+
+/// Most voxels, stacked in a column between two wall returns, that
+/// getVisibleScanStatus takes for a gap in the wall. A lidar that carves
+/// free space with one ray per 5 degree bin leaves 0.4 m between returns
+/// at 4.6 m; a window or a doorway is taller.
+inline constexpr int kMaxWallGapVoxels = 2;
 
 struct XYCellCenter {
   Eigen::Vector2d center = Eigen::Vector2d::Zero();
@@ -347,10 +355,12 @@ class MapInterface {
   /// getScanStatusIterative for rays that see only what the sensor could.
   /// A lidar leaves unknown gaps in a wall between the voxels its returns
   /// landed in, and a ray through such a gap counts the space behind the
-  /// wall. So an unknown voxel whose XY column holds an occupied voxel
-  /// overlapping `wall` ends the ray, as an occupied voxel does, and is
-  /// neither counted nor logged. An opening whose column holds no occupied
-  /// voxel in the band, such as a doorway, still lets rays through.
+  /// wall. So an unknown voxel with an occupied voxel of `wall` below it and
+  /// another above it in its XY column, with at most kMaxWallGapVoxels
+  /// voxels between the two, ends the ray as an occupied voxel does, and is
+  /// neither counted nor logged. Nothing is inferred above a column's highest
+  /// return or below its lowest: the open space over a window sill, a
+  /// railing or a rising ramp, and a doorway, still let rays through.
   /// Backends without this override scan as getScanStatusIterative does.
   virtual void getVisibleScanStatus(
       const Eigen::Vector3d& pos,

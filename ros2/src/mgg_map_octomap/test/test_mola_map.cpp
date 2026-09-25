@@ -707,13 +707,14 @@ TEST(MolaMap, MeasuredGroundBelowBodyDoesNotInheritVoxelTop) {
 
 TEST(MolaMap, VisibleScanLiftsTheWallBandIntoTheComponentFrame) {
   // The component frame sits 1 m above navigation. A wall column over
-  // x = [2.0, 2.2) holds one return at component z = [1.4, 1.6), navigation
-  // z = [0.4, 0.6), and unknown gaps above it.
+  // x = [2.0, 2.2) holds returns at navigation z = [0.4, 0.6) and
+  // [0.8, 1.0), component rows 7 and 9, and an unknown gap between them.
   Publication publication;
   MolaMap provider(config(publication));
   Eigen::Isometry3d component_from_navigation = Eigen::Isometry3d::Identity();
   component_from_navigation.translation() = Eigen::Vector3d(0.0, 0.0, 1.0);
-  const auto request = publication.publish(0, {{10, 2, 7}}, freeBlock(), true,
+  const auto request = publication.publish(0, {{10, 2, 7}, {10, 2, 9}},
+                                           freeBlock(), true,
                                            component_from_navigation);
   provider.requestSnapshot(request);
   ASSERT_TRUE(waitFor([&]() { return provider.getStatus(); }))
@@ -732,9 +733,10 @@ TEST(MolaMap, VisibleScanLiftsTheWallBandIntoTheComponentFrame) {
         ++behind;
     return behind;
   };
-  // The body band around the return, in navigation: the column is a wall.
-  EXPECT_EQ(behindTheWall({0.35, 0.65}), 0);
-  // A band below it: the ray passes the gap.
+  // A band in navigation that holds both returns: the gap is a wall's.
+  // Unlifted, it would hold neither.
+  EXPECT_EQ(behindTheWall({0.25, 0.95}), 0);
+  // A band below both: the ray passes the gap.
   EXPECT_GT(behindTheWall({-0.25, 0.05}), 30);
 }
 

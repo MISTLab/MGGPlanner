@@ -6,6 +6,7 @@
 #include <limits>
 #include <unordered_map>
 #include <unordered_set>
+#include <vector>
 
 namespace mgg {
 namespace {
@@ -455,20 +456,31 @@ void NativeMolaGrid::scanUnique(
   // making every column a wall or none.
   constexpr std::int64_t kMaxWallBandCells = 64;
   Cell band_low, band_high;
-  const bool walls = wall != nullptr && wall->min_z <= wall->max_z &&
-                     key({0.0, 0.0, wall->min_z}, band_low) &&
-                     key({0.0, 0.0, wall->max_z}, band_high) &&
-                     band_high.z - band_low.z < kMaxWallBandCells;
-  std::unordered_map<Cell, bool, CellHash, CellEqual> wall_columns;
-  const auto isWallColumn = [&](const Cell& k) {
+  const bool walls =
+      wall != nullptr && wall->min_z <= wall->max_z &&
+      key({0.0, 0.0, wall->min_z - 0.5 * resolution_}, band_low) &&
+      key({0.0, 0.0, wall->max_z - 0.5 * resolution_}, band_high) &&
+      band_high.z - band_low.z < kMaxWallBandCells;
+  // A voxel belongs to the band when its centre does: the first row whose
+  // centre is at or above min_z, the last at or below max_z.
+  if (walls && center(band_low).z() < wall->min_z) ++band_low.z;
+  // Occupied rows of the band, per column, in ascending order.
+  std::unordered_map<Cell, std::vector<std::int64_t>, CellHash, CellEqual>
+      wall_rows;
+  const auto isWallGap = [&](const Cell& k) {
     const Cell column{k.x, k.y, 0};
-    const auto known = wall_columns.find(column);
-    if (known != wall_columns.end()) return known->second;
-    bool occupied = false;
-    for (auto z = band_low.z; z <= band_high.z && !occupied; ++z)
-      occupied = status({k.x, k.y, z}) == VoxelStatus::kOccupied;
-    wall_columns.emplace(column, occupied);
-    return occupied;
+    auto rows = wall_rows.find(column);
+    if (rows == wall_rows.end()) {
+      std::vector<std::int64_t> occupied;
+      for (auto z = band_low.z; z <= band_high.z; ++z)
+        if (status({k.x, k.y, z}) == VoxelStatus::kOccupied)
+          occupied.push_back(z);
+      rows = wall_rows.emplace(column, std::move(occupied)).first;
+    }
+    const auto& occupied = rows->second;
+    const auto above = std::upper_bound(occupied.begin(), occupied.end(), k.z);
+    if (above == occupied.begin() || above == occupied.end()) return false;
+    return *above - *(above - 1) - 1 <= kMaxWallGapVoxels;
   };
   // Hashed rather than ordered: every cell the scan visits goes through it,
   // about 65k for the 648-ray, 20 m simulated VLP16.
@@ -478,7 +490,7 @@ void NativeMolaGrid::scanUnique(
     const bool valid = walk(p, e, [&](const Cell& k) {
       const auto s = status(k);
       // A gap in a wall hides what is behind it, for every ray.
-      if (walls && s == VoxelStatus::kUnknown && isWallColumn(k)) return false;
+      if (walls && s == VoxelStatus::kUnknown && isWallGap(k)) return false;
       if (seen.insert(k).second) {
         log.emplace_back(center(k), s);
         if (s == VoxelStatus::kOccupied)

@@ -51,15 +51,20 @@ void computeVolumetricGain(
     // unique on the captured Bistro grids, diag-viewpoint 2026-09-24).
     GainCounts raw;
     std::vector<std::pair<Eigen::Vector3d, VoxelStatus>> visited;
-    if (ctx.robot != nullptr && ctx.robot->type == RobotType::kGroundRobot) {
+    const bool ground_robot =
+        ctx.robot != nullptr && ctx.robot->type == RobotType::kGroundRobot;
+    // Ground robots only explore the traversable ground layer: voxels high
+    // above the vertex, or deep below it, are irrelevant to them.
+    const double max_h_above = std::max(ctx.planning->robot_height * 2.5, 1.2);
+    if (ground_robot) {
       // A lidar leaves unknown gaps in walls, and rays through them counted
-      // the space behind: 0.39 of the count at the captured plan ends. A
-      // column occupied at the height the robot's body rides at (its
-      // collision box at this vertex) is a wall; an opening with nothing
-      // there, such as a doorway, is not.
-      const double body = ctx.robot->getPlanningSize().z();
-      const double body_z = origin.z() + ctx.robot->center_offset.z();
-      const WallBand wall{body_z - 0.5 * body, body_z + 0.5 * body};
+      // the space behind: 0.39 of the count at the captured plan ends. Wall
+      // evidence is a return above the floor (a vertex rides
+      // max_ground_height over it) and within the gain band; a gap is
+      // inferred only between two such returns in a column.
+      const double floor_z = origin.z() - ctx.planning->max_ground_height;
+      const WallBand wall{floor_z + ctx.map->getResolution(),
+                          origin.z() + max_h_above};
       ctx.map->getVisibleScanStatus(origin, endpoints, wall, raw, visited,
                                     sensor.model());
     } else {
@@ -75,12 +80,7 @@ void computeVolumetricGain(
       if (!ctx.global_space->isInsideSpace(voxel)) continue;
       if (inNoGainZone(ctx, voxel)) continue;
 
-      // Ground robot awareness: ground robots only explore the traversable ground layer.
-      // Voxels high up in the sky or deep below the ground plane have no relevance to ground navigation.
-      if (ctx.robot != nullptr && ctx.robot->type == RobotType::kGroundRobot) {
-        const double max_h_above = (ctx.planning != nullptr)
-                                       ? std::max(ctx.planning->robot_height * 2.5, 1.2)
-                                       : 1.2;
+      if (ground_robot) {
         // A vertex rides max_ground_height above its ground. Below the
         // floor nothing can be seen; the band went 1.0 m below the vertex,
         // about 0.55 m under the simulated floor, and that was 0.10 of the
