@@ -142,7 +142,8 @@ ProjectedEdgeStatus GroundProjection::getProjectedEdgeStatus(
     const Eigen::Vector3d& start, const Eigen::Vector3d& end,
     const Eigen::Vector3d& box_size, bool stop_at_unknown_voxel,
     std::vector<Eigen::Vector3d>& projected_edge_out, bool is_hanging,
-    bool preserve_start_height, const EdgeBodyCheck* body) const {
+    bool preserve_start_height, const EdgeBodyCheck* body,
+    EdgeTravel travel) const {
   const double step_size = 2.0 * map_.getResolution();
   const double max_inclination = params_.max_inclination;
 
@@ -286,13 +287,19 @@ ProjectedEdgeStatus GroundProjection::getProjectedEdgeStatus(
   // footprint ahead must stand on observed ground. robot_0 was parked with
   // its front half over an unobserved 4 m pit in run 5 and tipped into it.
   // An edge that may hang, from a root the lidar has not yet seen the ground
-  // under, is exempt but for its end, which is a vertex with ground.
+  // under, is exempt but for its end, which is a vertex with ground. A
+  // graph edge may be driven either way, and each way has its own half
+  // ahead: checked one way only, a path driving it the other way could end
+  // with the robot's front over a drop (review r2, I-1).
   const double min_ground = params_.min_observed_ground_fraction;
   if (min_ground > 0.0 && heading.norm() > 1e-9) {
     for (std::size_t i = 0; i < samples.size(); ++i) {
       if (is_hanging && i + 1 < samples.size()) continue;
       if (observedGroundAhead(samples[i], heading, box_size) <
-          min_ground - 1e-9) {
+              min_ground - 1e-9 ||
+          (travel == EdgeTravel::kBothWays &&
+           observedGroundAhead(samples[i], -heading, box_size) <
+               min_ground - 1e-9)) {
         return ProjectedEdgeStatus::kGroundUnobserved;
       }
     }

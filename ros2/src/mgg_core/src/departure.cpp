@@ -174,7 +174,8 @@ bool findDeparture(const MapInterface& map, const GroundProjection& ground,
       std::vector<Eigen::Vector3d> projected;
       return ground.getProjectedEdgeStatus(from.head<3>(), to.head<3>(),
                                            body.size, true, projected, false,
-                                           false, &check) ==
+                                           false, &check,
+                                           EdgeTravel::kForward) ==
              ProjectedEdgeStatus::kAdmissible;
     };
     for (const bool backwards : {false, true}) {

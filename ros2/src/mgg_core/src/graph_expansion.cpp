@@ -60,7 +60,8 @@ bool edgeTraversable(const ExpandContext& ctx, const Eigen::Vector3d& start,
                      const Eigen::Vector3d& end, bool is_hanging,
                      bool preserve_start_height,
                      std::vector<Eigen::Vector3d>& projected_edge,
-                     ExpandGraphReport& rep, bool stop_at_unknown = false) {
+                     ExpandGraphReport& rep, bool stop_at_unknown = false,
+                     EdgeTravel travel = EdgeTravel::kBothWays) {
   if (ctx.robot->type == RobotType::kAerialRobot) {
     return ctx.map->getPathStatus(start, end, ctx.robot_box_size,
                                   stop_at_unknown) == VoxelStatus::kFree;
@@ -68,7 +69,7 @@ bool edgeTraversable(const ExpandContext& ctx, const Eigen::Vector3d& start,
   // Ground robot: the edge has to follow the terrain.
   const ProjectedEdgeStatus es = ctx.ground->getProjectedEdgeStatus(
       start, end, ctx.robot_box_size, stop_at_unknown, projected_edge,
-      is_hanging, preserve_start_height);
+      is_hanging, preserve_start_height, nullptr, travel);
   ++rep.edge_status[static_cast<int>(es)];
   if (es == ProjectedEdgeStatus::kAdmissible) return true;
   if (es == ProjectedEdgeStatus::kSteep) ++rep.steep_edges;
@@ -193,11 +194,13 @@ void expandGraph(GraphManager& graph, Vertex& new_vertex,
 
   std::vector<Eigen::Vector3d> projected_edge;
   const bool is_hanging = nearest_vertex->is_hanging || new_vertex.is_hanging;
-  bool admissible_edge = edgeTraversable(ctx, start_pos, end_pos, is_hanging,
-                                         ctx.preserve_hanging_root_start_height &&
-                                             nearest_vertex->id == 0,
-                                         projected_edge, rep,
-                                         ctx.stop_at_unknown);
+  // An edge out of the root, where the robot stands, is driven outwards
+  // only; any other lattice or roadmap edge either way.
+  bool admissible_edge = edgeTraversable(
+      ctx, start_pos, end_pos, is_hanging,
+      ctx.preserve_hanging_root_start_height && nearest_vertex->id == 0,
+      projected_edge, rep, ctx.stop_at_unknown,
+      nearest_vertex->id == 0 ? EdgeTravel::kForward : EdgeTravel::kBothWays);
   if (admissible_edge && ctx.projected_edge_admissible &&
       !ctx.projected_edge_admissible(projected_edge)) {
     admissible_edge = false;

@@ -1048,8 +1048,10 @@ void PlannerNode::shortcutAndResample(std::vector<mgg::StateVec>& path,
     // inclination) as every graph edge does.
     if (robot_params_.type == mgg::RobotType::kGroundRobot) {
       std::vector<Eigen::Vector3d> projected;
-      return ground_->getProjectedEdgeStatus(from, to, ctx.robot_box_size,
-                                             true, projected, false) ==
+      // Driven from `from` to `to`: the shortcut is the path itself.
+      return ground_->getProjectedEdgeStatus(
+                 from, to, ctx.robot_box_size, true, projected, false, false,
+                 nullptr, mgg::EdgeTravel::kForward) ==
              mgg::ProjectedEdgeStatus::kAdmissible;
     }
     return map_->getPathStatus(from, to, ctx.robot_box_size, true) ==

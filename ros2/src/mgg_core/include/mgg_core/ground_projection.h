@@ -72,6 +72,17 @@ inline constexpr double kMaxGoalGroundRise = 6.0;
 using SegmentSweepFn = std::function<VoxelStatus(const Eigen::Vector3d&,
                                                  const Eigen::Vector3d&)>;
 
+/// Which ways a robot may drive an edge getProjectedEdgeStatus checks, for
+/// the ground it must have observed ahead (min_observed_ground_fraction).
+enum class EdgeTravel {
+  /// Either way: a graph edge, which is undirected, and routed over in
+  /// whichever direction a path needs it.
+  kBothWays,
+  /// From `start` to `end` only: a departure, a shortcut segment, an edge
+  /// out of the robot's own position.
+  kForward,
+};
+
 /// How getProjectedEdgeStatus checks the body on an edge other than with
 /// the map's box sweep, as a boxed-in robot departs (findDeparture).
 struct EdgeBodyCheck {
@@ -148,7 +159,9 @@ class GroundProjection {
   /// differ in height by more than max_footprint_cell_rise.
   /// With min_observed_ground_fraction set, at the same points (not the
   /// start where the robot stands, nor the points of an edge that may hang)
-  /// observedGroundAhead must reach it, or the edge is kGroundUnobserved.
+  /// observedGroundAhead must reach it, or the edge is kGroundUnobserved:
+  /// ahead of the travel from `start` to `end`, and with EdgeTravel::
+  /// kBothWays also the other way (review r2, I-1).
   ///
   /// max_inclination and max_cross_slope stay as coarse pre-filters.
   /// Neither sees the plane the chassis sits on: a segment between samples
@@ -163,7 +176,8 @@ class GroundProjection {
       const Eigen::Vector3d& box_size, bool stop_at_unknown_voxel,
       std::vector<Eigen::Vector3d>& projected_edge_out, bool is_hanging,
       bool preserve_start_height = false,
-      const EdgeBodyCheck* body = nullptr) const;
+      const EdgeBodyCheck* body = nullptr,
+      EdgeTravel travel = EdgeTravel::kBothWays) const;
 
   /// Sideways slope of the ground under a ground-following polyline at
   /// driving height, relative to its heading from first to last point,

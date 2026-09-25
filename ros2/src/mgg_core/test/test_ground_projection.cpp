@@ -687,9 +687,16 @@ TEST(GroundProjection, AnEdgeOntoUnobservedGroundIsRefused) {
             ProjectedEdgeStatus::kAdmissible);
   EXPECT_EQ(gp.getProjectedEdgeStatus(here, edge, box, false, path, false),
             ProjectedEdgeStatus::kGroundUnobserved);
-  // Driving away from the ledge, the leading half is over ground.
-  EXPECT_EQ(gp.getProjectedEdgeStatus(edge, here, box, false, path, false),
+  // Driven only away from the ledge (a departure, a shortcut, an edge out
+  // of the root), the leading half is over ground.
+  EXPECT_EQ(gp.getProjectedEdgeStatus(edge, here, box, false, path, false,
+                                      false, nullptr,
+                                      mgg::EdgeTravel::kForward),
             ProjectedEdgeStatus::kAdmissible);
+  // A graph edge from the ledge vertex away from the ledge may be driven
+  // back onto it: checked either way, it is refused (review r2, I-1).
+  EXPECT_EQ(gp.getProjectedEdgeStatus(edge, here, box, false, path, false),
+            ProjectedEdgeStatus::kGroundUnobserved);
   // Off, as before.
   params.min_observed_ground_fraction = 0.0;
   EXPECT_EQ(gp.getProjectedEdgeStatus(here, edge, box, false, path, false),
