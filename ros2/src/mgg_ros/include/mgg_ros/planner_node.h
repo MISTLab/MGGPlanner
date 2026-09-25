@@ -139,6 +139,28 @@ class PlannerNode : public rclcpp::Node {
   /// Builds the local grid graph around the current state, scores it and
   /// selects the best path into best_path_. Returns a summary for the log.
   std::string buildLocalGraph();
+  /// A departure for a ground robot boxed in at `start`, at driving height:
+  /// straight ahead along its heading, start[3], or else, with
+  /// PlanningParams::departure_reverse_allowed, straight back. Poses every
+  /// path_interpolation_distance, each step checked as a shortcut is, with
+  /// the robot's collision box turned to its heading (the smallest box
+  /// aligned with the map that holds it), up to the first pose at least
+  /// kDepartureMinM out where the robot has room to turn in place
+  /// (mgg::turnClear), and no farther than kDepartureMaxM. Every pose keeps
+  /// the robot's heading, so the way back is driven in reverse. Returns
+  /// false, with `path` empty, when neither way reaches room to turn.
+  bool straightDeparture(const mgg::StateVec& start,
+                         std::vector<mgg::StateVec>& path, bool& reverse);
+  /// The robot is boxed in at `root_state`, its pose at driving height as
+  /// the lattice root takes it: it has no room to turn where it stands, and
+  /// `why`, for the log, says why the path it would otherwise be sent
+  /// starts with a turn it cannot make. best_path_ becomes its straightDeparture, or empty when it has none,
+  /// which sets boxed_in_without_departure_now_. Counts and logs the
+  /// outcome; returns the note for the plan summary.
+  std::string departBoxedIn(const mgg::StateVec& root_state, const char* why);
+  /// Past the controller's goal tolerance, and about a robot's length.
+  static constexpr double kDepartureMinM = 0.5;
+  static constexpr double kDepartureMaxM = 2.0;
   /// Dijkstra over the global graph to the best frontier (rrg.cpp:5559
   /// Rrg::runGlobalPlanner), or to `target_id` when the current global
   /// repositioning is resumed. Fills best_path_; returns false with a reason
@@ -147,10 +169,26 @@ class PlannerNode : public rclcpp::Node {
   /// Dijkstra over the global graph from the robot to `goal`, linking both
   /// ends into the graph first: the goal stands for the vertex within
   /// `goal_tolerance` of it, or (tolerance zero, or none there) gets its own
-  /// checked vertex at the exact goal. Returns the route in `path`.
+  /// checked vertex at the exact goal. Returns the route in `path`, under
+  /// the turn rule (applyRouteTurnRule), and in `turns_ok` the check its
+  /// shortcut must keep passing.
   bool routeOverGlobalGraph(const mgg::StateVec& goal, double goal_tolerance,
                             std::vector<mgg::StateVec>& path,
-                            std::string& reason);
+                            mgg::PathOkFn& turns_ok, std::string& reason);
+  /// A ground robot's route to a goal turns sharply only where it may, as an
+  /// exploration path does (mgg::chooseTurnCompliantRoute): `route` runs
+  /// through `graph` from where the robot joins it to the goal, after
+  /// `lead_in`, the robot's pose when it is off the first vertex. The slope
+  /// is measured from the map's ground with `slope_from_map` (the global
+  /// graph, whose vertices a metre apart seldom span a plane within the
+  /// robot's length), and from `graph`'s vertices otherwise (a lattice).
+  /// `route_name` names the route in the log. Returns the check the
+  /// route's shortcut must keep passing; empty for other robots.
+  mgg::PathOkFn applyRouteTurnRule(mgg::GraphManager& graph,
+                                   bool slope_from_map,
+                                   const std::vector<mgg::StateVec>& lead_in,
+                                   std::vector<mgg::Vertex*>& route,
+                                   const char* route_name);
   /// Straightens a route where the map vouches for the straight segment and
   /// resamples it at path_interpolation_distance (rrg.cpp:4160 and 4176).
   /// With `turns_ok`, a route that passes it still passes afterwards: the
@@ -185,10 +223,11 @@ class PlannerNode : public rclcpp::Node {
   /// stands on, for where the map shows no ground yet.
   mgg::StateVec physicalAnchorAtDrivingHeight(const mgg::StateVec& base_pose) const;
   /// Dijkstra through a fresh local lattice from the robot to a goal inside
-  /// the lattice box, the goal linked in with checked edges.
+  /// the lattice box, the goal linked in with checked edges; under the turn
+  /// rule as routeOverGlobalGraph.
   bool routeOverLocalLattice(const mgg::StateVec& goal,
                              std::vector<mgg::StateVec>& path,
-                             std::string& reason);
+                             mgg::PathOkFn& turns_ok, std::string& reason);
   /// Peer reservations and refused leaves, as points the selectors skip.
   std::vector<Eigen::Vector3d> selectionExclusions();
   mgg::RecomputeGainFn globalFrontierGain();
@@ -301,6 +340,24 @@ class PlannerNode : public rclcpp::Node {
   /// without room to turn (mgg::PathTurnCheck), because no path complied,
   /// since the node started.
   int sharp_turn_fallbacks_ = 0;
+  /// Routes to a goal (objectives and global repositioning) sent although
+  /// they turn sharply on a slope or without room to turn, because no route
+  /// complied (applyRouteTurnRule), since the node started.
+  int route_sharp_turn_fallbacks_ = 0;
+  /// Times the robot was found boxed in: no exploration path, or the global
+  /// route kept in place of one, complied with the turn rule and it had no
+  /// room to turn where it stood (departBoxedIn). It was sent a straight
+  /// departure, or no path when it had none, since the node started.
+  int boxed_in_departures_ = 0;
+  int boxed_in_without_departure_ = 0;
+  /// This cycle found the robot boxed in with no straight departure
+  /// (departBoxedIn; buildLocalGraph resets it): no global repositioning is
+  /// tried in its place.
+  bool boxed_in_without_departure_now_ = false;
+  /// The last route to a goal kept although it turns sharply where it may
+  /// not, and its first turn, from the robot's heading, is sharp where the
+  /// robot has no room to turn (applyRouteTurnRule): a turn it cannot make.
+  bool last_route_starts_with_turn_without_room_ = false;
   /// Exploration paths sent unshortcut because the shortcut, once resampled,
   /// turned where the lattice path did not, since the node started.
   int shortcut_turn_reverts_ = 0;

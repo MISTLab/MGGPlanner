@@ -96,6 +96,11 @@ class PlannerNodeTestPeer {
     node.onOdometry(msg);
   }
 
+  static void acceptOdometry(
+      PlannerNode& node, const nav_msgs::msg::Odometry::SharedPtr& msg) {
+    node.onOdometry(msg);
+  }
+
   static int globalVertices(PlannerNode& node) {
     const std::lock_guard<std::recursive_mutex> lock(node.planner_mutex_);
     return node.global_graph_->getNumVertices();
@@ -126,6 +131,20 @@ class PlannerNodeTestPeer {
         for (int repeat = 0; repeat < 6; ++repeat) {
           node.cloud_map_->insertPointCloud({Eigen::Vector3d(x, y, z)},
                                             Eigen::Vector3d(x, y - 1.0, z));
+        }
+      }
+    }
+    ++node.map_revision_;
+  }
+  /// A wall this robot has seen, across x = `x` from y0 to y1.
+  static void observeWallAlongY(PlannerNode& node, double y0, double y1,
+                                double x) {
+    const std::lock_guard<std::recursive_mutex> lock(node.planner_mutex_);
+    for (double y = y0; y <= y1 + 1e-9; y += 0.1) {
+      for (double z = 0.1; z <= 0.6 + 1e-9; z += 0.1) {
+        for (int repeat = 0; repeat < 6; ++repeat) {
+          node.cloud_map_->insertPointCloud({Eigen::Vector3d(x, y, z)},
+                                            Eigen::Vector3d(x - 1.0, y, z));
         }
       }
     }
@@ -205,6 +224,85 @@ class PlannerNodeTestPeer {
     const std::lock_guard<std::recursive_mutex> lock(node.planner_mutex_);
     node.shortcutAndResample(path, turns_ok);
     return node.shortcut_turn_reverts_;
+  }
+  /// A robot `length` along x and `width` across, box and all.
+  static void setRobotFootprint(PlannerNode& node, double length,
+                                double width) {
+    const std::lock_guard<std::recursive_mutex> lock(node.planner_mutex_);
+    node.robot_params_.size.x() = length;
+    node.robot_params_.size.y() = width;
+  }
+  /// Gain counts unknown voxels only, as the deployed configurations
+  /// (mgg_argos/config/*.yaml) have it.
+  static void gainFromUnknownVoxelsOnly(PlannerNode& node) {
+    node.planning_params_.free_voxel_gain = 0.0;
+    node.planning_params_.occupied_voxel_gain = 0.0;
+  }
+  static void setDepartureReverseAllowed(PlannerNode& node, bool allowed) {
+    node.planning_params_.departure_reverse_allowed = allowed;
+  }
+  /// The robot at (x, y) facing `yaw`, at driving height over the map.
+  static mgg::StateVec drivingState(PlannerNode& node, double x, double y,
+                                    double yaw) {
+    const std::lock_guard<std::recursive_mutex> lock(node.planner_mutex_);
+    mgg::StateVec state(x, y, 0.075, yaw);
+    EXPECT_TRUE(node.projectToDrivingHeight(state));
+    state[3] = yaw;
+    return state;
+  }
+  static bool roomToTurn(PlannerNode& node, const mgg::StateVec& state) {
+    const std::lock_guard<std::recursive_mutex> lock(node.planner_mutex_);
+    return mgg::turnClear(*node.map_, node.robot_params_, state);
+  }
+  static bool straightDeparture(PlannerNode& node, const mgg::StateVec& start,
+                                std::vector<mgg::StateVec>& path,
+                                bool& reverse) {
+    const std::lock_guard<std::recursive_mutex> lock(node.planner_mutex_);
+    return node.straightDeparture(start, path, reverse);
+  }
+  /// A chain of this robot's roadmap from the global graph's root through
+  /// `points`, at driving height and facing `yaw`; its last vertex a
+  /// frontier. Returns that vertex's id.
+  static int addGlobalChainToFrontier(
+      PlannerNode& node, const std::vector<Eigen::Vector2d>& points,
+      double yaw = 0.0) {
+    const std::lock_guard<std::recursive_mutex> lock(node.planner_mutex_);
+    node.seedGlobalGraph();
+    mgg::Vertex* previous = node.global_graph_->getVertex(0);
+    for (const Eigen::Vector2d& p : points) {
+      auto* v = new mgg::Vertex(node.global_graph_->generateVertexID(),
+                                mgg::StateVec(p.x(), p.y(),
+                                              previous->state.z(), yaw));
+      v->robot_id = static_cast<int>(node.planning_params_.robot_id);
+      node.global_graph_->addVertex(v);
+      node.global_graph_->addEdge(
+          v, previous, (v->state - previous->state).head<3>().norm());
+      previous = v;
+    }
+    previous->type = mgg::VertexType::kFrontier;
+    ++node.graph_revision_;
+    return previous->id;
+  }
+  /// The global planner runs as soon as the lattice has no frontier.
+  static void consultGlobalPlannerAtOnce(PlannerNode& node) {
+    node.auto_global_planner_low_gain_rounds_ = 0;
+  }
+  /// A global repositioning to `target_id` under way, and resumed while
+  /// the robot is more than a metre from it.
+  static void repositionTowards(PlannerNode& node, int target_id) {
+    node.global_frontier_reach_m_ = 1.0;
+    node.global_exploration_ongoing_ = true;
+    node.current_global_vertex_id_ = target_id;
+  }
+  static int boxedInWithoutDeparture(PlannerNode& node) {
+    return node.boxed_in_without_departure_;
+  }
+  static int boxedInDepartures(PlannerNode& node) {
+    return node.boxed_in_departures_;
+  }
+  /// Routes to a goal sent although no route complied with the turn rule.
+  static int routeSharpTurnFallbacks(PlannerNode& node) {
+    return node.route_sharp_turn_fallbacks_;
   }
   /// Corners the last shortcut left, before resampling.
   static int shortcutCorners(PlannerNode& node) {
@@ -339,6 +437,11 @@ TEST_F(PlannerNodeTest, ReturnHomeIsTheWholeRouteOverTheGlobalGraph) {
   // The whole way home, straightened where the map vouches for it.
   EXPECT_NEAR(pathLength(response->path), 4.0, 0.60);
   EXPECT_LE(maxStep(response->path), 0.25);
+  // The robot faces away from home: the route starts with a turn about, on
+  // mapped level floor with room, which the turn rule allows. The slope is
+  // measured from the map; the global graph's vertices along the track are
+  // in a line and would say nothing about it.
+  EXPECT_EQ(PlannerNodeTestPeer::routeSharpTurnFallbacks(*node), 0);
 }
 
 TEST_F(PlannerNodeTest, ReturnHomeRoutesToTheHomeTheCallerSends) {
@@ -820,6 +923,294 @@ TEST_F(PlannerNodeTest, AResampledRouteThatFailsTheTurnCheckIsSentUnshortcut) {
     EXPECT_TRUE(reverted[i].head<3>().isApprox(lattice[i].head<3>()))
         << "pose " << i;
   }
+}
+
+namespace {
+
+/// A robot 0.6 m long and 0.2 m wide in a corridor 0.5 m wide from `from`
+/// to `to` along x (walls at y = +-0.25) or, `along_y`, along y (walls at
+/// x = +-0.25), on a floor mapped from -3 to 4 along it and -1.5 to 1.5
+/// across: room to drive it along the corridor, not to turn it in place,
+/// since its corners reach 0.32 m from its centre.
+std::shared_ptr<PlannerNode> boxedIn(const std::string& name, double from,
+                                     double to, bool along_y = false) {
+  auto node = makeNode(name);
+  PlannerNodeTestPeer::setRobotFootprint(*node, 0.6, 0.2);
+  if (along_y) {
+    // At voxel centres: stepping 0.1 m from -3.0 drifts across a voxel
+    // boundary and leaves a row of the floor unseen.
+    PlannerNodeTestPeer::observeFloor(*node, -1.55, 1.55, -3.05, 4.05);
+    PlannerNodeTestPeer::observeWallAlongY(*node, from, to, 0.25);
+    PlannerNodeTestPeer::observeWallAlongY(*node, from, to, -0.25);
+  } else {
+    PlannerNodeTestPeer::observeFloor(*node, -3.0, 4.0, -1.5, 1.5);
+    PlannerNodeTestPeer::observeWall(*node, from, to, 0.25);
+    PlannerNodeTestPeer::observeWall(*node, from, to, -0.25);
+  }
+  return node;
+}
+
+/// How far along the corridor, and across it, `pose` is.
+double alongCorridor(const mgg::StateVec& pose, bool along_y) {
+  return along_y ? pose.y() : pose.x();
+}
+double acrossCorridor(const mgg::StateVec& pose, bool along_y) {
+  return along_y ? pose.x() : pose.y();
+}
+
+}  // namespace
+
+TEST_F(PlannerNodeTest, ABoxedInRobotDepartsStraightAheadWhenThereIsRoom) {
+  // Run 4, robot_1: a Bunker in a pocket too tight to turn in was sent a
+  // path that began with a turn, and DWB found no trajectory three times.
+  // The corridor opens out 0.4 m ahead of the robot. Along y, the robot
+  // faces +y: its box is checked turned with it, 0.2 m across the
+  // corridor, not 0.6 m as a box aligned with the map would be (review r0).
+  for (const bool along_y : {false, true}) {
+    SCOPED_TRACE(along_y ? "along y" : "along x");
+    const double yaw = along_y ? M_PI / 2.0 : 0.0;
+    auto node = boxedIn(along_y ? "boxed_ahead_y" : "boxed_ahead", -2.5, 0.4,
+                        along_y);
+    const mgg::StateVec start =
+        PlannerNodeTestPeer::drivingState(*node, 0.0, 0.0, yaw);
+    ASSERT_FALSE(PlannerNodeTestPeer::roomToTurn(*node, start));
+    std::vector<mgg::StateVec> path;
+    bool reverse = true;
+    ASSERT_TRUE(
+        PlannerNodeTestPeer::straightDeparture(*node, start, path, reverse));
+    EXPECT_FALSE(reverse);
+    ASSERT_GE(path.size(), 2u);
+    EXPECT_TRUE(path.front().head<3>().isApprox(start.head<3>()));
+    // Out of the corridor to the first pose with room to turn, and no
+    // farther.
+    EXPECT_GE(alongCorridor(path.back(), along_y), 0.5);
+    EXPECT_LE(alongCorridor(path.back(), along_y), 1.2);
+    EXPECT_TRUE(PlannerNodeTestPeer::roomToTurn(*node, path.back()));
+    EXPECT_FALSE(PlannerNodeTestPeer::roomToTurn(
+        *node, path[path.size() - 2]));
+    for (const mgg::StateVec& pose : path) {
+      EXPECT_NEAR(acrossCorridor(pose, along_y), 0.0, 1e-9);
+      EXPECT_DOUBLE_EQ(pose[3], yaw);
+    }
+  }
+}
+
+TEST_F(PlannerNodeTest, ABoxedInRobotReversesOutWhenOnlyBehindHasRoom) {
+  // The corridor runs on 2.5 m ahead and opens out 0.4 m behind.
+  for (const bool along_y : {false, true}) {
+    SCOPED_TRACE(along_y ? "along y" : "along x");
+    const double yaw = along_y ? M_PI / 2.0 : 0.0;
+    auto node = boxedIn(along_y ? "boxed_behind_y" : "boxed_behind", -0.4,
+                        2.5, along_y);
+    const mgg::StateVec start =
+        PlannerNodeTestPeer::drivingState(*node, 0.0, 0.0, yaw);
+    ASSERT_FALSE(PlannerNodeTestPeer::roomToTurn(*node, start));
+    std::vector<mgg::StateVec> path;
+    bool reverse = false;
+    ASSERT_TRUE(
+        PlannerNodeTestPeer::straightDeparture(*node, start, path, reverse));
+    EXPECT_TRUE(reverse);
+    ASSERT_GE(path.size(), 2u);
+    EXPECT_LE(alongCorridor(path.back(), along_y), -0.5);
+    EXPECT_GE(alongCorridor(path.back(), along_y), -1.2);
+    EXPECT_TRUE(PlannerNodeTestPeer::roomToTurn(*node, path.back()));
+    // Driven backwards: every pose faces the way the robot faces.
+    for (const mgg::StateVec& pose : path) {
+      EXPECT_NEAR(acrossCorridor(pose, along_y), 0.0, 1e-9);
+      EXPECT_DOUBLE_EQ(pose[3], yaw);
+    }
+
+    // A robot that may not reverse has no way out.
+    PlannerNodeTestPeer::setDepartureReverseAllowed(*node, false);
+    EXPECT_FALSE(
+        PlannerNodeTestPeer::straightDeparture(*node, start, path, reverse));
+    EXPECT_TRUE(path.empty());
+  }
+}
+
+TEST_F(PlannerNodeTest, ABoxedInRobotWithNoRoomEitherWayGetsNoDeparture) {
+  for (const bool along_y : {false, true}) {
+    SCOPED_TRACE(along_y ? "along y" : "along x");
+    auto node = boxedIn(along_y ? "boxed_both_y" : "boxed_both", -2.5, 2.5,
+                        along_y);
+    const mgg::StateVec start = PlannerNodeTestPeer::drivingState(
+        *node, 0.0, 0.0, along_y ? M_PI / 2.0 : 0.0);
+    std::vector<mgg::StateVec> path;
+    bool reverse = false;
+    EXPECT_FALSE(
+        PlannerNodeTestPeer::straightDeparture(*node, start, path, reverse));
+    EXPECT_TRUE(path.empty());
+  }
+}
+
+TEST_F(PlannerNodeTest, ExplorationBoxedInSendsNoPathThatStartsWithATurn) {
+  // Facing across the corridor, every exploration path starts with a
+  // right-angle turn the robot has no room for, so none complies. Straight
+  // ahead or back runs into a wall at once: no path, rather than the
+  // fallback path that turns.
+  auto node = boxedIn("boxed_explore", -2.5, 2.5);
+  auto msg = std::make_shared<nav_msgs::msg::Odometry>();
+  msg->header.stamp.sec = 1;
+  msg->pose.pose.position.z = 0.075;
+  msg->pose.pose.orientation.z = std::sin(M_PI / 4.0);
+  msg->pose.pose.orientation.w = std::cos(M_PI / 4.0);
+  PlannerNodeTestPeer::acceptOdometry(*node, msg);
+  auto response = std::make_shared<mgg_msgs::srv::PlannerSrv::Response>();
+  PlannerNodeTestPeer::plan(*node, response);
+  EXPECT_TRUE(response->path.empty())
+      << "path of " << response->path.size() << " poses";
+  EXPECT_EQ(PlannerNodeTestPeer::boxedInWithoutDeparture(*node), 1);
+  // A path may come on a later cycle: not exploration complete.
+  EXPECT_EQ(response->status, PlannerNode::kStatusNoPath);
+}
+
+TEST_F(PlannerNodeTest, ABoxedInRobotGetsNoGlobalRouteThatStartsWithATurn) {
+  // Review r0: with no local frontier for long enough the global planner is
+  // consulted, and its route to a global frontier is kept when it turns
+  // where it may not. Boxed in facing across the corridor, a route along it
+  // to a frontier starts with a turn the robot has no room for, the very
+  // path the boxed-in rule withholds. Neither the low-gain repositioning
+  // nor one already under way may send it, and the robot is not told
+  // exploration is complete: it gets no path, and its adapter's recovery
+  // runs.
+  auto node = boxedIn("boxed_global", -2.5, 2.5);
+  auto msg = std::make_shared<nav_msgs::msg::Odometry>();
+  msg->header.stamp.sec = 1;
+  msg->pose.pose.position.z = 0.075;
+  msg->pose.pose.orientation.z = std::sin(M_PI / 4.0);
+  msg->pose.pose.orientation.w = std::cos(M_PI / 4.0);
+  PlannerNodeTestPeer::acceptOdometry(*node, msg);
+  const int frontier = PlannerNodeTestPeer::addGlobalChainToFrontier(
+      *node, {{0.5, 0.0}, {1.0, 0.0}, {1.5, 0.0}, {2.0, 0.0}, {2.5, 0.0},
+              {3.0, 0.0}, {3.5, 0.0}});
+  PlannerNodeTestPeer::consultGlobalPlannerAtOnce(*node);
+
+  auto response = std::make_shared<mgg_msgs::srv::PlannerSrv::Response>();
+  PlannerNodeTestPeer::plan(*node, response);
+  EXPECT_TRUE(response->path.empty())
+      << "path of " << response->path.size() << " poses";
+  EXPECT_EQ(response->status, PlannerNode::kStatusNoPath);
+
+  PlannerNodeTestPeer::repositionTowards(*node, frontier);
+  response = std::make_shared<mgg_msgs::srv::PlannerSrv::Response>();
+  PlannerNodeTestPeer::plan(*node, response);
+  EXPECT_TRUE(response->path.empty())
+      << "path of " << response->path.size() << " poses";
+  EXPECT_EQ(response->status, PlannerNode::kStatusNoPath);
+}
+
+namespace {
+
+/// The robot, 0.6 m long and 0.2 m wide, at the origin facing +x, at the
+/// end of a dead-end corridor 0.5 m wide: walls at y = +-0.25 from x = -0.4
+/// to 1.0, and a wall across the whole floor at x = 1.0. It is open behind.
+/// The floor is mapped wide enough that no lattice viewpoint, facing +x as
+/// the robot does, sees unknown space, and gain counts only unknown space:
+/// the corridor is explored and no exploration path has gain. A global
+/// frontier 2.5 m behind, facing away into the unmapped floor beyond
+/// x = -3.5, is reached along the corridor's line. Returns its id.
+std::shared_ptr<PlannerNode> exploredDeadEnd(const std::string& name,
+                                             int& frontier) {
+  auto node = makeNode(name);
+  PlannerNodeTestPeer::setRobotFootprint(*node, 0.6, 0.2);
+  PlannerNodeTestPeer::gainFromUnknownVoxelsOnly(*node);
+  // At voxel centres, as boxedIn along y: a row of floor left unseen is
+  // unknown ground, and a viewpoint that sees it has gain.
+  PlannerNodeTestPeer::observeFloor(*node, -3.55, 1.05, -2.55, 2.55);
+  PlannerNodeTestPeer::observeWall(*node, -0.4, 1.0, 0.25);
+  PlannerNodeTestPeer::observeWall(*node, -0.4, 1.0, -0.25);
+  PlannerNodeTestPeer::observeWallAlongY(*node, -2.5, 2.5, 1.0);
+  PlannerNodeTestPeer::acceptOdometry(*node, 0.0, 0.0, 1.0);
+  frontier = PlannerNodeTestPeer::addGlobalChainToFrontier(
+      *node, {{-0.5, 0.0}, {-1.0, 0.0}, {-1.5, 0.0}, {-2.0, 0.0}, {-2.5, 0.0}},
+      M_PI);
+  return node;
+}
+
+/// The response is a straight reverse departure out of exploredDeadEnd's
+/// corridor: back along the robot's line to room to turn, every pose facing
+/// +x as the robot does.
+void expectReverseDepartureFromDeadEnd(
+    PlannerNode& node,
+    const mgg_msgs::srv::PlannerSrv::Response& response) {
+  EXPECT_EQ(response.status, mgg_msgs::srv::PlannerSrv::Response::FORWARD);
+  ASSERT_GE(response.path.size(), 2u);
+  EXPECT_LE(response.path.back().position.x, -0.5);
+  EXPECT_GE(response.path.back().position.x, -1.2);
+  for (const geometry_msgs::msg::Pose& pose : response.path) {
+    EXPECT_NEAR(pose.position.y, 0.0, 1e-6);
+    EXPECT_NEAR(pose.orientation.z, 0.0, 1e-6);
+  }
+  EXPECT_EQ(PlannerNodeTestPeer::boxedInDepartures(node), 1);
+}
+
+}  // namespace
+
+TEST_F(PlannerNodeTest, ARobotInAnExploredDeadEndReversesOutForTheGlobalRoute) {
+  // Review r1: a robot that drove into a corridor too narrow to turn in and
+  // explored it has no local frontier, so the global planner is consulted.
+  // Its route to the frontier behind starts with a 180-degree turn the
+  // robot has no room for, and is withheld; the robot backs out straight
+  // instead, as a boxed-in robot does, rather than getting no path.
+  int frontier = -1;
+  auto node = exploredDeadEnd("dead_end_low_gain", frontier);
+  const mgg::StateVec start =
+      PlannerNodeTestPeer::drivingState(*node, 0.0, 0.0, 0.0);
+  ASSERT_FALSE(PlannerNodeTestPeer::roomToTurn(*node, start));
+  PlannerNodeTestPeer::consultGlobalPlannerAtOnce(*node);
+
+  auto response = std::make_shared<mgg_msgs::srv::PlannerSrv::Response>();
+  PlannerNodeTestPeer::plan(*node, response);
+  EXPECT_EQ(PlannerNodeTestPeer::routeSharpTurnFallbacks(*node), 1);
+  expectReverseDepartureFromDeadEnd(*node, *response);
+}
+
+TEST_F(PlannerNodeTest, AResumedRepositioningFromADeadEndReversesOutFirst) {
+  // The same dead end with a global repositioning to the frontier behind
+  // under way: the resumed route starts with the turn the robot has no room
+  // for, and the robot backs out straight instead.
+  int frontier = -1;
+  auto node = exploredDeadEnd("dead_end_resume", frontier);
+  PlannerNodeTestPeer::repositionTowards(*node, frontier);
+
+  auto response = std::make_shared<mgg_msgs::srv::PlannerSrv::Response>();
+  PlannerNodeTestPeer::plan(*node, response);
+  EXPECT_EQ(PlannerNodeTestPeer::routeSharpTurnFallbacks(*node), 1);
+  expectReverseDepartureFromDeadEnd(*node, *response);
+}
+
+TEST_F(PlannerNodeTest, AResumedRouteWithheldWithNoWayOutIsNotExplorationComplete) {
+  // Review r2: the robot, 0.6 m long, faces +x in an explored corridor
+  // 0.5 m wide that runs 2.5 m on either side of it, too far for a
+  // straight departure to reach room to turn. A repositioning to a
+  // frontier behind it is under way; the resumed route starts with a
+  // 180-degree turn, and is withheld with no departure. The lattice has no
+  // gain and the global planner is due, but the robot is boxed in with no
+  // way out: no second global search, whose frontier has meanwhile seen
+  // everything and would make exploration complete, and no second
+  // boxed-in count. No path, and the robot's own recovery runs.
+  auto node = makeNode("withheld_no_way_out");
+  PlannerNodeTestPeer::setRobotFootprint(*node, 0.6, 0.2);
+  PlannerNodeTestPeer::gainFromUnknownVoxelsOnly(*node);
+  // At voxel centres, and far enough that no lattice viewpoint, facing +x,
+  // sees unknown space.
+  PlannerNodeTestPeer::observeFloor(*node, -3.55, 5.55, -2.55, 2.55);
+  PlannerNodeTestPeer::observeWall(*node, -2.5, 2.5, 0.25);
+  PlannerNodeTestPeer::observeWall(*node, -2.5, 2.5, -0.25);
+  PlannerNodeTestPeer::acceptOdometry(*node, 0.0, 0.0, 1.0);
+  // Facing +x, back up the corridor it has mapped: no gain on a re-check.
+  const int frontier = PlannerNodeTestPeer::addGlobalChainToFrontier(
+      *node, {{-0.5, 0.0}, {-1.0, 0.0}, {-1.5, 0.0}, {-2.0, 0.0}, {-2.5, 0.0}});
+  PlannerNodeTestPeer::repositionTowards(*node, frontier);
+  PlannerNodeTestPeer::consultGlobalPlannerAtOnce(*node);
+
+  auto response = std::make_shared<mgg_msgs::srv::PlannerSrv::Response>();
+  PlannerNodeTestPeer::plan(*node, response);
+  EXPECT_TRUE(response->path.empty())
+      << "path of " << response->path.size() << " poses";
+  EXPECT_EQ(response->status, PlannerNode::kStatusNoPath);
+  EXPECT_EQ(PlannerNodeTestPeer::boxedInWithoutDeparture(*node), 1);
+  EXPECT_EQ(PlannerNodeTestPeer::routeSharpTurnFallbacks(*node), 1);
 }
 
 }  // namespace mgg_ros

@@ -238,6 +238,10 @@
       # only when no other path has one. Half a 0.2 m planner voxel, for
       # where the controller's costmap places the same wall differently.
       viewpoint_clearance_margin: 0.1
+      # A ground robot with no room to turn where it stands, and no path that
+      # turns only where it may, drives straight out ahead or, with this,
+      # straight back, until it has room. Nav2's DWB reverses (min_vel_x < 0).
+      departure_reverse_allowed: true
       auto_global_planner_enable: true
       relaxed_corridor_multiplier: 1.5
       homing_backward: false

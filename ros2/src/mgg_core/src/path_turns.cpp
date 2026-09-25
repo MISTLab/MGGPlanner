@@ -55,54 +55,85 @@ std::vector<double> pathTurns(const std::vector<Eigen::Vector3d>& points,
   return turns;
 }
 
+namespace {
+
+/// Slope of the least-squares plane through `points`, radians;
+/// kUnknownSlopeRad when fewer than three of them span a plane.
+double planeSlope(const std::vector<Eigen::Vector3d>& points) {
+  if (points.size() < 3) return kUnknownSlopeRad;
+  // z = a x + b y + c.
+  Eigen::MatrixXd a(points.size(), 3);
+  Eigen::VectorXd z(points.size());
+  for (std::size_t i = 0; i < points.size(); ++i) {
+    a.row(i) << points[i].x(), points[i].y(), 1.0;
+    z(i) = points[i].z();
+  }
+  const auto qr = a.colPivHouseholderQr();
+  if (qr.rank() < 3) return kUnknownSlopeRad;
+  const Eigen::Vector3d plane = qr.solve(z);
+  return std::atan(std::hypot(plane.x(), plane.y()));
+}
+
+}  // namespace
+
 double terrainSlope(GraphManager& graph, const Vertex& vertex, double radius) {
   std::vector<Vertex*> nearby;
   StateVec state = vertex.state;
-  if (!graph.getNearestVertices(&state, radius, &nearby)) return 0.0;
+  if (!graph.getNearestVertices(&state, radius, &nearby)) {
+    return kUnknownSlopeRad;
+  }
   std::vector<Eigen::Vector3d> ground;
   for (const Vertex* v : nearby) {
     if (v != nullptr && !v->is_hanging) {
       ground.push_back(v->state.head<3>() - vertex.state.head<3>());
     }
   }
-  if (ground.size() < 3) return 0.0;
-  // z = a x + b y + c, about the vertex.
-  Eigen::MatrixXd a(ground.size(), 3);
-  Eigen::VectorXd z(ground.size());
-  for (std::size_t i = 0; i < ground.size(); ++i) {
-    a.row(i) << ground[i].x(), ground[i].y(), 1.0;
-    z(i) = ground[i].z();
+  // About the vertex.
+  return planeSlope(ground);
+}
+
+double groundSlope(const GroundProjection& ground,
+                   const Eigen::Vector3d& position, double radius) {
+  std::vector<Eigen::Vector3d> points;
+  for (int k = -1; k < 8; ++k) {
+    Eigen::Vector3d probe = position;
+    if (k >= 0) {
+      const double angle = k * M_PI / 4.0;
+      probe.x() += radius * std::cos(angle);
+      probe.y() += radius * std::sin(angle);
+    }
+    Eigen::Vector3d found;
+    if (ground.groundBelow(probe, found)) points.push_back(found - position);
   }
-  const auto qr = a.colPivHouseholderQr();
-  if (qr.rank() < 3) return 0.0;
-  const Eigen::Vector3d plane = qr.solve(z);
-  return std::atan(std::hypot(plane.x(), plane.y()));
+  // About the position.
+  return planeSlope(points);
 }
 
 TurnCompliantRoutes findTurnCompliantRoutes(
     GraphManager& graph, double start_heading, double window,
     const std::vector<int>& destinations,
-    const SharpTurnAllowedFn& sharp_turn_allowed, int max_states) {
+    const SharpTurnAllowedFn& sharp_turn_allowed, int max_states,
+    int start_id) {
   TurnCompliantRoutes out;
   const auto vertex = [&graph](int id) -> Vertex* {
     const auto it = graph.vertices_map_.find(id);
     return it == graph.vertices_map_.end() ? nullptr : it->second;
   };
-  if (vertex(0) == nullptr || destinations.empty()) return out;
+  if (vertex(start_id) == nullptr || destinations.empty()) return out;
 
   struct State {
     int at;
-    int from;  // -1 at vertex 0
+    int from;  // -1 at the start
     double cost;
-    int parent;  // index into states, -1 at vertex 0
+    int parent;  // index into states, -1 at the start
   };
-  std::vector<State> states = {{0, -1, 0.0, -1}};
+  std::vector<State> states = {{start_id, -1, 0.0, -1}};
   std::vector<bool> settled = {false};
   const auto key = [](int at, int from) {
     return (static_cast<std::uint64_t>(static_cast<std::uint32_t>(at)) << 32) |
            static_cast<std::uint32_t>(from);
   };
-  std::unordered_map<std::uint64_t, int> index = {{key(0, -1), 0}};
+  std::unordered_map<std::uint64_t, int> index = {{key(start_id, -1), 0}};
   // Destination -> the cheapest state that arrives there with every turn
   // allowed.
   std::unordered_map<int, int> arrival;
@@ -155,8 +186,8 @@ TurnCompliantRoutes findTurnCompliantRoutes(
       return d >= window && d > kMinMove;
     };
     // The heading into route[k] as pathTurns measures it: from the first
-    // vertex at least `window` back, or vertex 0 when the route is shorter,
-    // and at vertex 0 the robot's heading.
+    // vertex at least `window` back, or the start when the route is shorter,
+    // and at the start the robot's heading.
     const auto heading_into = [&](std::size_t k) {
       for (std::size_t j = k + 1; j < route.size(); ++j) {
         if (far(back[j] - back[k]) ||
@@ -259,10 +290,11 @@ bool turnClear(const MapInterface& map, const RobotParams& robot,
 }
 
 PathTurnCheck::PathTurnCheck(GraphManager& graph, const RobotParams& robot,
-                             TurnRoomFn room_to_turn)
+                             TurnRoomFn room_to_turn, SlopeFn slope)
     : graph_(graph),
       window_(std::max(robot.size.x(), robot.size.y())),
-      room_to_turn_(std::move(room_to_turn)) {}
+      room_to_turn_(std::move(room_to_turn)),
+      slope_(std::move(slope)) {}
 
 namespace {
 
@@ -279,6 +311,7 @@ double PathTurnCheck::slopeAt(const Eigen::Vector3d& position) {
   const PositionKey key = positionKey(position);
   const auto found = slope_at_.find(key);
   if (found != slope_at_.end()) return found->second;
+  if (slope_) return slope_at_[key] = slope_(position);
   const Vertex probe(-1, StateVec(position.x(), position.y(), position.z(), 0));
   return slope_at_[key] = terrainSlope(graph_, probe, window_);
 }
@@ -328,6 +361,47 @@ bool PathTurnCheck::operator()(const std::vector<Vertex*>& path) {
       break;
   }
   return true;
+}
+
+RouteTurnChoice chooseTurnCompliantRoute(
+    GraphManager& graph, PathTurnCheck& check,
+    const std::vector<Eigen::Vector3d>& lead_in, double start_heading,
+    std::vector<Vertex*>& route, int max_states) {
+  RouteTurnChoice out;
+  if (route.empty()) return out;
+  const auto points_of = [&lead_in](const std::vector<Vertex*>& path) {
+    std::vector<Eigen::Vector3d> points = lead_in;
+    for (const Vertex* v : path) points.push_back(v->state.head<3>());
+    return points;
+  };
+  if (check.admissible(points_of(route), start_heading)) return out;
+  out.searched = true;
+  // Onto the first vertex from the lead-in, as pathTurns measures it: from
+  // the path's start.
+  double heading = start_heading;
+  const Eigen::Vector3d first = route.front()->state.head<3>();
+  if (!lead_in.empty() &&
+      (first - lead_in.front()).head<2>().norm() > kMinMove) {
+    heading = headingBetween(lead_in.front(), first);
+  }
+  const int goal = route.back()->id;
+  const TurnCompliantRoutes found = findTurnCompliantRoutes(
+      graph, heading, check.window(), {goal},
+      [&check](const Vertex& v) {
+        return check.sharpTurnAllowedAt(v.state.head<3>());
+      },
+      max_states, route.front()->id);
+  out.states_expanded = found.states_expanded;
+  out.capped = found.capped;
+  const auto detour = found.to.find(goal);
+  if (detour != found.to.end() &&
+      check.admissible(points_of(detour->second.path), start_heading)) {
+    route = detour->second.path;
+    out.detour = true;
+  } else {
+    out.fallback = true;
+  }
+  return out;
 }
 
 }  // namespace mgg

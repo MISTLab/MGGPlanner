@@ -28,6 +28,7 @@
 #include <Eigen/Dense>
 
 #include "mgg_core/graph_manager.h"
+#include "mgg_core/ground_projection.h"
 #include "mgg_core/map_interface.h"
 #include "mgg_core/params.h"
 #include "mgg_core/types.h"
@@ -39,6 +40,9 @@ constexpr double kSharpTurnRad = 0.7853981633974483;
 /// ...and a sharp turn is not made where the ground slopes more than this,
 /// radians (8 degrees).
 constexpr double kLevelGroundSlopeRad = 0.13962634015954636;
+/// The slope of ground that cannot be measured, radians (90 degrees): steep,
+/// so no sharp turn is made where it is unknown.
+constexpr double kUnknownSlopeRad = 1.5707963267948966;
 
 /// Heading change at each of `points`, radians in [0, pi]. The heading into
 /// a point is the direction from the first point at least `window` metres
@@ -54,9 +58,20 @@ std::vector<double> pathTurns(const std::vector<Eigen::Vector3d>& points,
 /// Slope of the ground under `vertex`, radians: a plane fitted by least
 /// squares to it and every vertex of `graph` within `radius` that has ground
 /// beneath it (not is_hanging). Every vertex rides the same height above
-/// its ground, so the plane has the ground's slope. Zero when the vertices
-/// do not span a plane.
+/// its ground, so the plane has the ground's slope. kUnknownSlopeRad when
+/// fewer than three of them span a plane: a sparse lattice, or one in a
+/// line, says nothing about the slope across it.
 double terrainSlope(GraphManager& graph, const Vertex& vertex, double radius);
+
+/// Slope of the ground around `position`, radians, measured from the map
+/// rather than from graph vertices: a plane fitted by least squares to the
+/// ground straight below `position` and below eight points on a circle of
+/// `radius` round it. kUnknownSlopeRad when fewer than three ground points
+/// are found or they do not span a plane. For a route over the global
+/// graph, whose vertices lie a metre apart along the tracks the robots
+/// drove and so seldom span a plane within a robot's length.
+double groundSlope(const GroundProjection& ground,
+                   const Eigen::Vector3d& position, double radius);
 
 /// Whether the robot has room to turn in place at `state`: no occupied voxel
 /// within its circumscribed radius, half the diagonal of RobotParams::size x
@@ -76,11 +91,14 @@ using TurnRoomFn = std::function<bool(const StateVec&)>;
 /// PathTurnCheck::sharpTurnAllowedAt.
 using SharpTurnAllowedFn = std::function<bool(const Vertex&)>;
 
-/// Routes from graph vertex 0, found by findTurnCompliantRoutes.
+/// The slope of the ground at a position, radians, e.g. groundSlope.
+using SlopeFn = std::function<double(const Eigen::Vector3d&)>;
+
+/// Routes from a start vertex, found by findTurnCompliantRoutes.
 struct TurnCompliantRoutes {
   struct Route {
-    std::vector<Vertex*> path;  ///< vertex 0 first
-    std::vector<double> along;  ///< edge cost from vertex 0 to each vertex
+    std::vector<Vertex*> path;  ///< the start vertex first
+    std::vector<double> along;  ///< edge cost from the start to each vertex
   };
   /// By destination id; a destination with no route is absent.
   std::unordered_map<int, Route> to;
@@ -93,7 +111,8 @@ struct TurnCompliantRoutes {
   int arrivals_refused = 0;
 };
 
-/// The cheapest route from vertex 0 of `graph` to each of `destinations`
+/// The cheapest route from vertex `start_id` of `graph`, by default vertex
+/// 0, the lattice's root, to each of `destinations`
 /// that turns sharply (kSharpTurnRad) only at vertices where
 /// `sharp_turn_allowed`. The search runs over directed edges, a vertex
 /// together with the one it was reached from, so a vertex whose shortest
@@ -101,7 +120,7 @@ struct TurnCompliantRoutes {
 /// to its level top and back, rather than across it. A route passes each
 /// vertex once. The turn onto an edge is measured as pathTurns measures it
 /// looking back, from the first vertex at least `window` back along the
-/// route, and at vertex 0 from `start_heading`. A turn less than `window`
+/// route, and at the start from `start_heading`. A turn less than `window`
 /// before a destination is measured towards it when the route arrives, and
 /// an arrival that turns where it may not is refused while the search goes
 /// on for another. The caller still checks a route with PathTurnCheck before
@@ -109,7 +128,8 @@ struct TurnCompliantRoutes {
 TurnCompliantRoutes findTurnCompliantRoutes(
     GraphManager& graph, double start_heading, double window,
     const std::vector<int>& destinations,
-    const SharpTurnAllowedFn& sharp_turn_allowed, int max_states);
+    const SharpTurnAllowedFn& sharp_turn_allowed, int max_states,
+    int start_id = 0);
 
 /// The check selectBestPath applies to a ground robot's candidate paths
 /// through `graph`: a sharp turn (kSharpTurnRad) is refused where the
@@ -118,11 +138,15 @@ TurnCompliantRoutes findTurnCompliantRoutes(
 /// the robot stands: a path that sets off sharply away from its heading
 /// needs room there too. Turns are measured over the robot's length, the
 /// larger of RobotParams::size x and y, and the terrain slope is fitted over
-/// the same radius. Slope and room are found once per position.
+/// the same radius (terrainSlope), or given by `slope`. Slope and room are
+/// found once per position.
 class PathTurnCheck {
  public:
   PathTurnCheck(GraphManager& graph, const RobotParams& robot,
-                TurnRoomFn room_to_turn = nullptr);
+                TurnRoomFn room_to_turn = nullptr, SlopeFn slope = nullptr);
+
+  /// The distance over which turns are measured, the robot's length.
+  double window() const { return window_; }
 
   /// A candidate path through the graph, turning first from the heading of
   /// its first vertex (the root's is the robot's yaw). Counts refusals.
@@ -154,9 +178,40 @@ class PathTurnCheck {
   GraphManager& graph_;
   double window_ = 0.0;
   TurnRoomFn room_to_turn_;
+  SlopeFn slope_;
   std::map<PositionKey, double> slope_at_;
   std::map<PositionKey, bool> room_at_;
 };
+
+/// What chooseTurnCompliantRoute did with a route.
+struct RouteTurnChoice {
+  /// The route failed the check and a compliant one was looked for.
+  bool searched = false;
+  /// A longer route that passes the check replaced it.
+  bool detour = false;
+  /// None was found: the route is kept as it was, failing the check.
+  bool fallback = false;
+  /// What the search cost, and whether it stopped at its bound rather than
+  /// running out of routes: a fallback after a capped search may have
+  /// missed a compliant route.
+  int states_expanded = 0;
+  bool capped = false;
+};
+
+/// The turn rule for a route to a goal, as selectBestPath applies it to
+/// exploration paths. `route` runs through `graph` from where the robot
+/// joins it to the goal, after `lead_in`, the robot's own pose when it is
+/// not on the route's first vertex; the robot's heading is
+/// `start_heading`. A route that passes `check` is kept. Otherwise the
+/// cheapest route between the same two vertices that turns sharply only
+/// where `check` allows (findTurnCompliantRoutes, at most `max_states`
+/// states) replaces it if it passes `check` too; and failing that the
+/// route is kept, flagged fallback, so that the rule never leaves the robot
+/// without a route it had.
+RouteTurnChoice chooseTurnCompliantRoute(
+    GraphManager& graph, PathTurnCheck& check,
+    const std::vector<Eigen::Vector3d>& lead_in, double start_heading,
+    std::vector<Vertex*>& route, int max_states);
 
 }  // namespace mgg
 
