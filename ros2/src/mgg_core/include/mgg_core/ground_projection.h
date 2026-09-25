@@ -53,6 +53,10 @@ struct FootprintPlane {
   int cells = 0;
 };
 
+/// The farthest apart, metres, that getProjectedEdgeStatus measures the
+/// footprint plane along an edge: a map cell of MGG's 0.2 m MOLA grid.
+inline constexpr double kFootprintSampleSpacing = 0.2;
+
 /// The most PlanningParams::max_goal_ground_rise may reach, metres: about
 /// two storeys, so a goal never snaps to a floor far above it.
 inline constexpr double kMaxGoalGroundRise = 6.0;
@@ -131,8 +135,9 @@ class GroundProjection {
   /// sides is compared: see crossSlope. An edge whose cross slope exceeds
   /// max_cross_slope is kCrossSlope. Then, when max_footprint_tilt or
   /// max_footprint_step is set, the plane under the footprint is fitted at
-  /// every point: see footprintPlane. An edge with a point whose plane tilts
-  /// or steps past either is kFootprintPlane.
+  /// every point and between them, at most kFootprintSampleSpacing apart
+  /// along the edge, short edges included: see footprintPlane. An edge with
+  /// a point whose plane tilts or steps past either is kFootprintPlane.
   ///
   /// max_inclination and max_cross_slope stay as coarse pre-filters.
   /// Neither sees the plane the chassis sits on: a segment between samples

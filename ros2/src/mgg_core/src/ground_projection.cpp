@@ -244,16 +244,35 @@ ProjectedEdgeStatus GroundProjection::getProjectedEdgeStatus(
   if ((check_tilt || check_step) && projected_edge.size() >= 2) {
     const Eigen::Vector2d heading =
         (projected_edge.back() - projected_edge.front()).head<2>();
+    const auto refused = [&](const Eigen::Vector3d& point) {
+      const FootprintPlane plane = footprintPlane(point, heading, box_size);
+      return plane.measured &&
+             ((check_tilt && plane.tilt > params_.max_footprint_tilt) ||
+              (check_step &&
+               plane.max_residual > params_.max_footprint_step));
+    };
     if (heading.norm() > 1e-9) {
-      for (std::size_t i = standing_at_start ? 1 : 0;
-           i < projected_edge.size(); ++i) {
-        const FootprintPlane plane =
-            footprintPlane(projected_edge[i], heading, box_size);
-        if (!plane.measured) continue;
-        if ((check_tilt && plane.tilt > params_.max_footprint_tilt) ||
-            (check_step && plane.max_residual > params_.max_footprint_step)) {
-          return ProjectedEdgeStatus::kFootprintPlane;
+      // At every point of the polyline and between them, at most
+      // kFootprintSampleSpacing apart: a short edge's polyline is its two
+      // ends, 0.4 to 0.57 m apart on the lattice, and which of a rock's
+      // cells fell under a footprint then depended on where the lattice
+      // lay (run 5, robot_2).
+      for (std::size_t i = 1; i < projected_edge.size(); ++i) {
+        const Eigen::Vector3d& from = projected_edge[i - 1];
+        const Eigen::Vector3d& to = projected_edge[i];
+        const int samples = std::max(
+            1, static_cast<int>(std::ceil((to - from).head<2>().norm() /
+                                              kFootprintSampleSpacing -
+                                          1e-9)));
+        for (int k = (i == 1 && standing_at_start) ? 1 : 0; k < samples;
+             ++k) {
+          if (refused(from + (to - from) * (double(k) / samples))) {
+            return ProjectedEdgeStatus::kFootprintPlane;
+          }
         }
+      }
+      if (refused(projected_edge.back())) {
+        return ProjectedEdgeStatus::kFootprintPlane;
       }
     }
   }

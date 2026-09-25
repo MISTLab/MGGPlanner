@@ -621,6 +621,45 @@ TEST(GroundProjection, FootprintPlaneFindsARockInEveryCellUnderAnAngledBody) {
             ProjectedEdgeStatus::kFootprintPlane);
 }
 
+TEST(GroundProjection, AShortEdgeIsMeasuredBetweenItsEnds) {
+  // Run 5, robot_2: a lattice edge 0.4 to 0.57 m long was measured only at
+  // its two vertices, and whether a rock's worst footprint was seen hung
+  // on where the lattice lay. A Scout's diagonal edge from (0, 0) to
+  // (0.4, 0.4) with a 0.15 m rock in cell (1, 0): the plane under either
+  // end leaves it 0.103 m off, within a 0.12 m step, but halfway along it
+  // is 0.131 m off.
+  std::map<std::pair<std::int64_t, std::int64_t>, double> tops;
+  for (std::int64_t x = -10; x < 10; ++x) {
+    for (std::int64_t y = -10; y < 10; ++y) tops[{x, y}] = 0.0;
+  }
+  tops[{1, 0}] = 0.15;
+  const mgg_test::TerrainFixture map(0.2, tops);
+  PlanningParams params = makeParams();
+  params.max_step_height = 0.15;
+  params.max_ground_height = 0.4475;
+  params.max_footprint_tilt = 22.0 * M_PI / 180.0;
+  params.max_footprint_step = 0.12;
+  GroundProjection gp(map, params);
+  const Eigen::Vector3d box(0.662, 0.630, 0.295);
+  const Eigen::Vector3d start(0.0, 0.0, 0.4475);
+  const Eigen::Vector3d end(0.4, 0.4, 0.4475);
+  const Eigen::Vector2d heading(1.0, 1.0);
+  EXPECT_NEAR(gp.footprintPlane(start, heading, box).max_residual, 0.103,
+              0.001);
+  EXPECT_NEAR(gp.footprintPlane(end, heading, box).max_residual, 0.103,
+              0.001);
+  EXPECT_NEAR(gp.footprintPlane((start + end) / 2, heading, box).max_residual,
+              0.131, 0.001);
+  std::vector<Eigen::Vector3d> path;
+  EXPECT_EQ(gp.getProjectedEdgeStatus(start, end, box, false, path, false),
+            ProjectedEdgeStatus::kFootprintPlane);
+  // Every other check passes it.
+  params.max_footprint_tilt = 0.0;
+  params.max_footprint_step = 0.0;
+  EXPECT_EQ(gp.getProjectedEdgeStatus(start, end, box, false, path, false),
+            ProjectedEdgeStatus::kAdmissible);
+}
+
 /// Level 0.2 m cells that count the ground rays cast into them.
 class CountingSurface : public mgg_test::TerrainFixture {
  public:
