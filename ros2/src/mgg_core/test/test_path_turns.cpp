@@ -361,6 +361,12 @@ TEST(ViewpointClear, AGroundRobotsPathEndsOnlyWhereItCanTurn) {
       EXPECT_TRUE(mgg::turnClear(wall, bunker, end)) << "y " << y;
     }
   }
+  // A negative margin never takes the radius below the turning radius
+  // (review r0, M-2): 0.55 m is still not clear, 0.67 m is.
+  planning.viewpoint_clearance_margin = -0.3;
+  EXPECT_FALSE(mgg::viewpointClear(wall, bunker, planning, at_055));
+  EXPECT_TRUE(mgg::viewpointClear(wall, bunker, planning, at_067));
+  planning.viewpoint_clearance_margin = 0.0;
   // An aerial robot keeps its inscribed radius: 0.389 m.
   bunker.type = mgg::RobotType::kAerialRobot;
   EXPECT_TRUE(mgg::viewpointClear(wall, bunker, planning, at_055));

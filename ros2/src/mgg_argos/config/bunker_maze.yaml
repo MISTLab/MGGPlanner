@@ -170,6 +170,9 @@
                         4.0, 0.0, 0.0, 0.0]
     global_vertex_spacing: 0.6
     graph_publish_period_sec: 2.0
+    # The controller's goal tolerance, as mgg_pci's reach_distance below: an
+    # exploration path ending this close to the robot goes nowhere.
+    reach_distance: 0.35
 
 /**/mgg_pci:
   ros__parameters:

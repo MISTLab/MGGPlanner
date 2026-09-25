@@ -67,7 +67,8 @@ inline constexpr double kViewpointArrivalSlack = 0.05;
 /// known obstacles: no occupied voxel within a radius, in the xy plane, over
 /// the height of its collision box. For a ground robot the radius is its
 /// turning radius (RobotParams::turningRadius) plus kViewpointArrivalSlack
-/// plus PlanningParams::viewpoint_clearance_margin, so a robot that reaches
+/// plus PlanningParams::viewpoint_clearance_margin, and never less than the
+/// turning radius whatever the margin, so a robot that reaches
 /// a clear path end can turn there (turnClear): in run 5 (2026-09-25) path
 /// ends allowed 0.49 m from a wall left Bunkers, whose corners reach
 /// 0.64 m, boxed in. For an aerial robot it is its inscribed radius (half

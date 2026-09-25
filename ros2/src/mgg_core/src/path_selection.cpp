@@ -16,7 +16,12 @@ bool viewpointClear(const MapInterface& map, const RobotParams& robot,
       robot.type == RobotType::kGroundRobot
           ? robot.turningRadius() + kViewpointArrivalSlack
           : 0.5 * std::min(robot.size.x(), robot.size.y());
-  const double radius = needed + planning.viewpoint_clearance_margin;
+  // A negative margin may take an aerial robot's radius in, but never a
+  // ground robot's below its turning radius (review r0, M-2).
+  double radius = needed + planning.viewpoint_clearance_margin;
+  if (robot.type == RobotType::kGroundRobot) {
+    radius = std::max(radius, robot.turningRadius());
+  }
   const Eigen::Vector3d center = viewpoint.head<3>() + robot.center_offset;
   return map.getOccupiedOnlyCylinderPathStatus(
              center, center, radius, robot.getPlanningSize().z()) !=
