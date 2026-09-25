@@ -88,6 +88,9 @@ struct TurnCompliantRoutes {
   int states_expanded = 0;
   /// The search stopped at its bound; routes found by then are kept.
   bool capped = false;
+  /// Arrivals at a destination refused for a sharp turn, less than `window`
+  /// before it, where one is not allowed.
+  int arrivals_refused = 0;
 };
 
 /// The cheapest route from vertex 0 of `graph` to each of `destinations`
@@ -98,9 +101,11 @@ struct TurnCompliantRoutes {
 /// to its level top and back, rather than across it. A route passes each
 /// vertex once. The turn onto an edge is measured as pathTurns measures it
 /// looking back, from the first vertex at least `window` back along the
-/// route, and at vertex 0 from `start_heading`; the window ahead is not yet
-/// known, so the caller checks a route with PathTurnCheck before using it.
-/// At most `max_states` states are expanded.
+/// route, and at vertex 0 from `start_heading`. A turn less than `window`
+/// before a destination is measured towards it when the route arrives, and
+/// an arrival that turns where it may not is refused while the search goes
+/// on for another. The caller still checks a route with PathTurnCheck before
+/// using it. At most `max_states` states are expanded.
 TurnCompliantRoutes findTurnCompliantRoutes(
     GraphManager& graph, double start_heading, double window,
     const std::vector<int>& destinations,

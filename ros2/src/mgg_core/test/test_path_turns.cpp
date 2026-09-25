@@ -521,4 +521,63 @@ TEST(FindTurnCompliantRoutes, StopsAtItsBound) {
   EXPECT_EQ(bounded.to.count(5), 0u);
 }
 
+TEST(PathTurnCheck, ArrivalTurningWhereItMayNotLeavesTheSearchLooking) {
+  // Review r1, P1: flat ground, a 0.8 m window, root yaw 0. The short way
+  // R-A-F turns 90 degrees at A, where sharp turns are forbidden, but its
+  // last edge is 0.4 m, so that turn is settled only on arrival at F. The
+  // arrival must be refused and R-B-C-F found.
+  GraphManager graph;
+  const auto add = [&graph](int id, double x, double y) {
+    auto* v = new Vertex(id, StateVec(x, y, 0.5, 0.0));
+    graph.addVertex(v);
+    return v;
+  };
+  Vertex* r = add(0, -2.0, 0.0);
+  Vertex* a = add(1, 0.0, 0.0);
+  Vertex* f = add(2, 0.0, 0.4);
+  Vertex* b = add(3, -2.0, 2.0);
+  Vertex* c = add(4, 0.0, 2.0);
+  const auto link = [&graph](Vertex* u, Vertex* v) {
+    graph.addEdge(u, v, (u->state - v->state).head<3>().norm());
+  };
+  link(r, a);
+  link(a, f);
+  link(r, b);
+  link(b, c);
+  link(c, f);
+  f->vol_gain.gain = 100.0;
+
+  const mgg::SharpTurnAllowedFn not_at_a = [a](const Vertex& v) {
+    return v.id != a->id;
+  };
+  const auto routes =
+      mgg::findTurnCompliantRoutes(graph, 0.0, 0.8, {f->id}, not_at_a, 100);
+  ASSERT_EQ(routes.to.count(f->id), 1u);
+  EXPECT_EQ(routes.to.at(f->id).path,
+            (std::vector<Vertex*>{r, b, c, f}));
+  EXPECT_NEAR(routes.to.at(f->id).along.back(), 5.6, 1e-9);
+  EXPECT_EQ(routes.arrivals_refused, 1);
+  EXPECT_FALSE(routes.capped);
+
+  // Through selection: the full check forbids the same turns (no room at
+  // A), and the long way is taken rather than the fallback.
+  const Eigen::Vector3d at_a = a->state.head<3>();
+  PathTurnCheck check(graph, robot(), [at_a](const StateVec& pose) {
+    return (pose.head<3>() - at_a).norm() > 1e-6;
+  });
+  const mgg::SharpTurnAllowedFn allowed = [&check](const Vertex& v) {
+    return check.sharpTurnAllowedAt(v.state.head<3>());
+  };
+  mgg::PlanningParams planning;
+  planning.path_length_penalty = 0.0;
+  planning.path_direction_penalty = 0.0;
+  mgg::EdgeInclinations flat;
+  const auto sel = mgg::selectBestPath(graph, planning, robot(), flat, 0.2,
+                                       0.0, {}, 0.0, nullptr, std::ref(check),
+                                       allowed);
+  EXPECT_TRUE(sel.sharp_turn_detour);
+  EXPECT_FALSE(sel.sharp_turn_fallback);
+  EXPECT_EQ(sel.best_path, (std::vector<Vertex*>{r, b, c, f}));
+}
+
 }  // namespace

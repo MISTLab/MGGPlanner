@@ -103,8 +103,17 @@ TurnCompliantRoutes findTurnCompliantRoutes(
            static_cast<std::uint32_t>(from);
   };
   std::unordered_map<std::uint64_t, int> index = {{key(0, -1), 0}};
-  std::unordered_map<int, int> first_settled;  // vertex -> cheapest state
+  // Destination -> the cheapest state that arrives there with every turn
+  // allowed.
+  std::unordered_map<int, int> arrival;
   std::unordered_map<int, bool> allowed;
+  const auto allowed_at = [&](const Vertex* at) {
+    auto found = allowed.find(at->id);
+    if (found == allowed.end()) {
+      found = allowed.emplace(at->id, sharp_turn_allowed(*at)).first;
+    }
+    return found->second;
+  };
   using Entry = std::pair<double, int>;
   std::priority_queue<Entry, std::vector<Entry>, std::greater<Entry>> open;
   open.push({0.0, 0});
@@ -126,12 +135,8 @@ TurnCompliantRoutes findTurnCompliantRoutes(
     settled[si] = true;
     ++out.states_expanded;
     const State s = states[si];
-    if (first_settled.emplace(s.at, si).second && wanted.count(s.at) > 0) {
-      --destinations_left;
-    }
     const Vertex* u = vertex(s.at);
-    const auto edges = graph.edge_map_.find(s.at);
-    if (u == nullptr || edges == graph.edge_map_.end()) continue;
+    if (u == nullptr) continue;
     // The route back from `u`, with the planar distance back to each of
     // its vertices.
     route.clear();
@@ -162,6 +167,31 @@ TurnCompliantRoutes findTurnCompliantRoutes(
       }
       return start_heading;
     };
+
+    // Arriving: the turns at the vertices less than `window` back, whose
+    // heading out is towards the route's end, are settled only now. An
+    // arrival that turns sharply where it may not is not a route there;
+    // the search goes on for another.
+    if (wanted.count(s.at) > 0 && arrival.count(s.at) == 0) {
+      bool refused = false;
+      for (std::size_t k = 1; k < route.size() && !far(back[k]) && !refused;
+           ++k) {
+        if (back[k] <= kMinMove) continue;
+        const double out =
+            headingBetween(route[k]->state.head<3>(), u->state.head<3>());
+        refused = headingChange(heading_into(k), out) > kSharpTurnRad + 1e-9 &&
+                  !allowed_at(route[k]);
+      }
+      if (refused) {
+        ++out.arrivals_refused;
+      } else {
+        arrival.emplace(s.at, si);
+        --destinations_left;
+      }
+    }
+
+    const auto edges = graph.edge_map_.find(s.at);
+    if (edges == graph.edge_map_.end()) continue;
     for (const auto& [w, weight] : edges->second) {
       if (w == s.from) continue;
       const Vertex* next = vertex(w);
@@ -185,11 +215,7 @@ TurnCompliantRoutes findTurnCompliantRoutes(
         if (headingChange(heading_into(k), out) <= kSharpTurnRad + 1e-9) {
           continue;
         }
-        auto found = allowed.find(at->id);
-        if (found == allowed.end()) {
-          found = allowed.emplace(at->id, sharp_turn_allowed(*at)).first;
-        }
-        refused = !found->second;
+        refused = !allowed_at(at);
       }
       if (refused) continue;
       const double next_cost = cost + weight;
@@ -209,8 +235,8 @@ TurnCompliantRoutes findTurnCompliantRoutes(
   }
 
   for (int id : destinations) {
-    const auto found = first_settled.find(id);
-    if (found == first_settled.end()) continue;
+    const auto found = arrival.find(id);
+    if (found == arrival.end()) continue;
     TurnCompliantRoutes::Route route;
     for (int si = found->second; si >= 0; si = states[si].parent) {
       route.path.push_back(vertex(states[si].at));
