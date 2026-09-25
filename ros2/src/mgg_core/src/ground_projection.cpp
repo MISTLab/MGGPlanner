@@ -230,6 +230,23 @@ ProjectedEdgeStatus GroundProjection::getProjectedEdgeStatus(
     return ProjectedEdgeStatus::kCrossSlope;
   }
 
+  const bool check_tilt = params_.max_footprint_tilt > 0.0;
+  const bool check_step = params_.max_footprint_step > 0.0;
+  if ((check_tilt || check_step) && projected_edge.size() >= 2) {
+    const Eigen::Vector2d heading =
+        (projected_edge.back() - projected_edge.front()).head<2>();
+    if (heading.norm() > 1e-9) {
+      for (const Eigen::Vector3d& point : projected_edge) {
+        const FootprintPlane plane = footprintPlane(point, heading, box_size);
+        if (!plane.measured) continue;
+        if ((check_tilt && plane.tilt > params_.max_footprint_tilt) ||
+            (check_step && plane.max_residual > params_.max_footprint_step)) {
+          return ProjectedEdgeStatus::kFootprintPlane;
+        }
+      }
+    }
+  }
+
   projected_edge_out = projected_edge;
   return ProjectedEdgeStatus::kAdmissible;
 }
@@ -285,6 +302,82 @@ double GroundProjection::crossSlope(const std::vector<Eigen::Vector3d>& edge,
     if (next == gradients.size()) break;
   }
   return std::atan(steepest);
+}
+
+FootprintPlane GroundProjection::footprintPlane(
+    const Eigen::Vector3d& point, const Eigen::Vector2d& heading,
+    const Eigen::Vector3d& box_size) const {
+  FootprintPlane plane;
+  const double resolution = map_.getResolution();
+  const double length = box_size.x();
+  const double width = box_size.y();
+  if (!(heading.norm() > 1e-9) || !(length > 0.0) || !(width > 0.0) ||
+      !(resolution > 0.0)) {
+    return plane;
+  }
+  const Eigen::Vector2d along = heading.normalized();
+  const Eigen::Vector2d across(-along.y(), along.x());
+  // Probes at the centres of equal cells no larger than the map's, so each
+  // stays inside the footprint and neighbours are at most a map cell apart.
+  const int n_along =
+      std::max(2, static_cast<int>(std::ceil(length / resolution - 1e-9)));
+  const int n_across =
+      std::max(2, static_cast<int>(std::ceil(width / resolution - 1e-9)));
+
+  std::vector<Eigen::Vector3d> ground_points;
+  ground_points.reserve(static_cast<std::size_t>(n_along * n_across));
+  int probes_on_ground = 0;
+  for (int i = 0; i < n_along; ++i) {
+    const double u = length * ((i + 0.5) / n_along - 0.5);
+    for (int j = 0; j < n_across; ++j) {
+      const double v = width * ((j + 0.5) / n_across - 0.5);
+      const Eigen::Vector2d offset = u * along + v * across;
+      Eigen::Vector3d ground;
+      if (!groundBelow(point + Eigen::Vector3d(offset.x(), offset.y(), 0.0),
+                       ground)) {
+        continue;
+      }
+      ++probes_on_ground;
+      // A voxel map returns its cell's centre, so two probes in one cell
+      // return the same point; count it once.
+      const bool seen = std::any_of(
+          ground_points.begin(), ground_points.end(),
+          [&](const Eigen::Vector3d& other) {
+            return (other.head<2>() - ground.head<2>()).norm() < 1e-9;
+          });
+      if (!seen) ground_points.push_back(ground);
+    }
+  }
+  plane.cells = static_cast<int>(ground_points.size());
+  // With ground under fewer than half the probes, a plane would describe
+  // only part of the body.
+  if (2 * probes_on_ground < n_along * n_across || plane.cells < 3) {
+    return plane;
+  }
+
+  // z = c + a x + b y in coordinates centred on `point`, for conditioning,
+  // solved from the 3 x 3 normal equations.
+  auto row = [&](const Eigen::Vector3d& g) {
+    return Eigen::Vector3d(1.0, g.x() - point.x(), g.y() - point.y());
+  };
+  Eigen::Matrix3d normal = Eigen::Matrix3d::Zero();
+  Eigen::Vector3d moment = Eigen::Vector3d::Zero();
+  for (const Eigen::Vector3d& g : ground_points) {
+    const Eigen::Vector3d r = row(g);
+    normal.noalias() += r * r.transpose();
+    moment += r * g.z();
+  }
+  Eigen::FullPivLU<Eigen::Matrix3d> lu(normal);
+  lu.setThreshold(1e-9);
+  if (lu.rank() < 3) return plane;  // the points lie on a line
+  const Eigen::Vector3d coefficients = lu.solve(moment);
+  plane.measured = true;
+  plane.tilt = std::atan(coefficients.tail<2>().norm());
+  for (const Eigen::Vector3d& g : ground_points) {
+    plane.max_residual = std::max(
+        plane.max_residual, std::abs(g.z() - row(g).dot(coefficients)));
+  }
+  return plane;
 }
 
 }  // namespace mgg

@@ -166,6 +166,17 @@ struct PlanningParams {
   /// 16 degree ramp rolled a tall robot over (SubT, 2026-09-23). Refused like
   /// max_inclination; pi/2 or more disables it. Not an upstream parameter.
   double max_cross_slope = 0.3141592653589793;  // 18 degrees
+  /// Steepest plane the ground under the robot's footprint may form at any
+  /// point of an edge, radians: the combined roll and pitch the chassis
+  /// would take there. max_inclination and max_cross_slope measure the
+  /// ground along a centre line and between two side lines; a rock pile a
+  /// Scout Mini climbed to 33 degrees passed both (SubT, run 4,
+  /// 2026-09-24). Zero disables it. Not an upstream parameter.
+  double max_footprint_tilt = 0.0;
+  /// Largest distance of any ground cell under the footprint from that
+  /// plane, metres: a rock or step the plane does not explain. Zero
+  /// disables it. Not an upstream parameter.
+  double max_footprint_step = 0.0;
   double max_step_height = 0.0;
   /// How far above a goal's requested height its ground may lie, metres.
   /// A 2-D goal is seeded at the robot's altitude, which on another level

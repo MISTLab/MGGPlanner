@@ -221,6 +221,12 @@
       # past max_inclination. Launch files lower it per platform for tall,
       # narrow robots.
       max_cross_slope: 0.3141592653589793
+      # The plane fitted to the ground under the footprint at every point of
+      # an edge: past max_footprint_tilt (radians) or with a cell further
+      # than max_footprint_step (metres) from it, the edge is refused. Zero
+      # disables each; launch files set them per platform.
+      max_footprint_tilt: 0.0
+      max_footprint_step: 0.0
       yaw_tangent_correction: true
       traverse_length_max: 10.0
       traverse_time_max: 40.0

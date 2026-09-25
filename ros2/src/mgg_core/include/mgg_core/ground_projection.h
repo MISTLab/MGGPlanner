@@ -33,6 +33,20 @@ enum class ProjectedEdgeStatus {
   kUnknown,    ///< passes through unmapped space
   kHanging,    ///< no ground beneath it
   kCrossSlope,  ///< its ground slopes sideways past max_cross_slope
+  kFootprintPlane,  ///< the ground under its footprint tilts past
+                    ///< max_footprint_tilt or steps past max_footprint_step
+};
+
+/// The plane fitted to the ground under a robot's footprint at one point.
+struct FootprintPlane {
+  /// False when too few ground cells were found to fit a plane.
+  bool measured = false;
+  /// Angle between the plane and the horizontal, radians.
+  double tilt = 0.0;
+  /// Largest vertical distance of a ground cell from the plane, metres.
+  double max_residual = 0.0;
+  /// Distinct ground cells the plane was fitted to.
+  int cells = 0;
 };
 
 /// The most PlanningParams::max_goal_ground_rise may reach, metres: about
@@ -80,7 +94,15 @@ class GroundProjection {
   ///
   /// Once the edge is known to be clear, the ground under the robot's two
   /// sides is compared: see crossSlope. An edge whose cross slope exceeds
-  /// max_cross_slope is kCrossSlope.
+  /// max_cross_slope is kCrossSlope. Then, when max_footprint_tilt or
+  /// max_footprint_step is set, the plane under the footprint is fitted at
+  /// every point: see footprintPlane. An edge with a point whose plane tilts
+  /// or steps past either is kFootprintPlane.
+  ///
+  /// max_inclination and max_cross_slope stay as coarse pre-filters.
+  /// Neither sees the plane the chassis sits on: a segment between samples
+  /// rising no more than max_step_height is exempt from max_inclination,
+  /// and the cross slope is averaged over a body length.
   ProjectedEdgeStatus getProjectedEdgeStatus(
       const Eigen::Vector3d& start, const Eigen::Vector3d& end,
       const Eigen::Vector3d& box_size, bool stop_at_unknown_voxel,
@@ -99,6 +121,19 @@ class GroundProjection {
   /// nothing can be measured.
   double crossSlope(const std::vector<Eigen::Vector3d>& edge,
                     const Eigen::Vector3d& box_size) const;
+
+  /// The least-squares plane through the ground under a footprint centred
+  /// on `point`, at driving height, and facing `heading` in the XY plane.
+  /// The footprint is `box_size` x long along the heading and y wide.
+  /// It is split into cells of at most the map's resolution. The ground is
+  /// found straight below each cell's centre, as crossSlope finds it, and
+  /// each map cell counts once. The plane is fitted to the ground points the
+  /// map returns. It is not measured when ground lies under fewer than half
+  /// the probes, or the points do not span a plane. Such a point is skipped,
+  /// as crossSlope skips a point with a side over no ground.
+  FootprintPlane footprintPlane(const Eigen::Vector3d& point,
+                                const Eigen::Vector2d& heading,
+                                const Eigen::Vector3d& box_size) const;
 
   /// The ground straight below `point`, false when none is mapped within
   /// max_projection_length.
