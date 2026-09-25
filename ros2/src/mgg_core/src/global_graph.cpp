@@ -4,8 +4,10 @@
 #include <chrono>
 #include <cmath>
 #include <limits>
+#include <unordered_map>
 #include <utility>
 
+#include "mgg_core/departure.h"
 #include "mgg_core/trajectory.h"
 
 namespace mgg {
@@ -360,6 +362,299 @@ bool addRefPathToGraph(GraphManager& graph,
     poses.push_back({path[i]->state, path[i]});
   }
   return addRefPath(graph, poses, ctx, vertex_spacing, path_vertices);
+}
+
+namespace {
+
+/// A base pose at driving height over mapped ground, as the planner takes
+/// the robot's own pose. False when the map shows no ground under it, or
+/// only ground more than a step above the base: a probe that starts inside
+/// a wall or a table beside the robot finds its top, which the robot's base
+/// was not standing on.
+bool keyframeAtDrivingHeight(const ExpandContext& ctx, StateVec& state) {
+  if (ctx.robot->type != RobotType::kGroundRobot) return true;
+  Eigen::Vector3d position = state.head<3>();
+  VoxelStatus status = VoxelStatus::kUnknown;
+  const double ground = ctx.ground->projectSample(position, status);
+  if (status != VoxelStatus::kOccupied || !std::isfinite(ground) ||
+      ground < -ctx.planning->max_step_height) {
+    return false;
+  }
+  state[0] = position[0];
+  state[1] = position[1];
+  state[2] = position[2] - (ground - ctx.planning->max_ground_height);
+  return true;
+}
+
+}  // namespace
+
+bool drivenEdgeTraversable(const ExpandContext& ctx, const Vertex& from,
+                           const Vertex& to, ExpandGraphReport& rep) {
+  // The robot physically drove this trajectory, so the volume its body
+  // passed through was traversable, whether or not the map observed it: a
+  // keyframe map carves free space only from its keyframes and leaves most
+  // of the body volume near the ground unobserved, and requiring it known
+  // refused nine in ten of the run-5 trajectory's edges. Unobserved space
+  // therefore does not block, as it does not for the local lattice whose
+  // paths the roadmap is otherwise made of. Everything that makes a
+  // stretch undrivable still refuses it: mapped ground under the whole
+  // edge, the slope, the cross slope, the footprint plane, observed ground
+  // ahead, and known obstacles in the body's sweep. So segments where the
+  // robot tipped, climbed a rock or went over a ledge still drop out.
+  // The body is the robot's box turned along the edge: the map-aligned box
+  // grown to hold it split the trajectory wherever the robot drove near a
+  // wall.
+  const Eigen::Vector3d origin = from.state.head<3>();
+  const Eigen::Vector3d direction = to.state.head<3>() - origin;
+  const double d_norm = direction.norm();
+  const Eigen::Vector3d overshoot =
+      d_norm > 1e-12
+          ? Eigen::Vector3d(direction / d_norm * ctx.planning->edge_overshoot)
+          : Eigen::Vector3d::Zero();
+  const Eigen::Vector3d start = origin + ctx.robot->center_offset - overshoot;
+  Eigen::Vector3d end = origin + ctx.robot->center_offset + direction;
+  if (to.id != 0) end += overshoot;
+  if (ctx.planning->geofence_checking_enable && ctx.geofence != nullptr &&
+      ctx.geofence->getPathStatus(
+          start.head<2>(), end.head<2>(), ctx.robot_box_size.head<2>()) ==
+          GeofenceManager::CoordinateStatus::kViolated) {
+    return false;
+  }
+  OrientedBox body;
+  body.heading = std::atan2(direction.y(), direction.x());
+  body.size = ctx.robot_box_size;
+  if (ctx.robot->type != RobotType::kGroundRobot) {
+    return orientedBoxPathStatus(*ctx.map, start, end, body, false,
+                                 nullptr) == VoxelStatus::kFree;
+  }
+  EdgeBodyCheck check;
+  check.sweep = [&ctx, &body](const Eigen::Vector3d& a,
+                              const Eigen::Vector3d& b) {
+    return orientedBoxPathStatus(*ctx.map, a, b, body, false, nullptr);
+  };
+  std::vector<Eigen::Vector3d> projected;
+  const ProjectedEdgeStatus status = ctx.ground->getProjectedEdgeStatus(
+      start, end, ctx.robot_box_size, false, projected, false, false, &check,
+      EdgeTravel::kBothWays);
+  ++rep.edge_status[static_cast<int>(status)];
+  return status == ProjectedEdgeStatus::kAdmissible;
+}
+
+RoadmapRebuildReport rebuildRoadmapFromTrajectory(
+    GraphManager& graph, const std::vector<StateVec>& keyframes,
+    const ExpandContext& ctx, const RoadmapRebuildParams& params) {
+  using Clock = std::chrono::steady_clock;
+  const Clock::time_point started = Clock::now();
+  RoadmapRebuildReport report;
+  report.keyframes = static_cast<int>(keyframes.size());
+  const auto finish = [&report, started]() {
+    report.elapsed_s =
+        std::chrono::duration<double>(Clock::now() - started).count();
+    return report;
+  };
+  if (keyframes.empty() || graph.getNumVertices() != 0) return finish();
+
+  // The keyframes with mapped ground under them, as base poses: every
+  // vertex is dropped onto the ground from the robot's base, not from its
+  // driving height, which for a tall robot can lie above an overhang it
+  // drove under.
+  std::vector<StateVec> supported;
+  supported.reserve(keyframes.size());
+  StateVec home_state = StateVec::Zero();
+  for (std::size_t i = 0; i < keyframes.size(); ++i) {
+    StateVec state = keyframes[i];
+    if (!keyframeAtDrivingHeight(ctx, state)) {
+      ++report.unsupported_keyframes;
+      if (i == 0) return finish();
+      continue;
+    }
+    if (i == 0) home_state = state;
+    supported.push_back(keyframes[i]);
+  }
+  report.home_supported = true;
+
+  auto* home = new Vertex(0, home_state);
+  home->robot_id = ctx.robot_id;
+  home->type = VertexType::kVisited;
+  graph.addVertex(home);
+  std::vector<Vertex*> vertices{home};
+  Vertex* previous = home;
+  // The base pose the previous vertex was placed from.
+  StateVec previous_base = supported.front();
+
+  // Offsets across the direction of travel, nearest first.
+  std::vector<double> offsets{0.0};
+  const double offset_step = ctx.map->getResolution() > 0.0
+                                 ? ctx.map->getResolution()
+                                 : 0.2;
+  for (double o = offset_step; o <= params.max_offset + 1e-9;
+       o += offset_step) {
+    offsets.push_back(o);
+    offsets.push_back(-o);
+  }
+  const auto has_room = [&ctx](const StateVec& state) {
+    return ctx.map->getBoxStatus(state.head<3>() + ctx.robot->center_offset,
+                                 ctx.robot_box_size,
+                                 false) != VoxelStatus::kOccupied;
+  };
+  // A vertex at `target` or beside it, chained to `previous`. A robot
+  // against a wall or wedged stood where its box overlaps the map's
+  // obstacles; beside that spot there may be room, and every edge is
+  // checked in full wherever the vertex goes.
+  const auto place = [&](const StateVec& target) {
+    Eigen::Vector2d across(previous_base.y() - target.y(),
+                           target.x() - previous_base.x());
+    across = across.norm() > 1e-9 ? Eigen::Vector2d(across.normalized())
+                                  : Eigen::Vector2d(0.0, 1.0);
+    bool placed = false;
+    bool linked = false;
+    bool tried = false;
+    StateVec chosen = target;
+    ExpandGraphReport first_refusal;
+    for (const double offset : offsets) {
+      StateVec candidate = target;
+      candidate[0] += offset * across.x();
+      candidate[1] += offset * across.y();
+      if (!keyframeAtDrivingHeight(ctx, candidate) || !has_room(candidate)) {
+        continue;
+      }
+      if (!placed) {
+        chosen = candidate;
+        placed = true;
+      }
+      const double d =
+          (candidate.head<3>() - previous->state.head<3>()).norm();
+      if (d > ctx.planning->edge_length_max ||
+          d <= ctx.planning->edge_length_min) {
+        continue;
+      }
+      const Vertex probe(-1, candidate);
+      ExpandGraphReport rep;
+      const bool passes = drivenEdgeTraversable(ctx, *previous, probe, rep);
+      if (!tried) first_refusal = rep;
+      tried = true;
+      if (passes) {
+        chosen = candidate;
+        linked = true;
+        break;
+      }
+    }
+    if (!placed) {
+      ++report.boxed_vertices;
+      return;
+    }
+    previous_base = target;
+    if ((chosen.head<2>() - target.head<2>()).norm() > 1e-9) {
+      ++report.offset_vertices;
+    }
+    const double d = (chosen.head<3>() - previous->state.head<3>()).norm();
+    auto* vertex = new Vertex(graph.generateVertexID(), chosen);
+    vertex->robot_id = ctx.robot_id;
+    vertex->type = VertexType::kVisited;
+    // Distance travelled along the trajectory: the way round between two
+    // vertices, which the link rule below reads.
+    vertex->distance = previous->distance + d;
+    graph.addVertex(vertex);
+    vertices.push_back(vertex);
+    if (linked) {
+      vertex->parent = previous;
+      previous->children.push_back(vertex);
+      graph.addEdge(vertex, previous, d);
+      ++report.chain_edges;
+    } else if (!tried) {
+      ++report.chain_gaps;
+    } else {
+      ++report.chain_edges_refused;
+      for (int s = 1; s < 8; ++s) {
+        report.chain_refusals_by_status[s] += first_refusal.edge_status[s];
+      }
+    }
+    previous = vertex;
+  };
+
+  for (std::size_t i = 1; i < supported.size(); ++i) {
+    const StateVec& state = supported[i];
+    const double gap = (state.head<3>() - previous_base.head<3>()).norm();
+    const bool latest = i + 1 == supported.size();
+    if ((gap < params.vertex_spacing && !latest) ||
+        gap <= ctx.planning->edge_length_min) {
+      continue;
+    }
+    // Keyframes far apart (a fast stretch): vertices in between, about a
+    // spacing apart and no edge longer than edge_length_max.
+    int pieces = static_cast<int>(
+        std::ceil(gap / ctx.planning->edge_length_max - 1e-9));
+    if (params.vertex_spacing > 0.0) {
+      pieces = std::max(
+          pieces, static_cast<int>(std::floor(gap / params.vertex_spacing)));
+    }
+    pieces = std::max(1, pieces);
+    const StateVec from = previous_base;
+    for (int k = 1; k < pieces; ++k) {
+      StateVec between = from + (state - from) * (double(k) / pieces);
+      between[3] = state[3];
+      place(between);
+    }
+    place(state);
+  }
+
+  // Every vertex to the others within link_radius, nearest first.
+  const double reach =
+      std::min(params.link_radius, ctx.planning->edge_length_max);
+  for (Vertex* vertex : vertices) {
+    std::vector<Vertex*> near;
+    if (!graph.getNearestVertices(&vertex->state, reach, &near)) continue;
+    const Eigen::Vector3d at = vertex->state.head<3>();
+    std::sort(near.begin(), near.end(),
+              [&at](const Vertex* a, const Vertex* b) {
+                return (a->state.head<3>() - at).squaredNorm() <
+                       (b->state.head<3>() - at).squaredNorm();
+              });
+    for (Vertex* other : near) {
+      if (other == nullptr || other == vertex) continue;
+      const double d = (other->state.head<3>() - at).norm();
+      if (d <= ctx.planning->edge_length_min || d >= reach) continue;
+      if (graph.graph_->edgeExists(vertex->id, other->id)) continue;
+      // As expandGraphEdges (rrg.cpp:907): a long way round and a height
+      // change is a different floor, not a shortcut.
+      if (std::abs(other->distance - vertex->distance) >
+              ctx.planning->nearest_range_max &&
+          std::abs(other->state[2] - vertex->state[2]) >
+              ctx.planning->nearest_range_z) {
+        continue;
+      }
+      ExpandGraphReport rep;
+      if (!drivenEdgeTraversable(ctx, *vertex, *other, rep)) continue;
+      graph.addEdge(vertex, other, d);
+      ++report.link_edges;
+    }
+  }
+  report.vertices = graph.getNumVertices();
+
+  // Connected parts, by a walk over the edge lists.
+  std::unordered_map<int, int> component_of;
+  for (Vertex* start : vertices) {
+    if (component_of.count(start->id) > 0) continue;
+    const int component = report.components++;
+    int size = 0;
+    std::vector<int> stack{start->id};
+    component_of[start->id] = component;
+    while (!stack.empty()) {
+      const int id = stack.back();
+      stack.pop_back();
+      ++size;
+      const auto edges = graph.edge_map_.find(id);
+      if (edges == graph.edge_map_.end()) continue;
+      for (const auto& [neighbour, cost] : edges->second) {
+        (void)cost;
+        if (component_of.emplace(neighbour, component).second) {
+          stack.push_back(neighbour);
+        }
+      }
+    }
+    if (start == home) report.home_component_vertices = size;
+  }
+  return finish();
 }
 
 Vertex* connectGoalThroughLattice(GraphManager& graph, const StateVec& goal,

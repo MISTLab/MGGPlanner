@@ -186,6 +186,77 @@ bool addRefPathToGraph(GraphManager& graph,
                        const ExpandContext& ctx, double vertex_spacing,
                        std::vector<Vertex*>* path_vertices = nullptr);
 
+/// How rebuildRoadmapFromTrajectory lays a trajectory out.
+struct RoadmapRebuildParams {
+  /// About one vertex per this much travel (the roadmap's spacing).
+  double vertex_spacing = 1.0;
+  /// A vertex may sit up to this far beside its keyframe, across the
+  /// direction of travel, where the robot's box has room.
+  double max_offset = 0.8;
+  /// Vertices within this distance (and edge_length_max) are joined when
+  /// their edge passes: where the robot came back the same way, and round a
+  /// vertex whose chain edge was refused.
+  double link_radius = 2.0;
+};
+
+/// What rebuildRoadmapFromTrajectory made of a keyframe trajectory.
+struct RoadmapRebuildReport {
+  /// Keyframes offered, and those with no mapped ground under them.
+  int keyframes = 0;
+  int unsupported_keyframes = 0;
+  /// Vertices that found no spot with room for the robot's box at or
+  /// beside their keyframe (a robot against a wall or wedged) and were
+  /// left out.
+  int boxed_vertices = 0;
+  /// The home keyframe has mapped ground under it. Nothing is built without.
+  bool home_supported = false;
+  int vertices = 0;
+  /// Vertices placed beside their keyframe rather than on it.
+  int offset_vertices = 0;
+  /// Edges between consecutive vertices: added, refused by the edge check,
+  /// and not tried because the two lie farther apart than edge_length_max.
+  int chain_edges = 0;
+  int chain_edges_refused = 0;
+  int chain_gaps = 0;
+  /// The refusals by ProjectedEdgeStatus (ground robots; index 0 unused).
+  int chain_refusals_by_status[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+  /// Edges added between other vertices within link_radius.
+  int link_edges = 0;
+  /// Connected parts of the rebuilt graph, and the vertices in home's.
+  int components = 0;
+  int home_component_vertices = 0;
+  double elapsed_s = 0.0;
+};
+
+/// Rebuilds a roadmap from where the robot has been: its keyframe poses,
+/// home first and then in time order, as base poses in the graph's frame.
+/// `graph` must be empty. Poses are dropped from the base onto mapped
+/// ground (a ground robot's driving height); one with no ground under it,
+/// or only ground more than a step above its base, is left out, and
+/// without ground under home nothing is built.
+///
+/// Vertex 0 is home. After it, a vertex about every vertex_spacing of
+/// travel (and on the latest keyframe, where the robot is now), each
+/// kVisited: on its keyframe, or up to max_offset beside it across the
+/// direction of travel, the first spot where the robot's box has room and
+/// the edge from the previous vertex passes. Keyframes more than a spacing
+/// apart get vertices in between. Consecutive vertices are joined only
+/// where the edge check passes (drivenEdgeTraversable), so a stretch where
+/// the robot tipped, climbed a rock or went over a ledge is dropped and
+/// splits the graph there. Then vertices within link_radius are joined by
+/// the same check.
+RoadmapRebuildReport rebuildRoadmapFromTrajectory(
+    GraphManager& graph, const std::vector<StateVec>& keyframes,
+    const ExpandContext& ctx, const RoadmapRebuildParams& params);
+
+/// The edge check of a roadmap rebuilt from the robot's trajectory, the
+/// roadmap edge check (roadmapEdgeTraversable) with two differences, both
+/// because the robot drove this trajectory: unobserved space does not
+/// block, and the body swept is the robot's planning box turned along the
+/// edge (orientedBoxPathStatus), not the map-aligned box grown to hold it.
+bool drivenEdgeTraversable(const ExpandContext& ctx, const Vertex& from,
+                           const Vertex& to, ExpandGraphReport& rep);
+
 /// Roadmap vertices a goal lattice may bridge to, e.g. those the robot can
 /// reach. Null admits every vertex.
 using UsableVertexFn = std::function<bool(const Vertex&)>;

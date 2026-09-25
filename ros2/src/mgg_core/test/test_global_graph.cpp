@@ -6,6 +6,7 @@
 // cycle or a live timer.
 
 #include <cmath>
+#include <functional>
 #include <map>
 #include <utility>
 #include <vector>
@@ -13,6 +14,7 @@
 #include <gtest/gtest.h>
 
 #include "mgg_core/global_graph.h"
+#include "terrain_fixture.h"
 
 namespace {
 
@@ -1306,6 +1308,218 @@ TEST(OdometryIngestion, ExpandGraphWiresTheOdometryStateToEveryReachableNeighbou
   EXPECT_TRUE(chained.to_root);
   EXPECT_FALSE(chained.to_side);
   EXPECT_EQ(walled.global.getNumEdges(), 2);
+}
+
+/// A Bunker on mapped level ground (0.2 m columns, top at z = 0) over
+/// x in [-2, 14) and y in [-2, 4). `obstacle` raises chosen columns: a
+/// rock, or a wall. Keyframes are base poses 0.1 m above the ground.
+struct TrajectoryScene {
+  using Tops = std::map<std::pair<std::int64_t, std::int64_t>, double>;
+  using Raise = std::function<double(std::int64_t, std::int64_t)>;
+
+  explicit TrajectoryScene(const Raise& obstacle = nullptr)
+      : map(0.2, tops(obstacle)), ground(map, planning_for(planning)) {
+    robot.type = RobotType::kGroundRobot;
+    robot.size = Eigen::Vector3d(1.023, 0.778, 0.4);
+    robot.size_extension.setZero();
+    robot.size_extension_min.setZero();
+    robot.safety_extension.setZero();
+    ctx.map = &map;
+    ctx.planning = &planning;
+    ctx.robot = &robot;
+    ctx.ground = &ground;
+    ctx.robot_box_size = robot.getPlanningSize();
+    ctx.stop_at_unknown = true;
+  }
+
+  static Tops tops(const Raise& obstacle) {
+    Tops t;
+    for (std::int64_t x = -10; x < 70; ++x) {
+      for (std::int64_t y = -10; y < 20; ++y) {
+        t[{x, y}] = obstacle ? obstacle(x, y) : 0.0;
+      }
+    }
+    return t;
+  }
+  static PlanningParams& planning_for(PlanningParams& p) {
+    p.rr_mode = mgg::RRModeType::kGraph;
+    p.max_ground_height = 0.525;
+    p.max_step_height = 0.15;
+    p.max_inclination = 0.47;
+    p.edge_length_min = 0.05;
+    p.edge_length_max = 2.0;
+    p.edge_overshoot = 0.0;
+    p.nearest_range_min = 0.05;
+    p.nearest_range_max = 1.0;
+    p.nearest_range_z = 0.15;
+    p.max_footprint_tilt = 20.0 * M_PI / 180.0;
+    p.max_footprint_step = 0.10;
+    return p;
+  }
+
+  /// Base poses every 0.3 m from (x0, y) to (x1, y).
+  static void drive(std::vector<StateVec>& keyframes, double x0, double x1,
+                    double y) {
+    const int steps = static_cast<int>(std::round(std::abs(x1 - x0) / 0.3));
+    for (int i = 0; i <= steps; ++i) {
+      keyframes.emplace_back(x0 + (x1 - x0) * i / steps, y, 0.1, 0.0);
+    }
+  }
+
+  mgg::RoadmapRebuildReport rebuild(const std::vector<StateVec>& keyframes) {
+    mgg::RoadmapRebuildParams params;
+    params.vertex_spacing = 1.0;
+    params.max_offset = 0.8;
+    params.link_radius = 2.0;
+    return mgg::rebuildRoadmapFromTrajectory(graph, keyframes, ctx, params);
+  }
+
+  Vertex* vertexNear(double x, double y, double within) {
+    Vertex* best = nullptr;
+    double best_d = within;
+    for (auto& [id, vertex] : graph.vertices_map_) {
+      (void)id;
+      const double d = std::hypot(vertex->state.x() - x, vertex->state.y() - y);
+      if (d <= best_d) {
+        best_d = d;
+        best = vertex;
+      }
+    }
+    return best;
+  }
+
+  bool reachable(int from, int to) {
+    ShortestPathsReport rep;
+    if (!graph.findShortestPaths(from, rep)) return false;
+    const auto parent = rep.parent_id_map.find(to);
+    return parent != rep.parent_id_map.end() && parent->second != to;
+  }
+
+  RobotParams robot;
+  PlanningParams planning;
+  mgg_test::TerrainFixture map;
+  mgg::GroundProjection ground;
+  ExpandContext ctx;
+  GraphManager graph;
+};
+
+/// A 0.3 m rock across x in [4.0, 4.4), from y = -2 up to y = 0.8.
+double rockUpToY08(std::int64_t x, std::int64_t y) {
+  return (x == 20 || x == 21) && y < 4 ? 0.3 : 0.0;
+}
+
+TEST(RebuildRoadmapFromTrajectory, AChainFromHomeWithVertexZeroAtHome) {
+  // An MGG restart re-seeded the graph where the robot stood (run 5,
+  // 2026-09-25): the rebuild puts vertex 0 back at home and chains the
+  // track to where the robot is now, a vertex per metre or so: keyframes
+  // 0.3 m apart are kept at x = 0, 1.2, 2.4, ... 8.4 and at 9.0.
+  TrajectoryScene scene;
+  std::vector<StateVec> keyframes;
+  TrajectoryScene::drive(keyframes, 0.0, 9.0, 0.0);
+  const mgg::RoadmapRebuildReport report = scene.rebuild(keyframes);
+
+  EXPECT_TRUE(report.home_supported);
+  EXPECT_EQ(report.keyframes, static_cast<int>(keyframes.size()));
+  EXPECT_EQ(report.unsupported_keyframes, 0);
+  EXPECT_EQ(report.vertices, 9);
+  EXPECT_EQ(report.offset_vertices, 0);
+  EXPECT_EQ(report.chain_edges, 8);
+  EXPECT_EQ(report.chain_edges_refused, 0);
+  EXPECT_EQ(report.components, 1);
+  EXPECT_EQ(report.home_component_vertices, report.vertices);
+  const Vertex* home = scene.graph.getVertex(0);
+  ASSERT_NE(home, nullptr);
+  EXPECT_NEAR(home->state.x(), 0.0, 1e-9);
+  EXPECT_NEAR(home->state.y(), 0.0, 1e-9);
+  EXPECT_NEAR(home->state.z(), 0.525, 1e-6);
+  EXPECT_EQ(home->type, VertexType::kVisited);
+  // The latest keyframe is always kept: it is where the robot is.
+  Vertex* now = scene.vertexNear(9.0, 0.0, 1e-6);
+  ASSERT_NE(now, nullptr);
+  EXPECT_TRUE(scene.reachable(0, now->id));
+}
+
+TEST(RebuildRoadmapFromTrajectory, ASegmentOverARockIsDroppedAndSplitsTheGraph) {
+  // The robot drove over a 0.3 m rock (or was wedged on it): the keyframes
+  // there are real poses, but no roadmap edge may cross it, and there is no
+  // room beside it, so the graph splits there and the far side is not
+  // reachable from home.
+  TrajectoryScene scene(rockUpToY08);
+  std::vector<StateVec> keyframes;
+  TrajectoryScene::drive(keyframes, 0.0, 9.0, 0.0);
+  for (StateVec& keyframe : keyframes) {
+    if (keyframe.x() >= 4.0 && keyframe.x() < 4.4) keyframe.z() = 0.4;
+  }
+  const mgg::RoadmapRebuildReport report = scene.rebuild(keyframes);
+
+  EXPECT_TRUE(report.home_supported);
+  EXPECT_GE(report.chain_edges_refused, 1);
+  int refusals = 0;
+  for (int s = 1; s < 8; ++s) refusals += report.chain_refusals_by_status[s];
+  EXPECT_EQ(refusals, report.chain_edges_refused);
+  EXPECT_GE(report.components, 2);
+  EXPECT_LT(report.home_component_vertices, report.vertices);
+  Vertex* now = scene.vertexNear(9.0, 0.0, 1e-6);
+  ASSERT_NE(now, nullptr);
+  EXPECT_FALSE(scene.reachable(0, now->id));
+  // Without the rock the same trajectory is one piece.
+  TrajectoryScene flat;
+  EXPECT_EQ(flat.rebuild(keyframes).components, 1);
+}
+
+TEST(RebuildRoadmapFromTrajectory, APassBackBesideARockJoinsTheTrackRoundIt) {
+  // Out over the rock along y = 0, back beside it along y = 1.8: the
+  // outward track is split at the rock, but vertices of the two passes
+  // within link_radius are joined where their edge passes, so the far side
+  // of the rock is reachable from home by the way back.
+  TrajectoryScene scene(rockUpToY08);
+  std::vector<StateVec> keyframes;
+  TrajectoryScene::drive(keyframes, 0.0, 8.0, 0.0);
+  TrajectoryScene::drive(keyframes, 8.0, 0.0, 1.8);
+  for (StateVec& keyframe : keyframes) {
+    if (keyframe.x() >= 4.0 && keyframe.x() < 4.4 && keyframe.y() < 1.0) {
+      keyframe.z() = 0.4;
+    }
+  }
+  const mgg::RoadmapRebuildReport report = scene.rebuild(keyframes);
+  EXPECT_GE(report.chain_edges_refused, 1);
+  EXPECT_GT(report.link_edges, 0);
+  Vertex* far = scene.vertexNear(7.6, 0.0, 0.7);
+  ASSERT_NE(far, nullptr);
+  EXPECT_TRUE(scene.reachable(0, far->id));
+}
+
+TEST(RebuildRoadmapFromTrajectory, AVertexAgainstAWallMovesOutToWhereTheBoxHasRoom) {
+  // From x = 2 on, a 0.6 m wall starts at y = 0.2, and the robot drove
+  // along y = 0 with the side of its box 0.19 m into it (a map wall is
+  // where the cells are, not where the wall is). The vertices sit out
+  // from the wall instead, where the box has room, and the track stays one
+  // piece.
+  TrajectoryScene scene([](std::int64_t x, std::int64_t y) {
+    return x >= 10 && y >= 1 ? 0.6 : 0.0;
+  });
+  std::vector<StateVec> keyframes;
+  TrajectoryScene::drive(keyframes, 0.0, 9.0, 0.0);
+  const mgg::RoadmapRebuildReport report = scene.rebuild(keyframes);
+  EXPECT_GT(report.offset_vertices, 0);
+  EXPECT_EQ(report.boxed_vertices, 0);
+  EXPECT_EQ(report.components, 1);
+  EXPECT_EQ(scene.vertexNear(6.0, 0.0, 0.1), nullptr);
+  Vertex* now = scene.vertexNear(9.0, -0.3, 0.3);
+  ASSERT_NE(now, nullptr);
+  EXPECT_TRUE(scene.reachable(0, now->id));
+}
+
+TEST(RebuildRoadmapFromTrajectory, NothingIsBuiltWithoutGroundUnderHome) {
+  // Home off the mapped ground: vertex 0 cannot be placed, so the caller
+  // keeps the graph it has.
+  TrajectoryScene scene;
+  std::vector<StateVec> keyframes{StateVec(-5.0, 0.0, 0.1, 0.0)};
+  TrajectoryScene::drive(keyframes, 0.0, 3.0, 0.0);
+  const mgg::RoadmapRebuildReport report = scene.rebuild(keyframes);
+  EXPECT_FALSE(report.home_supported);
+  EXPECT_EQ(report.vertices, 0);
+  EXPECT_EQ(scene.graph.getNumVertices(), 0);
 }
 
 }  // namespace
