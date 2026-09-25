@@ -3,23 +3,30 @@
 Status: design, awaiting operator review. Date: 2026-09-25.
 Scope: MGGPlanner `ros2` branch (native code, not a downstream patch). SwarmDeck consumes it.
 
-## 1. Goal
+## 1. Problem and goal
 
-Robots must explore the whole reachable environment, spread across it, and stop
-revisiting ground that is already explored — by themselves or by a peer.
+### 1.1 The problem today (MGG b977bfc, before this design)
 
-Observed in SwarmDeck's simulated SubT runs (runs 4 and 5, MGG b977bfc):
+Observed in SwarmDeck's simulated SubT runs 4 and 5:
 
 - Clear frontiers remain in the map while robots linger in explored areas.
 - Robots work off leftover local gain and only reposition globally after
   `low_gain_rounds` (3) of low local gain; the global planner then picks one
   frontier greedily (`searchGlobalFrontier`: best gain over distance). There is
   no ordering of frontiers and no commitment to a plan.
-- Nothing splits the frontiers among robots. Each robot chooses its next
+- Today, nothing splits the frontiers among robots. Each robot chooses its next
   frontier as if it were alone; the only coordination is SwarmDeck's reservation
   lease, which keeps other robots away from the one spot a robot is heading to
-  (within a radius). Several robots can still head into the same region while
-  another region has nobody.
+  (within a radius). Several robots can head into the same region while another
+  region has nobody.
+
+### 1.2 The goal
+
+Each robot orders its frontiers into a tour and commits to it (§2), and each
+connected group of robots splits its frontiers among its members by auction
+(§3), so that the robots explore the whole reachable environment, spread
+across it, and stop revisiting ground that is already explored, by themselves
+or by a peer.
 
 Success means, on the 4-robot SubT simulation with C-SLAM merges on:
 
