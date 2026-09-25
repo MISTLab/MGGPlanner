@@ -16,6 +16,7 @@
 #include <iomanip>
 #include <iterator>
 #include <limits>
+#include <memory>
 #include <sstream>
 #include <string>
 #include <thread>
@@ -23,6 +24,7 @@
 #include <vector>
 #include <unistd.h>
 
+#include "mgg_core/departure.h"
 #include "mgg_core/graph_manager.h"
 #include "mgg_core/ground_projection.h"
 #include "mgg_core/grid_graph.h"
@@ -1772,16 +1774,15 @@ TEST(MolaMap, SparseMeasuredRayCorridorGrowsFootprintValidatedGroundGraph) {
 }
 
 
-TEST(NativeMolaGrid, AStraightDepartureAlongACorridorClearsTheBoxTurnedToItsHeading) {
-  // The map queries mgg_ros PlannerNode::straightDeparture makes for a
-  // ground robot, on the native MOLA grid: each 0.1 m step checked with
-  // getProjectedEdgeStatus, stopping at unknown space, with the collision
-  // box turned to the robot's heading (the smallest box aligned with the
-  // map that holds it), up to the first pose where mgg::turnClear finds
-  // room to turn in place. The robot is 1.2 m long and 0.4 m wide, facing
-  // +y in a corridor along y whose inside spans x = [-0.2, 0.4]: it can
-  // drive along the corridor, but has no room to turn in it. The corridor's
-  // walls end at y = 1.2.
+TEST(NativeMolaGrid, AStraightDepartureAlongACorridorChecksTheBodyTurnedToItsHeading) {
+  // mgg::findDeparture on the native MOLA grid, as mgg_ros PlannerNode
+  // departs a boxed-in ground robot: 0.1 m steps checked with
+  // getProjectedEdgeStatus, stopping at unknown space, with the robot's
+  // rectangle turned to its heading, up to the first pose where
+  // mgg::turnClear finds room to turn in place. The robot is 1.2 m long and
+  // 0.4 m wide, facing +y in a corridor along y whose inside spans
+  // x = [-0.2, 0.4]: it can drive along the corridor, but has no room to
+  // turn in it. The corridor's walls end at y = 1.2.
   using Grid = mgg::NativeMolaGrid;
   std::vector<Grid::Cell> occupied;
   std::vector<Grid::Cell> free;
@@ -1814,6 +1815,7 @@ TEST(NativeMolaGrid, AStraightDepartureAlongACorridorClearsTheBoxTurnedToItsHead
   planning.max_ground_height = 0.3;
   planning.max_step_height = 0.1;
   planning.max_inclination = 0.52;
+  planning.path_interpolation_distance = 0.1;
   const mgg::GroundProjection ground(map, planning);
 
   // At driving height over the floor, facing +y.
@@ -1822,48 +1824,161 @@ TEST(NativeMolaGrid, AStraightDepartureAlongACorridorClearsTheBoxTurnedToItsHead
   const double below = ground.projectSample(probe, found);
   ASSERT_EQ(found, VoxelStatus::kOccupied);
   const double driving_z = 0.3 - below + planning.max_ground_height;
-  const double heading = M_PI / 2.0;
-  const mgg::StateVec start(0.1, 0.1, driving_z, heading);
+  const mgg::StateVec start(0.1, 0.1, driving_z, M_PI / 2.0);
   ASSERT_FALSE(mgg::turnClear(map, robot, start));
 
-  // Steps along the heading while `box` sweeps free; returns how far out
-  // the first pose with room to turn is, at least 0.5 m and at most 2 m,
-  // or a negative distance when there is none.
-  const auto depart = [&](const Eigen::Vector3d& box) {
-    Eigen::Vector3d from = start.head<3>();
-    for (int i = 1; i <= 20; ++i) {
-      const double along = 0.1 * i;
-      const Eigen::Vector3d to(start.x(), start.y() + along, driving_z);
-      std::vector<Eigen::Vector3d> projected;
-      if (ground.getProjectedEdgeStatus(from, to, box, true, projected,
-                                        false) !=
-          mgg::ProjectedEdgeStatus::kAdmissible) {
-        return -along;
-      }
-      from = to;
-      if (along >= 0.5 - 1e-9 &&
-          mgg::turnClear(map, robot,
-                         mgg::StateVec(to.x(), to.y(), to.z(), heading))) {
-        return along;
-      }
-    }
-    return -1.0;
-  };
-
-  // Turned to face y the box is 0.4 m across the corridor: it drives out,
+  // Turned to face y the body is 0.4 m across the corridor: it drives out,
   // to room to turn past the walls' end. The turning circle, 0.632 m in
   // radius, clears the walls' corners 0.3 m to either side 0.556 m past
   // their end at y = 1.2: the first step there is y = 1.8, 1.7 m out.
-  const Eigen::Vector3d box = robot.getPlanningSize();
-  const double c = std::abs(std::cos(heading));
-  const double s = std::abs(std::sin(heading));
-  const Eigen::Vector3d turned(c * box.x() + s * box.y(),
-                               s * box.x() + c * box.y(), box.z());
-  const double out = depart(turned);
-  EXPECT_NEAR(out, 1.7, 1e-9);
-  // Aligned with the map, the box is its 1.2 m length across the corridor
-  // and the first step already hits the walls.
-  EXPECT_NEAR(depart(box), -0.1, 1e-9);
+  mgg::Departure departure;
+  ASSERT_TRUE(
+      mgg::findDeparture(map, ground, robot, planning, start, departure));
+  EXPECT_FALSE(departure.reverse);
+  EXPECT_EQ(departure.turn, 0.0);
+  EXPECT_NEAR(departure.path.back().y() - start.y(), 1.7, 1e-9);
+  EXPECT_NEAR(departure.path.back().x(), start.x(), 1e-9);
+  // The box aligned with the map is its 1.2 m length across the corridor,
+  // and meets the walls where the robot stands.
+  EXPECT_EQ(map.getPathStatus(start.head<3>(),
+                              start.head<3>() + Eigen::Vector3d(0, 0.1, 0),
+                              robot.getPlanningSize(), true),
+            VoxelStatus::kOccupied);
+}
+
+/// A planner grid cut from a SwarmDeck run around a robot that stood boxed
+/// in (test/data/README.md), and where the robot stood, on the ground.
+struct BoxedInFixture {
+  std::unique_ptr<mgg::NativeMolaGrid> map;
+  Eigen::Vector3d robot = Eigen::Vector3d::Zero();
+
+  explicit BoxedInFixture(const std::string& name) {
+    std::ifstream in(std::string(MGG_MAP_TEST_DATA_DIR) + "/" + name);
+    EXPECT_TRUE(in.good()) << name;
+    double resolution = 0.0;
+    std::vector<mgg::NativeMolaGrid::Cell> occupied;
+    std::vector<mgg::NativeMolaGrid::Cell> free;
+    std::vector<mgg::NativeMolaGrid::Surface> surfaces;
+    std::string line;
+    while (std::getline(in, line)) {
+      std::istringstream row(line);
+      std::string tag;
+      row >> tag;
+      if (tag == "resolution") {
+        row >> resolution;
+      } else if (tag == "robot") {
+        row >> robot.x() >> robot.y() >> robot.z();
+      } else if (tag == "o" || tag == "f") {
+        mgg::NativeMolaGrid::Cell cell;
+        row >> cell.x >> cell.y >> cell.z;
+        (tag == "o" ? occupied : free).push_back(cell);
+        double top = 0.0;
+        if (tag == "o" && row >> top) surfaces.push_back({cell, top});
+      }
+    }
+    map = std::make_unique<mgg::NativeMolaGrid>(resolution, occupied, free,
+                                                surfaces);
+  }
+};
+
+/// A Bunker as SwarmDeck deploys MGG for it (deploy/mgg/fleet.launch.py,
+/// run 5): 1.023 x 0.778 m, 0.4 m tall, 0.05 m of size extension.
+mgg::RobotParams bunker() {
+  mgg::RobotParams robot;
+  robot.type = mgg::RobotType::kGroundRobot;
+  robot.size = Eigen::Vector3d(1.023, 0.778, 0.4);
+  robot.size_extension = Eigen::Vector3d::Constant(0.05);
+  robot.bound_mode = mgg::BoundModeType::kExtendedBound;
+  return robot;
+}
+
+mgg::PlanningParams bunkerPlanning() {
+  mgg::PlanningParams planning;
+  planning.max_ground_height = 0.2 + 0.15 + 0.175;
+  planning.max_step_height = 0.15;
+  planning.max_inclination = 27.0 * M_PI / 180.0;
+  planning.max_cross_slope = 18.0 * M_PI / 180.0;
+  planning.max_footprint_tilt = 22.0 * M_PI / 180.0;
+  planning.max_footprint_step = 0.12;
+  planning.path_interpolation_distance = 0.25;  // bistro.yaml
+  return planning;
+}
+
+/// Where the robot of `fixture` stood, facing `yaw_deg`, at driving height.
+mgg::StateVec boxedInStart(const BoxedInFixture& fixture,
+                           const mgg::PlanningParams& planning,
+                           double yaw_deg) {
+  return mgg::StateVec(fixture.robot.x(), fixture.robot.y(),
+                       fixture.robot.z() + planning.max_ground_height,
+                       yaw_deg * M_PI / 180.0);
+}
+
+TEST(Departure, Run5Robot0TurnsAFewDegreesThenBacksOutOfTheCorner) {
+  // Run 5, robot_0 (Bunker) at 1790345307: parked facing about 17 degrees
+  // in a room's corner, a wall 0.84 m ahead, a wall notch 0.57 m to its
+  // right and the south wall's foot about 0.9 m behind its right side. It
+  // had no room to turn, and every departure was refused at the first step:
+  // the box aligned with the map that holds the turned robot, 1.27 x 1.11 m,
+  // met the notch where the robot stood. Its own rectangle does not. Still,
+  // straight at 17 degrees there is no way out: ahead meets the east wall;
+  // back heads for the south wall, whose foot comes within the turning
+  // circle from 0.3 m out and meets the body's corner at 0.6 m. Turned 10
+  // degrees clockwise in place, which the notch leaves room for, it backs
+  // out straight west to room to turn 0.5 m out.
+  const BoxedInFixture fixture("boxed_in_r0.txt");
+  const mgg::RobotParams robot = bunker();
+  const mgg::PlanningParams planning = bunkerPlanning();
+  const mgg::GroundProjection ground(*fixture.map, planning);
+  for (const double yaw : {15.5, 17.0, 20.0}) {
+    SCOPED_TRACE(yaw);
+    const mgg::StateVec start = boxedInStart(fixture, planning, yaw);
+    ASSERT_FALSE(mgg::turnClear(*fixture.map, robot, start));
+    mgg::Departure departure;
+    ASSERT_TRUE(mgg::findDeparture(*fixture.map, ground, robot, planning,
+                                   start, departure));
+    // Not straight at its heading, which findDeparture tries first.
+    EXPECT_NE(departure.turn, 0.0);
+    EXPECT_LE(std::abs(departure.turn), mgg::kDepartureMaxTurnRad + 1e-9);
+    EXPECT_TRUE(departure.reverse);
+    const double out = (departure.path.back().head<2>() -
+                        departure.path.front().head<2>())
+                           .norm();
+    EXPECT_GE(out, mgg::kDepartureMinM - 1e-9);
+    EXPECT_LE(out, 1.0);
+    EXPECT_TRUE(departure.path.front().head<2>().isApprox(start.head<2>()));
+    EXPECT_TRUE(mgg::turnClear(*fixture.map, robot, departure.path.back()));
+    std::printf("robot_0 at %.1f deg: turns %+.0f deg, backs out %.2f m\n",
+                yaw, departure.turn * 180.0 / M_PI, out);
+  }
+}
+
+TEST(Departure, Run5Robot1DepartsFromBesideTheWallColumn) {
+  // Run 5, robot_1 (Bunker) from 1790345621: boxed in 43 times beside a
+  // wall column 0.49 m from its centre, turning in place between 113 and
+  // 174 degrees. That column lies inside its own planning rectangle, so
+  // every check of the body where it stood failed. Those cells are not
+  // checked where it stands, and at each heading it drives straight out.
+  const BoxedInFixture fixture("boxed_in_r1.txt");
+  const mgg::RobotParams robot = bunker();
+  const mgg::PlanningParams planning = bunkerPlanning();
+  const mgg::GroundProjection ground(*fixture.map, planning);
+  for (const double yaw : {90.0, 113.0, 133.0, 174.0, 180.0}) {
+    SCOPED_TRACE(yaw);
+    const mgg::StateVec start = boxedInStart(fixture, planning, yaw);
+    ASSERT_FALSE(mgg::turnClear(*fixture.map, robot, start));
+    mgg::Departure departure;
+    EXPECT_TRUE(mgg::findDeparture(*fixture.map, ground, robot, planning,
+                                   start, departure));
+    if (departure.path.empty()) continue;
+    EXPECT_EQ(departure.turn, 0.0);
+    const double out = (departure.path.back().head<2>() -
+                        departure.path.front().head<2>())
+                           .norm();
+    EXPECT_GE(out, mgg::kDepartureMinM - 1e-9);
+    std::printf("robot_1 at %.0f deg: turns %+.0f deg, %.2f m %s\n", yaw,
+                departure.turn * 180.0 / M_PI, out,
+                departure.reverse ? "back" : "ahead");
+  }
 }
 
 }  // namespace

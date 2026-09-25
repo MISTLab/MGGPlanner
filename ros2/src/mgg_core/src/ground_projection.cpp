@@ -140,7 +140,7 @@ ProjectedEdgeStatus GroundProjection::getProjectedEdgeStatus(
     const Eigen::Vector3d& start, const Eigen::Vector3d& end,
     const Eigen::Vector3d& box_size, bool stop_at_unknown_voxel,
     std::vector<Eigen::Vector3d>& projected_edge_out, bool is_hanging,
-    bool preserve_start_height) const {
+    bool preserve_start_height, const EdgeBodyCheck* body) const {
   const double step_size = 2.0 * map_.getResolution();
   const double max_inclination = params_.max_inclination;
 
@@ -221,17 +221,21 @@ ProjectedEdgeStatus GroundProjection::getProjectedEdgeStatus(
   }
 
   for (size_t i = 1; i < projected_edge.size(); ++i) {
-    const VoxelStatus path = map_.getPathStatus(
-        projected_edge[i - 1], projected_edge[i], box_size,
-        stop_at_unknown_voxel);
+    const VoxelStatus path =
+        body != nullptr
+            ? body->sweep(projected_edge[i - 1], projected_edge[i])
+            : map_.getPathStatus(projected_edge[i - 1], projected_edge[i],
+                                 box_size, stop_at_unknown_voxel);
     if (path == VoxelStatus::kUnknown) return ProjectedEdgeStatus::kUnknown;
     if (path == VoxelStatus::kOccupied) return ProjectedEdgeStatus::kOccupied;
   }
 
   // After the sweep, so the side probes start inside a footprint known not
   // to be occupied rather than inside a wall.
+  const bool standing_at_start = body != nullptr && body->standing_at_start;
   if (params_.max_cross_slope < M_PI_2 &&
-      crossSlope(projected_edge, box_size) > params_.max_cross_slope) {
+      crossSlope(projected_edge, box_size, standing_at_start) >
+          params_.max_cross_slope) {
     return ProjectedEdgeStatus::kCrossSlope;
   }
 
@@ -241,8 +245,10 @@ ProjectedEdgeStatus GroundProjection::getProjectedEdgeStatus(
     const Eigen::Vector2d heading =
         (projected_edge.back() - projected_edge.front()).head<2>();
     if (heading.norm() > 1e-9) {
-      for (const Eigen::Vector3d& point : projected_edge) {
-        const FootprintPlane plane = footprintPlane(point, heading, box_size);
+      for (std::size_t i = standing_at_start ? 1 : 0;
+           i < projected_edge.size(); ++i) {
+        const FootprintPlane plane =
+            footprintPlane(projected_edge[i], heading, box_size);
         if (!plane.measured) continue;
         if ((check_tilt && plane.tilt > params_.max_footprint_tilt) ||
             (check_step && plane.max_residual > params_.max_footprint_step)) {
@@ -265,7 +271,8 @@ bool GroundProjection::groundBelow(const Eigen::Vector3d& point,
 }
 
 double GroundProjection::crossSlope(const std::vector<Eigen::Vector3d>& edge,
-                                    const Eigen::Vector3d& box_size) const {
+                                    const Eigen::Vector3d& box_size,
+                                    bool skip_start) const {
   if (edge.size() < 2) return 0.0;
   const Eigen::Vector2d travel = (edge.back() - edge.front()).head<2>();
   const double half_track = 0.5 * std::min(box_size.x(), box_size.y());
@@ -281,7 +288,8 @@ double GroundProjection::crossSlope(const std::vector<Eigen::Vector3d>& edge,
   // side of a 0.83 m track may be 0.8 or 1.0 m apart.
   std::vector<Eigen::Vector2d> positions;
   std::vector<double> gradients;
-  for (const Eigen::Vector3d& point : edge) {
+  for (std::size_t i = skip_start ? 1 : 0; i < edge.size(); ++i) {
+    const Eigen::Vector3d& point = edge[i];
     Eigen::Vector3d left;
     Eigen::Vector3d right;
     if (!groundBelow(point + side, left) || !groundBelow(point - side, right)) {

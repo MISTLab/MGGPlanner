@@ -1365,20 +1365,28 @@ std::string PlannerNode::buildLocalGraph() {
 
 std::string PlannerNode::departBoxedIn(const mgg::StateVec& root_state,
                                        const char* why) {
-  char note[128];
-  bool reverse = false;
-  if (straightDeparture(root_state, best_path_, reverse)) {
+  char note[160];
+  mgg::Departure departure;
+  best_path_.clear();
+  if (straightDeparture(root_state, departure)) {
+    best_path_ = departure.path;
     ++boxed_in_departures_;
     const double length =
         (best_path_.back().head<2>() - best_path_.front().head<2>()).norm();
+    char turn[48] = "";
+    if (departure.turn != 0.0) {
+      std::snprintf(turn, sizeof(turn), " after turning %+.0f deg",
+                    departure.turn * 180.0 / M_PI);
+    }
     std::snprintf(note, sizeof(note),
-                  "; boxed in: straight departure %.2f m %s", length,
-                  reverse ? "in reverse" : "ahead");
+                  "; boxed in: straight departure %.2f m %s%s", length,
+                  departure.reverse ? "in reverse" : "ahead", turn);
     RCLCPP_INFO(get_logger(),
                 "boxed in at (%.2f, %.2f, %.2f): no room to turn and %s; "
-                "departing %.2f m straight %s (%d departures so far)",
+                "departing %.2f m straight %s%s (%d departures so far)",
                 root_state.x(), root_state.y(), root_state.z(), why, length,
-                reverse ? "back" : "ahead", boxed_in_departures_);
+                departure.reverse ? "back" : "ahead", turn,
+                boxed_in_departures_);
   } else {
     ++boxed_in_without_departure_;
     boxed_in_without_departure_now_ = true;
@@ -1386,73 +1394,21 @@ std::string PlannerNode::departBoxedIn(const mgg::StateVec& root_state,
                   "; boxed in: no straight departure, no path");
     RCLCPP_WARN(get_logger(),
                 "boxed in at (%.2f, %.2f, %.2f): no room to turn, %s, and "
-                "no room to turn within %.1f m straight ahead%s; no path "
-                "(%d times so far)",
+                "no room to turn within %.1f m straight ahead%s, turned by "
+                "up to %.0f deg; no path (%d times so far)",
                 root_state.x(), root_state.y(), root_state.z(), why,
-                kDepartureMaxM,
+                mgg::kDepartureMaxM,
                 planning_params_.departure_reverse_allowed ? " or back" : "",
+                mgg::kDepartureMaxTurnRad * 180.0 / M_PI,
                 boxed_in_without_departure_);
   }
   return note;
 }
 
 bool PlannerNode::straightDeparture(const mgg::StateVec& start,
-                                    std::vector<mgg::StateVec>& path,
-                                    bool& reverse) {
-  const double heading = start[3];
-  const double spacing = planning_params_.path_interpolation_distance;
-  const double step = spacing > 0.0 ? std::min(spacing, kDepartureMinM)
-                                    : map_->getResolution();
-  // The collision box, length along the robot's heading, turned with it:
-  // the map's box checks are aligned with the map, so the box checked is
-  // the smallest aligned one that holds the turned box. Along x or y it is
-  // the box itself; a robot facing y is its width across x (review r0).
-  const Eigen::Vector3d box = robot_params_.getPlanningSize();
-  const double c = std::abs(std::cos(heading));
-  const double s = std::abs(std::sin(heading));
-  const Eigen::Vector3d turned_box(c * box.x() + s * box.y(),
-                                   s * box.x() + c * box.y(), box.z());
-  // Each step as shortcutAndResample checks a segment: through known free
-  // space only, the whole collision box, and for a ground robot along the
-  // terrain.
-  const auto step_free = [this, &turned_box](const mgg::StateVec& from,
-                                             const mgg::StateVec& to) {
-    if (robot_params_.type == mgg::RobotType::kGroundRobot) {
-      std::vector<Eigen::Vector3d> projected;
-      return ground_->getProjectedEdgeStatus(
-                 from.head<3>(), to.head<3>(), turned_box, true, projected,
-                 false) == mgg::ProjectedEdgeStatus::kAdmissible;
-    }
-    return map_->getPathStatus(from.head<3>(), to.head<3>(), turned_box,
-                               true) == mgg::VoxelStatus::kFree;
-  };
-  const int steps = static_cast<int>(std::ceil(kDepartureMaxM / step - 1e-9));
-  for (const bool backwards : {false, true}) {
-    if (backwards && !planning_params_.departure_reverse_allowed) break;
-    const double direction = backwards ? heading + M_PI : heading;
-    const Eigen::Vector2d unit(std::cos(direction), std::sin(direction));
-    path.assign(1, start);
-    for (int i = 1; i <= steps; ++i) {
-      const double along = std::min(i * step, kDepartureMaxM);
-      const Eigen::Vector2d xy = start.head<2>() + along * unit;
-      mgg::StateVec to(xy.x(), xy.y(), path.back().z(), heading);
-      if (!projectToDrivingHeight(to)) break;
-      // On the line, at the height of the ground found beside it if that
-      // is where projectSample found it.
-      to[0] = xy.x();
-      to[1] = xy.y();
-      to[3] = heading;
-      if (!step_free(path.back(), to)) break;
-      path.push_back(to);
-      if (along >= kDepartureMinM - 1e-9 &&
-          mgg::turnClear(*map_, robot_params_, to)) {
-        reverse = backwards;
-        return true;
-      }
-    }
-  }
-  path.clear();
-  return false;
+                                    mgg::Departure& departure) {
+  return mgg::findDeparture(*map_, *ground_, robot_params_, planning_params_,
+                            start, departure);
 }
 
 bool PlannerNode::routeOverGlobalGraph(const mgg::StateVec& goal,

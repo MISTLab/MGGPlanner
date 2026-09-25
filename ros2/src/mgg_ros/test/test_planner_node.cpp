@@ -258,7 +258,11 @@ class PlannerNodeTestPeer {
                                 std::vector<mgg::StateVec>& path,
                                 bool& reverse) {
     const std::lock_guard<std::recursive_mutex> lock(node.planner_mutex_);
-    return node.straightDeparture(start, path, reverse);
+    mgg::Departure departure;
+    const bool found = node.straightDeparture(start, departure);
+    path = departure.path;
+    reverse = departure.reverse;
+    return found;
   }
   /// A chain of this robot's roadmap from the global graph's root through
   /// `points`, at driving height and facing `yaw`; its last vertex a
@@ -931,9 +935,12 @@ namespace {
 /// to `to` along x (walls at y = +-0.25) or, `along_y`, along y (walls at
 /// x = +-0.25), on a floor mapped from -3 to 4 along it and -1.5 to 1.5
 /// across: room to drive it along the corridor, not to turn it in place,
-/// since its corners reach 0.32 m from its centre.
+/// since its corners reach 0.32 m from its centre. With `across`, the
+/// corridor runs along x and is 0.6 m wide (walls' faces at y = +-0.3), so
+/// that the robot fits in it facing across, its ends against the walls.
 std::shared_ptr<PlannerNode> boxedIn(const std::string& name, double from,
-                                     double to, bool along_y = false) {
+                                     double to, bool along_y = false,
+                                     bool across = false) {
   auto node = makeNode(name);
   PlannerNodeTestPeer::setRobotFootprint(*node, 0.6, 0.2);
   if (along_y) {
@@ -944,8 +951,9 @@ std::shared_ptr<PlannerNode> boxedIn(const std::string& name, double from,
     PlannerNodeTestPeer::observeWallAlongY(*node, from, to, -0.25);
   } else {
     PlannerNodeTestPeer::observeFloor(*node, -3.0, 4.0, -1.5, 1.5);
-    PlannerNodeTestPeer::observeWall(*node, from, to, 0.25);
-    PlannerNodeTestPeer::observeWall(*node, from, to, -0.25);
+    const double wall = across ? 0.35 : 0.25;
+    PlannerNodeTestPeer::observeWall(*node, from, to, wall);
+    PlannerNodeTestPeer::observeWall(*node, from, to, -wall);
   }
   return node;
 }
@@ -1046,9 +1054,9 @@ TEST_F(PlannerNodeTest, ABoxedInRobotWithNoRoomEitherWayGetsNoDeparture) {
 TEST_F(PlannerNodeTest, ExplorationBoxedInSendsNoPathThatStartsWithATurn) {
   // Facing across the corridor, every exploration path starts with a
   // right-angle turn the robot has no room for, so none complies. Straight
-  // ahead or back runs into a wall at once: no path, rather than the
-  // fallback path that turns.
-  auto node = boxedIn("boxed_explore", -2.5, 2.5);
+  // ahead or back runs into a wall at once, and so does turning its ends
+  // by 5 degrees: no path, rather than the fallback path that turns.
+  auto node = boxedIn("boxed_explore", -2.5, 2.5, false, true);
   auto msg = std::make_shared<nav_msgs::msg::Odometry>();
   msg->header.stamp.sec = 1;
   msg->pose.pose.position.z = 0.075;
@@ -1073,7 +1081,7 @@ TEST_F(PlannerNodeTest, ABoxedInRobotGetsNoGlobalRouteThatStartsWithATurn) {
   // nor one already under way may send it, and the robot is not told
   // exploration is complete: it gets no path, and its adapter's recovery
   // runs.
-  auto node = boxedIn("boxed_global", -2.5, 2.5);
+  auto node = boxedIn("boxed_global", -2.5, 2.5, false, true);
   auto msg = std::make_shared<nav_msgs::msg::Odometry>();
   msg->header.stamp.sec = 1;
   msg->pose.pose.position.z = 0.075;

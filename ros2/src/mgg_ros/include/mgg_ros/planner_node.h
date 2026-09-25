@@ -47,6 +47,7 @@
 #include <mgg_msgs/srv/planner_set_exploration_target.hpp>
 #include <mgg_msgs/srv/planner_srv.hpp>
 
+#include "mgg_core/departure.h"
 #include "mgg_core/geofence_manager.h"
 #include "mgg_core/gain.h"
 #include "mgg_core/global_graph.h"
@@ -140,27 +141,17 @@ class PlannerNode : public rclcpp::Node {
   /// selects the best path into best_path_. Returns a summary for the log.
   std::string buildLocalGraph();
   /// A departure for a ground robot boxed in at `start`, at driving height:
-  /// straight ahead along its heading, start[3], or else, with
-  /// PlanningParams::departure_reverse_allowed, straight back. Poses every
-  /// path_interpolation_distance, each step checked as a shortcut is, with
-  /// the robot's collision box turned to its heading (the smallest box
-  /// aligned with the map that holds it), up to the first pose at least
-  /// kDepartureMinM out where the robot has room to turn in place
-  /// (mgg::turnClear), and no farther than kDepartureMaxM. Every pose keeps
-  /// the robot's heading, so the way back is driven in reverse. Returns
-  /// false, with `path` empty, when neither way reaches room to turn.
-  bool straightDeparture(const mgg::StateVec& start,
-                         std::vector<mgg::StateVec>& path, bool& reverse);
+  /// mgg::findDeparture on this robot's map. Returns false, with `path`
+  /// empty, when there is no way out.
+  bool straightDeparture(const mgg::StateVec& start, mgg::Departure& departure);
   /// The robot is boxed in at `root_state`, its pose at driving height as
   /// the lattice root takes it: it has no room to turn where it stands, and
   /// `why`, for the log, says why the path it would otherwise be sent
-  /// starts with a turn it cannot make. best_path_ becomes its straightDeparture, or empty when it has none,
-  /// which sets boxed_in_without_departure_now_. Counts and logs the
-  /// outcome; returns the note for the plan summary.
+  /// starts with a turn it cannot make. best_path_ becomes its departure
+  /// (straightDeparture), or empty when it has none, which sets
+  /// boxed_in_without_departure_now_. Counts and logs the outcome; returns
+  /// the note for the plan summary.
   std::string departBoxedIn(const mgg::StateVec& root_state, const char* why);
-  /// Past the controller's goal tolerance, and about a robot's length.
-  static constexpr double kDepartureMinM = 0.5;
-  static constexpr double kDepartureMaxM = 2.0;
   /// Dijkstra over the global graph to the best frontier (rrg.cpp:5559
   /// Rrg::runGlobalPlanner), or to `target_id` when the current global
   /// repositioning is resumed. Fills best_path_; returns false with a reason

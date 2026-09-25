@@ -57,6 +57,21 @@ struct FootprintPlane {
 /// two storeys, so a goal never snaps to a floor far above it.
 inline constexpr double kMaxGoalGroundRise = 6.0;
 
+/// The collision check of the body moved straight between two points at
+/// driving height, as MapInterface::getPathStatus checks a box.
+using SegmentSweepFn = std::function<VoxelStatus(const Eigen::Vector3d&,
+                                                 const Eigen::Vector3d&)>;
+
+/// How getProjectedEdgeStatus checks the body on an edge other than with
+/// the map's box sweep, as a boxed-in robot departs (findDeparture).
+struct EdgeBodyCheck {
+  /// Checks each segment of the edge instead of the map's box sweep.
+  SegmentSweepFn sweep;
+  /// The robot stands at the edge's start: neither the cross slope nor the
+  /// footprint plane is measured there, where it already is.
+  bool standing_at_start = false;
+};
+
 class GroundProjection {
  public:
   /// With `cache_footprint_ground`, footprintPlane remembers two things and
@@ -123,11 +138,16 @@ class GroundProjection {
   /// Neither sees the plane the chassis sits on: a segment between samples
   /// rising no more than max_step_height is exempt from max_inclination,
   /// and the cross slope is averaged over a body length.
+  ///
+  /// With `body`, each segment is checked with its sweep instead of the
+  /// map's box sweep of `box_size`, which still sizes the cross slope and
+  /// the footprint plane.
   ProjectedEdgeStatus getProjectedEdgeStatus(
       const Eigen::Vector3d& start, const Eigen::Vector3d& end,
       const Eigen::Vector3d& box_size, bool stop_at_unknown_voxel,
       std::vector<Eigen::Vector3d>& projected_edge_out, bool is_hanging,
-      bool preserve_start_height = false) const;
+      bool preserve_start_height = false,
+      const EdgeBodyCheck* body = nullptr) const;
 
   /// Sideways slope of the ground under a ground-following polyline at
   /// driving height, relative to its heading from first to last point,
@@ -138,9 +158,11 @@ class GroundProjection {
   /// points where either side has no ground are skipped. The gradient is
   /// averaged over every run of points within the box's larger side, as the
   /// robot's body averages it, and the steepest run is returned. Zero when
-  /// nothing can be measured.
+  /// nothing can be measured. With `skip_start`, the first point is not
+  /// measured, but still sets the heading.
   double crossSlope(const std::vector<Eigen::Vector3d>& edge,
-                    const Eigen::Vector3d& box_size) const;
+                    const Eigen::Vector3d& box_size,
+                    bool skip_start = false) const;
 
   /// The least-squares plane through the ground under a footprint centred
   /// on `point`, at driving height, and facing `heading` in the XY plane.
