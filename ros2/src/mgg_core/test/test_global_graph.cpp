@@ -560,10 +560,11 @@ class BoxSweptSlab : public SlabSpace {
   double y1_;
 };
 
-TEST(ConnectStateToGraph, ARobotAgainstAWallLinksToAVertexBehindIt) {
+TEST(LinkDeparture, ARobotAgainstAWallDepartsToAVertexBehindIt) {
   // The robot stopped with its box touching a wall (robot_1 on the SubT
-  // return, 2026-09-23). Where it stands is not in question; the link out is
-  // checked along its centre line, so the free vertex behind it links.
+  // return, 2026-09-23). Where it stands is not in question; it departs
+  // along a centre line to the free vertex behind it, and since the box was
+  // not checked on that segment, the graph does not keep it.
   Roadmap fixture;
   BoxSweptSlab wall(0.25, 0.35);
   fixture.ctx.map = &wall;
@@ -575,14 +576,18 @@ TEST(ConnectStateToGraph, ARobotAgainstAWallLinksToAVertexBehindIt) {
   ASSERT_EQ(wall.getPathStatus(root->state.head<3>(), robot.head<3>(),
                                fixture.ctx.robot_box_size, false),
             VoxelStatus::kOccupied);
-  Vertex* linked = mgg::connectStateToGraph(fixture.global, robot,
-                                            fixture.ctx, 1.5, false);
-  ASSERT_NE(linked, nullptr);
-  EXPECT_EQ(linked->parent, root);
-  EXPECT_DOUBLE_EQ(linked->state.y(), robot.y());
+  ASSERT_EQ(mgg::connectStateToGraph(fixture.global, robot, fixture.ctx, 1.5,
+                                     false),
+            nullptr);
+  const mgg::DepartureLink link =
+      mgg::linkDeparture(fixture.global, robot, fixture.ctx, 1.5);
+  EXPECT_EQ(link.vertex, root);
+  EXPECT_TRUE(link.query_local);
+  EXPECT_EQ(fixture.global.getNumVertices(), 1);
+  EXPECT_EQ(fixture.global.getNumEdges(), 0);
 }
 
-TEST(ConnectStateToGraph, ARobotAgainstAWallDoesNotLinkThroughIt) {
+TEST(LinkDeparture, ARobotAgainstAWallDoesNotDepartThroughIt) {
   Roadmap fixture;
   BoxSweptSlab wall(0.25, 0.35);
   fixture.ctx.map = &wall;
@@ -590,20 +595,59 @@ TEST(ConnectStateToGraph, ARobotAgainstAWallDoesNotLinkThroughIt) {
   Vertex* root = fixture.global.getVertex(0);
   root->state = StateVec(0.0, 0.6, 0.0, 0.0);
   fixture.global.updateVertexState(0, root->state);
-  EXPECT_EQ(mgg::connectStateToGraph(fixture.global,
-                                     StateVec(0.0, 0.1, 0.0, 0.0),
-                                     fixture.ctx, 1.5, false),
+  const StateVec robot(0.0, 0.1, 0.0, 0.0);
+  EXPECT_EQ(mgg::linkDeparture(fixture.global, robot, fixture.ctx, 1.5).vertex,
             nullptr);
 
-  // With a free vertex behind the robot as well, that one is the link and
-  // the far one gets no edge.
+  // With a free vertex behind the robot as well, that one is the departure.
   Vertex* behind = fixture.add(fixture.global, StateVec(0.0, -0.9, 0.0, 0.0),
                                nullptr);
-  Vertex* linked = mgg::connectStateToGraph(
-      fixture.global, StateVec(0.0, 0.1, 0.0, 0.0), fixture.ctx, 1.5, false);
-  ASSERT_NE(linked, nullptr);
-  EXPECT_EQ(linked->parent, behind);
-  EXPECT_FALSE(fixture.global.graph_->edgeExists(linked->id, root->id));
+  const mgg::DepartureLink link =
+      mgg::linkDeparture(fixture.global, robot, fixture.ctx, 1.5);
+  EXPECT_EQ(link.vertex, behind);
+  EXPECT_TRUE(link.query_local);
+  EXPECT_EQ(fixture.global.getNumEdges(), 0);
+}
+
+TEST(LinkDeparture, AClearDepartureIsStoredAsBefore) {
+  Roadmap fixture;
+  BoxSweptSlab wall(0.25, 0.35);
+  fixture.ctx.map = &wall;
+  Vertex* root = fixture.global.getVertex(0);
+  const mgg::DepartureLink link = mgg::linkDeparture(
+      fixture.global, StateVec(0.8, -0.3, 0.0, 0.0), fixture.ctx, 1.5);
+  ASSERT_NE(link.vertex, nullptr);
+  EXPECT_FALSE(link.query_local);
+  EXPECT_EQ(link.vertex->parent, root);
+  EXPECT_EQ(fixture.global.getNumVertices(), 2);
+}
+
+TEST(LinkDeparture, ARelaxedDepartureIsNotReusedAsAGoalLink) {
+  // Depart from against the wall, drive away from it, then ask for that
+  // same pose as an exact goal: the goal's link sweeps the box and is
+  // refused, as it would be in a graph that never saw the departure
+  // (review r0).
+  Roadmap fixture;
+  BoxSweptSlab wall(0.25, 0.35);
+  fixture.ctx.map = &wall;
+  Vertex* root = fixture.global.getVertex(0);
+  root->state = StateVec(0.0, -0.9, 0.0, 0.0);
+  fixture.global.updateVertexState(0, root->state);
+  const StateVec against(0.0, 0.1, 0.0, 0.0);
+  ASSERT_TRUE(
+      mgg::linkDeparture(fixture.global, against, fixture.ctx, 1.5).query_local);
+
+  const mgg::DepartureLink retreat = mgg::linkDeparture(
+      fixture.global, StateVec(0.0, -0.4, 0.0, 0.0), fixture.ctx, 1.5);
+  ASSERT_NE(retreat.vertex, nullptr);
+  EXPECT_FALSE(retreat.query_local);
+
+  EXPECT_EQ(mgg::connectStateToGraph(fixture.global, against, fixture.ctx,
+                                     1.5, true),
+            nullptr);
+  EXPECT_EQ(mgg::connectStateToGraph(fixture.global, against, fixture.ctx,
+                                     1.5, false),
+            nullptr);
 }
 
 TEST(ConnectStateToGraph, AnExactGoalLinkStillSweepsTheBox) {

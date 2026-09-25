@@ -133,14 +133,30 @@ GlobalGraphExpansionReport expandGlobalGraph(
 /// Approximate attachment may reuse a vertex within 0.1 m; exact attachment
 /// preserves the requested position and collision-checks even a short link.
 /// Nearby links reject known obstacles; farther links use expandGraph.
-/// Approximate attachment is for the pose the robot stands on, so its nearby
-/// links are checked along their centre line, not with the robot's box: a
-/// robot whose box touches a wall still links out, but not through it.
 /// Returns the attached vertex, or null.
 Vertex* connectStateToGraph(GraphManager& graph, const StateVec& state,
                             const ExpandContext& ctx,
                             double dist_ignore_collision_check,
                             bool exact_state);
+
+/// Where a route out of the robot's current pose leaves the graph.
+struct DepartureLink {
+  /// The graph vertex the route starts from; null when nothing links.
+  Vertex* vertex = nullptr;
+  /// The pose is joined to `vertex` for this route only: the segment between
+  /// them is clear along its centre line but not for the robot's box, so it
+  /// is not stored, and the caller prepends the pose to the route itself.
+  bool query_local = false;
+};
+
+/// Links the pose the robot stands on for departing from it: as
+/// connectStateToGraph with approximate attachment, and when that finds no
+/// link, the nearest in-service vertex within `link_radius` whose segment to
+/// the pose is clear of known obstacles along its centre line. A robot whose
+/// box touches a wall can then leave it, but not through it, and the graph
+/// never holds an edge the box was not checked on.
+DepartureLink linkDeparture(GraphManager& graph, const StateVec& state,
+                            const ExpandContext& ctx, double link_radius);
 
 /// Folds a verified path into `graph` (rrg.cpp:4808 Rrg::addRefPathToGraph):
 /// links the first pose it can to the graph, adds the poses after it as a

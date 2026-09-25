@@ -723,6 +723,51 @@ TEST_F(PlannerNodeTest, NeighbourRoadmapDoesNotReachThroughAKnownWall) {
   EXPECT_TRUE(response->path.empty());
 }
 
+TEST_F(PlannerNodeTest, ARobotAgainstAWallDepartsButItsPoseIsNoGoalLater) {
+  // The robot stopped with its box touching a wall (robot_1 on the SubT
+  // return, 2026-09-23). It is routed home from there, along a first
+  // segment clear only for its centre line. Once it has driven away, the
+  // same pose as a goal is refused: that segment was never checked for the
+  // box, so it is not a roadmap edge (review r0).
+  auto node = makeNode("wall_departure");
+  PlannerNodeTestPeer::observeFloor(*node, -1.5, 6.0, -1.5, 1.5);
+  PlannerNodeTestPeer::observeWall(*node, 0.0, 3.0, 0.65);
+  PlannerNodeTestPeer::acceptOdometry(*node, 0.0, 0.0, 1.0);
+  double stamp = 2.0;
+  for (double x = 0.5; x <= 2.0 + 1e-9; x += 0.5) {
+    PlannerNodeTestPeer::acceptOdometry(*node, x, 0.0, stamp);
+    stamp += 1.0;
+  }
+  // The 0.2 m box at y = 0.52 reaches into the wall voxels from y = 0.6.
+  PlannerNodeTestPeer::acceptOdometry(*node, 2.0, 0.52, stamp++);
+
+  auto request = std::make_shared<mgg_msgs::srv::PlanObjective::Request>();
+  request->objective = mgg_msgs::srv::PlanObjective::Request::RETURN_HOME;
+  request->goal.position.z = 0.075;
+  request->goal.orientation.w = 1.0;
+  auto response = std::make_shared<mgg_msgs::srv::PlanObjective::Response>();
+  PlannerNodeTestPeer::objective(*node, request, response);
+  ASSERT_EQ(response->status,
+            mgg_msgs::srv::PlanObjective::Response::SUCCEEDED)
+      << response->reason;
+  ASSERT_GE(response->path.size(), 2u);
+  EXPECT_NEAR(response->path.front().position.x, 2.0, 0.05);
+  EXPECT_NEAR(response->path.front().position.y, 0.52, 0.05);
+  EXPECT_NEAR(response->path.back().position.x, 0.0, 1e-3);
+  EXPECT_NEAR(response->path.back().position.y, 0.0, 1e-3);
+
+  PlannerNodeTestPeer::acceptOdometry(*node, 1.0, 0.0, stamp++);
+  request->objective = mgg_msgs::srv::PlanObjective::Request::NAVIGATE;
+  request->goal.position.x = 2.0;
+  request->goal.position.y = 0.52;
+  response = std::make_shared<mgg_msgs::srv::PlanObjective::Response>();
+  PlannerNodeTestPeer::objective(*node, request, response);
+  EXPECT_EQ(response->status,
+            mgg_msgs::srv::PlanObjective::Response::UNREACHABLE)
+      << "route of " << response->path.size() << " poses";
+  EXPECT_TRUE(response->path.empty());
+}
+
 TEST_F(PlannerNodeTest, ARobotRestingInADipStillPlans) {
   // The floor around the robot is mapped a step higher than under it, so the
   // robot's own body box overlaps occupied voxels. Where it stands is not an

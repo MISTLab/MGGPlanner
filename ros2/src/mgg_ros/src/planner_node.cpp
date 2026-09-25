@@ -1355,9 +1355,11 @@ bool PlannerNode::routeOverGlobalGraph(const mgg::StateVec& goal,
   }
   const mgg::ExpandContext ctx = makeGlobalContext();
   const int before = global_graph_->getNumVertices();
-  mgg::Vertex* link_vertex =
-      mgg::connectStateToGraph(*global_graph_, current, ctx, kLinkRadius,
-                               /*exact_state=*/false);
+  // A departure clear only along its centre line joins this route and
+  // nothing else: the route starts at the robot, then that vertex.
+  const mgg::DepartureLink departure =
+      mgg::linkDeparture(*global_graph_, current, ctx, kLinkRadius);
+  mgg::Vertex* link_vertex = departure.vertex;
   if (global_graph_->getNumVertices() != before) ++graph_revision_;
   if (link_vertex == nullptr) {
     reason = "current pose cannot be linked to the global graph";
@@ -1447,7 +1449,7 @@ bool PlannerNode::routeOverGlobalGraph(const mgg::StateVec& goal,
     reason = "goal cannot be linked to the global graph";
     return false;
   }
-  if (goal_vertex->id == link_vertex->id) {
+  if (goal_vertex->id == link_vertex->id && !departure.query_local) {
     reason = "already at the goal";
     return false;
   }
@@ -1455,7 +1457,12 @@ bool PlannerNode::routeOverGlobalGraph(const mgg::StateVec& goal,
     reason = "no route over the global graph reaches the goal";
     return false;
   }
-  global_graph_->getShortestPath(goal_vertex->id, rep, true, path);
+  if (goal_vertex->id == link_vertex->id) {
+    path.push_back(goal_vertex->state);
+  } else {
+    global_graph_->getShortestPath(goal_vertex->id, rep, true, path);
+  }
+  if (departure.query_local) path.insert(path.begin(), current);
   if (path.size() < 2) {
     reason = "no route over the global graph reaches the goal";
     return false;
@@ -1595,9 +1602,10 @@ bool PlannerNode::runGlobalPlanner(int target_id, std::string& reason) {
       current = physicalAnchorAtDrivingHeight(current_state_);
     }
     const int before = global_graph_->getNumVertices();
-    mgg::Vertex* link_vertex = mgg::connectStateToGraph(
-        *global_graph_, current, makeGlobalContext(), kLinkRadius,
-        /*exact_state=*/false);
+    mgg::Vertex* link_vertex =
+        mgg::linkDeparture(*global_graph_, current, makeGlobalContext(),
+                           kLinkRadius)
+            .vertex;
     if (global_graph_->getNumVertices() != before) ++graph_revision_;
     if (link_vertex == nullptr) {
       reason = "current pose cannot be linked to the global graph";

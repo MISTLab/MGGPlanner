@@ -75,12 +75,9 @@ bool throughKnownObstacle(const ExpandContext& ctx, const StateVec& from,
 /// addRefPathToGraph and connectStateToGraph (rrg.cpp:5471 to 5510): the
 /// nearest vertex itself when the state sits on it, a blind edge when it is
 /// within `blind_radius`, otherwise a checked expandGraph.
-///
-/// With `centre_line_link` the nearby links are checked along their centre
-/// line rather than with the robot's box, for the pose the robot stands on.
 Vertex* linkStateToGraph(GraphManager& graph, const StateVec& state,
                          const ExpandContext& ctx, double blind_radius,
-                         bool exact_state, bool centre_line_link) {
+                         bool exact_state) {
   Vertex* nearest_vertex = nullptr;
   if (!graph.getNearestVertex(&state, &nearest_vertex) ||
       nearest_vertex == nullptr) {
@@ -97,14 +94,6 @@ Vertex* linkStateToGraph(GraphManager& graph, const StateVec& state,
   // segment is not known to cross an obstacle, so a vertex on the far side
   // of a thin wall cannot become the link. Unknown space still passes, as
   // it does for every lattice edge.
-  //
-  // The robot's own pose is where it stands, even when its box touches a
-  // wall it stopped against: every box sweep out of there was refused and
-  // the robot could not be routed anywhere (robot_1 and robot_2 on the SubT
-  // return, 2026-09-23). Its link is checked along the centre line, which
-  // still refuses a vertex behind a wall.
-  const Eigen::Vector3d link_box =
-      centre_line_link ? Eigen::Vector3d::Zero() : ctx.robot_box_size;
   const double radius = std::max(blind_radius, ctx.planning->edge_length_min);
   std::vector<Vertex*> candidates;
   if (graph.getNearestVertices(&state, radius, &candidates)) {
@@ -115,7 +104,8 @@ Vertex* linkStateToGraph(GraphManager& graph, const StateVec& state,
               });
     for (Vertex* candidate : candidates) {
       if (candidate == nullptr ||
-          throughKnownObstacle(ctx, candidate->state, state, link_box)) {
+          throughKnownObstacle(ctx, candidate->state, state,
+                               ctx.robot_box_size)) {
         continue;
       }
       const double direction_norm =
@@ -157,8 +147,7 @@ Vertex* linkPathPose(GraphManager& graph, const StateVec& state,
           ctx.planning->edge_length_max) {
     return nullptr;
   }
-  return linkStateToGraph(graph, state, ctx, kRadiusLimit, false,
-                          /*centre_line_link=*/false);
+  return linkStateToGraph(graph, state, ctx, kRadiusLimit, false);
 }
 
 /// A vertex of this robot already standing on `state`, if there is one: a
@@ -304,15 +293,48 @@ Vertex* connectStateToGraph(GraphManager& graph, const StateVec& state,
                             const ExpandContext& ctx,
                             double dist_ignore_collision_check,
                             bool exact_state) {
-  Vertex* linked =
-      linkStateToGraph(graph, state, ctx, dist_ignore_collision_check,
-                       exact_state, /*centre_line_link=*/!exact_state);
+  Vertex* linked = linkStateToGraph(
+      graph, state, ctx, dist_ignore_collision_check, exact_state);
   if (linked == nullptr) return nullptr;
   // rrg.cpp:5484 and 5497: edges from the linked vertex to whatever else is
   // reachable around it, so the route out of here is not just the chain in.
   ExpandGraphReport rep;
   expandGraphEdges(graph, linked, rep, ctx);
   return linked;
+}
+
+DepartureLink linkDeparture(GraphManager& graph, const StateVec& state,
+                            const ExpandContext& ctx, double link_radius) {
+  DepartureLink link;
+  link.vertex = connectStateToGraph(graph, state, ctx, link_radius,
+                                    /*exact_state=*/false);
+  if (link.vertex != nullptr) return link;
+  // The robot's own pose is where it stands, even when its box touches a
+  // wall it stopped against: every box sweep out of there was refused and
+  // the robot could not be routed anywhere (robot_1 and robot_2 on the SubT
+  // return, 2026-09-23). It may depart along a centre line clear of known
+  // obstacles, which still refuses a vertex behind a wall. That link was
+  // never checked for the robot's box, so it stays out of the graph: no
+  // later route, goal link or neighbour may use it (review r0).
+  const double radius = std::max(link_radius, ctx.planning->edge_length_min);
+  std::vector<Vertex*> candidates;
+  if (!graph.getNearestVertices(&state, radius, &candidates)) return link;
+  std::sort(candidates.begin(), candidates.end(),
+            [&state](const Vertex* a, const Vertex* b) {
+              return (a->state.head<3>() - state.head<3>()).squaredNorm() <
+                     (b->state.head<3>() - state.head<3>()).squaredNorm();
+            });
+  for (Vertex* candidate : candidates) {
+    if (candidate == nullptr || !graph.inService(*candidate) ||
+        throughKnownObstacle(ctx, candidate->state, state,
+                             Eigen::Vector3d::Zero())) {
+      continue;
+    }
+    link.vertex = candidate;
+    link.query_local = true;
+    return link;
+  }
+  return link;
 }
 
 bool addRefPathToGraph(GraphManager& graph, const std::vector<StateVec>& path,
