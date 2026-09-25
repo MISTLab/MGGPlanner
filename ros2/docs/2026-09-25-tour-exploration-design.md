@@ -15,8 +15,11 @@ Observed in SwarmDeck's simulated SubT runs (runs 4 and 5, MGG b977bfc):
   `low_gain_rounds` (3) of low local gain; the global planner then picks one
   frontier greedily (`searchGlobalFrontier`: best gain over distance). There is
   no ordering of frontiers and no commitment to a plan.
-- Robots do not divide the work: fleet coordination today is only SwarmDeck's
-  reservation leases (a claimed target is excluded for others within a radius).
+- Nothing splits the frontiers among robots. Each robot chooses its next
+  frontier as if it were alone; the only coordination is SwarmDeck's reservation
+  lease, which keeps other robots away from the one spot a robot is heading to
+  (within a radius). Several robots can still head into the same region while
+  another region has nobody.
 
 Success means, on the 4-robot SubT simulation with C-SLAM merges on:
 
@@ -114,9 +117,9 @@ invisible to assignment.
 Recompute when the shared data changes, at most every `fleet.assign_interval_s`;
 the commitment margin of §2.4 applies to reassignments.
 
-A robot with no clusters of its own helps with the nearest cluster that is
-claimed but not yet reached; if there is none, it reports exploration complete
-for itself.
+A robot with no clusters of its own takes over silent peers' claims as in §4
+(oldest first); if there are none, it reports exploration complete for itself.
+Claims of connected peers are never shared: two robots never work one cluster.
 
 ### 3.4 Conflicting claims
 Two robots claiming the same target (different pictures of the shared data):
