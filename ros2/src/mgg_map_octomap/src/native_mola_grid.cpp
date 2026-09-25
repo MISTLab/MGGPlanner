@@ -4,10 +4,24 @@
 #include <array>
 #include <cmath>
 #include <limits>
-#include <set>
+#include <unordered_set>
 
 namespace mgg {
 namespace {
+struct CellHash {
+  std::size_t operator()(const NativeMolaGrid::Cell& k) const {
+    std::uint64_t h = std::uint64_t(k.x) * 0x9e3779b97f4a7c15ULL;
+    h ^= std::uint64_t(k.y) * 0xc2b2ae3d27d4eb4fULL + (h << 6) + (h >> 2);
+    h ^= std::uint64_t(k.z) * 0x165667b19e3779f9ULL + (h << 6) + (h >> 2);
+    return std::size_t(h);
+  }
+};
+struct CellEqual {
+  bool operator()(const NativeMolaGrid::Cell& a,
+                  const NativeMolaGrid::Cell& b) const {
+    return a.x == b.x && a.y == b.y && a.z == b.z;
+  }
+};
 double pointSegmentDistance2(const Eigen::Vector2d& p, const Eigen::Vector2d& a,
                              const Eigen::Vector2d& b) {
   const auto d = b - a;
@@ -422,7 +436,10 @@ void NativeMolaGrid::getScanStatusIterative(
     GainCounts& g, std::vector<std::pair<Eigen::Vector3d, VoxelStatus>>& log,
     const SensorModel&) {
   g = {};
-  std::set<Cell> seen;
+  // Hashed rather than ordered: every cell the scan visits goes through it,
+  // about 65k for the 648-ray, 20 m simulated VLP16.
+  std::unordered_set<Cell, CellHash, CellEqual> seen;
+  seen.reserve(ends.size() * 64);
   for (const auto& e : ends) {
     const bool valid = walk(p, e, [&](const Cell& k) {
       const auto s = status(k);

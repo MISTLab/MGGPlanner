@@ -45,9 +45,14 @@ void computeVolumetricGain(
       continue;
     }
 
+    // Each voxel once per viewpoint: a voxel is revealed once however many
+    // rays cross it. getScanStatus logs it once per ray, and near the
+    // viewpoint hundreds of rays share a voxel (0.77 of the logged count was
+    // unique on the captured Bistro grids, diag-viewpoint 2026-09-24).
     GainCounts raw;
     std::vector<std::pair<Eigen::Vector3d, VoxelStatus>> visited;
-    ctx.map->getScanStatus(origin, endpoints, raw, visited, sensor.model());
+    ctx.map->getScanStatusIterative(origin, endpoints, raw, visited,
+                                    sensor.model());
 
     int unknown = 0, free = 0, occupied = 0;
     for (const auto& entry : visited) {

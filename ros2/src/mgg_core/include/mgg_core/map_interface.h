@@ -327,8 +327,9 @@ class MapInterface {
                             voxel_log,
       const SensorModel& sensor) = 0;
 
-  /// Same tally, but skipping rays whose voxels a neighbouring ray has
-  /// already covered. Cheaper and slightly less exact.
+  /// Same tally, counting each voxel once however many rays cross it; a ray
+  /// still walks on through voxels an earlier ray counted. This is what
+  /// volumetric gain uses.
   virtual void getScanStatusIterative(
       const Eigen::Vector3d& pos,
       const std::vector<Eigen::Vector3d>& multiray_endpoints,
