@@ -301,13 +301,30 @@ PlannerNode::PlannerNode(const rclcpp::NodeOptions& options)
   roadmap_rebuild_params_.link_radius = std::max(
       0.0, declareOrGet<double>(this, "roadmap_rebuild.link_radius_m",
                                 roadmap_rebuild_params_.link_radius));
-  if (mola_map_ != nullptr &&
-      declareOrGet<bool>(this, "roadmap_rebuild.enable", true)) {
-    const std::filesystem::path peer_root(
-        get_parameter("map.mola.peer_root").as_string());
+  const bool rebuild_enabled =
+      declareOrGet<bool>(this, "roadmap_rebuild.enable", true);
+  std::string rebuild_off;
+  if (!rebuild_enabled) {
+    rebuild_off = "roadmap_rebuild.enable is false";
+  } else if (mola_map_ == nullptr) {
+    rebuild_off = "the map backend '" + map_backend_ + "' has no keyframes";
+  } else {
+    // A trailing separator would make the robot id the empty last
+    // component.
+    std::filesystem::path peer_root =
+        std::filesystem::path(get_parameter("map.mola.peer_root").as_string())
+            .lexically_normal();
+    if (!peer_root.empty() && !peer_root.has_filename()) {
+      peer_root = peer_root.parent_path();
+    }
     const std::string robot = declareOrGet<std::string>(
         this, "roadmap_rebuild.robot_id", peer_root.filename().string());
-    if (!peer_root.empty() && !robot.empty()) {
+    if (peer_root.empty()) {
+      rebuild_off = "map.mola.peer_root is empty";
+    } else if (robot.empty()) {
+      rebuild_off = "no robot id (roadmap_rebuild.robot_id) for the peer "
+                    "root " + peer_root.string();
+    } else {
       keyframe_source_ = std::make_unique<GraphSolutionFile>(
           (peer_root / "graph_solution.json").string(), robot,
           std::size_t{64} * 1024 * 1024);
@@ -315,6 +332,11 @@ PlannerNode::PlannerNode(const rclcpp::NodeOptions& options)
                   "global graph rebuilds read %s's keyframes from %s",
                   robot.c_str(), (peer_root / "graph_solution.json").c_str());
     }
+  }
+  if (keyframe_source_ == nullptr) {
+    RCLCPP_INFO(get_logger(),
+                "global graph rebuilds from the keyframes are off: %s",
+                rebuild_off.c_str());
   }
 
   plan_srv_ = create_service<mgg_msgs::srv::PlannerSrv>(
