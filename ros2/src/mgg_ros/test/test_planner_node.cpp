@@ -341,6 +341,47 @@ TEST_F(PlannerNodeTest, ReturnHomeIsTheWholeRouteOverTheGlobalGraph) {
   EXPECT_LE(maxStep(response->path), 0.25);
 }
 
+TEST_F(PlannerNodeTest, ReturnHomeRoutesToTheHomeTheCallerSends) {
+  // The caller's home is the home keyframe through its current map
+  // correction; vertex 0 is where odometry started. They differ by the
+  // correction (0.13 m on robot_0, SubT 2026-09-23), and the caller refuses
+  // a route that does not end within 1 mm of the home it sent.
+  auto node = makeNode("return_home_goal");
+  PlannerNodeTestPeer::observeFloor(*node, -1.5, 6.0, -1.5, 1.5);
+  PlannerNodeTestPeer::acceptOdometry(*node, 0.0, 0.0, 1.0);
+  double stamp = 2.0;
+  for (double x = 0.5; x <= 4.0 + 1e-9; x += 0.5) {
+    PlannerNodeTestPeer::acceptOdometry(*node, x, 0.0, stamp);
+    stamp += 1.0;
+  }
+
+  auto request = std::make_shared<mgg_msgs::srv::PlanObjective::Request>();
+  request->objective = mgg_msgs::srv::PlanObjective::Request::RETURN_HOME;
+  request->goal.position.x = 0.003;
+  request->goal.position.y = 0.132;
+  request->goal.position.z = 0.075;
+  request->goal.orientation.w = 1.0;
+  auto response = std::make_shared<mgg_msgs::srv::PlanObjective::Response>();
+  PlannerNodeTestPeer::objective(*node, request, response);
+  ASSERT_EQ(response->status,
+            mgg_msgs::srv::PlanObjective::Response::SUCCEEDED)
+      << response->reason;
+  ASSERT_GE(response->path.size(), 2u);
+  EXPECT_NEAR(response->path.back().position.x, 0.003, 1e-3);
+  EXPECT_NEAR(response->path.back().position.y, 0.132, 1e-3);
+
+  // A goal that is not finite leaves vertex 0 as the only home there is.
+  request->goal.position.x = std::nan("");
+  response = std::make_shared<mgg_msgs::srv::PlanObjective::Response>();
+  PlannerNodeTestPeer::objective(*node, request, response);
+  ASSERT_EQ(response->status,
+            mgg_msgs::srv::PlanObjective::Response::SUCCEEDED)
+      << response->reason;
+  ASSERT_GE(response->path.size(), 2u);
+  EXPECT_NEAR(response->path.back().position.x, 0.0, 1e-3);
+  EXPECT_NEAR(response->path.back().position.y, 0.0, 1e-3);
+}
+
 TEST_F(PlannerNodeTest, NavigateRoutesToAGoalOnTheRoadmap) {
   auto node = makeNode("navigate_whole");
   PlannerNodeTestPeer::observeFloor(*node, -1.5, 6.0, -1.5, 1.5);

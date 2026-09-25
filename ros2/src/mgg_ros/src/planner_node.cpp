@@ -1814,14 +1814,22 @@ void PlannerNode::onObjectiveRequest(
   mgg::StateVec goal;
   double tolerance = 0.0;
   if (request->objective == Service::Request::RETURN_HOME) {
-    const mgg::Vertex* home = findGlobalVertex(0);
-    if (home == nullptr) {
-      response->status = Service::Response::UNREACHABLE;
-      response->reason = "no home recorded yet";
-      return;
+    // The caller's home is the home keyframe through its current map
+    // correction, and it refuses a route that does not end there. Vertex 0
+    // is where odometry started, which any correction moves off that home,
+    // so it stands in only for a goal that is not finite. Tolerance 0 links
+    // the goal itself into the graph.
+    goal = fromPoseMsg(request->goal);
+    if (!goal.allFinite()) {
+      const mgg::Vertex* home = findGlobalVertex(0);
+      if (home == nullptr) {
+        response->status = Service::Response::UNREACHABLE;
+        response->reason = "no home recorded yet";
+        return;
+      }
+      goal = home->state;
+      tolerance = 1e-3;
     }
-    goal = home->state;
-    tolerance = 1e-3;
   } else if (request->objective == Service::Request::NAVIGATE) {
     goal = fromPoseMsg(request->goal);
     if (!goal.allFinite()) {

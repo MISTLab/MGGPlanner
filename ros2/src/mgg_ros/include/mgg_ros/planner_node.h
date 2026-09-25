@@ -118,7 +118,9 @@ class PlannerNode : public rclcpp::Node {
   void onPlanRequest(
       const std::shared_ptr<mgg_msgs::srv::PlannerSrv::Request> request,
       std::shared_ptr<mgg_msgs::srv::PlannerSrv::Response> response);
-  /// Navigate and Return Home: a route over the global graph, whole.
+  /// Navigate and Return Home: a route over the global graph, whole, ending
+  /// at the requested goal. Return Home routes to vertex 0 only when its
+  /// goal is not finite.
   void onObjectiveRequest(
       const std::shared_ptr<mgg_msgs::srv::PlanObjective::Request> request,
       std::shared_ptr<mgg_msgs::srv::PlanObjective::Response> response);
