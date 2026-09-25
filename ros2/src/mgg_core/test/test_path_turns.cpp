@@ -94,16 +94,6 @@ TEST(TerrainSlope, FitsTheGroundUnderTheLattice) {
               0.1 * kDeg);
   const Vertex level(-1, StateVec(5.2, 0.8, rampGround(5.2) + 0.5, 0.0));
   EXPECT_NEAR(mgg::terrainSlope(ground, level, 0.8), 0.0, 1e-9);
-
-  // Two vertices, or only vertices without ground under them, fit nothing.
-  GraphManager sparse;
-  sparse.addVertex(new Vertex(0, StateVec(0, 0, 0, 0)));
-  sparse.addVertex(new Vertex(1, StateVec(0.4, 0, 0.3, 0)));
-  EXPECT_DOUBLE_EQ(mgg::terrainSlope(sparse, *sparse.getVertex(0), 1.0), 0.0);
-  auto* hanging = new Vertex(2, StateVec(0, 0.4, 0.3, 0));
-  hanging->is_hanging = true;
-  sparse.addVertex(hanging);
-  EXPECT_DOUBLE_EQ(mgg::terrainSlope(sparse, *sparse.getVertex(0), 1.0), 0.0);
 }
 
 RobotParams robot() {
@@ -111,6 +101,36 @@ RobotParams robot() {
   r.type = mgg::RobotType::kGroundRobot;
   r.size = Eigen::Vector3d(0.8, 0.6, 0.4);
   return r;
+}
+
+TEST(TerrainSlope, FailsClosedWhereNoPlaneCanBeFitted) {
+  // Two vertices, only vertices without ground under them, or vertices in
+  // a line fit no plane: the slope is unknown and reads as steep, so no
+  // sharp turn is made there. It read as level, which let a Scout start a
+  // 70 degree turn on a rock pile (run 4, 2026-09-23).
+  GraphManager sparse;
+  sparse.addVertex(new Vertex(0, StateVec(0, 0, 0, 0)));
+  sparse.addVertex(new Vertex(1, StateVec(0.4, 0, 0.3, 0)));
+  EXPECT_DOUBLE_EQ(mgg::terrainSlope(sparse, *sparse.getVertex(0), 1.0),
+                   mgg::kUnknownSlopeRad);
+  auto* hanging = new Vertex(2, StateVec(0, 0.4, 0.3, 0));
+  hanging->is_hanging = true;
+  sparse.addVertex(hanging);
+  EXPECT_DOUBLE_EQ(mgg::terrainSlope(sparse, *sparse.getVertex(0), 1.0),
+                   mgg::kUnknownSlopeRad);
+  sparse.addVertex(new Vertex(3, StateVec(0.8, 0, 0.0, 0)));
+  EXPECT_DOUBLE_EQ(mgg::terrainSlope(sparse, *sparse.getVertex(0), 1.0),
+                   mgg::kUnknownSlopeRad);
+  EXPECT_GT(mgg::kUnknownSlopeRad, mgg::kLevelGroundSlopeRad);
+
+  // So a sharp turn where the lattice is too sparse to measure is refused.
+  PathTurnCheck check(sparse, robot());
+  EXPECT_FALSE(check.sharpTurnAllowedAt(Eigen::Vector3d(0, 0, 0)));
+  auto path = std::vector<Vertex*>{new Vertex(10, StateVec(0, 0, 0, 0)),
+                                   new Vertex(11, StateVec(0, 0.8, 0, 0))};
+  EXPECT_FALSE(check(path));
+  EXPECT_EQ(check.refused_on_slope, 1);
+  for (Vertex* v : path) delete v;
 }
 
 /// Vertices at the given (x, y) lattice points over the ramp, chained.
@@ -577,9 +597,18 @@ TEST(PathTurnCheck, ArrivalTurningWhereItMayNotLeavesTheSearchLooking) {
   EXPECT_FALSE(routes.capped);
 
   // Through selection: the full check forbids the same turns (no room at
-  // A), and the long way is taken rather than the fallback.
+  // A), and the long way is taken rather than the fallback. The ground is
+  // level, measured under a lattice laid over it: the five route vertices
+  // alone are too sparse to measure it.
+  GraphManager level;
+  for (int i = -8; i <= 3; ++i) {
+    for (int j = -3; j <= 8; ++j) {
+      level.addVertex(new Vertex(level.generateVertexID(),
+                                 StateVec(0.4 * i, 0.4 * j, 0.5, 0.0)));
+    }
+  }
   const Eigen::Vector3d at_a = a->state.head<3>();
-  PathTurnCheck check(graph, robot(), [at_a](const StateVec& pose) {
+  PathTurnCheck check(level, robot(), [at_a](const StateVec& pose) {
     return (pose.head<3>() - at_a).norm() > 1e-6;
   });
   const mgg::SharpTurnAllowedFn allowed = [&check](const Vertex& v) {

@@ -39,6 +39,9 @@ constexpr double kSharpTurnRad = 0.7853981633974483;
 /// ...and a sharp turn is not made where the ground slopes more than this,
 /// radians (8 degrees).
 constexpr double kLevelGroundSlopeRad = 0.13962634015954636;
+/// The slope of ground that cannot be measured, radians (90 degrees): steep,
+/// so no sharp turn is made where it is unknown.
+constexpr double kUnknownSlopeRad = 1.5707963267948966;
 
 /// Heading change at each of `points`, radians in [0, pi]. The heading into
 /// a point is the direction from the first point at least `window` metres
@@ -54,8 +57,9 @@ std::vector<double> pathTurns(const std::vector<Eigen::Vector3d>& points,
 /// Slope of the ground under `vertex`, radians: a plane fitted by least
 /// squares to it and every vertex of `graph` within `radius` that has ground
 /// beneath it (not is_hanging). Every vertex rides the same height above
-/// its ground, so the plane has the ground's slope. Zero when the vertices
-/// do not span a plane.
+/// its ground, so the plane has the ground's slope. kUnknownSlopeRad when
+/// fewer than three of them span a plane: a sparse lattice, or one in a
+/// line, says nothing about the slope across it.
 double terrainSlope(GraphManager& graph, const Vertex& vertex, double radius);
 
 /// Whether the robot has room to turn in place at `state`: no occupied voxel

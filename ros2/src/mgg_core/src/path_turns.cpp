@@ -58,14 +58,16 @@ std::vector<double> pathTurns(const std::vector<Eigen::Vector3d>& points,
 double terrainSlope(GraphManager& graph, const Vertex& vertex, double radius) {
   std::vector<Vertex*> nearby;
   StateVec state = vertex.state;
-  if (!graph.getNearestVertices(&state, radius, &nearby)) return 0.0;
+  if (!graph.getNearestVertices(&state, radius, &nearby)) {
+    return kUnknownSlopeRad;
+  }
   std::vector<Eigen::Vector3d> ground;
   for (const Vertex* v : nearby) {
     if (v != nullptr && !v->is_hanging) {
       ground.push_back(v->state.head<3>() - vertex.state.head<3>());
     }
   }
-  if (ground.size() < 3) return 0.0;
+  if (ground.size() < 3) return kUnknownSlopeRad;
   // z = a x + b y + c, about the vertex.
   Eigen::MatrixXd a(ground.size(), 3);
   Eigen::VectorXd z(ground.size());
@@ -74,7 +76,7 @@ double terrainSlope(GraphManager& graph, const Vertex& vertex, double radius) {
     z(i) = ground[i].z();
   }
   const auto qr = a.colPivHouseholderQr();
-  if (qr.rank() < 3) return 0.0;
+  if (qr.rank() < 3) return kUnknownSlopeRad;
   const Eigen::Vector3d plane = qr.solve(z);
   return std::atan(std::hypot(plane.x(), plane.y()));
 }
