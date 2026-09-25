@@ -343,4 +343,35 @@ TEST(NativeGain, AnAerialViewOfUnknownSpaceIsAFrontierAtAnyResolution) {
   }
 }
 
+// Review r1 (P2): the frontier denominator walked each ray one axis at a
+// time, while the native gain walks every voxel a ray touches, edges and
+// corners included; a ray through an edge counted four voxels against five.
+// From a voxel centre, a scan of all-unknown space now counts exactly the
+// denominator, tied rays included.
+TEST(NativeGain, TheFrontierDenominatorIsWhatAnAllUnknownScanCounts) {
+  mgg::NativeMolaGrid unknown_space(kResolution, {}, {}, {});
+  struct Sensor {
+    double vertical_fov, step, range;
+  };
+  // The simulated VLP16; 45 degree steps, whose rays at (+-45, -45) pass
+  // through voxel edges and corners, short and long; and 0.5 degree steps.
+  for (const Sensor& s : {Sensor{M_PI / 4.0, M_PI / 36.0, 20.0},
+                          Sensor{M_PI / 2.0, M_PI / 4.0, 0.4},
+                          Sensor{M_PI / 2.0, M_PI / 4.0, 3.0},
+                          Sensor{M_PI / 4.0, M_PI / 360.0, 1.0}}) {
+    GainSetup setup(unknown_space);
+    mgg::SensorParams& sensor = setup.sensors["VLP16"];
+    sensor.fov = Eigen::Vector2d(2.0 * M_PI, s.vertical_fov);
+    sensor.resolution = Eigen::Vector2d::Constant(s.step);
+    sensor.max_range = s.range;
+    sensor.update();
+    mgg::VolumetricGain gain;
+    mgg::computeVolumetricGain(mgg::StateVec(0.1, 0.1, 0.1, 0.0), gain,
+                               setup.ctx);
+    EXPECT_EQ(gain.num_unknown_voxels,
+              static_cast<int>(sensor.uniqueVoxelsFullFov(kResolution)))
+        << s.step * 180.0 / M_PI << " degrees, " << s.range << " m";
+  }
+}
+
 }  // namespace

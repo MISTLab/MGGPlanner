@@ -19,6 +19,7 @@
 #ifndef MGG_CORE_SENSOR_PARAMS_H_
 #define MGG_CORE_SENSOR_PARAMS_H_
 
+#include <memory>
 #include <vector>
 
 #include <Eigen/Dense>
@@ -86,9 +87,11 @@ class SensorParams {
   /// until update().
   bool isFrontier(int num_unknown_voxels, double voxel_size) const;
 
-  /// Distinct voxels of edge `voxel_size` that the ray table crosses from
-  /// the centre of a voxel: the denominator of the frontier test. Computed
-  /// once per sensor geometry and voxel size. Zero until update().
+  /// Distinct voxels of edge `voxel_size` that the ray table touches from
+  /// the centre of a voxel, walked as the native planner grid walks a gain
+  /// scan (mgg_core/voxel_walk.h), so that an all-unknown scan from there
+  /// counts exactly this many: the denominator of the frontier test.
+  /// Computed once per ray table and voxel size. Zero until update().
   double uniqueVoxelsFullFov(double voxel_size) const;
 
   /// The subset of this description the map layer needs.
@@ -103,6 +106,8 @@ class SensorParams {
   Eigen::Matrix<double, 3, 4> normal_vectors_ =
       Eigen::Matrix<double, 3, 4>::Zero();
   std::vector<Eigen::Vector3d> frustum_endpoints_body_;
+  struct UniqueVoxelCounts;
+  std::shared_ptr<UniqueVoxelCounts> unique_voxel_counts_;
 };
 
 }  // namespace mgg

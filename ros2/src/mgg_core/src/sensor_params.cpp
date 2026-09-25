@@ -5,11 +5,22 @@
 #include <cstdint>
 #include <limits>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <unordered_set>
 #include <vector>
 
+#include "mgg_core/voxel_walk.h"
+
 namespace mgg {
+
+/// Distinct-voxel counts of one ray table, by voxel size. update() makes a
+/// new one; copies of a SensorParams share their table's.
+struct SensorParams::UniqueVoxelCounts {
+  std::mutex mutex;
+  std::map<double, double> by_voxel_size;
+};
+
 namespace {
 
 /// Rotation about Z by `yaw`, matching how the planner treats StateVec[3].
@@ -36,6 +47,7 @@ void SensorParams::update() {
       resolution[1] > 0.0 ? resolution[1] : (1.0 * M_PI / 180.0);
 
   frustum_endpoints_body_.clear();
+  unique_voxel_counts_ = std::make_shared<UniqueVoxelCounts>();
 
   if (type == SensorType::kCamera) {
     // Frustum as a pyramid: four corner rays, and inward normals for the
@@ -122,8 +134,8 @@ void SensorParams::getFrustumEndpoints(
 }
 
 double SensorParams::uniqueVoxelsFullFov(double voxel_size) const {
-  if (frustum_endpoints_body_.empty() || !std::isfinite(voxel_size) ||
-      voxel_size <= 0.0) {
+  if (frustum_endpoints_body_.empty() || unique_voxel_counts_ == nullptr ||
+      !std::isfinite(voxel_size) || voxel_size <= 0.0) {
     return 0.0;
   }
   // Cells are packed into 21 bits per axis, offset to stay positive.
@@ -133,53 +145,32 @@ double SensorParams::uniqueVoxelsFullFov(double voxel_size) const {
     reach = std::max(reach, p.cwiseAbs().maxCoeff());
   if (!(reach / voxel_size < double(kHalfSpan - 2))) return 0.0;
 
-  // The ray table and the voxel size decide the count, and the planner asks
-  // for it on every gain evaluation, so it is computed once per geometry.
-  std::vector<double> key{voxel_size};
-  key.reserve(1 + 3 * frustum_endpoints_body_.size());
-  for (const Eigen::Vector3d& p : frustum_endpoints_body_)
-    key.insert(key.end(), {p.x(), p.y(), p.z()});
-  static std::mutex mutex;
-  static std::map<std::vector<double>, double> counts;
+  // The planner asks on every gain evaluation; the walk is done once.
+  UniqueVoxelCounts& counts = *unique_voxel_counts_;
   {
-    const std::lock_guard<std::mutex> lock(mutex);
-    const auto found = counts.find(key);
-    if (found != counts.end()) return found->second;
+    const std::lock_guard<std::mutex> lock(counts.mutex);
+    const auto found = counts.by_voxel_size.find(voxel_size);
+    if (found != counts.by_voxel_size.end()) return found->second;
   }
 
-  // A 3-D DDA of each ray from the centre of voxel (0, 0, 0).
+  // Each ray walked from the centre of voxel (0, 0, 0) to the centre plus
+  // its endpoint, as the native grid walks a scan from a viewpoint there:
+  // every voxel it touches, edges and corners included.
+  constexpr std::uint64_t kMaxWalk = std::uint64_t(1) << 22;
   std::unordered_set<std::uint64_t> cells;
-  const auto pack = [&](const Eigen::Matrix<std::int64_t, 3, 1>& c) {
-    return (std::uint64_t(c.x() + kHalfSpan) << 42) |
-           (std::uint64_t(c.y() + kHalfSpan) << 21) |
-           std::uint64_t(c.z() + kHalfSpan);
-  };
   const Eigen::Vector3d origin = Eigen::Vector3d::Constant(0.5 * voxel_size);
   for (const Eigen::Vector3d& p : frustum_endpoints_body_) {
-    Eigen::Matrix<std::int64_t, 3, 1> cell(0, 0, 0), step(0, 0, 0), last;
-    Eigen::Vector3d next = Eigen::Vector3d::Constant(
-        std::numeric_limits<double>::infinity());
-    Eigen::Vector3d delta = next;
-    for (int axis = 0; axis < 3; ++axis) {
-      last[axis] = std::int64_t(std::floor((origin[axis] + p[axis]) / voxel_size));
-      if (p[axis] == 0.0) continue;
-      step[axis] = p[axis] > 0.0 ? 1 : -1;
-      next[axis] = 0.5 * voxel_size / std::abs(p[axis]);
-      delta[axis] = voxel_size / std::abs(p[axis]);
-    }
-    cells.insert(pack(cell));
-    while (cell != last) {
-      int axis = 0;
-      next.minCoeff(&axis);
-      if (next[axis] > 1.0) break;
-      cell[axis] += step[axis];
-      next[axis] += delta[axis];
-      cells.insert(pack(cell));
-    }
+    walkVoxels(origin, origin + p, voxel_size, kMaxWalk,
+               [&](const VoxelIndex& v) {
+                 cells.insert((std::uint64_t(v.x + kHalfSpan) << 42) |
+                              (std::uint64_t(v.y + kHalfSpan) << 21) |
+                              std::uint64_t(v.z + kHalfSpan));
+                 return true;
+               });
   }
   const double count = double(cells.size());
-  const std::lock_guard<std::mutex> lock(mutex);
-  counts.emplace(std::move(key), count);
+  const std::lock_guard<std::mutex> lock(counts.mutex);
+  counts.by_voxel_size.emplace(voxel_size, count);
   return count;
 }
 
