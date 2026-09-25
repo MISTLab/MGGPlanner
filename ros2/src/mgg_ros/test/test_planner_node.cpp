@@ -197,6 +197,19 @@ class PlannerNodeTestPeer {
     }
     return heights;
   }
+  /// shortcutAndResample on `path`; returns the routes sent unshortcut so
+  /// far.
+  static int shortcutAndResample(PlannerNode& node,
+                                 std::vector<mgg::StateVec>& path,
+                                 const mgg::PathOkFn& turns_ok) {
+    const std::lock_guard<std::recursive_mutex> lock(node.planner_mutex_);
+    node.shortcutAndResample(path, turns_ok);
+    return node.shortcut_turn_reverts_;
+  }
+  /// Corners the last shortcut left, before resampling.
+  static int shortcutCorners(PlannerNode& node) {
+    return node.path_shortcut_corners_;
+  }
   static void objective(
       PlannerNode& node,
       std::shared_ptr<mgg_msgs::srv::PlanObjective::Request> request,
@@ -648,6 +661,45 @@ TEST_F(PlannerNodeTest, ARobotRestingInADipStillPlans) {
   PlannerNodeTestPeer::plan(*node, response);
   ASSERT_EQ(response->status, mgg_msgs::srv::PlannerSrv::Response::FORWARD);
   ASSERT_GE(response->path.size(), 2u);
+}
+
+TEST_F(PlannerNodeTest, AResampledRouteThatFailsTheTurnCheckIsSentUnshortcut) {
+  auto node = makeNode("shortcut_revert");
+  PlannerNodeTestPeer::observeFloor(*node, -1.5, 4.0, -1.5, 1.5);
+  // A lattice staircase over open floor at driving height, which the
+  // shortcut straightens.
+  const std::vector<mgg::StateVec> lattice = {
+      {0.0, 0.0, 0.30, 0.0}, {0.5, 0.0, 0.30, 0.0}, {1.0, 0.5, 0.30, 0.0},
+      {1.5, 0.5, 0.30, 0.0}, {2.0, 1.0, 0.30, 0.0}};
+
+  // With a check the route passes as it is resampled, it goes out
+  // shortcut and resampled.
+  std::vector<mgg::StateVec> kept = lattice;
+  const mgg::PathOkFn anything = [](const mgg::PathType&) { return true; };
+  EXPECT_EQ(PlannerNodeTestPeer::shortcutAndResample(*node, kept, anything),
+            0);
+  EXPECT_LT(PlannerNodeTestPeer::shortcutCorners(*node),
+            static_cast<int>(lattice.size()));
+  EXPECT_GT(kept.size(), lattice.size());
+
+  // A check the lattice path and the shortcut pass but the resampled
+  // route fails, as a turn check can once resampling moves where a turn's
+  // measuring window ends (review r1): the lattice path goes out as it is.
+  std::vector<mgg::StateVec> reverted = lattice;
+  const std::size_t lattice_size = lattice.size();
+  const mgg::PathOkFn coarse_only = [lattice_size](const mgg::PathType& p) {
+    return p.size() <= lattice_size;
+  };
+  EXPECT_EQ(
+      PlannerNodeTestPeer::shortcutAndResample(*node, reverted, coarse_only),
+      1);
+  EXPECT_EQ(PlannerNodeTestPeer::shortcutCorners(*node),
+            static_cast<int>(lattice.size()));
+  ASSERT_EQ(reverted.size(), lattice.size());
+  for (std::size_t i = 0; i < lattice.size(); ++i) {
+    EXPECT_TRUE(reverted[i].head<3>().isApprox(lattice[i].head<3>()))
+        << "pose " << i;
+  }
 }
 
 }  // namespace mgg_ros
