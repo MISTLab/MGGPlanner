@@ -3,6 +3,8 @@
 
 #include <cstdint>
 #include <map>
+#include <unordered_map>
+#include <utility>
 #include <vector>
 
 #include "mgg_core/map_interface.h"
@@ -102,6 +104,19 @@ class NativeMolaGrid final : public MapInterface {
   std::vector<Cell> occupied_, free_;
   CellIndex<Cell> cell_index_;
   std::map<Cell, double> surface_max_z_;
+  /// Each XY column's occupied cells, as a range [first, second) of the
+  /// sorted occupied_, so ascending in z. For the gain's wall gaps.
+  struct ColumnHash {
+    std::size_t operator()(const std::pair<std::int64_t, std::int64_t>&) const;
+  };
+  std::unordered_map<std::pair<std::int64_t, std::int64_t>,
+                     std::pair<std::size_t, std::size_t>, ColumnHash>
+      occupied_columns_;
+  /// Cells between two occupied cells of their column that are at most
+  /// 2 kMaxWallGapVoxels apart: every cell a wall gap can be in, whatever
+  /// the band, in an index that is quick to miss.
+  std::vector<Cell> gap_candidates_, no_cells_;
+  CellIndex<Cell> gap_candidate_index_;
 };
 }  // namespace mgg
 #endif

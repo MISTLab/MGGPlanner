@@ -2,9 +2,10 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdint>
 #include <limits>
 #include <list>
-#include <map>
+#include <unordered_map>
 #include <utility>
 
 #include "mgg_core/log.h"
@@ -36,38 +37,61 @@ class ColumnSupport {
   /// gap, under the support of all four edge neighbours. Where no ground is
   /// mapped over it, a stairwell or ground falling away, it does not.
   bool isUnderGround(const Eigen::Vector3d& voxel) {
-    if (below(voxel, 0.0, 0.0)) return true;
-    return below(voxel, resolution_, 0.0) && below(voxel, -resolution_, 0.0) &&
-           below(voxel, 0.0, resolution_) && below(voxel, 0.0, -resolution_);
+    Column& column = at(voxel.x(), voxel.y());
+    if (below(voxel, column.support_z)) return true;
+    if (!column.enclosed_known) {
+      // The lowest of the four neighbours' supports; -inf once one has none.
+      double lowest = std::numeric_limits<double>::infinity();
+      for (const auto& [dx, dy] : {std::pair<double, double>{resolution_, 0.0},
+                                   {-resolution_, 0.0},
+                                   {0.0, resolution_},
+                                   {0.0, -resolution_}}) {
+        lowest = std::min(lowest,
+                          at(voxel.x() + dx, voxel.y() + dy).support_z);
+        if (std::isinf(lowest)) break;
+      }
+      // Elements of an unordered_map keep their address when it rehashes.
+      column.enclosed_z = lowest;
+      column.enclosed_known = true;
+    }
+    return below(voxel, column.enclosed_z);
   }
 
  private:
-  bool below(const Eigen::Vector3d& voxel, double dx, double dy) {
-    const double x = voxel.x() + dx, y = voxel.y() + dy;
+  struct Column {
+    double support_z = -std::numeric_limits<double>::infinity();
+    double enclosed_z = -std::numeric_limits<double>::infinity();
+    bool enclosed_known = false;
+  };
+
+  /// Below the support voxel centred at `support_z`, not in it.
+  bool below(const Eigen::Vector3d& voxel, double support_z) const {
+    return voxel.z() < support_z - 0.5 * resolution_;
+  }
+
+  Column& at(double x, double y) {
     // Voxel centres repeat at multiples of the resolution; a millimetre key
     // tells columns apart in any frame.
-    const std::pair<long long, long long> key(std::llround(x * 1000.0),
-                                              std::llround(y * 1000.0));
-    auto it = support_z_.find(key);
-    if (it == support_z_.end()) {
-      Eigen::Vector3d end;
-      const VoxelStatus status = map_.getRayStatus(
-          Eigen::Vector3d(x, y, origin_.z()),
-          Eigen::Vector3d(x, y, origin_.z() - depth_), false, end);
-      const double z = status == VoxelStatus::kOccupied
-                           ? end.z()
-                           : -std::numeric_limits<double>::infinity();
-      it = support_z_.emplace(key, z).first;
+    const std::uint64_t key =
+        (std::uint64_t(std::llround(x * 1000.0)) << 32) ^
+        (std::uint64_t(std::llround(y * 1000.0)) & 0xffffffffULL);
+    const auto found = columns_.find(key);
+    if (found != columns_.end()) return found->second;
+    Column column;
+    Eigen::Vector3d end;
+    if (map_.getRayStatus(Eigen::Vector3d(x, y, origin_.z()),
+                          Eigen::Vector3d(x, y, origin_.z() - depth_), false,
+                          end) == VoxelStatus::kOccupied) {
+      column.support_z = end.z();
     }
-    // Below the support voxel, not in it.
-    return voxel.z() < it->second - 0.5 * resolution_;
+    return columns_.emplace(key, column).first->second;
   }
 
   const MapInterface& map_;
   const Eigen::Vector3d origin_;
   const double depth_;
   const double resolution_;
-  std::map<std::pair<long long, long long>, double> support_z_;
+  std::unordered_map<std::uint64_t, Column> columns_;
 };
 
 }  // namespace

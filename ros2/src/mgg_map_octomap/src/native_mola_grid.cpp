@@ -3,9 +3,8 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <cstdint>
 #include <limits>
-#include <unordered_map>
-#include <unordered_set>
 #include <vector>
 
 namespace mgg {
@@ -24,6 +23,62 @@ struct CellEqual {
     return a.x == b.x && a.y == b.y && a.z == b.z;
   }
 };
+/// What a scan has made of each cell it visited: every visit of every ray
+/// goes through it, about 65k cells for the 648-ray, 20 m simulated VLP16,
+/// so it is open-addressed, and it is kept per thread and emptied by
+/// advancing a generation rather than by clearing a few megabytes per scan.
+/// A cell's state is 0 until the scan assigns it one.
+class ScanCells {
+ public:
+  void reset(std::size_t expected) {
+    count_ = 0;
+    if (++generation_ == 0) {
+      std::fill(generations_.begin(), generations_.end(), 0);
+      generation_ = 1;
+    }
+    if (cells_.size() < 2 * expected) rehash(2 * expected);
+  }
+  std::uint8_t& operator[](const NativeMolaGrid::Cell& k) {
+    if (2 * (count_ + 1) > cells_.size()) rehash(2 * cells_.size());
+    const std::size_t mask = cells_.size() - 1;
+    std::size_t pos = CellHash()(k) & mask;
+    while (generations_[pos] == generation_) {
+      if (CellEqual()(cells_[pos], k)) return states_[pos];
+      pos = (pos + 1) & mask;
+    }
+    generations_[pos] = generation_;
+    cells_[pos] = k;
+    states_[pos] = 0;
+    ++count_;
+    return states_[pos];
+  }
+
+ private:
+  void rehash(std::size_t wanted) {
+    std::size_t capacity = 64;
+    while (capacity < wanted) capacity *= 2;
+    std::vector<NativeMolaGrid::Cell> cells(capacity);
+    std::vector<std::uint32_t> generations(capacity, 0);
+    std::vector<std::uint8_t> states(capacity, 0);
+    for (std::size_t i = 0; i < cells_.size(); ++i) {
+      if (generations_[i] != generation_) continue;
+      std::size_t pos = CellHash()(cells_[i]) & (capacity - 1);
+      while (generations[pos] == generation_) pos = (pos + 1) & (capacity - 1);
+      generations[pos] = generation_;
+      cells[pos] = cells_[i];
+      states[pos] = states_[i];
+    }
+    cells_.swap(cells);
+    generations_.swap(generations);
+    states_.swap(states);
+  }
+  std::vector<NativeMolaGrid::Cell> cells_;
+  std::vector<std::uint32_t> generations_;
+  std::vector<std::uint8_t> states_;
+  std::uint32_t generation_ = 0;
+  std::size_t count_ = 0;
+};
+
 double pointSegmentDistance2(const Eigen::Vector2d& p, const Eigen::Vector2d& a,
                              const Eigen::Vector2d& b) {
   const auto d = b - a;
@@ -68,6 +123,24 @@ NativeMolaGrid::NativeMolaGrid(double r, std::vector<Cell> o,
   std::sort(occupied_.begin(), occupied_.end());
   std::sort(free_.begin(), free_.end());
   cell_index_.build(occupied_, free_);
+  for (std::size_t first = 0; first < occupied_.size();) {
+    std::size_t last = first + 1;
+    while (last < occupied_.size() && occupied_[last].x == occupied_[first].x &&
+           occupied_[last].y == occupied_[first].y)
+      ++last;
+    occupied_columns_.emplace(
+        std::make_pair(occupied_[first].x, occupied_[first].y),
+        std::make_pair(first, last));
+    for (std::size_t i = first + 1; i < last; ++i) {
+      const Cell& low = occupied_[i - 1];
+      const Cell& high = occupied_[i];
+      if (high.z - low.z > 2 * kMaxWallGapVoxels) continue;
+      for (auto z = low.z + 1; z < high.z; ++z)
+        gap_candidates_.push_back({low.x, low.y, z});
+    }
+    first = last;
+  }
+  gap_candidate_index_.build(gap_candidates_, no_cells_);
   for (const auto& v : s)
     if (std::isfinite(v.max_z)) {
       auto it = surface_max_z_.find(v.cell);
@@ -76,6 +149,10 @@ NativeMolaGrid::NativeMolaGrid(double r, std::vector<Cell> o,
       else
         it->second = std::max(it->second, v.max_z);
     }
+}
+std::size_t NativeMolaGrid::ColumnHash::operator()(
+    const std::pair<std::int64_t, std::int64_t>& column) const {
+  return CellHash()({column.first, column.second, 0});
 }
 bool NativeMolaGrid::key(const Eigen::Vector3d& p, Cell& k) const {
   if (!p.allFinite() || !std::isfinite(resolution_) || resolution_ <= 0)
@@ -451,68 +528,71 @@ void NativeMolaGrid::scanUnique(
     const WallBand* wall, GainCounts& g,
     std::vector<std::pair<Eigen::Vector3d, VoxelStatus>>& log) const {
   g = {};
-  // The wall band. It is a band of heights along wall->up, the caller's
-  // vertical in this grid's frame, which a tilted frame makes lean; each
-  // column holds the rows whose centres' heights lie in it. A band that is
-  // not finite, inverted, taller than kMaxWallBandCells or along a vertical
-  // tilted more than 60 degrees turns the wall rule off rather than making
-  // every column a wall or none.
-  constexpr double kMaxWallBandCells = 64.0;
+  // The wall band, a band of heights along wall->up: the caller's vertical
+  // in this grid's frame, which a tilted frame makes lean. A band that is
+  // not finite or inverted, or along a vertical tilted more than 60
+  // degrees, turns the wall rule off rather than making every gap a wall's
+  // or none.
   const bool walls =
       wall != nullptr && std::isfinite(wall->min_z) &&
       std::isfinite(wall->max_z) && wall->min_z <= wall->max_z &&
-      wall->up.allFinite() && wall->up.z() > 0.5 * wall->up.norm() &&
-      (wall->max_z - wall->min_z) / (wall->up.z() * resolution_) <
-          kMaxWallBandCells;
-  // Occupied rows of the band, per column, in ascending order.
-  std::unordered_map<Cell, std::vector<std::int64_t>, CellHash, CellEqual>
-      wall_rows;
-  const auto isWallGap = [&](const Cell& k) {
-    const Cell column{k.x, k.y, 0};
-    auto rows = wall_rows.find(column);
-    if (rows == wall_rows.end()) {
-      std::vector<std::int64_t> occupied;
-      const Eigen::Vector3d base = center({k.x, k.y, 0});
-      const double across = wall->up.x() * base.x() + wall->up.y() * base.y();
-      // Rows whose centre z satisfies min <= across + up.z z <= max, and one
-      // either side for rounding; each is checked on its own centre.
-      const double low = (wall->min_z - across) / wall->up.z();
-      const double high = (wall->max_z - across) / wall->up.z();
-      Cell first, last;
-      if (key({base.x(), base.y(), low}, first) &&
-          key({base.x(), base.y(), high}, last)) {
-        for (auto z = first.z - 1; z <= last.z + 1; ++z) {
-          const Cell cell{k.x, k.y, z};
-          const double height = wall->up.dot(center(cell));
-          if (height < wall->min_z || height > wall->max_z) continue;
-          if (status(cell) == VoxelStatus::kOccupied) occupied.push_back(z);
-        }
-      }
-      rows = wall_rows.emplace(column, std::move(occupied)).first;
-    }
-    const auto& occupied = rows->second;
-    const auto above = std::upper_bound(occupied.begin(), occupied.end(), k.z);
-    if (above == occupied.begin() || above == occupied.end()) return false;
-    return *above - *(above - 1) - 1 <= kMaxWallGapVoxels;
+      wall->up.allFinite() && wall->up.z() > 0.5 * wall->up.norm();
+  // A wall return is an occupied voxel whose centre's height is in the band.
+  const auto inBand = [&](const Cell& c) {
+    const double height = wall->up.dot(center(c));
+    return height >= wall->min_z && height <= wall->max_z;
   };
-  // Hashed rather than ordered: every cell the scan visits goes through it,
-  // about 65k for the 648-ray, 20 m simulated VLP16.
-  std::unordered_set<Cell, CellHash, CellEqual> seen;
-  seen.reserve(ends.size() * 64);
+  // The nearest wall return below, then one above close enough to it, from
+  // the column's occupied voxels. Most unknown voxels are no gap candidate.
+  const auto isWallGap = [&](const Cell& k) {
+    if (gap_candidate_index_.status(k, gap_candidates_, no_cells_) == 0)
+      return false;
+    const auto column = occupied_columns_.find({k.x, k.y});
+    if (column == occupied_columns_.end()) return false;
+    const auto first = occupied_.begin() + column->second.first;
+    const auto last = occupied_.begin() + column->second.second;
+    const auto above = std::upper_bound(
+        first, last, k.z,
+        [](std::int64_t z, const Cell& cell) { return z < cell.z; });
+    std::int64_t below = 0;
+    for (auto it = above; it != first;) {
+      --it;
+      if (k.z - it->z > kMaxWallGapVoxels + 1) break;
+      if (it->z < k.z && inBand(*it)) {
+        below = k.z - it->z;
+        break;
+      }
+    }
+    if (below == 0) return false;
+    for (auto it = above; it != last; ++it) {
+      if (below + (it->z - k.z) - 1 > kMaxWallGapVoxels) break;
+      if (inBand(*it)) return true;
+    }
+    return false;
+  };
+  // A cell's status and the wall rule are decided on its first visit; a
+  // later ray only needs the verdict.
+  enum : std::uint8_t { kNew = 0, kCounted, kCountedOccupied, kWallGap };
+  thread_local ScanCells cells;
+  cells.reset(ends.size() * 64);
   for (const auto& e : ends) {
     const bool valid = walk(p, e, [&](const Cell& k) {
+      std::uint8_t& state = cells[k];
+      if (state != kNew) return state == kCounted;
       const auto s = status(k);
       // A gap in a wall hides what is behind it, for every ray.
-      if (walls && s == VoxelStatus::kUnknown && isWallGap(k)) return false;
-      if (seen.insert(k).second) {
-        log.emplace_back(center(k), s);
-        if (s == VoxelStatus::kOccupied)
-          ++g.occupied;
-        else if (s == VoxelStatus::kUnknown)
-          ++g.unknown;
-        else
-          ++g.free;
+      if (walls && s == VoxelStatus::kUnknown && isWallGap(k)) {
+        state = kWallGap;
+        return false;
       }
+      state = s == VoxelStatus::kOccupied ? kCountedOccupied : kCounted;
+      log.emplace_back(center(k), s);
+      if (s == VoxelStatus::kOccupied)
+        ++g.occupied;
+      else if (s == VoxelStatus::kUnknown)
+        ++g.unknown;
+      else
+        ++g.free;
       return s != VoxelStatus::kOccupied;
     });
     if (!valid) {
