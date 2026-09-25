@@ -222,6 +222,73 @@ TEST(PathSelection, ZeroGainClearPrefixWinsOverAnUnclearEndpoint) {
   EXPECT_FALSE(r.unclear_viewpoint);
 }
 
+TEST(PathGoesNowhere, APulledBackPathLeadingToGainIsStillSent) {
+  // The zero-gain-prefix fixture: with leaf-only gain the path pulled back
+  // to its clear vertex scores nothing itself, but it leads to the leaf's
+  // gain, 1 m out. It goes somewhere.
+  GraphManager graph;
+  auto* root = new Vertex(0, StateVec(0, 0, 0, 0));
+  graph.addVertex(root);
+  auto* inner = new Vertex(1, StateVec(1.0, 0.0, 0.0, 0.0));
+  graph.addVertex(inner);
+  graph.addEdge(inner, root, 1.0);
+  auto* leaf = new Vertex(2, StateVec(2.0, 0.0, 0.0, 0.0));
+  leaf->vol_gain.gain = 100.0;
+  graph.addVertex(leaf);
+  graph.addEdge(leaf, inner, 1.0);
+  EdgeInclinations flat;
+  const mgg::ViewpointClearFn clear = [](const Vertex& v) {
+    return v.id != 2;
+  };
+  const auto r = mgg::selectBestPath(graph, makePlanning(), RobotParams(),
+                                     flat, 0.2, 0.0, {}, 0.0, clear);
+  ASSERT_EQ(r.best_path_id, 1);
+  EXPECT_DOUBLE_EQ(r.best_gain, 0.0);
+  EXPECT_DOUBLE_EQ(r.best_full_gain, 100.0);
+  EXPECT_FALSE(mgg::pathGoesNowhere(r, root->state.head<3>(), 0.3));
+  // Within the controller's goal tolerance of the robot, it does not.
+  EXPECT_TRUE(mgg::pathGoesNowhere(r, Eigen::Vector3d(0.8, 0.0, 0.0), 0.3));
+}
+
+TEST(PathGoesNowhere, AClearPathLeadingToNoGainGoesNowhere) {
+  // Run 5, robot_3: the +x branch's gain lies beyond ends without
+  // clearance, and the +y branch, clear, sees nothing. Clearance wins the
+  // selection, and the path it picks leads to no gain.
+  Fork f;
+  f.x_branch.back()->vol_gain.gain = 100.0;
+  EdgeInclinations flat;
+  const mgg::ViewpointClearFn clear = [](const Vertex& v) {
+    return v.state.x() < 0.5;
+  };
+  const auto r = mgg::selectBestPath(f.graph, makePlanning(), RobotParams(),
+                                     flat, 0.2, 0.0, {}, 0.0, clear);
+  ASSERT_FALSE(r.best_path.empty());
+  EXPECT_EQ(r.best_path.back()->state.x(), 0.0);
+  EXPECT_DOUBLE_EQ(r.best_full_gain, 0.0);
+  EXPECT_TRUE(mgg::pathGoesNowhere(
+      r, f.graph.getVertex(0)->state.head<3>(), 0.3));
+}
+
+TEST(PathGoesNowhere, AShortPathWithGainGoesNowhereWithinTheGoalTolerance) {
+  // A 2-pose path 0.25 m long: the controller has reached its end before
+  // it starts (PCI reach_distance 0.3 m).
+  GraphManager graph;
+  auto* root = new Vertex(0, StateVec(0, 0, 0, 0));
+  graph.addVertex(root);
+  auto* near = new Vertex(1, StateVec(0.25, 0.0, 0.0, 0.0));
+  near->vol_gain.gain = 10.0;
+  graph.addVertex(near);
+  graph.addEdge(near, root, 0.25);
+  EdgeInclinations flat;
+  const auto r = mgg::selectBestPath(graph, makePlanning(), RobotParams(),
+                                     flat, 0.2, 0.0);
+  ASSERT_EQ(r.best_path.size(), 2u);
+  EXPECT_TRUE(mgg::pathGoesNowhere(r, root->state.head<3>(), 0.3));
+  EXPECT_FALSE(mgg::pathGoesNowhere(r, root->state.head<3>(), 0.2));
+  EXPECT_FALSE(mgg::pathGoesNowhere(mgg::PathSelectionResult(),
+                                    root->state.head<3>(), 0.3));
+}
+
 TEST(PathSelection, ReservedGainIsNotPursuedThroughAClearPrefix) {
   // The zero-gain-prefix fixture with its leaf reserved by a peer: the
   // branch's only gain lies in the reservation, so no path at all (controller

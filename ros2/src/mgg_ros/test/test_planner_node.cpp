@@ -238,6 +238,20 @@ class PlannerNodeTestPeer {
     node.planning_params_.free_voxel_gain = 0.0;
     node.planning_params_.occupied_voxel_gain = 0.0;
   }
+  /// The controller's goal tolerance the planner assumes.
+  static void setReachDistance(PlannerNode& node, double reach) {
+    node.reach_distance_ = reach;
+  }
+  static int pathsGoingNowhere(PlannerNode& node) {
+    return node.paths_going_nowhere_;
+  }
+  static int lowGainRounds(PlannerNode& node) {
+    return node.low_gain_rounds_;
+  }
+  /// Gain is counted at leaves only, as bistro.yaml has it.
+  static void gainAtLeavesOnly(PlannerNode& node) {
+    node.planning_params_.leafs_only_for_volumetric_gain = true;
+  }
   static void setDepartureReverseAllowed(PlannerNode& node, bool allowed) {
     node.planning_params_.departure_reverse_allowed = allowed;
   }
@@ -407,6 +421,56 @@ TEST_F(PlannerNodeTest, ExplorationReturnsTheWholeLatticePath) {
   EXPECT_LT(std::hypot(response->path.front().position.x - first.back().position.x,
                        response->path.front().position.y - first.back().position.y),
             0.30);
+}
+
+TEST_F(PlannerNodeTest, APathEndingWithinTheGoalToleranceIsNoPath) {
+  // Run 5, robot_3: a 2-pose path with no gain, sent 28 times and refused
+  // each time by PCI as ending within its goal tolerance. Here every path
+  // ends within the tolerance the planner is told: no path, and the round
+  // counts towards global repositioning as one without gain does.
+  auto node = makeNode("goes_nowhere");
+  PlannerNodeTestPeer::observeFloor(*node, -1.5, 4.0, -1.5, 1.5);
+  PlannerNodeTestPeer::acceptOdometry(*node, 0.0, 0.0, 1.0);
+  PlannerNodeTestPeer::setReachDistance(*node, 10.0);
+  auto response = std::make_shared<mgg_msgs::srv::PlannerSrv::Response>();
+  PlannerNodeTestPeer::plan(*node, response);
+  EXPECT_TRUE(response->path.empty())
+      << "path of " << response->path.size() << " poses";
+  EXPECT_EQ(response->status, PlannerNode::kStatusNoPath);
+  EXPECT_EQ(PlannerNodeTestPeer::pathsGoingNowhere(*node), 1);
+  EXPECT_EQ(PlannerNodeTestPeer::lowGainRounds(*node), 1);
+
+  // With the global planner due, the robot is repositioned over the global
+  // graph instead.
+  PlannerNodeTestPeer::addGlobalChainToFrontier(
+      *node, {{-0.5, 0.0}, {-1.0, 0.0}, {-1.5, 0.0}}, M_PI);
+  PlannerNodeTestPeer::consultGlobalPlannerAtOnce(*node);
+  response = std::make_shared<mgg_msgs::srv::PlannerSrv::Response>();
+  PlannerNodeTestPeer::plan(*node, response);
+  EXPECT_EQ(response->status, mgg_msgs::srv::PlannerSrv::Response::FORWARD);
+  ASSERT_GE(response->path.size(), 2u);
+  EXPECT_LT(response->path.back().position.x, -1.0);
+}
+
+TEST_F(PlannerNodeTest, WithGainAtLeavesOnlyAPlanWithPathsPulledBackStillSendsOne) {
+  // Gain at leaves only, as deployed, and a wall across the far end of the
+  // lattice: the leaves against it are pulled back to vertices with room,
+  // which carry no gain of their own (5 paths pulled back). A path whose
+  // gain lies beyond its end goes somewhere (PathGoesNowhere, core), and
+  // the plan still sends one.
+  auto node = makeNode("pulled_back_sent");
+  PlannerNodeTestPeer::gainAtLeavesOnly(*node);
+  PlannerNodeTestPeer::observeFloor(*node, -1.5, 4.0, -1.5, 1.5);
+  PlannerNodeTestPeer::observeWallAlongY(*node, -1.5, 1.5, 3.15);
+  PlannerNodeTestPeer::acceptOdometry(*node, 0.0, 0.0, 1.0);
+  auto response = std::make_shared<mgg_msgs::srv::PlannerSrv::Response>();
+  PlannerNodeTestPeer::plan(*node, response);
+  EXPECT_EQ(response->status, mgg_msgs::srv::PlannerSrv::Response::FORWARD);
+  ASSERT_GE(response->path.size(), 2u);
+  EXPECT_EQ(PlannerNodeTestPeer::pathsGoingNowhere(*node), 0);
+  EXPECT_GE(std::hypot(response->path.back().position.x,
+                       response->path.back().position.y),
+            1.0);
 }
 
 TEST_F(PlannerNodeTest, ReturnHomeIsTheWholeRouteOverTheGlobalGraph) {

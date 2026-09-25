@@ -96,6 +96,11 @@ struct PathSelectionResult {
   /// the vertex its path was pulled back to.
   int best_path_id = -1;
   double best_gain = 0.0;
+  /// The gain of the whole path the best path was chosen for: best_gain,
+  /// or when the best path was pulled back to a clear vertex, the gain of
+  /// the path it was pulled back from, whose prefix may carry none of it
+  /// (leafs_only_for_volumetric_gain).
+  double best_full_gain = 0.0;
   /// The best path, root first.
   std::vector<Vertex*> best_path;
   /// Any vertex on any evaluated path was a frontier.
@@ -130,6 +135,16 @@ struct PathSelectionResult {
   bool detour_search_capped = false;
   int detour_routes_found = 0;
 };
+
+/// Whether the best path of `selection` takes the robot nowhere, and so is
+/// no path: it ends within `reach` of `robot` in the xy plane, a
+/// controller's goal tolerance, reached before it starts; or the path it
+/// was chosen for leads to no gain at all (best_full_gain). In run 5 a Spot
+/// on a slope was sent a 2-pose path with no gain 28 times, which its
+/// controller refused each time, and neither its boxed-in departure nor
+/// global repositioning ran. False when there is no best path.
+bool pathGoesNowhere(const PathSelectionResult& selection,
+                     const Eigen::Vector3d& robot, double reach);
 
 /// Bound on findTurnCompliantRoutes in selectBestPath, in states: one per
 /// directed edge at most; a Bunker lattice of 979 vertices on a ramp had

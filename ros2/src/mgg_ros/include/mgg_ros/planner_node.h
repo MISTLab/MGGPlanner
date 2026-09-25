@@ -331,6 +331,9 @@ class PlannerNode : public rclcpp::Node {
   /// without room to turn (mgg::PathTurnCheck), because no path complied,
   /// since the node started.
   int sharp_turn_fallbacks_ = 0;
+  /// Exploration paths dropped because they went nowhere
+  /// (mgg::pathGoesNowhere), since the node started.
+  int paths_going_nowhere_ = 0;
   /// Routes to a goal (objectives and global repositioning) sent although
   /// they turn sharply on a slope or without room to turn, because no route
   /// complied (applyRouteTurnRule), since the node started.
@@ -358,6 +361,9 @@ class PlannerNode : public rclcpp::Node {
   bool global_exploration_ongoing_ = false;
   int current_global_vertex_id_ = -1;
   double global_frontier_reach_m_ = 5.0;
+  /// The controller's goal tolerance, metres: PCI's reach_distance. An
+  /// exploration path ending this close to the robot goes nowhere.
+  double reach_distance_ = 0.3;
   /// See the parameter's comment in the constructor.
   bool allow_unknown_lattice_body_ = false;
   double hanging_root_edge_length_max_ = 0.0;

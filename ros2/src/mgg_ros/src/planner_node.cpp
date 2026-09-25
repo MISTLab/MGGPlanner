@@ -261,6 +261,8 @@ PlannerNode::PlannerNode(const rclcpp::NodeOptions& options)
   global_frontier_reach_m_ = std::max(
       0.5, declareOrGet<double>(this, "global_frontier_reach_m",
                                 global_frontier_reach_m_));
+  reach_distance_ = std::max(
+      0.0, declareOrGet<double>(this, "reach_distance", reach_distance_));
   // Upstream's lattice only admits a cell whose whole body volume is known
   // free (rrg.cpp buildGridGraphExapnd, getBoxStatus with stop_at_unknown),
   // on a map that carves free space from every scan. A map that carves it
@@ -1263,24 +1265,48 @@ std::string PlannerNode::buildLocalGraph() {
                 best_path_.back().z(), unclear_viewpoints_selected_);
   }
 
-  // Boxed in: no path turns only where it may, and the robot has no room to
-  // turn where it stands, so the fallback path starts with a turn it cannot
-  // make. In run 4 a Bunker sent one in a pocket got no valid trajectory
-  // from DWB three times and exploration was blocked. It drives straight
-  // out instead, ahead or back, until it has room; the next cycle plans
-  // from there. With no way out it gets no path, and its adapter's own
-  // recovery runs.
+  // A best path that ends within the controller's goal tolerance, or leads
+  // to no gain, takes the robot nowhere: run 5's Spot was sent a 2-pose
+  // path with no gain 28 times, and its controller refused each one. It is
+  // no path, so that the departure, the low-gain count and global
+  // repositioning below run as they do when there is none.
+  char nowhere[128] = "";
+  const bool goes_nowhere =
+      mgg::pathGoesNowhere(sel, current_state_.head<3>(), reach_distance_);
+  if (goes_nowhere) {
+    ++paths_going_nowhere_;
+    std::snprintf(nowhere, sizeof(nowhere),
+                  "; best path goes nowhere (ends %.2f m away, gain %.1f of "
+                  "%.1f): no path",
+                  (best_path_.back().head<2>() - current_state_.head<2>())
+                      .norm(),
+                  sel.best_gain, sel.best_full_gain);
+    best_path_.clear();
+    path_shortcut_from_ = path_shortcut_corners_ = path_shortcut_to_ = 0;
+  }
+
+  // Boxed in: no path turns only where it may, or none goes anywhere, and
+  // the robot has no room to turn where it stands, so the fallback path
+  // starts with a turn it cannot make. In run 4 a Bunker sent one in a
+  // pocket got no valid trajectory from DWB three times and exploration was
+  // blocked. It drives straight out instead, ahead or back, until it has
+  // room; the next cycle plans from there. With no way out it gets no path,
+  // and its adapter's own recovery runs.
   std::string boxed_in;
-  const bool is_boxed_in = sel.sharp_turn_fallback && turns_admissible &&
+  const bool is_boxed_in = (sel.sharp_turn_fallback || goes_nowhere) &&
+                           turns_admissible &&
                            !mgg::turnClear(*map_, robot_params_, root_state);
   if (is_boxed_in) {
-    boxed_in = departBoxedIn(root_state, "no path turns only where it may");
+    boxed_in = departBoxedIn(root_state, goes_nowhere
+                                             ? "its best path goes nowhere"
+                                             : "no path turns only where it "
+                                               "may");
     // Sent as it is: not a lattice path, and the roadmap keeps no edge the
     // robot drives backwards.
     path_shortcut_from_ = static_cast<int>(best_path_.size());
     path_shortcut_corners_ = path_shortcut_from_;
     path_shortcut_to_ = path_shortcut_from_;
-  } else {
+  } else if (!goes_nowhere) {
     // rrg.cpp:4538: the accepted lattice path joins the global graph as its
     // vertices, before the shortcut turns it into poses.
     if (best_path_.size() >= 2) addRefPathToGraph(best_path_);
@@ -1336,7 +1362,7 @@ std::string PlannerNode::buildLocalGraph() {
       "%d frontiers; best path %zu poses (%d lattice -> %d corners -> %d "
       "resampled), gain %.1f%s; viewpoint clearance: %d paths pulled back, "
       "%d without%s; sharp turns: %d paths refused (%d on a slope, %d "
-      "without room)%s%s%s; "
+      "without room)%s%s%s%s; "
       "heading %.2f rad%s",
       r.free_cells, r.vertices_added, r.edges_added,
       r.hit_limit ? " (hit a size limit)" : "", why, evaluated, frontiers,
@@ -1348,14 +1374,14 @@ std::string PlannerNode::buildLocalGraph() {
       sel.paths_with_sharp_turns, turn_check.refused_on_slope,
       turn_check.refused_without_room,
       sel.sharp_turn_detour ? ", detour" : "",
-      sel.sharp_turn_fallback ? ", none complies" : "", boxed_in.c_str(),
-      exploring_direction_, timing);
+      sel.sharp_turn_fallback ? ", none complies" : "", nowhere,
+      boxed_in.c_str(), exploring_direction_, timing);
 
   // rrg.cpp:2098 to 2120: rounds without a frontier among the leaves count
   // towards the global planner; a round with one counts back.
   if (local_graph_->getNumVertices() <= 1) {
     // Nothing was scored; this round says nothing about the frontier.
-  } else if (frontiers == 0) {
+  } else if (frontiers == 0 || goes_nowhere) {
     ++low_gain_rounds_;
   } else if (low_gain_rounds_ > 0) {
     --low_gain_rounds_;

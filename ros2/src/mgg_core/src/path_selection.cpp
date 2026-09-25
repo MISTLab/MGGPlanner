@@ -23,6 +23,16 @@ bool viewpointClear(const MapInterface& map, const RobotParams& robot,
          VoxelStatus::kOccupied;
 }
 
+bool pathGoesNowhere(const PathSelectionResult& selection,
+                     const Eigen::Vector3d& robot, double reach) {
+  if (selection.best_path.empty() || selection.best_path.back() == nullptr) {
+    return false;
+  }
+  const Eigen::Vector2d end = selection.best_path.back()->state.head<2>();
+  return (end - robot.head<2>()).norm() <= reach ||
+         !(selection.best_full_gain > 0.0);
+}
+
 bool pullBackToClearViewpoint(
     std::vector<StateVec>& route,
     const std::function<bool(const StateVec&)>& clear) {
@@ -155,6 +165,7 @@ PathSelectionResult selectBestPath(GraphManager& graph,
     bool have_clear = false;
     double best_clear_gain = 0.0;
     double best_clear_full_gain = 0.0;
+    double best_clear_leads_to = 0.0;
     std::vector<Vertex*> best_clear_path;
     for (const Candidate& candidate : candidates) {
       std::vector<Vertex*> path = candidate.path;
@@ -165,15 +176,20 @@ PathSelectionResult selectBestPath(GraphManager& graph,
       const bool leaf_excluded = excluded(leaf);
       double path_gain = 0.0;
       bool admissible = false;
+      // The gain the whole path leads to, whether or not it may be driven
+      // as it is.
+      double leads_to = 0.0;
       if (!leaf_excluded) {
         ++result.leaves_evaluated;
         admissible = score(path, candidate.along, path_gain);
+        if (admissible) leads_to = path_gain;
         if (!admissible) {
           ++result.paths_rejected_steep;
         } else if (!turns_ok(path)) {
           admissible = false;
         } else if (path_gain > result.best_gain) {
           result.best_gain = path_gain;
+          result.best_full_gain = path_gain;
           result.best_path = path;
         }
       }
@@ -203,6 +219,7 @@ PathSelectionResult selectBestPath(GraphManager& graph,
         have_clear = true;
         best_clear_gain = path_gain;
         best_clear_full_gain = full_gain;
+        best_clear_leads_to = std::max(leads_to, path_gain);
         best_clear_path = path;
       }
     }
@@ -214,6 +231,7 @@ PathSelectionResult selectBestPath(GraphManager& graph,
         result.unclear_viewpoint = true;
       } else {
         result.best_gain = best_clear_gain;
+        result.best_full_gain = best_clear_leads_to;
         result.best_path = best_clear_path;
       }
     }
