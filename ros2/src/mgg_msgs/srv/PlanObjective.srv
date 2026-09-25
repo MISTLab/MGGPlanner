@@ -1,5 +1,7 @@
 # An explicit objective routed over the global graph: the route to a goal
-# pose (NAVIGATE) or back to the initial anchor (RETURN_HOME). The response
+# pose (NAVIGATE), or home (RETURN_HOME). RETURN_HOME routes to `goal`, the
+# caller's home in the planning frame, and ends exactly there; only when
+# `goal` is not finite does it route to the initial anchor. The response
 # carries the whole route, shortcut where the map already vouches for the
 # straight line, or a reason it could not be produced. The identity fields
 # echo the map the route was planned on so the caller can tell a route from
