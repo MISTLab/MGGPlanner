@@ -142,8 +142,9 @@ class PlannerNode : public rclcpp::Node {
   /// A departure for a ground robot boxed in at `start`, at driving height:
   /// straight ahead along its heading, start[3], or else, with
   /// PlanningParams::departure_reverse_allowed, straight back. Poses every
-  /// path_interpolation_distance, each step checked with the robot's
-  /// collision box as a shortcut is, up to the first pose at least
+  /// path_interpolation_distance, each step checked as a shortcut is, with
+  /// the robot's collision box turned to its heading (the smallest box
+  /// aligned with the map that holds it), up to the first pose at least
   /// kDepartureMinM out where the robot has room to turn in place
   /// (mgg::turnClear), and no farther than kDepartureMaxM. Every pose keeps
   /// the robot's heading, so the way back is driven in reverse. Returns

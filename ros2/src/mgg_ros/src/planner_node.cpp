@@ -1390,20 +1390,27 @@ bool PlannerNode::straightDeparture(const mgg::StateVec& start,
   const double spacing = planning_params_.path_interpolation_distance;
   const double step = spacing > 0.0 ? std::min(spacing, kDepartureMinM)
                                     : map_->getResolution();
-  const mgg::ExpandContext ctx = makeContext();
+  // The collision box, length along the robot's heading, turned with it:
+  // the map's box checks are aligned with the map, so the box checked is
+  // the smallest aligned one that holds the turned box. Along x or y it is
+  // the box itself; a robot facing y is its width across x (review r0).
+  const Eigen::Vector3d box = robot_params_.getPlanningSize();
+  const double c = std::abs(std::cos(heading));
+  const double s = std::abs(std::sin(heading));
+  const Eigen::Vector3d turned_box(c * box.x() + s * box.y(),
+                                   s * box.x() + c * box.y(), box.z());
   // Each step as shortcutAndResample checks a segment: through known free
   // space only, the whole collision box, and for a ground robot along the
   // terrain.
-  const auto step_free = [this, &ctx](const mgg::StateVec& from,
-                                      const mgg::StateVec& to) {
+  const auto step_free = [this, &turned_box](const mgg::StateVec& from,
+                                             const mgg::StateVec& to) {
     if (robot_params_.type == mgg::RobotType::kGroundRobot) {
       std::vector<Eigen::Vector3d> projected;
       return ground_->getProjectedEdgeStatus(
-                 from.head<3>(), to.head<3>(), ctx.robot_box_size, true,
-                 projected, false) == mgg::ProjectedEdgeStatus::kAdmissible;
+                 from.head<3>(), to.head<3>(), turned_box, true, projected,
+                 false) == mgg::ProjectedEdgeStatus::kAdmissible;
     }
-    return map_->getPathStatus(from.head<3>(), to.head<3>(),
-                               ctx.robot_box_size,
+    return map_->getPathStatus(from.head<3>(), to.head<3>(), turned_box,
                                true) == mgg::VoxelStatus::kFree;
   };
   const int steps = static_cast<int>(std::ceil(kDepartureMaxM / step - 1e-9));

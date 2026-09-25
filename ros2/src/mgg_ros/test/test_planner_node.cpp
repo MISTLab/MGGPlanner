@@ -136,6 +136,20 @@ class PlannerNodeTestPeer {
     }
     ++node.map_revision_;
   }
+  /// A wall this robot has seen, across x = `x` from y0 to y1.
+  static void observeWallAlongY(PlannerNode& node, double y0, double y1,
+                                double x) {
+    const std::lock_guard<std::recursive_mutex> lock(node.planner_mutex_);
+    for (double y = y0; y <= y1 + 1e-9; y += 0.1) {
+      for (double z = 0.1; z <= 0.6 + 1e-9; z += 0.1) {
+        for (int repeat = 0; repeat < 6; ++repeat) {
+          node.cloud_map_->insertPointCloud({Eigen::Vector3d(x, y, z)},
+                                            Eigen::Vector3d(x - 1.0, y, z));
+        }
+      }
+    }
+    ++node.map_revision_;
+  }
   /// A vertex of `robot_id`'s merged roadmap joined to nothing, as a part of
   /// it cut off by the merge's step and grade filter would be.
   static void addDisconnectedNeighbourVertex(PlannerNode& node, int robot_id,
@@ -870,18 +884,35 @@ TEST_F(PlannerNodeTest, AResampledRouteThatFailsTheTurnCheckIsSentUnshortcut) {
 
 namespace {
 
-/// A robot 0.6 m long and 0.2 m wide in a corridor along x, 0.5 m wide
-/// (walls at y = +-0.25) from x0 to x1, on a floor mapped from x -3 to 4:
-/// room to drive it along the corridor, not to turn it in place, since its
-/// corners reach 0.32 m from its centre.
-std::shared_ptr<PlannerNode> boxedIn(const std::string& name, double x0,
-                                     double x1) {
+/// A robot 0.6 m long and 0.2 m wide in a corridor 0.5 m wide from `from`
+/// to `to` along x (walls at y = +-0.25) or, `along_y`, along y (walls at
+/// x = +-0.25), on a floor mapped from -3 to 4 along it and -1.5 to 1.5
+/// across: room to drive it along the corridor, not to turn it in place,
+/// since its corners reach 0.32 m from its centre.
+std::shared_ptr<PlannerNode> boxedIn(const std::string& name, double from,
+                                     double to, bool along_y = false) {
   auto node = makeNode(name);
   PlannerNodeTestPeer::setRobotFootprint(*node, 0.6, 0.2);
-  PlannerNodeTestPeer::observeFloor(*node, -3.0, 4.0, -1.5, 1.5);
-  PlannerNodeTestPeer::observeWall(*node, x0, x1, 0.25);
-  PlannerNodeTestPeer::observeWall(*node, x0, x1, -0.25);
+  if (along_y) {
+    // At voxel centres: stepping 0.1 m from -3.0 drifts across a voxel
+    // boundary and leaves a row of the floor unseen.
+    PlannerNodeTestPeer::observeFloor(*node, -1.55, 1.55, -3.05, 4.05);
+    PlannerNodeTestPeer::observeWallAlongY(*node, from, to, 0.25);
+    PlannerNodeTestPeer::observeWallAlongY(*node, from, to, -0.25);
+  } else {
+    PlannerNodeTestPeer::observeFloor(*node, -3.0, 4.0, -1.5, 1.5);
+    PlannerNodeTestPeer::observeWall(*node, from, to, 0.25);
+    PlannerNodeTestPeer::observeWall(*node, from, to, -0.25);
+  }
   return node;
+}
+
+/// How far along the corridor, and across it, `pose` is.
+double alongCorridor(const mgg::StateVec& pose, bool along_y) {
+  return along_y ? pose.y() : pose.x();
+}
+double acrossCorridor(const mgg::StateVec& pose, bool along_y) {
+  return along_y ? pose.x() : pose.y();
 }
 
 }  // namespace
@@ -889,65 +920,84 @@ std::shared_ptr<PlannerNode> boxedIn(const std::string& name, double x0,
 TEST_F(PlannerNodeTest, ABoxedInRobotDepartsStraightAheadWhenThereIsRoom) {
   // Run 4, robot_1: a Bunker in a pocket too tight to turn in was sent a
   // path that began with a turn, and DWB found no trajectory three times.
-  // The corridor opens out 0.4 m ahead of the robot.
-  auto node = boxedIn("boxed_ahead", -2.5, 0.4);
-  const mgg::StateVec start =
-      PlannerNodeTestPeer::drivingState(*node, 0.0, 0.0, 0.0);
-  ASSERT_FALSE(PlannerNodeTestPeer::roomToTurn(*node, start));
-  std::vector<mgg::StateVec> path;
-  bool reverse = true;
-  ASSERT_TRUE(
-      PlannerNodeTestPeer::straightDeparture(*node, start, path, reverse));
-  EXPECT_FALSE(reverse);
-  ASSERT_GE(path.size(), 2u);
-  EXPECT_TRUE(path.front().head<3>().isApprox(start.head<3>()));
-  // Out of the corridor to the first pose with room to turn, and no
-  // farther.
-  EXPECT_GE(path.back().x(), 0.5);
-  EXPECT_LE(path.back().x(), 1.2);
-  EXPECT_TRUE(PlannerNodeTestPeer::roomToTurn(*node, path.back()));
-  EXPECT_FALSE(PlannerNodeTestPeer::roomToTurn(
-      *node, path[path.size() - 2]));
-  for (const mgg::StateVec& pose : path) {
-    EXPECT_NEAR(pose.y(), 0.0, 1e-9);
-    EXPECT_DOUBLE_EQ(pose[3], 0.0);
+  // The corridor opens out 0.4 m ahead of the robot. Along y, the robot
+  // faces +y: its box is checked turned with it, 0.2 m across the
+  // corridor, not 0.6 m as a box aligned with the map would be (review r0).
+  for (const bool along_y : {false, true}) {
+    SCOPED_TRACE(along_y ? "along y" : "along x");
+    const double yaw = along_y ? M_PI / 2.0 : 0.0;
+    auto node = boxedIn(along_y ? "boxed_ahead_y" : "boxed_ahead", -2.5, 0.4,
+                        along_y);
+    const mgg::StateVec start =
+        PlannerNodeTestPeer::drivingState(*node, 0.0, 0.0, yaw);
+    ASSERT_FALSE(PlannerNodeTestPeer::roomToTurn(*node, start));
+    std::vector<mgg::StateVec> path;
+    bool reverse = true;
+    ASSERT_TRUE(
+        PlannerNodeTestPeer::straightDeparture(*node, start, path, reverse));
+    EXPECT_FALSE(reverse);
+    ASSERT_GE(path.size(), 2u);
+    EXPECT_TRUE(path.front().head<3>().isApprox(start.head<3>()));
+    // Out of the corridor to the first pose with room to turn, and no
+    // farther.
+    EXPECT_GE(alongCorridor(path.back(), along_y), 0.5);
+    EXPECT_LE(alongCorridor(path.back(), along_y), 1.2);
+    EXPECT_TRUE(PlannerNodeTestPeer::roomToTurn(*node, path.back()));
+    EXPECT_FALSE(PlannerNodeTestPeer::roomToTurn(
+        *node, path[path.size() - 2]));
+    for (const mgg::StateVec& pose : path) {
+      EXPECT_NEAR(acrossCorridor(pose, along_y), 0.0, 1e-9);
+      EXPECT_DOUBLE_EQ(pose[3], yaw);
+    }
   }
 }
 
 TEST_F(PlannerNodeTest, ABoxedInRobotReversesOutWhenOnlyBehindHasRoom) {
   // The corridor runs on 2.5 m ahead and opens out 0.4 m behind.
-  auto node = boxedIn("boxed_behind", -0.4, 2.5);
-  const mgg::StateVec start =
-      PlannerNodeTestPeer::drivingState(*node, 0.0, 0.0, 0.0);
-  ASSERT_FALSE(PlannerNodeTestPeer::roomToTurn(*node, start));
-  std::vector<mgg::StateVec> path;
-  bool reverse = false;
-  ASSERT_TRUE(
-      PlannerNodeTestPeer::straightDeparture(*node, start, path, reverse));
-  EXPECT_TRUE(reverse);
-  ASSERT_GE(path.size(), 2u);
-  EXPECT_LE(path.back().x(), -0.5);
-  EXPECT_GE(path.back().x(), -1.2);
-  EXPECT_TRUE(PlannerNodeTestPeer::roomToTurn(*node, path.back()));
-  // Driven backwards: every pose faces the way the robot faces.
-  for (const mgg::StateVec& pose : path) EXPECT_DOUBLE_EQ(pose[3], 0.0);
+  for (const bool along_y : {false, true}) {
+    SCOPED_TRACE(along_y ? "along y" : "along x");
+    const double yaw = along_y ? M_PI / 2.0 : 0.0;
+    auto node = boxedIn(along_y ? "boxed_behind_y" : "boxed_behind", -0.4,
+                        2.5, along_y);
+    const mgg::StateVec start =
+        PlannerNodeTestPeer::drivingState(*node, 0.0, 0.0, yaw);
+    ASSERT_FALSE(PlannerNodeTestPeer::roomToTurn(*node, start));
+    std::vector<mgg::StateVec> path;
+    bool reverse = false;
+    ASSERT_TRUE(
+        PlannerNodeTestPeer::straightDeparture(*node, start, path, reverse));
+    EXPECT_TRUE(reverse);
+    ASSERT_GE(path.size(), 2u);
+    EXPECT_LE(alongCorridor(path.back(), along_y), -0.5);
+    EXPECT_GE(alongCorridor(path.back(), along_y), -1.2);
+    EXPECT_TRUE(PlannerNodeTestPeer::roomToTurn(*node, path.back()));
+    // Driven backwards: every pose faces the way the robot faces.
+    for (const mgg::StateVec& pose : path) {
+      EXPECT_NEAR(acrossCorridor(pose, along_y), 0.0, 1e-9);
+      EXPECT_DOUBLE_EQ(pose[3], yaw);
+    }
 
-  // A robot that may not reverse has no way out.
-  PlannerNodeTestPeer::setDepartureReverseAllowed(*node, false);
-  EXPECT_FALSE(
-      PlannerNodeTestPeer::straightDeparture(*node, start, path, reverse));
-  EXPECT_TRUE(path.empty());
+    // A robot that may not reverse has no way out.
+    PlannerNodeTestPeer::setDepartureReverseAllowed(*node, false);
+    EXPECT_FALSE(
+        PlannerNodeTestPeer::straightDeparture(*node, start, path, reverse));
+    EXPECT_TRUE(path.empty());
+  }
 }
 
 TEST_F(PlannerNodeTest, ABoxedInRobotWithNoRoomEitherWayGetsNoDeparture) {
-  auto node = boxedIn("boxed_both", -2.5, 2.5);
-  const mgg::StateVec start =
-      PlannerNodeTestPeer::drivingState(*node, 0.0, 0.0, 0.0);
-  std::vector<mgg::StateVec> path;
-  bool reverse = false;
-  EXPECT_FALSE(
-      PlannerNodeTestPeer::straightDeparture(*node, start, path, reverse));
-  EXPECT_TRUE(path.empty());
+  for (const bool along_y : {false, true}) {
+    SCOPED_TRACE(along_y ? "along y" : "along x");
+    auto node = boxedIn(along_y ? "boxed_both_y" : "boxed_both", -2.5, 2.5,
+                        along_y);
+    const mgg::StateVec start = PlannerNodeTestPeer::drivingState(
+        *node, 0.0, 0.0, along_y ? M_PI / 2.0 : 0.0);
+    std::vector<mgg::StateVec> path;
+    bool reverse = false;
+    EXPECT_FALSE(
+        PlannerNodeTestPeer::straightDeparture(*node, start, path, reverse));
+    EXPECT_TRUE(path.empty());
+  }
 }
 
 TEST_F(PlannerNodeTest, ExplorationBoxedInSendsNoPathThatStartsWithATurn) {
