@@ -7,7 +7,7 @@
 #include <cmath>
 #include <cstdint>
 #include <functional>
-#include <limits>
+#include <optional>
 #include <set>
 #include <string>
 #include <tuple>
@@ -207,35 +207,78 @@ TEST(NativeGain, OpenSpaceOverASillARailingAndARampStaysVisible) {
   EXPECT_GT(over_ramp, 100);
 }
 
+/// A floor at z = [-0.2, 0) except where `ground_row(x, y)` says otherwise:
+/// the row of the column's occupied ground voxel, or no ground at all.
+/// Air over the ground is mapped free up to x = 2.0 and z = 2.0; beyond, the
+/// map is unknown. 20 m to either side.
+mgg::NativeMolaGrid terrain(
+    const std::function<std::optional<std::int64_t>(std::int64_t,
+                                                    std::int64_t)>& ground) {
+  std::vector<Cell> occupied, free;
+  for (std::int64_t y = -100; y < 100; ++y)
+    for (std::int64_t x = -100; x < 110; ++x) {
+      const auto row = ground(x, y);
+      if (row) occupied.push_back({x, y, *row});
+      if (x < 10)
+        for (std::int64_t z = row ? *row + 1 : -1; z < 10; ++z)
+          free.push_back({x, y, z});
+    }
+  return mgg::NativeMolaGrid(kResolution, occupied, free, {});
+}
+
+/// Unknown voxels counted between `low` and `high`, beyond x = 2.2.
+int beyondBetween(
+    const std::vector<std::pair<Eigen::Vector3d, VoxelStatus>>& counted,
+    double low, double high) {
+  return static_cast<int>(std::count_if(
+      counted.begin(), counted.end(), [low, high](const auto& entry) {
+        return entry.second == VoxelStatus::kUnknown &&
+               entry.first.x() > 2.2 && entry.first.z() > low &&
+               entry.first.z() < high;
+      }));
+}
+
 // Diagnosis 2026-09-24 (diag-viewpoint, Q2): the gain counted voxels down to
 // 1.0 m below the vertex, about 0.55 m below the floor for the simulated
-// robots, where nothing can be seen (0.10 of the count at the captured plan
-// ends). A vertex rides max_ground_height above its ground, and the gain
-// stops one voxel below that ground.
-TEST(NativeGain, NothingMoreThanAVoxelBelowTheFloorCounts) {
-  mgg::NativeMolaGrid map(kResolution, {}, {}, {});
-  GainSetup setup(map);
-  mgg::RobotParams robot;
-  robot.type = mgg::RobotType::kGroundRobot;
-  setup.ctx.robot = &robot;
-  setup.planning.robot_height = 0.2;
-  setup.planning.max_ground_height = 0.45;
+// robots; under a mapped floor nothing can be seen (0.10 of the count at the
+// captured plan ends). Review r0 (P1): cutting the band one voxel under the
+// vertex's own floor also cut the space over ground that falls away. The
+// cut now follows the ground mapped over each voxel.
+TEST(NativeGain, UnderFloorGainDropsOnlyUnderMappedGround) {
+  // The vertex's floor is at z = 0.05; one voxel under it is z = -0.15.
+  const Eigen::Vector3d viewpoint(0.1, 0.5, 0.5);
+  // Flat ground whose floor has one-voxel gaps, as a lidar leaves: nothing
+  // under it counts.
+  auto flat = terrain([](std::int64_t x, std::int64_t y)
+                          -> std::optional<std::int64_t> {
+    if (x % 3 == 0 && y % 3 == 0) return std::nullopt;
+    return -1;
+  });
+  const auto over_flat = groundGain(flat, viewpoint);
+  const int under_flat = static_cast<int>(std::count_if(
+      over_flat.begin(), over_flat.end(), [](const auto& entry) {
+        return entry.second == VoxelStatus::kUnknown &&
+               entry.first.z() < -0.15;
+      }));
+  EXPECT_EQ(under_flat, 0);
 
-  // The floor under this vertex is at z = 0.05.
-  const double vertex_z = 0.5;
-  const double floor_z = vertex_z - setup.planning.max_ground_height;
-  mgg::VolumetricGain gain;
-  std::vector<std::pair<Eigen::Vector3d, VoxelStatus>> counted;
-  mgg::computeVolumetricGain(mgg::StateVec(0.1, 0.1, vertex_z, 0.0), gain,
-                             setup.ctx, &counted);
+  // A 16 degree ramp down from x = 1.0: the air over it, below the vertex's
+  // floor, counts.
+  const double slope = std::tan(16.0 * M_PI / 180.0);
+  auto ramp = terrain([slope](std::int64_t x, std::int64_t)
+                          -> std::optional<std::int64_t> {
+    const double drop = std::max(0.0, ((x + 0.5) * kResolution - 1.0) * slope);
+    return -1 - static_cast<std::int64_t>(std::floor(drop / kResolution));
+  });
+  EXPECT_GT(beyondBetween(groundGain(ramp, viewpoint), -0.5, -0.15), 20);
 
-  ASSERT_FALSE(counted.empty());
-  double lowest = std::numeric_limits<double>::infinity();
-  for (const auto& entry : counted) lowest = std::min(lowest, entry.first.z());
-  // Voxel centres: the one straddling the floor, [0.0, 0.2), counts, and the
-  // one below it, [-0.2, 0.0), is within a voxel of the floor.
-  EXPECT_GE(lowest, floor_z - kResolution - 1e-9);
-  EXPECT_LE(lowest, floor_z);
+  // A stairwell opening, 3.4 by 3.0 m, at x = [3.6, 7.0): no ground in it.
+  auto stairwell = terrain([](std::int64_t x, std::int64_t y)
+                               -> std::optional<std::int64_t> {
+    if (x >= 18 && x < 35 && y >= -5 && y < 10) return std::nullopt;
+    return -1;
+  });
+  EXPECT_GT(beyondBetween(groundGain(stairwell, viewpoint), -0.5, -0.15), 30);
 }
 
 }  // namespace

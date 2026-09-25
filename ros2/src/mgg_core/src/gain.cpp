@@ -1,7 +1,11 @@
 #include "mgg_core/gain.h"
 
 #include <algorithm>
+#include <cmath>
+#include <limits>
 #include <list>
+#include <map>
+#include <utility>
 
 #include "mgg_core/log.h"
 
@@ -15,6 +19,56 @@ bool inNoGainZone(const GainContext& ctx, const Eigen::Vector3d& voxel) {
   }
   return false;
 }
+
+/// Where the ground under a vertex's surroundings has been mapped. The
+/// support of a column is the first occupied voxel below the vertex's
+/// height, as the planner's ground projection would find it, searched down
+/// to `depth` below the vertex. Columns are cached per viewpoint.
+class ColumnSupport {
+ public:
+  ColumnSupport(const MapInterface& map, const Eigen::Vector3d& origin,
+                double depth)
+      : map_(map), origin_(origin), depth_(depth),
+        resolution_(map.getResolution()) {}
+
+  /// Whether the voxel centred at `voxel` lies under mapped ground: under
+  /// its own column's support, or, for a column whose floor has a one-voxel
+  /// gap, under the support of all four edge neighbours. Where no ground is
+  /// mapped over it, a stairwell or ground falling away, it does not.
+  bool isUnderGround(const Eigen::Vector3d& voxel) {
+    if (below(voxel, 0.0, 0.0)) return true;
+    return below(voxel, resolution_, 0.0) && below(voxel, -resolution_, 0.0) &&
+           below(voxel, 0.0, resolution_) && below(voxel, 0.0, -resolution_);
+  }
+
+ private:
+  bool below(const Eigen::Vector3d& voxel, double dx, double dy) {
+    const double x = voxel.x() + dx, y = voxel.y() + dy;
+    // Voxel centres repeat at multiples of the resolution; a millimetre key
+    // tells columns apart in any frame.
+    const std::pair<long long, long long> key(std::llround(x * 1000.0),
+                                              std::llround(y * 1000.0));
+    auto it = support_z_.find(key);
+    if (it == support_z_.end()) {
+      Eigen::Vector3d end;
+      const VoxelStatus status = map_.getRayStatus(
+          Eigen::Vector3d(x, y, origin_.z()),
+          Eigen::Vector3d(x, y, origin_.z() - depth_), false, end);
+      const double z = status == VoxelStatus::kOccupied
+                           ? end.z()
+                           : -std::numeric_limits<double>::infinity();
+      it = support_z_.emplace(key, z).first;
+    }
+    // Below the support voxel, not in it.
+    return voxel.z() < it->second - 0.5 * resolution_;
+  }
+
+  const MapInterface& map_;
+  const Eigen::Vector3d origin_;
+  const double depth_;
+  const double resolution_;
+  std::map<std::pair<long long, long long>, double> support_z_;
+};
 
 }  // namespace
 
@@ -72,6 +126,17 @@ void computeVolumetricGain(
                                       sensor.model());
     }
 
+    // Below the vertex, the band reaches max(2 max_ground_height, 1 m). A
+    // vertex rides max_ground_height above its ground, and nothing under
+    // mapped ground can be seen: 0.10 of the count at the captured plan
+    // ends lay under the floor (diag-viewpoint, 2026-09-24).
+    const double max_h_below =
+        std::max(ctx.planning->max_ground_height * 2.0, 1.0);
+    const double floor_depth =
+        ctx.planning->max_ground_height + ctx.map->getResolution();
+    ColumnSupport support(*ctx.map, origin,
+                          max_h_below + ctx.map->getResolution());
+
     int unknown = 0, free = 0, occupied = 0;
     for (const auto& entry : visited) {
       const Eigen::Vector3d& voxel = entry.first;
@@ -81,14 +146,15 @@ void computeVolumetricGain(
       if (inNoGainZone(ctx, voxel)) continue;
 
       if (ground_robot) {
-        // A vertex rides max_ground_height above its ground. Below the
-        // floor nothing can be seen; the band went 1.0 m below the vertex,
-        // about 0.55 m under the simulated floor, and that was 0.10 of the
-        // count (diag-viewpoint, 2026-09-24). It now ends one voxel below
-        // the ground, which keeps the voxel the floor surface lies in.
-        const double max_h_below =
-            ctx.planning->max_ground_height + ctx.map->getResolution();
-        if (voxel.z() - origin.z() > max_h_above || origin.z() - voxel.z() > max_h_below) {
+        if (voxel.z() - origin.z() > max_h_above ||
+            origin.z() - voxel.z() > max_h_below) {
+          continue;
+        }
+        // Deeper than a voxel under the vertex's own floor: counted unless
+        // mapped ground lies over it. The band once ended one voxel under
+        // that floor, and a ramp down or a stairwell lost its lower space.
+        if (origin.z() - voxel.z() > floor_depth &&
+            support.isUnderGround(voxel)) {
           continue;
         }
       }
