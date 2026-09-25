@@ -1210,12 +1210,29 @@ std::string PlannerNode::buildLocalGraph() {
   }
   if (sel.sharp_turn_fallback) {
     ++sharp_turn_fallbacks_;
+    // Whether a route turning only where it may was ruled out, or only not
+    // found in time.
+    char search[192];
+    if (!sel.detour_searched) {
+      std::snprintf(search, sizeof(search), "no route search");
+    } else if (sel.detour_search_capped) {
+      std::snprintf(search, sizeof(search),
+                    "route search stopped at its cap of %d states with %d "
+                    "route(s) found, none chosen; a compliant route may "
+                    "exist",
+                    mgg::kMaxDetourSearchStates, sel.detour_routes_found);
+    } else {
+      std::snprintf(search, sizeof(search),
+                    "route search completed in %d states: %d route(s) "
+                    "found, none chosen",
+                    sel.detour_states_expanded, sel.detour_routes_found);
+    }
     RCLCPP_WARN(get_logger(),
                 "exploration path to (%.2f, %.2f, %.2f) turns sharply on a "
                 "slope or without room to turn: no path turns only where it "
-                "may (%d such paths so far)",
+                "may; %s (%d such paths so far)",
                 best_path_.back().x(), best_path_.back().y(),
-                best_path_.back().z(), sharp_turn_fallbacks_);
+                best_path_.back().z(), search, sharp_turn_fallbacks_);
   }
   if (sel.unclear_viewpoint) {
     ++unclear_viewpoints_selected_;

@@ -377,6 +377,23 @@ TEST(PathTurnCheck, TurnWithoutRoomIsAvoidedWhenThereIsAnother) {
       graph, planning, bot, flat, 0.2, 0.0, {}, 0.0, nullptr, std::ref(check));
   EXPECT_EQ(fallback.best_path_id, a.back()->id);
   EXPECT_TRUE(fallback.sharp_turn_fallback);
+  EXPECT_FALSE(fallback.detour_searched);
+
+  // Searching for a way round finds none either: every way into the side
+  // passage turns where the corridor leaves no room. The search ran to
+  // completion, which the planner reports apart from a capped one.
+  const mgg::SharpTurnAllowedFn allowed = [&check](const Vertex& v) {
+    return check.sharpTurnAllowedAt(v.state.head<3>());
+  };
+  const auto searched =
+      mgg::selectBestPath(graph, planning, bot, flat, 0.2, 0.0, {}, 0.0,
+                          nullptr, std::ref(check), allowed);
+  EXPECT_EQ(searched.best_path_id, a.back()->id);
+  EXPECT_TRUE(searched.sharp_turn_fallback);
+  EXPECT_TRUE(searched.detour_searched);
+  EXPECT_FALSE(searched.detour_search_capped);
+  EXPECT_GT(searched.detour_states_expanded, 0);
+  EXPECT_EQ(searched.detour_routes_found, 0);
 }
 
 TEST(PathTurnCheck, ShortcutMakesNoTurnTheChosenPathDidNotHave) {

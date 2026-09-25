@@ -228,6 +228,7 @@ PathSelectionResult selectBestPath(GraphManager& graph,
     PathSelectionResult detour;
     int states = 0;
     bool capped = false;
+    int found_routes = 0;
     if (sharp_turn_allowed) {
       std::vector<int> destinations;
       for (const auto& [id, v] : graph.vertices_map_) {
@@ -242,6 +243,7 @@ PathSelectionResult selectBestPath(GraphManager& graph,
           sharp_turn_allowed, kMaxDetourSearchStates);
       states = routes.states_expanded;
       capped = routes.capped;
+      found_routes = static_cast<int>(routes.to.size());
       std::vector<Candidate> candidates;
       candidates.reserve(routes.to.size());
       for (const int id : destinations) {
@@ -260,6 +262,8 @@ PathSelectionResult selectBestPath(GraphManager& graph,
     result.paths_with_sharp_turns = refused;
     result.detour_states_expanded = states;
     result.detour_search_capped = capped;
+    result.detour_searched = static_cast<bool>(sharp_turn_allowed);
+    result.detour_routes_found = found_routes;
   }
   if (!result.best_path.empty()) {
     result.best_path_id = result.best_path.back()->id;

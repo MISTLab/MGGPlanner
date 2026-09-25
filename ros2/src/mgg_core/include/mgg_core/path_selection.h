@@ -109,9 +109,16 @@ struct PathSelectionResult {
   /// No leaf's shortest path passed `turns_admissible`, and the path chosen
   /// is a longer route to gain that does (findTurnCompliantRoutes).
   bool sharp_turn_detour = false;
-  /// What looking for that route cost, when it was looked for.
+  /// Whether that route was looked for (the refusals allowed it and a
+  /// `sharp_turn_allowed` was given), what the search cost, whether it
+  /// stopped at kMaxDetourSearchStates rather than running out of routes,
+  /// and how many routes to gain it found. A fallback after a capped search
+  /// may have missed a compliant route; after a completed one, the search
+  /// found none that was chosen.
+  bool detour_searched = false;
   int detour_states_expanded = 0;
   bool detour_search_capped = false;
+  int detour_routes_found = 0;
 };
 
 /// Bound on findTurnCompliantRoutes in selectBestPath, in states: one per
