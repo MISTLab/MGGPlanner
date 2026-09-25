@@ -180,6 +180,16 @@ class MolaMap : public MapInterface {
       const std::vector<Eigen::Vector3d>& multiray_endpoints, GainCounts& gain,
       std::vector<std::pair<Eigen::Vector3d, VoxelStatus>>& voxel_log,
       const SensorModel& sensor) override;
+  /// The wall band goes into the component frame as a band of navigation
+  /// heights: under a merged frame's tilt, up to kMaxAuthorityTiltRad, a
+  /// band that is level in the component frame would be off by the tilt
+  /// times the distance, 0.4 m at 10 m for 0.04 rad.
+  void getVisibleScanStatus(
+      const Eigen::Vector3d& pos,
+      const std::vector<Eigen::Vector3d>& multiray_endpoints,
+      const WallBand& wall, GainCounts& gain,
+      std::vector<std::pair<Eigen::Vector3d, VoxelStatus>>& voxel_log,
+      const SensorModel& sensor) override;
   bool augmentFreeBox(const Eigen::Vector3d& position,
                       const Eigen::Vector3d& box_size) override;
   void augmentFreeFrustum() override;

@@ -1,8 +1,26 @@
 #include "mgg_core/sensor_params.h"
 
+#include <algorithm>
 #include <cmath>
+#include <cstdint>
+#include <limits>
+#include <map>
+#include <memory>
+#include <mutex>
+#include <unordered_set>
+#include <vector>
+
+#include "mgg_core/voxel_walk.h"
 
 namespace mgg {
+
+/// Distinct-voxel counts of one ray table, by voxel size. update() makes a
+/// new one; copies of a SensorParams share their table's.
+struct SensorParams::UniqueVoxelCounts {
+  std::mutex mutex;
+  std::map<double, double> by_voxel_size;
+};
+
 namespace {
 
 /// Rotation about Z by `yaw`, matching how the planner treats StateVec[3].
@@ -29,6 +47,7 @@ void SensorParams::update() {
       resolution[1] > 0.0 ? resolution[1] : (1.0 * M_PI / 180.0);
 
   frustum_endpoints_body_.clear();
+  unique_voxel_counts_ = std::make_shared<UniqueVoxelCounts>();
 
   if (type == SensorType::kCamera) {
     // Frustum as a pyramid: four corner rays, and inward normals for the
@@ -68,8 +87,6 @@ void SensorParams::update() {
                                         center_offset);
     }
   }
-
-  num_voxels_full_fov_ = (fov[0] / h_res) * (fov[1] / v_res) * max_range;
 }
 
 bool SensorParams::isInsideFOV(const StateVec& state,
@@ -116,10 +133,51 @@ void SensorParams::getFrustumEndpoints(
   }
 }
 
-bool SensorParams::isFrontier(double num_unknown_voxels_normalized) const {
-  if (num_voxels_full_fov_ <= 0.0) return false;
-  return (num_unknown_voxels_normalized / num_voxels_full_fov_) >=
-         frontier_percentage_threshold;
+double SensorParams::uniqueVoxelsFullFov(double voxel_size) const {
+  if (frustum_endpoints_body_.empty() || unique_voxel_counts_ == nullptr ||
+      !std::isfinite(voxel_size) || voxel_size <= 0.0) {
+    return 0.0;
+  }
+  // Cells are packed into 21 bits per axis, offset to stay positive.
+  constexpr std::int64_t kHalfSpan = std::int64_t(1) << 20;
+  double reach = 0.0;
+  for (const Eigen::Vector3d& p : frustum_endpoints_body_)
+    reach = std::max(reach, p.cwiseAbs().maxCoeff());
+  if (!(reach / voxel_size < double(kHalfSpan - 2))) return 0.0;
+
+  // The planner asks on every gain evaluation; the walk is done once.
+  UniqueVoxelCounts& counts = *unique_voxel_counts_;
+  {
+    const std::lock_guard<std::mutex> lock(counts.mutex);
+    const auto found = counts.by_voxel_size.find(voxel_size);
+    if (found != counts.by_voxel_size.end()) return found->second;
+  }
+
+  // Each ray walked from the centre of voxel (0, 0, 0) to the centre plus
+  // its endpoint, as the native grid walks a scan from a viewpoint there:
+  // every voxel it touches, edges and corners included.
+  constexpr std::uint64_t kMaxWalk = std::uint64_t(1) << 22;
+  std::unordered_set<std::uint64_t> cells;
+  const Eigen::Vector3d origin = Eigen::Vector3d::Constant(0.5 * voxel_size);
+  for (const Eigen::Vector3d& p : frustum_endpoints_body_) {
+    walkVoxels(origin, origin + p, voxel_size, kMaxWalk,
+               [&](const VoxelIndex& v) {
+                 cells.insert((std::uint64_t(v.x + kHalfSpan) << 42) |
+                              (std::uint64_t(v.y + kHalfSpan) << 21) |
+                              std::uint64_t(v.z + kHalfSpan));
+                 return true;
+               });
+  }
+  const double count = double(cells.size());
+  const std::lock_guard<std::mutex> lock(counts.mutex);
+  counts.by_voxel_size.emplace(voxel_size, count);
+  return count;
+}
+
+bool SensorParams::isFrontier(int num_unknown_voxels, double voxel_size) const {
+  const double full = uniqueVoxelsFullFov(voxel_size);
+  if (full <= 0.0) return false;
+  return num_unknown_voxels / full >= frontier_percentage_threshold;
 }
 
 }  // namespace mgg

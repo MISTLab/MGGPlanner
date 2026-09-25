@@ -653,17 +653,64 @@ void OctomapMap::getScanStatusIterative(
     const Eigen::Vector3d& pos,
     const std::vector<Eigen::Vector3d>& multiray_endpoints, GainCounts& gain,
     std::vector<std::pair<Eigen::Vector3d, VoxelStatus>>& voxel_log,
-    const SensorModel& sensor) {
+    const SensorModel& /*sensor*/) {
+  scanUnique(pos, multiray_endpoints, nullptr, gain, voxel_log);
+}
+
+void OctomapMap::getVisibleScanStatus(
+    const Eigen::Vector3d& pos,
+    const std::vector<Eigen::Vector3d>& multiray_endpoints,
+    const WallBand& wall, GainCounts& gain,
+    std::vector<std::pair<Eigen::Vector3d, VoxelStatus>>& voxel_log,
+    const SensorModel& /*sensor*/) {
+  scanUnique(pos, multiray_endpoints, &wall, gain, voxel_log);
+}
+
+void OctomapMap::scanUnique(
+    const Eigen::Vector3d& pos,
+    const std::vector<Eigen::Vector3d>& multiray_endpoints,
+    const WallBand* wall, GainCounts& gain,
+    std::vector<std::pair<Eigen::Vector3d, VoxelStatus>>& voxel_log) const {
   // The voxblox "iterative" variant skipped rays whose voxels a neighbouring
   // ray had already covered, using the sensor's angular resolution. OctoMap's
   // key-based traversal makes the equivalent saving available far more
   // cheaply: dedupe on voxel keys instead of reasoning about ray geometry.
   gain = GainCounts{};
+  // The wall band, a band of heights along wall->up, and the wall gap test;
+  // see NativeMolaGrid::scanUnique.
+  const bool walls =
+      wall != nullptr && std::isfinite(wall->min_z) &&
+      std::isfinite(wall->max_z) && wall->min_z <= wall->max_z &&
+      wall->up.allFinite() && wall->up.z() > 0.5 * wall->up.norm();
+  const auto isWallReturn = [&](const octomap::OcTreeKey& key, int dz) {
+    const int z = int(key[2]) + dz;
+    if (z < 0 || z > 0xffff) return false;
+    const octomap::point3d centre = tree_->keyToCoord(
+        octomap::OcTreeKey(key[0], key[1], static_cast<octomap::key_type>(z)));
+    const double height = wall->up.dot(toEigen(centre));
+    return height >= wall->min_z && height <= wall->max_z &&
+           statusAt(centre) == VoxelStatus::kOccupied;
+  };
+  const auto isWallGap = [&](const octomap::OcTreeKey& key) {
+    for (int below = 1; below <= kMaxWallGapVoxels + 1; ++below) {
+      if (!isWallReturn(key, -below)) continue;
+      for (int above = 1; below + above - 1 <= kMaxWallGapVoxels; ++above) {
+        if (isWallReturn(key, above)) return true;
+      }
+      return false;
+    }
+    return false;
+  };
   octomap::KeySet seen;
   for (const Eigen::Vector3d& endpoint : multiray_endpoints) {
     walkRay(pos, endpoint, [&](const octomap::point3d& centre, VoxelStatus s) {
       octomap::OcTreeKey key;
-      if (tree_->coordToKeyChecked(centre, key) && !seen.insert(key).second) {
+      const bool keyed = tree_->coordToKeyChecked(centre, key);
+      // A gap in a wall hides what is behind it, for every ray.
+      if (walls && keyed && s == VoxelStatus::kUnknown && isWallGap(key)) {
+        return false;
+      }
+      if (keyed && !seen.insert(key).second) {
         // Already counted through another ray; keep walking but do not
         // double-count.
         return s != VoxelStatus::kOccupied;
@@ -677,7 +724,6 @@ void OctomapMap::getScanStatusIterative(
       return true;
     });
   }
-  (void)sensor;
 }
 
 bool OctomapMap::augmentFreeBox(const Eigen::Vector3d& position,

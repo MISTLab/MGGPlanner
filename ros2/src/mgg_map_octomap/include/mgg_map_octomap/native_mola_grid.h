@@ -3,6 +3,8 @@
 
 #include <cstdint>
 #include <map>
+#include <unordered_map>
+#include <utility>
 #include <vector>
 
 #include "mgg_core/map_interface.h"
@@ -59,6 +61,11 @@ class NativeMolaGrid final : public MapInterface {
       const Eigen::Vector3d&, const std::vector<Eigen::Vector3d>&, GainCounts&,
       std::vector<std::pair<Eigen::Vector3d, VoxelStatus>>&,
       const SensorModel&) override;
+  void getVisibleScanStatus(
+      const Eigen::Vector3d&, const std::vector<Eigen::Vector3d>&,
+      const WallBand&, GainCounts&,
+      std::vector<std::pair<Eigen::Vector3d, VoxelStatus>>&,
+      const SensorModel&) override;
   bool augmentFreeBox(const Eigen::Vector3d&, const Eigen::Vector3d&) override {
     return false;
   }
@@ -88,12 +95,29 @@ class NativeMolaGrid final : public MapInterface {
                   bool) const;
   VoxelStatus path(const Eigen::Vector3d&, const Eigen::Vector3d&,
                    const Eigen::Vector3d&, bool, bool) const;
+  void scanUnique(const Eigen::Vector3d&, const std::vector<Eigen::Vector3d>&,
+                  const WallBand*, GainCounts&,
+                  std::vector<std::pair<Eigen::Vector3d, VoxelStatus>>&) const;
   template <class F>
   bool walk(const Eigen::Vector3d&, const Eigen::Vector3d&, F) const;
   double resolution_;
   std::vector<Cell> occupied_, free_;
   CellIndex<Cell> cell_index_;
   std::map<Cell, double> surface_max_z_;
+  /// Each XY column's occupied cells, as a range [first, second) of the
+  /// sorted occupied_, so ascending in z. For the gain's wall gaps.
+  struct ColumnHash {
+    std::size_t operator()(const std::pair<std::int64_t, std::int64_t>&) const;
+  };
+  std::unordered_map<std::pair<std::int64_t, std::int64_t>,
+                     std::pair<std::size_t, std::size_t>, ColumnHash>
+      occupied_columns_;
+  /// Cells between two consecutive occupied cells of their column that are
+  /// at most kMaxWallGapVoxels + 1 apart. A wall gap lies between two such
+  /// cells whatever the band, since a band is contiguous in height; the
+  /// index is quick to miss.
+  std::vector<Cell> gap_candidates_, no_cells_;
+  CellIndex<Cell> gap_candidate_index_;
 };
 }  // namespace mgg
 #endif

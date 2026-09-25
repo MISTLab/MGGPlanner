@@ -1,13 +1,89 @@
 #include "mgg_map_octomap/native_mola_grid.h"
 
 #include <algorithm>
-#include <array>
 #include <cmath>
+#include <cstdint>
 #include <limits>
-#include <set>
+#include <vector>
+
+#include "mgg_core/voxel_walk.h"
 
 namespace mgg {
 namespace {
+struct CellHash {
+  std::size_t operator()(const NativeMolaGrid::Cell& k) const {
+    std::uint64_t h = std::uint64_t(k.x) * 0x9e3779b97f4a7c15ULL;
+    h ^= std::uint64_t(k.y) * 0xc2b2ae3d27d4eb4fULL + (h << 6) + (h >> 2);
+    h ^= std::uint64_t(k.z) * 0x165667b19e3779f9ULL + (h << 6) + (h >> 2);
+    return std::size_t(h);
+  }
+};
+struct CellEqual {
+  bool operator()(const NativeMolaGrid::Cell& a,
+                  const NativeMolaGrid::Cell& b) const {
+    return a.x == b.x && a.y == b.y && a.z == b.z;
+  }
+};
+/// What a scan has made of each cell it visited: every visit of every ray
+/// goes through it, about 65k cells for the 648-ray, 20 m simulated VLP16,
+/// so it is open-addressed, and it is kept per thread and emptied by
+/// advancing a generation rather than by clearing megabytes per scan.
+/// It starts at kInitialSlots and doubles as the distinct cells a scan
+/// visits fill half of it, so its size follows what scans visit, not how
+/// many rays they cast: 29 bytes a slot, 0.9 MB to start, 7.6 MB for the
+/// simulated VLP16. A cell's state is 0 until the scan assigns it one.
+class ScanCells {
+ public:
+  static constexpr std::size_t kInitialSlots = std::size_t(1) << 15;
+  void reset() {
+    count_ = 0;
+    if (++generation_ == 0) {
+      std::fill(generations_.begin(), generations_.end(), 0);
+      generation_ = 1;
+    }
+    if (cells_.empty()) rehash(kInitialSlots);
+  }
+  std::uint8_t& operator[](const NativeMolaGrid::Cell& k) {
+    if (2 * (count_ + 1) > cells_.size()) rehash(2 * cells_.size());
+    const std::size_t mask = cells_.size() - 1;
+    std::size_t pos = CellHash()(k) & mask;
+    while (generations_[pos] == generation_) {
+      if (CellEqual()(cells_[pos], k)) return states_[pos];
+      pos = (pos + 1) & mask;
+    }
+    generations_[pos] = generation_;
+    cells_[pos] = k;
+    states_[pos] = 0;
+    ++count_;
+    return states_[pos];
+  }
+
+ private:
+  void rehash(std::size_t wanted) {
+    std::size_t capacity = 64;
+    while (capacity < wanted) capacity *= 2;
+    std::vector<NativeMolaGrid::Cell> cells(capacity);
+    std::vector<std::uint32_t> generations(capacity, 0);
+    std::vector<std::uint8_t> states(capacity, 0);
+    for (std::size_t i = 0; i < cells_.size(); ++i) {
+      if (generations_[i] != generation_) continue;
+      std::size_t pos = CellHash()(cells_[i]) & (capacity - 1);
+      while (generations[pos] == generation_) pos = (pos + 1) & (capacity - 1);
+      generations[pos] = generation_;
+      cells[pos] = cells_[i];
+      states[pos] = states_[i];
+    }
+    cells_.swap(cells);
+    generations_.swap(generations);
+    states_.swap(states);
+  }
+  std::vector<NativeMolaGrid::Cell> cells_;
+  std::vector<std::uint32_t> generations_;
+  std::vector<std::uint8_t> states_;
+  std::uint32_t generation_ = 0;
+  std::size_t count_ = 0;
+};
+
 double pointSegmentDistance2(const Eigen::Vector2d& p, const Eigen::Vector2d& a,
                              const Eigen::Vector2d& b) {
   const auto d = b - a;
@@ -52,6 +128,24 @@ NativeMolaGrid::NativeMolaGrid(double r, std::vector<Cell> o,
   std::sort(occupied_.begin(), occupied_.end());
   std::sort(free_.begin(), free_.end());
   cell_index_.build(occupied_, free_);
+  for (std::size_t first = 0; first < occupied_.size();) {
+    std::size_t last = first + 1;
+    while (last < occupied_.size() && occupied_[last].x == occupied_[first].x &&
+           occupied_[last].y == occupied_[first].y)
+      ++last;
+    occupied_columns_.emplace(
+        std::make_pair(occupied_[first].x, occupied_[first].y),
+        std::make_pair(first, last));
+    for (std::size_t i = first + 1; i < last; ++i) {
+      const Cell& low = occupied_[i - 1];
+      const Cell& high = occupied_[i];
+      if (high.z - low.z > kMaxWallGapVoxels + 1) continue;
+      for (auto z = low.z + 1; z < high.z; ++z)
+        gap_candidates_.push_back({low.x, low.y, z});
+    }
+    first = last;
+  }
+  gap_candidate_index_.build(gap_candidates_, no_cells_);
   for (const auto& v : s)
     if (std::isfinite(v.max_z)) {
       auto it = surface_max_z_.find(v.cell);
@@ -61,14 +155,14 @@ NativeMolaGrid::NativeMolaGrid(double r, std::vector<Cell> o,
         it->second = std::max(it->second, v.max_z);
     }
 }
+std::size_t NativeMolaGrid::ColumnHash::operator()(
+    const std::pair<std::int64_t, std::int64_t>& column) const {
+  return CellHash()({column.first, column.second, 0});
+}
 bool NativeMolaGrid::key(const Eigen::Vector3d& p, Cell& k) const {
-  if (!p.allFinite() || !std::isfinite(resolution_) || resolution_ <= 0)
-    return false;
-  constexpr double lim = double(std::numeric_limits<std::int64_t>::max()) / 4;
-  const auto q = p / resolution_;
-  if ((q.array().abs() > lim).any()) return false;
-  k = {std::int64_t(std::floor(q.x())), std::int64_t(std::floor(q.y())),
-       std::int64_t(std::floor(q.z()))};
+  VoxelIndex v;
+  if (!voxelIndexOf(p, resolution_, v)) return false;
+  k = {v.x, v.y, v.z};
   return true;
 }
 Eigen::Vector3d NativeMolaGrid::center(const Cell& k) const {
@@ -98,135 +192,9 @@ VoxelStatus NativeMolaGrid::getVoxelStatus(const Eigen::Vector3d& p) const {
 template <class F>
 bool NativeMolaGrid::walk(const Eigen::Vector3d& a, const Eigen::Vector3d& b,
                           F visit) const {
-  Cell current, target;
-  if (!key(a, current) || !key(b, target)) return false;
-  const long double crossings =
-      std::abs(static_cast<long double>(target.x) - current.x) +
-      std::abs(static_cast<long double>(target.y) - current.y) +
-      std::abs(static_cast<long double>(target.z) - current.z);
-  // A 3-D corner may conservatively visit seven adjacent cells. Reject the
-  // entire query before producing a partial occupancy result.
-  // Include the at-most seven extra closed cells at each endpoint so a query
-  // is rejected before its visitor observes any partial result.
-  if (15.0L + 7.0L * crossings > kMaxWork) return false;
-  const Eigen::Vector3d direction = b - a;
-  std::array<int, 3> step{};
-  Eigen::Vector3d next =
-      Eigen::Vector3d::Constant(std::numeric_limits<double>::infinity());
-  Eigen::Vector3d delta = next;
-  for (int axis = 0; axis < 3; ++axis) {
-    if (direction[axis] == 0.0) continue;
-    step[axis] = direction[axis] > 0.0 ? 1 : -1;
-    const std::int64_t index = axis == 0   ? current.x
-                               : axis == 1 ? current.y
-                                           : current.z;
-    const double boundary = resolution_ * double(index + (step[axis] > 0));
-    next[axis] = (boundary - a[axis]) / direction[axis];
-    delta[axis] = resolution_ / std::abs(direction[axis]);
-  }
-  std::uint64_t work = 0;
-  unsigned plane_mask = 0;
-  unsigned initial_boundary_mask = 0;
-  for (int axis = 0; axis < 3; ++axis) {
-    const double scaled = a[axis] / resolution_;
-    if (std::abs(scaled - std::round(scaled)) <=
-        16.0 * std::numeric_limits<double>::epsilon() *
-            std::max(1.0, std::abs(scaled))) {
-      initial_boundary_mask |= 1u << axis;
-      if (direction[axis] == 0.0) plane_mask |= 1u << axis;
-    }
-  }
-  std::array<Cell, 8> initial_cells{};
-  std::size_t initial_cell_count = 0;
-  bool recording_initial_cells = true;
-  auto call = [&](const Cell& cell) {
-    // A ray lying on a grid plane touches cells on both sides for its whole
-    // length. Expand those stationary axes before applying the visitor.
-    for (unsigned subset = plane_mask;; subset = (subset - 1) & plane_mask) {
-      Cell touched = cell;
-      if (subset & 1u) --touched.x;
-      if (subset & 2u) --touched.y;
-      if (subset & 4u) --touched.z;
-      if (recording_initial_cells) {
-        initial_cells[initial_cell_count++] = touched;
-      } else {
-        const bool already_visited = std::any_of(
-            initial_cells.begin(), initial_cells.begin() + initial_cell_count,
-            [&](const Cell& initial) {
-              return initial.x == touched.x && initial.y == touched.y &&
-                     initial.z == touched.z;
-            });
-        if (already_visited) {
-          if (subset == 0) break;
-          continue;
-        }
-      }
-      if (++work > kMaxWork) return -1;
-      if (!visit(touched)) return 0;
-      if (subset == 0) break;
-    }
-    return 1;
-  };
-  const unsigned stationary_plane_mask = plane_mask;
-  plane_mask = initial_boundary_mask;
-  int action = call(current);
-  if (action <= 0) return action == 0;
-  recording_initial_cells = false;
-  plane_mask = stationary_plane_mask;
-  while (current.x != target.x || current.y != target.y ||
-         current.z != target.z) {
-    const double crossing = next.minCoeff();
-    if (!std::isfinite(crossing)) return false;
-    const double tolerance = 16.0 * std::numeric_limits<double>::epsilon() *
-                             std::max(1.0, std::abs(crossing));
-    unsigned mask = 0;
-    for (int axis = 0; axis < 3; ++axis)
-      if (std::abs(next[axis] - crossing) <= tolerance) mask |= 1u << axis;
-    // A boundary edge or corner belongs to every adjacent closed cell for
-    // conservative ray semantics. Visit all non-empty tied-axis subsets.
-    for (unsigned subset = mask; subset != 0; subset = (subset - 1) & mask) {
-      Cell touched = current;
-      if (subset & 1u) touched.x += step[0];
-      if (subset & 2u) touched.y += step[1];
-      if (subset & 4u) touched.z += step[2];
-      action = call(touched);
-      if (action <= 0) return action == 0;
-    }
-    if (mask & 1u) {
-      current.x += step[0];
-      next.x() += delta.x();
-    }
-    if (mask & 2u) {
-      current.y += step[1];
-      next.y() += delta.y();
-    }
-    if (mask & 4u) {
-      current.z += step[2];
-      next.z() += delta.z();
-    }
-  }
-  unsigned negative_endpoint_mask = 0;
-  for (int axis = 0; axis < 3; ++axis) {
-    const double scaled = b[axis] / resolution_;
-    if (direction[axis] < 0.0 &&
-        std::abs(scaled - std::round(scaled)) <=
-            16.0 * std::numeric_limits<double>::epsilon() *
-                std::max(1.0, std::abs(scaled))) {
-      negative_endpoint_mask |= 1u << axis;
-    }
-  }
-  const unsigned endpoint_mask = negative_endpoint_mask | plane_mask;
-  for (unsigned subset = endpoint_mask; subset != 0;
-       subset = (subset - 1) & endpoint_mask) {
-    if ((subset & negative_endpoint_mask) == 0) continue;
-    Cell touched = target;
-    if (subset & 1u) --touched.x;
-    if (subset & 2u) --touched.y;
-    if (subset & 4u) --touched.z;
-    if (++work > kMaxWork) return false;
-    if (!visit(touched)) return true;
-  }
-  return true;
+  return walkVoxels(a, b, resolution_, kMaxWork, [&](const VoxelIndex& v) {
+    return visit(Cell{v.x, v.y, v.z});
+  });
 }
 VoxelStatus NativeMolaGrid::getRayStatus(const Eigen::Vector3d& a,
                                          const Eigen::Vector3d& b,
@@ -421,20 +389,85 @@ void NativeMolaGrid::getScanStatusIterative(
     const Eigen::Vector3d& p, const std::vector<Eigen::Vector3d>& ends,
     GainCounts& g, std::vector<std::pair<Eigen::Vector3d, VoxelStatus>>& log,
     const SensorModel&) {
+  scanUnique(p, ends, nullptr, g, log);
+}
+void NativeMolaGrid::getVisibleScanStatus(
+    const Eigen::Vector3d& p, const std::vector<Eigen::Vector3d>& ends,
+    const WallBand& wall, GainCounts& g,
+    std::vector<std::pair<Eigen::Vector3d, VoxelStatus>>& log,
+    const SensorModel&) {
+  scanUnique(p, ends, &wall, g, log);
+}
+void NativeMolaGrid::scanUnique(
+    const Eigen::Vector3d& p, const std::vector<Eigen::Vector3d>& ends,
+    const WallBand* wall, GainCounts& g,
+    std::vector<std::pair<Eigen::Vector3d, VoxelStatus>>& log) const {
   g = {};
-  std::set<Cell> seen;
+  // The wall band, a band of heights along wall->up: the caller's vertical
+  // in this grid's frame, which a tilted frame makes lean. A band that is
+  // not finite or inverted, or along a vertical tilted more than 60
+  // degrees, turns the wall rule off rather than making every gap a wall's
+  // or none.
+  const bool walls =
+      wall != nullptr && std::isfinite(wall->min_z) &&
+      std::isfinite(wall->max_z) && wall->min_z <= wall->max_z &&
+      wall->up.allFinite() && wall->up.z() > 0.5 * wall->up.norm();
+  // A wall return is an occupied voxel whose centre's height is in the band.
+  const auto inBand = [&](const Cell& c) {
+    const double height = wall->up.dot(center(c));
+    return height >= wall->min_z && height <= wall->max_z;
+  };
+  // The nearest wall return below, then one above close enough to it, from
+  // the column's occupied voxels. Most unknown voxels are no gap candidate.
+  const auto isWallGap = [&](const Cell& k) {
+    if (gap_candidate_index_.status(k, gap_candidates_, no_cells_) == 0)
+      return false;
+    const auto column = occupied_columns_.find({k.x, k.y});
+    if (column == occupied_columns_.end()) return false;
+    const auto first = occupied_.begin() + column->second.first;
+    const auto last = occupied_.begin() + column->second.second;
+    const auto above = std::upper_bound(
+        first, last, k.z,
+        [](std::int64_t z, const Cell& cell) { return z < cell.z; });
+    std::int64_t below = 0;
+    for (auto it = above; it != first;) {
+      --it;
+      if (k.z - it->z > kMaxWallGapVoxels + 1) break;
+      if (it->z < k.z && inBand(*it)) {
+        below = k.z - it->z;
+        break;
+      }
+    }
+    if (below == 0) return false;
+    for (auto it = above; it != last; ++it) {
+      if (below + (it->z - k.z) - 1 > kMaxWallGapVoxels) break;
+      if (inBand(*it)) return true;
+    }
+    return false;
+  };
+  // A cell's status and the wall rule are decided on its first visit; a
+  // later ray only needs the verdict.
+  enum : std::uint8_t { kNew = 0, kCounted, kCountedOccupied, kWallGap };
+  thread_local ScanCells cells;
+  cells.reset();
   for (const auto& e : ends) {
     const bool valid = walk(p, e, [&](const Cell& k) {
+      std::uint8_t& state = cells[k];
+      if (state != kNew) return state == kCounted;
       const auto s = status(k);
-      if (seen.insert(k).second) {
-        log.emplace_back(center(k), s);
-        if (s == VoxelStatus::kOccupied)
-          ++g.occupied;
-        else if (s == VoxelStatus::kUnknown)
-          ++g.unknown;
-        else
-          ++g.free;
+      // A gap in a wall hides what is behind it, for every ray.
+      if (walls && s == VoxelStatus::kUnknown && isWallGap(k)) {
+        state = kWallGap;
+        return false;
       }
+      state = s == VoxelStatus::kOccupied ? kCountedOccupied : kCounted;
+      log.emplace_back(center(k), s);
+      if (s == VoxelStatus::kOccupied)
+        ++g.occupied;
+      else if (s == VoxelStatus::kUnknown)
+        ++g.unknown;
+      else
+        ++g.free;
       return s != VoxelStatus::kOccupied;
     });
     if (!valid) {

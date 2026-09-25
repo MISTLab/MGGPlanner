@@ -1,7 +1,12 @@
 #include "mgg_core/gain.h"
 
 #include <algorithm>
+#include <cmath>
+#include <cstdint>
+#include <limits>
 #include <list>
+#include <unordered_map>
+#include <utility>
 
 #include "mgg_core/log.h"
 
@@ -15,6 +20,79 @@ bool inNoGainZone(const GainContext& ctx, const Eigen::Vector3d& voxel) {
   }
   return false;
 }
+
+/// Where the ground under a vertex's surroundings has been mapped. The
+/// support of a column is the first occupied voxel below the vertex's
+/// height, as the planner's ground projection would find it, searched down
+/// to `depth` below the vertex. Columns are cached per viewpoint.
+class ColumnSupport {
+ public:
+  ColumnSupport(const MapInterface& map, const Eigen::Vector3d& origin,
+                double depth)
+      : map_(map), origin_(origin), depth_(depth),
+        resolution_(map.getResolution()) {}
+
+  /// Whether the voxel centred at `voxel` lies under mapped ground: under
+  /// its own column's support, or, for a column whose floor has a one-voxel
+  /// gap, under the support of all four edge neighbours. Where no ground is
+  /// mapped over it, a stairwell or ground falling away, it does not.
+  bool isUnderGround(const Eigen::Vector3d& voxel) {
+    Column& column = at(voxel.x(), voxel.y());
+    if (below(voxel, column.support_z)) return true;
+    if (!column.enclosed_known) {
+      // The lowest of the four neighbours' supports; -inf once one has none.
+      double lowest = std::numeric_limits<double>::infinity();
+      for (const auto& [dx, dy] : {std::pair<double, double>{resolution_, 0.0},
+                                   {-resolution_, 0.0},
+                                   {0.0, resolution_},
+                                   {0.0, -resolution_}}) {
+        lowest = std::min(lowest,
+                          at(voxel.x() + dx, voxel.y() + dy).support_z);
+        if (std::isinf(lowest)) break;
+      }
+      // Elements of an unordered_map keep their address when it rehashes.
+      column.enclosed_z = lowest;
+      column.enclosed_known = true;
+    }
+    return below(voxel, column.enclosed_z);
+  }
+
+ private:
+  struct Column {
+    double support_z = -std::numeric_limits<double>::infinity();
+    double enclosed_z = -std::numeric_limits<double>::infinity();
+    bool enclosed_known = false;
+  };
+
+  /// Below the support voxel centred at `support_z`, not in it.
+  bool below(const Eigen::Vector3d& voxel, double support_z) const {
+    return voxel.z() < support_z - 0.5 * resolution_;
+  }
+
+  Column& at(double x, double y) {
+    // Voxel centres repeat at multiples of the resolution; a millimetre key
+    // tells columns apart in any frame.
+    const std::uint64_t key =
+        (std::uint64_t(std::llround(x * 1000.0)) << 32) ^
+        (std::uint64_t(std::llround(y * 1000.0)) & 0xffffffffULL);
+    const auto found = columns_.find(key);
+    if (found != columns_.end()) return found->second;
+    Column column;
+    Eigen::Vector3d end;
+    if (map_.getRayStatus(Eigen::Vector3d(x, y, origin_.z()),
+                          Eigen::Vector3d(x, y, origin_.z() - depth_), false,
+                          end) == VoxelStatus::kOccupied) {
+      column.support_z = end.z();
+    }
+    return columns_.emplace(key, column).first->second;
+  }
+
+  const MapInterface& map_;
+  const Eigen::Vector3d origin_;
+  const double depth_;
+  const double resolution_;
+  std::unordered_map<std::uint64_t, Column> columns_;
+};
 
 }  // namespace
 
@@ -45,9 +123,43 @@ void computeVolumetricGain(
       continue;
     }
 
+    // Each voxel once per viewpoint: a voxel is revealed once however many
+    // rays cross it. getScanStatus logs it once per ray, and near the
+    // viewpoint hundreds of rays share a voxel (0.77 of the logged count was
+    // unique on the captured Bistro grids, diag-viewpoint 2026-09-24).
     GainCounts raw;
     std::vector<std::pair<Eigen::Vector3d, VoxelStatus>> visited;
-    ctx.map->getScanStatus(origin, endpoints, raw, visited, sensor.model());
+    const bool ground_robot =
+        ctx.robot != nullptr && ctx.robot->type == RobotType::kGroundRobot;
+    // Ground robots only explore the traversable ground layer: voxels high
+    // above the vertex, or deep below it, are irrelevant to them.
+    const double max_h_above = std::max(ctx.planning->robot_height * 2.5, 1.2);
+    if (ground_robot) {
+      // A lidar leaves unknown gaps in walls, and rays through them counted
+      // the space behind: 0.39 of the count at the captured plan ends. Wall
+      // evidence is a return above the floor (a vertex rides
+      // max_ground_height over it) and within the gain band; a gap is
+      // inferred only between two such returns in a column.
+      const double floor_z = origin.z() - ctx.planning->max_ground_height;
+      const WallBand wall{floor_z + ctx.map->getResolution(),
+                          origin.z() + max_h_above};
+      ctx.map->getVisibleScanStatus(origin, endpoints, wall, raw, visited,
+                                    sensor.model());
+    } else {
+      ctx.map->getScanStatusIterative(origin, endpoints, raw, visited,
+                                      sensor.model());
+    }
+
+    // Below the vertex, the band reaches max(2 max_ground_height, 1 m). A
+    // vertex rides max_ground_height above its ground, and nothing under
+    // mapped ground can be seen: 0.10 of the count at the captured plan
+    // ends lay under the floor (diag-viewpoint, 2026-09-24).
+    const double max_h_below =
+        std::max(ctx.planning->max_ground_height * 2.0, 1.0);
+    const double floor_depth =
+        ctx.planning->max_ground_height + ctx.map->getResolution();
+    ColumnSupport support(*ctx.map, origin,
+                          max_h_below + ctx.map->getResolution());
 
     int unknown = 0, free = 0, occupied = 0;
     for (const auto& entry : visited) {
@@ -57,16 +169,16 @@ void computeVolumetricGain(
       if (!ctx.global_space->isInsideSpace(voxel)) continue;
       if (inNoGainZone(ctx, voxel)) continue;
 
-      // Ground robot awareness: ground robots only explore the traversable ground layer.
-      // Voxels high up in the sky or deep below the ground plane have no relevance to ground navigation.
-      if (ctx.robot != nullptr && ctx.robot->type == RobotType::kGroundRobot) {
-        const double max_h_above = (ctx.planning != nullptr)
-                                       ? std::max(ctx.planning->robot_height * 2.5, 1.2)
-                                       : 1.2;
-        const double max_h_below = (ctx.planning != nullptr)
-                                       ? std::max(ctx.planning->max_ground_height * 2.0, 1.0)
-                                       : 1.0;
-        if (voxel.z() - origin.z() > max_h_above || origin.z() - voxel.z() > max_h_below) {
+      if (ground_robot) {
+        if (voxel.z() - origin.z() > max_h_above ||
+            origin.z() - voxel.z() > max_h_below) {
+          continue;
+        }
+        // Deeper than a voxel under the vertex's own floor: counted unless
+        // mapped ground lies over it. The band once ended one voxel under
+        // that floor, and a ramp down or a stairwell lost its lower space.
+        if (origin.z() - voxel.z() > floor_depth &&
+            support.isUnderGround(voxel)) {
           continue;
         }
       }
@@ -87,12 +199,15 @@ void computeVolumetricGain(
                  free * ctx.planning->free_voxel_gain +
                  occupied * ctx.planning->occupied_voxel_gain;
 
-    // Scaled to metres, as the ROS 1 code did, so the threshold is
-    // resolution independent.
-    const double unknown_scaled = unknown * ctx.map->getResolution();
-    if (sensor.isFrontier(unknown_scaled) ||
-        (ctx.robot != nullptr && ctx.robot->type == RobotType::kGroundRobot &&
-         unknown_scaled >= 0.5)) {
+    // A ground robot's vertex is a frontier with 0.5 m of unknown, in
+    // voxels times their edge. Otherwise the distinct unknown voxels are
+    // measured against the distinct voxels the sensor's rays reach in space
+    // that is all unknown. The ray-length denominator of the ROS 1 code
+    // suited a count of every voxel of every ray; against distinct voxels it
+    // can deny a frontier even in space that is all unknown.
+    const double resolution = ctx.map->getResolution();
+    if ((ground_robot && unknown * resolution >= 0.5) ||
+        sensor.isFrontier(unknown, resolution)) {
       gain.is_frontier = true;
     }
   }

@@ -75,6 +75,16 @@ roslaunch mggplanner 3smb_sim_mgg.launch
 ```
 In Ubuntu 18.04 with ROS Melodic, the gazebo node might crash when running the ground robot simulation. In this case set the `gpu` parameter to false [here](https://github.com/ntnu-arl/smb_simulator/blob/6ed9d738ffd045d666311a8ba266570f58dca438/smb_description/urdf/sensor_head.urdf.xacro#L20).
 
+## ROS 2 port: exploration gain
+
+In the ROS 2 port (`ros2/src`), a viewpoint's gain counts the unknown voxels its sensor could reveal from there (`mgg_core/src/gain.cpp`):
+
+- Each voxel counts once per viewpoint, however many rays cross it.
+- For a ground robot, a ray also ends at a gap in a wall. A gap is an unknown voxel with wall returns both below and above it in its column, at most `kMaxWallGapVoxels` voxels apart. Wall returns are occupied voxels from one voxel above the vertex's floor to the top of the gain band. Nothing is inferred above a column's highest return or below its lowest, so the space over a sill, a rail or a rising ramp stays visible, and so does a doorway.
+- **Minimum opening height.** `kMaxWallGapVoxels` is 3, i.e. 0.6 m at the 0.2 m planner grid. The mapping carves free space with one ray per 5 x 5 degree bin, which leaves gaps of that size between lidar rings a few metres away. A framed opening no taller than that, such as a low window, is taken for a wall gap, and nothing beyond it counts. Taller openings stay visible.
+- A vertex is a frontier when its distinct unknown voxels are at least `frontier_percentage_threshold` of those an all-unknown scan from a voxel centre reaches (`SensorParams::uniqueVoxelsFullFov`, walked as the planner grid walks rays, `mgg_core/voxel_walk.h`). For a ground robot, 0.5 m of unknown (three 0.2 m voxels) is also enough.
+- Below the vertex's floor, a voxel counts unless mapped ground lies over it. Ground falling away, such as a ramp down or a stairwell, keeps its gain down to `max(2 max_ground_height, 1 m)` below the vertex.
+
 ## Results
 
 Software Architecture Used During the Deployments

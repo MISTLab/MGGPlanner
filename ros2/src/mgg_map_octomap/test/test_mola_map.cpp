@@ -19,6 +19,7 @@
 #include <sstream>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 #include <unistd.h>
 
@@ -26,6 +27,7 @@
 #include "mgg_core/ground_projection.h"
 #include "mgg_core/grid_graph.h"
 #include "mgg_core/path_selection.h"
+#include "mgg_core/voxel_walk.h"
 #include "mgg_map_octomap/mola_map.h"
 #include "mgg_map_octomap/native_mola_grid.h"
 #include "reference_binary_grid.h"
@@ -705,6 +707,87 @@ TEST(MolaMap, MeasuredGroundBelowBodyDoesNotInheritVoxelTop) {
             VoxelStatus::kOccupied);
 }
 
+TEST(MolaMap, VisibleScanLiftsTheWallBandIntoTheComponentFrame) {
+  // The component frame sits 1 m above navigation. A wall column over
+  // x = [2.0, 2.2) holds returns at navigation z = [0.4, 0.6) and
+  // [0.8, 1.0), component rows 7 and 9, and an unknown gap between them.
+  Publication publication;
+  MolaMap provider(config(publication));
+  Eigen::Isometry3d component_from_navigation = Eigen::Isometry3d::Identity();
+  component_from_navigation.translation() = Eigen::Vector3d(0.0, 0.0, 1.0);
+  const auto request = publication.publish(0, {{10, 2, 7}, {10, 2, 9}},
+                                           freeBlock(), true,
+                                           component_from_navigation);
+  provider.requestSnapshot(request);
+  ASSERT_TRUE(waitFor([&]() { return provider.getStatus(); }))
+      << provider.lastError();
+
+  // One ray, in navigation, rising through the gap at z = [0.6, 0.8).
+  const Eigen::Vector3d origin(0.1, 0.5, 0.5);
+  const std::vector<Eigen::Vector3d> ray{Eigen::Vector3d(10.1, 0.5, 1.3)};
+  const auto behindTheWall = [&](const mgg::WallBand& wall) {
+    mgg::GainCounts counts;
+    std::vector<std::pair<Eigen::Vector3d, VoxelStatus>> log;
+    provider.getVisibleScanStatus(origin, ray, wall, counts, log, {});
+    int behind = 0;
+    for (const auto& entry : log)
+      if (entry.second == VoxelStatus::kUnknown && entry.first.x() > 2.2)
+        ++behind;
+    return behind;
+  };
+  // A band in navigation that holds both returns: the gap is a wall's.
+  // Unlifted, it would hold neither.
+  EXPECT_EQ(behindTheWall({0.25, 0.95}), 0);
+  // A band below both: the ray passes the gap.
+  EXPECT_GT(behindTheWall({-0.25, 0.05}), 30);
+}
+
+// Review r0 (P2): the wall band went into the component frame lifted but
+// level. Under a merged frame's 0.04 rad pitch it is then off by 0.4 m 10 m
+// away: wall returns fall out of it, and floor returns into it.
+TEST(MolaMap, VisibleScanKeepsTheWallBandLevelInNavigationUnderTilt) {
+  Publication publication;
+  MolaMap provider(config(publication));
+  Eigen::Isometry3d component_from_navigation = Eigen::Isometry3d::Identity();
+  component_from_navigation.linear() =
+      Eigen::AngleAxisd(0.04, Eigen::Vector3d::UnitY()).toRotationMatrix();
+  // A component point p is at navigation height p.z + 0.04 p.x, about.
+  // At x = 10.1: returns in component rows 0 and 2, navigation 0.50 and
+  // 0.90, a wall's, with a gap in row 1. At x = -10.1: returns in rows 2
+  // and 4, navigation 0.10, a floor return below the band, and 0.50.
+  const auto request = publication.publish(
+      0, {{50, 2, 0}, {50, 2, 2}, {-51, 2, 2}, {-51, 2, 4}}, freeBlock(), true,
+      component_from_navigation);
+  provider.requestSnapshot(request);
+  ASSERT_TRUE(waitFor([&]() { return provider.getStatus(); }))
+      << provider.lastError();
+
+  // The navigation band of a vertex at z = 0.5 over a floor at 0.05.
+  const mgg::WallBand band{0.25, 1.7};
+  const Eigen::Vector3d origin(0.1, 0.5, 0.5);
+  const Eigen::Isometry3d navigation_from_component =
+      component_from_navigation.inverse();
+  // One ray through the middle of a gap, on to twice as far, and the
+  // unknown voxels it counted beyond the wall column.
+  const auto beyondTheGap = [&](const Eigen::Vector3d& gap_in_component) {
+    const Eigen::Vector3d gap = navigation_from_component * gap_in_component;
+    const std::vector<Eigen::Vector3d> ray{origin + 2.0 * (gap - origin)};
+    mgg::GainCounts counts;
+    std::vector<std::pair<Eigen::Vector3d, VoxelStatus>> log;
+    provider.getVisibleScanStatus(origin, ray, band, counts, log, {});
+    int beyond = 0;
+    for (const auto& entry : log)
+      if (entry.second == VoxelStatus::kUnknown &&
+          std::abs(entry.first.x()) > std::abs(gap.x()) + 0.2)
+        ++beyond;
+    return beyond;
+  };
+  // The wall's gap hides what is behind it.
+  EXPECT_EQ(beyondTheGap({10.1, 0.5, 0.3}), 0);
+  // A floor return and a return over it do not make a wall.
+  EXPECT_GT(beyondTheGap({-10.1, 0.5, 0.7}), 30);
+}
+
 TEST(NativeMolaGrid, HighAndUnmeasuredReturnsRemainBlockingOnSlopedSweep) {
   using Grid = mgg::NativeMolaGrid;
   const Eigen::Vector3d start(0.1, 0.1, 0.1343);
@@ -740,6 +823,89 @@ TEST(NativeMolaGrid, RaySupercoverIncludesCornerCellsInBothDirections) {
   const Eigen::Vector3d b(0.3, 0.3, 0.1);
   EXPECT_EQ(map.getRayStatus(a, b, false), VoxelStatus::kOccupied);
   EXPECT_EQ(map.getRayStatus(b, a, false), VoxelStatus::kOccupied);
+}
+
+// Review r1 (P2) turned this up: a 45 degree ray ending on a voxel
+// boundary, whose last y crossing rounds within the tie tolerance of an x
+// crossing. The walk stepped y past the target cell with x and ran on to
+// its work limit, 4 million voxels, and the query came back unknown.
+TEST(NativeMolaGrid, RayEndingOnABoundaryAtATieEndsAtItsTarget) {
+  using Grid = mgg::NativeMolaGrid;
+  Grid map(0.2, {}, {}, {});
+  const Eigen::Vector3d a(0.1, 0.1, 0.1);
+  const Eigen::Vector3d b =
+      a + Eigen::Vector3d(1.5000000000000002, -1.5, -2.1213203435596424);
+  Eigen::Vector3d end;
+  EXPECT_EQ(map.getRayStatus(a, b, false, end), VoxelStatus::kFree);
+  EXPECT_TRUE(end.isApprox(b));
+  // The walk ends at the target cell, and a return in it stops the ray.
+  Grid wall(0.2, {{8, -7, -11}}, {}, {});
+  EXPECT_EQ(wall.getRayStatus(a, b, false, end), VoxelStatus::kOccupied);
+}
+
+// Review r2 (P1): ending the walk at its target (713a4ab) stopped an axis
+// already at its target from stepping with another whose crossing tied at
+// the end, and the end cleanup added only voxels below the target along
+// negative axes. From (0.1, 0.1, 0.1) to (0.2, 0.0, 0.1), the voxel
+// (0, -1, 0) touching the end was missed, so a return in it went unseen.
+TEST(NativeMolaGrid, RayEndingOnAnEdgeSeesTheVoxelDiagonallyAcrossIt) {
+  using Grid = mgg::NativeMolaGrid;
+  Grid map(0.2, {{0, -1, 0}}, {}, {});
+  const Eigen::Vector3d a(0.1, 0.1, 0.1);
+  const Eigen::Vector3d b(0.2, 0.0, 0.1);
+  EXPECT_EQ(map.getRayStatus(a, b, false), VoxelStatus::kOccupied);
+  EXPECT_EQ(map.getRayStatus(b, a, false), VoxelStatus::kOccupied);
+}
+
+// Every face, edge and corner of a voxel, in every mix of directions: a
+// segment from the voxel's centre to it touches, and visits once each, the
+// voxel and those across the face, edge or corner. A return in any one of
+// them is seen, walking out or in.
+TEST(NativeMolaGrid, RaysToEveryFaceEdgeAndCornerSeeEveryVoxelTouchingIt) {
+  using Grid = mgg::NativeMolaGrid;
+  const Eigen::Vector3d centre(0.1, 0.1, 0.1);
+  for (int sx = -1; sx <= 1; ++sx)
+    for (int sy = -1; sy <= 1; ++sy)
+      for (int sz = -1; sz <= 1; ++sz) {
+        if (sx == 0 && sy == 0 && sz == 0) continue;
+        const Eigen::Vector3d end = centre + 0.1 * Eigen::Vector3d(sx, sy, sz);
+        std::vector<std::array<std::int64_t, 3>> touching;
+        for (int x : {0, sx})
+          for (int y : {0, sy})
+            for (int z : {0, sz}) {
+              const std::array<std::int64_t, 3> cell{x, y, z};
+              if (std::find(touching.begin(), touching.end(), cell) ==
+                  touching.end())
+                touching.push_back(cell);
+            }
+        const std::string where = std::to_string(sx) + "," +
+                                  std::to_string(sy) + "," +
+                                  std::to_string(sz);
+        for (const auto& [from, to] :
+             {std::pair{centre, end}, std::pair{end, centre}}) {
+          std::vector<std::array<std::int64_t, 3>> visited;
+          EXPECT_TRUE(mgg::walkVoxels(
+              from, to, 0.2, 1u << 22, [&](const mgg::VoxelIndex& v) {
+                visited.push_back({v.x, v.y, v.z});
+                return true;
+              }))
+              << where;
+          std::sort(visited.begin(), visited.end());
+          std::sort(touching.begin(), touching.end());
+          EXPECT_EQ(visited, touching) << where;
+        }
+        for (const auto& cell : touching) {
+          Grid map(0.2, {{cell[0], cell[1], cell[2]}}, {}, {});
+          EXPECT_EQ(map.getRayStatus(centre, end, false),
+                    VoxelStatus::kOccupied)
+              << where << " out, return in " << cell[0] << "," << cell[1]
+              << "," << cell[2];
+          EXPECT_EQ(map.getRayStatus(end, centre, false),
+                    VoxelStatus::kOccupied)
+              << where << " in, return in " << cell[0] << "," << cell[1]
+              << "," << cell[2];
+        }
+      }
 }
 
 TEST(NativeMolaGrid, RaySupercoverIncludesStartFaceInBothDirections) {
