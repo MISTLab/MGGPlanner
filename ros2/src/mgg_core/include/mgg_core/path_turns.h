@@ -19,8 +19,9 @@
 #ifndef MGG_CORE_PATH_TURNS_H_
 #define MGG_CORE_PATH_TURNS_H_
 
+#include <array>
 #include <functional>
-#include <unordered_map>
+#include <map>
 #include <vector>
 
 #include <Eigen/Dense>
@@ -67,8 +68,8 @@ bool turnClear(const MapInterface& map, const RobotParams& robot,
 /// Whether a path turns sharply only where it may.
 using PathTurnsFn = std::function<bool(const std::vector<Vertex*>&)>;
 
-/// Whether the robot has room to turn in place at a vertex, e.g. turnClear.
-using TurnRoomFn = std::function<bool(const Vertex&)>;
+/// Whether the robot has room to turn in place at a pose, e.g. turnClear.
+using TurnRoomFn = std::function<bool(const StateVec&)>;
 
 /// The check selectBestPath applies to a ground robot's candidate paths
 /// through `graph`: a sharp turn (kSharpTurnRad) is refused where the
@@ -77,13 +78,20 @@ using TurnRoomFn = std::function<bool(const Vertex&)>;
 /// the robot stands: a path that sets off sharply away from its heading
 /// needs room there too. Turns are measured over the robot's length, the
 /// larger of RobotParams::size x and y, and the terrain slope is fitted over
-/// the same radius. Slope and room are found once per vertex.
+/// the same radius. Slope and room are found once per position.
 class PathTurnCheck {
  public:
   PathTurnCheck(GraphManager& graph, const RobotParams& robot,
                 TurnRoomFn room_to_turn = nullptr);
 
+  /// A candidate path through the graph, turning first from the heading of
+  /// its first vertex (the root's is the robot's yaw). Counts refusals.
   bool operator()(const std::vector<Vertex*>& path);
+
+  /// The same check on any polyline, e.g. a path after shortcutting, whose
+  /// first point turns from `start_heading`. Counts nothing.
+  bool admissible(const std::vector<Eigen::Vector3d>& points,
+                  double start_heading);
 
   /// Candidate paths refused for a sharp turn on a slope, and for one
   /// without room to turn.
@@ -91,14 +99,19 @@ class PathTurnCheck {
   int refused_without_room = 0;
 
  private:
-  double slopeAt(const Vertex& vertex);
-  bool roomAt(const Vertex& vertex);
+  enum class Refusal { kNone, kSlope, kRoom };
+  using PositionKey = std::array<long long, 3>;
+
+  Refusal firstRefusal(const std::vector<Eigen::Vector3d>& points,
+                       double start_heading);
+  double slopeAt(const Eigen::Vector3d& position);
+  bool roomAt(const Eigen::Vector3d& position);
 
   GraphManager& graph_;
   double window_ = 0.0;
   TurnRoomFn room_to_turn_;
-  std::unordered_map<int, double> slope_by_id_;
-  std::unordered_map<int, bool> room_by_id_;
+  std::map<PositionKey, double> slope_at_;
+  std::map<PositionKey, bool> room_at_;
 };
 
 }  // namespace mgg

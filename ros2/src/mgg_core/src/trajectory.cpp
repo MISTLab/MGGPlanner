@@ -216,4 +216,30 @@ PathType shortcutPath(const PathType& path, const SegmentFreeFn& segment_free) {
   return out;
 }
 
+PathType shortcutPath(const PathType& path, const SegmentFreeFn& segment_free,
+                      const PathOkFn& path_ok) {
+  if (path.size() < 3 || !segment_free || !path_ok || !path_ok(path)) {
+    return shortcutPath(path, segment_free);
+  }
+  PathType out;
+  out.push_back(path.front());
+  size_t at = 0;
+  PathType trial;
+  while (at + 1 < path.size()) {
+    size_t next = at + 1;
+    for (size_t candidate = path.size() - 1; candidate > at + 1; --candidate) {
+      if (!segment_free(path[at], path[candidate])) continue;
+      trial = out;
+      trial.insert(trial.end(), path.begin() + candidate, path.end());
+      if (path_ok(trial)) {
+        next = candidate;
+        break;
+      }
+    }
+    out.push_back(path[next]);
+    at = next;
+  }
+  return out;
+}
+
 }  // namespace mgg

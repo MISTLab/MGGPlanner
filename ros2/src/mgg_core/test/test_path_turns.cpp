@@ -10,6 +10,7 @@
 
 #include "mgg_core/path_selection.h"
 #include "mgg_core/path_turns.h"
+#include "mgg_core/trajectory.h"
 
 namespace {
 
@@ -346,8 +347,8 @@ TEST(PathTurnCheck, TurnWithoutRoomIsAvoidedWhenThereIsAnother) {
 
   const Walls map(corridorWall);
   const RobotParams bot = robot();
-  const auto room = [&map, &bot](const Vertex& v) {
-    return mgg::turnClear(map, bot, v.state);
+  const auto room = [&map, &bot](const StateVec& pose) {
+    return mgg::turnClear(map, bot, pose);
   };
   mgg::PlanningParams planning;
   planning.path_length_penalty = 0.0;
@@ -376,6 +377,60 @@ TEST(PathTurnCheck, TurnWithoutRoomIsAvoidedWhenThereIsAnother) {
       graph, planning, bot, flat, 0.2, 0.0, {}, 0.0, nullptr, std::ref(check));
   EXPECT_EQ(fallback.best_path_id, a.back()->id);
   EXPECT_TRUE(fallback.sharp_turn_fallback);
+}
+
+TEST(PathTurnCheck, ShortcutMakesNoTurnTheChosenPathDidNotHave) {
+  // Review r0, P1 1: segment headings of 0, 30, 60 and 90 degrees, one
+  // metre each, over the 16 degree ramp. Each turn is 30 degrees, so the
+  // path is chosen; joining the segments in pairs gives headings of 15 and
+  // 75 degrees, a 60 degree turn on the ramp.
+  GraphManager ground;
+  addRampLattice(ground);
+  std::vector<Eigen::Vector2d> at = {{0.2, 0.0}};
+  for (double heading : {0.0, 30.0, 60.0, 90.0}) {
+    at.push_back(at.back() + Eigen::Vector2d(std::cos(heading * kDeg),
+                                             std::sin(heading * kDeg)));
+  }
+  const auto branch = rampPath(at, 0.0);
+  GraphManager graph;
+  graph.addVertex(branch.front());
+  for (std::size_t i = 1; i < branch.size(); ++i) {
+    graph.addVertex(branch[i]);
+    graph.addEdge(branch[i], branch[i - 1], 1.0);
+  }
+  branch.back()->vol_gain.gain = 100.0;
+  PathTurnCheck check(ground, robot());
+  mgg::PlanningParams planning;
+  mgg::EdgeInclinations flat;
+  const auto sel = mgg::selectBestPath(graph, planning, robot(), flat, 0.2,
+                                       0.0, {}, 0.0, nullptr,
+                                       std::ref(check));
+  ASSERT_EQ(sel.best_path_id, branch.back()->id);
+  ASSERT_FALSE(sel.sharp_turn_fallback);
+
+  // The planner's shortcut, with only leaps over one point free.
+  mgg::PathType points;
+  for (const Vertex* v : sel.best_path) points.push_back(v->state.head<3>());
+  const auto index = [&points](const Eigen::Vector3d& p) {
+    return std::find(points.begin(), points.end(), p) - points.begin();
+  };
+  const mgg::SegmentFreeFn skip_one = [&index](const Eigen::Vector3d& a,
+                                               const Eigen::Vector3d& b) {
+    return index(b) - index(a) <= 2;
+  };
+  const mgg::PathOkFn turns_ok = [&check](const mgg::PathType& p) {
+    return check.admissible(p, 0.0);
+  };
+  ASSERT_TRUE(turns_ok(points));
+  const mgg::PathType plain = mgg::shortcutPath(points, skip_one);
+  ASSERT_EQ(plain.size(), 3u);
+  EXPECT_FALSE(turns_ok(plain));  // what the planner used to send
+
+  const mgg::PathType kept = mgg::shortcutPath(points, skip_one, turns_ok);
+  EXPECT_TRUE(turns_ok(kept));
+  EXPECT_LT(kept.size(), points.size());  // it still shortcuts where it can
+  EXPECT_EQ(kept.front(), points.front());
+  EXPECT_EQ(kept.back(), points.back());
 }
 
 }  // namespace

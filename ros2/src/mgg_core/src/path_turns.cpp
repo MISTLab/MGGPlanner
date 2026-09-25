@@ -91,17 +91,48 @@ PathTurnCheck::PathTurnCheck(GraphManager& graph, const RobotParams& robot,
       window_(std::max(robot.size.x(), robot.size.y())),
       room_to_turn_(std::move(room_to_turn)) {}
 
-double PathTurnCheck::slopeAt(const Vertex& vertex) {
-  const auto found = slope_by_id_.find(vertex.id);
-  if (found != slope_by_id_.end()) return found->second;
-  return slope_by_id_[vertex.id] = terrainSlope(graph_, vertex, window_);
+namespace {
+
+/// Millimetres: a path's points are graph vertices or lie on its edges, so
+/// equal positions are equal to far better than that.
+std::array<long long, 3> positionKey(const Eigen::Vector3d& p) {
+  return {std::llround(p.x() * 1000.0), std::llround(p.y() * 1000.0),
+          std::llround(p.z() * 1000.0)};
 }
 
-bool PathTurnCheck::roomAt(const Vertex& vertex) {
+}  // namespace
+
+double PathTurnCheck::slopeAt(const Eigen::Vector3d& position) {
+  const PositionKey key = positionKey(position);
+  const auto found = slope_at_.find(key);
+  if (found != slope_at_.end()) return found->second;
+  const Vertex probe(-1, StateVec(position.x(), position.y(), position.z(), 0));
+  return slope_at_[key] = terrainSlope(graph_, probe, window_);
+}
+
+bool PathTurnCheck::roomAt(const Eigen::Vector3d& position) {
   if (!room_to_turn_) return true;
-  const auto found = room_by_id_.find(vertex.id);
-  if (found != room_by_id_.end()) return found->second;
-  return room_by_id_[vertex.id] = room_to_turn_(vertex);
+  const PositionKey key = positionKey(position);
+  const auto found = room_at_.find(key);
+  if (found != room_at_.end()) return found->second;
+  return room_at_[key] = room_to_turn_(
+             StateVec(position.x(), position.y(), position.z(), 0.0));
+}
+
+PathTurnCheck::Refusal PathTurnCheck::firstRefusal(
+    const std::vector<Eigen::Vector3d>& points, double start_heading) {
+  const std::vector<double> turns = pathTurns(points, start_heading, window_);
+  for (std::size_t i = 0; i < turns.size(); ++i) {
+    if (turns[i] <= kSharpTurnRad + 1e-9) continue;
+    if (slopeAt(points[i]) > kLevelGroundSlopeRad) return Refusal::kSlope;
+    if (!roomAt(points[i])) return Refusal::kRoom;
+  }
+  return Refusal::kNone;
+}
+
+bool PathTurnCheck::admissible(const std::vector<Eigen::Vector3d>& points,
+                               double start_heading) {
+  return firstRefusal(points, start_heading) == Refusal::kNone;
 }
 
 bool PathTurnCheck::operator()(const std::vector<Vertex*>& path) {
@@ -109,18 +140,15 @@ bool PathTurnCheck::operator()(const std::vector<Vertex*>& path) {
   std::vector<Eigen::Vector3d> points;
   points.reserve(path.size());
   for (const Vertex* v : path) points.push_back(v->state.head<3>());
-  const std::vector<double> turns =
-      pathTurns(points, path.front()->state[3], window_);
-  for (std::size_t i = 0; i < turns.size(); ++i) {
-    if (turns[i] <= kSharpTurnRad + 1e-9) continue;
-    if (slopeAt(*path[i]) > kLevelGroundSlopeRad) {
+  switch (firstRefusal(points, path.front()->state[3])) {
+    case Refusal::kSlope:
       ++refused_on_slope;
       return false;
-    }
-    if (!roomAt(*path[i])) {
+    case Refusal::kRoom:
       ++refused_without_room;
       return false;
-    }
+    case Refusal::kNone:
+      break;
   }
   return true;
 }

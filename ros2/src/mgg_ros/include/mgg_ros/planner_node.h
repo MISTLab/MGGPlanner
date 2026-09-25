@@ -59,6 +59,7 @@
 #include "mgg_core/params.h"
 #include "mgg_core/random_sampler.h"
 #include "mgg_core/sensor_params.h"
+#include "mgg_core/trajectory.h"
 #include "mgg_map_octomap/mola_map.h"
 
 namespace mgg {
@@ -150,7 +151,11 @@ class PlannerNode : public rclcpp::Node {
                             std::string& reason);
   /// Straightens a route where the map vouches for the straight segment and
   /// resamples it at path_interpolation_distance (rrg.cpp:4160 and 4176).
-  void shortcutAndResample(std::vector<mgg::StateVec>& path);
+  /// With `turns_ok`, a route that passes it still passes afterwards: the
+  /// shortcut takes only leaps that keep it, and a resampled route that
+  /// fails it is replaced by the route as it came.
+  void shortcutAndResample(std::vector<mgg::StateVec>& path,
+                           const mgg::PathOkFn& turns_ok = nullptr);
 
   /// The roadmap side of the cycle: the accepted exploration path and the
   /// frontier clusters of the local graph join the global graph.
@@ -291,6 +296,9 @@ class PlannerNode : public rclcpp::Node {
   /// without room to turn (mgg::PathTurnCheck), because no path complied,
   /// since the node started.
   int sharp_turn_fallbacks_ = 0;
+  /// Exploration paths sent unshortcut because the shortcut, once resampled,
+  /// turned where the lattice path did not, since the node started.
+  int shortcut_turn_reverts_ = 0;
   int auto_global_planner_low_gain_rounds_ = 15;
   /// rrg.cpp:5838 to 5843 and 1229 to 1240: the global frontier being
   /// driven to, kept until the robot is within global_frontier_reach_m.

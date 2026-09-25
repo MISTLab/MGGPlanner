@@ -1006,7 +1006,8 @@ void PlannerNode::addFrontiers() {
 // ---------------------------------------------------------------------------
 // Paths
 
-void PlannerNode::shortcutAndResample(std::vector<mgg::StateVec>& path) {
+void PlannerNode::shortcutAndResample(std::vector<mgg::StateVec>& path,
+                                      const mgg::PathOkFn& turns_ok) {
   path_shortcut_from_ = static_cast<int>(path.size());
   path_shortcut_corners_ = path_shortcut_from_;
   path_shortcut_to_ = path_shortcut_from_;
@@ -1043,7 +1044,9 @@ void PlannerNode::shortcutAndResample(std::vector<mgg::StateVec>& path) {
   mgg::PathType points;
   points.reserve(path.size());
   for (const mgg::StateVec& s : path) points.push_back(s.head(3));
-  points = mgg::shortcutPath(points, segment_free);
+  const mgg::PathType unshortcut = points;
+  const bool unshortcut_ok = turns_ok && turns_ok(unshortcut);
+  points = mgg::shortcutPath(points, segment_free, turns_ok);
   path_shortcut_corners_ = static_cast<int>(points.size());
   mgg::PathType resampled;
   if (planning_params_.path_interpolation_distance > 0.0 &&
@@ -1057,6 +1060,17 @@ void PlannerNode::shortcutAndResample(std::vector<mgg::StateVec>& path) {
       resampled.push_back(points.back());
     }
     points = resampled;
+  }
+  // Resampling moves where each turn's measuring window ends, so the route
+  // is checked again as it will be sent.
+  if (unshortcut_ok && !turns_ok(points)) {
+    points = unshortcut;
+    path_shortcut_corners_ = static_cast<int>(points.size());
+    ++shortcut_turn_reverts_;
+    RCLCPP_WARN(get_logger(),
+                "shortcut route turns where the lattice path does not; sent "
+                "unshortcut (%d so far)",
+                shortcut_turn_reverts_);
   }
   path_shortcut_to_ = static_cast<int>(points.size());
 
@@ -1162,8 +1176,8 @@ std::string PlannerNode::buildLocalGraph() {
   // place; a path that turns elsewhere is taken only when no other path
   // would be.
   mgg::PathTurnCheck turn_check(
-      *local_graph_, robot_params_, [this](const mgg::Vertex& v) {
-        return mgg::turnClear(*map_, robot_params_, v.state);
+      *local_graph_, robot_params_, [this](const mgg::StateVec& pose) {
+        return mgg::turnClear(*map_, robot_params_, pose);
       });
   mgg::PathTurnsFn turns_admissible;
   if (robot_params_.type == mgg::RobotType::kGroundRobot) {
@@ -1203,7 +1217,15 @@ std::string PlannerNode::buildLocalGraph() {
   // rrg.cpp:4538: the accepted lattice path joins the global graph as its
   // vertices, before the shortcut turns it into poses.
   if (best_path_.size() >= 2) addRefPathToGraph(best_path_);
-  shortcutAndResample(best_path_);
+  // The shortcut must not make a turn the chosen path did not have.
+  const double start_heading = current_state_[3];
+  shortcutAndResample(
+      best_path_, turns_admissible
+                      ? mgg::PathOkFn([&turn_check, start_heading](
+                                          const mgg::PathType& points) {
+                          return turn_check.admissible(points, start_heading);
+                        })
+                      : mgg::PathOkFn());
   if (best_path_.size() >= 2) {
     // Remember where this path is heading, so the next cycle penalises
     // doubling back.
