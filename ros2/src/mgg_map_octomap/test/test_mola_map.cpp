@@ -823,6 +823,24 @@ TEST(NativeMolaGrid, RaySupercoverIncludesCornerCellsInBothDirections) {
   EXPECT_EQ(map.getRayStatus(b, a, false), VoxelStatus::kOccupied);
 }
 
+// Review r1 (P2) turned this up: a 45 degree ray ending on a voxel
+// boundary, whose last y crossing rounds within the tie tolerance of an x
+// crossing. The walk stepped y past the target cell with x and ran on to
+// its work limit, 4 million voxels, and the query came back unknown.
+TEST(NativeMolaGrid, RayEndingOnABoundaryAtATieEndsAtItsTarget) {
+  using Grid = mgg::NativeMolaGrid;
+  Grid map(0.2, {}, {}, {});
+  const Eigen::Vector3d a(0.1, 0.1, 0.1);
+  const Eigen::Vector3d b =
+      a + Eigen::Vector3d(1.5000000000000002, -1.5, -2.1213203435596424);
+  Eigen::Vector3d end;
+  EXPECT_EQ(map.getRayStatus(a, b, false, end), VoxelStatus::kFree);
+  EXPECT_TRUE(end.isApprox(b));
+  // The walk ends at the target cell, and a return in it stops the ray.
+  Grid wall(0.2, {{8, -7, -11}}, {}, {});
+  EXPECT_EQ(wall.getRayStatus(a, b, false, end), VoxelStatus::kOccupied);
+}
+
 TEST(NativeMolaGrid, RaySupercoverIncludesStartFaceInBothDirections) {
   using Grid = mgg::NativeMolaGrid;
   const Eigen::Vector3d face(0.2, 0.1, 0.1);

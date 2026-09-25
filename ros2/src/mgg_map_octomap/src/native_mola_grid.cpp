@@ -268,13 +268,23 @@ bool NativeMolaGrid::walk(const Eigen::Vector3d& a, const Eigen::Vector3d& b,
   plane_mask = stationary_plane_mask;
   while (current.x != target.x || current.y != target.y ||
          current.z != target.z) {
-    const double crossing = next.minCoeff();
+    // Only axes short of the target cell take part. Where the segment ends
+    // on a voxel boundary, rounding can put that boundary's crossing within
+    // the tie tolerance of another axis's; stepping such an axis past its
+    // target cell left the walk unable to finish until it ran out of work.
+    const unsigned open = (current.x != target.x ? 1u : 0u) |
+                          (current.y != target.y ? 2u : 0u) |
+                          (current.z != target.z ? 4u : 0u);
+    double crossing = std::numeric_limits<double>::infinity();
+    for (int axis = 0; axis < 3; ++axis)
+      if (open & (1u << axis)) crossing = std::min(crossing, next[axis]);
     if (!std::isfinite(crossing)) return false;
     const double tolerance = 16.0 * std::numeric_limits<double>::epsilon() *
                              std::max(1.0, std::abs(crossing));
     unsigned mask = 0;
     for (int axis = 0; axis < 3; ++axis)
-      if (std::abs(next[axis] - crossing) <= tolerance) mask |= 1u << axis;
+      if ((open & (1u << axis)) && std::abs(next[axis] - crossing) <= tolerance)
+        mask |= 1u << axis;
     // A boundary edge or corner belongs to every adjacent closed cell for
     // conservative ray semantics. Visit all non-empty tied-axis subsets.
     for (unsigned subset = mask; subset != 0; subset = (subset - 1) & mask) {
