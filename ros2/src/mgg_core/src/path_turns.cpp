@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <utility>
 
 namespace mgg {
 namespace {
@@ -75,13 +76,32 @@ double terrainSlope(GraphManager& graph, const Vertex& vertex, double radius) {
   return std::atan(std::hypot(plane.x(), plane.y()));
 }
 
-PathTurnCheck::PathTurnCheck(GraphManager& graph, const RobotParams& robot)
-    : graph_(graph), window_(std::max(robot.size.x(), robot.size.y())) {}
+bool turnClear(const MapInterface& map, const RobotParams& robot,
+               const StateVec& state) {
+  const double radius = 0.5 * robot.size.head<2>().norm();
+  const Eigen::Vector3d center = state.head<3>() + robot.center_offset;
+  return map.getOccupiedOnlyCylinderPathStatus(
+             center, center, radius, robot.getPlanningSize().z()) !=
+         VoxelStatus::kOccupied;
+}
+
+PathTurnCheck::PathTurnCheck(GraphManager& graph, const RobotParams& robot,
+                             TurnRoomFn room_to_turn)
+    : graph_(graph),
+      window_(std::max(robot.size.x(), robot.size.y())),
+      room_to_turn_(std::move(room_to_turn)) {}
 
 double PathTurnCheck::slopeAt(const Vertex& vertex) {
   const auto found = slope_by_id_.find(vertex.id);
   if (found != slope_by_id_.end()) return found->second;
   return slope_by_id_[vertex.id] = terrainSlope(graph_, vertex, window_);
+}
+
+bool PathTurnCheck::roomAt(const Vertex& vertex) {
+  if (!room_to_turn_) return true;
+  const auto found = room_by_id_.find(vertex.id);
+  if (found != room_by_id_.end()) return found->second;
+  return room_by_id_[vertex.id] = room_to_turn_(vertex);
 }
 
 bool PathTurnCheck::operator()(const std::vector<Vertex*>& path) {
@@ -95,6 +115,10 @@ bool PathTurnCheck::operator()(const std::vector<Vertex*>& path) {
     if (turns[i] <= kSharpTurnRad + 1e-9) continue;
     if (slopeAt(*path[i]) > kLevelGroundSlopeRad) {
       ++refused_on_slope;
+      return false;
+    }
+    if (!roomAt(*path[i])) {
+      ++refused_without_room;
       return false;
     }
   }

@@ -10,6 +10,11 @@
 // vertices carry no heading: whether a robot turns at a vertex depends on
 // the edge it arrives by and the edge it leaves by, which only a path fixes.
 // A lattice with heading in its state would be a different planner.
+//
+// A sharp turn also needs room: a skid-steer robot turns in place, sweeping
+// the circle through its corners. MGG's body check is a box aligned with the
+// map, 0.41 m either side for a Bunker whose corners reach 0.64 m, and it
+// routed Bunkers along walls to turn where they could not (SubT, 2026-09-23).
 
 #ifndef MGG_CORE_PATH_TURNS_H_
 #define MGG_CORE_PATH_TURNS_H_
@@ -21,6 +26,7 @@
 #include <Eigen/Dense>
 
 #include "mgg_core/graph_manager.h"
+#include "mgg_core/map_interface.h"
 #include "mgg_core/params.h"
 #include "mgg_core/types.h"
 
@@ -50,29 +56,49 @@ std::vector<double> pathTurns(const std::vector<Eigen::Vector3d>& points,
 /// do not span a plane.
 double terrainSlope(GraphManager& graph, const Vertex& vertex, double radius);
 
+/// Whether the robot has room to turn in place at `state`: no occupied voxel
+/// within its circumscribed radius, half the diagonal of RobotParams::size x
+/// and y, over the height of its collision box. viewpointClear asks for the
+/// inscribed radius, which is room to stand, not to turn. Unknown space
+/// passes, as it does there, and so does a query the map cannot answer.
+bool turnClear(const MapInterface& map, const RobotParams& robot,
+               const StateVec& state);
+
 /// Whether a path turns sharply only where it may.
 using PathTurnsFn = std::function<bool(const std::vector<Vertex*>&)>;
 
+/// Whether the robot has room to turn in place at a vertex, e.g. turnClear.
+using TurnRoomFn = std::function<bool(const Vertex&)>;
+
 /// The check selectBestPath applies to a ground robot's candidate paths
-/// through `graph`: no sharp turn (kSharpTurnRad) where the terrain slopes
-/// more than kLevelGroundSlopeRad. Turns are measured over the robot's
-/// length, the larger of RobotParams::size x and y, and the terrain slope is
-/// fitted over the same radius. Slopes are computed once per vertex.
+/// through `graph`: a sharp turn (kSharpTurnRad) is refused where the
+/// terrain slopes more than kLevelGroundSlopeRad, and, with `room_to_turn`,
+/// where the robot has no room to turn in place. The first vertex is where
+/// the robot stands: a path that sets off sharply away from its heading
+/// needs room there too. Turns are measured over the robot's length, the
+/// larger of RobotParams::size x and y, and the terrain slope is fitted over
+/// the same radius. Slope and room are found once per vertex.
 class PathTurnCheck {
  public:
-  PathTurnCheck(GraphManager& graph, const RobotParams& robot);
+  PathTurnCheck(GraphManager& graph, const RobotParams& robot,
+                TurnRoomFn room_to_turn = nullptr);
 
   bool operator()(const std::vector<Vertex*>& path);
 
-  /// Candidate paths refused for a sharp turn on a slope.
+  /// Candidate paths refused for a sharp turn on a slope, and for one
+  /// without room to turn.
   int refused_on_slope = 0;
+  int refused_without_room = 0;
 
  private:
   double slopeAt(const Vertex& vertex);
+  bool roomAt(const Vertex& vertex);
 
   GraphManager& graph_;
   double window_ = 0.0;
+  TurnRoomFn room_to_turn_;
   std::unordered_map<int, double> slope_by_id_;
+  std::unordered_map<int, bool> room_by_id_;
 };
 
 }  // namespace mgg

@@ -1158,9 +1158,13 @@ std::string PlannerNode::buildLocalGraph() {
           ? std::atan2(exploration_target_->y() - current_state_.y(),
                        exploration_target_->x() - current_state_.x())
           : exploring_direction_;
-  // A ground robot turns sharply only on level ground; a path that turns
-  // on a slope is taken only when no other path would be.
-  mgg::PathTurnCheck turn_check(*local_graph_, robot_params_);
+  // A ground robot turns sharply only on level ground with room to turn in
+  // place; a path that turns elsewhere is taken only when no other path
+  // would be.
+  mgg::PathTurnCheck turn_check(
+      *local_graph_, robot_params_, [this](const mgg::Vertex& v) {
+        return mgg::turnClear(*map_, robot_params_, v.state);
+      });
   mgg::PathTurnsFn turns_admissible;
   if (robot_params_.type == mgg::RobotType::kGroundRobot) {
     turns_admissible = std::ref(turn_check);
@@ -1181,8 +1185,8 @@ std::string PlannerNode::buildLocalGraph() {
     ++sharp_turn_fallbacks_;
     RCLCPP_WARN(get_logger(),
                 "exploration path to (%.2f, %.2f, %.2f) turns sharply on a "
-                "slope: no path turns only on level ground (%d such paths so "
-                "far)",
+                "slope or without room to turn: no path turns only where it "
+                "may (%d such paths so far)",
                 best_path_.back().x(), best_path_.back().y(),
                 best_path_.back().z(), sharp_turn_fallbacks_);
   }
@@ -1240,7 +1244,8 @@ std::string PlannerNode::buildLocalGraph() {
       "grid graph: %d free cells, %d vertices, %d edges%s%s; %d viewpoints, "
       "%d frontiers; best path %zu poses (%d lattice -> %d corners -> %d "
       "resampled), gain %.1f%s; viewpoint clearance: %d paths pulled back, "
-      "%d without%s; sharp turns: %d paths refused (%d on a slope)%s; "
+      "%d without%s; sharp turns: %d paths refused (%d on a slope, %d "
+      "without room)%s; "
       "heading %.2f rad%s",
       r.free_cells, r.vertices_added, r.edges_added,
       r.hit_limit ? " (hit a size limit)" : "", why, evaluated, frontiers,
@@ -1250,6 +1255,7 @@ std::string PlannerNode::buildLocalGraph() {
       sel.paths_pulled_back, sel.paths_without_clear_viewpoint,
       sel.unclear_viewpoint ? ", none ends clear" : "",
       sel.paths_with_sharp_turns, turn_check.refused_on_slope,
+      turn_check.refused_without_room,
       sel.sharp_turn_fallback ? ", none complies" : "", exploring_direction_,
       timing);
 
