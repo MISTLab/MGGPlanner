@@ -81,9 +81,13 @@ void computeVolumetricGain(
         const double max_h_above = (ctx.planning != nullptr)
                                        ? std::max(ctx.planning->robot_height * 2.5, 1.2)
                                        : 1.2;
-        const double max_h_below = (ctx.planning != nullptr)
-                                       ? std::max(ctx.planning->max_ground_height * 2.0, 1.0)
-                                       : 1.0;
+        // A vertex rides max_ground_height above its ground. Below the
+        // floor nothing can be seen; the band went 1.0 m below the vertex,
+        // about 0.55 m under the simulated floor, and that was 0.10 of the
+        // count (diag-viewpoint, 2026-09-24). It now ends one voxel below
+        // the ground, which keeps the voxel the floor surface lies in.
+        const double max_h_below =
+            ctx.planning->max_ground_height + ctx.map->getResolution();
         if (voxel.z() - origin.z() > max_h_above || origin.z() - voxel.z() > max_h_below) {
           continue;
         }

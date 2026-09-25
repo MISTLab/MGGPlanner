@@ -4,7 +4,9 @@
 #include <gtest/gtest.h>
 
 #include <cmath>
+#include <algorithm>
 #include <cstdint>
+#include <limits>
 #include <set>
 #include <string>
 #include <tuple>
@@ -128,6 +130,37 @@ TEST(NativeGain, WallGapsHideWhatIsBehindAndADoorwayDoesNot) {
   }
   EXPECT_EQ(through_gaps, 0);
   EXPECT_GT(through_doorway, 200);
+}
+
+// Diagnosis 2026-09-24 (diag-viewpoint, Q2): the gain counted voxels down to
+// 1.0 m below the vertex, about 0.55 m below the floor for the simulated
+// robots, where nothing can be seen (0.10 of the count at the captured plan
+// ends). A vertex rides max_ground_height above its ground, and the gain
+// stops one voxel below that ground.
+TEST(NativeGain, NothingMoreThanAVoxelBelowTheFloorCounts) {
+  mgg::NativeMolaGrid map(kResolution, {}, {}, {});
+  GainSetup setup(map);
+  mgg::RobotParams robot;
+  robot.type = mgg::RobotType::kGroundRobot;
+  setup.ctx.robot = &robot;
+  setup.planning.robot_height = 0.2;
+  setup.planning.max_ground_height = 0.45;
+
+  // The floor under this vertex is at z = 0.05.
+  const double vertex_z = 0.5;
+  const double floor_z = vertex_z - setup.planning.max_ground_height;
+  mgg::VolumetricGain gain;
+  std::vector<std::pair<Eigen::Vector3d, VoxelStatus>> counted;
+  mgg::computeVolumetricGain(mgg::StateVec(0.1, 0.1, vertex_z, 0.0), gain,
+                             setup.ctx, &counted);
+
+  ASSERT_FALSE(counted.empty());
+  double lowest = std::numeric_limits<double>::infinity();
+  for (const auto& entry : counted) lowest = std::min(lowest, entry.first.z());
+  // Voxel centres: the one straddling the floor, [0.0, 0.2), counts, and the
+  // one below it, [-0.2, 0.0), is within a voxel of the floor.
+  EXPECT_GE(lowest, floor_z - kResolution - 1e-9);
+  EXPECT_LE(lowest, floor_z);
 }
 
 }  // namespace
