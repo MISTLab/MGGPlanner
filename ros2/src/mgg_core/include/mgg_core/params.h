@@ -206,6 +206,12 @@ struct PlanningParams {
   /// path's final pose keeps from known obstacles (viewpointClear), metres.
   /// Not an upstream parameter.
   double viewpoint_clearance_margin = 0.1;
+  /// Whether a ground robot boxed in where it stands, with no room to turn
+  /// in place, may be sent straight back out along its heading when there is
+  /// no room ahead (PlannerNode::straightDeparture). SwarmDeck's Nav2
+  /// controllers drive backwards (DWB min_vel_x below zero). Not an
+  /// upstream parameter.
+  bool departure_reverse_allowed = true;
 
   // Global planner.
   double relaxed_corridor_multiplier = 1.0;

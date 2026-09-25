@@ -96,6 +96,11 @@ class PlannerNodeTestPeer {
     node.onOdometry(msg);
   }
 
+  static void acceptOdometry(
+      PlannerNode& node, const nav_msgs::msg::Odometry::SharedPtr& msg) {
+    node.onOdometry(msg);
+  }
+
   static int globalVertices(PlannerNode& node) {
     const std::lock_guard<std::recursive_mutex> lock(node.planner_mutex_);
     return node.global_graph_->getNumVertices();
@@ -205,6 +210,38 @@ class PlannerNodeTestPeer {
     const std::lock_guard<std::recursive_mutex> lock(node.planner_mutex_);
     node.shortcutAndResample(path, turns_ok);
     return node.shortcut_turn_reverts_;
+  }
+  /// A robot `length` along x and `width` across, box and all.
+  static void setRobotFootprint(PlannerNode& node, double length,
+                                double width) {
+    const std::lock_guard<std::recursive_mutex> lock(node.planner_mutex_);
+    node.robot_params_.size.x() = length;
+    node.robot_params_.size.y() = width;
+  }
+  static void setDepartureReverseAllowed(PlannerNode& node, bool allowed) {
+    node.planning_params_.departure_reverse_allowed = allowed;
+  }
+  /// The robot at (x, y) facing `yaw`, at driving height over the map.
+  static mgg::StateVec drivingState(PlannerNode& node, double x, double y,
+                                    double yaw) {
+    const std::lock_guard<std::recursive_mutex> lock(node.planner_mutex_);
+    mgg::StateVec state(x, y, 0.075, yaw);
+    EXPECT_TRUE(node.projectToDrivingHeight(state));
+    state[3] = yaw;
+    return state;
+  }
+  static bool roomToTurn(PlannerNode& node, const mgg::StateVec& state) {
+    const std::lock_guard<std::recursive_mutex> lock(node.planner_mutex_);
+    return mgg::turnClear(*node.map_, node.robot_params_, state);
+  }
+  static bool straightDeparture(PlannerNode& node, const mgg::StateVec& start,
+                                std::vector<mgg::StateVec>& path,
+                                bool& reverse) {
+    const std::lock_guard<std::recursive_mutex> lock(node.planner_mutex_);
+    return node.straightDeparture(start, path, reverse);
+  }
+  static int boxedInWithoutDeparture(PlannerNode& node) {
+    return node.boxed_in_without_departure_;
   }
   /// Routes to a goal sent although no route complied with the turn rule.
   static int routeSharpTurnFallbacks(PlannerNode& node) {
@@ -829,6 +866,107 @@ TEST_F(PlannerNodeTest, AResampledRouteThatFailsTheTurnCheckIsSentUnshortcut) {
     EXPECT_TRUE(reverted[i].head<3>().isApprox(lattice[i].head<3>()))
         << "pose " << i;
   }
+}
+
+namespace {
+
+/// A robot 0.6 m long and 0.2 m wide in a corridor along x, 0.5 m wide
+/// (walls at y = +-0.25) from x0 to x1, on a floor mapped from x -3 to 4:
+/// room to drive it along the corridor, not to turn it in place, since its
+/// corners reach 0.32 m from its centre.
+std::shared_ptr<PlannerNode> boxedIn(const std::string& name, double x0,
+                                     double x1) {
+  auto node = makeNode(name);
+  PlannerNodeTestPeer::setRobotFootprint(*node, 0.6, 0.2);
+  PlannerNodeTestPeer::observeFloor(*node, -3.0, 4.0, -1.5, 1.5);
+  PlannerNodeTestPeer::observeWall(*node, x0, x1, 0.25);
+  PlannerNodeTestPeer::observeWall(*node, x0, x1, -0.25);
+  return node;
+}
+
+}  // namespace
+
+TEST_F(PlannerNodeTest, ABoxedInRobotDepartsStraightAheadWhenThereIsRoom) {
+  // Run 4, robot_1: a Bunker in a pocket too tight to turn in was sent a
+  // path that began with a turn, and DWB found no trajectory three times.
+  // The corridor opens out 0.4 m ahead of the robot.
+  auto node = boxedIn("boxed_ahead", -2.5, 0.4);
+  const mgg::StateVec start =
+      PlannerNodeTestPeer::drivingState(*node, 0.0, 0.0, 0.0);
+  ASSERT_FALSE(PlannerNodeTestPeer::roomToTurn(*node, start));
+  std::vector<mgg::StateVec> path;
+  bool reverse = true;
+  ASSERT_TRUE(
+      PlannerNodeTestPeer::straightDeparture(*node, start, path, reverse));
+  EXPECT_FALSE(reverse);
+  ASSERT_GE(path.size(), 2u);
+  EXPECT_TRUE(path.front().head<3>().isApprox(start.head<3>()));
+  // Out of the corridor to the first pose with room to turn, and no
+  // farther.
+  EXPECT_GE(path.back().x(), 0.5);
+  EXPECT_LE(path.back().x(), 1.2);
+  EXPECT_TRUE(PlannerNodeTestPeer::roomToTurn(*node, path.back()));
+  EXPECT_FALSE(PlannerNodeTestPeer::roomToTurn(
+      *node, path[path.size() - 2]));
+  for (const mgg::StateVec& pose : path) {
+    EXPECT_NEAR(pose.y(), 0.0, 1e-9);
+    EXPECT_DOUBLE_EQ(pose[3], 0.0);
+  }
+}
+
+TEST_F(PlannerNodeTest, ABoxedInRobotReversesOutWhenOnlyBehindHasRoom) {
+  // The corridor runs on 2.5 m ahead and opens out 0.4 m behind.
+  auto node = boxedIn("boxed_behind", -0.4, 2.5);
+  const mgg::StateVec start =
+      PlannerNodeTestPeer::drivingState(*node, 0.0, 0.0, 0.0);
+  ASSERT_FALSE(PlannerNodeTestPeer::roomToTurn(*node, start));
+  std::vector<mgg::StateVec> path;
+  bool reverse = false;
+  ASSERT_TRUE(
+      PlannerNodeTestPeer::straightDeparture(*node, start, path, reverse));
+  EXPECT_TRUE(reverse);
+  ASSERT_GE(path.size(), 2u);
+  EXPECT_LE(path.back().x(), -0.5);
+  EXPECT_GE(path.back().x(), -1.2);
+  EXPECT_TRUE(PlannerNodeTestPeer::roomToTurn(*node, path.back()));
+  // Driven backwards: every pose faces the way the robot faces.
+  for (const mgg::StateVec& pose : path) EXPECT_DOUBLE_EQ(pose[3], 0.0);
+
+  // A robot that may not reverse has no way out.
+  PlannerNodeTestPeer::setDepartureReverseAllowed(*node, false);
+  EXPECT_FALSE(
+      PlannerNodeTestPeer::straightDeparture(*node, start, path, reverse));
+  EXPECT_TRUE(path.empty());
+}
+
+TEST_F(PlannerNodeTest, ABoxedInRobotWithNoRoomEitherWayGetsNoDeparture) {
+  auto node = boxedIn("boxed_both", -2.5, 2.5);
+  const mgg::StateVec start =
+      PlannerNodeTestPeer::drivingState(*node, 0.0, 0.0, 0.0);
+  std::vector<mgg::StateVec> path;
+  bool reverse = false;
+  EXPECT_FALSE(
+      PlannerNodeTestPeer::straightDeparture(*node, start, path, reverse));
+  EXPECT_TRUE(path.empty());
+}
+
+TEST_F(PlannerNodeTest, ExplorationBoxedInSendsNoPathThatStartsWithATurn) {
+  // Facing across the corridor, every exploration path starts with a
+  // right-angle turn the robot has no room for, so none complies. Straight
+  // ahead or back runs into a wall at once: no path, rather than the
+  // fallback path that turns.
+  auto node = boxedIn("boxed_explore", -2.5, 2.5);
+  auto msg = std::make_shared<nav_msgs::msg::Odometry>();
+  msg->header.stamp.sec = 1;
+  msg->pose.pose.position.z = 0.075;
+  msg->pose.pose.orientation.z = std::sin(M_PI / 4.0);
+  msg->pose.pose.orientation.w = std::cos(M_PI / 4.0);
+  PlannerNodeTestPeer::acceptOdometry(*node, msg);
+  auto response = std::make_shared<mgg_msgs::srv::PlannerSrv::Response>();
+  PlannerNodeTestPeer::plan(*node, response);
+  EXPECT_TRUE(response->path.empty())
+      << "path of " << response->path.size() << " poses";
+  EXPECT_EQ(PlannerNodeTestPeer::boxedInWithoutDeparture(*node), 1);
 }
 
 }  // namespace mgg_ros

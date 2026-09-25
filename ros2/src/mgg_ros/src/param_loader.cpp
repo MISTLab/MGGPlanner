@@ -282,6 +282,7 @@ bool loadPlanningParams(const ParamLoader& p, const std::string& ns,
   p.get(ns + "/path_safety_enhance_enable", out.path_safety_enhance_enable);
   p.get(ns + "/path_interpolation_distance", out.path_interpolation_distance);
   p.get(ns + "/viewpoint_clearance_margin", out.viewpoint_clearance_margin);
+  p.get(ns + "/departure_reverse_allowed", out.departure_reverse_allowed);
   p.get(ns + "/relaxed_corridor_multiplier", out.relaxed_corridor_multiplier);
   p.get(ns + "/auto_global_planner_enable", out.auto_global_planner_enable);
   p.get(ns + "/go_home_if_fully_explored", out.go_home_if_fully_explored);

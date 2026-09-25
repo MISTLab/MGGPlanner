@@ -27,6 +27,7 @@ class ParamFixture : public ::testing::Test {
         {"PlanningParams.type", std::string("kAdaptiveExploration")},
         {"PlanningParams.viewpoint_clearance_margin", 0.15},
         {"PlanningParams.max_cross_slope", 0.1745},
+        {"PlanningParams.departure_reverse_allowed", false},
         {"PlanningParams.max_goal_ground_rise", 3.5},
         {"RobotParams.type", std::string("kGroundRobot")},
         {"RobotParams.size", std::vector<double>{0.8, 0.8, 0.2}},
@@ -80,6 +81,7 @@ TEST_F(ParamFixture, LoadsPlanningParams) {
   EXPECT_EQ(params.type, mgg::PlanningModeType::kAdaptiveExploration);
   EXPECT_DOUBLE_EQ(params.viewpoint_clearance_margin, 0.15);
   EXPECT_DOUBLE_EQ(params.max_cross_slope, 0.1745);
+  EXPECT_FALSE(params.departure_reverse_allowed);
   EXPECT_DOUBLE_EQ(params.max_goal_ground_rise, 3.5);
   // Absent from the overrides, so the struct default survives.
   EXPECT_DOUBLE_EQ(params.v_max, 0.2);

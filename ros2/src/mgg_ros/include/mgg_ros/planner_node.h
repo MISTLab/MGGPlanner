@@ -139,6 +139,20 @@ class PlannerNode : public rclcpp::Node {
   /// Builds the local grid graph around the current state, scores it and
   /// selects the best path into best_path_. Returns a summary for the log.
   std::string buildLocalGraph();
+  /// A departure for a ground robot boxed in at `start`, at driving height:
+  /// straight ahead along its heading, start[3], or else, with
+  /// PlanningParams::departure_reverse_allowed, straight back. Poses every
+  /// path_interpolation_distance, each step checked with the robot's
+  /// collision box as a shortcut is, up to the first pose at least
+  /// kDepartureMinM out where the robot has room to turn in place
+  /// (mgg::turnClear), and no farther than kDepartureMaxM. Every pose keeps
+  /// the robot's heading, so the way back is driven in reverse. Returns
+  /// false, with `path` empty, when neither way reaches room to turn.
+  bool straightDeparture(const mgg::StateVec& start,
+                         std::vector<mgg::StateVec>& path, bool& reverse);
+  /// Past the controller's goal tolerance, and about a robot's length.
+  static constexpr double kDepartureMinM = 0.5;
+  static constexpr double kDepartureMaxM = 2.0;
   /// Dijkstra over the global graph to the best frontier (rrg.cpp:5559
   /// Rrg::runGlobalPlanner), or to `target_id` when the current global
   /// repositioning is resumed. Fills best_path_; returns false with a reason
@@ -322,6 +336,12 @@ class PlannerNode : public rclcpp::Node {
   /// they turn sharply on a slope or without room to turn, because no route
   /// complied (applyRouteTurnRule), since the node started.
   int route_sharp_turn_fallbacks_ = 0;
+  /// Exploration cycles in which the robot was boxed in: no path complied
+  /// with the turn rule and it had no room to turn where it stood. It was
+  /// sent a straight departure, or no path when it had none, since the node
+  /// started.
+  int boxed_in_departures_ = 0;
+  int boxed_in_without_departure_ = 0;
   /// Exploration paths sent unshortcut because the shortcut, once resampled,
   /// turned where the lattice path did not, since the node started.
   int shortcut_turn_reverts_ = 0;

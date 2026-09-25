@@ -1256,19 +1256,66 @@ std::string PlannerNode::buildLocalGraph() {
                 best_path_.back().z(), unclear_viewpoints_selected_);
   }
 
-  // rrg.cpp:4538: the accepted lattice path joins the global graph as its
-  // vertices, before the shortcut turns it into poses.
-  if (best_path_.size() >= 2) addRefPathToGraph(best_path_);
-  // The shortcut must not make a turn the chosen path did not have.
-  const double start_heading = current_state_[3];
-  shortcutAndResample(
-      best_path_, turns_admissible
-                      ? mgg::PathOkFn([&turn_check, start_heading](
-                                          const mgg::PathType& points) {
-                          return turn_check.admissible(points, start_heading);
-                        })
-                      : mgg::PathOkFn());
-  if (best_path_.size() >= 2) {
+  // Boxed in: no path turns only where it may, and the robot has no room to
+  // turn where it stands, so the fallback path starts with a turn it cannot
+  // make. In run 4 a Bunker sent one in a pocket got no valid trajectory
+  // from DWB three times and exploration was blocked. It drives straight
+  // out instead, ahead or back, until it has room; the next cycle plans
+  // from there. With no way out it gets no path, and its adapter's own
+  // recovery runs.
+  char boxed_in[128] = "";
+  const bool is_boxed_in = sel.sharp_turn_fallback && turns_admissible &&
+                           !mgg::turnClear(*map_, robot_params_, root_state);
+  if (is_boxed_in) {
+    bool reverse = false;
+    if (straightDeparture(root_state, best_path_, reverse)) {
+      ++boxed_in_departures_;
+      const double length =
+          (best_path_.back().head<2>() - best_path_.front().head<2>()).norm();
+      std::snprintf(boxed_in, sizeof(boxed_in),
+                    "; boxed in: straight departure %.2f m %s", length,
+                    reverse ? "in reverse" : "ahead");
+      RCLCPP_INFO(get_logger(),
+                  "boxed in at (%.2f, %.2f, %.2f): no room to turn and no "
+                  "path turns only where it may; departing %.2f m straight "
+                  "%s (%d departures so far)",
+                  root_state.x(), root_state.y(), root_state.z(), length,
+                  reverse ? "back" : "ahead", boxed_in_departures_);
+    } else {
+      ++boxed_in_without_departure_;
+      std::snprintf(boxed_in, sizeof(boxed_in),
+                    "; boxed in: no straight departure, no path");
+      RCLCPP_WARN(get_logger(),
+                  "boxed in at (%.2f, %.2f, %.2f): no room to turn, no path "
+                  "turns only where it may, and no room to turn within "
+                  "%.1f m straight ahead%s; no path (%d times so far)",
+                  root_state.x(), root_state.y(), root_state.z(),
+                  kDepartureMaxM,
+                  planning_params_.departure_reverse_allowed ? " or back"
+                                                             : "",
+                  boxed_in_without_departure_);
+    }
+    // Sent as it is: not a lattice path, and the roadmap keeps no edge the
+    // robot drives backwards.
+    path_shortcut_from_ = static_cast<int>(best_path_.size());
+    path_shortcut_corners_ = path_shortcut_from_;
+    path_shortcut_to_ = path_shortcut_from_;
+  } else {
+    // rrg.cpp:4538: the accepted lattice path joins the global graph as its
+    // vertices, before the shortcut turns it into poses.
+    if (best_path_.size() >= 2) addRefPathToGraph(best_path_);
+    // The shortcut must not make a turn the chosen path did not have.
+    const double start_heading = current_state_[3];
+    shortcutAndResample(
+        best_path_, turns_admissible
+                        ? mgg::PathOkFn([&turn_check, start_heading](
+                                            const mgg::PathType& points) {
+                            return turn_check.admissible(points,
+                                                         start_heading);
+                          })
+                        : mgg::PathOkFn());
+  }
+  if (!is_boxed_in && best_path_.size() >= 2) {
     // Remember where this path is heading, so the next cycle penalises
     // doubling back.
     std::vector<Eigen::Vector3d> points;
@@ -1302,14 +1349,14 @@ std::string PlannerNode::buildLocalGraph() {
                 "; %.0f ms (global %.0f, grid %.0f, gain %.0f, select %.0f)",
                 ms(t_start, t_end), ms(t_start, t_global), ms(t_global, t_grid),
                 ms(t_grid, t_gain), ms(t_gain, t_end));
-  char buf[768];
+  char buf[896];
   std::snprintf(
       buf, sizeof(buf),
       "grid graph: %d free cells, %d vertices, %d edges%s%s; %d viewpoints, "
       "%d frontiers; best path %zu poses (%d lattice -> %d corners -> %d "
       "resampled), gain %.1f%s; viewpoint clearance: %d paths pulled back, "
       "%d without%s; sharp turns: %d paths refused (%d on a slope, %d "
-      "without room)%s%s; "
+      "without room)%s%s%s; "
       "heading %.2f rad%s",
       r.free_cells, r.vertices_added, r.edges_added,
       r.hit_limit ? " (hit a size limit)" : "", why, evaluated, frontiers,
@@ -1321,8 +1368,8 @@ std::string PlannerNode::buildLocalGraph() {
       sel.paths_with_sharp_turns, turn_check.refused_on_slope,
       turn_check.refused_without_room,
       sel.sharp_turn_detour ? ", detour" : "",
-      sel.sharp_turn_fallback ? ", none complies" : "", exploring_direction_,
-      timing);
+      sel.sharp_turn_fallback ? ", none complies" : "", boxed_in,
+      exploring_direction_, timing);
 
   // rrg.cpp:2098 to 2120: rounds without a frontier among the leaves count
   // towards the global planner; a round with one counts back.
@@ -1334,6 +1381,58 @@ std::string PlannerNode::buildLocalGraph() {
     --low_gain_rounds_;
   }
   return std::string(buf);
+}
+
+bool PlannerNode::straightDeparture(const mgg::StateVec& start,
+                                    std::vector<mgg::StateVec>& path,
+                                    bool& reverse) {
+  const double heading = start[3];
+  const double spacing = planning_params_.path_interpolation_distance;
+  const double step = spacing > 0.0 ? std::min(spacing, kDepartureMinM)
+                                    : map_->getResolution();
+  const mgg::ExpandContext ctx = makeContext();
+  // Each step as shortcutAndResample checks a segment: through known free
+  // space only, the whole collision box, and for a ground robot along the
+  // terrain.
+  const auto step_free = [this, &ctx](const mgg::StateVec& from,
+                                      const mgg::StateVec& to) {
+    if (robot_params_.type == mgg::RobotType::kGroundRobot) {
+      std::vector<Eigen::Vector3d> projected;
+      return ground_->getProjectedEdgeStatus(
+                 from.head<3>(), to.head<3>(), ctx.robot_box_size, true,
+                 projected, false) == mgg::ProjectedEdgeStatus::kAdmissible;
+    }
+    return map_->getPathStatus(from.head<3>(), to.head<3>(),
+                               ctx.robot_box_size,
+                               true) == mgg::VoxelStatus::kFree;
+  };
+  const int steps = static_cast<int>(std::ceil(kDepartureMaxM / step - 1e-9));
+  for (const bool backwards : {false, true}) {
+    if (backwards && !planning_params_.departure_reverse_allowed) break;
+    const double direction = backwards ? heading + M_PI : heading;
+    const Eigen::Vector2d unit(std::cos(direction), std::sin(direction));
+    path.assign(1, start);
+    for (int i = 1; i <= steps; ++i) {
+      const double along = std::min(i * step, kDepartureMaxM);
+      const Eigen::Vector2d xy = start.head<2>() + along * unit;
+      mgg::StateVec to(xy.x(), xy.y(), path.back().z(), heading);
+      if (!projectToDrivingHeight(to)) break;
+      // On the line, at the height of the ground found beside it if that
+      // is where projectSample found it.
+      to[0] = xy.x();
+      to[1] = xy.y();
+      to[3] = heading;
+      if (!step_free(path.back(), to)) break;
+      path.push_back(to);
+      if (along >= kDepartureMinM - 1e-9 &&
+          mgg::turnClear(*map_, robot_params_, to)) {
+        reverse = backwards;
+        return true;
+      }
+    }
+  }
+  path.clear();
+  return false;
 }
 
 bool PlannerNode::routeOverGlobalGraph(const mgg::StateVec& goal,
