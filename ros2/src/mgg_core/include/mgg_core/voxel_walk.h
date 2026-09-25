@@ -75,6 +75,35 @@ bool walkVoxels(const Eigen::Vector3d& a, const Eigen::Vector3d& b,
     next[axis] = (boundary - a[axis]) / direction[axis];
     delta[axis] = resolution / std::abs(direction[axis]);
   }
+  // The voxels touching the end point: on each axis, the voxel holding it,
+  // or both voxels meeting at a boundary it lies on. The walk stops in one
+  // of them; those it did not enter, where the end is an edge or a corner,
+  // are visited after it, once each.
+  std::array<std::int64_t, 3> end_low{target.x, target.y, target.z};
+  std::array<std::int64_t, 3> end_high = end_low;
+  for (int axis = 0; axis < 3; ++axis) {
+    const double scaled = b[axis] / resolution;
+    if (std::abs(scaled - std::round(scaled)) <=
+        16.0 * std::numeric_limits<double>::epsilon() *
+            std::max(1.0, std::abs(scaled))) {
+      end_high[axis] = std::llround(scaled);
+      end_low[axis] = end_high[axis] - 1;
+    }
+  }
+  std::array<VoxelIndex, 8> end_cells_visited{};
+  std::size_t end_cells_visited_count = 0;
+  const auto isEndCell = [&](const VoxelIndex& c) {
+    return c.x >= end_low[0] && c.x <= end_high[0] && c.y >= end_low[1] &&
+           c.y <= end_high[1] && c.z >= end_low[2] && c.z <= end_high[2];
+  };
+  const auto endCellVisited = [&](const VoxelIndex& c) {
+    return std::any_of(
+        end_cells_visited.begin(),
+        end_cells_visited.begin() + end_cells_visited_count,
+        [&](const VoxelIndex& v) {
+          return v.x == c.x && v.y == c.y && v.z == c.z;
+        });
+  };
   std::uint64_t work = 0;
   unsigned plane_mask = 0;
   unsigned initial_boundary_mask = 0;
@@ -113,6 +142,10 @@ bool walkVoxels(const Eigen::Vector3d& a, const Eigen::Vector3d& b,
         }
       }
       if (++work > max_work) return -1;
+      if (isEndCell(touched) && !endCellVisited(touched) &&
+          end_cells_visited_count < end_cells_visited.size()) {
+        end_cells_visited[end_cells_visited_count++] = touched;
+      }
       if (!visit(touched)) return 0;
       if (subset == 0) break;
     }
@@ -166,27 +199,17 @@ bool walkVoxels(const Eigen::Vector3d& a, const Eigen::Vector3d& b,
       next.z() += delta.z();
     }
   }
-  unsigned negative_endpoint_mask = 0;
-  for (int axis = 0; axis < 3; ++axis) {
-    const double scaled = b[axis] / resolution;
-    if (direction[axis] < 0.0 &&
-        std::abs(scaled - std::round(scaled)) <=
-            16.0 * std::numeric_limits<double>::epsilon() *
-                std::max(1.0, std::abs(scaled))) {
-      negative_endpoint_mask |= 1u << axis;
-    }
-  }
-  const unsigned endpoint_mask = negative_endpoint_mask | plane_mask;
-  for (unsigned subset = endpoint_mask; subset != 0;
-       subset = (subset - 1) & endpoint_mask) {
-    if ((subset & negative_endpoint_mask) == 0) continue;
-    VoxelIndex touched = target;
-    if (subset & 1u) --touched.x;
-    if (subset & 2u) --touched.y;
-    if (subset & 4u) --touched.z;
-    if (++work > max_work) return false;
-    if (!visit(touched)) return true;
-  }
+  // The walk does not step across a boundary the end lies on, and an axis
+  // that reached its target does not step with another whose crossing ties
+  // at the end: end voxels in any mix of directions may be left unentered.
+  for (auto x = end_low[0]; x <= end_high[0]; ++x)
+    for (auto y = end_low[1]; y <= end_high[1]; ++y)
+      for (auto z = end_low[2]; z <= end_high[2]; ++z) {
+        const VoxelIndex touched{x, y, z};
+        if (endCellVisited(touched)) continue;
+        if (++work > max_work) return false;
+        if (!visit(touched)) return true;
+      }
   return true;
 }
 

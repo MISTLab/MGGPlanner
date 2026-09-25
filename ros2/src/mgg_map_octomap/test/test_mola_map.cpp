@@ -19,6 +19,7 @@
 #include <sstream>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 #include <unistd.h>
 
@@ -26,6 +27,7 @@
 #include "mgg_core/ground_projection.h"
 #include "mgg_core/grid_graph.h"
 #include "mgg_core/path_selection.h"
+#include "mgg_core/voxel_walk.h"
 #include "mgg_map_octomap/mola_map.h"
 #include "mgg_map_octomap/native_mola_grid.h"
 #include "reference_binary_grid.h"
@@ -839,6 +841,71 @@ TEST(NativeMolaGrid, RayEndingOnABoundaryAtATieEndsAtItsTarget) {
   // The walk ends at the target cell, and a return in it stops the ray.
   Grid wall(0.2, {{8, -7, -11}}, {}, {});
   EXPECT_EQ(wall.getRayStatus(a, b, false, end), VoxelStatus::kOccupied);
+}
+
+// Review r2 (P1): ending the walk at its target (713a4ab) stopped an axis
+// already at its target from stepping with another whose crossing tied at
+// the end, and the end cleanup added only voxels below the target along
+// negative axes. From (0.1, 0.1, 0.1) to (0.2, 0.0, 0.1), the voxel
+// (0, -1, 0) touching the end was missed, so a return in it went unseen.
+TEST(NativeMolaGrid, RayEndingOnAnEdgeSeesTheVoxelDiagonallyAcrossIt) {
+  using Grid = mgg::NativeMolaGrid;
+  Grid map(0.2, {{0, -1, 0}}, {}, {});
+  const Eigen::Vector3d a(0.1, 0.1, 0.1);
+  const Eigen::Vector3d b(0.2, 0.0, 0.1);
+  EXPECT_EQ(map.getRayStatus(a, b, false), VoxelStatus::kOccupied);
+  EXPECT_EQ(map.getRayStatus(b, a, false), VoxelStatus::kOccupied);
+}
+
+// Every face, edge and corner of a voxel, in every mix of directions: a
+// segment from the voxel's centre to it touches, and visits once each, the
+// voxel and those across the face, edge or corner. A return in any one of
+// them is seen, walking out or in.
+TEST(NativeMolaGrid, RaysToEveryFaceEdgeAndCornerSeeEveryVoxelTouchingIt) {
+  using Grid = mgg::NativeMolaGrid;
+  const Eigen::Vector3d centre(0.1, 0.1, 0.1);
+  for (int sx = -1; sx <= 1; ++sx)
+    for (int sy = -1; sy <= 1; ++sy)
+      for (int sz = -1; sz <= 1; ++sz) {
+        if (sx == 0 && sy == 0 && sz == 0) continue;
+        const Eigen::Vector3d end = centre + 0.1 * Eigen::Vector3d(sx, sy, sz);
+        std::vector<std::array<std::int64_t, 3>> touching;
+        for (int x : {0, sx})
+          for (int y : {0, sy})
+            for (int z : {0, sz}) {
+              const std::array<std::int64_t, 3> cell{x, y, z};
+              if (std::find(touching.begin(), touching.end(), cell) ==
+                  touching.end())
+                touching.push_back(cell);
+            }
+        const std::string where = std::to_string(sx) + "," +
+                                  std::to_string(sy) + "," +
+                                  std::to_string(sz);
+        for (const auto& [from, to] :
+             {std::pair{centre, end}, std::pair{end, centre}}) {
+          std::vector<std::array<std::int64_t, 3>> visited;
+          EXPECT_TRUE(mgg::walkVoxels(
+              from, to, 0.2, 1u << 22, [&](const mgg::VoxelIndex& v) {
+                visited.push_back({v.x, v.y, v.z});
+                return true;
+              }))
+              << where;
+          std::sort(visited.begin(), visited.end());
+          std::sort(touching.begin(), touching.end());
+          EXPECT_EQ(visited, touching) << where;
+        }
+        for (const auto& cell : touching) {
+          Grid map(0.2, {{cell[0], cell[1], cell[2]}}, {}, {});
+          EXPECT_EQ(map.getRayStatus(centre, end, false),
+                    VoxelStatus::kOccupied)
+              << where << " out, return in " << cell[0] << "," << cell[1]
+              << "," << cell[2];
+          EXPECT_EQ(map.getRayStatus(end, centre, false),
+                    VoxelStatus::kOccupied)
+              << where << " in, return in " << cell[0] << "," << cell[1]
+              << "," << cell[2];
+        }
+      }
 }
 
 TEST(NativeMolaGrid, RaySupercoverIncludesStartFaceInBothDirections) {
