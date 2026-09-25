@@ -2227,6 +2227,38 @@ void PlannerNode::onObjectiveRequest(
     std::shared_ptr<mgg_msgs::srv::PlanObjective::Response> response) {
   using Service = mgg_msgs::srv::PlanObjective;
   const std::lock_guard<std::recursive_mutex> lock(planner_mutex_);
+  // Every answer is logged with the objective, where the robot is and the
+  // goal it asked for: a refusal alone does not say which objective it
+  // answered or where it was going (run 5, 2026-09-25).
+  std::string route_note;
+  struct LogAnswer {
+    std::function<void()> log;
+    ~LogAnswer() { log(); }
+  } log_answer{[this, &request, &response, &route_note]() {
+    const char* objective =
+        request->objective == Service::Request::NAVIGATE      ? "NAVIGATE"
+        : request->objective == Service::Request::RETURN_HOME ? "RETURN_HOME"
+                                                              : "UNKNOWN";
+    const auto& g = request->goal.position;
+    if (response->status == Service::Response::SUCCEEDED) {
+      RCLCPP_INFO(get_logger(),
+                  "objective %s route (robot at %.2f, %.2f; goal %.2f, %.2f, "
+                  "%.2f): %zu poses %s",
+                  objective, current_state_.x(), current_state_.y(), g.x, g.y,
+                  g.z, response->path.size(), route_note.c_str());
+      return;
+    }
+    const char* status =
+        response->status == Service::Response::UNREACHABLE      ? "unreachable"
+        : response->status == Service::Response::STALE_REVISION ? "stale map"
+        : response->status == Service::Response::BLOCKED        ? "blocked"
+                                                          : "unsupported";
+    RCLCPP_WARN(get_logger(),
+                "objective %s refused (robot at %.2f, %.2f; goal %.2f, %.2f, "
+                "%.2f): %s: %s",
+                objective, current_state_.x(), current_state_.y(), g.x, g.y,
+                g.z, status, response->reason.c_str());
+  }};
   withdrawUnplacedNeighbours();
   auto map_read = mapReadLease();
   refreshMapRevision();
@@ -2303,17 +2335,17 @@ void PlannerNode::onObjectiveRequest(
     if (!local_reason.empty()) reason += "; local lattice: " + local_reason;
     response->status = Service::Response::UNREACHABLE;
     response->reason = reason;
-    RCLCPP_WARN(get_logger(), "objective refused: %s", reason.c_str());
     return;
   }
   shortcutAndResample(route, turns_ok);
   response->status = Service::Response::SUCCEEDED;
   for (const mgg::StateVec& s : route) response->path.push_back(toPoseMsg(s));
-  RCLCPP_INFO(get_logger(),
-              "objective route: %zu poses to (%.2f, %.2f) over the %s (%d "
-              "corners)",
-              route.size(), goal.x(), goal.y(),
-              local ? "local lattice" : "global graph", path_shortcut_corners_);
+  char note[160];
+  std::snprintf(note, sizeof(note),
+                "to (%.2f, %.2f) over the %s (%d corners)", goal.x(), goal.y(),
+                local ? "local lattice" : "global graph",
+                path_shortcut_corners_);
+  route_note = note;
 }
 
 // ---------------------------------------------------------------------------
