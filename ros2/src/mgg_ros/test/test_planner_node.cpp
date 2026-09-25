@@ -413,6 +413,12 @@ class PlannerNodeTestPeer {
     }
     return false;
   }
+  static bool repositioningOngoing(PlannerNode& node) {
+    return node.global_exploration_ongoing_;
+  }
+  static int repositioningTarget(PlannerNode& node) {
+    return node.current_global_vertex_id_;
+  }
   /// An accepted exploration path joins the global graph.
   static void addExplorationPath(PlannerNode& node,
                                  const std::vector<mgg::StateVec>& path) {
@@ -1604,6 +1610,34 @@ TEST_F(PlannerNodeTest, APoseTheGraphCannotReachRebuildsItAndRoutesHome) {
       << response->reason;
   EXPECT_EQ(PlannerNodeTestPeer::roadmapRebuilds(*node), 1);
   EXPECT_NEAR(response->path.back().position.x, 0.0, 1e-3);
+}
+
+TEST_F(PlannerNodeTest, ARebuildWhileResumingARepositioningGivesItUp) {
+  // Review r0, C-1: a global repositioning is under way when the robot is
+  // driven round a wall, off its graph. The resumed route cannot link the
+  // robot's pose, which rebuilds the graph and frees the frontier the
+  // route was going to. The repositioning is given up; nothing reads the
+  // old graph afterwards (run under ASan), and no id of it is kept.
+  auto node = makeNode("rebuild_while_resuming");
+  PlannerNodeTestPeer::observeFloor(*node, -1.5, 6.0, -1.5, 1.5);
+  PlannerNodeTestPeer::observeWallAlongY(*node, -1.5, 0.6, 1.35);
+  PlannerNodeTestPeer::acceptOdometry(*node, 0.0, 0.0, 1.0);
+  const int frontier = PlannerNodeTestPeer::addGlobalChainToFrontier(
+      *node, {{0.5, 0.0}, {1.0, 0.0}});
+  PlannerNodeTestPeer::repositionTowards(*node, frontier);
+  PlannerNodeTestPeer::acceptOdometry(*node, 4.5, 0.0, 2.0);
+  PlannerNodeTestPeer::serveMap(*node, "component:test", 0);
+  auto source = std::make_unique<TrajectoryInMemory>();
+  source->trajectory = keyframesAlong(
+      {{0.0, 0.0}, {0.8, 0.0}, {0.8, 1.1}, {2.0, 1.1}, {4.5, 0.0}});
+  PlannerNodeTestPeer::setKeyframeSource(*node, std::move(source));
+
+  auto response = std::make_shared<mgg_msgs::srv::PlannerSrv::Response>();
+  PlannerNodeTestPeer::plan(*node, response);
+  EXPECT_EQ(PlannerNodeTestPeer::roadmapRebuilds(*node), 1);
+  EXPECT_FALSE(PlannerNodeTestPeer::repositioningOngoing(*node));
+  EXPECT_EQ(PlannerNodeTestPeer::repositioningTarget(*node), -1);
+  EXPECT_NE(response->status, PlannerNode::kStatusComplete);
 }
 
 TEST_F(PlannerNodeTest, AnExplorationPathThatCannotBeLinkedRebuildsTheGraph) {

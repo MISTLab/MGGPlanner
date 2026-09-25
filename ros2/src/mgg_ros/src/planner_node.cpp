@@ -1621,7 +1621,7 @@ bool PlannerNode::straightDeparture(const mgg::StateVec& start,
                             start, departure);
 }
 
-bool PlannerNode::routeOverGlobalGraph(const mgg::StateVec& goal,
+bool PlannerNode::routeOverGlobalGraph(const mgg::StateVec goal,
                                        double goal_tolerance,
                                        std::vector<mgg::StateVec>& path,
                                        mgg::PathOkFn& turns_ok,
@@ -2008,12 +2008,28 @@ bool PlannerNode::runGlobalPlanner(int target_id, std::string& reason) {
                 report.best_distance);
     target = report.best_frontier;
   }
-  // Route to it over the global graph (rrg.cpp:5846), whole.
+  // Route to it over the global graph (rrg.cpp:5846), whole. Routing may
+  // rebuild the graph (the robot's pose not linking), which frees `target`:
+  // its state and id are copied first, and a repositioning whose graph was
+  // replaced under it is given up rather than kept on an id of the old one.
+  const mgg::StateVec target_state = target->state;
+  const int target_vertex_id = target->id;
+  target = nullptr;
+  const int rebuilds_before = roadmap_rebuilds_;
   mgg::PathOkFn turns_ok;
-  if (!routeOverGlobalGraph(target->state, 1e-3, best_path_, turns_ok,
-                            reason)) {
+  const bool routed = routeOverGlobalGraph(target_state, 1e-3, best_path_,
+                                           turns_ok, reason);
+  if (roadmap_rebuilds_ != rebuilds_before) {
+    best_path_.clear();
+    global_exploration_ongoing_ = false;
+    current_global_vertex_id_ = -1;
+    reason = "the global graph was rebuilt from the keyframes while routing "
+             "to the frontier" +
+             std::string(routed ? "" : " (" + reason + ")") +
+             "; the repositioning is given up";
     return false;
   }
+  if (!routed) return false;
   shortcutAndResample(best_path_, turns_ok);
   // The frontier is a lattice leaf of an earlier cycle, which may stand
   // against a wall: the route ends where the robot has room (viewpointClear)
@@ -2034,7 +2050,7 @@ bool PlannerNode::runGlobalPlanner(int target_id, std::string& reason) {
   }
   best_path_from_global_graph_ = true;
   // rrg.cpp:5838 to 5843: this frontier is the target until it is reached.
-  current_global_vertex_id_ = target->id;
+  current_global_vertex_id_ = target_vertex_id;
   global_exploration_ongoing_ = true;
   return true;
 }

@@ -163,8 +163,10 @@ class PlannerNode : public rclcpp::Node {
   /// `goal_tolerance` of it, or (tolerance zero, or none there) gets its own
   /// checked vertex at the exact goal. Returns the route in `path`, under
   /// the turn rule (applyRouteTurnRule), and in `turns_ok` the check its
-  /// shortcut must keep passing.
-  bool routeOverGlobalGraph(const mgg::StateVec& goal, double goal_tolerance,
+  /// shortcut must keep passing. `goal` is taken by value: linking the
+  /// robot may rebuild the graph, which would free a goal read from a
+  /// vertex.
+  bool routeOverGlobalGraph(mgg::StateVec goal, double goal_tolerance,
                             std::vector<mgg::StateVec>& path,
                             mgg::PathOkFn& turns_ok, std::string& reason);
   /// A ground robot's route to a goal turns sharply only where it may, as an
