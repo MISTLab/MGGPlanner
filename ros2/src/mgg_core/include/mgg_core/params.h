@@ -227,6 +227,17 @@ struct PlanningParams {
   /// controllers drive backwards (DWB min_vel_x below zero). Not an
   /// upstream parameter.
   bool departure_reverse_allowed = true;
+  /// A ground robot's exploration path is worth less the closer it passes
+  /// known obstacles (selectBestPath): its score is multiplied by a factor
+  /// that is 1 where the least clearance (obstacleClearance) of its end and
+  /// of its vertices farther than this distance from the root is at least
+  /// this distance, metres, and falls linearly to path_clearance_min_factor
+  /// at none.
+  /// Unknown voxels pooled around walls and rocks pull path ends onto them;
+  /// at similar gain, a path down the middle wins. 0 turns it off. Not
+  /// upstream parameters.
+  double path_clearance_distance = 1.5;
+  double path_clearance_min_factor = 0.2;
 
   // Global planner.
   double relaxed_corridor_multiplier = 1.0;

@@ -244,6 +244,13 @@
       # turns only where it may, drives straight out ahead or, with this,
       # straight back, until it has room. Nav2's DWB reverses (min_vel_x < 0).
       departure_reverse_allowed: true
+      # A ground robot's exploration path scores less the closer it passes
+      # known obstacles: times a factor that is 1 at this clearance or more
+      # along the path and its end, falling linearly to the floor at none. At
+      # similar gain a path down the middle wins over one along a wall or a
+      # rock pile. 0 turns it off.
+      path_clearance_distance: 1.5
+      path_clearance_min_factor: 0.2
       auto_global_planner_enable: true
       relaxed_corridor_multiplier: 1.5
       homing_backward: false

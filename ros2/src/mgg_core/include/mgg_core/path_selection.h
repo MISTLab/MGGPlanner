@@ -84,6 +84,25 @@ bool viewpointClear(const MapInterface& map, const RobotParams& robot,
 /// Whether an exploration path may end at a vertex, e.g. viewpointClear.
 using ViewpointClearFn = std::function<bool(const Vertex&)>;
 
+/// How far from `state` the nearest known occupied voxel lies in the xy
+/// plane, over the height of the robot's collision box, up to `limit`
+/// metres: the largest radius of the occupied-only cylinder check
+/// (MapInterface::getOccupiedOnlyCylinderPathStatus, as viewpointClear asks
+/// it) that is clear, found to within limit / 16. `limit` when nothing is
+/// that close, 0 when the check fails at any radius. Unknown space and a
+/// query the map cannot answer count as clear.
+double obstacleClearance(const MapInterface& map, const RobotParams& robot,
+                         const StateVec& state, double limit);
+
+/// The clearance of a vertex, e.g. obstacleClearance.
+using VertexClearanceFn = std::function<double(const Vertex&)>;
+
+/// The factor selectBestPath multiplies a ground robot's path score by for
+/// the least clearance along it, metres: 1 at path_clearance_distance or
+/// more, falling linearly to path_clearance_min_factor at 0; 1 when
+/// path_clearance_distance is 0.
+double pathClearanceFactor(double clearance, const PlanningParams& planning);
+
 /// Ends `route` at its last pose that passes `clear`, dropping the poses
 /// after it; the first pose, where the robot stands, is never asked. Returns
 /// false, leaving `route` untouched, when no pose after the first passes.
@@ -175,6 +194,11 @@ constexpr int kMaxDetourSearchStates = 100000;
 /// frontier then wins over the short one that turns where it may not.
 /// Only when that too chooses nothing is the selection made without the
 /// check, flagged sharp_turn_fallback.
+///
+/// With `clearance`, a ground robot's path score is multiplied by
+/// pathClearanceFactor of the least clearance of its end and of its
+/// vertices farther than PlanningParams::path_clearance_distance from the
+/// root: nearer the robot, every path passes the obstacles it stands by.
 PathSelectionResult selectBestPath(GraphManager& graph,
                                    const PlanningParams& planning,
                                    const RobotParams& robot,
@@ -189,7 +213,9 @@ PathSelectionResult selectBestPath(GraphManager& graph,
                                    const PathTurnsFn& turns_admissible =
                                        nullptr,
                                    const SharpTurnAllowedFn&
-                                       sharp_turn_allowed = nullptr);
+                                       sharp_turn_allowed = nullptr,
+                                   const VertexClearanceFn& clearance =
+                                       nullptr);
 
 }  // namespace mgg
 

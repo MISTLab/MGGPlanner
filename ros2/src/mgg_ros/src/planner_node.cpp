@@ -1216,7 +1216,11 @@ std::string PlannerNode::buildLocalGraph() {
         return mgg::viewpointClear(*map_, robot_params_, planning_params_,
                                    v.state);
       },
-      turns_admissible, sharp_turn_allowed);
+      turns_admissible, sharp_turn_allowed,
+      [this](const mgg::Vertex& v) {
+        return mgg::obstacleClearance(*map_, robot_params_, v.state,
+                                      planning_params_.path_clearance_distance);
+      });
   for (const mgg::Vertex* v : sel.best_path) {
     if (v != nullptr) best_path_.push_back(v->state);
   }

@@ -33,6 +33,33 @@ bool pathGoesNowhere(const PathSelectionResult& selection,
          !(selection.best_full_gain > 0.0);
 }
 
+double obstacleClearance(const MapInterface& map, const RobotParams& robot,
+                         const StateVec& state, double limit) {
+  const Eigen::Vector3d center = state.head<3>() + robot.center_offset;
+  const double height = robot.getPlanningSize().z();
+  const auto clear = [&](double radius) {
+    return map.getOccupiedOnlyCylinderPathStatus(center, center, radius,
+                                                 height) !=
+           VoxelStatus::kOccupied;
+  };
+  if (!(limit > 0.0) || clear(limit)) return std::max(limit, 0.0);
+  if (!clear(0.0)) return 0.0;
+  double lo = 0.0;
+  double hi = limit;
+  for (int i = 0; i < 4; ++i) {
+    const double mid = 0.5 * (lo + hi);
+    (clear(mid) ? lo : hi) = mid;
+  }
+  return lo;
+}
+
+double pathClearanceFactor(double clearance, const PlanningParams& planning) {
+  const double distance = planning.path_clearance_distance;
+  if (!(distance > 0.0)) return 1.0;
+  const double floor = std::clamp(planning.path_clearance_min_factor, 0.0, 1.0);
+  return floor + (1.0 - floor) * std::clamp(clearance / distance, 0.0, 1.0);
+}
+
 bool pullBackToClearViewpoint(
     std::vector<StateVec>& route,
     const std::function<bool(const StateVec&)>& clear) {
@@ -55,13 +82,23 @@ PathSelectionResult selectBestPath(GraphManager& graph,
                                    const ViewpointClearFn& viewpoint_clear,
                                    const PathTurnsFn& turns_admissible,
                                    const SharpTurnAllowedFn&
-                                       sharp_turn_allowed) {
+                                       sharp_turn_allowed,
+                                   const VertexClearanceFn& clearance) {
   // Leaves share their paths' inner vertices; check each vertex once.
   std::unordered_map<int, bool> clear_by_id;
   const auto clear = [&](const Vertex* v) {
     const auto found = clear_by_id.find(v->id);
     if (found != clear_by_id.end()) return found->second;
     return clear_by_id[v->id] = viewpoint_clear(*v);
+  };
+  const bool prefer_clearance = clearance &&
+                                robot.type == RobotType::kGroundRobot &&
+                                planning.path_clearance_distance > 0.0;
+  std::unordered_map<int, double> clearance_by_id;
+  const auto clearance_of = [&](const Vertex* v) {
+    const auto found = clearance_by_id.find(v->id);
+    if (found != clearance_by_id.end()) return found->second;
+    return clearance_by_id[v->id] = clearance(*v);
   };
 
   ShortestPathsReport rep;
@@ -142,6 +179,22 @@ PathSelectionResult selectBestPath(GraphManager& graph,
       const double deviation = computeDistanceBetweenTrajectoryAndDirection(
           path_points, exploring_direction, 0.2, true);
       gain = path_gain * std::exp(-planning.path_direction_penalty * deviation);
+      if (prefer_clearance && path.size() > 1) {
+        // Where the path leaves the robot's surroundings: within that
+        // distance of the root every path passes the same obstacles, and
+        // the end always counts.
+        const Eigen::Vector2d root = path.front()->state.head<2>();
+        double least = planning.path_clearance_distance;
+        for (std::size_t ind = 1; ind < path.size() && least > 0.0; ++ind) {
+          if (ind + 1 < path.size() &&
+              (path[ind]->state.head<2>() - root).norm() <
+                  planning.path_clearance_distance) {
+            continue;
+          }
+          least = std::min(least, clearance_of(path[ind]));
+        }
+        gain *= pathClearanceFactor(least, planning);
+      }
       return true;
     };
     const auto excluded = [&](const Vertex* viewpoint) {
