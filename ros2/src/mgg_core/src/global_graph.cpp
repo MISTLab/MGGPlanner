@@ -461,10 +461,38 @@ RoadmapRebuildReport rebuildRoadmapFromTrajectory(
   // vertex is dropped onto the ground from the robot's base, not from its
   // driving height, which for a tall robot can lie above an overhang it
   // drove under.
-  std::vector<TrajectoryKeyframe> supported;
+  // Where the robot tipped past max_inclination (the latest keyframe
+  // aside): tipped keyframes are set apart before the ground is looked
+  // for, since the ground under a tipped robot is not where its base says.
+  // No edge may pass within the robot's half diagonal of them, and the
+  // keyframe after them starts a new piece of the chain.
+  const auto tipped = [&ctx](const TrajectoryKeyframe& keyframe) {
+    return std::max(std::abs(keyframe.roll), std::abs(keyframe.pitch)) >
+           ctx.planning->max_inclination;
+  };
+  struct Supported {
+    TrajectoryKeyframe keyframe;
+    /// The robot tipped since the previous supported keyframe.
+    bool after_tipping = false;
+    /// The latest keyframe, tipped.
+    bool tipped = false;
+  };
+  std::vector<Supported> supported;
   supported.reserve(keyframes.size());
+  std::vector<Eigen::Vector2d> tipped_at;
   StateVec home_state = StateVec::Zero();
+  bool tipped_since = false;
   for (std::size_t i = 0; i < keyframes.size(); ++i) {
+    const bool latest = i + 1 == keyframes.size();
+    const bool is_tipped = i > 0 && tipped(keyframes[i]);
+    if (is_tipped) {
+      ++report.tilted_keyframes;
+      if (!latest) {
+        tipped_at.push_back(keyframes[i].pose.head<2>());
+        tipped_since = true;
+        continue;
+      }
+    }
     StateVec state = keyframes[i].pose;
     if (!keyframeAtDrivingHeight(ctx, state)) {
       ++report.unsupported_keyframes;
@@ -472,20 +500,11 @@ RoadmapRebuildReport rebuildRoadmapFromTrajectory(
       continue;
     }
     if (i == 0) home_state = state;
-    supported.push_back(keyframes[i]);
+    supported.push_back({keyframes[i], tipped_since, is_tipped});
+    tipped_since = false;
   }
   report.home_supported = true;
 
-  // Where the robot tipped past max_inclination, the latest keyframe
-  // aside: no edge may pass within the robot's half diagonal of them.
-  const auto tipped = [&ctx](const TrajectoryKeyframe& keyframe) {
-    return std::max(std::abs(keyframe.roll), std::abs(keyframe.pitch)) >
-           ctx.planning->max_inclination;
-  };
-  std::vector<Eigen::Vector2d> tipped_at;
-  for (std::size_t i = 1; i + 1 < supported.size(); ++i) {
-    if (tipped(supported[i])) tipped_at.push_back(supported[i].pose.head<2>());
-  }
   const double tipped_clearance =
       0.5 * ctx.robot_box_size.head<2>().norm();
   const auto passes_tipping = [&tipped_at, tipped_clearance](
@@ -510,7 +529,7 @@ RoadmapRebuildReport rebuildRoadmapFromTrajectory(
   std::vector<Vertex*> vertices{home};
   Vertex* previous = home;
   // The base pose the previous vertex was placed from.
-  StateVec previous_base = supported.front().pose;
+  StateVec previous_base = supported.front().keyframe.pose;
 
   // Offsets across the direction of travel, nearest first.
   std::vector<double> offsets{0.0};
@@ -578,7 +597,7 @@ RoadmapRebuildReport rebuildRoadmapFromTrajectory(
     }
     if (!placed) {
       ++report.boxed_vertices;
-      return;
+      return false;
     }
     previous_base = target;
     if ((chosen.head<2>() - target.head<2>()).norm() > 1e-9) {
@@ -613,28 +632,21 @@ RoadmapRebuildReport rebuildRoadmapFromTrajectory(
       }
     }
     previous = vertex;
+    return true;
   };
 
-  // The robot tipped since the previous vertex: the chain breaks there.
-  bool tipped_since = false;
+  // No chain edge across a stretch where the robot tipped (until a vertex
+  // after it is placed), nor into the latest keyframe when it is tipped.
+  bool break_pending = false;
   for (std::size_t i = 1; i < supported.size(); ++i) {
-    const StateVec& state = supported[i].pose;
+    const StateVec& state = supported[i].keyframe.pose;
     const bool latest = i + 1 == supported.size();
-    if (tipped(supported[i])) {
-      ++report.tilted_keyframes;
-      if (!latest) {
-        tipped_since = true;
-        continue;
-      }
-      place(state, false);
-      break;
-    }
-    const double gap = (state.head<3>() - previous_base.head<3>()).norm();
-    if (tipped_since) {
-      tipped_since = false;
-      place(state, false);
+    if (supported[i].after_tipping) break_pending = true;
+    if (break_pending || supported[i].tipped) {
+      if (place(state, false)) break_pending = false;
       continue;
     }
+    const double gap = (state.head<3>() - previous_base.head<3>()).norm();
     if ((gap < params.vertex_spacing && !latest) ||
         gap <= ctx.planning->edge_length_min) {
       continue;
