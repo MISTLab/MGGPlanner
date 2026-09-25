@@ -271,13 +271,19 @@ ProjectedEdgeStatus GroundProjection::getProjectedEdgeStatus(
   const bool check_rise = params_.max_footprint_cell_rise > 0.0;
   if ((check_tilt || check_step || check_rise) && heading.norm() > 1e-9) {
     for (const Eigen::Vector3d& point : samples) {
-      const FootprintPlane plane = footprintPlane(point, heading, box_size);
-      if ((plane.measured &&
-           ((check_tilt && plane.tilt > params_.max_footprint_tilt) ||
-            (check_step &&
-             plane.max_residual > params_.max_footprint_step))) ||
-          (check_rise &&
-           plane.max_cell_rise > params_.max_footprint_cell_rise)) {
+      if (check_tilt || check_step) {
+        const FootprintPlane plane = footprintPlane(point, heading, box_size);
+        if (plane.measured &&
+            ((check_tilt && plane.tilt > params_.max_footprint_tilt) ||
+             (check_step &&
+              plane.max_residual > params_.max_footprint_step))) {
+          return ProjectedEdgeStatus::kFootprintPlane;
+        }
+      }
+      // Only when set: the rise is not cached with the plane, whose key
+      // carries no parameter (review r2, M-2).
+      if (check_rise && footprintCellRise(point, heading, box_size) >
+                            params_.max_footprint_cell_rise) {
         return ProjectedEdgeStatus::kFootprintPlane;
       }
     }
@@ -346,6 +352,53 @@ double GroundProjection::observedGroundAhead(
     }
   }
   return ahead > 0 ? static_cast<double>(observed) / ahead : 0.0;
+}
+
+double GroundProjection::footprintCellRise(
+    const Eigen::Vector3d& point, const Eigen::Vector2d& heading,
+    const Eigen::Vector3d& box_size) const {
+  const double half_length = 0.5 * box_size.x();
+  const double half_width = 0.5 * box_size.y();
+  if (!point.allFinite() || !(heading.norm() > 1e-9) ||
+      !(half_length > 0.0) || !(half_width > 0.0)) {
+    return 0.0;
+  }
+  const Eigen::Vector2d along = heading.normalized();
+  const Eigen::Vector2d across(-along.y(), along.x());
+  std::vector<XYCellCenter> candidates;
+  if (!map_.getCircleIntersectingXYCellCenters(
+          point.head<2>(), std::hypot(half_length, half_width),
+          kMaxFootprintCells, candidates)) {
+    return 0.0;
+  }
+  // The ground of each cell under the footprint by its index on the map's
+  // grid.
+  std::map<std::pair<std::int64_t, std::int64_t>, double> ground_by_cell;
+  for (const XYCellCenter& cell : candidates) {
+    const Eigen::Vector2d offset = cell.center - point.head<2>();
+    if (std::abs(offset.dot(along)) > half_length + 1e-9 ||
+        std::abs(offset.dot(across)) > half_width + 1e-9) {
+      continue;
+    }
+    Eigen::Vector3d ground;
+    if (footprintGroundBelow(
+            Eigen::Vector3d(cell.center.x(), cell.center.y(), point.z()),
+            ground)) {
+      ground_by_cell[{cell.grid_x, cell.grid_y}] = ground.z();
+    }
+  }
+  double rise = 0.0;
+  for (const auto& [index, z] : ground_by_cell) {
+    for (const std::pair<std::int64_t, std::int64_t> next :
+         {std::make_pair(index.first + 1, index.second),
+          std::make_pair(index.first, index.second + 1)}) {
+      const auto found = ground_by_cell.find(next);
+      if (found != ground_by_cell.end()) {
+        rise = std::max(rise, std::abs(found->second - z));
+      }
+    }
+  }
+  return rise;
 }
 
 bool GroundProjection::groundBelow(const Eigen::Vector3d& point,
@@ -486,9 +539,6 @@ FootprintPlane GroundProjection::measureFootprintPlane(
   }
   std::vector<Eigen::Vector3d> ground_points;
   ground_points.reserve(candidates.size());
-  // The ground of each cell by its index on the map's grid, for the rise
-  // between neighbours.
-  std::map<std::pair<std::int64_t, std::int64_t>, double> ground_by_cell;
   int cells_under = 0;
   for (const XYCellCenter& cell : candidates) {
     const Eigen::Vector2d offset = cell.center - point.head<2>();
@@ -502,18 +552,6 @@ FootprintPlane GroundProjection::measureFootprintPlane(
                                              cell.center.y(), point.z()),
                              ground)) {
       ground_points.push_back(ground);
-      ground_by_cell[{cell.grid_x, cell.grid_y}] = ground.z();
-    }
-  }
-  for (const auto& [index, z] : ground_by_cell) {
-    for (const std::pair<std::int64_t, std::int64_t> next :
-         {std::make_pair(index.first + 1, index.second),
-          std::make_pair(index.first, index.second + 1)}) {
-      const auto found = ground_by_cell.find(next);
-      if (found != ground_by_cell.end()) {
-        plane.max_cell_rise =
-            std::max(plane.max_cell_rise, std::abs(found->second - z));
-      }
     }
   }
   plane.cells = static_cast<int>(ground_points.size());

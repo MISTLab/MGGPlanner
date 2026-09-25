@@ -53,10 +53,6 @@ struct FootprintPlane {
   double max_residual = 0.0;
   /// Distinct ground cells the plane was fitted to.
   int cells = 0;
-  /// Largest height difference between the ground of two neighbouring
-  /// cells (sharing a side on the map's grid) under the footprint, metres;
-  /// found whether or not the plane is measured. 0 with no such pair.
-  double max_cell_rise = 0.0;
 };
 
 /// The farthest apart, metres, that getProjectedEdgeStatus measures the
@@ -218,6 +214,16 @@ class GroundProjection {
   double observedGroundAhead(const Eigen::Vector3d& point,
                              const Eigen::Vector2d& heading,
                              const Eigen::Vector3d& box_size) const;
+
+  /// The largest height difference between the ground of two neighbouring
+  /// map cells (sharing a side on the map's grid) under a footprint, laid
+  /// out as for footprintPlane, metres; 0 with no such pair. Not cached
+  /// with the plane: getProjectedEdgeStatus asks for it only with
+  /// max_footprint_cell_rise set, and the ground under each cell comes
+  /// from the column cache.
+  double footprintCellRise(const Eigen::Vector3d& point,
+                           const Eigen::Vector2d& heading,
+                           const Eigen::Vector3d& box_size) const;
 
   /// The ground straight below `point`, false when none is mapped within
   /// max_projection_length.

@@ -181,11 +181,17 @@ struct PlanningParams {
   /// disables it. Not an upstream parameter.
   double max_footprint_step = 0.0;
   /// Largest height difference between the observed ground of two
-  /// neighbouring map cells under the footprint, metres: a rock's edge.
-  /// A plane fitted over the footprint smooths a 0.2 m rock under a Scout
-  /// Mini to 23.9 degrees and 0.105 m, within a smooth 16 degree ramp's
-  /// noise (run 5); one cell to the next the rock rises 0.16 to 0.23 m and
-  /// the ramp 0.06 m. Zero disables it. Not an upstream parameter.
+  /// neighbouring map cells under the footprint, metres, meant for a rock's
+  /// edge. Zero disables it. Not an upstream parameter.
+  ///
+  /// It does not separate rocks from ramps on MGG's 0.2 m grid. The run-5
+  /// Scout rock and the robot_0 rock rise 0.13 to 0.145 m at their crests.
+  /// The SubT ramp's surface noise steps 0.14 to 0.16 m between neighbouring
+  /// cells (p99 0.156 m under a Scout), although the ramp is smooth. The
+  /// 0.057 m a clean 16 degree ramp rises per cell holds only for synthetic
+  /// ground. No value keeps 99 % of the ramp and refuses both rocks (run-5
+  /// lane sweep); telling them apart needs a finer ground model, such as the
+  /// 0.05 m metric map.
   double max_footprint_cell_rise = 0.0;
   double max_step_height = 0.0;
   /// How far above a goal's requested height its ground may lie, metres.

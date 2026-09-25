@@ -756,7 +756,7 @@ TEST(GroundProjection, ARockEdgeRisesMoreBetweenCellsThanARamp) {
   const GroundProjection up(on_ramp, params);
   const Eigen::Vector3d ramp_start(0.0, 0.0, 0.4475);
   const Eigen::Vector3d ramp_end(0.8, 0.0, 0.8 * slope + 0.4475);
-  EXPECT_NEAR(up.footprintPlane(ramp_start, {1.0, 0.0}, box).max_cell_rise,
+  EXPECT_NEAR(up.footprintCellRise(ramp_start, {1.0, 0.0}, box),
               0.2 * slope, 1e-6);
   std::vector<Eigen::Vector3d> path;
   EXPECT_EQ(up.getProjectedEdgeStatus(ramp_start, ramp_end, box, false, path,
@@ -767,7 +767,7 @@ TEST(GroundProjection, ARockEdgeRisesMoreBetweenCellsThanARamp) {
   const GroundProjection over(on_rock, params);
   const Eigen::Vector3d rock_start(0.0, 0.0, 0.4475);
   const Eigen::Vector3d rock_end(0.4, 0.0, 0.4475);
-  EXPECT_NEAR(over.footprintPlane(rock_end, {1.0, 0.0}, box).max_cell_rise,
+  EXPECT_NEAR(over.footprintCellRise(rock_end, {1.0, 0.0}, box),
               0.2, 1e-6);
   EXPECT_EQ(over.getProjectedEdgeStatus(rock_start, rock_end, box, false,
                                         path, false),
