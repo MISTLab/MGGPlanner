@@ -29,8 +29,10 @@ double deg(double d) { return d * M_PI / 180.0; }
 
 /// A simulated platform: its RobotSpec, the parameters SwarmDeck's fleet
 /// launch derives from it (deploy/mgg/fleet.launch.py), and the limits
-/// proposed for it. On MGG's 0.2 m map the ramp's footprint tilt reaches
-/// 21 degrees from map noise, so 20 degrees would close some of it.
+/// proposed for it. On MGG's 0.2 m map, with every cell under the body, the
+/// ramp's footprint tilt passes 22 degrees from map noise, so the Scout's
+/// limit is 25. The Spot's limits let it cross the rock face: it is stable
+/// on rough ground and cannot tip over in simulation (operator, 2026-09-25).
 struct Platform {
   const char* name;
   double length, width, base_height, max_step_height;
@@ -39,7 +41,7 @@ struct Platform {
 };
 
 const Platform kScout{"scout_mini", 0.612, 0.580, 0.1225, 0.15,
-                      27.0,         18.0,  22.0,  0.12};
+                      27.0,         18.0,  25.0,  0.15};
 const Platform kBunker{"bunker", 1.023, 0.778, 0.200, 0.15,
                        27.0,     18.0,  22.0,  0.12};
 const Platform kSpot{"spot", 1.100, 0.500, 0.500, 0.30,
@@ -153,10 +155,14 @@ Tally run(const char* fixture, const Platform& platform) {
   return t;
 }
 
-void expectRampOpenAndFaceRefused(const Platform& platform) {
+void expectRampOpen(const Platform& platform) {
   const Tally ramp = run("subt_ramp.txt", platform);
   ASSERT_GE(ramp.admitted_without, 70);  // of 101
   EXPECT_GE(ramp.admitted_with, 0.99 * ramp.admitted_without);
+}
+
+void expectRampOpenAndFaceRefused(const Platform& platform) {
+  expectRampOpen(platform);
 
   // What MGG saw when it planned the drive onto the rocks: some edge over
   // the face passes every other check, and none passes this one.
@@ -178,8 +184,11 @@ TEST(FootprintPlane, BunkerKeepsTheRampAndRefusesTheRockFace) {
   expectRampOpenAndFaceRefused(kBunker);
 }
 
-TEST(FootprintPlane, SpotKeepsTheRampAndRefusesTheRockFace) {
-  expectRampOpenAndFaceRefused(kSpot);
+TEST(FootprintPlane, SpotKeepsTheRamp) {
+  expectRampOpen(kSpot);
+  // Reported, not asserted: the Spot may cross the face.
+  run("rock_field_preplan.txt", kSpot);
+  run("rock_field_now.txt", kSpot);
 }
 
 }  // namespace

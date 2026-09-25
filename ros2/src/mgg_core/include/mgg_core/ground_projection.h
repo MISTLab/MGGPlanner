@@ -125,12 +125,14 @@ class GroundProjection {
   /// The least-squares plane through the ground under a footprint centred
   /// on `point`, at driving height, and facing `heading` in the XY plane.
   /// The footprint is `box_size` x long along the heading and y wide.
-  /// It is split into cells of at most the map's resolution. The ground is
-  /// found straight below each cell's centre, as crossSlope finds it, and
-  /// each map cell counts once. The plane is fitted to the ground points the
-  /// map returns. It is not measured when ground lies under fewer than half
-  /// the probes, or the points do not span a plane. Such a point is skipped,
-  /// as crossSlope skips a point with a side over no ground.
+  /// Every map cell whose centre lies under it is used, from the map's XY
+  /// cell grid (MapInterface::getCircleIntersectingXYCellCenters); a map
+  /// without one is not measured. The ground is found straight below each
+  /// cell's centre, as crossSlope finds it, and the plane is fitted to the
+  /// ground points the map returns. It is not measured when ground lies
+  /// under fewer than half the cells, or the points do not span a plane.
+  /// Such a point is skipped, as crossSlope skips a point with a side over
+  /// no ground.
   FootprintPlane footprintPlane(const Eigen::Vector3d& point,
                                 const Eigen::Vector2d& heading,
                                 const Eigen::Vector3d& box_size) const;

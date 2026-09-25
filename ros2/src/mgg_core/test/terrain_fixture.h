@@ -5,6 +5,7 @@
 // 2026-09-24 (test/data/README.md). Only the surface is recorded, not free
 // space, so the map answers as NativeMolaGrid does for its measured
 // surface and treats every other cell as free:
+//   * the XY cell grid is axis-aligned, as NativeMolaGrid's is;
 //   * a downward ray stops in the column's top cell and returns the cell's
 //     centre at the surface's height;
 //   * a box is occupied when a column under it rises above its underside.
@@ -55,10 +56,23 @@ class TerrainFixture : public mgg::MapInterface {
     }
   }
 
+  /// A surface given column by column: `tops` maps a cell's (x, y) index to
+  /// the height of its top.
+  TerrainFixture(double resolution,
+                 std::map<std::pair<std::int64_t, std::int64_t>, double> tops)
+      : resolution_(resolution), top_(std::move(tops)) {}
+
   /// Where the robot's base was at each keyframe, in drive order.
   const std::vector<Eigen::Vector3d>& poses() const { return poses_; }
 
   double getResolution() const override { return resolution_; }
+  bool getAxisAlignedXYCellCenter(const Eigen::Vector2d& p,
+                                  Eigen::Vector2d& center) const override {
+    center = Eigen::Vector2d((std::floor(p.x() / resolution_) + 0.5),
+                             (std::floor(p.y() / resolution_) + 0.5)) *
+             resolution_;
+    return center.allFinite();
+  }
   bool getStatus() const override { return true; }
 
   mgg::VoxelStatus getVoxelStatus(const Eigen::Vector3d& p) const override {

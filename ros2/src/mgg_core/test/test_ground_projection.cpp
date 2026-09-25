@@ -3,13 +3,16 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdint>
 #include <limits>
+#include <map>
 #include <utility>
 #include <vector>
 
 #include <gtest/gtest.h>
 
 #include "mgg_core/ground_projection.h"
+#include "terrain_fixture.h"
 
 namespace {
 
@@ -24,6 +27,12 @@ using mgg::VoxelStatus;
 class Terrain : public MapInterface {
  public:
   double getResolution() const override { return 0.2; }
+  bool getAxisAlignedXYCellCenter(const Eigen::Vector2d& p,
+                                  Eigen::Vector2d& center) const override {
+    center = 0.2 * Eigen::Vector2d(std::floor(p.x() / 0.2) + 0.5,
+                                   std::floor(p.y() / 0.2) + 0.5);
+    return true;
+  }
   bool getStatus() const override { return true; }
 
   VoxelStatus getVoxelStatus(const Eigen::Vector3d& p) const override {
@@ -482,17 +491,17 @@ TEST(GroundProjection, AGoalTakesTheFloorNearestItsHeight) {
 
 TEST(GroundProjection, FootprintPlaneMeasuresTheRampUnderTheBody) {
   // The combined roll and pitch: 16 degrees facing up the ramp, across it,
-  // or diagonally, with every probe on the plane.
+  // or diagonally, with every cell on the plane.
   Ramp map;
   PlanningParams params = makeParams();
   GroundProjection gp(map, params);
-  for (const Eigen::Vector2d heading :
+  for (const Eigen::Vector2d& heading :
        {Eigen::Vector2d(0.0, 1.0), Eigen::Vector2d(1.0, 0.0),
         Eigen::Vector2d(1.0, 1.0)}) {
     const mgg::FootprintPlane plane =
         gp.footprintPlane(onRamp(0.0, 2.0), heading, kBox);
     ASSERT_TRUE(plane.measured);
-    EXPECT_EQ(plane.cells, 12);  // 4 along the 0.8 m body by 3 across
+    EXPECT_GE(plane.cells, 12);  // of 0.2 m cells under the 0.8 x 0.6 m body
     EXPECT_NEAR(plane.tilt, 16.0 * M_PI / 180.0, 0.2 * M_PI / 180.0);
     EXPECT_LT(plane.max_residual, 0.01);
   }
@@ -551,19 +560,20 @@ TEST(GroundProjection, EdgeOverARockPastTheFootprintStepIsRefused) {
   const mgg::FootprintPlane plane =
       gp.footprintPlane({1.2, 0.0, 0.5}, {1.0, 0.0}, kBox);
   ASSERT_TRUE(plane.measured);
-  // Two of the twelve probes are on the rock; the plane leans towards it
-  // and leaves it about half its height proud.
-  EXPECT_NEAR(plane.max_residual, 0.155, 0.005);
+  // Two of the sixteen cells are on the rock; the plane leans towards it
+  // and leaves it 0.24 m proud.
+  EXPECT_EQ(plane.cells, 16);
+  EXPECT_NEAR(plane.max_residual, 0.24, 0.005);
 
   params.max_footprint_step = 0.1;
   EXPECT_EQ(gp.getProjectedEdgeStatus(start, end, kBox, true, path, false),
             ProjectedEdgeStatus::kFootprintPlane);
-  params.max_footprint_step = 0.25;
+  params.max_footprint_step = 0.3;
   EXPECT_EQ(gp.getProjectedEdgeStatus(start, end, kBox, true, path, false),
             ProjectedEdgeStatus::kAdmissible);
 }
 
-TEST(GroundProjection, FootprintPlaneNeedsGroundUnderHalfTheProbes) {
+TEST(GroundProjection, FootprintPlaneNeedsGroundUnderHalfTheCells) {
   // The pit at x in [4, 6] has no ground: a body three quarters over it is
   // not measured, one half over it still is.
   Terrain map;
@@ -574,6 +584,41 @@ TEST(GroundProjection, FootprintPlaneNeedsGroundUnderHalfTheProbes) {
       gp.footprintPlane({4.0, 0.0, 0.5}, {1.0, 0.0}, kBox);
   ASSERT_TRUE(half.measured);
   EXPECT_NEAR(half.tilt, 0.0, 1e-9);
+}
+
+TEST(GroundProjection, FootprintPlaneFindsARockInEveryCellUnderAnAngledBody) {
+  // Review r0: a Scout facing (1, 1) on 0.2 m cells, with a 0.25 m rock in
+  // cell (0, -1), whose centre (0.1, -0.1) is well inside the footprint. A
+  // lattice of 16 probes rotated with the body stepped over that cell, saw
+  // only level ground, and the rock passed under the chassis.
+  std::map<std::pair<std::int64_t, std::int64_t>, double> tops;
+  for (std::int64_t x = -10; x < 10; ++x) {
+    for (std::int64_t y = -10; y < 10; ++y) tops[{x, y}] = 0.0;
+  }
+  tops[{0, -1}] = 0.25;
+  const mgg_test::TerrainFixture map(0.2, tops);
+  PlanningParams params = makeParams();
+  params.max_step_height = 0.15;
+  params.max_ground_height = 0.4475;
+  GroundProjection gp(map, params);
+  const Eigen::Vector3d box(0.662, 0.630, 0.295);
+  const Eigen::Vector3d start(0.0, 0.0, 0.4475);
+  const Eigen::Vector3d end(0.4, 0.4, 0.4475);
+
+  const mgg::FootprintPlane plane = gp.footprintPlane(start, {1.0, 1.0}, box);
+  ASSERT_TRUE(plane.measured);
+  EXPECT_EQ(plane.cells, 12);
+  EXPECT_NEAR(plane.max_residual, 0.218, 0.001);
+
+  // Below the box's underside and between the side lines: every other
+  // check passes it.
+  std::vector<Eigen::Vector3d> path;
+  ASSERT_EQ(gp.getProjectedEdgeStatus(start, end, box, false, path, false),
+            ProjectedEdgeStatus::kAdmissible);
+  params.max_footprint_tilt = 22.0 * M_PI / 180.0;
+  params.max_footprint_step = 0.12;
+  EXPECT_EQ(gp.getProjectedEdgeStatus(start, end, box, false, path, false),
+            ProjectedEdgeStatus::kFootprintPlane);
 }
 
 }  // namespace

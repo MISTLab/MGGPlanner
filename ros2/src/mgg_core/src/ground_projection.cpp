@@ -12,6 +12,10 @@ double probeOffset(const MapInterface& map) {
   return std::max(0.20, 2.0 * map.getResolution());
 }
 
+/// Most map cells footprintPlane considers around one point. A Bunker's
+/// footprint spans about 150 of 0.2 m; a far larger one is not measured.
+constexpr std::size_t kMaxFootprintCells = 1024;
+
 /// Solids a goal's upward search steps through before giving up; each has
 /// free space above it, so a column this tall is never met in practice.
 constexpr int kMaxGoalGroundLayers = 32;
@@ -308,52 +312,45 @@ FootprintPlane GroundProjection::footprintPlane(
     const Eigen::Vector3d& point, const Eigen::Vector2d& heading,
     const Eigen::Vector3d& box_size) const {
   FootprintPlane plane;
-  const double resolution = map_.getResolution();
-  const double length = box_size.x();
-  const double width = box_size.y();
-  if (!(heading.norm() > 1e-9) || !(length > 0.0) || !(width > 0.0) ||
-      !(resolution > 0.0)) {
+  const double half_length = 0.5 * box_size.x();
+  const double half_width = 0.5 * box_size.y();
+  if (!point.allFinite() || !(heading.norm() > 1e-9) ||
+      !(half_length > 0.0) || !(half_width > 0.0)) {
     return plane;
   }
   const Eigen::Vector2d along = heading.normalized();
   const Eigen::Vector2d across(-along.y(), along.x());
-  // Probes at the centres of equal cells no larger than the map's, so each
-  // stays inside the footprint and neighbours are at most a map cell apart.
-  const int n_along =
-      std::max(2, static_cast<int>(std::ceil(length / resolution - 1e-9)));
-  const int n_across =
-      std::max(2, static_cast<int>(std::ceil(width / resolution - 1e-9)));
 
+  // Every map cell whose centre lies under the footprint, whatever the
+  // footprint's heading. A lattice of probes rotated against the map's grid
+  // can step over a cell entirely, and a rock in it (review r0).
+  std::vector<XYCellCenter> candidates;
+  if (!map_.getCircleIntersectingXYCellCenters(
+          point.head<2>(), std::hypot(half_length, half_width),
+          kMaxFootprintCells, candidates)) {
+    return plane;
+  }
   std::vector<Eigen::Vector3d> ground_points;
-  ground_points.reserve(static_cast<std::size_t>(n_along * n_across));
-  int probes_on_ground = 0;
-  for (int i = 0; i < n_along; ++i) {
-    const double u = length * ((i + 0.5) / n_along - 0.5);
-    for (int j = 0; j < n_across; ++j) {
-      const double v = width * ((j + 0.5) / n_across - 0.5);
-      const Eigen::Vector2d offset = u * along + v * across;
-      Eigen::Vector3d ground;
-      if (!groundBelow(point + Eigen::Vector3d(offset.x(), offset.y(), 0.0),
-                       ground)) {
-        continue;
-      }
-      ++probes_on_ground;
-      // A voxel map returns its cell's centre, so two probes in one cell
-      // return the same point; count it once.
-      const bool seen = std::any_of(
-          ground_points.begin(), ground_points.end(),
-          [&](const Eigen::Vector3d& other) {
-            return (other.head<2>() - ground.head<2>()).norm() < 1e-9;
-          });
-      if (!seen) ground_points.push_back(ground);
+  ground_points.reserve(candidates.size());
+  int cells_under = 0;
+  for (const XYCellCenter& cell : candidates) {
+    const Eigen::Vector2d offset = cell.center - point.head<2>();
+    if (std::abs(offset.dot(along)) > half_length + 1e-9 ||
+        std::abs(offset.dot(across)) > half_width + 1e-9) {
+      continue;
+    }
+    ++cells_under;
+    Eigen::Vector3d ground;
+    if (groundBelow(Eigen::Vector3d(cell.center.x(), cell.center.y(),
+                                    point.z()),
+                    ground)) {
+      ground_points.push_back(ground);
     }
   }
   plane.cells = static_cast<int>(ground_points.size());
-  // With ground under fewer than half the probes, a plane would describe
+  // With ground under fewer than half the cells, a plane would describe
   // only part of the body.
-  if (2 * probes_on_ground < n_along * n_across || plane.cells < 3) {
-    return plane;
-  }
+  if (2 * plane.cells < cells_under || plane.cells < 3) return plane;
 
   // z = c + a x + b y in coordinates centred on `point`, for conditioning,
   // solved from the 3 x 3 normal equations.
