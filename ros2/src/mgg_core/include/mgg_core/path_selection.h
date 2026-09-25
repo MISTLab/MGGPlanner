@@ -182,7 +182,11 @@ constexpr int kMaxDetourSearchStates = 100000;
 /// along it that passes, and is scored up to there. The best path ending
 /// clear wins; only when there is none is the best path chosen without the
 /// check, flagged unclear_viewpoint, so that clearance never stops
-/// exploration where it would have gone on.
+/// exploration where it would have gone on. A clear end within
+/// `goal_reach` of the root, or on a path leading to no gain, goes nowhere
+/// (pathGoesNowhere) and does not count as clear: at the mouth of a
+/// passage too narrow to end a path in, the path into it is chosen
+/// unclear, not the robot's own place.
 ///
 /// With `turns_admissible` (PathTurnCheck), a candidate that fails it is not
 /// admissible, and outranks clearance: a path that turns only where it may
@@ -215,7 +219,8 @@ PathSelectionResult selectBestPath(GraphManager& graph,
                                    const SharpTurnAllowedFn&
                                        sharp_turn_allowed = nullptr,
                                    const VertexClearanceFn& clearance =
-                                       nullptr);
+                                       nullptr,
+                                   double goal_reach = 0.0);
 
 }  // namespace mgg
 

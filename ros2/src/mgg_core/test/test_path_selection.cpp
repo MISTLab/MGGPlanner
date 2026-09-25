@@ -300,10 +300,12 @@ TEST(PathGoesNowhere, APulledBackPathLeadingToGainIsStillSent) {
   EXPECT_TRUE(mgg::pathGoesNowhere(r, Eigen::Vector3d(0.8, 0.0, 0.0), 0.3));
 }
 
-TEST(PathGoesNowhere, AClearPathLeadingToNoGainGoesNowhere) {
+TEST(PathSelection, AClearEndLeadingToNoGainIsNoClearEnd) {
   // Run 5, robot_3: the +x branch's gain lies beyond ends without
-  // clearance, and the +y branch, clear, sees nothing. Clearance wins the
-  // selection, and the path it picks leads to no gain.
+  // clearance, and the +y branch, clear, sees nothing. Clearance used to
+  // win the selection with a path to no gain. That clear end goes nowhere
+  // and is no clear end (review r0, I-3): no path ends clear, and the +x
+  // branch is taken unclear.
   Fork f;
   f.x_branch.back()->vol_gain.gain = 100.0;
   EdgeInclinations flat;
@@ -312,11 +314,47 @@ TEST(PathGoesNowhere, AClearPathLeadingToNoGainGoesNowhere) {
   };
   const auto r = mgg::selectBestPath(f.graph, makePlanning(), RobotParams(),
                                      flat, 0.2, 0.0, {}, 0.0, clear);
-  ASSERT_FALSE(r.best_path.empty());
-  EXPECT_EQ(r.best_path.back()->state.x(), 0.0);
-  EXPECT_DOUBLE_EQ(r.best_full_gain, 0.0);
-  EXPECT_TRUE(mgg::pathGoesNowhere(
+  EXPECT_EQ(r.best_path_id, 3);
+  EXPECT_TRUE(r.unclear_viewpoint);
+  EXPECT_DOUBLE_EQ(r.best_full_gain, 100.0);
+  EXPECT_FALSE(mgg::pathGoesNowhere(
       r, f.graph.getVertex(0)->state.head<3>(), 0.3));
+}
+
+TEST(PathSelection, AClearEndWithinTheGoalToleranceIsNoClearEnd) {
+  // The robot at the mouth of a passage too narrow to end a path in: the
+  // passage's path is pulled back to the one clear vertex, 0.25 m from the
+  // robot, within the controller's goal tolerance. That end goes nowhere;
+  // no path ends clear, and the path into the passage is taken unclear.
+  GraphManager graph;
+  auto* root = new Vertex(0, StateVec(0, 0, 0, 0));
+  graph.addVertex(root);
+  auto* mouth = new Vertex(1, StateVec(0.25, 0.0, 0.0, 0.0));
+  graph.addVertex(mouth);
+  graph.addEdge(mouth, root, 0.25);
+  Vertex* prev = mouth;
+  for (int i = 2; i <= 5; ++i) {
+    auto* v = new Vertex(i, StateVec(0.25 + 0.5 * (i - 1), 0.0, 0.0, 0.0));
+    graph.addVertex(v);
+    graph.addEdge(v, prev, 0.5);
+    prev = v;
+  }
+  prev->vol_gain.gain = 100.0;
+  EdgeInclinations flat;
+  const mgg::ViewpointClearFn clear = [](const Vertex& v) {
+    return v.id <= 1;
+  };
+  const auto within = mgg::selectBestPath(
+      graph, makePlanning(), RobotParams(), flat, 0.2, 0.0, {}, 0.0, clear,
+      nullptr, nullptr, nullptr, 0.3);
+  EXPECT_EQ(within.best_path_id, 5);
+  EXPECT_TRUE(within.unclear_viewpoint);
+  // Farther from the mouth than the tolerance, the robot is sent to it.
+  const auto beyond = mgg::selectBestPath(
+      graph, makePlanning(), RobotParams(), flat, 0.2, 0.0, {}, 0.0, clear,
+      nullptr, nullptr, nullptr, 0.2);
+  EXPECT_EQ(beyond.best_path_id, 1);
+  EXPECT_FALSE(beyond.unclear_viewpoint);
 }
 
 TEST(PathGoesNowhere, AShortPathWithGainGoesNowhereWithinTheGoalTolerance) {

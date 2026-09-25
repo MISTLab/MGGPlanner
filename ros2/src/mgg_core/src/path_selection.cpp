@@ -83,7 +83,8 @@ PathSelectionResult selectBestPath(GraphManager& graph,
                                    const PathTurnsFn& turns_admissible,
                                    const SharpTurnAllowedFn&
                                        sharp_turn_allowed,
-                                   const VertexClearanceFn& clearance) {
+                                   const VertexClearanceFn& clearance,
+                                   double goal_reach) {
   // Leaves share their paths' inner vertices; check each vertex once.
   std::unordered_map<int, bool> clear_by_id;
   const auto clear = [&](const Vertex* v) {
@@ -264,6 +265,18 @@ PathSelectionResult selectBestPath(GraphManager& graph,
         // Toward a reserved leaf, only gain outside the reservation counts.
         if (leaf_excluded && !(path_gain > 0.0)) continue;
       } else if (leaf_excluded) {
+        continue;
+      }
+      // A clear end that goes nowhere, within the controller's goal
+      // tolerance of the robot or leading to no gain, is no clear end: the
+      // robot at the mouth of a passage too narrow to end in is sent in,
+      // unclear, rather than to where it stands (review r0, I-3). A dead
+      // end inside is left to the boxed-in departure.
+      if (admissible &&
+          ((path.back()->state.head<2>() - path.front()->state.head<2>())
+                   .norm() <= goal_reach ||
+           !(std::max(leads_to, path_gain) > 0.0))) {
+        ++result.paths_without_clear_viewpoint;
         continue;
       }
       if (admissible &&

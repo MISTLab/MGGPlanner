@@ -1264,7 +1264,39 @@ TEST_F(PlannerNodeTest, APathGoingNowhereFromWhereTheRobotCannotTurnDepartsInste
   }
 }
 
-TEST_F(PlannerNodeTest, ATwoPoseClearPathToNoGainGoesNowhere) {
+TEST_F(PlannerNodeTest, ABunkerAtAnExploredRoomEntersACorridorTooNarrowToEndIn) {
+  // Review r0, I-3: a Bunker (1.023 x 0.778 m) in an explored room, 1 m from
+  // the mouth of a corridor 1.3 m wide and 6 m long (walls at y = +-0.65
+  // from x = 0.5, the room's end wall across x = 0.5 either side of it).
+  // The corridor is mapped to x = 3 and unknown beyond, so the gain lies in
+  // it; no pose in it has viewpoint clearance (0.79 m). The room's clear
+  // ends lead to no gain and go nowhere, so no path ends clear, and the
+  // path into the corridor is sent, unclear, rather than no path.
+  auto node = makeNode("narrow_corridor");
+  PlannerNodeTestPeer::setRobotFootprint(*node, 1.023, 0.778);
+  PlannerNodeTestPeer::gainFromUnknownVoxelsOnly(*node);
+  PlannerNodeTestPeer::observeFloor(*node, -3.05, 3.05, -2.55, 2.55);
+  PlannerNodeTestPeer::observeWall(*node, 0.5, 6.5, 0.65);
+  PlannerNodeTestPeer::observeWall(*node, 0.5, 6.5, -0.65);
+  PlannerNodeTestPeer::observeWallAlongY(*node, 0.7, 2.5, 0.5);
+  PlannerNodeTestPeer::observeWallAlongY(*node, -2.5, -0.7, 0.5);
+  // Within 1 m of the corridor's axis: from there the sensor, reaching
+  // 2 m within 45 degrees of +x, sees only mapped floor across the room.
+  PlannerNodeTestPeer::setLattice(*node, Eigen::Vector2d(-2.0, -1.0),
+                                  Eigen::Vector2d(3.5, 1.0));
+  PlannerNodeTestPeer::acceptOdometry(*node, -0.5, 0.0, 1.0);
+  auto response = std::make_shared<mgg_msgs::srv::PlannerSrv::Response>();
+  PlannerNodeTestPeer::plan(*node, response);
+  EXPECT_EQ(response->status, mgg_msgs::srv::PlannerSrv::Response::FORWARD);
+  ASSERT_GE(response->path.size(), 2u);
+  EXPECT_GT(response->path.back().position.x, 1.0);
+  EXPECT_NEAR(response->path.back().position.y, 0.0, 0.3);
+  std::printf("corridor path: %zu poses to (%.2f, %.2f)\n",
+              response->path.size(), response->path.back().position.x,
+              response->path.back().position.y);
+}
+
+TEST_F(PlannerNodeTest, AClearTwoPosePathToNoGainLosesToThePathToGain) {
   // Review r0, M-5, robot_3's 2-pose, gain-0 path. The robot, 0.2 m
   // square, faces +x on mapped floor that ends at x = 0.75. To its right a
   // slot 0.5 m wide along y = -1 (walls at y = -0.75 up to x = 0.3, and at
@@ -1273,8 +1305,10 @@ TEST_F(PlannerNodeTest, ATwoPoseClearPathToNoGainGoesNowhere) {
   // (0, -1) to (0.5, 0). Vertices in and at the slot see its unmapped part
   // but lack viewpoint clearance (0.29 m); the one at (0.5, 0) is clear and
   // sees none of it (the sensor reaches 1 m, 45 degrees either side of +x).
-  // Clearance picks the one-edge path there: two poses, 0.5 m long, leading
-  // to no gain. It goes nowhere, not by distance but by gain: no path.
+  // Clearance used to pick the one-edge path there: two poses, 0.5 m long,
+  // leading to no gain, which went nowhere, and there was no path. That
+  // clear end goes nowhere and is no clear end (review r0, I-3): no path
+  // ends clear, and the path into the slot is sent, unclear.
   auto node = makeNode("gainless_two_pose");
   PlannerNodeTestPeer::gainFromUnknownVoxelsOnly(*node);
   PlannerNodeTestPeer::setSensorRange(*node, 1.0);
@@ -1288,12 +1322,10 @@ TEST_F(PlannerNodeTest, ATwoPoseClearPathToNoGainGoesNowhere) {
   PlannerNodeTestPeer::acceptOdometry(*node, 0.0, 0.0, 1.0);
   auto response = std::make_shared<mgg_msgs::srv::PlannerSrv::Response>();
   PlannerNodeTestPeer::plan(*node, response);
-  EXPECT_TRUE(response->path.empty())
-      << "path of " << response->path.size() << " poses";
-  EXPECT_EQ(response->status, PlannerNode::kStatusNoPath);
-  EXPECT_EQ(PlannerNodeTestPeer::pathsGoingNowhere(*node), 1);
-  EXPECT_EQ(PlannerNodeTestPeer::lastNowherePoses(*node), 2);
-  EXPECT_EQ(PlannerNodeTestPeer::lowGainRounds(*node), 1);
+  EXPECT_EQ(response->status, mgg_msgs::srv::PlannerSrv::Response::FORWARD);
+  ASSERT_GE(response->path.size(), 2u);
+  EXPECT_LE(response->path.back().position.y, -0.5 + 1e-6);
+  EXPECT_EQ(PlannerNodeTestPeer::pathsGoingNowhere(*node), 0);
 }
 
 TEST_F(PlannerNodeTest, AFailedGlobalSearchWithLocalGainLeftIsNotExplorationComplete) {

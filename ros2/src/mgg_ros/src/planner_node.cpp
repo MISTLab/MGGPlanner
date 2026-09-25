@@ -1221,7 +1221,8 @@ std::string PlannerNode::buildLocalGraph() {
       [this](const mgg::Vertex& v) {
         return mgg::obstacleClearance(*map_, robot_params_, v.state,
                                       planning_params_.path_clearance_distance);
-      });
+      },
+      reach_distance_);
   for (const mgg::Vertex* v : sel.best_path) {
     if (v != nullptr) best_path_.push_back(v->state);
   }
