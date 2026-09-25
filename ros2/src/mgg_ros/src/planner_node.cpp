@@ -1264,39 +1264,11 @@ std::string PlannerNode::buildLocalGraph() {
   // out instead, ahead or back, until it has room; the next cycle plans
   // from there. With no way out it gets no path, and its adapter's own
   // recovery runs.
-  char boxed_in[128] = "";
+  std::string boxed_in;
   const bool is_boxed_in = sel.sharp_turn_fallback && turns_admissible &&
                            !mgg::turnClear(*map_, robot_params_, root_state);
   if (is_boxed_in) {
-    bool reverse = false;
-    if (straightDeparture(root_state, best_path_, reverse)) {
-      ++boxed_in_departures_;
-      const double length =
-          (best_path_.back().head<2>() - best_path_.front().head<2>()).norm();
-      std::snprintf(boxed_in, sizeof(boxed_in),
-                    "; boxed in: straight departure %.2f m %s", length,
-                    reverse ? "in reverse" : "ahead");
-      RCLCPP_INFO(get_logger(),
-                  "boxed in at (%.2f, %.2f, %.2f): no room to turn and no "
-                  "path turns only where it may; departing %.2f m straight "
-                  "%s (%d departures so far)",
-                  root_state.x(), root_state.y(), root_state.z(), length,
-                  reverse ? "back" : "ahead", boxed_in_departures_);
-    } else {
-      ++boxed_in_without_departure_;
-      boxed_in_without_departure_now_ = true;
-      std::snprintf(boxed_in, sizeof(boxed_in),
-                    "; boxed in: no straight departure, no path");
-      RCLCPP_WARN(get_logger(),
-                  "boxed in at (%.2f, %.2f, %.2f): no room to turn, no path "
-                  "turns only where it may, and no room to turn within "
-                  "%.1f m straight ahead%s; no path (%d times so far)",
-                  root_state.x(), root_state.y(), root_state.z(),
-                  kDepartureMaxM,
-                  planning_params_.departure_reverse_allowed ? " or back"
-                                                             : "",
-                  boxed_in_without_departure_);
-    }
+    boxed_in = departBoxedIn(root_state, "no path turns only where it may");
     // Sent as it is: not a lattice path, and the roadmap keeps no edge the
     // robot drives backwards.
     path_shortcut_from_ = static_cast<int>(best_path_.size());
@@ -1370,7 +1342,7 @@ std::string PlannerNode::buildLocalGraph() {
       sel.paths_with_sharp_turns, turn_check.refused_on_slope,
       turn_check.refused_without_room,
       sel.sharp_turn_detour ? ", detour" : "",
-      sel.sharp_turn_fallback ? ", none complies" : "", boxed_in,
+      sel.sharp_turn_fallback ? ", none complies" : "", boxed_in.c_str(),
       exploring_direction_, timing);
 
   // rrg.cpp:2098 to 2120: rounds without a frontier among the leaves count
@@ -1383,6 +1355,39 @@ std::string PlannerNode::buildLocalGraph() {
     --low_gain_rounds_;
   }
   return std::string(buf);
+}
+
+std::string PlannerNode::departBoxedIn(const mgg::StateVec& root_state,
+                                       const char* why) {
+  char note[128];
+  bool reverse = false;
+  if (straightDeparture(root_state, best_path_, reverse)) {
+    ++boxed_in_departures_;
+    const double length =
+        (best_path_.back().head<2>() - best_path_.front().head<2>()).norm();
+    std::snprintf(note, sizeof(note),
+                  "; boxed in: straight departure %.2f m %s", length,
+                  reverse ? "in reverse" : "ahead");
+    RCLCPP_INFO(get_logger(),
+                "boxed in at (%.2f, %.2f, %.2f): no room to turn and %s; "
+                "departing %.2f m straight %s (%d departures so far)",
+                root_state.x(), root_state.y(), root_state.z(), why, length,
+                reverse ? "back" : "ahead", boxed_in_departures_);
+  } else {
+    ++boxed_in_without_departure_;
+    boxed_in_without_departure_now_ = true;
+    std::snprintf(note, sizeof(note),
+                  "; boxed in: no straight departure, no path");
+    RCLCPP_WARN(get_logger(),
+                "boxed in at (%.2f, %.2f, %.2f): no room to turn, %s, and "
+                "no room to turn within %.1f m straight ahead%s; no path "
+                "(%d times so far)",
+                root_state.x(), root_state.y(), root_state.z(), why,
+                kDepartureMaxM,
+                planning_params_.departure_reverse_allowed ? " or back" : "",
+                boxed_in_without_departure_);
+  }
+  return note;
 }
 
 bool PlannerNode::straightDeparture(const mgg::StateVec& start,
@@ -1916,26 +1921,35 @@ void PlannerNode::onPlanRequest(
   }
   // A route over the global graph is kept when no route turns only where it
   // may. One whose first turn the robot has no room to make is the path a
-  // boxed-in robot is not sent (buildLocalGraph): it is withheld, and the
-  // repositioning given up, rather than sent (review r0).
-  const auto withhold_turning_route = [this]() {
+  // boxed-in robot is not sent (buildLocalGraph): the repositioning is given
+  // up and, as a boxed-in robot does, it departs straight ahead or back
+  // instead, or gets no path when it has no departure.
+  const auto depart_instead_of_turning_route = [this](std::string& note) {
     if (!last_route_starts_with_turn_without_room_) return false;
-    best_path_.clear();
     best_path_from_global_graph_ = false;
     global_exploration_ongoing_ = false;
+    mgg::StateVec root_state = current_state_;
+    if (!projectToDrivingHeight(root_state)) {
+      root_state = physicalAnchorAtDrivingHeight(current_state_);
+    }
+    note = departBoxedIn(root_state,
+                         "the global route starts with a sharp turn");
     return true;
   };
   std::string resumed;
   if (resume_global) {
     auto map_read = mapReadLease();
     refreshMapRevision();
+    std::string departure;
     if (!runGlobalPlanner(current_global_vertex_id_, reason)) {
       global_exploration_ongoing_ = false;
       summary = "global repositioning abandoned: " + reason;
-    } else if (withhold_turning_route()) {
+    } else if (depart_instead_of_turning_route(departure)) {
       resumed =
           "; global repositioning given up: its route starts with a turn "
-          "the robot has no room for";
+          "the robot has no room for" +
+          departure;
+      summary = resumed.substr(2);
     } else {
       summary = "resuming global repositioning";
     }
@@ -1960,13 +1974,15 @@ void PlannerNode::onPlanRequest(
       // best global frontier (rrg.cpp:2119, mggplanner.cpp:217).
       auto map_read = mapReadLease();
       low_gain_rounds_ = 0;
+      std::string departure;
       if (!runGlobalPlanner(-1, reason)) {
         complete = true;
         summary += "; exploration complete: " + reason;
-      } else if (withhold_turning_route()) {
+      } else if (depart_instead_of_turning_route(departure)) {
         summary +=
             "; no local gain, and the global route starts with a turn the "
-            "robot has no room for: no path";
+            "robot has no room for" +
+            departure;
       } else {
         summary += "; no local gain, repositioning over the global graph";
       }

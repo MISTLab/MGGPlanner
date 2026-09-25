@@ -151,6 +151,13 @@ class PlannerNode : public rclcpp::Node {
   /// false, with `path` empty, when neither way reaches room to turn.
   bool straightDeparture(const mgg::StateVec& start,
                          std::vector<mgg::StateVec>& path, bool& reverse);
+  /// The robot is boxed in at `root_state`, its pose at driving height as
+  /// the lattice root takes it: it has no room to turn where it stands, and
+  /// `why`, for the log, says why the path it would otherwise be sent
+  /// starts with a turn it cannot make. best_path_ becomes its straightDeparture, or empty when it has none,
+  /// which sets boxed_in_without_departure_now_. Counts and logs the
+  /// outcome; returns the note for the plan summary.
+  std::string departBoxedIn(const mgg::StateVec& root_state, const char* why);
   /// Past the controller's goal tolerance, and about a robot's length.
   static constexpr double kDepartureMinM = 0.5;
   static constexpr double kDepartureMaxM = 2.0;
@@ -337,14 +344,15 @@ class PlannerNode : public rclcpp::Node {
   /// they turn sharply on a slope or without room to turn, because no route
   /// complied (applyRouteTurnRule), since the node started.
   int route_sharp_turn_fallbacks_ = 0;
-  /// Exploration cycles in which the robot was boxed in: no path complied
-  /// with the turn rule and it had no room to turn where it stood. It was
-  /// sent a straight departure, or no path when it had none, since the node
-  /// started.
+  /// Times the robot was found boxed in: no exploration path, or the global
+  /// route kept in place of one, complied with the turn rule and it had no
+  /// room to turn where it stood (departBoxedIn). It was sent a straight
+  /// departure, or no path when it had none, since the node started.
   int boxed_in_departures_ = 0;
   int boxed_in_without_departure_ = 0;
-  /// This cycle's exploration selection found the robot boxed in with no
-  /// straight departure: no global repositioning is tried in its place.
+  /// This cycle found the robot boxed in with no straight departure
+  /// (departBoxedIn; buildLocalGraph resets it): no global repositioning is
+  /// tried in its place.
   bool boxed_in_without_departure_now_ = false;
   /// The last route to a goal kept although it turns sharply where it may
   /// not, and its first turn, from the robot's heading, is sharp where the
