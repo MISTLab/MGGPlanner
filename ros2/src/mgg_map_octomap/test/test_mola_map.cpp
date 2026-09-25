@@ -26,6 +26,7 @@
 #include "mgg_core/ground_projection.h"
 #include "mgg_core/grid_graph.h"
 #include "mgg_core/path_selection.h"
+#include "mgg_core/path_turns.h"
 #include "mgg_map_octomap/mola_map.h"
 #include "mgg_map_octomap/native_mola_grid.h"
 #include "reference_binary_grid.h"
@@ -1602,6 +1603,101 @@ TEST(MolaMap, SparseMeasuredRayCorridorGrowsFootprintValidatedGroundGraph) {
           << "edge " << id << " -> " << expected[i].first;
     }
   }
+}
+
+
+TEST(NativeMolaGrid, AStraightDepartureAlongACorridorClearsTheBoxTurnedToItsHeading) {
+  // The map queries mgg_ros PlannerNode::straightDeparture makes for a
+  // ground robot, on the native MOLA grid: each 0.1 m step checked with
+  // getProjectedEdgeStatus, stopping at unknown space, with the collision
+  // box turned to the robot's heading (the smallest box aligned with the
+  // map that holds it), up to the first pose where mgg::turnClear finds
+  // room to turn in place. The robot is 1.2 m long and 0.4 m wide, facing
+  // +y in a corridor along y whose inside spans x = [-0.2, 0.4]: it can
+  // drive along the corridor, but has no room to turn in it. The corridor's
+  // walls end at y = 1.2.
+  using Grid = mgg::NativeMolaGrid;
+  std::vector<Grid::Cell> occupied;
+  std::vector<Grid::Cell> free;
+  std::vector<Grid::Surface> surfaces;
+  for (std::int64_t x = -10; x <= 10; ++x) {
+    for (std::int64_t y = -10; y <= 15; ++y) {
+      occupied.push_back({x, y, -1});  // floor, its top at z = 0
+      surfaces.push_back({{x, y, -1}, 0.0});
+      const bool wall = (x == -2 || x == 2) && y <= 5;
+      for (std::int64_t z = 0; z <= 2; ++z) {
+        if (wall) {
+          occupied.push_back({x, y, z});
+          surfaces.push_back({{x, y, z}, (z + 1) * 0.2});
+        } else {
+          free.push_back({x, y, z});
+        }
+      }
+    }
+  }
+  const Grid map(0.2, occupied, free, surfaces);
+
+  mgg::RobotParams robot;
+  robot.type = mgg::RobotType::kGroundRobot;
+  robot.size = Eigen::Vector3d(1.2, 0.4, 0.15);
+  robot.size_extension.setZero();
+  robot.size_extension_min.setZero();
+  robot.safety_extension.setZero();
+  robot.bound_mode = mgg::BoundModeType::kExactBound;
+  mgg::PlanningParams planning;
+  planning.max_ground_height = 0.3;
+  planning.max_step_height = 0.1;
+  planning.max_inclination = 0.52;
+  const mgg::GroundProjection ground(map, planning);
+
+  // At driving height over the floor, facing +y.
+  Eigen::Vector3d probe(0.1, 0.1, 0.3);
+  VoxelStatus found = VoxelStatus::kUnknown;
+  const double below = ground.projectSample(probe, found);
+  ASSERT_EQ(found, VoxelStatus::kOccupied);
+  const double driving_z = 0.3 - below + planning.max_ground_height;
+  const double heading = M_PI / 2.0;
+  const mgg::StateVec start(0.1, 0.1, driving_z, heading);
+  ASSERT_FALSE(mgg::turnClear(map, robot, start));
+
+  // Steps along the heading while `box` sweeps free; returns how far out
+  // the first pose with room to turn is, at least 0.5 m and at most 2 m,
+  // or a negative distance when there is none.
+  const auto depart = [&](const Eigen::Vector3d& box) {
+    Eigen::Vector3d from = start.head<3>();
+    for (int i = 1; i <= 20; ++i) {
+      const double along = 0.1 * i;
+      const Eigen::Vector3d to(start.x(), start.y() + along, driving_z);
+      std::vector<Eigen::Vector3d> projected;
+      if (ground.getProjectedEdgeStatus(from, to, box, true, projected,
+                                        false) !=
+          mgg::ProjectedEdgeStatus::kAdmissible) {
+        return -along;
+      }
+      from = to;
+      if (along >= 0.5 - 1e-9 &&
+          mgg::turnClear(map, robot,
+                         mgg::StateVec(to.x(), to.y(), to.z(), heading))) {
+        return along;
+      }
+    }
+    return -1.0;
+  };
+
+  // Turned to face y the box is 0.4 m across the corridor: it drives out,
+  // to room to turn past the walls' end. The turning circle, 0.632 m in
+  // radius, clears the walls' corners 0.3 m to either side 0.556 m past
+  // their end at y = 1.2: the first step there is y = 1.8, 1.7 m out.
+  const Eigen::Vector3d box = robot.getPlanningSize();
+  const double c = std::abs(std::cos(heading));
+  const double s = std::abs(std::sin(heading));
+  const Eigen::Vector3d turned(c * box.x() + s * box.y(),
+                               s * box.x() + c * box.y(), box.z());
+  const double out = depart(turned);
+  EXPECT_NEAR(out, 1.7, 1e-9);
+  // Aligned with the map, the box is its 1.2 m length across the corridor
+  // and the first step already hits the walls.
+  EXPECT_NEAR(depart(box), -0.1, 1e-9);
 }
 
 }  // namespace
