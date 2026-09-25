@@ -161,6 +161,31 @@ TEST(NativeGain, WallGapsHideWhatIsBehindAndADoorwayDoesNot) {
   EXPECT_GT(through_doorway, 200);
 }
 
+// Review r1 (P1), accepted as a minimum opening height: a framed opening of
+// at most kMaxWallGapVoxels (0.6 m at 0.2 m) is taken for a gap between
+// lidar rings in a wall, and hides what is beyond it; a taller one does not.
+TEST(NativeGain, FramedOpeningsUpToTheWallGapLimitHideWhatIsBeyond) {
+  static_assert(mgg::kMaxWallGapVoxels == 3);
+  const Eigen::Vector3d viewpoint(0.1, 0.5, 0.5);
+  // Returns in every row from the wall base to z = 1.8 but the opening's.
+  const auto framed = [](std::int64_t low, std::int64_t high) {
+    return street([low, high](std::int64_t) {
+      std::vector<std::int64_t> rows;
+      for (std::int64_t z = 0; z < 9; ++z)
+        if (z < low || z > high) rows.push_back(z);
+      return rows;
+    });
+  };
+  // 0.4 m, z = [0.4, 0.8), and 0.6 m, z = [0.4, 1.0): wall gaps.
+  auto low_window = framed(2, 3);
+  EXPECT_EQ(beyondAndAbove(groundGain(low_window, viewpoint), -1.0), 0);
+  auto limit_window = framed(2, 4);
+  EXPECT_EQ(beyondAndAbove(groundGain(limit_window, viewpoint), -1.0), 0);
+  // 0.8 m, z = [0.4, 1.2): a window, seen through.
+  auto window = framed(2, 5);
+  EXPECT_GT(beyondAndAbove(groundGain(window, viewpoint), -1.0), 200);
+}
+
 // Review r0 (P1): a single return in a column made the whole column a wall,
 // so rays over a window sill, a railing or a rising ramp saw nothing beyond.
 // Only a gap between two returns hides what is behind it.

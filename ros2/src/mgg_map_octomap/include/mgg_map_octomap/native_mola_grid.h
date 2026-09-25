@@ -112,9 +112,10 @@ class NativeMolaGrid final : public MapInterface {
   std::unordered_map<std::pair<std::int64_t, std::int64_t>,
                      std::pair<std::size_t, std::size_t>, ColumnHash>
       occupied_columns_;
-  /// Cells between two occupied cells of their column that are at most
-  /// 2 kMaxWallGapVoxels apart: every cell a wall gap can be in, whatever
-  /// the band, in an index that is quick to miss.
+  /// Cells between two consecutive occupied cells of their column that are
+  /// at most kMaxWallGapVoxels + 1 apart. A wall gap lies between two such
+  /// cells whatever the band, since a band is contiguous in height; the
+  /// index is quick to miss.
   std::vector<Cell> gap_candidates_, no_cells_;
   CellIndex<Cell> gap_candidate_index_;
 };

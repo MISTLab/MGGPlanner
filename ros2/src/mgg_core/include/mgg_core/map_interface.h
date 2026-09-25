@@ -80,10 +80,13 @@ struct WallBand {
 };
 
 /// Most voxels, stacked in a column between two wall returns, that
-/// getVisibleScanStatus takes for a gap in the wall. A lidar that carves
-/// free space with one ray per 5 degree bin leaves 0.4 m between returns
-/// at 4.6 m; a window or a doorway is taller.
-inline constexpr int kMaxWallGapVoxels = 2;
+/// getVisibleScanStatus takes for a gap in the wall: 0.6 m at 0.2 m. A
+/// mapping that carves free space with one ray per 5 x 5 degree bin leaves
+/// gaps of that size between lidar rings a few metres away (5 degrees is
+/// 0.6 m at 6.9 m). This is a minimum opening height: a framed opening of
+/// at most this many voxels, a low window, is taken for a wall gap, and
+/// what lies beyond it is not counted. A taller opening stays visible.
+inline constexpr int kMaxWallGapVoxels = 3;
 
 struct XYCellCenter {
   Eigen::Vector2d center = Eigen::Vector2d::Zero();

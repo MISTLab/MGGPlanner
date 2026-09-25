@@ -134,7 +134,7 @@ NativeMolaGrid::NativeMolaGrid(double r, std::vector<Cell> o,
     for (std::size_t i = first + 1; i < last; ++i) {
       const Cell& low = occupied_[i - 1];
       const Cell& high = occupied_[i];
-      if (high.z - low.z > 2 * kMaxWallGapVoxels) continue;
+      if (high.z - low.z > kMaxWallGapVoxels + 1) continue;
       for (auto z = low.z + 1; z < high.z; ++z)
         gap_candidates_.push_back({low.x, low.y, z});
     }
