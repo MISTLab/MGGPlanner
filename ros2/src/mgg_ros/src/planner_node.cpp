@@ -406,6 +406,7 @@ mgg::ExpandContext PlannerNode::makeContext() {
   // projecting it again onto absent ground would only fail.
   ctx.preserve_hanging_root_start_height = hanging_root_edge_length_max_ > 0.0;
   ctx.root_footprint_exempt = true;
+  ctx.root_is_robot = true;
   return ctx;
 }
 
@@ -417,6 +418,7 @@ mgg::ExpandContext PlannerNode::makeGlobalContext() {
   ctx.stop_at_unknown = true;
   // Vertex zero of the roadmap is home, not the robot.
   ctx.root_footprint_exempt = false;
+  ctx.root_is_robot = false;
   return ctx;
 }
 

@@ -10,6 +10,7 @@
 
 #include "mgg_core/graph_expansion.h"
 #include "mgg_core/grid_graph.h"
+#include "terrain_fixture.h"
 
 namespace {
 
@@ -527,6 +528,62 @@ TEST(GridGraph, CountsOccupiedProjectedEndpointSeparatelyFromUnknown) {
       graph, StateVec(0.0, 0.0, 1.0, 0.0), grid, ctx, 0.0);
   EXPECT_EQ(result.projected_endpoint_occupied, 1);
   EXPECT_EQ(result.projected_endpoint_unknown, 0);
+}
+
+TEST(GridGraph, HomeOnALedgeIsNotEnteredWithItsFrontOverTheDrop) {
+  // Review r3, I-1b: in the global roadmap vertex zero is home, not the
+  // robot, and the robot drives into it. Home stands on level ground that
+  // ends at x = 0.6 (a ledge over unobserved space), 0.2 m from its edge; a
+  // new vertex lies 0.4 m back from it, away from the drop. The edge from
+  // home to it is driven the other way, into home, arriving with only 1/3
+  // of the leading half of a Bunker's footprint on observed ground: it is
+  // refused. Only where vertex zero is the robot itself (the local
+  // lattice) is an edge out of it checked outwards alone.
+  std::map<std::pair<std::int64_t, std::int64_t>, double> tops;
+  for (std::int64_t x = -10; x < 3; ++x) {
+    for (std::int64_t y = -10; y < 10; ++y) tops[{x, y}] = 0.0;
+  }
+  for (const bool root_is_robot : {false, true}) {
+    SCOPED_TRACE(root_is_robot ? "vertex zero is the robot"
+                               : "vertex zero is home");
+    const mgg_test::TerrainFixture map(0.2, tops);
+    RobotParams robot;
+    robot.type = RobotType::kGroundRobot;
+    robot.size = Eigen::Vector3d(1.023, 0.778, 0.4);
+    PlanningParams planning;
+    planning.max_ground_height = 0.525;
+    planning.max_step_height = 0.15;
+    planning.max_inclination = 0.6;
+    planning.edge_length_min = 0.1;
+    planning.edge_length_max = 2.0;
+    planning.edge_overshoot = 0.0;
+    planning.nearest_range = 1.1;
+    planning.nearest_range_min = 0.1;
+    planning.nearest_range_max = 100.0;
+    planning.nearest_range_z = 100.0;
+    const mgg::GroundProjection ground(map, planning);
+    mgg::ExpandContext ctx;
+    ctx.map = &map;
+    ctx.planning = &planning;
+    ctx.robot = &robot;
+    ctx.ground = &ground;
+    ctx.robot_box_size = robot.getPlanningSize();
+    ctx.stop_at_unknown = !root_is_robot;
+    ctx.root_is_robot = root_is_robot;
+    GraphManager graph;
+    graph.addVertex(new Vertex(0, StateVec(0.4, 0.1, 0.525, 0.0)));
+    Vertex candidate(1, StateVec(0.0, 0.1, 0.525, 0.0));
+    mgg::ExpandGraphReport report;
+    mgg::expandGraph(graph, candidate, report, ctx);
+    if (root_is_robot) {
+      EXPECT_EQ(report.num_vertices_added, 1);
+    } else {
+      EXPECT_EQ(report.num_vertices_added, 0);
+      EXPECT_EQ(report.edge_status[static_cast<int>(
+                    mgg::ProjectedEdgeStatus::kGroundUnobserved)],
+                1);
+    }
+  }
 }
 
 }  // namespace

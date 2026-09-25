@@ -194,13 +194,16 @@ void expandGraph(GraphManager& graph, Vertex& new_vertex,
 
   std::vector<Eigen::Vector3d> projected_edge;
   const bool is_hanging = nearest_vertex->is_hanging || new_vertex.is_hanging;
-  // An edge out of the root, where the robot stands, is driven outwards
-  // only; any other lattice or roadmap edge either way.
+  // An edge out of the root, when the root is where the robot stands, is
+  // driven outwards only; any other lattice or roadmap edge either way.
+  // Vertex zero is home in the roadmap and the goal in a goal lattice,
+  // both of which the robot drives into.
   bool admissible_edge = edgeTraversable(
       ctx, start_pos, end_pos, is_hanging,
       ctx.preserve_hanging_root_start_height && nearest_vertex->id == 0,
       projected_edge, rep, ctx.stop_at_unknown,
-      nearest_vertex->id == 0 ? EdgeTravel::kForward : EdgeTravel::kBothWays);
+      nearest_vertex->id == 0 && ctx.root_is_robot ? EdgeTravel::kForward
+                                                   : EdgeTravel::kBothWays);
   if (admissible_edge && ctx.projected_edge_admissible &&
       !ctx.projected_edge_admissible(projected_edge)) {
     admissible_edge = false;

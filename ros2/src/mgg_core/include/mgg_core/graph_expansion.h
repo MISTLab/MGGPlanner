@@ -73,6 +73,13 @@ struct ExpandContext {
   /// Edges out of vertex zero (the robot) are swept from the edge of the
   /// robot's own footprint: where the robot stands is not an obstacle to it.
   bool root_footprint_exempt = false;
+  /// Vertex zero is the robot, where it stands: an edge out of it is only
+  /// ever driven outwards, so the ground ahead is checked one way only
+  /// (EdgeTravel::kForward). True for the local lattice only. In the global
+  /// roadmap vertex zero is home, and in connectGoalThroughLattice's
+  /// scratch lattice it is the goal; the robot drives into both, so their
+  /// edges are checked both ways (review r3, I-1b).
+  bool root_is_robot = false;
   /// Explicit-objective graph builds require a ground-projected candidate's
   /// final body box to be observed free. Explore leaves this false to retain
   /// its legacy frontier policy; explicit refinement still validates the full
