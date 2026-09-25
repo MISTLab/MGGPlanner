@@ -1937,6 +1937,10 @@ void PlannerNode::onPlanRequest(
     return true;
   };
   std::string resumed;
+  // A resumed route withheld with no departure: the robot is boxed in with
+  // no way out, as buildLocalGraph's boxed_in_without_departure_now_ says,
+  // which buildLocalGraph resets.
+  bool withheld_without_departure = false;
   if (resume_global) {
     auto map_read = mapReadLease();
     refreshMapRevision();
@@ -1945,6 +1949,7 @@ void PlannerNode::onPlanRequest(
       global_exploration_ongoing_ = false;
       summary = "global repositioning abandoned: " + reason;
     } else if (depart_instead_of_turning_route(departure)) {
+      withheld_without_departure = best_path_.empty();
       resumed =
           "; global repositioning given up: its route starts with a turn "
           "the robot has no room for" +
@@ -1963,7 +1968,8 @@ void PlannerNode::onPlanRequest(
     const bool low_gain =
         best_path_.empty() && local_graph_->getNumVertices() > 1 &&
         low_gain_rounds_ >= auto_global_planner_low_gain_rounds_;
-    if (low_gain && boxed_in_without_departure_now_) {
+    if (low_gain &&
+        (boxed_in_without_departure_now_ || withheld_without_departure)) {
       // Boxed in with no way out: the global planner's route would start
       // with the turn the robot cannot make, and failing to find one would
       // not make exploration complete. No path, and the robot's own

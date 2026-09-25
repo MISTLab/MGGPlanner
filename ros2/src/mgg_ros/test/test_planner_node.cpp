@@ -1179,4 +1179,38 @@ TEST_F(PlannerNodeTest, AResumedRepositioningFromADeadEndReversesOutFirst) {
   expectReverseDepartureFromDeadEnd(*node, *response);
 }
 
+TEST_F(PlannerNodeTest, AResumedRouteWithheldWithNoWayOutIsNotExplorationComplete) {
+  // Review r2: the robot, 0.6 m long, faces +x in an explored corridor
+  // 0.5 m wide that runs 2.5 m on either side of it, too far for a
+  // straight departure to reach room to turn. A repositioning to a
+  // frontier behind it is under way; the resumed route starts with a
+  // 180-degree turn, and is withheld with no departure. The lattice has no
+  // gain and the global planner is due, but the robot is boxed in with no
+  // way out: no second global search, whose frontier has meanwhile seen
+  // everything and would make exploration complete, and no second
+  // boxed-in count. No path, and the robot's own recovery runs.
+  auto node = makeNode("withheld_no_way_out");
+  PlannerNodeTestPeer::setRobotFootprint(*node, 0.6, 0.2);
+  PlannerNodeTestPeer::gainFromUnknownVoxelsOnly(*node);
+  // At voxel centres, and far enough that no lattice viewpoint, facing +x,
+  // sees unknown space.
+  PlannerNodeTestPeer::observeFloor(*node, -3.55, 5.55, -2.55, 2.55);
+  PlannerNodeTestPeer::observeWall(*node, -2.5, 2.5, 0.25);
+  PlannerNodeTestPeer::observeWall(*node, -2.5, 2.5, -0.25);
+  PlannerNodeTestPeer::acceptOdometry(*node, 0.0, 0.0, 1.0);
+  // Facing +x, back up the corridor it has mapped: no gain on a re-check.
+  const int frontier = PlannerNodeTestPeer::addGlobalChainToFrontier(
+      *node, {{-0.5, 0.0}, {-1.0, 0.0}, {-1.5, 0.0}, {-2.0, 0.0}, {-2.5, 0.0}});
+  PlannerNodeTestPeer::repositionTowards(*node, frontier);
+  PlannerNodeTestPeer::consultGlobalPlannerAtOnce(*node);
+
+  auto response = std::make_shared<mgg_msgs::srv::PlannerSrv::Response>();
+  PlannerNodeTestPeer::plan(*node, response);
+  EXPECT_TRUE(response->path.empty())
+      << "path of " << response->path.size() << " poses";
+  EXPECT_EQ(response->status, PlannerNode::kStatusNoPath);
+  EXPECT_EQ(PlannerNodeTestPeer::boxedInWithoutDeparture(*node), 1);
+  EXPECT_EQ(PlannerNodeTestPeer::routeSharpTurnFallbacks(*node), 1);
+}
+
 }  // namespace mgg_ros
