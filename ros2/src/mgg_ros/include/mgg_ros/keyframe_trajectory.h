@@ -52,8 +52,9 @@ class KeyframeTrajectorySource {
 ///
 /// Other fields are ignored. The component may hold other robots'
 /// keyframes; only `robot_id`'s are taken, which must all be of one session
-/// and include its first keyframe, seq 0: the robot's home. They are
-/// ordered by seq, which is the order they were taken in.
+/// and include its first keyframe, seq 0: the robot's home, each seq once,
+/// each pose a rigid transform. They are ordered by seq, which is the order
+/// they were taken in.
 class GraphSolutionFile : public KeyframeTrajectorySource {
  public:
   /// Files larger than `max_bytes` are refused.

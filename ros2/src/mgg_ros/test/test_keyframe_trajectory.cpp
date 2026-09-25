@@ -92,6 +92,25 @@ TEST(GraphSolution, MalformedDocumentsAreRefused) {
       R"( "T_component_keyframe": [[1, 0, 0, 0], [0, 1, 0, 0], [0, 0, 1, 0],)"
       R"( [0, 0, 1, 1]]})");
   EXPECT_FALSE(parseGraphSolution(not_rigid, "robot_1", trajectory, error));
+  // Review r0, M-6: a rotation block that is not a rotation.
+  const std::string sheared = solution(
+      R"({"keyframe_id": {"robot_id": "robot_1", "session_id": "s1", "seq": 0},)"
+      R"( "T_component_keyframe": [[1, 0.3, 0, 0], [0, 1, 0, 0], [0, 0, 1, 0],)"
+      R"( [0, 0, 0, 1]]})");
+  EXPECT_FALSE(parseGraphSolution(sheared, "robot_1", trajectory, error));
+  EXPECT_NE(error.find("rigid"), std::string::npos) << error;
+}
+
+TEST(GraphSolution, AKeyframeTwiceIsRefused) {
+  // Review r0, M-6: a duplicate seq is not silently overwritten.
+  KeyframeTrajectory trajectory;
+  std::string error;
+  EXPECT_FALSE(parseGraphSolution(
+      solution(pose("robot_1", "s1", 0, 0.0, 0.0) + ", " +
+               pose("robot_1", "s1", 1, 1.0, 0.0) + ", " +
+               pose("robot_1", "s1", 1, 5.0, 0.0)),
+      "robot_1", trajectory, error));
+  EXPECT_NE(error.find("twice"), std::string::npos) << error;
 }
 
 TEST(GraphSolution, TheFileIsReadWholeAndBounded) {
