@@ -93,6 +93,8 @@ if(BUILD_TESTING)
   target_link_libraries(test_native_mola_index ${PROJECT_NAME})
   ament_add_gtest(test_native_gain test/test_native_gain.cpp)
   target_link_libraries(test_native_gain ${PROJECT_NAME})
+  ament_add_gtest(test_native_gain_memory test/test_native_gain_memory.cpp)
+  target_link_libraries(test_native_gain_memory ${PROJECT_NAME})
 endif()
 
 ament_package(CONFIG_EXTRAS mgg_map_octomap-extras.cmake.in)

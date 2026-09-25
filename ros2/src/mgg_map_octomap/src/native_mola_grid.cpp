@@ -27,17 +27,21 @@ struct CellEqual {
 /// What a scan has made of each cell it visited: every visit of every ray
 /// goes through it, about 65k cells for the 648-ray, 20 m simulated VLP16,
 /// so it is open-addressed, and it is kept per thread and emptied by
-/// advancing a generation rather than by clearing a few megabytes per scan.
-/// A cell's state is 0 until the scan assigns it one.
+/// advancing a generation rather than by clearing megabytes per scan.
+/// It starts at kInitialSlots and doubles as the distinct cells a scan
+/// visits fill half of it, so its size follows what scans visit, not how
+/// many rays they cast: 29 bytes a slot, 0.9 MB to start, 7.6 MB for the
+/// simulated VLP16. A cell's state is 0 until the scan assigns it one.
 class ScanCells {
  public:
-  void reset(std::size_t expected) {
+  static constexpr std::size_t kInitialSlots = std::size_t(1) << 15;
+  void reset() {
     count_ = 0;
     if (++generation_ == 0) {
       std::fill(generations_.begin(), generations_.end(), 0);
       generation_ = 1;
     }
-    if (cells_.size() < 2 * expected) rehash(2 * expected);
+    if (cells_.empty()) rehash(kInitialSlots);
   }
   std::uint8_t& operator[](const NativeMolaGrid::Cell& k) {
     if (2 * (count_ + 1) > cells_.size()) rehash(2 * cells_.size());
@@ -445,7 +449,7 @@ void NativeMolaGrid::scanUnique(
   // later ray only needs the verdict.
   enum : std::uint8_t { kNew = 0, kCounted, kCountedOccupied, kWallGap };
   thread_local ScanCells cells;
-  cells.reset(ends.size() * 64);
+  cells.reset();
   for (const auto& e : ends) {
     const bool valid = walk(p, e, [&](const Cell& k) {
       std::uint8_t& state = cells[k];
