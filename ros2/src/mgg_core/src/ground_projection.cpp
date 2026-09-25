@@ -239,46 +239,100 @@ ProjectedEdgeStatus GroundProjection::getProjectedEdgeStatus(
     return ProjectedEdgeStatus::kCrossSlope;
   }
 
+  // The points the body is checked at: every point of the polyline and
+  // between them, at most kFootprintSampleSpacing apart. A short edge's
+  // polyline is its two ends, 0.4 to 0.57 m apart on the lattice, and which
+  // of a rock's cells fell under a footprint then depended on where the
+  // lattice lay (run 5, robot_2). Not the start where the robot stands.
+  std::vector<Eigen::Vector3d> samples;
+  for (std::size_t i = 1; i < projected_edge.size(); ++i) {
+    const Eigen::Vector3d& from = projected_edge[i - 1];
+    const Eigen::Vector3d& to = projected_edge[i];
+    const int count = std::max(
+        1, static_cast<int>(std::ceil((to - from).head<2>().norm() /
+                                          kFootprintSampleSpacing -
+                                      1e-9)));
+    for (int k = (i == 1 && standing_at_start) ? 1 : 0; k < count; ++k) {
+      samples.push_back(from + (to - from) * (double(k) / count));
+    }
+  }
+  if (!projected_edge.empty()) samples.push_back(projected_edge.back());
+  const Eigen::Vector2d heading =
+      projected_edge.size() >= 2
+          ? Eigen::Vector2d(
+                (projected_edge.back() - projected_edge.front()).head<2>())
+          : Eigen::Vector2d::Zero();
+
   const bool check_tilt = params_.max_footprint_tilt > 0.0;
   const bool check_step = params_.max_footprint_step > 0.0;
-  if ((check_tilt || check_step) && projected_edge.size() >= 2) {
-    const Eigen::Vector2d heading =
-        (projected_edge.back() - projected_edge.front()).head<2>();
-    const auto refused = [&](const Eigen::Vector3d& point) {
+  if ((check_tilt || check_step) && heading.norm() > 1e-9) {
+    for (const Eigen::Vector3d& point : samples) {
       const FootprintPlane plane = footprintPlane(point, heading, box_size);
-      return plane.measured &&
-             ((check_tilt && plane.tilt > params_.max_footprint_tilt) ||
-              (check_step &&
-               plane.max_residual > params_.max_footprint_step));
-    };
-    if (heading.norm() > 1e-9) {
-      // At every point of the polyline and between them, at most
-      // kFootprintSampleSpacing apart: a short edge's polyline is its two
-      // ends, 0.4 to 0.57 m apart on the lattice, and which of a rock's
-      // cells fell under a footprint then depended on where the lattice
-      // lay (run 5, robot_2).
-      for (std::size_t i = 1; i < projected_edge.size(); ++i) {
-        const Eigen::Vector3d& from = projected_edge[i - 1];
-        const Eigen::Vector3d& to = projected_edge[i];
-        const int samples = std::max(
-            1, static_cast<int>(std::ceil((to - from).head<2>().norm() /
-                                              kFootprintSampleSpacing -
-                                          1e-9)));
-        for (int k = (i == 1 && standing_at_start) ? 1 : 0; k < samples;
-             ++k) {
-          if (refused(from + (to - from) * (double(k) / samples))) {
-            return ProjectedEdgeStatus::kFootprintPlane;
-          }
-        }
-      }
-      if (refused(projected_edge.back())) {
+      if (plane.measured &&
+          ((check_tilt && plane.tilt > params_.max_footprint_tilt) ||
+           (check_step && plane.max_residual > params_.max_footprint_step))) {
         return ProjectedEdgeStatus::kFootprintPlane;
+      }
+    }
+  }
+
+  // Never onto unobserved ground (item 7): at every point, the half of the
+  // footprint ahead must stand on observed ground. robot_0 was parked with
+  // its front half over an unobserved 4 m pit in run 5 and tipped into it.
+  // An edge that may hang, from a root the lidar has not yet seen the ground
+  // under, is exempt but for its end, which is a vertex with ground.
+  const double min_ground = params_.min_observed_ground_fraction;
+  if (min_ground > 0.0 && heading.norm() > 1e-9) {
+    for (std::size_t i = 0; i < samples.size(); ++i) {
+      if (is_hanging && i + 1 < samples.size()) continue;
+      if (observedGroundAhead(samples[i], heading, box_size) <
+          min_ground - 1e-9) {
+        return ProjectedEdgeStatus::kGroundUnobserved;
       }
     }
   }
 
   projected_edge_out = projected_edge;
   return ProjectedEdgeStatus::kAdmissible;
+}
+
+double GroundProjection::observedGroundAhead(
+    const Eigen::Vector3d& point, const Eigen::Vector2d& heading,
+    const Eigen::Vector3d& box_size) const {
+  const double half_length = 0.5 * box_size.x();
+  const double half_width = 0.5 * box_size.y();
+  if (!point.allFinite() || !(heading.norm() > 1e-9) ||
+      !(half_length > 0.0) || !(half_width > 0.0)) {
+    return 0.0;
+  }
+  const Eigen::Vector2d along = heading.normalized();
+  const Eigen::Vector2d across(-along.y(), along.x());
+  std::vector<XYCellCenter> candidates;
+  if (!map_.getCircleIntersectingXYCellCenters(
+          point.head<2>(), std::hypot(half_length, half_width),
+          kMaxFootprintCells, candidates)) {
+    return 0.0;
+  }
+  const double lowest = point.z() - 2.0 * params_.max_ground_height;
+  int ahead = 0;
+  int observed = 0;
+  for (const XYCellCenter& cell : candidates) {
+    const Eigen::Vector2d offset = cell.center - point.head<2>();
+    const double forward = offset.dot(along);
+    if (forward < -1e-9 || forward > half_length + 1e-9 ||
+        std::abs(offset.dot(across)) > half_width + 1e-9) {
+      continue;
+    }
+    ++ahead;
+    Eigen::Vector3d ground;
+    if (footprintGroundBelow(
+            Eigen::Vector3d(cell.center.x(), cell.center.y(), point.z()),
+            ground) &&
+        ground.z() >= lowest) {
+      ++observed;
+    }
+  }
+  return ahead > 0 ? static_cast<double>(observed) / ahead : 0.0;
 }
 
 bool GroundProjection::groundBelow(const Eigen::Vector3d& point,

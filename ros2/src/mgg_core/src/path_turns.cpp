@@ -289,6 +289,50 @@ bool turnClear(const MapInterface& map, const RobotParams& robot,
          VoxelStatus::kOccupied;
 }
 
+bool turnSpaceObserved(const MapInterface& map, const RobotParams& robot,
+                       const PlanningParams& planning, const StateVec& state) {
+  const double min_ground = planning.min_observed_ground_fraction;
+  if (!(min_ground > 0.0)) return true;
+  const Eigen::Vector3d center = state.head<3>() + robot.center_offset;
+  std::vector<XYCellCenter> cells;
+  constexpr std::size_t kMaxTurnCells = 1024;
+  if (!center.allFinite() ||
+      !map.getCircleIntersectingXYCellCenters(
+          center.head<2>(), robot.turningRadius(), kMaxTurnCells, cells)) {
+    return false;
+  }
+  const double resolution = map.getResolution();
+  const double height = robot.getPlanningSize().z();
+  const double lowest = center.z() - 2.0 * planning.max_ground_height;
+  int observed_ground = 0;
+  for (const XYCellCenter& cell : cells) {
+    bool observed = false;
+    for (double z = center.z() - 0.5 * height;
+         z <= center.z() + 0.5 * height + 1e-9 && !observed;
+         z += resolution) {
+      observed = map.getVoxelStatus(Eigen::Vector3d(
+                     cell.center.x(), cell.center.y(), z)) !=
+                 VoxelStatus::kUnknown;
+    }
+    if (!observed) return false;
+    const Eigen::Vector3d from(cell.center.x(), cell.center.y(), center.z());
+    Eigen::Vector3d ground;
+    if (map.getGroundRayStatus(
+            from, from - Eigen::Vector3d(0.0, 0.0, 2.0 * planning.max_ground_height),
+            false, ground) == VoxelStatus::kOccupied &&
+        ground.z() >= lowest) {
+      ++observed_ground;
+    }
+  }
+  return observed_ground >= min_ground * static_cast<double>(cells.size()) - 1e-9;
+}
+
+bool roomToTurn(const MapInterface& map, const RobotParams& robot,
+                const PlanningParams& planning, const StateVec& state) {
+  return turnClear(map, robot, state) &&
+         turnSpaceObserved(map, robot, planning, state);
+}
+
 PathTurnCheck::PathTurnCheck(GraphManager& graph, const RobotParams& robot,
                              TurnRoomFn room_to_turn, SlopeFn slope)
     : graph_(graph),

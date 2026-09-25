@@ -69,7 +69,9 @@ inline constexpr double kViewpointArrivalSlack = 0.05;
 /// turning radius (RobotParams::turningRadius) plus kViewpointArrivalSlack
 /// plus PlanningParams::viewpoint_clearance_margin, and never less than the
 /// turning radius whatever the margin, so a robot that reaches
-/// a clear path end can turn there (turnClear): in run 5 (2026-09-25) path
+/// a clear path end can turn there (roomToTurn; with
+/// PlanningParams::min_observed_ground_fraction set, a ground robot's end
+/// also needs turnSpaceObserved): in run 5 (2026-09-25) path
 /// ends allowed 0.49 m from a wall left Bunkers, whose corners reach
 /// 0.64 m, boxed in. For an aerial robot it is its inscribed radius (half
 /// the smaller of RobotParams::size x and y) plus the margin. The lattice's

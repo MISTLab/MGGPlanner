@@ -65,12 +65,22 @@ class PlannerNodeTestPeer {
   /// Mapped floor at z = 0 over [xmin, xmax] x [ymin, ymax], observed by
   /// vertical rays, and a free body volume above it. Space outside the
   /// rectangle stays unknown, which is what the lattice's frontiers look at.
+  /// The floor is observed at the centre of every 0.1 m voxel from the one
+  /// holding xmin (ymin) up: stepping 0.1 m from a bound drifts across voxel
+  /// boundaries and leaves rows of floor unobserved, which the planner does
+  /// not drive onto (min_observed_ground_fraction).
   static void observeFloor(PlannerNode& node, double xmin, double xmax,
-                           double ymin, double ymax) {
+                           double ymin, double ymax,
+                           bool at_voxel_centres = true) {
     const std::lock_guard<std::recursive_mutex> lock(node.planner_mutex_);
     std::vector<Eigen::Vector3d> floor;
-    for (double x = xmin; x <= xmax + 1e-9; x += 0.10) {
-      for (double y = ymin; y <= ymax + 1e-9; y += 0.10) {
+    const auto first = [at_voxel_centres](double v) {
+      return at_voxel_centres ? (std::floor(v / 0.10 + 1e-6) + 0.5) * 0.10
+                              : v;
+    };
+    const double past = at_voxel_centres ? 0.05 : 0.0;
+    for (double x = first(xmin); x <= xmax + past + 1e-9; x += 0.10) {
+      for (double y = first(ymin); y <= ymax + past + 1e-9; y += 0.10) {
         floor.emplace_back(x, y, 0.0);
       }
     }
@@ -262,6 +272,9 @@ class PlannerNodeTestPeer {
   /// Poses of the last lattice path dropped because it went nowhere.
   static int lastNowherePoses(PlannerNode& node) {
     return node.last_nowhere_poses_;
+  }
+  static void setMinObservedGround(PlannerNode& node, double fraction) {
+    node.planning_params_.min_observed_ground_fraction = fraction;
   }
   static int pathsGoingNowhere(PlannerNode& node) {
     return node.paths_going_nowhere_;
@@ -965,7 +978,13 @@ TEST_F(PlannerNodeTest, ARobotRestingInADipStillPlans) {
   // robot's own body box overlaps occupied voxels. Where it stands is not an
   // obstacle to it: the lattice still has admissible cells.
   auto node = makeNode("dip");
-  PlannerNodeTestPeer::observeFloor(*node, -1.5, 4.0, -1.5, 1.5);
+  // As this scene was written: floor and ring stepped 0.1 m from their
+  // bounds, which leaves rows of voxels unobserved, and the lattice leaves
+  // the dip through them. The unobserved-ground check refuses exactly those
+  // edges, so it is off here; a hole-free ring 0.25 m up all round, a step
+  // over max_step_height, has no way out at all.
+  PlannerNodeTestPeer::setMinObservedGround(*node, 0.0);
+  PlannerNodeTestPeer::observeFloor(*node, -1.5, 4.0, -1.5, 1.5, false);
   // A raised ring of floor 0.25 m up, from 0.3 m to 0.7 m out, all around.
   PlannerNodeTestPeer::observeRaisedRing(*node, 0.3, 0.7, 0.25);
   PlannerNodeTestPeer::acceptOdometry(*node, 0.0, 0.0, 1.0);

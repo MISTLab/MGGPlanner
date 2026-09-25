@@ -22,6 +22,12 @@ bool viewpointClear(const MapInterface& map, const RobotParams& robot,
   if (robot.type == RobotType::kGroundRobot) {
     radius = std::max(radius, robot.turningRadius());
   }
+  // Where it can turn, as roomToTurn has it: with the space it would turn
+  // in observed (item 7).
+  if (robot.type == RobotType::kGroundRobot &&
+      !turnSpaceObserved(map, robot, planning, viewpoint)) {
+    return false;
+  }
   const Eigen::Vector3d center = viewpoint.head<3>() + robot.center_offset;
   return map.getOccupiedOnlyCylinderPathStatus(
              center, center, radius, robot.getPlanningSize().z()) !=

@@ -1199,7 +1199,7 @@ std::string PlannerNode::buildLocalGraph() {
   // would be.
   mgg::PathTurnCheck turn_check(
       *local_graph_, robot_params_, [this](const mgg::StateVec& pose) {
-        return mgg::turnClear(*map_, robot_params_, pose);
+        return mgg::roomToTurn(*map_, robot_params_, planning_params_, pose);
       });
   mgg::PathTurnsFn turns_admissible;
   mgg::SharpTurnAllowedFn sharp_turn_allowed;
@@ -1302,7 +1302,8 @@ std::string PlannerNode::buildLocalGraph() {
   std::string boxed_in;
   const bool is_boxed_in = (sel.sharp_turn_fallback || goes_nowhere) &&
                            turns_admissible &&
-                           !mgg::turnClear(*map_, robot_params_, root_state);
+                           !mgg::roomToTurn(*map_, robot_params_, planning_params_,
+                                            root_state);
   if (is_boxed_in) {
     boxed_in = departBoxedIn(root_state, goes_nowhere
                                              ? "its best path goes nowhere"
@@ -1341,17 +1342,17 @@ std::string PlannerNode::buildLocalGraph() {
   // lattice is finding space but every candidate is being turned away. The
   // reason breakdown is the only thing that separates a geometry mistake from
   // a genuinely blocked robot, so report it whenever it happens.
-  char why[192] = "";
+  char why[224] = "";
   if (r.vertices_added == 0 && r.free_cells > 0) {
     std::snprintf(why, sizeof(why),
                   " (rejected: %d collision, %d no ground; edges: %d ok, "
                   "%d steep, %d occupied, %d unmapped, %d hanging, %d "
-                  "cross-slope, %d footprint-plane)",
+                  "cross-slope, %d footprint-plane, %d ground unobserved)",
                   r.rejected[static_cast<int>(mgg::ExpandGraphStatus::
                                                   kErrorCollisionEdge)],
                   r.no_ground, r.edge_status[0], r.edge_status[1],
                   r.edge_status[2], r.edge_status[3], r.edge_status[4],
-                  r.edge_status[5], r.edge_status[6]);
+                  r.edge_status[5], r.edge_status[6], r.edge_status[7]);
   }
   const auto t_end = Clock::now();
   const auto ms = [](Clock::time_point a, Clock::time_point b) {
@@ -1731,7 +1732,7 @@ mgg::PathOkFn PlannerNode::applyRouteTurnRule(
   const auto check = std::make_shared<mgg::PathTurnCheck>(
       graph, robot_params_,
       [this](const mgg::StateVec& pose) {
-        return mgg::turnClear(*map_, robot_params_, pose);
+        return mgg::roomToTurn(*map_, robot_params_, planning_params_, pose);
       },
       slope);
   const double start_heading = current_state_[3];
@@ -1756,9 +1757,9 @@ mgg::PathOkFn PlannerNode::applyRouteTurnRule(
         mgg::pathTurns(points, start_heading, check->window());
     last_route_starts_with_turn_without_room_ =
         !turns.empty() && turns.front() > mgg::kSharpTurnRad + 1e-9 &&
-        !mgg::turnClear(*map_, robot_params_,
-                        mgg::StateVec(points.front().x(), points.front().y(),
-                                      points.front().z(), start_heading));
+        !mgg::roomToTurn(*map_, robot_params_, planning_params_,
+                         mgg::StateVec(points.front().x(), points.front().y(),
+                                       points.front().z(), start_heading));
     RCLCPP_WARN(get_logger(),
                 "%s to (%.2f, %.2f, %.2f) turns sharply on a slope or "
                 "without room to turn: no route turns only where it may; "

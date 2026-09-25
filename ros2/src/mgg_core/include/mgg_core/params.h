@@ -238,6 +238,20 @@ struct PlanningParams {
   /// upstream parameters.
   double path_clearance_distance = 1.5;
   double path_clearance_min_factor = 0.2;
+  /// A ground robot never drives or turns onto space it has not observed
+  /// (operator decision after run 5, 2026-09-25). At every pose of an edge
+  /// (GroundProjection::getProjectedEdgeStatus), at least this fraction of
+  /// the map cells under the leading half of its footprint, the half ahead
+  /// in the direction of travel, must have observed ground: an occupied
+  /// voxel a downward ray meets within 2 max_ground_height of the pose's
+  /// driving height, so that unknown cells, and a drop deeper than that,
+  /// count as none. Where it turns in place (roomToTurn), the same fraction
+  /// of the cells of its turning circle must have observed ground, and no
+  /// column of that circle may be unobserved over the height of its
+  /// collision box. On the run-5 grids 0.4 to 3.4 % of the poses the robots
+  /// drove had less than 0.75 ahead, and robot_0's ledge, where it tipped
+  /// into a 4 m pit, 1/9. 0 turns it off. Not an upstream parameter.
+  double min_observed_ground_fraction = 0.75;
 
   // Global planner.
   double relaxed_corridor_multiplier = 1.0;

@@ -251,6 +251,12 @@
       # rock pile. 0 turns it off.
       path_clearance_distance: 1.5
       path_clearance_min_factor: 0.2
+      # A ground robot never drives or turns onto unobserved space: at every
+      # pose of an edge this fraction of the cells under the leading half of
+      # its footprint, and where it turns in place of its turning circle, must
+      # have observed ground, and the turning circle no unobserved column.
+      # 0 turns it off.
+      min_observed_ground_fraction: 0.75
       auto_global_planner_enable: true
       relaxed_corridor_multiplier: 1.5
       homing_backward: false

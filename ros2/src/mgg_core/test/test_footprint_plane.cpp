@@ -53,6 +53,9 @@ PlanningParams planningFor(const Platform& p) {
   params.max_ground_height = p.base_height + p.max_step_height + 0.175;
   params.max_inclination = deg(p.max_inclination_deg);
   params.max_cross_slope = deg(p.max_cross_slope_deg);
+  // The fixtures record the ground within 1.5 m of the path and no free
+  // space; the unobserved-ground check is tested on its own.
+  params.min_observed_ground_fraction = 0.0;
   return params;
 }
 

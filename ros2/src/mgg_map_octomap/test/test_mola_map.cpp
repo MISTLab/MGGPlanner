@@ -567,6 +567,8 @@ TEST(MolaMap, ViewpointBesideAnOccupiedColumnLacksClearanceThoughItsBoxIsFree) {
   robot.bound_mode = mgg::BoundModeType::kExactBound;
   mgg::PlanningParams planning;
   planning.viewpoint_clearance_margin = 0.1;
+  // No floor is mapped: the observed-space part is tested on its own.
+  planning.min_observed_ground_fraction = 0.0;
 
   // 0.25 m beside the column. The body box, 0.2 m to either side, is free;
   // the turning radius, 0.36 m, plus the arrival slack and the margin,
@@ -1654,6 +1656,9 @@ TEST(MolaMap, SparseMeasuredRayCorridorGrowsFootprintValidatedGroundGraph) {
   planning.num_vertices_max = 100;
   planning.num_edges_max = 1000;
   planning.num_loops_max = 1000;
+  // One line of measured floor under a 0.78 m wide body: what the
+  // unobserved-ground check (tested on its own) refuses.
+  planning.min_observed_ground_fraction = 0.0;
   mgg::GroundProjection ground(provider, planning);
   mgg::ExpandContext context;
   context.map = &provider;
@@ -1982,6 +1987,77 @@ TEST(Departure, Run5Robot1DepartsFromBesideTheWallColumn) {
                 departure.turn * 180.0 / M_PI, out,
                 departure.reverse ? "back" : "ahead");
   }
+}
+
+TEST(ObservedGround, Run5Robot0IsNotParkedAtTheLedge) {
+  // Run 5, robot_0 (Bunker) at 1790349295: at the end of a passage 1.2 m
+  // wide it stood with its centre 0.1 m from a ledge, facing south, its
+  // front half over a 4 m pit, and fell in. The pit floor lies below the
+  // fixture's cut, as it lay unobserved before the fall. Of the cells under
+  // the leading half of its footprint only 1 in 9 has observed ground: the
+  // pose is refused, as is turning there. 0.4 m back it stood on observed
+  // ground ahead.
+  const BoxedInFixture fixture("ledge_r0.txt");
+  const mgg::RobotParams robot = bunker();
+  mgg::PlanningParams planning = bunkerPlanning();
+  planning.max_footprint_tilt = 0.0;  // the passage's walls read as steps
+  planning.max_footprint_step = 0.0;
+  const mgg::GroundProjection ground(*fixture.map, planning);
+  const auto at = [&](double x, double y) {
+    Eigen::Vector3d p(x, y, fixture.robot.z() + planning.max_ground_height);
+    VoxelStatus found = VoxelStatus::kUnknown;
+    const double below = ground.projectSample(p, found);
+    EXPECT_EQ(found, VoxelStatus::kOccupied);
+    p.z() -= below - planning.max_ground_height;
+    p.x() = x;
+    p.y() = y;
+    return p;
+  };
+  const Eigen::Vector2d south(0.0, -1.0);
+  const Eigen::Vector3d ledge = at(137.83, -79.52);
+  const Eigen::Vector3d back = at(137.80, -79.10);
+  const double at_ledge =
+      ground.observedGroundAhead(ledge, south, robot.getPlanningSize());
+  const double at_back =
+      ground.observedGroundAhead(back, south, robot.getPlanningSize());
+  std::printf("robot_0 ledge: observed ground ahead %.2f at the ledge, %.2f "
+              "0.4 m back\n", at_ledge, at_back);
+  EXPECT_LT(at_ledge, planning.min_observed_ground_fraction);
+  EXPECT_GE(at_back, planning.min_observed_ground_fraction);
+  std::vector<Eigen::Vector3d> path;
+  EXPECT_EQ(ground.getProjectedEdgeStatus(back, ledge,
+                                          robot.getPlanningSize(), false,
+                                          path, false),
+            mgg::ProjectedEdgeStatus::kGroundUnobserved);
+  EXPECT_FALSE(mgg::roomToTurn(
+      *fixture.map, robot, planning,
+      mgg::StateVec(ledge.x(), ledge.y(), ledge.z(), -M_PI / 2.0)));
+  // Without the check, nothing else refuses the edge onto the ledge.
+  planning.min_observed_ground_fraction = 0.0;
+  EXPECT_EQ(ground.getProjectedEdgeStatus(back, ledge,
+                                          robot.getPlanningSize(), false,
+                                          path, false),
+            mgg::ProjectedEdgeStatus::kAdmissible);
+}
+
+TEST(ObservedGround, Run5Robot1HasNoRoomToTurnBesideAnUnobservedWall) {
+  // Run 5, robot_1 (Bunker) at 1790348990.57 was sent a path starting with
+  // a 170 degree turn at (76.60, -43.76), and rode onto a wall's foot. The
+  // wall's cells within its turning circle, 0.43 to 0.62 m from its centre,
+  // were not yet observed, and unknown space passes turnClear. The fixture
+  // leaves them unknown: the turning circle holds unobserved columns, so
+  // there is no room to turn.
+  const BoxedInFixture fixture("turn_r1.txt");
+  const mgg::RobotParams robot = bunker();
+  const mgg::PlanningParams planning = bunkerPlanning();
+  const mgg::StateVec root = boxedInStart(fixture, planning, 79.0);
+  EXPECT_TRUE(mgg::turnClear(*fixture.map, robot, root));
+  EXPECT_FALSE(mgg::turnSpaceObserved(*fixture.map, robot, planning, root));
+  EXPECT_FALSE(mgg::roomToTurn(*fixture.map, robot, planning, root));
+  // 0.6 m east, clear of the wall, the robot may turn.
+  mgg::StateVec east = root;
+  east.x() += 0.6;
+  EXPECT_TRUE(mgg::roomToTurn(*fixture.map, robot, planning, east));
 }
 
 }  // namespace

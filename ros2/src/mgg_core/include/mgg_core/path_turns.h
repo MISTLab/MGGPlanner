@@ -81,6 +81,26 @@ double groundSlope(const GroundProjection& ground,
 bool turnClear(const MapInterface& map, const RobotParams& robot,
                const StateVec& state);
 
+/// Whether the robot at `state`, at driving height, has observed where it
+/// would turn in place: with PlanningParams::min_observed_ground_fraction
+/// set, at least that fraction of the map cells meeting its turning circle
+/// (RobotParams::turningRadius) have observed ground, an occupied voxel a
+/// downward ray meets within 2 max_ground_height of `state`, and every
+/// such cell has been observed, free or occupied, somewhere over the height
+/// of the collision box. In run 5 robot_1 turned 170 degrees where its
+/// turning circle held a wall cell the map had not yet seen, and rode onto
+/// the wall's foot. A column observed only in part counts as observed: the
+/// planner grids carve free space more sparsely higher up (robot_1's run-5
+/// grid leaves 23 % of the voxels 0.6 to 0.8 m over the floor unknown). True
+/// when the fraction is 0.
+bool turnSpaceObserved(const MapInterface& map, const RobotParams& robot,
+                       const PlanningParams& planning, const StateVec& state);
+
+/// Whether a ground robot may turn in place at `state`: turnClear, and
+/// turnSpaceObserved. Unknown space passes turnClear alone.
+bool roomToTurn(const MapInterface& map, const RobotParams& robot,
+                const PlanningParams& planning, const StateVec& state);
+
 /// Whether a path turns sharply only where it may.
 using PathTurnsFn = std::function<bool(const std::vector<Vertex*>&)>;
 

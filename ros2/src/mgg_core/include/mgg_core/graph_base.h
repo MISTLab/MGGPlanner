@@ -172,7 +172,7 @@ struct ExpandGraphReport {
   /// all six surface as kErrorCollisionEdge; without this, a lattice that
   /// produces no vertices gives no clue whether the terrain is too steep, the
   /// space is unmapped, or something is genuinely in the way.
-  int edge_status[7] = {0, 0, 0, 0, 0, 0, 0};
+  int edge_status[8] = {0, 0, 0, 0, 0, 0, 0, 0};
 };
 
 struct RandomSamplingParams {

@@ -287,6 +287,8 @@ bool loadPlanningParams(const ParamLoader& p, const std::string& ns,
   p.get(ns + "/departure_reverse_allowed", out.departure_reverse_allowed);
   p.get(ns + "/path_clearance_distance", out.path_clearance_distance);
   p.get(ns + "/path_clearance_min_factor", out.path_clearance_min_factor);
+  p.get(ns + "/min_observed_ground_fraction",
+        out.min_observed_ground_fraction);
   p.get(ns + "/relaxed_corridor_multiplier", out.relaxed_corridor_multiplier);
   p.get(ns + "/auto_global_planner_enable", out.auto_global_planner_enable);
   p.get(ns + "/go_home_if_fully_explored", out.go_home_if_fully_explored);

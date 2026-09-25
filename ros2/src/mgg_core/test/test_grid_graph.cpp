@@ -165,6 +165,9 @@ struct SparseGroundFixture {
     robot.type = RobotType::kGroundRobot;
     robot.size = Eigen::Vector3d(0.4, 0.4, 0.4);
     planning.max_ground_height = 0.5;
+    // Ground under only part of the body, which the unobserved-ground check
+    // (min_observed_ground_fraction, tested on its own) would refuse.
+    planning.min_observed_ground_fraction = 0.0;
     planning.max_step_height = 0.2;
     planning.max_inclination = 0.6;
     planning.edge_length_min = 0.1;
@@ -430,6 +433,9 @@ TEST(GridGraph, ExplicitBuildRejectsUnknownProjectedEndpointAndKeepsAlternative)
   robot.size = Eigen::Vector3d(0.2, 0.2, 0.2);
   PlanningParams planning;
   planning.max_ground_height = 0.5;
+  // Ground under only part of the body, which the unobserved-ground check
+  // (min_observed_ground_fraction, tested on its own) would refuse.
+  planning.min_observed_ground_fraction = 0.0;
   planning.max_step_height = 0.2;
   planning.max_inclination = 0.6;
   planning.edge_length_min = 0.1;

@@ -12,6 +12,7 @@
 #include <gtest/gtest.h>
 
 #include "mgg_core/ground_projection.h"
+#include "mgg_core/path_turns.h"
 #include "terrain_fixture.h"
 
 namespace {
@@ -658,6 +659,73 @@ TEST(GroundProjection, AShortEdgeIsMeasuredBetweenItsEnds) {
   params.max_footprint_step = 0.0;
   EXPECT_EQ(gp.getProjectedEdgeStatus(start, end, box, false, path, false),
             ProjectedEdgeStatus::kAdmissible);
+}
+
+TEST(GroundProjection, AnEdgeOntoUnobservedGroundIsRefused) {
+  // Item 7: level ground mapped up to x = 0.6, nothing beyond (a ledge over
+  // an unobserved drop), and a Bunker's planning box heading +x. At x = 0.4
+  // the leading half of its footprint reaches 0.54 m ahead: of its cells
+  // (centres 0.5, 0.7, 0.9 along it) only the first has ground.
+  std::map<std::pair<std::int64_t, std::int64_t>, double> tops;
+  for (std::int64_t x = -10; x < 3; ++x) {
+    for (std::int64_t y = -10; y < 10; ++y) tops[{x, y}] = 0.0;
+  }
+  const mgg_test::TerrainFixture map(0.2, tops);
+  PlanningParams params = makeParams();
+  params.max_step_height = 0.15;
+  params.max_ground_height = 0.525;
+  GroundProjection gp(map, params);
+  const Eigen::Vector3d box(1.073, 0.828, 0.45);
+  const Eigen::Vector3d back(-0.4, 0.1, 0.525);
+  const Eigen::Vector3d here(0.0, 0.1, 0.525);
+  const Eigen::Vector3d edge(0.4, 0.1, 0.525);
+  EXPECT_DOUBLE_EQ(gp.observedGroundAhead(here, {1.0, 0.0}, box), 1.0);
+  EXPECT_NEAR(gp.observedGroundAhead(edge, {1.0, 0.0}, box), 1.0 / 3.0,
+              1e-9);
+  std::vector<Eigen::Vector3d> path;
+  EXPECT_EQ(gp.getProjectedEdgeStatus(back, here, box, false, path, false),
+            ProjectedEdgeStatus::kAdmissible);
+  EXPECT_EQ(gp.getProjectedEdgeStatus(here, edge, box, false, path, false),
+            ProjectedEdgeStatus::kGroundUnobserved);
+  // Driving away from the ledge, the leading half is over ground.
+  EXPECT_EQ(gp.getProjectedEdgeStatus(edge, here, box, false, path, false),
+            ProjectedEdgeStatus::kAdmissible);
+  // Off, as before.
+  params.min_observed_ground_fraction = 0.0;
+  EXPECT_EQ(gp.getProjectedEdgeStatus(here, edge, box, false, path, false),
+            ProjectedEdgeStatus::kAdmissible);
+
+  // A pit that has been observed, its floor 4 m down, is no ground either.
+  params.min_observed_ground_fraction = 0.75;
+  for (std::int64_t x = 3; x < 10; ++x) {
+    for (std::int64_t y = -10; y < 10; ++y) tops[{x, y}] = -4.0;
+  }
+  const mgg_test::TerrainFixture pit(0.2, tops);
+  GroundProjection over_pit(pit, params);
+  EXPECT_NEAR(over_pit.observedGroundAhead(edge, {1.0, 0.0}, box),
+              1.0 / 3.0, 1e-9);
+}
+
+TEST(TurnSpaceObserved, NeedsObservedGroundUnderTheTurningCircle) {
+  // Item 7, a turn in place: the turning circle of a Bunker, 0.643 m, needs
+  // observed ground under 3/4 of its cells. Level ground up to x = 0.6.
+  std::map<std::pair<std::int64_t, std::int64_t>, double> tops;
+  for (std::int64_t x = -10; x < 3; ++x) {
+    for (std::int64_t y = -10; y < 10; ++y) tops[{x, y}] = 0.0;
+  }
+  const mgg_test::TerrainFixture map(0.2, tops);
+  mgg::RobotParams bunker;
+  bunker.type = mgg::RobotType::kGroundRobot;
+  bunker.size = Eigen::Vector3d(1.023, 0.778, 0.4);
+  PlanningParams params = makeParams();
+  params.max_ground_height = 0.525;
+  EXPECT_TRUE(mgg::turnSpaceObserved(map, bunker, params,
+                                     mgg::StateVec(-0.4, 0.1, 0.525, 0.0)));
+  EXPECT_FALSE(mgg::turnSpaceObserved(map, bunker, params,
+                                      mgg::StateVec(0.4, 0.1, 0.525, 0.0)));
+  params.min_observed_ground_fraction = 0.0;
+  EXPECT_TRUE(mgg::turnSpaceObserved(map, bunker, params,
+                                     mgg::StateVec(0.4, 0.1, 0.525, 0.0)));
 }
 
 /// Level 0.2 m cells that count the ground rays cast into them.

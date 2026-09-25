@@ -39,6 +39,8 @@ enum class ProjectedEdgeStatus {
   kCrossSlope,  ///< its ground slopes sideways past max_cross_slope
   kFootprintPlane,  ///< the ground under its footprint tilts past
                     ///< max_footprint_tilt or steps past max_footprint_step
+  kGroundUnobserved,  ///< too little of the ground ahead of its footprint
+                      ///< is observed (min_observed_ground_fraction)
 };
 
 /// The plane fitted to the ground under a robot's footprint at one point.
@@ -138,6 +140,9 @@ class GroundProjection {
   /// every point and between them, at most kFootprintSampleSpacing apart
   /// along the edge, short edges included: see footprintPlane. An edge with
   /// a point whose plane tilts or steps past either is kFootprintPlane.
+  /// With min_observed_ground_fraction set, at the same points (not the
+  /// start where the robot stands, nor the points of an edge that may hang)
+  /// observedGroundAhead must reach it, or the edge is kGroundUnobserved.
   ///
   /// max_inclination and max_cross_slope stay as coarse pre-filters.
   /// Neither sees the plane the chassis sits on: a segment between samples
@@ -183,6 +188,16 @@ class GroundProjection {
   FootprintPlane footprintPlane(const Eigen::Vector3d& point,
                                 const Eigen::Vector2d& heading,
                                 const Eigen::Vector3d& box_size) const;
+
+  /// The fraction of the map cells under the leading half of a footprint
+  /// (`box_size` x long along `heading`, y wide, centred on `point` at
+  /// driving height; the cells whose centre lies under it, ahead of or on
+  /// its centre line) with observed ground: an occupied voxel the ground ray
+  /// meets within 2 max_ground_height below `point`. 0 when the map's cells
+  /// cannot be enumerated.
+  double observedGroundAhead(const Eigen::Vector3d& point,
+                             const Eigen::Vector2d& heading,
+                             const Eigen::Vector3d& box_size) const;
 
   /// The ground straight below `point`, false when none is mapped within
   /// max_projection_length.

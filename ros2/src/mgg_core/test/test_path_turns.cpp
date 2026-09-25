@@ -340,6 +340,8 @@ TEST(ViewpointClear, AGroundRobotsPathEndsOnlyWhereItCanTurn) {
   bunker.size = Eigen::Vector3d(1.023, 0.778, 0.4);
   mgg::PlanningParams planning;
   planning.viewpoint_clearance_margin = 0.0;
+  // Walls answers no ground: the observed-space part is tested on its own.
+  planning.min_observed_ground_fraction = 0.0;
   // 0.55 m from the wall: no room to turn, so not a path end.
   const StateVec at_055(0.1, 0.05, 0.5, 0.0);
   EXPECT_FALSE(mgg::turnClear(wall, bunker, at_055));

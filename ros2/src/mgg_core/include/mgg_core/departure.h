@@ -90,7 +90,7 @@ struct Departure {
 /// PlanningParams::departure_reverse_allowed, straight back, in steps of
 /// path_interpolation_distance (at most kDepartureMinM) up to
 /// kDepartureMaxM, to the first pose at least kDepartureMinM out where
-/// the robot has room to turn in place (turnClear). Each step is projected
+/// the robot has room to turn in place (roomToTurn). Each step is projected
 /// to driving height and checked with getProjectedEdgeStatus, through
 /// known free space only, its body the robot's planning box turned to the
 /// heading (orientedBoxPathStatus, the cells under the robot where it
