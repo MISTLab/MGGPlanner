@@ -227,6 +227,9 @@
       # disables each; launch files set them per platform.
       max_footprint_tilt: 0.0
       max_footprint_step: 0.0
+      # The largest height difference between neighbouring ground cells
+      # under the footprint (metres), a rock's edge; zero disables it.
+      max_footprint_cell_rise: 0.0
       yaw_tangent_correction: true
       traverse_length_max: 10.0
       traverse_time_max: 40.0

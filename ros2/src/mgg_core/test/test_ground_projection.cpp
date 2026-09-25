@@ -728,6 +728,49 @@ TEST(TurnSpaceObserved, NeedsObservedGroundUnderTheTurningCircle) {
                                      mgg::StateVec(0.4, 0.1, 0.525, 0.0)));
 }
 
+TEST(GroundProjection, ARockEdgeRisesMoreBetweenCellsThanARamp) {
+  // Item 8: a Scout's edge up a 16 degree ramp rises 0.057 m from one
+  // 0.2 m cell to the next; one onto a 0.2 m rock 0.2 m in one step.
+  // max_footprint_cell_rise 0.12 keeps the ramp and refuses the rock.
+  std::map<std::pair<std::int64_t, std::int64_t>, double> ramp, rock;
+  const double slope = std::tan(16.0 * M_PI / 180.0);
+  for (std::int64_t x = -10; x < 10; ++x) {
+    for (std::int64_t y = -10; y < 10; ++y) {
+      ramp[{x, y}] = (x + 0.5) * 0.2 * slope;
+      rock[{x, y}] = (x >= 2 && x <= 3 && y >= -1 && y <= 0) ? 0.2 : 0.0;
+    }
+  }
+  PlanningParams params = makeParams();
+  params.max_step_height = 0.15;
+  params.max_ground_height = 0.4475;
+  params.max_footprint_cell_rise = 0.12;
+  const Eigen::Vector3d box(0.662, 0.630, 0.295);
+  const mgg_test::TerrainFixture on_ramp(0.2, ramp);
+  const GroundProjection up(on_ramp, params);
+  const Eigen::Vector3d ramp_start(0.0, 0.0, 0.4475);
+  const Eigen::Vector3d ramp_end(0.8, 0.0, 0.8 * slope + 0.4475);
+  EXPECT_NEAR(up.footprintPlane(ramp_start, {1.0, 0.0}, box).max_cell_rise,
+              0.2 * slope, 1e-6);
+  std::vector<Eigen::Vector3d> path;
+  EXPECT_EQ(up.getProjectedEdgeStatus(ramp_start, ramp_end, box, false, path,
+                                      false),
+            ProjectedEdgeStatus::kAdmissible);
+
+  const mgg_test::TerrainFixture on_rock(0.2, rock);
+  const GroundProjection over(on_rock, params);
+  const Eigen::Vector3d rock_start(0.0, 0.0, 0.4475);
+  const Eigen::Vector3d rock_end(0.4, 0.0, 0.4475);
+  EXPECT_NEAR(over.footprintPlane(rock_end, {1.0, 0.0}, box).max_cell_rise,
+              0.2, 1e-6);
+  EXPECT_EQ(over.getProjectedEdgeStatus(rock_start, rock_end, box, false,
+                                        path, false),
+            ProjectedEdgeStatus::kFootprintPlane);
+  params.max_footprint_cell_rise = 0.0;
+  EXPECT_EQ(over.getProjectedEdgeStatus(rock_start, rock_end, box, false,
+                                        path, false),
+            ProjectedEdgeStatus::kAdmissible);
+}
+
 /// Level 0.2 m cells that count the ground rays cast into them.
 class CountingSurface : public mgg_test::TerrainFixture {
  public:

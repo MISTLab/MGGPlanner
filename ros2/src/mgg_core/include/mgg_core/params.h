@@ -180,6 +180,13 @@ struct PlanningParams {
   /// plane, metres: a rock or step the plane does not explain. Zero
   /// disables it. Not an upstream parameter.
   double max_footprint_step = 0.0;
+  /// Largest height difference between the observed ground of two
+  /// neighbouring map cells under the footprint, metres: a rock's edge.
+  /// A plane fitted over the footprint smooths a 0.2 m rock under a Scout
+  /// Mini to 23.9 degrees and 0.105 m, within a smooth 16 degree ramp's
+  /// noise (run 5); one cell to the next the rock rises 0.16 to 0.23 m and
+  /// the ramp 0.06 m. Zero disables it. Not an upstream parameter.
+  double max_footprint_cell_rise = 0.0;
   double max_step_height = 0.0;
   /// How far above a goal's requested height its ground may lie, metres.
   /// A 2-D goal is seeded at the robot's altitude, which on another level

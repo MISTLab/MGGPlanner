@@ -3,6 +3,8 @@
 #include <algorithm>
 #include <cmath>
 #include <functional>
+#include <map>
+#include <utility>
 
 namespace mgg {
 
@@ -265,12 +267,16 @@ ProjectedEdgeStatus GroundProjection::getProjectedEdgeStatus(
 
   const bool check_tilt = params_.max_footprint_tilt > 0.0;
   const bool check_step = params_.max_footprint_step > 0.0;
-  if ((check_tilt || check_step) && heading.norm() > 1e-9) {
+  const bool check_rise = params_.max_footprint_cell_rise > 0.0;
+  if ((check_tilt || check_step || check_rise) && heading.norm() > 1e-9) {
     for (const Eigen::Vector3d& point : samples) {
       const FootprintPlane plane = footprintPlane(point, heading, box_size);
-      if (plane.measured &&
-          ((check_tilt && plane.tilt > params_.max_footprint_tilt) ||
-           (check_step && plane.max_residual > params_.max_footprint_step))) {
+      if ((plane.measured &&
+           ((check_tilt && plane.tilt > params_.max_footprint_tilt) ||
+            (check_step &&
+             plane.max_residual > params_.max_footprint_step))) ||
+          (check_rise &&
+           plane.max_cell_rise > params_.max_footprint_cell_rise)) {
         return ProjectedEdgeStatus::kFootprintPlane;
       }
     }
@@ -473,6 +479,9 @@ FootprintPlane GroundProjection::measureFootprintPlane(
   }
   std::vector<Eigen::Vector3d> ground_points;
   ground_points.reserve(candidates.size());
+  // The ground of each cell by its index on the map's grid, for the rise
+  // between neighbours.
+  std::map<std::pair<std::int64_t, std::int64_t>, double> ground_by_cell;
   int cells_under = 0;
   for (const XYCellCenter& cell : candidates) {
     const Eigen::Vector2d offset = cell.center - point.head<2>();
@@ -486,6 +495,18 @@ FootprintPlane GroundProjection::measureFootprintPlane(
                                              cell.center.y(), point.z()),
                              ground)) {
       ground_points.push_back(ground);
+      ground_by_cell[{cell.grid_x, cell.grid_y}] = ground.z();
+    }
+  }
+  for (const auto& [index, z] : ground_by_cell) {
+    for (const std::pair<std::int64_t, std::int64_t> next :
+         {std::make_pair(index.first + 1, index.second),
+          std::make_pair(index.first, index.second + 1)}) {
+      const auto found = ground_by_cell.find(next);
+      if (found != ground_by_cell.end()) {
+        plane.max_cell_rise =
+            std::max(plane.max_cell_rise, std::abs(found->second - z));
+      }
     }
   }
   plane.cells = static_cast<int>(ground_points.size());

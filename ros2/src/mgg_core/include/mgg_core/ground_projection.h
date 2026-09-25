@@ -53,6 +53,10 @@ struct FootprintPlane {
   double max_residual = 0.0;
   /// Distinct ground cells the plane was fitted to.
   int cells = 0;
+  /// Largest height difference between the ground of two neighbouring
+  /// cells (sharing a side on the map's grid) under the footprint, metres;
+  /// found whether or not the plane is measured. 0 with no such pair.
+  double max_cell_rise = 0.0;
 };
 
 /// The farthest apart, metres, that getProjectedEdgeStatus measures the
@@ -139,7 +143,9 @@ class GroundProjection {
   /// max_footprint_step is set, the plane under the footprint is fitted at
   /// every point and between them, at most kFootprintSampleSpacing apart
   /// along the edge, short edges included: see footprintPlane. An edge with
-  /// a point whose plane tilts or steps past either is kFootprintPlane.
+  /// a point whose plane tilts or steps past either is kFootprintPlane, and
+  /// so is one where two neighbouring ground cells under the footprint
+  /// differ in height by more than max_footprint_cell_rise.
   /// With min_observed_ground_fraction set, at the same points (not the
   /// start where the robot stands, nor the points of an edge that may hang)
   /// observedGroundAhead must reach it, or the edge is kGroundUnobserved.

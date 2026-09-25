@@ -33,6 +33,7 @@ class ParamFixture : public ::testing::Test {
         {"PlanningParams.path_clearance_distance", 0.8},
         {"PlanningParams.path_clearance_min_factor", 0.6},
         {"PlanningParams.min_observed_ground_fraction", 0.6},
+        {"PlanningParams.max_footprint_cell_rise", 0.13},
         {"PlanningParams.max_goal_ground_rise", 3.5},
         {"RobotParams.type", std::string("kGroundRobot")},
         {"RobotParams.size", std::vector<double>{0.8, 0.8, 0.2}},
@@ -92,6 +93,7 @@ TEST_F(ParamFixture, LoadsPlanningParams) {
   EXPECT_DOUBLE_EQ(params.path_clearance_distance, 0.8);
   EXPECT_DOUBLE_EQ(params.path_clearance_min_factor, 0.6);
   EXPECT_DOUBLE_EQ(params.min_observed_ground_fraction, 0.6);
+  EXPECT_DOUBLE_EQ(params.max_footprint_cell_rise, 0.13);
   EXPECT_DOUBLE_EQ(params.max_goal_ground_rise, 3.5);
   // Absent from the overrides, so the struct default survives.
   EXPECT_DOUBLE_EQ(params.v_max, 0.2);
