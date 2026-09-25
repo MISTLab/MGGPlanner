@@ -1114,6 +1114,7 @@ std::string PlannerNode::buildLocalGraph() {
   best_path_.clear();
   best_path_from_global_graph_ = false;
   boxed_in_without_departure_now_ = false;
+  local_gain_remains_now_ = false;
   if (!have_odometry_) return "no odometry received yet";
   if (!map_->getStatus()) {
     if (mola_map_ != nullptr) {
@@ -1279,6 +1280,7 @@ std::string PlannerNode::buildLocalGraph() {
       mgg::pathGoesNowhere(sel, current_state_.head<3>(), reach_distance_);
   if (goes_nowhere) {
     ++paths_going_nowhere_;
+    last_nowhere_poses_ = static_cast<int>(best_path_.size());
     std::snprintf(nowhere, sizeof(nowhere),
                   "; best path goes nowhere (ends %.2f m away, gain %.1f of "
                   "%.1f): no path",
@@ -1387,6 +1389,8 @@ std::string PlannerNode::buildLocalGraph() {
     // Nothing was scored; this round says nothing about the frontier.
   } else if (frontiers == 0 || goes_nowhere) {
     ++low_gain_rounds_;
+    local_gain_remains_now_ =
+        frontiers > 0 || (goes_nowhere && sel.best_full_gain > 0.0);
   } else if (low_gain_rounds_ > 0) {
     --low_gain_rounds_;
   }
@@ -1980,8 +1984,15 @@ void PlannerNode::onPlanRequest(
       low_gain_rounds_ = 0;
       std::string departure;
       if (!runGlobalPlanner(-1, reason)) {
-        complete = true;
-        summary += "; exploration complete: " + reason;
+        if (local_gain_remains_now_) {
+          // The lattice still sees gain it cannot send a path to; that is
+          // not a finished exploration. No path, and PCI retries.
+          summary += "; no global route (" + reason +
+                     "), but local gain remains: no path";
+        } else {
+          complete = true;
+          summary += "; exploration complete: " + reason;
+        }
       } else if (depart_instead_of_turning_route(departure)) {
         summary +=
             "; no local gain, and the global route starts with a turn the "

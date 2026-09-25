@@ -242,6 +242,27 @@ class PlannerNodeTestPeer {
   static void setReachDistance(PlannerNode& node, double reach) {
     node.reach_distance_ = reach;
   }
+  /// Gain counts only voxels inside this box (the global space).
+  static void setGainSpace(PlannerNode& node, const Eigen::Vector3d& lo,
+                           const Eigen::Vector3d& hi) {
+    const std::lock_guard<std::recursive_mutex> lock(node.planner_mutex_);
+    node.global_space_.setBound(lo, hi);
+  }
+  /// The lattice spans `lo` to `hi` in x and y around the robot.
+  static void setLattice(PlannerNode& node, const Eigen::Vector2d& lo,
+                         const Eigen::Vector2d& hi) {
+    node.grid_params_.min_val.head<2>() = lo;
+    node.grid_params_.max_val.head<2>() = hi;
+  }
+  static void setSensorRange(PlannerNode& node, double range) {
+    mgg::SensorParams& sensor = node.sensors_["test_lidar"];
+    sensor.max_range = range;
+    sensor.update();
+  }
+  /// Poses of the last lattice path dropped because it went nowhere.
+  static int lastNowherePoses(PlannerNode& node) {
+    return node.last_nowhere_poses_;
+  }
   static int pathsGoingNowhere(PlannerNode& node) {
     return node.paths_going_nowhere_;
   }
@@ -1217,6 +1238,81 @@ void expectReverseDepartureFromDeadEnd(
 }
 
 }  // namespace
+
+TEST_F(PlannerNodeTest, APathGoingNowhereFromWhereTheRobotCannotTurnDepartsInstead) {
+  // Review r0, M-5: the robot faces +x in a corridor too narrow to turn in
+  // that opens out 0.4 m ahead. Every path ends within the goal tolerance
+  // the planner is told, so none goes anywhere; with no room to turn it
+  // departs straight ahead, as a boxed-in robot does, rather than getting
+  // no path.
+  auto node = boxedIn("nowhere_departs", -2.5, 0.4);
+  PlannerNodeTestPeer::acceptOdometry(*node, 0.0, 0.0, 1.0);
+  const mgg::StateVec start =
+      PlannerNodeTestPeer::drivingState(*node, 0.0, 0.0, 0.0);
+  ASSERT_FALSE(PlannerNodeTestPeer::roomToTurn(*node, start));
+  PlannerNodeTestPeer::setReachDistance(*node, 10.0);
+  auto response = std::make_shared<mgg_msgs::srv::PlannerSrv::Response>();
+  PlannerNodeTestPeer::plan(*node, response);
+  EXPECT_EQ(PlannerNodeTestPeer::pathsGoingNowhere(*node), 1);
+  EXPECT_EQ(PlannerNodeTestPeer::boxedInDepartures(*node), 1);
+  EXPECT_EQ(response->status, mgg_msgs::srv::PlannerSrv::Response::FORWARD);
+  ASSERT_GE(response->path.size(), 2u);
+  EXPECT_GE(response->path.back().position.x, 0.5);
+  EXPECT_LE(response->path.back().position.x, 1.2);
+  for (const geometry_msgs::msg::Pose& pose : response->path) {
+    EXPECT_NEAR(pose.position.y, 0.0, 1e-6);
+  }
+}
+
+TEST_F(PlannerNodeTest, ATwoPoseClearPathToNoGainGoesNowhere) {
+  // Review r0, M-5, robot_3's 2-pose, gain-0 path. The robot, 0.2 m
+  // square, faces +x on mapped floor that ends at x = 0.75. To its right a
+  // slot 0.5 m wide along y = -1 (walls at y = -0.75 up to x = 0.3, and at
+  // y = -1.25) runs on into unmapped space, the only place gain counts
+  // (x > 0.8, y < -0.8). The lattice is the robot's 0.5 m cells from
+  // (0, -1) to (0.5, 0). Vertices in and at the slot see its unmapped part
+  // but lack viewpoint clearance (0.29 m); the one at (0.5, 0) is clear and
+  // sees none of it (the sensor reaches 1 m, 45 degrees either side of +x).
+  // Clearance picks the one-edge path there: two poses, 0.5 m long, leading
+  // to no gain. It goes nowhere, not by distance but by gain: no path.
+  auto node = makeNode("gainless_two_pose");
+  PlannerNodeTestPeer::gainFromUnknownVoxelsOnly(*node);
+  PlannerNodeTestPeer::setSensorRange(*node, 1.0);
+  PlannerNodeTestPeer::observeFloor(*node, -1.5, 0.75, -1.5, 1.5);
+  PlannerNodeTestPeer::observeWall(*node, -1.5, 0.3, -0.75);
+  PlannerNodeTestPeer::observeWall(*node, -1.5, 0.75, -1.25);
+  PlannerNodeTestPeer::setGainSpace(*node, Eigen::Vector3d(0.8, -4.0, -1.0),
+                                    Eigen::Vector3d(8.0, -0.8, 2.0));
+  PlannerNodeTestPeer::setLattice(*node, Eigen::Vector2d(0.0, -1.0),
+                                  Eigen::Vector2d(0.5, 0.0));
+  PlannerNodeTestPeer::acceptOdometry(*node, 0.0, 0.0, 1.0);
+  auto response = std::make_shared<mgg_msgs::srv::PlannerSrv::Response>();
+  PlannerNodeTestPeer::plan(*node, response);
+  EXPECT_TRUE(response->path.empty())
+      << "path of " << response->path.size() << " poses";
+  EXPECT_EQ(response->status, PlannerNode::kStatusNoPath);
+  EXPECT_EQ(PlannerNodeTestPeer::pathsGoingNowhere(*node), 1);
+  EXPECT_EQ(PlannerNodeTestPeer::lastNowherePoses(*node), 2);
+  EXPECT_EQ(PlannerNodeTestPeer::lowGainRounds(*node), 1);
+}
+
+TEST_F(PlannerNodeTest, AFailedGlobalSearchWithLocalGainLeftIsNotExplorationComplete) {
+  // Review r0, I-2: every path goes nowhere (the goal tolerance the planner
+  // is told reaches past the lattice), the round counts towards global
+  // repositioning, and the global graph has no frontier. The lattice still
+  // sees frontiers: no path, and PCI retries, not exploration complete.
+  auto node = makeNode("nowhere_not_complete");
+  PlannerNodeTestPeer::observeFloor(*node, -1.5, 4.0, -1.5, 1.5);
+  PlannerNodeTestPeer::acceptOdometry(*node, 0.0, 0.0, 1.0);
+  PlannerNodeTestPeer::setReachDistance(*node, 10.0);
+  PlannerNodeTestPeer::consultGlobalPlannerAtOnce(*node);
+  auto response = std::make_shared<mgg_msgs::srv::PlannerSrv::Response>();
+  PlannerNodeTestPeer::plan(*node, response);
+  EXPECT_TRUE(response->path.empty())
+      << "path of " << response->path.size() << " poses";
+  EXPECT_EQ(PlannerNodeTestPeer::pathsGoingNowhere(*node), 1);
+  EXPECT_EQ(response->status, PlannerNode::kStatusNoPath);
+}
 
 TEST_F(PlannerNodeTest, ARobotInAnExploredDeadEndReversesOutForTheGlobalRoute) {
   // Review r1: a robot that drove into a corridor too narrow to turn in and

@@ -334,6 +334,8 @@ class PlannerNode : public rclcpp::Node {
   /// Exploration paths dropped because they went nowhere
   /// (mgg::pathGoesNowhere), since the node started.
   int paths_going_nowhere_ = 0;
+  /// Poses of the last of them, for the log and tests.
+  int last_nowhere_poses_ = 0;
   /// Routes to a goal (objectives and global repositioning) sent although
   /// they turn sharply on a slope or without room to turn, because no route
   /// complied (applyRouteTurnRule), since the node started.
@@ -348,6 +350,11 @@ class PlannerNode : public rclcpp::Node {
   /// (departBoxedIn; buildLocalGraph resets it): no global repositioning is
   /// tried in its place.
   bool boxed_in_without_departure_now_ = false;
+  /// This cycle's lattice still had gain to go to: a frontier, or a path
+  /// that went nowhere only because it ended too near or unclear while the
+  /// gain lay beyond (buildLocalGraph resets it). A failed global search
+  /// is then no path, not exploration complete (review r0, I-2).
+  bool local_gain_remains_now_ = false;
   /// The last route to a goal kept although it turns sharply where it may
   /// not, and its first turn, from the robot's heading, is sharp where the
   /// robot has no room to turn (applyRouteTurnRule): a turn it cannot make.
