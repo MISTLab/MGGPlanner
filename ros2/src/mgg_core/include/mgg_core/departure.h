@@ -47,6 +47,9 @@ struct OrientedBox {
 bool cellMeetsBox(const Eigen::Vector2d& cell_center, double resolution,
                   const OrientedBox& box, double touch);
 
+/// Whether `point` lies inside `box`'s XY rectangle, edges included.
+bool pointInBox(const Eigen::Vector2d& point, const OrientedBox& box);
+
 /// Occupancy of the volume `box` sweeps moved in a straight line from
 /// `start` to `end`, keeping its heading. The sweep is split into steps of
 /// at most a map cell; each step's box is lengthened along the heading and
@@ -55,9 +58,14 @@ bool cellMeetsBox(const Eigen::Vector2d& cell_center, double resolution,
 /// getCircleIntersectingXYCellCenters, the cells treated as squares along
 /// the caller's x and y) is checked as a column over the box's height with
 /// MapInterface::getBoxStatus; with `stop_at_unknown_voxel` an unknown
-/// cell is kUnknown, unless an occupied one is met. A cell whose square
-/// overlaps `standing`, where the robot stands, is not checked at any
-/// height: the robot's own body is there. `box.center` is ignored.
+/// cell is kUnknown, unless an occupied one is met. With `standing`, where
+/// the robot stands, a cell whose centre lies inside it is not checked at
+/// any height: the robot's own body is there. A cell that only reaches
+/// into it is checked where the moving body reaches into the cell beyond
+/// the standing body (sampled every resolution / 8), so a post just past
+/// the robot's front is not driven through, while a wall column beside it
+/// does not stop the robot driving along it (review r0, I-1).
+/// `box.center` is ignored.
 VoxelStatus orientedBoxPathStatus(const MapInterface& map,
                                   const Eigen::Vector3d& start,
                                   const Eigen::Vector3d& end,
@@ -90,8 +98,14 @@ struct Departure {
 /// With no way out at its heading, the robot may
 /// first turn in place by up to kDepartureMaxTurnRad, nearest first: at
 /// every kDepartureTurnStepRad of the turn the body turned there must be
-/// free, checked the same way. Returns false, with `departure.path` empty,
-/// when there is no way out.
+/// free, checked the same way. These are discrete poses, not the swept
+/// arc: halfway between two steps a Bunker's corners reach about 2 cm
+/// outside both (review r0, M-1). The path turns only in its first pose,
+/// the start at the new heading; a controller such as SwarmDeck's DWB
+/// blends that turn into the drive rather than turning in place first, so
+/// the body it drives is not exactly the one checked, and its own costmap
+/// stays the collision authority (review r0, M-6). Returns false, with
+/// `departure.path` empty, when there is no way out.
 bool findDeparture(const MapInterface& map, const GroundProjection& ground,
                    const RobotParams& robot, const PlanningParams& planning,
                    const StateVec& start, Departure& departure);

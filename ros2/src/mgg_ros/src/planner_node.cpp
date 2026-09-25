@@ -1405,7 +1405,9 @@ std::string PlannerNode::departBoxedIn(const mgg::StateVec& root_state,
         (best_path_.back().head<2>() - best_path_.front().head<2>()).norm();
     char turn[48] = "";
     if (departure.turn != 0.0) {
-      std::snprintf(turn, sizeof(turn), " after turning %+.0f deg",
+      // The path's poses face the new heading; the controller turns while
+      // it drives off rather than first (mgg::findDeparture, review r0 M-6).
+      std::snprintf(turn, sizeof(turn), " at %+.0f deg to its heading",
                     departure.turn * 180.0 / M_PI);
     }
     std::snprintf(note, sizeof(note),

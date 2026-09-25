@@ -50,6 +50,46 @@ bool cellMeetsBox(const Eigen::Vector2d& cell_center, double resolution,
          reach_y - std::abs(offset.y()) > touch;
 }
 
+bool pointInBox(const Eigen::Vector2d& point, const OrientedBox& box) {
+  const Eigen::Vector2d along(std::cos(box.heading), std::sin(box.heading));
+  const Eigen::Vector2d across(-along.y(), along.x());
+  const Eigen::Vector2d offset = point - box.center.head<2>();
+  return std::abs(offset.dot(along)) <= 0.5 * box.size.x() + 1e-9 &&
+         std::abs(offset.dot(across)) <= 0.5 * box.size.y() + 1e-9;
+}
+
+namespace {
+
+/// Whether the body `swept` reaches into a map cell's square anywhere the
+/// robot does not already stand (`standing`). A cell whose centre lies
+/// inside the standing body is the robot's own place and never is. For a
+/// cell that only reaches into it, the square is sampled every
+/// resolution / 8, edges included, for a point inside `swept` and outside
+/// `standing`: a post just past the robot's front is met driving ahead but
+/// not backing away, and a wall column beside it is not met driving along
+/// it (review r0, I-1). A cell clear of the standing body always is.
+bool entersBeyondStanding(const Eigen::Vector2d& cell_center,
+                          double resolution, const OrientedBox& swept,
+                          const OrientedBox& standing) {
+  if (pointInBox(cell_center, standing)) return false;
+  if (!cellMeetsBox(cell_center, resolution, standing, 1e-6)) return true;
+  constexpr int kSamples = 8;
+  const double half = 0.5 * resolution;
+  for (int i = 0; i <= kSamples; ++i) {
+    for (int j = 0; j <= kSamples; ++j) {
+      const Eigen::Vector2d point =
+          cell_center + Eigen::Vector2d(-half + resolution * i / kSamples,
+                                        -half + resolution * j / kSamples);
+      if (pointInBox(point, swept) && !pointInBox(point, standing)) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
+}  // namespace
+
 VoxelStatus orientedBoxPathStatus(const MapInterface& map,
                                   const Eigen::Vector3d& start,
                                   const Eigen::Vector3d& end,
@@ -87,7 +127,7 @@ VoxelStatus orientedBoxPathStatus(const MapInterface& map,
     for (const XYCellCenter& cell : cells) {
       if (!cellMeetsBox(cell.center, resolution, swept, -1e-9)) continue;
       if (standing != nullptr &&
-          cellMeetsBox(cell.center, resolution, *standing, 1e-6)) {
+          !entersBeyondStanding(cell.center, resolution, swept, *standing)) {
         continue;
       }
       const VoxelStatus status = map.getBoxStatus(
@@ -168,7 +208,8 @@ bool findDeparture(const MapInterface& map, const GroundProjection& ground,
 
   if (straight(start[3])) return true;
   // Turned in place first, nearest first; a way blocked at some turn stays
-  // blocked beyond it.
+  // blocked beyond it. Each 5-degree pose is checked, not the arc between
+  // them (review r0, M-1).
   const int turns =
       static_cast<int>(std::round(kDepartureMaxTurnRad / kDepartureTurnStepRad));
   bool blocked[2] = {false, false};

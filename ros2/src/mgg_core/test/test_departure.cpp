@@ -175,4 +175,32 @@ TEST(OrientedBoxPathStatus, ACellTouchingTheStandingBodyIsStillChecked) {
             VoxelStatus::kOccupied);
 }
 
+TEST(OrientedBoxPathStatus, APostJustPastTheStandingBodysFrontIsChecked) {
+  // Review r0, I-1: a one-cell post centred 0.07 m past the front of a
+  // Bunker's planning box. Its square reaches 0.03 m into the box, but its
+  // centre lies outside: the robot does not stand on it, and driving ahead
+  // meets it.
+  const Columns map([](double x, double y) {
+    return std::abs(x - 0.7) < 0.05 && std::abs(y - 0.1) < 0.05;
+  });
+  for (const double past : {0.05, 0.07, 0.09}) {
+    SCOPED_TRACE(past);
+    const OrientedBox standing = bunkerAt(0.7 - past - 0.5365, 0.1, 0.0);
+    EXPECT_TRUE(mgg::cellMeetsBox(Eigen::Vector2d(0.7, 0.1), 0.2, standing,
+                                  1e-6));
+    const Eigen::Vector3d ahead =
+        standing.center + Eigen::Vector3d(0.25, 0.0, 0.0);
+    EXPECT_EQ(mgg::orientedBoxPathStatus(map, standing.center, ahead,
+                                         standing, true, &standing),
+              VoxelStatus::kOccupied);
+    // Backing away from it is free: the body reaches into the post's cell
+    // only where it already stands.
+    const Eigen::Vector3d back =
+        standing.center - Eigen::Vector3d(0.25, 0.0, 0.0);
+    EXPECT_EQ(mgg::orientedBoxPathStatus(map, standing.center, back,
+                                         standing, true, &standing),
+              VoxelStatus::kFree);
+  }
+}
+
 }  // namespace
