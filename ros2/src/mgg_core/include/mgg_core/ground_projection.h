@@ -16,6 +16,10 @@
 #ifndef MGG_CORE_GROUND_PROJECTION_H_
 #define MGG_CORE_GROUND_PROJECTION_H_
 
+#include <array>
+#include <cstdint>
+#include <functional>
+#include <unordered_map>
 #include <vector>
 
 #include <Eigen/Dense>
@@ -33,6 +37,20 @@ enum class ProjectedEdgeStatus {
   kUnknown,    ///< passes through unmapped space
   kHanging,    ///< no ground beneath it
   kCrossSlope,  ///< its ground slopes sideways past max_cross_slope
+  kFootprintPlane,  ///< the ground under its footprint tilts past
+                    ///< max_footprint_tilt or steps past max_footprint_step
+};
+
+/// The plane fitted to the ground under a robot's footprint at one point.
+struct FootprintPlane {
+  /// False when too few ground cells were found to fit a plane.
+  bool measured = false;
+  /// Angle between the plane and the horizontal, radians.
+  double tilt = 0.0;
+  /// Largest vertical distance of a ground cell from the plane, metres.
+  double max_residual = 0.0;
+  /// Distinct ground cells the plane was fitted to.
+  int cells = 0;
 };
 
 /// The most PlanningParams::max_goal_ground_rise may reach, metres: about
@@ -41,8 +59,24 @@ inline constexpr double kMaxGoalGroundRise = 6.0;
 
 class GroundProjection {
  public:
-  GroundProjection(const MapInterface& map, const PlanningParams& params)
-      : map_(map), params_(params) {}
+  /// With `cache_footprint_ground`, footprintPlane remembers two things and
+  /// reuses them for every later edge:
+  ///   * the ground found under each map cell, with the height its ray
+  ///     started from. A later ray down the same column that starts no
+  ///     higher, and not below that ground, passes only cells the first
+  ///     one found empty before it reached the ground, so it is not cast;
+  ///   * the plane at each point for each body axis (a heading and its
+  ///     reverse cover the same cells).
+  /// A lattice checks each vertex's footprint from every edge that meets
+  /// it, so this is most of the check's cost. The cache is only valid while
+  /// the map stays the same. Build such a GroundProjection for one plan,
+  /// while holding the map's read lease, and discard it with the plan. It
+  /// is not thread-safe.
+  GroundProjection(const MapInterface& map, const PlanningParams& params,
+                   bool cache_footprint_ground = false)
+      : map_(map),
+        params_(params),
+        cache_footprint_ground_(cache_footprint_ground) {}
 
   /// How far below `sample` the ground lies.
   ///
@@ -80,7 +114,15 @@ class GroundProjection {
   ///
   /// Once the edge is known to be clear, the ground under the robot's two
   /// sides is compared: see crossSlope. An edge whose cross slope exceeds
-  /// max_cross_slope is kCrossSlope.
+  /// max_cross_slope is kCrossSlope. Then, when max_footprint_tilt or
+  /// max_footprint_step is set, the plane under the footprint is fitted at
+  /// every point: see footprintPlane. An edge with a point whose plane tilts
+  /// or steps past either is kFootprintPlane.
+  ///
+  /// max_inclination and max_cross_slope stay as coarse pre-filters.
+  /// Neither sees the plane the chassis sits on: a segment between samples
+  /// rising no more than max_step_height is exempt from max_inclination,
+  /// and the cross slope is averaged over a body length.
   ProjectedEdgeStatus getProjectedEdgeStatus(
       const Eigen::Vector3d& start, const Eigen::Vector3d& end,
       const Eigen::Vector3d& box_size, bool stop_at_unknown_voxel,
@@ -100,6 +142,21 @@ class GroundProjection {
   double crossSlope(const std::vector<Eigen::Vector3d>& edge,
                     const Eigen::Vector3d& box_size) const;
 
+  /// The least-squares plane through the ground under a footprint centred
+  /// on `point`, at driving height, and facing `heading` in the XY plane.
+  /// The footprint is `box_size` x long along the heading and y wide.
+  /// Every map cell whose centre lies under it is used, from the map's XY
+  /// cell grid (MapInterface::getCircleIntersectingXYCellCenters); a map
+  /// without one is not measured. The ground is found straight below each
+  /// cell's centre, as crossSlope finds it, and the plane is fitted to the
+  /// ground points the map returns. It is not measured when ground lies
+  /// under fewer than half the cells, or the points do not span a plane.
+  /// Such a point is skipped, as crossSlope skips a point with a side over
+  /// no ground.
+  FootprintPlane footprintPlane(const Eigen::Vector3d& point,
+                                const Eigen::Vector2d& heading,
+                                const Eigen::Vector3d& box_size) const;
+
   /// The ground straight below `point`, false when none is mapped within
   /// max_projection_length.
   bool groundBelow(const Eigen::Vector3d& point, Eigen::Vector3d& ground) const;
@@ -108,8 +165,40 @@ class GroundProjection {
   double max_projection_length = 5.0;
 
  private:
+  using ColumnKey = std::array<std::int64_t, 2>;
+  using PlaneKey = std::array<std::int64_t, 6>;
+  struct CacheKeyHash {
+    template <std::size_t N>
+    std::size_t operator()(const std::array<std::int64_t, N>& key) const {
+      std::size_t hash = 0;
+      for (const std::int64_t part : key) {
+        hash ^= std::hash<std::int64_t>()(part) + 0x9e3779b97f4a7c15ULL +
+                (hash << 6) + (hash >> 2);
+      }
+      return hash;
+    }
+  };
+  /// One ground ray cast down a map cell's column.
+  struct GroundFromHeight {
+    double from_z = 0.0;  ///< where the ray started
+    bool found = false;
+    Eigen::Vector3d ground = Eigen::Vector3d::Zero();
+  };
+  /// groundBelow, through the cache when there is one.
+  bool footprintGroundBelow(const Eigen::Vector3d& point,
+                            Eigen::Vector3d& ground) const;
+  FootprintPlane measureFootprintPlane(const Eigen::Vector3d& point,
+                                       const Eigen::Vector2d& heading,
+                                       const Eigen::Vector3d& box_size) const;
+
   const MapInterface& map_;
   const PlanningParams& params_;
+  const bool cache_footprint_ground_ = false;
+  mutable std::unordered_map<ColumnKey, std::vector<GroundFromHeight>,
+                             CacheKeyHash>
+      ground_below_column_;
+  mutable std::unordered_map<PlaneKey, FootprintPlane, CacheKeyHash>
+      footprint_planes_;
 };
 
 }  // namespace mgg

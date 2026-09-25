@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <functional>
 
 namespace mgg {
 
@@ -11,6 +12,10 @@ namespace {
 double probeOffset(const MapInterface& map) {
   return std::max(0.20, 2.0 * map.getResolution());
 }
+
+/// Most map cells footprintPlane considers around one point. A Bunker's
+/// footprint spans about 150 of 0.2 m; a far larger one is not measured.
+constexpr std::size_t kMaxFootprintCells = 1024;
 
 /// Solids a goal's upward search steps through before giving up; each has
 /// free space above it, so a column this tall is never met in practice.
@@ -230,6 +235,23 @@ ProjectedEdgeStatus GroundProjection::getProjectedEdgeStatus(
     return ProjectedEdgeStatus::kCrossSlope;
   }
 
+  const bool check_tilt = params_.max_footprint_tilt > 0.0;
+  const bool check_step = params_.max_footprint_step > 0.0;
+  if ((check_tilt || check_step) && projected_edge.size() >= 2) {
+    const Eigen::Vector2d heading =
+        (projected_edge.back() - projected_edge.front()).head<2>();
+    if (heading.norm() > 1e-9) {
+      for (const Eigen::Vector3d& point : projected_edge) {
+        const FootprintPlane plane = footprintPlane(point, heading, box_size);
+        if (!plane.measured) continue;
+        if ((check_tilt && plane.tilt > params_.max_footprint_tilt) ||
+            (check_step && plane.max_residual > params_.max_footprint_step)) {
+          return ProjectedEdgeStatus::kFootprintPlane;
+        }
+      }
+    }
+  }
+
   projected_edge_out = projected_edge;
   return ProjectedEdgeStatus::kAdmissible;
 }
@@ -285,6 +307,134 @@ double GroundProjection::crossSlope(const std::vector<Eigen::Vector3d>& edge,
     if (next == gradients.size()) break;
   }
   return std::atan(steepest);
+}
+
+namespace {
+
+/// A length or angle as a whole number of millionths, for a cache key.
+std::int64_t micro(double value) {
+  return static_cast<std::int64_t>(std::llround(value * 1e6));
+}
+
+}  // namespace
+
+bool GroundProjection::footprintGroundBelow(const Eigen::Vector3d& point,
+                                            Eigen::Vector3d& ground) const {
+  if (!cache_footprint_ground_) return groundBelow(point, ground);
+  std::vector<GroundFromHeight>& column =
+      ground_below_column_[ColumnKey{micro(point.x()), micro(point.y())}];
+  for (const GroundFromHeight& earlier : column) {
+    // A ray that starts between an earlier ray's start and the ground it
+    // found crosses only cells that ray found empty, then that ground; its
+    // end, 5 m below its start, is still below that ground. The ground
+    // point lies in the cell that stopped the ray, so a start at or above
+    // it is not past that cell. With no ground found, only the same start
+    // gives the same answer: a lower ray reaches further down.
+    const bool same = earlier.found ? earlier.ground.z() <= point.z() &&
+                                          point.z() <= earlier.from_z
+                                    : point.z() == earlier.from_z;
+    if (same) {
+      ground = earlier.ground;
+      return earlier.found;
+    }
+  }
+  GroundFromHeight cast;
+  cast.from_z = point.z();
+  cast.found = groundBelow(point, cast.ground);
+  column.push_back(cast);
+  ground = cast.ground;
+  return cast.found;
+}
+
+FootprintPlane GroundProjection::footprintPlane(
+    const Eigen::Vector3d& point, const Eigen::Vector2d& heading,
+    const Eigen::Vector3d& box_size) const {
+  if (!cache_footprint_ground_ || !point.allFinite() ||
+      !(heading.norm() > 1e-9)) {
+    return measureFootprintPlane(point, heading, box_size);
+  }
+  // The body's axis, folded into [0, pi): a heading and its reverse put the
+  // footprint on the same cells.
+  double axis = std::atan2(heading.y(), heading.x());
+  if (axis < 0.0) axis += M_PI;
+  if (axis >= M_PI) axis -= M_PI;
+  const PlaneKey key{micro(point.x()), micro(point.y()), micro(point.z()),
+                     micro(axis),      micro(box_size.x()),
+                     micro(box_size.y())};
+  const auto found = footprint_planes_.find(key);
+  if (found != footprint_planes_.end()) return found->second;
+  const FootprintPlane plane = measureFootprintPlane(point, heading, box_size);
+  footprint_planes_.emplace(key, plane);
+  return plane;
+}
+
+FootprintPlane GroundProjection::measureFootprintPlane(
+    const Eigen::Vector3d& point, const Eigen::Vector2d& heading,
+    const Eigen::Vector3d& box_size) const {
+  FootprintPlane plane;
+  const double half_length = 0.5 * box_size.x();
+  const double half_width = 0.5 * box_size.y();
+  if (!point.allFinite() || !(heading.norm() > 1e-9) ||
+      !(half_length > 0.0) || !(half_width > 0.0)) {
+    return plane;
+  }
+  const Eigen::Vector2d along = heading.normalized();
+  const Eigen::Vector2d across(-along.y(), along.x());
+
+  // Every map cell whose centre lies under the footprint, whatever the
+  // footprint's heading. A lattice of probes rotated against the map's grid
+  // can step over a cell entirely, and a rock in it (review r0).
+  std::vector<XYCellCenter> candidates;
+  if (!map_.getCircleIntersectingXYCellCenters(
+          point.head<2>(), std::hypot(half_length, half_width),
+          kMaxFootprintCells, candidates)) {
+    return plane;
+  }
+  std::vector<Eigen::Vector3d> ground_points;
+  ground_points.reserve(candidates.size());
+  int cells_under = 0;
+  for (const XYCellCenter& cell : candidates) {
+    const Eigen::Vector2d offset = cell.center - point.head<2>();
+    if (std::abs(offset.dot(along)) > half_length + 1e-9 ||
+        std::abs(offset.dot(across)) > half_width + 1e-9) {
+      continue;
+    }
+    ++cells_under;
+    Eigen::Vector3d ground;
+    if (footprintGroundBelow(Eigen::Vector3d(cell.center.x(),
+                                             cell.center.y(), point.z()),
+                             ground)) {
+      ground_points.push_back(ground);
+    }
+  }
+  plane.cells = static_cast<int>(ground_points.size());
+  // With ground under fewer than half the cells, a plane would describe
+  // only part of the body.
+  if (2 * plane.cells < cells_under || plane.cells < 3) return plane;
+
+  // z = c + a x + b y in coordinates centred on `point`, for conditioning,
+  // solved from the 3 x 3 normal equations.
+  auto row = [&](const Eigen::Vector3d& g) {
+    return Eigen::Vector3d(1.0, g.x() - point.x(), g.y() - point.y());
+  };
+  Eigen::Matrix3d normal = Eigen::Matrix3d::Zero();
+  Eigen::Vector3d moment = Eigen::Vector3d::Zero();
+  for (const Eigen::Vector3d& g : ground_points) {
+    const Eigen::Vector3d r = row(g);
+    normal.noalias() += r * r.transpose();
+    moment += r * g.z();
+  }
+  Eigen::FullPivLU<Eigen::Matrix3d> lu(normal);
+  lu.setThreshold(1e-9);
+  if (lu.rank() < 3) return plane;  // the points lie on a line
+  const Eigen::Vector3d coefficients = lu.solve(moment);
+  plane.measured = true;
+  plane.tilt = std::atan(coefficients.tail<2>().norm());
+  for (const Eigen::Vector3d& g : ground_points) {
+    plane.max_residual = std::max(
+        plane.max_residual, std::abs(g.z() - row(g).dot(coefficients)));
+  }
+  return plane;
 }
 
 }  // namespace mgg
