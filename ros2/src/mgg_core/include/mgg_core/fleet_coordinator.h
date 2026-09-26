@@ -59,7 +59,11 @@ class FleetCoordinator {
   /// A peer's bid, in this robot's frame. Malformed bids are dropped.
   void onBid(const TourBidData& bid, double now_s);
   /// A peer's call or award, in this robot's frame. Only this robot's
-  /// current auctioneer is followed, and each award is applied once.
+  /// current auctioneer is followed. A call or award is known by its round,
+  /// (auctioneer, stamp): a call is answered once per round, and an award is
+  /// applied only when its round is newer than the last one applied from
+  /// that auctioneer (a replayed or overtaken award is stale). A restarted
+  /// auctioneer reuses auction IDs but not stamps.
   void onAward(const TourAwardData& award, double now_s);
   /// One step. Returns this robot's bid when an auction was called, every
   /// fleet.auction_interval_s, and at once when it requests an auction; as
@@ -110,6 +114,18 @@ class FleetCoordinator {
   std::uint64_t assignmentVersion() const { return assignment_version_; }
 
  private:
+  static constexpr double kNever = -std::numeric_limits<double>::infinity();
+
+  /// A call's or award's identity: its auctioneer and stamp.
+  struct Round {
+    int auctioneer_id = -1;
+    double stamp_s = kNever;
+    bool operator==(const Round& other) const {
+      return auctioneer_id == other.auctioneer_id && stamp_s == other.stamp_s;
+    }
+    bool operator!=(const Round& other) const { return !(*this == other); }
+  };
+
   struct Collection {
     std::uint64_t auction_id = 0;
     double started_s = 0.0;
@@ -121,7 +137,9 @@ class FleetCoordinator {
   /// Clock rollback (a simulation restart moves now_s backwards): a time
   /// after `now_s` becomes `now_s`, as ClaimRegistry::expire does for claims,
   /// so a silent robot counts as just heard once and then ages normally, and
-  /// the next bid, award or call waits at most one interval or deadline.
+  /// the next bid, award or call waits at most one interval or deadline. The
+  /// rounds applied and answered are forgotten, as their stamps are of the
+  /// old clock.
   /// Called first by every member that takes the time.
   void rebaseFutureTimes(double now_s);
   /// `robot_id` was heard at the local receipt time `now_s`.
@@ -138,8 +156,6 @@ class FleetCoordinator {
   /// The cluster IDs the members' latest bids name: the pool's makeup.
   std::set<ClusterId> poolSignature(const std::vector<int>& members) const;
 
-  static constexpr double kNever = -std::numeric_limits<double>::infinity();
-
   int robot_id_;
   FleetParams params_;
   double commit_margin_;
@@ -154,16 +170,17 @@ class FleetCoordinator {
   std::uint64_t assignment_version_ = 0;
   std::size_t last_unassigned_ = 0;
 
-  // The last award applied, by (auctioneer, auction ID, stamp).
-  int applied_auctioneer_ = -1;
-  std::uint64_t applied_auction_id_ = 0;
-  double applied_stamp_s_ = kNever;
+  // The stamp of the last award applied, per auctioneer; the local time a
+  // round was last heard (a later now_s before it means a clock reset).
+  std::map<int, double> applied_stamp_s_;
+  double round_heard_s_ = kNever;
 
   // Bidding.
   std::uint64_t seq_ = 0;
   double last_bid_s_ = kNever;
   std::uint64_t called_auction_ = 0;
-  std::uint64_t bid_for_auction_ = 0;
+  std::optional<Round> called_round_;
+  std::optional<Round> answered_round_;
   std::set<ClusterId> own_cluster_ids_;
   std::size_t explored_turn_ = 0;
   bool requested_ = false;

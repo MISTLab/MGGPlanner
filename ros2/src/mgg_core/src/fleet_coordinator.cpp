@@ -55,6 +55,11 @@ void FleetCoordinator::rebaseFutureTimes(double now_s) {
   if (collecting_) {
     collecting_->started_s = std::min(collecting_->started_s, now_s);
   }
+  if (now_s < round_heard_s_) {
+    applied_stamp_s_.clear();
+    answered_round_.reset();
+    round_heard_s_ = now_s;
+  }
 }
 
 void FleetCoordinator::noteHeard(int robot_id, double now_s) {
@@ -82,15 +87,14 @@ void FleetCoordinator::onAward(const TourAwardData& award, double now_s) {
   // A robot that left the sender's group, or whose group just merged with a
   // lower ID, ignores it.
   if (award.auctioneer_id != auctioneer(now_s)) return;
+  round_heard_s_ = now_s;
   if (award.call) {
     called_auction_ = award.auction_id;
+    called_round_ = Round{award.auctioneer_id, award.stamp_s};
     return;
   }
-  // Applied once. A restarted auctioneer numbers its auctions afresh, so an
-  // award is known by its stamp as well as its number.
-  if (award.auctioneer_id == applied_auctioneer_ &&
-      award.auction_id == applied_auction_id_ &&
-      award.stamp_s == applied_stamp_s_) {
+  const auto applied = applied_stamp_s_.find(award.auctioneer_id);
+  if (applied != applied_stamp_s_.end() && award.stamp_s <= applied->second) {
     return;
   }
   applyAward(award, now_s);
@@ -137,13 +141,13 @@ FleetTickOutput FleetCoordinator::tick(double now_s, const OwnBidFn& own_bid,
 
   // §3.3: bid on a call, every auction interval so peers hear this robot,
   // and at once when its bundle is done.
-  const bool called = called_auction_ != 0 && called_auction_ != bid_for_auction_;
+  const bool called = called_round_ && called_round_ != answered_round_;
   const bool periodic = now_s - last_bid_s_ >= params_.auction_interval_s;
   const bool request_now = requesting && !request_sent_;
   if (called || periodic || request_now) {
     out.bid = makeBid(called ? called_auction_ : 0);
     last_bid_s_ = now_s;
-    if (called) bid_for_auction_ = called_auction_;
+    if (called) answered_round_ = called_round_;
     if (requesting) request_sent_ = true;
   }
 
@@ -318,9 +322,7 @@ TourAwardData FleetCoordinator::computeAward(double now_s,
 }
 
 void FleetCoordinator::applyAward(const TourAwardData& award, double now_s) {
-  applied_auctioneer_ = award.auctioneer_id;
-  applied_auction_id_ = award.auction_id;
-  applied_stamp_s_ = award.stamp_s;
+  applied_stamp_s_[award.auctioneer_id] = award.stamp_s;
   has_award_ = true;
   award_clusters_ = namedOnly(award.clusters);
   noteExplored(namedOnly(award.explored));

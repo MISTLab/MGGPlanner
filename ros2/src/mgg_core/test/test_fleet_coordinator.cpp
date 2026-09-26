@@ -44,6 +44,28 @@ std::vector<ClusterId> idsOf(const std::vector<FleetCluster>& clusters) {
   return ids;
 }
 
+TourAwardData makeCall(int auctioneer, std::uint64_t auction_id,
+                       double stamp_s) {
+  TourAwardData call;
+  call.auction_id = auction_id;
+  call.auctioneer_id = auctioneer;
+  call.stamp_s = stamp_s;
+  call.call = true;
+  return call;
+}
+
+TourAwardData makeAward(int auctioneer, std::uint64_t auction_id,
+                        double stamp_s, std::vector<mgg::RobotBundle> bundles,
+                        std::vector<FleetCluster> clusters) {
+  TourAwardData award;
+  award.auction_id = auction_id;
+  award.auctioneer_id = auctioneer;
+  award.stamp_s = stamp_s;
+  award.bundles = std::move(bundles);
+  award.clusters = std::move(clusters);
+  return award;
+}
+
 /// A robot standing still at (x, y) that knows `known`, with straight-line
 /// costs, and bids its bundle's first cluster as its current target.
 struct SimRobot {
@@ -677,6 +699,50 @@ TEST(FleetCoordinator, AnAwardsUnnamedClustersAreIgnored) {
   ASSERT_TRUE(out.bid.has_value());
   EXPECT_TRUE(out.bid->wellFormed());
   EXPECT_EQ(out.bid->bundle, std::vector<ClusterId>{21});
+}
+
+// An award is known by its round, (auctioneer, stamp). A round no newer
+// than one already applied from the same auctioneer is a replay or arrived
+// out of order: applying it would restore a superseded assignment.
+TEST(FleetCoordinator, AReplayedOrReorderedAwardIsNotApplied) {
+  FleetCoordinator coordinator(2, FleetParams{}, 0.2);
+  const std::vector<FleetCluster> known = {
+      cluster(21, 2, 2.0), cluster(22, 2, 4.0), cluster(23, 2, 6.0),
+      cluster(24, 2, 8.0)};
+  const auto award = [&known](std::uint64_t auction_id, double stamp_s,
+                              ClusterId id) {
+    return makeAward(1, auction_id, stamp_s, {mgg::RobotBundle{2, {id}, 0.0}},
+                     known);
+  };
+  const TourAwardData a = award(1, 1.0, 21);
+  coordinator.onAward(a, 1.0);
+  coordinator.onAward(award(2, 3.0, 22), 3.0);
+  coordinator.onAward(a, 3.5);  // A, B, then A again
+  EXPECT_EQ(idsOf(coordinator.bundle()), std::vector<ClusterId>{22});
+  // Round 4 overtakes round 3 on the way.
+  coordinator.onAward(award(4, 6.0, 23), 6.1);
+  coordinator.onAward(award(3, 5.0, 24), 6.2);
+  EXPECT_EQ(idsOf(coordinator.bundle()), std::vector<ClusterId>{23});
+}
+
+// A restarted auctioneer numbers its auctions from 1 again: a call reusing
+// an auction ID already answered, with a new stamp, is a new round.
+TEST(FleetCoordinator, ACallReusingAnAuctionIdWithANewStampIsAnswered) {
+  FleetCoordinator coordinator(2, FleetParams{}, 0.2);
+  TourAwardData call = makeCall(1, 7, 1.0);
+  coordinator.onAward(call, 1.0);
+  mgg::FleetTickOutput out = coordinator.tick(1.0, nullptr, nullptr, nullptr);
+  ASSERT_TRUE(out.bid.has_value());
+  EXPECT_EQ(out.bid->auction_id, 7u);
+
+  call.stamp_s = 2.0;
+  coordinator.onAward(call, 2.0);
+  out = coordinator.tick(2.0, nullptr, nullptr, nullptr);
+  ASSERT_TRUE(out.bid.has_value());
+  EXPECT_EQ(out.bid->auction_id, 7u);
+  // The same round delivered twice is answered once.
+  coordinator.onAward(call, 2.5);
+  EXPECT_FALSE(coordinator.tick(2.5, nullptr, nullptr, nullptr).bid);
 }
 
 }  // namespace
