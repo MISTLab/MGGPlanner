@@ -71,6 +71,23 @@ TEST(TourPlanner, TheCommitmentMarginPreventsFlipFlop) {
   EXPECT_DOUBLE_EQ(planner.targetSince(), 2.0);
 }
 
+TEST(TourPlanner, ASavingOfExactlyTheMarginKeepsTheTarget) {
+  mgg::TourParams params;
+  params.commit_margin = 0.25;  // (1 - 0.25) * 40 is exactly 30
+  TourPlanner planner(params);
+  const std::vector<FrontierCluster> clusters{named(1, 10.0), named(2, -11.0)};
+  planner.solve(clusters, twoClusters(10.0, 11.0, 30.0), 1, 0, 0.0);
+  ASSERT_EQ(planner.target(), 1u);
+
+  // Starting at b costs 30, keeping a costs 40: a saving of exactly the
+  // margin, which is not more than it.
+  const TourPlan& kept =
+      planner.solve(clusters, twoClusters(10.0, 0.0, 30.0), 2, 0, 1.0);
+  EXPECT_EQ(planner.target(), 1u);
+  EXPECT_TRUE(kept.kept_target);
+  EXPECT_DOUBLE_EQ(kept.cost, 40.0);
+}
+
 TEST(TourPlanner, SolvesOnChangeAtMostEveryIntervalAndAtOnceWhenTheTargetGoes) {
   mgg::TourParams params;
   params.recompute_interval_s = 1.0;
@@ -104,6 +121,30 @@ TEST(TourPlanner, AnUnreachableClusterIsLeftOut) {
       1.0);
   EXPECT_TRUE(none.clusters.empty());
   EXPECT_EQ(planner.target(), mgg::kNoCluster);
+}
+
+TEST(TourPlanner, ATargetThatCannotBeReachedGivesWayToAReachableCluster) {
+  TourPlanner planner{mgg::TourParams{}};
+  const std::vector<FrontierCluster> clusters{named(1, 10.0), named(2, -11.0)};
+  planner.solve(clusters, twoClusters(10.0, 11.0, 30.0), 1, 0, 0.0);
+  ASSERT_EQ(planner.target(), 1u);
+  // The target is still listed but no route reaches it.
+  const TourPlan& plan = planner.solve(
+      clusters, twoClusters(mgg::kUnreachableCost, 9.0, 30.0), 2, 0, 1.0);
+  ASSERT_EQ(plan.clusters.size(), 1u);
+  EXPECT_EQ(planner.target(), 2u);
+  EXPECT_FALSE(plan.kept_target);
+}
+
+TEST(TourPlanner, AClockThatWentBackwardsDoesNotStallTheSolve) {
+  mgg::TourParams params;
+  params.recompute_interval_s = 1.0;
+  TourPlanner planner(params);
+  const std::vector<FrontierCluster> clusters{named(1, 10.0), named(2, -11.0)};
+  planner.solve(clusters, twoClusters(10.0, 11.0, 30.0), 1, 0, 100.0);
+  // The simulation was reset: the clock restarts near zero.
+  EXPECT_TRUE(planner.needsSolve(clusters, 2, 0, 0.5));
+  EXPECT_FALSE(planner.needsSolve(clusters, 1, 0, 0.5));  // nothing changed
 }
 
 TEST(LocalPathServesTarget, AheadOrInsideTheLatticeOnly) {

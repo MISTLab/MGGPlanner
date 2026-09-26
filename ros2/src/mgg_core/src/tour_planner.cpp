@@ -17,7 +17,12 @@ bool TourPlanner::needsSolve(const std::vector<FrontierCluster>& clusters,
   const bool changed = graph_revision != graph_revision_ ||
                        assignment_version != assignment_version_ ||
                        ids != cluster_ids_;
-  return changed && now_s - solved_at_s_ >= params_.recompute_interval_s;
+  // A clock that went backwards (a simulation reset under use_sim_time)
+  // counts as the interval elapsed.
+  const bool interval_elapsed =
+      now_s < solved_at_s_ ||
+      now_s - solved_at_s_ >= params_.recompute_interval_s;
+  return changed && interval_elapsed;
 }
 
 const TourPlan& TourPlanner::solve(const std::vector<FrontierCluster>& clusters,

@@ -37,7 +37,9 @@ class TourPlanner {
   /// §2.3: at once before the first solve, when the target's cluster is
   /// gone, or after releaseTarget; otherwise when the graph revision, the
   /// assignment version or the set of cluster IDs changed, and at least
-  /// tour.recompute_interval_s after the last solve.
+  /// tour.recompute_interval_s after the last solve. A `now_s` before the
+  /// last solve (the clock went backwards, as a simulation reset under
+  /// use_sim_time does) counts as the interval elapsed.
   bool needsSolve(const std::vector<FrontierCluster>& clusters,
                   std::uint64_t graph_revision,
                   std::uint64_t assignment_version, double now_s) const;
