@@ -553,6 +553,10 @@ class PlannerNodeTestPeer {
                              const mgg_msgs::msg::TourBid& msg) {
     node.onTourBid(std::make_shared<mgg_msgs::msg::TourBid>(msg));
   }
+  static void receiveTourAward(PlannerNode& node,
+                               const mgg_msgs::msg::TourAward& msg) {
+    node.onTourAward(std::make_shared<mgg_msgs::msg::TourAward>(msg));
+  }
   static std::vector<int> fleetGroup(PlannerNode& node) {
     const std::lock_guard<std::recursive_mutex> lock(node.planner_mutex_);
     return node.fleet_->group(node.now().seconds());
@@ -2576,6 +2580,62 @@ TEST_F(PlannerNodeTest, AnEmptyAwardAfterARebuildDroppedFrontiersIsNotYetComplet
   ASSERT_TRUE(PlannerNodeTestPeer::fleetHasAward(*node));
   EXPECT_EQ(plan(), PlannerNode::kStatusNoPath);
   EXPECT_EQ(plan(), PlannerNode::kStatusComplete);
+}
+
+TEST_F(PlannerNodeTest, InAPersistentChainOthersClaimsOverrideOurAwardedTour) {
+  // 1 <-> 2 <-> 3: robot 1 cannot hear robot 3's overlapping claim.
+  // Robot 2 can, and must respect it even when robot 1 awards it that area.
+  const auto robot = [](int id) {
+    auto node = makeNode("chain_" + std::to_string(id),
+                         "chain_" + std::to_string(id) + "/odom",
+                         {rclcpp::Parameter("PlanningParams.robot_id", id),
+                          rclcpp::Parameter("neighbour_pose_source", "topic")});
+    PlannerNodeTestPeer::observeFloor(*node, -1.5, 6.0, -1.5, 1.5);
+    PlannerNodeTestPeer::acceptOdometry(*node, 0.0, 0.0, 1.0);
+    PlannerNodeTestPeer::setTour(*node, true, 0.0);
+    PlannerNodeTestPeer::solveTourOnEveryChange(*node);
+    return node;
+  };
+  auto a = robot(1), b = robot(2), c = robot(3);
+  for (const auto& edge : std::vector<std::pair<int, int>>{
+           {1, 2}, {2, 1}, {2, 3}, {3, 2}}) {
+    auto& receiver = edge.first == 1 ? a : edge.first == 2 ? b : c;
+    PlannerNodeTestPeer::receiveTransform(
+        *receiver, "chain_" + std::to_string(edge.first) + "/odom",
+        "chain_" + std::to_string(edge.second) + "/odom", 0.0, 0.0);
+  }
+  PlannerNodeTestPeer::addGlobalChainToFrontier(*b, {{3.0, 0.0}});
+  PlannerNodeTestPeer::addGlobalChainToFrontier(*c, {{3.5, 0.0}});
+  ASSERT_NE(PlannerNodeTestPeer::refreshTour(*c), mgg::kNoCluster);
+  const auto b_content = PlannerNodeTestPeer::ownTourBidMsg(*b);
+  ASSERT_EQ(b_content.clusters.size(), 1u);
+  mgg_msgs::msg::TourAward award;
+  award.header.frame_id = "chain_1/odom";
+  award.auctioneer_id = 1;
+  award.clusters = b_content.clusters;
+  mgg_msgs::msg::TourBundle bundle;
+  bundle.robot_id = 2;
+  bundle.clusters = {b_content.clusters.front().id};
+  award.bundles = {bundle};
+  for (int round = 1; round <= 4; ++round) {
+    PlannerNodeTestPeer::receiveTourBid(
+        *b, PlannerNodeTestPeer::ownTourBidMsg(*a));
+    const auto middle_bid = PlannerNodeTestPeer::ownTourBidMsg(*b);
+    ASSERT_EQ(middle_bid.auctioneer_id, 1);
+    PlannerNodeTestPeer::receiveTourBid(*a, middle_bid);
+    PlannerNodeTestPeer::receiveTourBid(*c, middle_bid);
+    const auto end_bid = PlannerNodeTestPeer::ownTourBidMsg(*c);
+    ASSERT_EQ(end_bid.auctioneer_id, 3);
+    PlannerNodeTestPeer::receiveTourBid(*b, end_bid);
+    award.auction_id = round;
+    award.header.stamp = a->now();
+    PlannerNodeTestPeer::receiveTourAward(*b, award);
+    ASSERT_TRUE(PlannerNodeTestPeer::fleetHasAward(*b));
+    EXPECT_EQ(PlannerNodeTestPeer::fleetGroup(*a), (std::vector<int>{1, 2}));
+    EXPECT_EQ(PlannerNodeTestPeer::fleetGroup(*c), (std::vector<int>{2, 3}));
+    EXPECT_EQ(PlannerNodeTestPeer::refreshTour(*b), mgg::kNoCluster)
+        << "round " << round << ": robot 3's claim precedes our bundle";
+  }
 }
 
 }  // namespace mgg_ros

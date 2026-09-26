@@ -621,8 +621,10 @@ std::vector<mgg::FrontierCluster> PlannerNode::tourCandidates(
       std::remove_if(clusters.begin(), clusters.end(),
                      [&](const mgg::FrontierCluster& cluster) {
                        if (near(cluster, explored)) return true;
-                       if (near(cluster, bundle)) return false;
+                       // A chain's auctioneer may not hear a claim we do.
+                       // Respect that claim even when our award overlaps it.
                        if (near(cluster, held)) return true;
+                       if (near(cluster, bundle)) return false;
                        return assigned && (cluster.owner_robot_id != own_id ||
                                            near(cluster, awarded));
                      }),
