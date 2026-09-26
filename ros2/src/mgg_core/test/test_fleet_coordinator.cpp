@@ -1252,4 +1252,21 @@ TEST(FleetCoordinator, OverlappingFixedClaimsAreAwardedToOneHolder) {
   }
 }
 
+// A call is answered once per round: after calls A and B of one
+// auctioneer, A delivered again is not answered.
+TEST(FleetCoordinator, AReplayedCallIsNotAnsweredAgain) {
+  FleetCoordinator coordinator(2, FleetParams{}, 0.2);
+  const TourAwardData a = makeCall(1, 7, 1.0);
+  coordinator.onAward(a, 1.0);
+  mgg::FleetTickOutput out = coordinator.tick(1.0, nullptr, nullptr, nullptr);
+  ASSERT_TRUE(out.bid.has_value());
+  EXPECT_EQ(out.bid->auction_id, 7u);
+  coordinator.onAward(makeCall(1, 8, 1.5), 1.5);
+  out = coordinator.tick(1.5, nullptr, nullptr, nullptr);
+  ASSERT_TRUE(out.bid.has_value());
+  EXPECT_EQ(out.bid->auction_id, 8u);
+  coordinator.onAward(a, 1.8);
+  EXPECT_FALSE(coordinator.tick(1.8, nullptr, nullptr, nullptr).bid);
+}
+
 }  // namespace

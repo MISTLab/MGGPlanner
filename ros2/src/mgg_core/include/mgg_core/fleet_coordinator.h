@@ -78,10 +78,10 @@ class FleetCoordinator {
   /// cluster entry lists, a cluster in two bundles) is dropped whole;
   /// kNoCluster entries are only filtered out. Only this robot's current
   /// auctioneer is followed. A call or award is known by its round,
-  /// (auctioneer, stamp): a call is answered once per round, and an award is
-  /// applied only when its round is newer than the last one applied from
-  /// that auctioneer (a replayed or overtaken award is stale). A restarted
-  /// auctioneer reuses auction IDs but not stamps.
+  /// (auctioneer, stamp): a call is answered, and an award applied, only
+  /// when its round is newer than the last call answered, or award applied,
+  /// from that auctioneer (a replayed or overtaken one is stale). A
+  /// restarted auctioneer reuses auction IDs but not stamps.
   void onAward(const TourAwardData& award, double now_s);
   /// One step. Returns this robot's bid when an auction was called, every
   /// fleet.auction_interval_s, and at once when it requests an auction; as
@@ -142,10 +142,6 @@ class FleetCoordinator {
   struct Round {
     int auctioneer_id = -1;
     double stamp_s = kNever;
-    bool operator==(const Round& other) const {
-      return auctioneer_id == other.auctioneer_id && stamp_s == other.stamp_s;
-    }
-    bool operator!=(const Round& other) const { return !(*this == other); }
   };
 
   struct Collection {
@@ -215,8 +211,10 @@ class FleetCoordinator {
   std::uint64_t seq_ = 0;
   double last_bid_s_ = kNever;
   std::uint64_t called_auction_ = 0;
+  // The call to answer, and per auctioneer the stamp of the last call
+  // answered.
   std::optional<Round> called_round_;
-  std::optional<Round> answered_round_;
+  std::map<int, double> answered_call_s_;
   std::set<ClusterId> own_cluster_ids_;
   std::size_t broadcast_explored_turn_ = 0;
   std::size_t collected_explored_turn_ = 0;

@@ -69,7 +69,8 @@ void FleetCoordinator::rebaseFutureTimes(double now_s) {
   }
   if (now_s < round_heard_s_) {
     applied_stamp_s_.clear();
-    answered_round_.reset();
+    answered_call_s_.clear();
+    called_round_.reset();
     round_heard_s_ = now_s;
   }
 }
@@ -162,8 +163,12 @@ void FleetCoordinator::onAward(const TourAwardData& award, double now_s) {
   if (award.auctioneer_id != auctioneer(now_s)) return;
   round_heard_s_ = now_s;
   if (award.call) {
-    called_auction_ = award.auction_id;
-    called_round_ = Round{award.auctioneer_id, award.stamp_s};
+    // A replayed call does not displace a newer one not yet answered.
+    if (!called_round_ || called_round_->auctioneer_id != award.auctioneer_id ||
+        award.stamp_s > called_round_->stamp_s) {
+      called_auction_ = award.auction_id;
+      called_round_ = Round{award.auctioneer_id, award.stamp_s};
+    }
     return;
   }
   const auto applied = applied_stamp_s_.find(award.auctioneer_id);
@@ -216,13 +221,20 @@ FleetTickOutput FleetCoordinator::tick(double now_s, const OwnBidFn& own_bid,
 
   // §3.3: bid on a call, every auction interval so peers hear this robot,
   // and at once when its bundle is done.
-  const bool called = called_round_ && called_round_ != answered_round_;
+  bool called = false;
+  if (called_round_) {
+    const auto answered = answered_call_s_.find(called_round_->auctioneer_id);
+    called = answered == answered_call_s_.end() ||
+             called_round_->stamp_s > answered->second;
+  }
   const bool periodic = now_s - last_bid_s_ >= params_.auction_interval_s;
   const bool request_now = requesting && !request_sent_;
   if (called || periodic || request_now) {
     out.bid = makeBid(called ? called_auction_ : 0, broadcast_explored_turn_);
     last_bid_s_ = now_s;
-    if (called) answered_round_ = called_round_;
+    if (called) {
+      answered_call_s_[called_round_->auctioneer_id] = called_round_->stamp_s;
+    }
     if (requesting) {
       request_sent_ = true;
       request_auctioneer_ = elected;
