@@ -47,6 +47,9 @@
 #include <mgg_msgs/srv/plan_objective.hpp>
 #include <mgg_msgs/srv/planner_set_exploration_target.hpp>
 #include <mgg_msgs/srv/planner_srv.hpp>
+#include <mgg_msgs/msg/tour_award.hpp>
+#include <mgg_msgs/msg/tour_bid.hpp>
+#include <mgg_msgs/srv/release_claims.hpp>
 
 #include "mgg_core/departure.h"
 #include "mgg_core/geofence_manager.h"
@@ -66,6 +69,7 @@
 #include "mgg_core/tour_costs.h"
 #include "mgg_core/tour_params.h"
 #include "mgg_core/tour_planner.h"
+#include "mgg_core/fleet_coordinator.h"
 #include "mgg_map_octomap/mola_map.h"
 #include "mgg_ros/keyframe_trajectory.h"
 
@@ -322,6 +326,45 @@ class PlannerNode : public rclcpp::Node {
   bool tourKeepsRoute(int vertex_id);
   /// The robot's pose, then its clusters' representatives in tour order.
   void publishTour();
+  /// Fleet frontier assignment (tour-exploration design §3, §4). A peer's
+  /// bid or award is placed in this robot's frame with the transform its
+  /// roadmap would merge with, and dropped without one, when malformed, or
+  /// (a bid) from beyond communication_range, as a roadmap is.
+  void onTourBid(mgg_msgs::msg::TourBid::ConstSharedPtr msg);
+  void onTourAward(mgg_msgs::msg::TourAward::ConstSharedPtr msg);
+  /// §4 release 3: the operator releases a silent robot's claims on the
+  /// group's auctioneer, which forwards the release in its next award.
+  void onReleaseClaims(
+      const std::shared_ptr<mgg_msgs::srv::ReleaseClaims::Request> request,
+      std::shared_ptr<mgg_msgs::srv::ReleaseClaims::Response> response);
+  /// One fleet step at `now_s`; fleet_timer_ calls it with the node's clock.
+  void fleetTick(double now_s);
+  /// This robot's bid content: every frontier cluster it knows, costed from
+  /// where it joins the global graph (no heading penalty), its tour's
+  /// target and when it took it, and the awarded clusters its roadmap shows
+  /// explored.
+  mgg::TourBidData ownTourBid();
+  /// The auctioneer's estimate of a cost a bid does not give: the global
+  /// graph distance between the vertices nearest the two points, plus the
+  /// straight links to them.
+  mgg::CostEstimateFn roadmapCostEstimate();
+  /// mgg::exploredInGraph on this robot's global graph.
+  mgg::ExploredFn exploredByRoadmap();
+  /// The transform placing a peer's messages from `frame` in this robot's
+  /// frame, as its roadmap is placed; false when there is none.
+  bool peerTransform(int robot_id, const std::string& frame,
+                     Eigen::Isometry3d& t_ours_theirs);
+  /// Clusters other robots hold and clusters peers explored, for the greedy
+  /// fallback's frontier search.
+  std::vector<Eigen::Vector3d> fleetExclusions();
+  /// §3.5 for a robot with no tour target and no local path. In a group it
+  /// asks for an auction and gets no path until the award answers; if that
+  /// award leaves it nothing, exploration is complete for it, with the
+  /// failed global search's exceptions: local gain remains, or a graph
+  /// rebuild dropped frontiers since (review r0, I-2). Alone, it
+  /// takes over the claim of the robot silent longest. False when it is
+  /// alone with no claim to take over: the low-gain rule decides.
+  bool settleIdleRobot(std::string& summary, bool& complete);
   /// §2.4: whether the local path ending at `viewpoint` serves the tour's
   /// `target`. The lattice is laid out along the robot's heading
   /// (buildGridGraph), so both offsets from the robot are turned into its
@@ -518,6 +561,9 @@ class PlannerNode : public rclcpp::Node {
   std::uint64_t tour_assignment_version_ = 0;
   /// The last tour's costing and solving time, for the plan summary.
   double tour_solve_ms_ = 0.0;
+  /// Fleet frontier assignment (tour-exploration design §3); null when
+  /// fleet.enabled is false.
+  std::unique_ptr<mgg::FleetCoordinator> fleet_;
   /// The target refreshTour last released as reached. A reached cluster
   /// that is still a frontier is released once: the free solve may take it
   /// again, and it is then kept until explored, reassigned or unroutable,
@@ -593,6 +639,15 @@ class PlannerNode : public rclcpp::Node {
       marker_pub_;
   rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr path_pub_;
   rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr tour_pub_;
+  rclcpp::Publisher<mgg_msgs::msg::TourBid>::SharedPtr tour_bid_pub_;
+  rclcpp::Publisher<mgg_msgs::msg::TourAward>::SharedPtr tour_award_pub_;
+  rclcpp::Subscription<mgg_msgs::msg::TourBid>::SharedPtr tour_bid_sub_;
+  rclcpp::Subscription<mgg_msgs::msg::TourAward>::SharedPtr tour_award_sub_;
+  rclcpp::Service<mgg_msgs::srv::ReleaseClaims>::SharedPtr
+      release_claims_srv_;
+  /// Runs fleetTick: bids, calls and awards.
+  rclcpp::TimerBase::SharedPtr fleet_timer_;
+  static constexpr double kFleetTickPeriodS = 0.1;
   rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr build_srv_;
   rclcpp::Service<mgg_msgs::srv::PlannerSrv>::SharedPtr plan_srv_;
   rclcpp::Service<mgg_msgs::srv::PlanObjective>::SharedPtr objective_srv_;

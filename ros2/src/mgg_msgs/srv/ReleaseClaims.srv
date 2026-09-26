@@ -1,0 +1,7 @@
+# The operator releases a silent robot's claimed frontier clusters
+# (tour-exploration design §4). Answered by the group's auctioneer, which
+# forwards the release in its next award.
+int32 robot_id
+---
+bool success
+string message

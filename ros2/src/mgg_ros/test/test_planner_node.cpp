@@ -21,6 +21,7 @@
 
 #include "mgg_map_octomap/octomap_map.h"
 #include "mgg_ros/planner_node.h"
+#include "mgg_ros/fleet_conversions.h"
 
 namespace mgg_ros {
 
@@ -538,6 +539,47 @@ class PlannerNodeTestPeer {
   static bool bestPathFromGlobalGraph(PlannerNode& node) {
     const std::lock_guard<std::recursive_mutex> lock(node.planner_mutex_);
     return node.best_path_from_global_graph_;
+  }
+  /// This robot's bid as it would broadcast it.
+  static mgg_msgs::msg::TourBid ownTourBidMsg(PlannerNode& node) {
+    const std::lock_guard<std::recursive_mutex> lock(node.planner_mutex_);
+    auto map_read = node.mapReadLease();
+    mgg::TourBidData bid = node.ownTourBid();
+    bid.robot_id = static_cast<int>(node.planning_params_.robot_id);
+    bid.stamp_s = node.now().seconds();
+    return toTourBidMsg(bid, node.world_frame_);
+  }
+  static void receiveTourBid(PlannerNode& node,
+                             const mgg_msgs::msg::TourBid& msg) {
+    node.onTourBid(std::make_shared<mgg_msgs::msg::TourBid>(msg));
+  }
+  static std::vector<int> fleetGroup(PlannerNode& node) {
+    const std::lock_guard<std::recursive_mutex> lock(node.planner_mutex_);
+    return node.fleet_->group(node.now().seconds());
+  }
+  static void fleetTick(PlannerNode& node, double now_s) {
+    node.fleetTick(now_s);
+  }
+  static bool fleetHasAward(PlannerNode& node) {
+    const std::lock_guard<std::recursive_mutex> lock(node.planner_mutex_);
+    return node.fleet_->hasAward();
+  }
+  /// Robot `robot_id` heard now, bidding nothing: this robot is in a group,
+  /// whose auctioneer is the lower ID of the two.
+  static void hearPeer(PlannerNode& node, int robot_id) {
+    const std::lock_guard<std::recursive_mutex> lock(node.planner_mutex_);
+    mgg::TourBidData bid;
+    bid.robot_id = robot_id;
+    bid.auctioneer_id = robot_id;
+    node.fleet_->onBid(bid, node.now().seconds());
+  }
+  static std::shared_ptr<mgg_msgs::srv::ReleaseClaims::Response>
+  releaseClaims(PlannerNode& node, int robot_id) {
+    auto request = std::make_shared<mgg_msgs::srv::ReleaseClaims::Request>();
+    request->robot_id = robot_id;
+    auto response = std::make_shared<mgg_msgs::srv::ReleaseClaims::Response>();
+    node.onReleaseClaims(request, response);
+    return response;
   }
   /// A global repositioning to `target_id` under way, and resumed while
   /// the robot is more than a metre from it.
@@ -2443,6 +2485,97 @@ TEST_F(PlannerNodeTest, AReachedTourTargetThatIsStillAFrontierIsReleasedOnce) {
     EXPECT_EQ(PlannerNodeTestPeer::tourTarget(*node), target);
     EXPECT_DOUBLE_EQ(PlannerNodeTestPeer::tourTargetSince(*node), since);
   }
+}
+
+TEST_F(PlannerNodeTest, APeersBidJoinsTheGroupOnlyWithATransformToIt) {
+  TwoPlanners fleet("fleet_transform");
+  const mgg_msgs::msg::TourBid bid = PlannerNodeTestPeer::ownTourBidMsg(*fleet.b);
+  // No shared frame yet: robot 1 tours alone (tour-exploration design §4).
+  PlannerNodeTestPeer::receiveTourBid(*fleet.a, bid);
+  EXPECT_EQ(PlannerNodeTestPeer::fleetGroup(*fleet.a), std::vector<int>{1});
+  // A transform appears: robot 2 joins robot 1's group.
+  PlannerNodeTestPeer::receiveTransform(*fleet.a, "robot_0/odom",
+                                        "robot_1/odom", 5.0, 0.0);
+  PlannerNodeTestPeer::receiveTourBid(*fleet.a, bid);
+  EXPECT_EQ(PlannerNodeTestPeer::fleetGroup(*fleet.a),
+            (std::vector<int>{1, 2}));
+}
+
+TEST_F(PlannerNodeTest, AMalformedBidIsIgnored) {
+  // Review Focus 1: one cost more than the bid has clusters.
+  TwoPlanners fleet("fleet_malformed");
+  PlannerNodeTestPeer::receiveTransform(*fleet.a, "robot_0/odom",
+                                        "robot_1/odom", 5.0, 0.0);
+  mgg_msgs::msg::TourBid bid = PlannerNodeTestPeer::ownTourBidMsg(*fleet.b);
+  bid.costs_from_pose.push_back(1.0);
+  PlannerNodeTestPeer::receiveTourBid(*fleet.a, bid);
+  EXPECT_EQ(PlannerNodeTestPeer::fleetGroup(*fleet.a), std::vector<int>{1});
+}
+
+TEST_F(PlannerNodeTest, OnlyTheAuctioneerReleasesClaims) {
+  TwoPlanners fleet("fleet_release");
+  PlannerNodeTestPeer::receiveTransform(*fleet.a, "robot_0/odom",
+                                        "robot_1/odom", 5.0, 0.0);
+  PlannerNodeTestPeer::receiveTourBid(
+      *fleet.a, PlannerNodeTestPeer::ownTourBidMsg(*fleet.b));
+  PlannerNodeTestPeer::receiveTransform(*fleet.b, "robot_1/odom",
+                                        "robot_0/odom", -5.0, 0.0);
+  PlannerNodeTestPeer::receiveTourBid(
+      *fleet.b, PlannerNodeTestPeer::ownTourBidMsg(*fleet.a));
+  EXPECT_TRUE(PlannerNodeTestPeer::releaseClaims(*fleet.a, 3)->success);
+  const auto refused = PlannerNodeTestPeer::releaseClaims(*fleet.b, 3);
+  EXPECT_FALSE(refused->success);
+  EXPECT_NE(refused->message.find("robot 1"), std::string::npos)
+      << refused->message;
+}
+
+TEST_F(PlannerNodeTest, TheAuctioneerCallsAndAwardsOnItsFleetTimer) {
+  TwoPlanners fleet("fleet_award");
+  PlannerNodeTestPeer::receiveTransform(*fleet.a, "robot_0/odom",
+                                        "robot_1/odom", 5.0, 0.0);
+  PlannerNodeTestPeer::receiveTourBid(
+      *fleet.a, PlannerNodeTestPeer::ownTourBidMsg(*fleet.b));
+  const double t0 = fleet.a->now().seconds();
+  PlannerNodeTestPeer::fleetTick(*fleet.a, t0);
+  EXPECT_FALSE(PlannerNodeTestPeer::fleetHasAward(*fleet.a));  // call out
+  PlannerNodeTestPeer::fleetTick(*fleet.a, t0 + 1.1);  // past the deadline
+  EXPECT_TRUE(PlannerNodeTestPeer::fleetHasAward(*fleet.a));
+}
+
+TEST_F(PlannerNodeTest, AnEmptyAwardAfterARebuildDroppedFrontiersIsNotYetComplete) {
+  // TheFirstFailedSearchAfterARebuildDroppedFrontiersIsNotComplete, in a
+  // group: the award answering this robot's request is its failed search.
+  // The first one after the rebuild is no path; the next is exploration
+  // complete.
+  auto node = makeNode("fleet_rebuild_dropped");
+  PlannerNodeTestPeer::gainFromUnknownVoxelsOnly(*node);
+  PlannerNodeTestPeer::observeFloor(*node, -3.55, 5.55, -2.55, 2.55);
+  PlannerNodeTestPeer::acceptOdometry(*node, 0.0, 0.0, 1.0);
+  PlannerNodeTestPeer::addGlobalChainToFrontier(*node, {{-0.5, 0.0}, {-1.0, 0.0}});
+  PlannerNodeTestPeer::serveMap(*node, "component:test", 0);
+  auto source = std::make_unique<TrajectoryInMemory>();
+  source->trajectory = keyframesAlongX(0.0, 1.0);
+  PlannerNodeTestPeer::setKeyframeSource(*node, std::move(source));
+  ASSERT_TRUE(PlannerNodeTestPeer::rebuildRoadmap(
+      *node, PlannerNode::RoadmapRebuildTrigger::kPoseUnlinkable));
+  PlannerNodeTestPeer::setTour(*node, true, 0.0);
+  PlannerNodeTestPeer::hearPeer(*node, 2);
+
+  const auto plan = [&node]() {
+    auto response = std::make_shared<mgg_msgs::srv::PlannerSrv::Response>();
+    PlannerNodeTestPeer::plan(*node, response);
+    EXPECT_TRUE(response->path.empty())
+        << "path of " << response->path.size() << " poses";
+    return response->status;
+  };
+  // Nothing on its tour and no local path: it asks for an auction.
+  EXPECT_EQ(plan(), PlannerNode::kStatusNoPath);
+  const double t0 = node->now().seconds();
+  PlannerNodeTestPeer::fleetTick(*node, t0);        // the call
+  PlannerNodeTestPeer::fleetTick(*node, t0 + 1.1);  // the award: nothing
+  ASSERT_TRUE(PlannerNodeTestPeer::fleetHasAward(*node));
+  EXPECT_EQ(plan(), PlannerNode::kStatusNoPath);
+  EXPECT_EQ(plan(), PlannerNode::kStatusComplete);
 }
 
 }  // namespace mgg_ros

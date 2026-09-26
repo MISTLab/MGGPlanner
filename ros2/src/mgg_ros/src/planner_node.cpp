@@ -17,6 +17,7 @@
 #include "mgg_core/path_turns.h"
 #include "mgg_core/trajectory.h"
 #include "mgg_ros/conversions.h"
+#include "mgg_ros/fleet_conversions.h"
 #include "mgg_ros/param_loader.h"
 #ifdef MGG_WITH_OCTOMAP
 #include "mgg_map_octomap/octomap_map.h"
@@ -253,6 +254,40 @@ PlannerNode::PlannerNode(const rclcpp::NodeOptions& options)
   tour_planner_ = std::make_unique<mgg::TourPlanner>(tour_params_);
   tour_pub_ = create_publisher<nav_msgs::msg::Path>(
       "tour", rclcpp::QoS(1).transient_local());
+
+  // Fleet frontier assignment (tour-exploration design §3). Each robot
+  // publishes on tour_bid_out/tour_award_out and reads its peers' on
+  // tour_bid_in/tour_award_in; a deployment remaps each pair to one shared
+  // topic, as it does neighbour_graph_out/in.
+  if (fleet_params_.enabled) {
+    fleet_ = std::make_unique<mgg::FleetCoordinator>(
+        static_cast<int>(planning_params_.robot_id), fleet_params_,
+        tour_params_.commit_margin);
+    tour_bid_pub_ = create_publisher<mgg_msgs::msg::TourBid>(
+        "tour_bid_out", rclcpp::QoS(10));
+    tour_award_pub_ = create_publisher<mgg_msgs::msg::TourAward>(
+        "tour_award_out", rclcpp::QoS(10));
+    tour_bid_sub_ = create_subscription<mgg_msgs::msg::TourBid>(
+        "tour_bid_in", rclcpp::QoS(10),
+        [this](mgg_msgs::msg::TourBid::ConstSharedPtr m) { onTourBid(m); },
+        sub_opts);
+    tour_award_sub_ = create_subscription<mgg_msgs::msg::TourAward>(
+        "tour_award_in", rclcpp::QoS(10),
+        [this](mgg_msgs::msg::TourAward::ConstSharedPtr m) {
+          onTourAward(m);
+        },
+        sub_opts);
+    release_claims_srv_ = create_service<mgg_msgs::srv::ReleaseClaims>(
+        "release_claims",
+        [this](const std::shared_ptr<mgg_msgs::srv::ReleaseClaims::Request> req,
+               std::shared_ptr<mgg_msgs::srv::ReleaseClaims::Response> res) {
+          onReleaseClaims(req, res);
+        },
+        rclcpp::ServicesQoS(), callback_group_);
+    fleet_timer_ = create_timer(
+        std::chrono::duration<double>(kFleetTickPeriodS),
+        [this]() { fleetTick(now().seconds()); }, callback_group_);
+  }
 
   build_srv_ = create_service<std_srvs::srv::Trigger>(
       "build_local_graph",
@@ -554,13 +589,45 @@ std::vector<mgg::FrontierCluster> PlannerNode::tourCandidates(
                      }),
       clusters.end());
   const int own_id = static_cast<int>(planning_params_.robot_id);
-  const auto others = [own_id](const mgg::FrontierCluster& cluster) {
-    return cluster.owner_robot_id != own_id;
-  };
-  if (!std::all_of(clusters.begin(), clusters.end(), others)) {
-    clusters.erase(std::remove_if(clusters.begin(), clusters.end(), others),
-                   clusters.end());
+  if (!fleet_) {
+    const auto others = [own_id](const mgg::FrontierCluster& cluster) {
+      return cluster.owner_robot_id != own_id;
+    };
+    if (!std::all_of(clusters.begin(), clusters.end(), others)) {
+      clusters.erase(std::remove_if(clusters.begin(), clusters.end(), others),
+                     clusters.end());
+    }
+    return clusters;
   }
+  // Tour-exploration design §3.5: never a cluster another robot holds or a
+  // peer explored; in a group with an award, the awarded bundle and the
+  // frontiers this robot found itself that no award has named yet.
+  const double now_s = now().seconds();
+  const double radius = fleet_params_.cluster_merge_radius_m;
+  const auto near = [radius](const mgg::FrontierCluster& cluster,
+                             const std::vector<mgg::FleetCluster>& others) {
+    return std::any_of(others.begin(), others.end(),
+                       [&](const mgg::FleetCluster& other) {
+                         return (other.position - cluster.position).norm() <=
+                                radius;
+                       });
+  };
+  const std::vector<mgg::FleetCluster> held = fleet_->claimedByOthers(now_s);
+  const std::vector<mgg::FleetCluster>& bundle = fleet_->bundle();
+  const std::vector<mgg::FleetCluster>& explored = fleet_->exploredElsewhere();
+  const std::vector<mgg::FleetCluster>& awarded = fleet_->lastAwardClusters();
+  const bool assigned = fleet_->inGroup(now_s) && fleet_->hasAward();
+  clusters.erase(
+      std::remove_if(clusters.begin(), clusters.end(),
+                     [&](const mgg::FrontierCluster& cluster) {
+                       if (near(cluster, explored)) return true;
+                       if (near(cluster, bundle)) return false;
+                       if (near(cluster, held)) return true;
+                       return assigned && (cluster.owner_robot_id != own_id ||
+                                           near(cluster, awarded));
+                     }),
+      clusters.end());
+  tour_assignment_version_ = fleet_->assignmentVersion();
   return clusters;
 }
 
@@ -690,6 +757,229 @@ void PlannerNode::publishTour() {
     msg.poses.push_back(pose);
   }
   tour_pub_->publish(msg);
+}
+
+bool PlannerNode::peerTransform(int robot_id, const std::string& frame,
+                                Eigen::Isometry3d& t_ours_theirs) {
+  if (!refreshNeighbourTransform(robot_id, frame)) return false;
+  return poses_->getRobotTransform(robot_id, t_ours_theirs);
+}
+
+void PlannerNode::onTourBid(mgg_msgs::msg::TourBid::ConstSharedPtr msg) {
+  if (!fleet_ || msg->robot_id == static_cast<int>(planning_params_.robot_id)) {
+    return;
+  }
+  const std::lock_guard<std::recursive_mutex> lock(planner_mutex_);
+  Eigen::Isometry3d t_ours_theirs = Eigen::Isometry3d::Identity();
+  if (!peerTransform(msg->robot_id, msg->header.frame_id, t_ours_theirs)) {
+    RCLCPP_DEBUG_THROTTLE(get_logger(), *get_clock(), 5000,
+                          "bid from robot %d ignored: no transform to '%s'",
+                          msg->robot_id, msg->header.frame_id.c_str());
+    return;
+  }
+  const mgg::TourBidData bid = fromTourBidMsg(*msg, t_ours_theirs);
+  if (!bid.wellFormed()) {
+    RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 5000,
+                         "ignoring a malformed bid from robot %d",
+                         msg->robot_id);
+    return;
+  }
+  if (communication_range_ > 0.0 &&
+      (bid.pose.head<3>() - current_state_.head<3>()).norm() >
+          communication_range_) {
+    return;
+  }
+  fleet_->onBid(bid, now().seconds());
+}
+
+void PlannerNode::onTourAward(mgg_msgs::msg::TourAward::ConstSharedPtr msg) {
+  if (!fleet_ ||
+      msg->auctioneer_id == static_cast<int>(planning_params_.robot_id)) {
+    return;
+  }
+  const std::lock_guard<std::recursive_mutex> lock(planner_mutex_);
+  Eigen::Isometry3d t_ours_theirs = Eigen::Isometry3d::Identity();
+  if (!peerTransform(msg->auctioneer_id, msg->header.frame_id,
+                     t_ours_theirs)) {
+    return;
+  }
+  const std::uint64_t before = fleet_->assignmentVersion();
+  fleet_->onAward(fromTourAwardMsg(*msg, t_ours_theirs), now().seconds());
+  if (!msg->call && fleet_->assignmentVersion() != before) {
+    RCLCPP_INFO(get_logger(),
+                "fleet award %llu from robot %d: %zu cluster(s) for this "
+                "robot",
+                static_cast<unsigned long long>(msg->auction_id),
+                msg->auctioneer_id, fleet_->bundle().size());
+  }
+}
+
+void PlannerNode::onReleaseClaims(
+    const std::shared_ptr<mgg_msgs::srv::ReleaseClaims::Request> request,
+    std::shared_ptr<mgg_msgs::srv::ReleaseClaims::Response> response) {
+  const std::lock_guard<std::recursive_mutex> lock(planner_mutex_);
+  if (!fleet_) {
+    response->success = false;
+    response->message = "fleet assignment is off (fleet.enabled)";
+    return;
+  }
+  const double now_s = now().seconds();
+  if (!fleet_->releaseClaims(request->robot_id, now_s)) {
+    response->success = false;
+    response->message = "not the auctioneer: robot " +
+                        std::to_string(fleet_->auctioneer(now_s)) + " is";
+    return;
+  }
+  response->success = true;
+  response->message = "robot " + std::to_string(request->robot_id) +
+                      "'s claims released; forwarded in the next award";
+  RCLCPP_INFO(get_logger(), "%s", response->message.c_str());
+}
+
+void PlannerNode::fleetTick(double now_s) {
+  if (!fleet_) return;
+  const std::lock_guard<std::recursive_mutex> lock(planner_mutex_);
+  if (!have_odometry_) return;
+  auto map_read = mapReadLease();
+  const mgg::FleetTickOutput out =
+      fleet_->tick(now_s, [this]() { return ownTourBid(); },
+                   roadmapCostEstimate(), exploredByRoadmap());
+  if (out.bid) tour_bid_pub_->publish(toTourBidMsg(*out.bid, world_frame_));
+  if (!out.award) return;
+  tour_award_pub_->publish(toTourAwardMsg(*out.award, world_frame_));
+  if (out.award->call) return;
+  std::size_t assigned = 0;
+  for (const mgg::RobotBundle& bundle : out.award->bundles) {
+    assigned += bundle.clusters.size();
+  }
+  RCLCPP_INFO(get_logger(),
+              "fleet award %llu: %zu cluster(s) to %zu robot(s), %zu "
+              "unassigned, %zu explored, %zu claim(s) released",
+              static_cast<unsigned long long>(out.award->auction_id),
+              assigned, out.award->bundles.size(), fleet_->lastUnassigned(),
+              out.award->explored.size(),
+              out.award->released_robot_ids.size());
+}
+
+mgg::TourBidData PlannerNode::ownTourBid() {
+  mgg::TourBidData bid;
+  bid.robot_id = static_cast<int>(planning_params_.robot_id);
+  bid.auctioneer_id = fleet_->auctioneer(now().seconds());
+  bid.pose = current_state_;
+  bid.current_target = tour_planner_->target();
+  bid.claim_stamp_s = tour_planner_->targetSince();
+  // §3.3 pool construction: the awarded clusters this robot's roadmap
+  // shows explored.
+  for (const mgg::FleetCluster& cluster : fleet_->lastAwardClusters()) {
+    if (mgg::exploredInGraph(*global_graph_, cluster.position,
+                             fleet_params_.cluster_merge_radius_m)) {
+      bid.explored.push_back(cluster.id);
+    }
+  }
+  if (global_graph_->getNumVertices() <= 1) return bid;
+  std::vector<mgg::FrontierCluster> clusters = globalFrontierClusters();
+  // Best gain first: what a peer would refuse as too large is cut from the
+  // low-gain end.
+  if (clusters.size() > mgg::kMaxBidClusters) {
+    clusters.resize(mgg::kMaxBidClusters);
+  }
+  if (clusters.empty()) return bid;
+  mgg::TourCostMatrix costs;
+  if (mgg::Vertex* link = linkRobotToGlobalGraph()) {
+    costs = mgg::computeTourCosts(*global_graph_, graph_revision_,
+                                  tour_distances_, link->id,
+                                  current_state_[3], clusters,
+                                  /*heading_weight=*/0.0);
+  } else {
+    costs.from_robot.assign(clusters.size(), mgg::kUnreachableCost);
+    costs.between.assign(clusters.size(),
+                         std::vector<double>(clusters.size(),
+                                             mgg::kUnreachableCost));
+  }
+  for (std::size_t i = 0; i < clusters.size(); ++i) {
+    const mgg::FrontierCluster& c = clusters[i];
+    bid.clusters.push_back({c.id, c.owner_robot_id, c.position, c.gain});
+    bid.costs_from_pose.push_back(costs.from_robot[i]);
+    for (std::size_t j = 0; j < clusters.size(); ++j) {
+      bid.costs_between.push_back(i == j ? 0.0 : costs.between[i][j]);
+    }
+  }
+  return bid;
+}
+
+mgg::CostEstimateFn PlannerNode::roadmapCostEstimate() {
+  return [this](const Eigen::Vector3d& from, const Eigen::Vector3d& to) {
+    const mgg::StateVec from_state(from.x(), from.y(), from.z(), 0.0);
+    const mgg::StateVec to_state(to.x(), to.y(), to.z(), 0.0);
+    mgg::Vertex* a = nullptr;
+    mgg::Vertex* b = nullptr;
+    if (!global_graph_->getNearestVertex(&from_state, &a) ||
+        !global_graph_->getNearestVertex(&to_state, &b) || a == nullptr ||
+        b == nullptr) {
+      return mgg::kUnreachableCost;
+    }
+    const mgg::ShortestPathsReport* report =
+        tour_distances_.from(*global_graph_, graph_revision_, a->id);
+    if (report == nullptr) return mgg::kUnreachableCost;
+    return mgg::reachedDistance(*report, b->id) +
+           (from - a->state.head<3>()).norm() +
+           (to - b->state.head<3>()).norm();
+  };
+}
+
+mgg::ExploredFn PlannerNode::exploredByRoadmap() {
+  return [this](const Eigen::Vector3d& position) {
+    return mgg::exploredInGraph(*global_graph_, position,
+                                fleet_params_.cluster_merge_radius_m);
+  };
+}
+
+std::vector<Eigen::Vector3d> PlannerNode::fleetExclusions() {
+  std::vector<Eigen::Vector3d> points;
+  if (!fleet_) return points;
+  for (const mgg::FleetCluster& c : fleet_->claimedByOthers(now().seconds())) {
+    points.push_back(c.position);
+  }
+  for (const mgg::FleetCluster& c : fleet_->exploredElsewhere()) {
+    points.push_back(c.position);
+  }
+  return points;
+}
+
+bool PlannerNode::settleIdleRobot(std::string& summary, bool& complete) {
+  const double now_s = now().seconds();
+  if (fleet_->inGroup(now_s)) {
+    if (fleet_->requestAnswered()) {
+      // As a failed global search is (review r0, I-2): not exploration
+      // complete while the lattice still sees gain it cannot send a path
+      // to, nor the first time after a graph rebuild dropped frontiers.
+      if (local_gain_remains_now_) {
+        summary +=
+            "; the fleet's award leaves it nothing, but local gain remains: "
+            "no path";
+      } else if (frontiers_dropped_in_rebuild_ > 0) {
+        summary += "; the fleet's award leaves it nothing, but a graph "
+                   "rebuild dropped " +
+                   std::to_string(frontiers_dropped_in_rebuild_) +
+                   " frontier(s): no path";
+        frontiers_dropped_in_rebuild_ = 0;
+      } else {
+        complete = true;
+        summary +=
+            "; exploration complete for this robot: the fleet's award "
+            "leaves it nothing";
+      }
+    } else {
+      if (!fleet_->awaitingAuction()) fleet_->requestAuction();
+      summary += "; its bundle is done: waiting for the auction it asked for";
+    }
+    return true;
+  }
+  const int taken = fleet_->takeOverOldestClaim(now_s);
+  if (taken < 0) return false;
+  summary += "; took over silent robot " + std::to_string(taken) +
+             "'s claims";
+  return true;
 }
 
 mgg::MolaMap::ReadLease PlannerNode::mapReadLease() const {
@@ -2370,10 +2660,21 @@ bool PlannerNode::runGlobalPlanner(int target_id, std::string& reason) {
       reason = "current pose cannot be linked to the global graph";
       return false;
     }
+    // A peer's reservation, and with fleet assignment the clusters other
+    // robots hold or peers explored (tour-exploration design §3.5): the
+    // greedy fallback takes none of them either.
+    std::vector<Eigen::Vector3d> excluded = selectionExclusions();
+    const std::vector<Eigen::Vector3d> fleet_excluded = fleetExclusions();
+    excluded.insert(excluded.end(), fleet_excluded.begin(),
+                    fleet_excluded.end());
+    const double exclusion_radius =
+        fleet_ ? std::max(reservation_exclusion_radius_m_,
+                          fleet_params_.cluster_merge_radius_m)
+               : reservation_exclusion_radius_m_;
     const mgg::GlobalFrontierReport report = mgg::searchGlobalFrontier(
         *global_graph_, link_vertex->id,
         static_cast<int>(planning_params_.robot_id), globalFrontierGain(),
-        selectionExclusions(), reservation_exclusion_radius_m_,
+        excluded, exclusion_radius,
         exploration_target_.has_value() ? &*exploration_target_ : nullptr);
     global_space_.setCenter(current_state_, /*use_extension=*/true);
     if (report.best_frontier == nullptr) {
@@ -2609,8 +2910,17 @@ void PlannerNode::onPlanRequest(
     const bool low_gain =
         best_path_.empty() && local_graph_->getNumVertices() > 1 &&
         low_gain_rounds_ >= auto_global_planner_low_gain_rounds_;
-    if (tour_decided) {
-      // The tour decided this cycle.
+    // Design §3.5: with fleet assignment, a robot with nothing on its tour
+    // and no local path asks for an auction, or takes a silent robot's
+    // claims over, before the greedy fallback is consulted.
+    const bool fleet_decided =
+        !tour_decided && fleet_ && tour_params_.enabled &&
+        !tour_target.has_value() && best_path_.empty() &&
+        local_graph_->getNumVertices() > 1 && !departed &&
+        !boxed_in_without_departure_now_ && !withheld_without_departure &&
+        settleIdleRobot(summary, complete);
+    if (tour_decided || fleet_decided) {
+      // The tour or the fleet decided this cycle.
     } else if (low_gain &&
                (boxed_in_without_departure_now_ ||
                 withheld_without_departure)) {

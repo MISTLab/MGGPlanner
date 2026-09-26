@@ -72,6 +72,7 @@ rosidl_generate_interfaces(${PROJECT_NAME}
   "srv/PlannerSrv.srv"
   "srv/PlanObjective.srv"
   "srv/PlannerStringTrigger.srv"
+  "srv/ReleaseClaims.srv"
 
   "action/PathFollower.action"
   DEPENDENCIES std_msgs geometry_msgs sensor_msgs builtin_interfaces
