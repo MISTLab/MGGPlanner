@@ -794,4 +794,47 @@ TEST(FleetCoordinator, ARequestFollowsTheAuctioneerWhenItChanges) {
   EXPECT_TRUE(coordinator.requestAnswered());
 }
 
+/// A well-formed bid from `robot_id` standing at (x, 0) that knows `known`
+/// and holds `bundle`, answering `auction_id`.
+TourBidData bidFrom(int robot_id, double x, std::vector<FleetCluster> known,
+                    std::uint64_t auction_id = 0,
+                    std::vector<ClusterId> bundle = {}) {
+  SimRobot robot(robot_id, x, 0.0, FleetParams{});
+  robot.known = std::move(known);
+  TourBidData bid = robot.ownBid();
+  bid.robot_id = robot_id;
+  bid.auction_id = auction_id;
+  bid.bundle = std::move(bundle);
+  bid.current_target = bid.bundle.empty() ? mgg::kNoCluster : bid.bundle[0];
+  return bid;
+}
+
+// §3.4: a bid received at or after fleet.bid_deadline_s is late, even when
+// the auctioneer has not ticked past the deadline yet; it is not collected.
+// One received before the deadline is.
+TEST(FleetCoordinator, ABidReceivedAfterTheDeadlineIsNotCollected) {
+  const FleetParams params;
+  const auto collected = [&params](double received_s) {
+    FleetCoordinator coordinator(1, params, 0.2);
+    coordinator.onBid(emptyBid(2), 0.0);
+    const mgg::FleetTickOutput call =
+        coordinator.tick(0.0, nullptr, nullptr, nullptr);
+    EXPECT_TRUE(call.award && call.award->call);
+    if (!call.award) return false;
+    coordinator.onBid(
+        bidFrom(2, 20.0, {cluster(21, 2, 18.0)}, call.award->auction_id),
+        received_s);
+    const mgg::FleetTickOutput out = coordinator.tick(
+        std::max(received_s, params.bid_deadline_s) + 0.1, nullptr, nullptr,
+        nullptr);
+    EXPECT_TRUE(out.award && !out.award->call);
+    if (!out.award) return false;
+    return out.award->bundleOf(2) != nullptr;
+  };
+  EXPECT_TRUE(collected(params.bid_deadline_s - 0.0625));
+  EXPECT_FALSE(collected(params.bid_deadline_s));
+  // Received after the deadline, before the auctioneer's next tick.
+  EXPECT_FALSE(collected(params.bid_deadline_s + 0.1));
+}
+
 }  // namespace

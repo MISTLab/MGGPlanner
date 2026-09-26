@@ -75,7 +75,10 @@ void FleetCoordinator::onBid(const TourBidData& bid, double now_s) {
   noteHeard(bid.robot_id, now_s);
   last_bids_[bid.robot_id] = bid;
   if (bid.request_auction) peer_requested_ = true;
-  if (collecting_ && bid.auction_id == collecting_->auction_id) {
+  // Collected only before the deadline, as the local receipt time tells: a
+  // late bid, like a missing one, leaves its bidder with what it holds.
+  if (collecting_ && bid.auction_id == collecting_->auction_id &&
+      now_s - collecting_->started_s < params_.bid_deadline_s) {
     collecting_->bids[bid.robot_id] = bid;
   }
 }

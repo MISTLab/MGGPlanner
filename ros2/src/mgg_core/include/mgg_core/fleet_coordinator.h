@@ -56,7 +56,9 @@ class FleetCoordinator {
   FleetCoordinator(int robot_id, const FleetParams& params,
                    double commit_margin);
 
-  /// A peer's bid, in this robot's frame. Malformed bids are dropped.
+  /// A peer's bid, in this robot's frame. Malformed bids are dropped. A bid
+  /// answering this robot's call is collected only if received before
+  /// fleet.bid_deadline_s has passed.
   void onBid(const TourBidData& bid, double now_s);
   /// A peer's call or award, in this robot's frame. Only this robot's
   /// current auctioneer is followed. A call or award is known by its round,
