@@ -128,7 +128,17 @@ void FleetCoordinator::recordBidClaim(const TourBidData& bid, double now_s) {
       if (named(clusters, c.id) == nullptr) clusters.push_back(c);
     }
   }
+  // Added, replaced or removed, not only heard again: the tour solves anew.
+  const auto same = [](const FleetCluster& a, const FleetCluster& b) {
+    return a.id == b.id && a.position == b.position;
+  };
+  const bool changed =
+      held == nullptr
+          ? !clusters.empty()
+          : !std::equal(held->clusters.begin(), held->clusters.end(),
+                        clusters.begin(), clusters.end(), same);
   claims_.record(bid.robot_id, std::move(clusters), now_s);
+  if (changed) ++assignment_version_;
 }
 
 void FleetCoordinator::noteReportedExplored(

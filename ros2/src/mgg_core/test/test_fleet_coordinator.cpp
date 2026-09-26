@@ -1269,4 +1269,29 @@ TEST(FleetCoordinator, AReplayedCallIsNotAnsweredAgain) {
   EXPECT_FALSE(coordinator.tick(1.8, nullptr, nullptr, nullptr).bid);
 }
 
+// The tour solves again when the claims it respects change: a bid that
+// adds, replaces or removes a claim advances assignmentVersion, and one
+// that repeats it (a refresh of when its robot was heard) does not.
+TEST(FleetCoordinator, BidClaimChangesAdvanceTheAssignmentVersion) {
+  FleetCoordinator coordinator(1, FleetParams{}, 0.2);
+  const auto bid = [](double stamp_s, std::vector<ClusterId> bundle) {
+    TourBidData b =
+        bidFrom(2, 20.0, {cluster(21, 2, 18.0), cluster(22, 2, 14.0)}, 0,
+                std::move(bundle));
+    b.stamp_s = stamp_s;
+    return b;
+  };
+  std::uint64_t version = coordinator.assignmentVersion();
+  coordinator.onBid(bid(1.0, {21}), 1.0);
+  EXPECT_GT(coordinator.assignmentVersion(), version) << "added";
+  version = coordinator.assignmentVersion();
+  coordinator.onBid(bid(2.0, {21}), 2.0);
+  EXPECT_EQ(coordinator.assignmentVersion(), version) << "unchanged";
+  coordinator.onBid(bid(3.0, {22}), 3.0);
+  EXPECT_GT(coordinator.assignmentVersion(), version) << "replaced";
+  version = coordinator.assignmentVersion();
+  coordinator.onBid(bid(4.0, {}), 4.0);
+  EXPECT_GT(coordinator.assignmentVersion(), version) << "removed";
+}
+
 }  // namespace

@@ -165,7 +165,8 @@ class FleetCoordinator {
   /// The bidder holds its current target and bundle, as named by its own
   /// clusters, the last award or its claim; IDs none names are skipped. A
   /// bundle cut at kMaxBidClusters keeps the rest of the claim. Only a bid
-  /// newer than the claim's source replaces it.
+  /// newer than the claim's source replaces it; a change of the claim's
+  /// clusters advances assignmentVersion.
   void recordBidClaim(const TourBidData& bid, double now_s);
   /// Keeps explored IDs a bid reports for the next auction.
   void noteReportedExplored(const std::vector<ClusterId>& ids);
