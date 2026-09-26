@@ -64,6 +64,9 @@ class PlannerNodeTestPeer {
     node.ground_ = std::make_unique<mgg::GroundProjection>(
         *node.map_, node.planning_params_);
   }
+  static void setTourAside(PlannerNode& node, mgg::ClusterId id) {
+    node.setTourClusterAside(id);
+  }
   static void setFrontierOwner(PlannerNode& node, int id, int owner) {
     node.global_graph_->getVertex(id)->robot_id = owner;
   }
@@ -158,6 +161,9 @@ class PlannerNodeTestPeer {
   static int globalVertices(PlannerNode& node) {
     const std::lock_guard<std::recursive_mutex> lock(node.planner_mutex_);
     return node.global_graph_->getNumVertices();
+  }
+  static std::uint64_t graphRevision(PlannerNode& node) {
+    return node.graph_revision_;
   }
   static int globalEdges(PlannerNode& node) {
     const std::lock_guard<std::recursive_mutex> lock(node.planner_mutex_);
@@ -2748,6 +2754,47 @@ TEST_F(PlannerNodeTest, ImportedFrontierScoringExcludesSnapshotPublication) {
   EXPECT_EQ(probe->writer.wait_for(std::chrono::seconds(1)),
             std::future_status::ready);
   probe->writer.get();
+}
+
+TEST_F(PlannerNodeTest, PeerFrontierRescoringDoesNotLapseATourSetAside) {
+  TwoPlanners fleet("rescore_set_aside");
+  PlannerNodeTestPeer::gainFromUnknownVoxelsOnly(*fleet.a);
+  PlannerNodeTestPeer::observeFloor(*fleet.a, -3.55, 10.55, -3.55, 3.55);
+  PlannerNodeTestPeer::setTour(*fleet.a, true, 0.0);
+  PlannerNodeTestPeer::solveTourOnEveryChange(*fleet.a);
+  PlannerNodeTestPeer::addGlobalChainToFrontier(*fleet.a, {{-2.0, 0.0}});
+  auto graph = PlannerNodeTestPeer::ownGraph(*fleet.b);
+  auto frontier = std::max_element(graph.vertices.begin(), graph.vertices.end(),
+      [](const auto& a, const auto& b) { return a.pose.position.x < b.pose.position.x; });
+  ASSERT_NE(frontier, graph.vertices.end());
+  frontier->is_frontier = true;
+  PlannerNodeTestPeer::receiveTransform(*fleet.a, "robot_0/odom", "robot_1/odom", 0.0, 0.0);
+  PlannerNodeTestPeer::receiveGraph(*fleet.a, graph);
+  const auto target = PlannerNodeTestPeer::refreshTour(*fleet.a);
+  ASSERT_NE(target, mgg::kNoCluster);
+  ASSERT_LT(PlannerNodeTestPeer::tourTargetPosition(*fleet.a).x(), 0.0);
+  PlannerNodeTestPeer::setTourAside(*fleet.a, target);
+  const auto revision = PlannerNodeTestPeer::graphRevision(*fleet.a);
+  for (int broadcast = 0; broadcast < 3; ++broadcast) {
+    PlannerNodeTestPeer::receiveGraph(*fleet.a, graph);
+    const auto clusters = PlannerNodeTestPeer::frontierClusters(*fleet.a);
+    ASSERT_EQ(clusters.size(), 1u);  // peer frontier was explored here
+    EXPECT_EQ(PlannerNodeTestPeer::refreshTour(*fleet.a), mgg::kNoCluster);
+    EXPECT_EQ(PlannerNodeTestPeer::graphRevision(*fleet.a), revision);
+  }
+  // Unlike re-marking a frontier, a genuinely new edge changes topology.
+  const auto ends = std::minmax_element(graph.vertices.begin(), graph.vertices.end(),
+      [](const auto& a, const auto& b) { return a.pose.position.x < b.pose.position.x; });
+  mgg_msgs::msg::Edge edge;
+  edge.source_id = ends.first->id;
+  edge.target_id = ends.second->id;
+  edge.weight = 4.0;
+  graph.edges.push_back(edge);
+  const int edges = PlannerNodeTestPeer::globalEdges(*fleet.a);
+  PlannerNodeTestPeer::receiveGraph(*fleet.a, graph);
+  EXPECT_EQ(PlannerNodeTestPeer::globalEdges(*fleet.a), edges + 1);
+  EXPECT_GT(PlannerNodeTestPeer::graphRevision(*fleet.a), revision);
+  EXPECT_EQ(PlannerNodeTestPeer::refreshTour(*fleet.a), target);
 }
 
 }  // namespace mgg_ros

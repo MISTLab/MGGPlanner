@@ -584,7 +584,7 @@ std::vector<mgg::FrontierCluster> PlannerNode::globalFrontierClusters() {
     if (!vertex->vol_gain.is_frontier) {
       vertex->type = mgg::VertexType::kUnvisited;
     }
-    ++graph_revision_;
+    // Gain/type changes alter the cluster set, not graph topology.
   }
   global_space_.setCenter(current_state_, /*use_extension=*/true);
   std::vector<mgg::FrontierCluster> clusters = mgg::extractFrontierClusters(
@@ -1420,9 +1420,11 @@ void PlannerNode::onNeighbourGraph(mgg_msgs::msg::Graph::ConstSharedPtr msg) {
            mgg::ProjectedEdgeStatus::kAdmissible;
   };
 
+  const int edges_before = global_graph_->getNumEdges();
   const mgg::MergeResult r = mgg::mergeNeighbourGraph(
       *global_graph_, incoming, *poses_, admissible, 5.0, receiverPlatform());
-  if (r.vertices_added > 0 || r.edges_added > 0 || r.vertices_replaced > 0 ||
+  if (r.vertices_added > 0 || global_graph_->getNumEdges() != edges_before ||
+      r.vertices_replaced > 0 ||
       r.neighbour_restarted) {
     ++graph_revision_;
   }
