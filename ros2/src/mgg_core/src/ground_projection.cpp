@@ -619,14 +619,17 @@ bool GroundProjection::freeInColumn(const Eigen::Vector2d& cell, double top,
       !(bottom < top)) {
     return false;
   }
-  // The column is sampled once per voxel, at heights (k + 1/2) resolution
-  // from `from` down to `to`, so that cached and uncached asks see the same
-  // samples and a voxel counts when its sample lies between the bounds.
+  // The column is sampled once per voxel, at heights (k + 1/2) resolution,
+  // so that cached and uncached asks see the same samples. A voxel counts
+  // when its sample lies between the bounds to within kSampleTolerance, and
+  // the samples looked at are enumerated to that same tolerance: a sample
+  // on a bound counts in either mode (review r2, P2).
+  constexpr double kSampleTolerance = 1e-9;
   const auto sample = [&](double from, double to, std::vector<double>& free) {
-    const auto highest =
-        static_cast<std::int64_t>(std::floor(from / resolution - 0.5));
-    const auto lowest =
-        static_cast<std::int64_t>(std::ceil(to / resolution - 0.5));
+    const auto highest = static_cast<std::int64_t>(
+        std::floor((from + kSampleTolerance) / resolution - 0.5));
+    const auto lowest = static_cast<std::int64_t>(
+        std::ceil((to - kSampleTolerance) / resolution - 0.5));
     for (std::int64_t k = highest; k >= lowest; --k) {
       const double z = (static_cast<double>(k) + 0.5) * resolution;
       if (map_.getVoxelStatus(Eigen::Vector3d(cell.x(), cell.y(), z)) ==
@@ -636,7 +639,7 @@ bool GroundProjection::freeInColumn(const Eigen::Vector2d& cell, double top,
     }
   };
   const auto between = [&](double z) {
-    return z <= top + 1e-9 && z >= bottom - 1e-9;
+    return z <= top + kSampleTolerance && z >= bottom - kSampleTolerance;
   };
   if (!cache_footprint_ground_) {
     std::vector<double> free;

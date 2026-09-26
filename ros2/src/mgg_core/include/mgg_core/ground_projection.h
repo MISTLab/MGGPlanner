@@ -328,8 +328,9 @@ class GroundProjection {
                      double lowest) const;
   /// Whether the map has a free voxel in the column of `cell` between the
   /// heights `bottom` and `top`: sampled once per voxel, at (k + 1/2)
-  /// resolution, a voxel counts when its sample lies between them. Through
-  /// the cache when there is one.
+  /// resolution, a voxel counts when its sample lies between them, bounds
+  /// included to within 1e-9 m, cached or not. Through the cache when there
+  /// is one.
   bool freeInColumn(const Eigen::Vector2d& cell, double top,
                     double bottom) const;
   FootprintPlane measureFootprintPlane(const Eigen::Vector3d& point,

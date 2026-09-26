@@ -2456,6 +2456,47 @@ TEST(ObservedGround, AHoleTheLidarLookedIntoIsNotBridged) {
       }
     }
   }
+  // Review r2 (P2): on a bound, cached or not. Floor at z = 5.7, a trench
+  // two cells wide in it, unknown but for one free voxel: row 3, whose
+  // sample, 0.7, lies on the lower bound, 5.7 - 5.0 in floating point, is
+  // a hole; row 2, 0.2 m under it, is not looked at.
+  const auto raised = [](std::int64_t free_row) {
+    constexpr double kResolution = 0.2;
+    std::vector<mgg::NativeMolaGrid::Cell> occupied;
+    std::vector<mgg::NativeMolaGrid::Cell> free;
+    std::vector<mgg::NativeMolaGrid::Surface> surfaces;
+    for (std::int64_t ix = -20; ix < 5; ++ix) {
+      for (std::int64_t iy = -15; iy < 15; ++iy) {
+        if (ix == -10 || ix == -9) {
+          free.push_back({ix, iy, free_row});
+          continue;
+        }
+        const mgg::NativeMolaGrid::Cell top{ix, iy, 28};  // [5.6, 5.8)
+        occupied.push_back(top);
+        surfaces.push_back({top, 5.7});
+        for (std::int64_t iz = 29; iz < 39; ++iz) free.push_back({ix, iy, iz});
+      }
+    }
+    return std::make_unique<mgg::NativeMolaGrid>(kResolution, occupied, free,
+                                                 surfaces);
+  };
+  const Eigen::Vector3d raised_before(-2.3, 0.1,
+                                      5.7 + planning.max_ground_height);
+  for (const bool cached : {false, true}) {
+    for (const std::int64_t row : {std::int64_t(3), std::int64_t(2)}) {
+      SCOPED_TRACE(std::string(cached ? "cached" : "uncached") +
+                   ", raised floor, row " + std::to_string(row));
+      const auto map = raised(row);
+      const mgg::GroundProjection raised_ground(*map, planning, cached);
+      const double fraction =
+          raised_ground.observedGroundAhead(raised_before, east, box);
+      if (row == 3) {
+        EXPECT_LT(fraction, planning.min_observed_ground_fraction);
+      } else {
+        EXPECT_GE(fraction, planning.min_observed_ground_fraction);
+      }
+    }
+  }
   // Not looked into, the same gap is bridged: 0.4 m between observed floor
   // at one height is taken for floor.
   const auto unseen = sparseRampCrest(Trench::kUnseen);
