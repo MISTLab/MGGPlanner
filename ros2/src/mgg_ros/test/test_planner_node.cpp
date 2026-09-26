@@ -633,6 +633,32 @@ class PlannerNodeTestPeer {
     const std::lock_guard<std::recursive_mutex> lock(node.planner_mutex_);
     return node.fleet_->group(node.now().seconds());
   }
+  static bool greedyRoute(PlannerNode& node) {
+    const std::lock_guard<std::recursive_mutex> lock(node.planner_mutex_);
+    std::string reason;
+    return node.runGlobalPlanner(-1, reason);
+  }
+  static void claim(PlannerNode& node, int robot_id, const mgg::FleetCluster& cluster,
+                    double heard_s) {
+    mgg::TourBidData bid;
+    bid.robot_id = robot_id;
+    bid.auctioneer_id = robot_id;
+    bid.stamp_s = heard_s;
+    bid.clusters = {cluster};
+    bid.costs_from_pose = {1.0};
+    bid.costs_between = {0.0};
+    bid.bundle = {cluster.id};
+    node.fleet_->onBid(bid, heard_s);
+  }
+  static void applyAward(PlannerNode& node, const mgg::TourAwardData& award) {
+    node.fleet_->onAward(award, node.now().seconds());
+  }
+  static std::vector<Eigen::Vector3d> fleetExclusions(PlannerNode& node) {
+    return node.fleetExclusions();
+  }
+  static void localGainRemains(PlannerNode& node, bool remains) {
+    node.local_gain_remains_now_ = remains;
+  }
   static bool settleIdle(PlannerNode& node, std::string& summary, bool& complete) {
     const std::lock_guard<std::recursive_mutex> lock(node.planner_mutex_);
     return node.settleIdleRobot(summary, complete);
@@ -2906,6 +2932,89 @@ TEST_F(PlannerNodeTest, AMissedCallAwardDoesNotCompleteAnUnconsideredRobot) {
   PlannerNodeTestPeer::receiveTourAward(*fleet.b, toTourAwardMsg(*out.award, "robot_0/odom"));
   complete = false;
   ASSERT_TRUE(PlannerNodeTestPeer::settleIdle(*fleet.b, note, complete));
+  EXPECT_TRUE(complete);
+}
+
+TEST_F(PlannerNodeTest, AnOutOfRangeBidDoesNotJoinTheFleet) {
+  TwoPlanners fleet("bid_range");
+  PlannerNodeTestPeer::receiveTransform(*fleet.a, "robot_0/odom", "robot_1/odom", 100.0, 0.0);
+  PlannerNodeTestPeer::receiveTourBid(*fleet.a, PlannerNodeTestPeer::ownTourBidMsg(*fleet.b));
+  EXPECT_EQ(PlannerNodeTestPeer::fleetGroup(*fleet.a), std::vector<int>{1});
+}
+
+TEST_F(PlannerNodeTest, AnAwardWithoutATransformIsNotApplied) {
+  TwoPlanners fleet("award_transform");
+  PlannerNodeTestPeer::receiveTransform(*fleet.b, "robot_1/odom", "robot_0/odom", -5.0, 0.0);
+  PlannerNodeTestPeer::receiveTourBid(*fleet.b, PlannerNodeTestPeer::ownTourBidMsg(*fleet.a));
+  mgg_msgs::msg::TourAward award;
+  award.auctioneer_id = 1;
+  award.auction_id = 1;
+  award.header.stamp = fleet.a->now();
+  award.header.frame_id = "unconnected/odom";
+  PlannerNodeTestPeer::receiveTourAward(*fleet.b, award);
+  EXPECT_FALSE(PlannerNodeTestPeer::fleetHasAward(*fleet.b));
+  award.header.frame_id = "robot_0/odom";
+  PlannerNodeTestPeer::receiveTourAward(*fleet.b, award);
+  EXPECT_TRUE(PlannerNodeTestPeer::fleetHasAward(*fleet.b));
+}
+
+TEST_F(PlannerNodeTest, GreedyFallbackExcludesHeldAndPeerExploredClusters) {
+  for (bool explored : {false, true}) {
+    int frontier;
+    auto node = exploredDeadEnd(explored ? "greedy_explored" : "greedy_held", frontier);
+    PlannerNodeTestPeer::setTour(*node, false, 0.0);
+    ASSERT_TRUE(PlannerNodeTestPeer::greedyRoute(*node));
+    const auto clusters = PlannerNodeTestPeer::frontierClusters(*node);
+    ASSERT_EQ(clusters.size(), 1u);
+    const auto& c = clusters.front();
+    mgg::FleetCluster held{c.id, c.owner_robot_id, c.position, c.gain};
+    if (explored) {
+      mgg::TourAwardData award;
+      award.auctioneer_id = 0;
+      award.stamp_s = node->now().seconds();
+      award.explored = {held};
+      PlannerNodeTestPeer::applyAward(*node, award);
+    } else {
+      PlannerNodeTestPeer::claim(*node, 2, held, node->now().seconds());
+    }
+    EXPECT_FALSE(PlannerNodeTestPeer::greedyRoute(*node));
+  }
+}
+
+TEST_F(PlannerNodeTest, ASoloIdleRobotTakesOverTheOldestSilentClaimFirst) {
+  auto node = makeNode("solo_takeover");
+  const double now = node->now().seconds();
+  PlannerNodeTestPeer::claim(*node, 2, {21, 2, {3.0, 0.0, 0.0}, 1000.0}, now - 30.0);
+  PlannerNodeTestPeer::claim(*node, 3, {31, 3, {8.0, 0.0, 0.0}, 1000.0}, now - 20.0);
+  ASSERT_EQ(PlannerNodeTestPeer::fleetGroup(*node), std::vector<int>{1});
+  bool complete = false;
+  std::string note;
+  EXPECT_TRUE(PlannerNodeTestPeer::settleIdle(*node, note, complete));
+  EXPECT_FALSE(complete);
+  const auto excluded = PlannerNodeTestPeer::fleetExclusions(*node);
+  ASSERT_EQ(excluded.size(), 1u);
+  EXPECT_DOUBLE_EQ(excluded.front().x(), 8.0);
+  EXPECT_TRUE(PlannerNodeTestPeer::settleIdle(*node, note, complete));
+  EXPECT_TRUE(PlannerNodeTestPeer::fleetExclusions(*node).empty());
+  EXPECT_FALSE(PlannerNodeTestPeer::settleIdle(*node, note, complete));
+}
+
+TEST_F(PlannerNodeTest, AnEmptyFleetAwardIsNotCompleteWhileLocalGainRemains) {
+  auto node = makeNode("fleet_local_gain");
+  PlannerNodeTestPeer::acceptOdometry(*node, 0.0, 0.0, 1.0);
+  PlannerNodeTestPeer::hearPeer(*node, 2);
+  bool complete = false;
+  std::string note;
+  ASSERT_TRUE(PlannerNodeTestPeer::settleIdle(*node, note, complete));
+  const double now = node->now().seconds();
+  PlannerNodeTestPeer::fleetTick(*node, now);
+  PlannerNodeTestPeer::fleetTick(*node, now + 1.1);
+  ASSERT_TRUE(PlannerNodeTestPeer::fleetHasAward(*node));
+  PlannerNodeTestPeer::localGainRemains(*node, true);
+  ASSERT_TRUE(PlannerNodeTestPeer::settleIdle(*node, note, complete));
+  EXPECT_FALSE(complete);
+  PlannerNodeTestPeer::localGainRemains(*node, false);
+  ASSERT_TRUE(PlannerNodeTestPeer::settleIdle(*node, note, complete));
   EXPECT_TRUE(complete);
 }
 
