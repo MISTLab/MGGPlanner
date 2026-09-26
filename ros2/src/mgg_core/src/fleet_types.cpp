@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <set>
 
 namespace mgg {
 
@@ -44,6 +45,26 @@ const FleetCluster* TourAwardData::cluster(ClusterId id) const {
     if (c.id == id) return &c;
   }
   return nullptr;
+}
+
+bool TourAwardData::wellFormed() const {
+  const auto finite = [](const FleetCluster& c) {
+    return c.id == kNoCluster || c.position.allFinite();
+  };
+  if (!std::all_of(clusters.begin(), clusters.end(), finite) ||
+      !std::all_of(explored.begin(), explored.end(), finite)) {
+    return false;
+  }
+  std::set<ClusterId> assigned;
+  for (const RobotBundle& bundle : bundles) {
+    if (!std::isfinite(bundle.silent_s) || bundle.silent_s < 0.0) return false;
+    std::set<ClusterId> ids(bundle.clusters.begin(), bundle.clusters.end());
+    ids.erase(kNoCluster);
+    for (const ClusterId id : ids) {
+      if (cluster(id) == nullptr || !assigned.insert(id).second) return false;
+    }
+  }
+  return true;
 }
 
 }  // namespace mgg

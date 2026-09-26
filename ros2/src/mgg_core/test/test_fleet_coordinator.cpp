@@ -9,6 +9,7 @@
 #include <map>
 #include <memory>
 #include <set>
+#include <tuple>
 #include <utility>
 #include <vector>
 
@@ -131,6 +132,9 @@ struct Radio {
                             now, [r] { return r->ownBid(); }, euclid, nullptr));
     }
     for (const auto& [from, out] : sent) {
+      if (out.award) {
+        EXPECT_TRUE(out.award->wellFormed()) << "from robot " << from;
+      }
       if (out.award && !out.award->call) awards.emplace_back(now, *out.award);
       if (out.award && out.award->call) calls.emplace_back(now, *out.award);
       if (out.bid) bids.emplace_back(now, *out.bid);
@@ -1192,6 +1196,60 @@ TEST(FleetCoordinator, AfterAClockRollbackTheNextBidReplacesAClaim) {
   coordinator.onBid(after, 10.5);
   EXPECT_EQ(idsOf(coordinator.claimedByOthers(10.5)),
             std::vector<ClusterId>{22});
+}
+
+// Two partitions that auctioned apart meet: robots 2 and 3 both claim 50.
+// Neither answers robot 1's call, so both claims are fixed. The award names
+// 50 once, under the newer claim (the lower ID on a tie), keeps it from the
+// bidders, and a follower applies the award.
+TEST(FleetCoordinator, OverlappingFixedClaimsAreAwardedToOneHolder) {
+  const FleetParams params;
+  const auto run = [&params](double stamp2, double stamp3) {
+    FleetCoordinator coordinator(1, params, 0.2);
+    SimRobot self(1, 0.0, 0.0, params);
+    self.known = {cluster(11, 1, 2.0), cluster(50, 2, 10.0)};
+    const auto claim = [](int robot_id, double stamp_s) {
+      TourBidData bid =
+          bidFrom(robot_id, 20.0, {cluster(50, 2, 10.0)}, 0, {50});
+      bid.stamp_s = stamp_s;
+      bid.auctioneer_id = robot_id;  // each led its own partition
+      return bid;
+    };
+    coordinator.onBid(claim(2, stamp2), 0.0);
+    coordinator.onBid(claim(3, stamp3), 0.0);
+    const auto own_bid = [&self] { return self.ownBid(); };
+    EXPECT_TRUE(coordinator.tick(0.0, own_bid, euclid, nullptr).award);
+    const mgg::FleetTickOutput out =
+        coordinator.tick(params.bid_deadline_s, own_bid, euclid, nullptr);
+    EXPECT_TRUE(out.award && !out.award->call);
+    return out.award.value_or(TourAwardData{});
+  };
+  for (const auto& [stamp2, stamp3, holder] :
+       std::vector<std::tuple<double, double, int>>{{0.0, 0.0, 2},
+                                                    {0.0, -0.5, 2},
+                                                    {-0.5, 0.0, 3}}) {
+    const TourAwardData award = run(stamp2, stamp3);
+    EXPECT_TRUE(award.wellFormed());
+    int named = 0;
+    for (const mgg::RobotBundle& bundle : award.bundles) {
+      const bool holds =
+          std::find(bundle.clusters.begin(), bundle.clusters.end(), 50u) !=
+          bundle.clusters.end();
+      named += holds ? 1 : 0;
+      if (holds) {
+        EXPECT_EQ(bundle.robot_id, holder);
+      }
+    }
+    EXPECT_EQ(named, 1);
+    ASSERT_NE(award.bundleOf(1), nullptr);
+    EXPECT_EQ(award.bundleOf(1)->clusters, std::vector<ClusterId>{11});
+
+    FleetCoordinator follower(4, params, 0.2);
+    follower.onAward(award, 1.5);
+    EXPECT_TRUE(follower.hasAward());
+    EXPECT_EQ(idsOf(follower.lastAwardClusters()),
+              (std::vector<ClusterId>{11, 50}));
+  }
 }
 
 }  // namespace

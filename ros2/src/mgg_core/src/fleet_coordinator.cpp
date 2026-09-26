@@ -1,7 +1,6 @@
 #include "mgg_core/fleet_coordinator.h"
 
 #include <algorithm>
-#include <cmath>
 #include <utility>
 
 namespace mgg {
@@ -23,31 +22,6 @@ std::vector<FleetCluster> namedOnly(const std::vector<FleetCluster>& clusters) {
     if (c.id != kNoCluster) named.push_back(c);
   }
   return named;
-}
-
-/// An award this robot can apply: finite positions, every silence finite
-/// and not negative, every bundle ID listed in clusters, and no cluster in
-/// two bundles. kNoCluster entries are not checked: namedOnly filters them.
-bool wellFormedAward(const TourAwardData& award) {
-  const auto finite = [](const FleetCluster& c) {
-    return c.id == kNoCluster || c.position.allFinite();
-  };
-  if (!std::all_of(award.clusters.begin(), award.clusters.end(), finite) ||
-      !std::all_of(award.explored.begin(), award.explored.end(), finite)) {
-    return false;
-  }
-  std::set<ClusterId> assigned;
-  for (const RobotBundle& bundle : award.bundles) {
-    if (!std::isfinite(bundle.silent_s) || bundle.silent_s < 0.0) return false;
-    std::set<ClusterId> ids(bundle.clusters.begin(), bundle.clusters.end());
-    ids.erase(kNoCluster);
-    for (const ClusterId id : ids) {
-      if (award.cluster(id) == nullptr || !assigned.insert(id).second) {
-        return false;
-      }
-    }
-  }
-  return true;
 }
 
 bool isMember(const std::vector<int>& members, int robot_id) {
@@ -180,7 +154,7 @@ void FleetCoordinator::noteReportedExplored(
 
 void FleetCoordinator::onAward(const TourAwardData& award, double now_s) {
   rebaseFutureTimes(now_s);
-  if (award.auctioneer_id == robot_id_ || !wellFormedAward(award)) return;
+  if (award.auctioneer_id == robot_id_ || !award.wellFormed()) return;
   noteHeard(award.auctioneer_id, now_s);
   follows_[award.auctioneer_id] = award.auctioneer_id;
   // A robot that left the sender's group, or whose group just merged with a
@@ -267,6 +241,8 @@ FleetTickOutput FleetCoordinator::tick(double now_s, const OwnBidFn& own_bid,
     collecting_.reset();
     last_auction_s_ = now_s;
     peer_requested_ = false;
+    // What followers would refuse is not applied here either.
+    if (!award.wellFormed()) return out;
     applyAward(award, now_s);
     out.award = std::move(award);
     return out;
@@ -413,6 +389,33 @@ TourAwardData FleetCoordinator::computeAward(double now_s,
     for (const int p : indices) bundle.clusters.push_back(name(p));
     award.bundles.push_back(std::move(bundle));
   }
+  // Claims can overlap (partitions that auctioned apart, a claim known from
+  // a bid): each fixed pool cluster goes to one holder, the one whose claim
+  // came from the newest message, the lower ID on a tie.
+  const auto held_index = [&](const FleetCluster& c) {
+    const int p = pool.indexOf(c.id);
+    return p >= 0 ? p : pool.indexNear(c.position,
+                                       params_.cluster_merge_radius_m);
+  };
+  const auto source_s = [this](int robot_id) {
+    const auto found = claim_stamp_s_.find(robot_id);
+    return found == claim_stamp_s_.end() ? kNever : found->second;
+  };
+  std::map<int, int> fixed_holder;
+  for (const int holder : holders) {
+    const Claim* claim = claims_.find(holder);
+    if (claim == nullptr) continue;
+    for (const FleetCluster& c : claim->clusters) {
+      const int p = held_index(c);
+      if (p < 0) continue;  // explored meanwhile
+      const auto owner = fixed_holder.find(p);
+      if (owner == fixed_holder.end()) {
+        fixed_holder[p] = holder;
+      } else if (source_s(holder) > source_s(owner->second)) {
+        owner->second = holder;
+      }
+    }
+  }
   for (const int holder : holders) {
     const Claim* claim = claims_.find(holder);
     if (claim == nullptr) continue;
@@ -420,9 +423,8 @@ TourAwardData FleetCoordinator::computeAward(double now_s,
     bundle.robot_id = holder;
     bundle.silent_s = std::max(0.0, now_s - claim->last_heard_s);
     for (const FleetCluster& c : claim->clusters) {
-      int p = pool.indexOf(c.id);
-      if (p < 0) p = pool.indexNear(c.position, params_.cluster_merge_radius_m);
-      if (p < 0) continue;  // explored meanwhile
+      const int p = held_index(c);
+      if (p < 0 || fixed_holder[p] != holder) continue;
       const ClusterId id = pool.clusters[p].id;
       if (std::find(bundle.clusters.begin(), bundle.clusters.end(), id) ==
           bundle.clusters.end()) {

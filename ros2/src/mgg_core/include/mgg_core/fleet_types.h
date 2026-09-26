@@ -96,6 +96,10 @@ struct TourAwardData {
 
   const RobotBundle* bundleOf(int robot_id) const;
   const FleetCluster* cluster(ClusterId id) const;
+  /// Finite positions, every silence finite and not negative, every bundle
+  /// ID listed in clusters, and no cluster in two bundles. kNoCluster
+  /// entries are not checked: a receiver filters them out.
+  bool wellFormed() const;
 };
 
 /// Whether the holder's own map or roadmap shows a position explored.
