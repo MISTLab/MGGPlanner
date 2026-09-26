@@ -315,6 +315,64 @@ ProjectedEdgeStatus GroundProjection::getProjectedEdgeStatus(
   return ProjectedEdgeStatus::kAdmissible;
 }
 
+/// The map's XY cell grid round one footprint, from the cells
+/// getCircleIntersectingXYCellCenters listed for it: a cell centre and one
+/// cell's step along each of the grid's axes, which a map whose grid is
+/// turned against the planner's frame (MolaMap) turns with it. A point is
+/// taken to the centre of the cell it lies in, so that the ground under it
+/// is looked up in the per-plan column cache as a footprint's own cells
+/// are. Found from the cells when first needed.
+struct GroundProjection::BridgeCells {
+  explicit BridgeCells(const std::vector<XYCellCenter>& cells)
+      : cells_(cells) {}
+
+  /// Whether the grid's axes were found.
+  bool valid() {
+    if (!found_) find();
+    return valid_;
+  }
+
+  /// The centre of the cell `point` lies in; valid() first.
+  Eigen::Vector2d centerOf(const Eigen::Vector2d& point) const {
+    const Eigen::Vector2d offset = point - origin_;
+    return origin_ +
+           std::round(offset.dot(step_x_) / step_x_.squaredNorm()) * step_x_ +
+           std::round(offset.dot(step_y_) / step_y_.squaredNorm()) * step_y_;
+  }
+
+ private:
+  void find() {
+    found_ = true;
+    // A cell with both its next neighbours listed; the cells lie in a
+    // circle, so most have them.
+    for (const XYCellCenter& cell : cells_) {
+      const XYCellCenter* next_x = nullptr;
+      const XYCellCenter* next_y = nullptr;
+      for (const XYCellCenter& other : cells_) {
+        if (other.grid_x == cell.grid_x + 1 && other.grid_y == cell.grid_y) {
+          next_x = &other;
+        } else if (other.grid_x == cell.grid_x &&
+                   other.grid_y == cell.grid_y + 1) {
+          next_y = &other;
+        }
+      }
+      if (next_x == nullptr || next_y == nullptr) continue;
+      origin_ = cell.center;
+      step_x_ = next_x->center - cell.center;
+      step_y_ = next_y->center - cell.center;
+      valid_ = step_x_.squaredNorm() > 1e-12 && step_y_.squaredNorm() > 1e-12;
+      return;
+    }
+  }
+
+  const std::vector<XYCellCenter>& cells_;
+  bool found_ = false;
+  bool valid_ = false;
+  Eigen::Vector2d origin_ = Eigen::Vector2d::Zero();
+  Eigen::Vector2d step_x_ = Eigen::Vector2d::Zero();
+  Eigen::Vector2d step_y_ = Eigen::Vector2d::Zero();
+};
+
 double GroundProjection::observedGroundAhead(
     const Eigen::Vector3d& point, const Eigen::Vector2d& heading,
     const Eigen::Vector3d& box_size) const {
@@ -333,6 +391,7 @@ double GroundProjection::observedGroundAhead(
     return 0.0;
   }
   const double lowest = point.z() - 2.0 * params_.max_ground_height;
+  BridgeCells bridge(candidates);
   int ahead = 0;
   int observed = 0;
   for (const XYCellCenter& cell : candidates) {
@@ -350,9 +409,73 @@ double GroundProjection::observedGroundAhead(
       if (ground.z() >= lowest) ++observed;
     } else if (standing_start_ && standing_start_->covers(cell.center)) {
       ++observed;
+    } else if (groundBridged(bridge, cell.center, along, point.z(),
+                             lowest)) {
+      ++observed;
     }
   }
   return ahead > 0 ? static_cast<double>(observed) / ahead : 0.0;
+}
+
+bool GroundProjection::groundBridged(BridgeCells& cells,
+                                     const Eigen::Vector2d& cell,
+                                     const Eigen::Vector2d& along,
+                                     double from_z, double lowest) const {
+  const double resolution = map_.getResolution();
+  const double grade = std::tan(params_.max_inclination);
+  if (!(resolution > 0.0) || !std::isfinite(grade) || grade < 0.0 ||
+      !cells.valid()) {
+    return false;
+  }
+  // The observed ground nearest the cell on one side of it, within
+  // kGroundBridgeCells. k cells out, the window reaches k cells' rise at
+  // max_inclination further down than the footprint's.
+  struct Side {
+    bool found = false;
+    Eigen::Vector2d at = Eigen::Vector2d::Zero();
+    double z = 0.0;
+  };
+  const auto nearest = [&](const Eigen::Vector2d& direction) {
+    Side side;
+    for (int k = 1; k <= kGroundBridgeCells; ++k) {
+      const Eigen::Vector2d at =
+          cells.centerOf(cell + k * resolution * direction);
+      Eigen::Vector3d ground;
+      if (footprintGroundBelow(Eigen::Vector3d(at.x(), at.y(), from_z),
+                               ground) &&
+          ground.z() >= lowest - k * resolution * grade) {
+        side.found = true;
+        side.at = at;
+        side.z = ground.z();
+        break;
+      }
+    }
+    return side;
+  };
+  const Eigen::Vector2d across(-along.y(), along.x());
+  for (const Eigen::Vector2d& direction : {along, across}) {
+    const Side ahead = nearest(direction);
+    if (!ahead.found) continue;
+    const Side behind = nearest(-direction);
+    if (!behind.found) continue;
+    const double to_ahead = (ahead.at - cell).norm();
+    const double to_behind = (behind.at - cell).norm();
+    const double rise = ahead.z - behind.z;
+    if (std::abs(rise) > (to_ahead + to_behind) * grade + 1e-9) continue;
+    const double bridged = behind.z + rise * to_behind / (to_ahead + to_behind);
+    // A free voxel in the column deeper than kGroundBridgeHoleDepth under
+    // the bridged ground, looked for over four voxels, is a hole the lidar
+    // looked into.
+    bool hole = false;
+    for (int j = 0; j < 4 && !hole; ++j) {
+      const double z =
+          bridged - kGroundBridgeHoleDepth - (j + 0.5) * resolution;
+      hole = map_.getVoxelStatus(Eigen::Vector3d(cell.x(), cell.y(), z)) ==
+             VoxelStatus::kFree;
+    }
+    if (!hole) return true;
+  }
+  return false;
 }
 
 double GroundProjection::footprintCellRise(

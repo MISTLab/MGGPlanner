@@ -1544,9 +1544,12 @@ std::string PlannerNode::buildLocalGraph() {
       *local_graph_, planning_params_, robot_params_, edge_inclinations_,
       map_->getResolution(), selection_direction, selectionExclusions(),
       reservation_exclusion_radius_m_,
-      [this](const mgg::Vertex& v) {
+      [this, &turn_check](const mgg::Vertex& v) {
+        // On a slope, where the path-turn rule forbids turning, an end
+        // needs no observed turn space.
         return mgg::viewpointClear(*map_, robot_params_, planning_params_,
-                                   v.state);
+                                   v.state,
+                                   turn_check.slopeAt(v.state.head<3>()));
       },
       turns_admissible, sharp_turn_allowed, reach_distance_);
   for (const mgg::Vertex* v : sel.best_path) {

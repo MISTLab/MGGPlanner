@@ -259,7 +259,11 @@
       # Until the robot first moves, as its keyframe trajectory shows, the
       # ground within its initial ground reach (the node's
       # hanging_root_edge_length_max) counts as observed; not without a
-      # trajectory (roadmap_rebuild off).
+      # trajectory (roadmap_rebuild off). A cell in a gap of up to 0.6 m
+      # between observed ground at a drivable grade counts as observed
+      # unless free space shows a hole under it, and a path may end on a
+      # slope, where it may not turn, without observed turn space
+      # (diag-ramp, run 7).
       # 0 turns it off.
       min_observed_ground_fraction: 0.75
       auto_global_planner_enable: true

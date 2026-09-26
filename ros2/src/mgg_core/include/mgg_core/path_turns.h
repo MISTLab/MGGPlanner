@@ -186,6 +186,11 @@ class PathTurnCheck {
   /// there and, with `room_to_turn`, the robot has room to turn.
   bool sharpTurnAllowedAt(const Eigen::Vector3d& position);
 
+  /// The slope of the ground at `position`, radians, as the check takes
+  /// it: from `slope`, or fitted over the graph (terrainSlope), found once
+  /// per position.
+  double slopeAt(const Eigen::Vector3d& position);
+
   /// The robot stands at `position`, tilted `tilt` radians from level (the
   /// roll and pitch of its odometry). Where the slope there cannot be
   /// measured (kUnknownSlopeRad) and `tilt` is below kLevelGroundSlopeRad,
@@ -207,7 +212,6 @@ class PathTurnCheck {
 
   Refusal firstRefusal(const std::vector<Eigen::Vector3d>& points,
                        double start_heading);
-  double slopeAt(const Eigen::Vector3d& position);
   bool roomAt(const Eigen::Vector3d& position);
 
   GraphManager& graph_;

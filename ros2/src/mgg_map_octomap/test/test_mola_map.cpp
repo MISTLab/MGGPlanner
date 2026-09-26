@@ -2031,4 +2031,200 @@ TEST(ObservedGround, Run5Robot1HasNoRoomToTurnBesideAnUnobservedWall) {
   EXPECT_TRUE(mgg::roomToTurn(*fixture.map, robot, planning, east));
 }
 
+/// What sparseRampCrest cuts into the floor behind its crest.
+enum class Trench {
+  kNone,
+  /// The floor at x = [-2.0, -1.6) is cut down to z = -1.0, its bottom
+  /// unobserved and its inside carved free, as a lidar looking into it
+  /// leaves it.
+  kSeenInto,
+  /// The same cells unobserved, with nothing carved in them.
+  kUnseen,
+};
+
+/// A crest at x = 0 as a Bunker's planner grid records it from the level
+/// floor behind (diag-ramp, run 7): the floor, at z = 0 for x < 0, is
+/// observed everywhere, with free air over it; past the crest a 16 degree
+/// ramp falls 6 m along +x to a level bottom. The lidar meets the ramp in
+/// rings across it: its ground is observed on every other row of cells
+/// across the ramp, and between them on one cell in three, two thirds of
+/// the cells, with free air carved over those cells only. The rest is
+/// unknown. (Ground projection finds each unobserved cell's ground 0.4 m
+/// to its side, at its height.) 3 m either side of y = 0. `trench` cuts
+/// the floor behind the crest.
+std::unique_ptr<mgg::NativeMolaGrid> sparseRampCrest(
+    Trench trench = Trench::kNone) {
+  constexpr double kResolution = 0.2;
+  const double grade = std::tan(16.0 * M_PI / 180.0);
+  std::vector<mgg::NativeMolaGrid::Cell> occupied;
+  std::vector<mgg::NativeMolaGrid::Cell> free;
+  std::vector<mgg::NativeMolaGrid::Surface> surfaces;
+  const auto cell = [&](double z) {
+    return static_cast<std::int64_t>(std::floor(z / kResolution));
+  };
+  for (std::int64_t ix = -20; ix < 40; ++ix) {
+    const double x = (ix + 0.5) * kResolution;
+    const double ground = -std::clamp(x, 0.0, 6.0) * grade;
+    const bool in_trench = trench != Trench::kNone && (ix == -10 || ix == -9);
+    for (std::int64_t iy = -15; iy < 15; ++iy) {
+      const bool observed =
+          ix < 0 || ix % 2 == 0 || (iy % 3 + 3) % 3 == 2;
+      if (in_trench) {
+        for (std::int64_t iz = cell(-0.9);
+             trench == Trench::kSeenInto && iz < cell(2.0); ++iz) {
+          free.push_back({ix, iy, iz});
+        }
+        continue;
+      }
+      if (!observed) continue;
+      const mgg::NativeMolaGrid::Cell top{ix, iy, cell(ground - 1e-6)};
+      occupied.push_back(top);
+      surfaces.push_back({top, ground});
+      for (std::int64_t iz = top.z + 1; iz < cell(ground + 2.0); ++iz) {
+        free.push_back({ix, iy, iz});
+      }
+    }
+  }
+  return std::make_unique<mgg::NativeMolaGrid>(kResolution, occupied, free,
+                                               surfaces);
+}
+
+TEST(ObservedGround, ADownRampSeenInRingsPastACrestIsDriven) {
+  // Run 7: the robots came to a 16 degree ramp's crest and turned back.
+  // Past a crest the lidar meets the ramp in rings; under the leading half
+  // of a footprint going down, 0.25 to 0.62 of the cells had observed
+  // ground, and the edges down were refused (item 7). And the air over the
+  // ramp is carved over the rings only: every end on it had wholly unknown
+  // columns in its turning circle, and was pulled back to the crest. The
+  // cells between the rings lie in gaps of observed ground, which are
+  // bridged; an end on a measured slope, where the robot may not turn, does
+  // not need its turn space observed.
+  const auto map = sparseRampCrest();
+  const mgg::RobotParams robot = bunker();
+  mgg::PlanningParams planning = bunkerPlanning();
+  ASSERT_GT(planning.min_observed_ground_fraction, 0.0);
+  const mgg::GroundProjection ground(*map, planning, true);
+  const Eigen::Vector3d box = robot.getPlanningSize();
+  const double grade = std::tan(16.0 * M_PI / 180.0);
+  const auto driving = [&](double x) {
+    return Eigen::Vector3d(x, 0.1,
+                           -std::clamp(x, 0.0, 6.0) * grade +
+                               planning.max_ground_height);
+  };
+  const Eigen::Vector2d down(1.0, 0.0);
+  for (const double x : {0.5, 1.5, 2.5, 3.5}) {
+    SCOPED_TRACE(x);
+    EXPECT_GE(ground.observedGroundAhead(driving(x), down, box),
+              planning.min_observed_ground_fraction);
+    EXPECT_GE(ground.observedGroundAhead(driving(x), -down, box),
+              planning.min_observed_ground_fraction);
+  }
+  std::vector<Eigen::Vector3d> edge;
+  EXPECT_EQ(ground.getProjectedEdgeStatus(driving(1.0), driving(1.4), box,
+                                          false, edge, false),
+            mgg::ProjectedEdgeStatus::kAdmissible);
+
+  // 2 m down: the turning circle holds unknown columns. Measured as a
+  // slope, the end is clear; unmeasured it is not, nor level.
+  const Eigen::Vector3d end = driving(2.1);
+  const mgg::StateVec end_state(end.x(), end.y(), end.z(), 0.0);
+  EXPECT_FALSE(mgg::turnSpaceObserved(*map, robot, planning, end_state));
+  EXPECT_TRUE(mgg::viewpointClear(*map, robot, planning, end_state,
+                                  16.0 * M_PI / 180.0));
+  EXPECT_FALSE(mgg::viewpointClear(*map, robot, planning, end_state));
+  EXPECT_FALSE(mgg::viewpointClear(*map, robot, planning, end_state, 0.0));
+
+  // The node's local plan from the level floor 0.5 m before the crest,
+  // facing it, scored by depth: it ends down the ramp. The lattice's
+  // points lie on cell centres.
+  const Eigen::Vector3d start = driving(-0.5);
+  const double yaw = 0.0;
+  mgg::GraphManager graph;
+  graph.addVertex(
+      new mgg::Vertex(0, mgg::StateVec(start.x(), start.y(), start.z(), yaw)));
+  mgg::EdgeInclinations inclinations;
+  planning.edge_length_min = 0.05;
+  planning.edge_length_max = 2.0;
+  planning.nearest_range = 0.6;
+  planning.nearest_range_z = 0.15;
+  planning.nearest_range_min = 0.05;
+  planning.nearest_range_max = 1.0;
+  planning.num_vertices_max = 1500;
+  planning.num_edges_max = 50000;
+  mgg::ExpandContext context;
+  context.map = map.get();
+  context.planning = &planning;
+  context.robot = &robot;
+  context.ground = &ground;
+  context.inclinations = &inclinations;
+  context.robot_box_size = box;
+  context.allow_unknown_lattice_body = true;
+  context.root_footprint_exempt = true;
+  context.root_is_robot = true;
+  mgg::GridGraphParams grid;
+  grid.min_val = {-2.0, -3.0, 0.0};
+  grid.max_val = {6.0, 3.0, 0.0};
+  grid.resolution = {0.4, 0.4, 0.1};
+  mgg::buildGridGraph(graph, graph.getVertex(0)->state, grid, context, yaw);
+  const double start_floor = start.z() - planning.max_ground_height;
+  int down_the_ramp = 0;
+  for (auto& [id, vertex] : graph.vertices_map_) {
+    if (vertex == nullptr) continue;
+    const double drop =
+        start_floor - (vertex->state.z() - planning.max_ground_height);
+    vertex->vol_gain.gain = 1.0 + 1000.0 * std::max(0.0, drop);
+    if (drop > 0.25) ++down_the_ramp;
+  }
+  ASSERT_GT(down_the_ramp, 0);
+  mgg::PathTurnCheck turns(graph, robot, [&](const mgg::StateVec& pose) {
+    return mgg::roomToTurn(*map, robot, planning, pose);
+  });
+  const mgg::PathSelectionResult selection = mgg::selectBestPath(
+      graph, planning, robot, inclinations, map->getResolution(), yaw, {},
+      0.0,
+      [&](const mgg::Vertex& v) {
+        return mgg::viewpointClear(*map, robot, planning, v.state,
+                                   turns.slopeAt(v.state.head<3>()));
+      },
+      std::ref(turns),
+      [&](const mgg::Vertex& v) {
+        return turns.sharpTurnAllowedAt(v.state.head<3>());
+      });
+  ASSERT_FALSE(selection.best_path.empty());
+  const mgg::StateVec& best = selection.best_path.back()->state;
+  std::printf("sparse crest: %d vertices down the ramp, the plan ends at "
+              "(%.2f, %.2f), %.2f m below the crest\n",
+              down_the_ramp, best.x(), best.y(),
+              start_floor - (best.z() - planning.max_ground_height));
+  EXPECT_GT(best.x(), 1.0);
+  EXPECT_LT(best.z() - planning.max_ground_height, start_floor - 0.25);
+  EXPECT_FALSE(selection.unclear_viewpoint);
+}
+
+TEST(ObservedGround, AHoleTheLidarLookedIntoIsNotBridged) {
+  // A trench two cells wide across the floor, looked into: its inside is
+  // free and its bottom, 1 m down, was not seen. Observed floor lies on
+  // both sides at one height, but the free space under it is a hole.
+  const mgg::RobotParams robot = bunker();
+  const mgg::PlanningParams planning = bunkerPlanning();
+  const Eigen::Vector3d box = robot.getPlanningSize();
+  const Eigen::Vector2d east(1.0, 0.0);
+  const Eigen::Vector3d before(-2.3, 0.1, planning.max_ground_height);
+  const auto seen_into = sparseRampCrest(Trench::kSeenInto);
+  const mgg::GroundProjection ground(*seen_into, planning);
+  EXPECT_LT(ground.observedGroundAhead(before, east, box),
+            planning.min_observed_ground_fraction);
+  std::vector<Eigen::Vector3d> edge;
+  EXPECT_EQ(ground.getProjectedEdgeStatus(
+                before, before + Eigen::Vector3d(0.4, 0.0, 0.0), box, false,
+                edge, false),
+            mgg::ProjectedEdgeStatus::kGroundUnobserved);
+  // Not looked into, the same gap is bridged: 0.4 m between observed floor
+  // at one height is taken for floor.
+  const auto unseen = sparseRampCrest(Trench::kUnseen);
+  const mgg::GroundProjection unseen_ground(*unseen, planning);
+  EXPECT_GE(unseen_ground.observedGroundAhead(before, east, box),
+            planning.min_observed_ground_fraction);
+}
+
 }  // namespace

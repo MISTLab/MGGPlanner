@@ -81,8 +81,17 @@ inline constexpr double kViewpointArrivalSlack = 0.05;
 /// 0.08 and 0.11 m from a lethal cell of the controller's costmap
 /// (2026-09-23). Unknown space passes, as it does for the lattice's body
 /// check, and so does a query the map cannot answer.
+///
+/// `slope` is the ground's measured slope at the viewpoint, radians
+/// (terrainSlope, PathTurnCheck::slopeAt). Where it is steeper than
+/// kLevelGroundSlopeRad the robot may not turn (PathTurnCheck), so the end
+/// does not need turnSpaceObserved: on a ramp down past a crest the air
+/// over the ground is carved in patches, and every end on it had a wholly
+/// unknown column in its turning circle (diag-ramp, run 7). A slope that
+/// was not measured (kUnknownSlopeRad, the default) is not exempt.
 bool viewpointClear(const MapInterface& map, const RobotParams& robot,
-                    const PlanningParams& planning, const StateVec& viewpoint);
+                    const PlanningParams& planning, const StateVec& viewpoint,
+                    double slope = kUnknownSlopeRad);
 
 /// Whether an exploration path may end at a vertex, e.g. viewpointClear.
 using ViewpointClearFn = std::function<bool(const Vertex&)>;

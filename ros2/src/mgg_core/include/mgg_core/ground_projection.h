@@ -64,6 +64,15 @@ inline constexpr double kFootprintSampleSpacing = 0.2;
 /// two storeys, so a goal never snaps to a floor far above it.
 inline constexpr double kMaxGoalGroundRise = 6.0;
 
+/// How many map cells to either side of a cell with no observed ground
+/// observedGroundAhead looks for observed ground to bridge it with: 0.6 m
+/// on MGG's 0.2 m grid.
+inline constexpr int kGroundBridgeCells = 3;
+
+/// How far below the ground bridged over a cell, metres, a free voxel in
+/// its column shows a hole the lidar looked into, which is not bridged.
+inline constexpr double kGroundBridgeHoleDepth = 0.3;
+
 /// The collision check of the body moved straight between two points at
 /// driving height, as MapInterface::getPathStatus checks a box.
 using SegmentSweepFn = std::function<VoxelStatus(const Eigen::Vector3d&,
@@ -232,6 +241,18 @@ class GroundProjection {
   /// meets within 2 max_ground_height below `point`, or, in the disk of a
   /// standing start (setStandingStart), no ground found at all. 0 when the
   /// map's cells cannot be enumerated.
+  ///
+  /// A cell with no ground found under it also counts when it lies in a gap
+  /// of observed ground, which is interpolated, never extrapolated: within
+  /// kGroundBridgeCells on both sides of it, along `heading` or across it,
+  /// observed ground (the window reaching a cell's rise at max_inclination
+  /// further down) whose two heights differ by no more than max_inclination
+  /// over their distance, and no free voxel in the cell's column more than
+  /// kGroundBridgeHoleDepth under the ground interpolated between them. The
+  /// lidar sees a ramp down past a crest only in patches (diag-ramp, run
+  /// 7: 84 % of its cells 0-1 m down, 17 % 4-5 m down), and the crest read
+  /// as a ledge. A drop has no observed ground on its far side at a
+  /// drivable height, and a hole looked into has free space under it.
   double observedGroundAhead(const Eigen::Vector3d& point,
                              const Eigen::Vector2d& heading,
                              const Eigen::Vector3d& box_size) const;
@@ -286,6 +307,14 @@ class GroundProjection {
   /// groundBelow, through the cache when there is one.
   bool footprintGroundBelow(const Eigen::Vector3d& point,
                             Eigen::Vector3d& ground) const;
+  /// The map's cell grid round one footprint, for groundBridged.
+  struct BridgeCells;
+  /// Whether the cell centred at `cell`, where no ground was found, lies in
+  /// a gap of observed ground (observedGroundAhead), looking from driving
+  /// height `from_z` for ground no lower than `lowest`.
+  bool groundBridged(BridgeCells& cells, const Eigen::Vector2d& cell,
+                     const Eigen::Vector2d& along, double from_z,
+                     double lowest) const;
   FootprintPlane measureFootprintPlane(const Eigen::Vector3d& point,
                                        const Eigen::Vector2d& heading,
                                        const Eigen::Vector3d& box_size) const;

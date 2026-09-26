@@ -8,8 +8,8 @@
 namespace mgg {
 
 bool viewpointClear(const MapInterface& map, const RobotParams& robot,
-                    const PlanningParams& planning,
-                    const StateVec& viewpoint) {
+                    const PlanningParams& planning, const StateVec& viewpoint,
+                    double slope) {
   // A ground robot stops only where it can turn: a clear viewpoint passes
   // turnClear, which asks for the same cylinder at the turning radius.
   const double needed =
@@ -23,8 +23,10 @@ bool viewpointClear(const MapInterface& map, const RobotParams& robot,
     radius = std::max(radius, robot.turningRadius());
   }
   // Where it can turn, as roomToTurn has it: with the space it would turn
-  // in observed (item 7).
-  if (robot.type == RobotType::kGroundRobot &&
+  // in observed (item 7). Not on a measured slope, where it may not turn.
+  const bool may_turn =
+      !(slope > kLevelGroundSlopeRad && slope < kUnknownSlopeRad);
+  if (robot.type == RobotType::kGroundRobot && may_turn &&
       !turnSpaceObserved(map, robot, planning, viewpoint)) {
     return false;
   }
