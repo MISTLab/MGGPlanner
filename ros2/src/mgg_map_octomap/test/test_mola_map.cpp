@@ -1951,17 +1951,10 @@ TEST(ObservedGround, Run5Robot0IsNotParkedAtTheLedge) {
   EXPECT_FALSE(mgg::roomToTurn(
       *fixture.map, robot, planning,
       mgg::StateVec(ledge.x(), ledge.y(), ledge.z(), -M_PI / 2.0)));
-  // robot_0 had driven 130 m from its start: no standing start is set,
-  // and one elsewhere, its disk short of the ledge, changes nothing.
-  mgg::GroundProjection away(*fixture.map, planning);
-  away.setStandingStart(
-      mgg::StandingStart{back.head<2>() + Eigen::Vector2d(0.0, 2.5), 2.0});
-  EXPECT_DOUBLE_EQ(
-      away.observedGroundAhead(ledge, south, robot.getPlanningSize()),
-      at_ledge);
-  EXPECT_EQ(away.getProjectedEdgeStatus(back, ledge, robot.getPlanningSize(),
-                                        false, path, false),
-            mgg::ProjectedEdgeStatus::kGroundUnobserved);
+  // robot_0 had driven 130 m from its start: its planner sets no standing
+  // start there, restarted or not, whose disk would count the pit as
+  // observed ground (PlannerNodeTest.
+  // APlannerRestartedBesideAnUnobservedDropIsNotAtItsStart).
   // Without the check, nothing else refuses the edge onto the ledge.
   planning.min_observed_ground_fraction = 0.0;
   EXPECT_EQ(ground.getProjectedEdgeStatus(back, ledge,
