@@ -74,6 +74,7 @@ void FleetCoordinator::onBid(const TourBidData& bid, double now_s) {
   if (bid.robot_id == robot_id_ || !bid.wellFormed()) return;
   noteHeard(bid.robot_id, now_s);
   recordBidClaim(bid, now_s);
+  noteReportedExplored(bid.explored);
   last_bids_[bid.robot_id] = bid;
   if (bid.request_auction) peer_requested_ = true;
   // Collected only before the deadline, as the local receipt time tells: a
@@ -111,6 +112,28 @@ void FleetCoordinator::recordBidClaim(const TourBidData& bid, double now_s) {
     }
   }
   claims_.record(bid.robot_id, std::move(clusters), now_s);
+}
+
+void FleetCoordinator::noteReportedExplored(
+    const std::vector<ClusterId>& ids) {
+  for (const ClusterId id : ids) {
+    if (std::find(reported_explored_.begin(), reported_explored_.end(), id) !=
+        reported_explored_.end()) {
+      continue;
+    }
+    reported_explored_.push_back(id);
+    if (std::any_of(award_clusters_.begin(), award_clusters_.end(),
+                    [id](const FleetCluster& c) { return c.id == id; })) {
+      explored_reported_ = true;
+    }
+  }
+  if (reported_explored_.size() > kMaxExploredElsewhere) {
+    reported_explored_.erase(
+        reported_explored_.begin(),
+        reported_explored_.begin() +
+            static_cast<std::ptrdiff_t>(reported_explored_.size() -
+                                        kMaxExploredElsewhere));
+  }
 }
 
 void FleetCoordinator::onAward(const TourAwardData& award, double now_s) {
@@ -207,7 +230,8 @@ FleetTickOutput FleetCoordinator::tick(double now_s, const OwnBidFn& own_bid,
   const std::set<ClusterId> signature = poolSignature(members);
   const bool due = !has_award_ || members != auctioned_members_ ||
                    signature != auctioned_signature_ || peer_requested_ ||
-                   requesting || !pending_releases_.empty();
+                   requesting || !pending_releases_.empty() ||
+                   explored_reported_;
   if (!due || now_s - last_auction_s_ < params_.auction_interval_s) return out;
   Collection collection;
   collection.auction_id =
@@ -237,7 +261,16 @@ TourAwardData FleetCoordinator::computeAward(double now_s,
     if (!isMember(collection.members, robot_id)) continue;
     bids.push_back(bid);
     bidders.insert(robot_id);
+    // The explored reports of bids since the last auction go with this
+    // robot's own bid (buildClusterPool drops every ID a bid reports).
+    if (robot_id == robot_id_) {
+      bids.back().explored.insert(bids.back().explored.end(),
+                                  reported_explored_.begin(),
+                                  reported_explored_.end());
+    }
   }
+  reported_explored_.clear();
+  explored_reported_ = false;
   // Robots that did not bid keep what they hold (§3.4 step 3): members whose
   // bid missed the deadline, and silent robots.
   std::set<int> holders;

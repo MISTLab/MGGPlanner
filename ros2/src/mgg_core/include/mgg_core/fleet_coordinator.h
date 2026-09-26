@@ -59,7 +59,10 @@ class FleetCoordinator {
   /// A peer's bid, in this robot's frame. Malformed bids are dropped. A bid
   /// answering this robot's call is collected only if received before
   /// fleet.bid_deadline_s has passed. The bid's current target and bundle
-  /// are the bidder's claim until a later bid or award (§4).
+  /// are the bidder's claim until a later bid or award (§4). The clusters
+  /// it reports explored are kept for this robot's next auction (at most
+  /// kMaxExploredElsewhere, the oldest go); one the last award named makes
+  /// an auction due.
   void onBid(const TourBidData& bid, double now_s);
   /// A peer's call or award, in this robot's frame. Only this robot's
   /// current auctioneer is followed. A call or award is known by its round,
@@ -154,6 +157,8 @@ class FleetCoordinator {
   /// clusters, the last award or its claim; IDs none names are skipped. A
   /// bundle cut at kMaxBidClusters keeps the rest of the claim.
   void recordBidClaim(const TourBidData& bid, double now_s);
+  /// Keeps explored IDs a bid reports for the next auction.
+  void noteReportedExplored(const std::vector<ClusterId>& ids);
   void noteExplored(const std::vector<FleetCluster>& clusters);
   /// Cuts this robot's own bid to what peers accept (kMaxBidClusters per
   /// list): the bundle keeps its first clusters, the ones visited next; a
@@ -206,6 +211,10 @@ class FleetCoordinator {
   std::vector<int> auctioned_members_;
   std::set<ClusterId> auctioned_signature_;
   bool peer_requested_ = false;
+  // Cluster IDs bids reported explored since the last auction, oldest
+  // first, and whether one of them was named by the last award.
+  std::vector<ClusterId> reported_explored_;
+  bool explored_reported_ = false;
   std::vector<int> pending_releases_;
 };
 

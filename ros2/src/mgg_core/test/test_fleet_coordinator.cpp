@@ -897,4 +897,40 @@ TEST(FleetCoordinator, AClaimFromABidKeepsWhatATruncatedBundleLeavesOut) {
             (std::vector<ClusterId>{100, 900}));
 }
 
+// A peer reports a cluster of the settled award explored in one periodic
+// bid, with no new cluster and no request: that makes an auction due, and
+// the report is kept for it, which drops the cluster.
+TEST(FleetCoordinator, AnExploredReportAfterASettledAwardIsAuctioned) {
+  const FleetParams params;
+  SimRobot r1(1, 0.0, 0.0, params), r2(2, 20.0, 0.0, params);
+  r1.known = {cluster(11, 1, 2.0), cluster(12, 1, 6.0)};
+  r2.known = {cluster(21, 2, 18.0)};
+  Radio radio{{&r1, &r2}};
+  double now = 0.0;
+  radio.runUntil(now, 5.0);
+  ASSERT_EQ(idsOf(r1.coordinator->bundle()), (std::vector<ClusterId>{11, 12}));
+  // Let one auction interval pass with nothing new.
+  const std::size_t settled = radio.awards.size();
+  radio.runUntil(now, 5.0 + 2.0 * params.auction_interval_s);
+  ASSERT_EQ(radio.awards.size(), settled);
+
+  r2.explored = {12};
+  const std::size_t bids = radio.bids.size();
+  bool reported = false;
+  for (; !reported && now < 20.0; now += 0.1) {
+    radio.step(now);
+    for (std::size_t i = bids; i < radio.bids.size(); ++i) {
+      reported |= radio.bids[i].second.robot_id == 2 &&
+                  radio.bids[i].second.auction_id == 0;
+    }
+  }
+  ASSERT_TRUE(reported);
+  r2.explored.clear();  // reported once
+  radio.runUntil(now, now + 2.0 * params.auction_interval_s);
+  ASSERT_GT(radio.awards.size(), settled);
+  EXPECT_EQ(idsOf(radio.awards.back().second.explored),
+            std::vector<ClusterId>{12});
+  EXPECT_EQ(idsOf(r1.coordinator->bundle()), std::vector<ClusterId>{11});
+}
+
 }  // namespace
