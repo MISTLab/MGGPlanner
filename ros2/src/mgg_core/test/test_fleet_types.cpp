@@ -1,0 +1,88 @@
+// Tests for the fleet's exchange types (tour-exploration design §3.3, §3.4).
+
+#include <cmath>
+#include <limits>
+
+#include <gtest/gtest.h>
+
+#include "mgg_core/fleet_types.h"
+
+namespace {
+
+using mgg::FleetCluster;
+using mgg::TourAwardData;
+using mgg::TourBidData;
+
+FleetCluster cluster(mgg::ClusterId id, double x) {
+  FleetCluster c;
+  c.id = id;
+  c.owner_robot_id = 1;
+  c.position = Eigen::Vector3d(x, 0.0, 0.0);
+  c.gain = 1000.0;
+  return c;
+}
+
+TourBidData twoClusterBid() {
+  TourBidData bid;
+  bid.robot_id = 1;
+  bid.pose = mgg::StateVec(0.0, 0.0, 0.0, 0.0);
+  bid.clusters = {cluster(11, 3.0), cluster(12, 7.0)};
+  bid.costs_from_pose = {3.0, 7.0};
+  bid.costs_between = {0.0, 4.0, 4.0, 0.0};
+  return bid;
+}
+
+TEST(FleetTypes, WellFormedRejectsInconsistentOrInvalidBids) {
+  // Review Focus 1: a peer's bid arrives over a link nobody controls.
+  const double nan = std::numeric_limits<double>::quiet_NaN();
+  const TourBidData bid = twoClusterBid();
+  EXPECT_TRUE(bid.wellFormed());
+  TourBidData b = bid;
+  b.costs_from_pose.push_back(1.0);
+  EXPECT_FALSE(b.wellFormed());
+  b = bid;
+  b.costs_between.pop_back();
+  EXPECT_FALSE(b.wellFormed());
+  b = bid;
+  b.costs_between[1] = nan;
+  EXPECT_FALSE(b.wellFormed());
+  b = bid;
+  b.costs_from_pose[0] = -1.0;
+  EXPECT_FALSE(b.wellFormed());
+  b = bid;
+  b.pose[0] = std::numeric_limits<double>::infinity();
+  EXPECT_FALSE(b.wellFormed());
+  b = bid;
+  b.clusters[0].id = mgg::kNoCluster;
+  EXPECT_FALSE(b.wellFormed());
+  b = bid;
+  b.clusters[1].position.x() = nan;
+  EXPECT_FALSE(b.wellFormed());
+  // Unreachable is a cost like any other.
+  b = bid;
+  b.costs_between[1] = std::numeric_limits<double>::infinity();
+  EXPECT_TRUE(b.wellFormed());
+  // A robot with nothing to report still bids.
+  EXPECT_TRUE(TourBidData{}.wellFormed());
+}
+
+TEST(FleetTypes, CostBetweenReadsTheRowMajorMatrix) {
+  TourBidData bid = twoClusterBid();
+  bid.costs_between = {0.0, 4.0, 5.0, 0.0};
+  EXPECT_DOUBLE_EQ(bid.costBetween(0, 1), 4.0);
+  EXPECT_DOUBLE_EQ(bid.costBetween(1, 0), 5.0);
+}
+
+TEST(FleetTypes, AnAwardFindsBundlesAndClustersById) {
+  TourAwardData award;
+  award.clusters = {cluster(11, 3.0), cluster(21, 9.0)};
+  award.bundles = {{1, {11}, 0.0}, {2, {21}, 4.5}};
+  ASSERT_NE(award.bundleOf(2), nullptr);
+  EXPECT_DOUBLE_EQ(award.bundleOf(2)->silent_s, 4.5);
+  EXPECT_EQ(award.bundleOf(3), nullptr);
+  ASSERT_NE(award.cluster(21), nullptr);
+  EXPECT_DOUBLE_EQ(award.cluster(21)->position.x(), 9.0);
+  EXPECT_EQ(award.cluster(99), nullptr);
+}
+
+}  // namespace

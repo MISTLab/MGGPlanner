@@ -42,6 +42,7 @@ find_package(nlohmann_json REQUIRED)
 add_library(${PROJECT_NAME}
   src/param_loader.cpp
   src/conversions.cpp
+  src/fleet_conversions.cpp
   src/keyframe_trajectory.cpp
   src/planner_node.cpp)
 target_include_directories(${PROJECT_NAME} PUBLIC
@@ -81,6 +82,9 @@ if(BUILD_TESTING)
   ament_add_gtest(test_conversions test/test_conversions.cpp)
   target_link_libraries(test_conversions ${PROJECT_NAME})
   ament_target_dependencies(test_conversions rclcpp mgg_msgs)
+  ament_add_gtest(test_fleet_conversions test/test_fleet_conversions.cpp)
+  target_link_libraries(test_fleet_conversions ${PROJECT_NAME})
+  ament_target_dependencies(test_fleet_conversions rclcpp mgg_msgs)
   ament_add_gtest(test_keyframe_trajectory test/test_keyframe_trajectory.cpp)
   target_link_libraries(test_keyframe_trajectory ${PROJECT_NAME})
   ament_add_gtest(test_map_backend test/test_map_backend.cpp)
