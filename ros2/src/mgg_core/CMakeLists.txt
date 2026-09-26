@@ -47,6 +47,7 @@ add_library(${PROJECT_NAME}
   src/departure.cpp
   src/global_graph.cpp
   src/frontier_clusters.cpp
+  src/tour_solver.cpp
   src/random_sampler.cpp
   src/log.cpp)
 target_include_directories(${PROJECT_NAME} PUBLIC
@@ -105,6 +106,8 @@ if(BUILD_TESTING)
   target_link_libraries(test_tour_params ${PROJECT_NAME})
   ament_add_gtest(test_frontier_clusters test/test_frontier_clusters.cpp)
   target_link_libraries(test_frontier_clusters ${PROJECT_NAME})
+  ament_add_gtest(test_tour_solver test/test_tour_solver.cpp)
+  target_link_libraries(test_tour_solver ${PROJECT_NAME})
 endif()
 
 ament_package()
