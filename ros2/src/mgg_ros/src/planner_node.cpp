@@ -1705,7 +1705,8 @@ std::string PlannerNode::buildLocalGraph() {
       "grid graph: %d free cells, %d vertices, %d edges%s%s; %d viewpoints, "
       "%d frontiers; best path %zu poses (%d lattice -> %d corners -> %d "
       "resampled), gain %.1f%s; viewpoint clearance: %d paths pulled back, "
-      "%d without%s; sharp turns: %d paths refused (%d on a slope, %d "
+      "%d without%s, %d slope ends without a way back; sharp turns: %d "
+      "paths refused (%d on a slope, %d "
       "without room)%s%s%s%s; "
       "heading %.2f rad%s",
       r.free_cells, r.vertices_added, r.edges_added,
@@ -1715,6 +1716,7 @@ std::string PlannerNode::buildLocalGraph() {
       sel.paths_rejected_steep > 0 ? " (some paths too steep)" : "",
       sel.paths_pulled_back, sel.paths_without_clear_viewpoint,
       sel.unclear_viewpoint ? ", none ends clear" : "",
+      sel.slope_ends_without_way_back,
       sel.paths_with_sharp_turns, turn_check.refused_on_slope,
       turn_check.refused_without_room,
       sel.sharp_turn_detour ? ", detour" : "",
