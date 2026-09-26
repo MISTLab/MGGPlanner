@@ -933,4 +933,48 @@ TEST(FleetCoordinator, AnExploredReportAfterASettledAwardIsAuctioned) {
   EXPECT_EQ(idsOf(r1.coordinator->bundle()), std::vector<ClusterId>{11});
 }
 
+// The auctioneer's broadcast bids and its own collected bids each send an
+// explored list longer than kMaxBidClusters in turns of their own: every
+// report reaches the peers and every report reaches this robot's pools,
+// whatever the rhythm of bids and auctions.
+TEST(FleetCoordinator, TheAuctioneersExploredReportsAllGoOut) {
+  const FleetParams params;
+  FleetCoordinator coordinator(1, params, 0.2);
+  const std::size_t chunks = 3;
+  std::vector<ClusterId> explored;
+  for (std::size_t i = 0; i < chunks * mgg::kMaxBidClusters; ++i) {
+    explored.push_back(static_cast<ClusterId>(5000 + i));
+  }
+  // One of this robot's own clusters in each turn's share of the list.
+  SimRobot self(1, 0.0, 0.0, params);
+  std::set<ClusterId> expected;
+  for (std::size_t k = 0; k < chunks; ++k) {
+    const ClusterId id = explored[k * mgg::kMaxBidClusters];
+    self.known.push_back(cluster(id, 1, 10.0 * static_cast<double>(k + 1)));
+    expected.insert(id);
+  }
+  const auto own_bid = [&self, &explored] {
+    TourBidData bid = self.ownBid();
+    bid.explored = explored;
+    return bid;
+  };
+  std::set<ClusterId> broadcast;
+  std::set<ClusterId> pooled;
+  // A peer keeps asking for auctions; this robot ticks every two seconds.
+  for (double now = 0.0; now < 24.0; now += 2.0) {
+    TourBidData peer = emptyBid(2);
+    peer.request_auction = true;
+    coordinator.onBid(peer, now);
+    const mgg::FleetTickOutput out =
+        coordinator.tick(now, own_bid, euclid, nullptr);
+    if (out.bid) broadcast.insert(out.bid->explored.begin(),
+                                  out.bid->explored.end());
+    if (out.award && !out.award->call) {
+      for (const FleetCluster& c : out.award->explored) pooled.insert(c.id);
+    }
+  }
+  EXPECT_EQ(broadcast.size(), explored.size());
+  EXPECT_EQ(pooled, expected);
+}
+
 }  // namespace

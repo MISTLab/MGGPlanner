@@ -180,14 +180,15 @@ FleetTickOutput FleetCoordinator::tick(double now_s, const OwnBidFn& own_bid,
     request_sent_ = false;
   }
 
-  const auto makeBid = [&](std::uint64_t auction_id) {
+  const auto makeBid = [&](std::uint64_t auction_id,
+                           std::size_t& explored_turn) {
     TourBidData bid = own_bid ? own_bid() : TourBidData{};
     bid.robot_id = robot_id_;
     bid.seq = ++seq_;
     bid.stamp_s = now_s;
     bid.auction_id = auction_id;
     bid.bundle = idsOf(bundle_);
-    capBidLists(bid);
+    capBidLists(bid, explored_turn);
     bid.request_auction = bid.request_auction || requesting;
     own_cluster_ids_.clear();
     for (const FleetCluster& c : bid.clusters) own_cluster_ids_.insert(c.id);
@@ -200,7 +201,7 @@ FleetTickOutput FleetCoordinator::tick(double now_s, const OwnBidFn& own_bid,
   const bool periodic = now_s - last_bid_s_ >= params_.auction_interval_s;
   const bool request_now = requesting && !request_sent_;
   if (called || periodic || request_now) {
-    out.bid = makeBid(called ? called_auction_ : 0);
+    out.bid = makeBid(called ? called_auction_ : 0, broadcast_explored_turn_);
     last_bid_s_ = now_s;
     if (called) answered_round_ = called_round_;
     if (requesting) {
@@ -240,7 +241,8 @@ FleetTickOutput FleetCoordinator::tick(double now_s, const OwnBidFn& own_bid,
   collection.started_s = now_s;
   collection.members = members;
   collection.signature = signature;
-  collection.bids[robot_id_] = makeBid(collection.auction_id);
+  collection.bids[robot_id_] =
+      makeBid(collection.auction_id, collected_explored_turn_);
   TourAwardData call;
   call.auction_id = collection.auction_id;
   call.auctioneer_id = robot_id_;
@@ -460,16 +462,17 @@ std::vector<FleetCluster> FleetCoordinator::claimedByOthers(double now_s) {
   return claims_.clustersExcept(robot_id_);
 }
 
-void FleetCoordinator::capBidLists(TourBidData& bid) {
+void FleetCoordinator::capBidLists(TourBidData& bid,
+                                   std::size_t& explored_turn) {
   if (bid.bundle.size() > kMaxBidClusters) bid.bundle.resize(kMaxBidClusters);
   const std::size_t n = bid.explored.size();
   if (n <= kMaxBidClusters) return;
-  const std::size_t first = explored_turn_ % n;
+  const std::size_t first = explored_turn % n;
   std::rotate(bid.explored.begin(),
               bid.explored.begin() + static_cast<std::ptrdiff_t>(first),
               bid.explored.end());
   bid.explored.resize(kMaxBidClusters);
-  explored_turn_ = (first + kMaxBidClusters) % n;
+  explored_turn = (first + kMaxBidClusters) % n;
 }
 
 void FleetCoordinator::noteExplored(const std::vector<FleetCluster>& clusters) {

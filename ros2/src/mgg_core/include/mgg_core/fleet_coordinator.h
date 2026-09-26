@@ -162,9 +162,10 @@ class FleetCoordinator {
   void noteExplored(const std::vector<FleetCluster>& clusters);
   /// Cuts this robot's own bid to what peers accept (kMaxBidClusters per
   /// list): the bundle keeps its first clusters, the ones visited next; a
-  /// longer explored list is sent in turns, the next entries each bid, so
-  /// every report goes out.
-  void capBidLists(TourBidData& bid);
+  /// longer explored list is sent in turns, the next entries each bid from
+  /// `explored_turn`, so every report goes out. Broadcast bids and the bids
+  /// this robot collects in its own auctions take turns of their own.
+  void capBidLists(TourBidData& bid, std::size_t& explored_turn);
   void applyAward(const TourAwardData& award, double now_s);
   TourAwardData computeAward(double now_s, const CostEstimateFn& estimate,
                              const ExploredFn& explored);
@@ -197,7 +198,8 @@ class FleetCoordinator {
   std::optional<Round> called_round_;
   std::optional<Round> answered_round_;
   std::set<ClusterId> own_cluster_ids_;
-  std::size_t explored_turn_ = 0;
+  std::size_t broadcast_explored_turn_ = 0;
+  std::size_t collected_explored_turn_ = 0;
   bool requested_ = false;
   bool request_sent_ = false;
   bool answered_ = false;
