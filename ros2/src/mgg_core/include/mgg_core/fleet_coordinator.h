@@ -58,7 +58,8 @@ class FleetCoordinator {
 
   /// A peer's bid, in this robot's frame. Malformed bids are dropped. A bid
   /// answering this robot's call is collected only if received before
-  /// fleet.bid_deadline_s has passed.
+  /// fleet.bid_deadline_s has passed. The bid's current target and bundle
+  /// are the bidder's claim until a later bid or award (§4).
   void onBid(const TourBidData& bid, double now_s);
   /// A peer's call or award, in this robot's frame. Only this robot's
   /// current auctioneer is followed. A call or award is known by its round,
@@ -149,6 +150,10 @@ class FleetCoordinator {
   void rebaseFutureTimes(double now_s);
   /// `robot_id` was heard at the local receipt time `now_s`.
   void noteHeard(int robot_id, double now_s);
+  /// The bidder holds its current target and bundle, as named by its own
+  /// clusters, the last award or its claim; IDs none names are skipped. A
+  /// bundle cut at kMaxBidClusters keeps the rest of the claim.
+  void recordBidClaim(const TourBidData& bid, double now_s);
   void noteExplored(const std::vector<FleetCluster>& clusters);
   /// Cuts this robot's own bid to what peers accept (kMaxBidClusters per
   /// list): the bundle keeps its first clusters, the ones visited next; a

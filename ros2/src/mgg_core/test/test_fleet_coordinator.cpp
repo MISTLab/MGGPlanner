@@ -837,4 +837,64 @@ TEST(FleetCoordinator, ABidReceivedAfterTheDeadlineIsNotCollected) {
   EXPECT_FALSE(collected(params.bid_deadline_s + 0.1));
 }
 
+// §4: a peer's bid names what it holds, its current target and bundle. An
+// auctioneer that knows the claim only from that bid (it restarted, or its
+// group just merged) keeps it fixed when the peer misses the call, rather
+// than awarding it to another robot.
+TEST(FleetCoordinator, AClaimKnownOnlyFromABidIsNotAwardedElsewhere) {
+  const FleetParams params;
+  SimRobot r1(1, 0.0, 0.0, params), r2(2, 20.0, 0.0, params);
+  r1.known = {cluster(11, 1, 2.0)};
+  r2.known = {cluster(21, 2, 18.0)};
+  Radio radio{{&r1, &r2}};
+  double now = 0.0;
+  radio.runUntil(now, 5.0);
+  ASSERT_EQ(r2.front(), 21u);
+
+  // Robot 1 restarts knowing robot 2's frontier too. Robot 2 does not hear
+  // it, so never answers its calls; its periodic bids get through.
+  r1.coordinator = std::make_unique<FleetCoordinator>(1, params, 0.2);
+  r1.known.push_back(cluster(21, 2, 18.0));
+  radio.deaf.insert({1, 2});
+  const std::size_t first = radio.awards.size();
+  radio.runUntil(now, 12.0);
+  ASSERT_GT(radio.awards.size(), first);
+  for (std::size_t i = first; i < radio.awards.size(); ++i) {
+    const mgg::RobotBundle* own = radio.awards[i].second.bundleOf(1);
+    ASSERT_NE(own, nullptr);
+    EXPECT_EQ(own->clusters, std::vector<ClusterId>{11});
+  }
+  EXPECT_EQ(idsOf(r1.coordinator->bundle()), std::vector<ClusterId>{11});
+  EXPECT_EQ(idsOf(r1.coordinator->claimedByOthers(now)),
+            std::vector<ClusterId>{21});
+  EXPECT_EQ(r2.front(), 21u);
+}
+
+// A bundle cut at kMaxBidClusters may go on beyond the cut: the claim keeps
+// what it held there. Ids the bid and the awards do not name are skipped.
+TEST(FleetCoordinator, AClaimFromABidKeepsWhatATruncatedBundleLeavesOut) {
+  FleetCoordinator coordinator(1, FleetParams{}, 0.2);
+  std::vector<FleetCluster> held;
+  mgg::RobotBundle bundle{2, {}, 0.0};
+  for (std::size_t i = 0; i < mgg::kMaxBidClusters + 1; ++i) {
+    held.push_back(cluster(static_cast<ClusterId>(100 + i), 2,
+                           static_cast<double>(i)));
+    bundle.clusters.push_back(held.back().id);
+  }
+  // Robot 1 learned robot 2's claim from robot 0's award.
+  coordinator.onAward(makeAward(0, 1, 0.0, {bundle}, held), 0.0);
+  ASSERT_EQ(coordinator.claimedByOthers(0.0).size(), held.size());
+
+  std::vector<ClusterId> sent(bundle.clusters.begin(),
+                              bundle.clusters.begin() + mgg::kMaxBidClusters);
+  coordinator.onBid(bidFrom(2, 0.0, {}, 0, sent), 1.0);
+  EXPECT_EQ(coordinator.claimedByOthers(1.0).size(), held.size());
+
+  // A bundle within the limit is the whole claim; an unknown ID is skipped.
+  coordinator.onBid(
+      bidFrom(2, 0.0, {cluster(900, 2, 50.0)}, 0, {100, 900, 5000}), 2.0);
+  EXPECT_EQ(idsOf(coordinator.claimedByOthers(2.0)),
+            (std::vector<ClusterId>{100, 900}));
+}
+
 }  // namespace

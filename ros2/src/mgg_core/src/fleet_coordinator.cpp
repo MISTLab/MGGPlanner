@@ -73,6 +73,7 @@ void FleetCoordinator::onBid(const TourBidData& bid, double now_s) {
   rebaseFutureTimes(now_s);
   if (bid.robot_id == robot_id_ || !bid.wellFormed()) return;
   noteHeard(bid.robot_id, now_s);
+  recordBidClaim(bid, now_s);
   last_bids_[bid.robot_id] = bid;
   if (bid.request_auction) peer_requested_ = true;
   // Collected only before the deadline, as the local receipt time tells: a
@@ -81,6 +82,35 @@ void FleetCoordinator::onBid(const TourBidData& bid, double now_s) {
       now_s - collecting_->started_s < params_.bid_deadline_s) {
     collecting_->bids[bid.robot_id] = bid;
   }
+}
+
+void FleetCoordinator::recordBidClaim(const TourBidData& bid, double now_s) {
+  std::vector<ClusterId> ids;
+  if (bid.current_target != kNoCluster) ids.push_back(bid.current_target);
+  for (const ClusterId id : bid.bundle) {
+    if (std::find(ids.begin(), ids.end(), id) == ids.end()) ids.push_back(id);
+  }
+  const Claim* held = claims_.find(bid.robot_id);
+  const auto named = [](const std::vector<FleetCluster>& clusters,
+                        ClusterId id) -> const FleetCluster* {
+    for (const FleetCluster& c : clusters) {
+      if (c.id == id) return &c;
+    }
+    return nullptr;
+  };
+  std::vector<FleetCluster> clusters;
+  for (const ClusterId id : ids) {
+    const FleetCluster* c = named(bid.clusters, id);
+    if (c == nullptr) c = named(award_clusters_, id);
+    if (c == nullptr && held != nullptr) c = named(held->clusters, id);
+    if (c != nullptr) clusters.push_back(*c);
+  }
+  if (held != nullptr && bid.bundle.size() >= kMaxBidClusters) {
+    for (const FleetCluster& c : held->clusters) {
+      if (named(clusters, c.id) == nullptr) clusters.push_back(c);
+    }
+  }
+  claims_.record(bid.robot_id, std::move(clusters), now_s);
 }
 
 void FleetCoordinator::onAward(const TourAwardData& award, double now_s) {
