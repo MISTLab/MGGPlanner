@@ -435,6 +435,47 @@ class PlannerNodeTestPeer {
     node.tour_params_.min_cluster_gain = min_cluster_gain;
     node.tour_planner_ = std::make_unique<mgg::TourPlanner>(node.tour_params_);
   }
+  /// A tour that solves on any change at once.
+  static void solveTourOnEveryChange(PlannerNode& node) {
+    const std::lock_guard<std::recursive_mutex> lock(node.planner_mutex_);
+    node.tour_params_.recompute_interval_s = 0.0;
+    node.tour_planner_ = std::make_unique<mgg::TourPlanner>(node.tour_params_);
+  }
+  /// refreshTour alone, outside a plan request; its target or kNoCluster.
+  static mgg::ClusterId refreshTour(PlannerNode& node) {
+    const std::lock_guard<std::recursive_mutex> lock(node.planner_mutex_);
+    std::string note;
+    const std::optional<mgg::FrontierCluster> target = node.refreshTour(note);
+    return target.has_value() ? target->id : mgg::kNoCluster;
+  }
+  /// The id of the global vertex at (x, y), or -1.
+  static int globalVertexAt(PlannerNode& node, double x, double y) {
+    const std::lock_guard<std::recursive_mutex> lock(node.planner_mutex_);
+    for (const auto& entry : node.global_graph_->vertices_map_) {
+      if (entry.second != nullptr &&
+          (entry.second->state.head<2>() - Eigen::Vector2d(x, y)).norm() <
+              1e-6) {
+        return entry.first;
+      }
+    }
+    return -1;
+  }
+  /// Removes the global edge between `a` and `b`, a new revision.
+  static void removeGlobalEdge(PlannerNode& node, int a, int b) {
+    const std::lock_guard<std::recursive_mutex> lock(node.planner_mutex_);
+    node.global_graph_->removeEdge(node.findGlobalVertex(a),
+                                   node.findGlobalVertex(b));
+    ++node.graph_revision_;
+  }
+  /// Adds a global edge between `a` and `b` and nothing else, as a link
+  /// that reuses a vertex does: no new vertex, and no revision.
+  static void addGlobalEdgeOnly(PlannerNode& node, int a, int b) {
+    const std::lock_guard<std::recursive_mutex> lock(node.planner_mutex_);
+    mgg::Vertex* u = node.findGlobalVertex(a);
+    mgg::Vertex* v = node.findGlobalVertex(b);
+    node.global_graph_->addEdge(u, v,
+                                (u->state - v->state).head<3>().norm());
+  }
   static mgg::ClusterId tourTarget(PlannerNode& node) {
     const std::lock_guard<std::recursive_mutex> lock(node.planner_mutex_);
     return node.tour_planner_->target();
@@ -2211,6 +2252,30 @@ TEST_F(PlannerNodeTest, TheTourTargetIsJudgedInTheLatticeFrameAtTheRobotsHeading
   // Facing +x, (2, 0) is inside the box.
   EXPECT_TRUE(PlannerNodeTestPeer::localPathServesTour(
       *node, 0.0, {0.0, 2.0, 0.0}, {2.0, 0.0, 0.0}));
+}
+
+TEST_F(PlannerNodeTest, AnEdgeAloneThatConnectsAClusterReachesTheTour) {
+  // Review r0, I-4: the frontier at (6, 0) is cut off from the robot by a
+  // missing edge between (4, 0) and (5, 0), so the tour has no reachable
+  // cluster. Adding that edge, with no new vertex, makes the cluster
+  // reachable; the tour's cached distances must not hide it.
+  auto node = makeNode("tour_edge_only");
+  PlannerNodeTestPeer::observeFloor(*node, -1.5, 7.0, -1.5, 1.5);
+  PlannerNodeTestPeer::acceptOdometry(*node, 0.0, 0.0, 1.0);
+  PlannerNodeTestPeer::addGlobalChainToFrontier(
+      *node, {{1.0, 0.0}, {2.0, 0.0}, {3.0, 0.0}, {4.0, 0.0}, {5.0, 0.0},
+              {6.0, 0.0}});
+  const int a = PlannerNodeTestPeer::globalVertexAt(*node, 4.0, 0.0);
+  const int b = PlannerNodeTestPeer::globalVertexAt(*node, 5.0, 0.0);
+  ASSERT_GE(a, 0);
+  ASSERT_GE(b, 0);
+  PlannerNodeTestPeer::removeGlobalEdge(*node, a, b);
+  PlannerNodeTestPeer::setTour(*node, true, 0.0);
+  PlannerNodeTestPeer::solveTourOnEveryChange(*node);
+
+  EXPECT_EQ(PlannerNodeTestPeer::refreshTour(*node), mgg::kNoCluster);
+  PlannerNodeTestPeer::addGlobalEdgeOnly(*node, a, b);
+  EXPECT_NE(PlannerNodeTestPeer::refreshTour(*node), mgg::kNoCluster);
 }
 
 TEST_F(PlannerNodeTest, AReachedTourTargetThatIsStillAFrontierIsReleasedOnce) {

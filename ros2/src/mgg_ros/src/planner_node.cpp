@@ -501,11 +501,23 @@ mgg::Vertex* PlannerNode::linkRobotToGlobalGraph() {
     current = physicalAnchorAtDrivingHeight(current_state_);
   }
   const int before = global_graph_->getNumVertices();
+  const int edges_before = global_graph_->getNumEdges();
   mgg::Vertex* link = mgg::linkDeparture(*global_graph_, current,
                                          makeGlobalContext(), kLinkRadius)
                           .vertex;
-  if (global_graph_->getNumVertices() != before) ++graph_revision_;
+  // A pose that reuses a vertex may still gain edges (connectStateToGraph).
+  if (global_graph_->getNumVertices() != before ||
+      global_graph_->getNumEdges() != edges_before) {
+    ++graph_revision_;
+  }
   return link;
+}
+
+void PlannerNode::noteGlobalGraphEdges() {
+  const int edges = global_graph_->getNumEdges();
+  if (edges == tour_graph_edges_) return;
+  ++graph_revision_;
+  tour_graph_edges_ = edges;
 }
 
 std::vector<mgg::FrontierCluster> PlannerNode::globalFrontierClusters() {
@@ -548,6 +560,7 @@ std::optional<mgg::FrontierCluster> PlannerNode::refreshTour(
     tour_clusters_.clear();
     return std::nullopt;
   }
+  noteGlobalGraphEdges();
   std::vector<mgg::FrontierCluster> clusters =
       tourCandidates(globalFrontierClusters());
   // Reached: within global_frontier_reach_m of it, as a repositioning's
@@ -572,6 +585,7 @@ std::optional<mgg::FrontierCluster> PlannerNode::refreshTour(
       note = "; tour: the robot's pose cannot be linked to the global graph";
       return std::nullopt;
     }
+    noteGlobalGraphEdges();
     const auto started = std::chrono::steady_clock::now();
     const mgg::TourCostMatrix costs = mgg::computeTourCosts(
         *global_graph_, graph_revision_, tour_distances_, link->id,

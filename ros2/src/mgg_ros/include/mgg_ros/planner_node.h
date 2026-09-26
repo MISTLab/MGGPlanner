@@ -292,6 +292,10 @@ class PlannerNode : public rclcpp::Node {
   /// Links where the robot stands into the global graph, as a route out of
   /// here does (mgg::linkDeparture); null when nothing links.
   mgg::Vertex* linkRobotToGlobalGraph();
+  /// Bumps graph_revision_ when the global graph's edges changed since the
+  /// tour last looked: most writers bump it only for new vertices, and an
+  /// edge alone can make a cluster reachable (GraphDistanceCache).
+  void noteGlobalGraphEdges();
   /// Every frontier cluster of the global graph, other robots' included,
   /// under its stable name (tour-exploration design §2.1).
   std::vector<mgg::FrontierCluster> globalFrontierClusters();
@@ -512,6 +516,9 @@ class PlannerNode : public rclcpp::Node {
   /// every cycle and restamp its claim (targetSince). Cleared once the
   /// target is another cluster.
   mgg::ClusterId tour_reached_cluster_ = mgg::kNoCluster;
+  /// The global graph's edge count when the tour last looked
+  /// (noteGlobalGraphEdges).
+  int tour_graph_edges_ = -1;
 
   /// Frontiers reserved by peers, in the planning frame, and how long a
   /// message stays in force.
