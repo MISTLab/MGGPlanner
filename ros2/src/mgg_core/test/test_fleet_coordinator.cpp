@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <limits>
 #include <map>
 #include <memory>
 #include <set>
@@ -975,6 +976,67 @@ TEST(FleetCoordinator, TheAuctioneersExploredReportsAllGoOut) {
   }
   EXPECT_EQ(broadcast.size(), explored.size());
   EXPECT_EQ(pooled, expected);
+}
+
+// An award with a non-finite position, a non-finite or negative silence, a
+// cluster in two robots' bundles or a bundle ID no cluster entry names is
+// refused whole: nothing this robot holds or knows changes. (kNoCluster
+// entries alone are filtered instead: AnAwardsUnnamedClustersAreIgnored.)
+TEST(FleetCoordinator, AMalformedAwardIsRefusedWhole) {
+  const double nan = std::numeric_limits<double>::quiet_NaN();
+  const double inf = std::numeric_limits<double>::infinity();
+  const TourAwardData valid = makeAward(
+      1, 1, 1.0,
+      {mgg::RobotBundle{2, {21}, 0.0}, mgg::RobotBundle{3, {31}, 0.0}},
+      {cluster(21, 2, 2.0), cluster(31, 3, 3.0), cluster(22, 2, 4.0)});
+  // A later round that moves robot 2 to cluster 22, and what breaks it.
+  TourAwardData next = valid;
+  next.auction_id = 2;
+  next.stamp_s = 2.0;
+  next.bundles[0].clusters = {22};
+  std::vector<std::pair<const char*, TourAwardData>> broken;
+  const auto variant = [&](const char* what, auto&& change) {
+    TourAwardData award = next;
+    change(award);
+    broken.emplace_back(what, award);
+  };
+  variant("NaN position", [&](TourAwardData& a) {
+    a.clusters[2].position.x() = nan;
+  });
+  variant("infinite explored position", [&](TourAwardData& a) {
+    a.explored = {cluster(41, 4, inf)};
+  });
+  variant("NaN silence",
+          [&](TourAwardData& a) { a.bundles[1].silent_s = nan; });
+  variant("infinite silence",
+          [&](TourAwardData& a) { a.bundles[1].silent_s = inf; });
+  variant("negative silence",
+          [&](TourAwardData& a) { a.bundles[1].silent_s = -1.0; });
+  variant("a cluster in two bundles",
+          [](TourAwardData& a) { a.bundles[0].clusters = {22, 31}; });
+  variant("an unlisted bundle ID",
+          [](TourAwardData& a) { a.bundles[0].clusters = {22, 99}; });
+
+  for (const auto& [what, award] : broken) {
+    FleetCoordinator coordinator(2, FleetParams{}, 0.2);
+    coordinator.onAward(valid, 1.0);
+    const std::uint64_t version = coordinator.assignmentVersion();
+    coordinator.onAward(award, 2.0);
+    EXPECT_EQ(idsOf(coordinator.bundle()), std::vector<ClusterId>{21}) << what;
+    EXPECT_EQ(idsOf(coordinator.claimedByOthers(2.0)),
+              std::vector<ClusterId>{31})
+        << what;
+    EXPECT_EQ(idsOf(coordinator.lastAwardClusters()),
+              (std::vector<ClusterId>{21, 22, 31}))
+        << what;
+    EXPECT_TRUE(coordinator.exploredElsewhere().empty()) << what;
+    EXPECT_EQ(coordinator.assignmentVersion(), version) << what;
+  }
+  // The same round, well formed, is applied.
+  FleetCoordinator coordinator(2, FleetParams{}, 0.2);
+  coordinator.onAward(valid, 1.0);
+  coordinator.onAward(next, 2.0);
+  EXPECT_EQ(idsOf(coordinator.bundle()), std::vector<ClusterId>{22});
 }
 
 }  // namespace

@@ -64,8 +64,11 @@ class FleetCoordinator {
   /// kMaxExploredElsewhere, the oldest go); one the last award named makes
   /// an auction due.
   void onBid(const TourBidData& bid, double now_s);
-  /// A peer's call or award, in this robot's frame. Only this robot's
-  /// current auctioneer is followed. A call or award is known by its round,
+  /// A peer's call or award, in this robot's frame. A malformed one (a
+  /// non-finite position, a non-finite or negative silence, a bundle ID no
+  /// cluster entry lists, a cluster in two bundles) is dropped whole;
+  /// kNoCluster entries are only filtered out. Only this robot's current
+  /// auctioneer is followed. A call or award is known by its round,
   /// (auctioneer, stamp): a call is answered once per round, and an award is
   /// applied only when its round is newer than the last one applied from
   /// that auctioneer (a replayed or overtaken award is stale). A restarted

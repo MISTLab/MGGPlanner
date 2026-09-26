@@ -1,6 +1,7 @@
 #include "mgg_core/fleet_coordinator.h"
 
 #include <algorithm>
+#include <cmath>
 #include <utility>
 
 namespace mgg {
@@ -22,6 +23,31 @@ std::vector<FleetCluster> namedOnly(const std::vector<FleetCluster>& clusters) {
     if (c.id != kNoCluster) named.push_back(c);
   }
   return named;
+}
+
+/// An award this robot can apply: finite positions, every silence finite
+/// and not negative, every bundle ID listed in clusters, and no cluster in
+/// two bundles. kNoCluster entries are not checked: namedOnly filters them.
+bool wellFormedAward(const TourAwardData& award) {
+  const auto finite = [](const FleetCluster& c) {
+    return c.id == kNoCluster || c.position.allFinite();
+  };
+  if (!std::all_of(award.clusters.begin(), award.clusters.end(), finite) ||
+      !std::all_of(award.explored.begin(), award.explored.end(), finite)) {
+    return false;
+  }
+  std::set<ClusterId> assigned;
+  for (const RobotBundle& bundle : award.bundles) {
+    if (!std::isfinite(bundle.silent_s) || bundle.silent_s < 0.0) return false;
+    std::set<ClusterId> ids(bundle.clusters.begin(), bundle.clusters.end());
+    ids.erase(kNoCluster);
+    for (const ClusterId id : ids) {
+      if (award.cluster(id) == nullptr || !assigned.insert(id).second) {
+        return false;
+      }
+    }
+  }
+  return true;
 }
 
 bool isMember(const std::vector<int>& members, int robot_id) {
@@ -138,7 +164,7 @@ void FleetCoordinator::noteReportedExplored(
 
 void FleetCoordinator::onAward(const TourAwardData& award, double now_s) {
   rebaseFutureTimes(now_s);
-  if (award.auctioneer_id == robot_id_) return;
+  if (award.auctioneer_id == robot_id_ || !wellFormedAward(award)) return;
   noteHeard(award.auctioneer_id, now_s);
   // A robot that left the sender's group, or whose group just merged with a
   // lower ID, ignores it.
