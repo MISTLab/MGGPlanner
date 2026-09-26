@@ -170,6 +170,8 @@ class FleetCoordinator {
   void recordBidClaim(const TourBidData& bid, double now_s);
   /// Keeps explored IDs a bid reports for the next auction.
   void noteReportedExplored(const std::vector<ClusterId>& ids);
+  /// `robot_id`'s claims were released here at the local time `now_s`.
+  void noteReleased(int robot_id, double now_s);
   void noteExplored(const std::vector<FleetCluster>& clusters);
   /// Cuts this robot's own bid to what peers accept (kMaxBidClusters per
   /// list): the bundle keeps its first clusters, the ones visited next; a
@@ -191,9 +193,13 @@ class FleetCoordinator {
   std::map<int, TourBidData> last_bids_;
   // The auctioneer each robot's latest bid, call or award names.
   std::map<int, int> follows_;
-  // Per robot, the stamp of the bid or award its claim last came from. A bid
-  // replaces the claim only when newer; an award unless older (an award
-  // wins a tie: a bid sent at its stamp did not know it).
+  // Per robot, the stamp of the claim's latest state: the bid or award it
+  // came from, or its release (an operator's or a take-over here, at the
+  // local time; one an award forwards, at the award's stamp). A released
+  // claim keeps its stamp, so a delayed older bid cannot bring it back. A
+  // bid replaces the state only when newer; an award, or the release it
+  // forwards, unless older (an award wins a tie: a bid sent at its stamp
+  // did not know it). One entry per robot ID.
   std::map<int, double> claim_stamp_s_;
   ClaimRegistry claims_;
   std::vector<FleetCluster> bundle_;

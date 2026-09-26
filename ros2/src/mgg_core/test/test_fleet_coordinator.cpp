@@ -1294,4 +1294,88 @@ TEST(FleetCoordinator, BidClaimChangesAdvanceTheAssignmentVersion) {
   EXPECT_GT(coordinator.assignmentVersion(), version) << "removed";
 }
 
+/// Robot 2's bid holding `bundle`, stamped `stamp_s`, following robot 1.
+TourBidData claimOf2(double stamp_s, std::vector<ClusterId> bundle) {
+  TourBidData bid =
+      bidFrom(2, 20.0, {cluster(21, 2, 18.0), cluster(22, 2, 14.0)}, 0,
+              std::move(bundle));
+  bid.stamp_s = stamp_s;
+  bid.auctioneer_id = 1;
+  return bid;
+}
+
+// A release is the claim's latest state. Robot 2's bid of 1 s, delayed in
+// transit, arrives after the operator released robot 2's claims at 20 s:
+// it must not bring the claim back.
+TEST(FleetCoordinator, ADelayedBidDoesNotUndoAnOperatorRelease) {
+  FleetCoordinator coordinator(1, FleetParams{}, 0.2);
+  coordinator.onBid(claimOf2(0.0, {21}), 0.0);
+  ASSERT_EQ(idsOf(coordinator.claimedByOthers(0.0)),
+            std::vector<ClusterId>{21});
+  ASSERT_TRUE(coordinator.releaseClaims(2, 20.0));
+  coordinator.onBid(claimOf2(1.0, {21}), 21.0);
+  EXPECT_TRUE(coordinator.claimedByOthers(21.0).empty());
+  // A bid sent after the release claims again.
+  coordinator.onBid(claimOf2(22.0, {22}), 22.0);
+  EXPECT_EQ(idsOf(coordinator.claimedByOthers(22.0)),
+            std::vector<ClusterId>{22});
+}
+
+// The same for a robot alone taking the oldest silent claim over.
+TEST(FleetCoordinator, ADelayedBidDoesNotUndoATakeOver) {
+  FleetCoordinator coordinator(1, FleetParams{}, 0.2);
+  coordinator.onBid(claimOf2(0.0, {21}), 0.0);
+  ASSERT_EQ(coordinator.group(20.0), std::vector<int>{1});
+  ASSERT_EQ(coordinator.takeOverOldestClaim(20.0), 2);
+  coordinator.onBid(claimOf2(1.0, {21}), 21.0);
+  EXPECT_TRUE(coordinator.claimedByOthers(21.0).empty());
+}
+
+// And for the take-over an auction makes for an idle bidder (§4 release 2):
+// robot 1, idle, gets robot 2's cluster; robot 2's delayed bid must not
+// leave it claimed by robot 2 as well.
+TEST(FleetCoordinator, ADelayedBidDoesNotUndoAnAuctionsTakeOver) {
+  const FleetParams params;
+  FleetCoordinator coordinator(1, params, 0.2);
+  coordinator.onBid(claimOf2(0.0, {21}), 0.0);
+  bool released = false;
+  for (double now = 0.0; now < 12.0 && !released; now += 0.5) {
+    coordinator.onBid(emptyBid(3), now);  // keeps robot 1 in a group
+    const mgg::FleetTickOutput out =
+        coordinator.tick(now, nullptr, euclid, nullptr);
+    if (out.award && !out.award->call) {
+      const auto& ids = out.award->released_robot_ids;
+      released = std::find(ids.begin(), ids.end(), 2) != ids.end();
+    }
+  }
+  ASSERT_TRUE(released);
+  EXPECT_EQ(idsOf(coordinator.bundle()), std::vector<ClusterId>{21});
+  // Sent at 4 s, after the first award, before robot 2 fell silent.
+  coordinator.onBid(claimOf2(4.0, {21}), 12.5);
+  EXPECT_TRUE(coordinator.claimedByOthers(12.5).empty());
+}
+
+// An award releasing robot 2's claims, stamped before robot 2's latest bid,
+// arrives after that bid: the bid is newer and its claim stays. A release
+// award newer than the bid removes it.
+TEST(FleetCoordinator, AReleaseAwardOlderThanABidKeepsTheBidsClaim) {
+  FleetCoordinator coordinator(3, FleetParams{}, 0.2);
+  const std::vector<FleetCluster> clusters = {cluster(21, 2, 18.0)};
+  coordinator.onAward(
+      makeAward(1, 1, 10.0, {mgg::RobotBundle{2, {21}, 0.0}}, clusters),
+      10.0);
+  coordinator.onBid(claimOf2(30.0, {22}), 30.0);
+  ASSERT_EQ(idsOf(coordinator.claimedByOthers(30.0)),
+            std::vector<ClusterId>{22});
+  TourAwardData release = makeAward(1, 2, 20.0, {}, {});
+  release.released_robot_ids = {2};
+  coordinator.onAward(release, 31.0);
+  EXPECT_EQ(idsOf(coordinator.claimedByOthers(31.0)),
+            std::vector<ClusterId>{22});
+  release.auction_id = 3;
+  release.stamp_s = 32.0;
+  coordinator.onAward(release, 32.0);
+  EXPECT_TRUE(coordinator.claimedByOthers(32.0).empty());
+}
+
 }  // namespace

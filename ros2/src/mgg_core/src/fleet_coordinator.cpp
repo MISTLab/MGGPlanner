@@ -389,6 +389,7 @@ TourAwardData FleetCoordinator::computeAward(double now_s,
     if (oldest == nullptr) break;
     freed = oldest->clusters;
     const int taken = claims_.releaseOldest(candidates);
+    noteReleased(taken, now_s);
     holders.erase(taken);
     released.push_back(taken);
     ++assignment_version_;
@@ -465,7 +466,15 @@ void FleetCoordinator::applyAward(const TourAwardData& award, double now_s) {
   has_award_ = true;
   award_clusters_ = namedOnly(award.clusters);
   noteExplored(namedOnly(award.explored));
-  for (const int robot_id : award.released_robot_ids) claims_.release(robot_id);
+  for (const int robot_id : award.released_robot_ids) {
+    // A bid newer than this award claimed again since.
+    const auto source = claim_stamp_s_.find(robot_id);
+    if (source != claim_stamp_s_.end() && award.stamp_s < source->second) {
+      continue;
+    }
+    claims_.release(robot_id);
+    claim_stamp_s_[robot_id] = award.stamp_s;
+  }
   for (const RobotBundle& bundle : award.bundles) {
     std::vector<FleetCluster> clusters;
     for (const ClusterId id : bundle.clusters) {
@@ -512,6 +521,7 @@ bool FleetCoordinator::releaseClaims(int robot_id, double now_s) {
   rebaseFutureTimes(now_s);
   if (auctioneer(now_s) != robot_id_) return false;
   claims_.release(robot_id);
+  noteReleased(robot_id, now_s);
   pending_releases_.push_back(robot_id);
   ++assignment_version_;
   return true;
@@ -525,8 +535,18 @@ int FleetCoordinator::takeOverOldestClaim(double now_s) {
     if (!isMember(members, robot_id)) silent.insert(robot_id);
   }
   const int taken = claims_.releaseOldest(silent);
-  if (taken >= 0) ++assignment_version_;
+  if (taken >= 0) {
+    noteReleased(taken, now_s);
+    ++assignment_version_;
+  }
   return taken;
+}
+
+void FleetCoordinator::noteReleased(int robot_id, double now_s) {
+  const auto source = claim_stamp_s_.find(robot_id);
+  claim_stamp_s_[robot_id] = source == claim_stamp_s_.end()
+                                 ? now_s
+                                 : std::max(source->second, now_s);
 }
 
 std::vector<FleetCluster> FleetCoordinator::claimedByOthers(double now_s) {
