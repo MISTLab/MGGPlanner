@@ -78,6 +78,8 @@ struct SimRobot {
 
   TourBidData ownBid() const {
     TourBidData bid;
+    bid.robot_id = id;
+    bid.auctioneer_id = id;  // tick fills in the current election
     bid.pose = mgg::StateVec(position.x(), position.y(), 0.0, 0.0);
     bid.clusters = known;
     for (const FleetCluster& c : known) {
@@ -544,6 +546,7 @@ TEST(FleetCoordinator, AfterAClockRollbackASilentRobotsClaimAgesFromTheReset) {
   };
   TourBidData bid;
   bid.robot_id = 3;
+  bid.auctioneer_id = 3;
   coordinator.onBid(bid, 10000.0);
   std::uint64_t auction_id = 1;
   coordinator.onAward(award(auction_id++, 10000.0, 0.0), 10000.0);
@@ -646,6 +649,8 @@ TEST(FleetCoordinator, OwnBidsStayWithinTheBidClusterLimit) {
   }
   const auto own_bid = [&explored] {
     TourBidData bid;
+    bid.robot_id = 2;
+    bid.auctioneer_id = 1;
     bid.explored = explored;
     return bid;
   };
@@ -754,6 +759,7 @@ TEST(FleetCoordinator, ACallReusingAnAuctionIdWithANewStampIsAnswered) {
 TourBidData emptyBid(int robot_id) {
   TourBidData bid;
   bid.robot_id = robot_id;
+  bid.auctioneer_id = robot_id;
   return bid;
 }
 

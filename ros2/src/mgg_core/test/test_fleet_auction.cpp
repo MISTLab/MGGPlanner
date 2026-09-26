@@ -36,6 +36,7 @@ double euclid(const Eigen::Vector3d& a, const Eigen::Vector3d& b) {
 TourBidData bidAt(int robot, double x, const std::vector<FleetCluster>& clusters) {
   TourBidData bid;
   bid.robot_id = robot;
+  bid.auctioneer_id = robot;
   bid.pose = mgg::StateVec(x, 0.0, 0.0, 0.0);
   bid.clusters = clusters;
   for (const FleetCluster& c : clusters) {

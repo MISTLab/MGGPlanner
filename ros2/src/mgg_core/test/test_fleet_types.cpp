@@ -25,6 +25,7 @@ FleetCluster cluster(mgg::ClusterId id, double x) {
 TourBidData twoClusterBid() {
   TourBidData bid;
   bid.robot_id = 1;
+  bid.auctioneer_id = 1;
   bid.pose = mgg::StateVec(0.0, 0.0, 0.0, 0.0);
   bid.clusters = {cluster(11, 3.0), cluster(12, 7.0)};
   bid.costs_from_pose = {3.0, 7.0};
@@ -63,7 +64,9 @@ TEST(FleetTypes, WellFormedRejectsInconsistentOrInvalidBids) {
   b.costs_between[1] = std::numeric_limits<double>::infinity();
   EXPECT_TRUE(b.wellFormed());
   // A robot with nothing to report still bids.
-  EXPECT_TRUE(TourBidData{}.wellFormed());
+  TourBidData empty;
+  empty.auctioneer_id = empty.robot_id;
+  EXPECT_TRUE(empty.wellFormed());
 }
 
 TEST(FleetTypes, WellFormedRejectsUnnamedBundleAndExploredEntries) {
@@ -83,6 +86,7 @@ TEST(FleetTypes, WellFormedRejectsUnnamedBundleAndExploredEntries) {
 TEST(FleetTypes, WellFormedCapsEveryListAtTheBidClusterLimit) {
   const auto bidWith = [](std::size_t n) {
     TourBidData bid;
+    bid.auctioneer_id = bid.robot_id;
     for (std::size_t i = 0; i < n; ++i) {
       bid.clusters.push_back(cluster(i + 1, static_cast<double>(i)));
     }
@@ -93,6 +97,7 @@ TEST(FleetTypes, WellFormedCapsEveryListAtTheBidClusterLimit) {
   EXPECT_TRUE(bidWith(mgg::kMaxBidClusters).wellFormed());
   EXPECT_FALSE(bidWith(mgg::kMaxBidClusters + 1).wellFormed());
   TourBidData b;
+  b.auctioneer_id = b.robot_id;
   b.bundle.assign(mgg::kMaxBidClusters, 11);
   b.explored.assign(mgg::kMaxBidClusters, 12);
   EXPECT_TRUE(b.wellFormed());
