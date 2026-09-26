@@ -1733,6 +1733,12 @@ TEST_F(PlannerNodeTest, APlannerRestartedBesideAnUnobservedDropIsNotAtItsStart) 
   ASSERT_TRUE(PlannerNodeTestPeer::standingStart(*at_start).has_value());
   EXPECT_NE(onto_the_drop(*at_start),
             mgg::ProjectedEdgeStatus::kGroundUnobserved);
+  // Crept 0.3 m on, it still stands at its start; the disk stays where it
+  // stood (review r0, M-3).
+  PlannerNodeTestPeer::acceptOdometry(*at_start, -0.3, 0.0, 2.0);
+  const auto crept = PlannerNodeTestPeer::standingStart(*at_start);
+  ASSERT_TRUE(crept.has_value());
+  EXPECT_LT(crept->center.norm(), 1e-9) << crept->center.transpose();
 }
 
 TEST_F(PlannerNodeTest, AGraphHoldingOnlyItsSeedIsRebuiltFromTheKeyframes) {

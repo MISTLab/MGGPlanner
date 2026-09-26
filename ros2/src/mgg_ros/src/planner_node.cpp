@@ -566,8 +566,9 @@ std::optional<mgg::StandingStart> PlannerNode::standingStart() {
   if ((current_state_.head<2>() - home).norm() >= kStandingStartMoveM) {
     return std::nullopt;
   }
-  return mgg::StandingStart{current_state_.head<2>(),
-                            hanging_root_edge_length_max_};
+  // Round where it stood, the blind disk of its first scans: not where it
+  // has crept to since, whose ground its lidar could see.
+  return mgg::StandingStart{*standing_start_xy_, hanging_root_edge_length_max_};
 }
 
 Eigen::Isometry3d PlannerNode::navigationFromComponent() const {
