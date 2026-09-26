@@ -287,7 +287,16 @@ PlannerNode::PlannerNode(const rclcpp::NodeOptions& options)
         rclcpp::ServicesQoS(), callback_group_);
     fleet_timer_ = create_timer(
         std::chrono::duration<double>(kFleetTickPeriodS),
-        [this]() { fleetTick(now().seconds()); }, callback_group_);
+        [this]() {
+          // The time is read under the lock, as every fleet entry point
+          // reads it: a call or award handled between an earlier reading
+          // and the tick would leave the tick's time behind the one the
+          // coordinator last saw, which it takes for a clock reset (it
+          // forgets the call waiting for this robot's bid).
+          const std::lock_guard<std::recursive_mutex> lock(planner_mutex_);
+          fleetTick(now().seconds());
+        },
+        callback_group_);
   }
 
   build_srv_ = create_service<std_srvs::srv::Trigger>(

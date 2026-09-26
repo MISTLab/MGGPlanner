@@ -338,7 +338,8 @@ class PlannerNode : public rclcpp::Node {
   void onReleaseClaims(
       const std::shared_ptr<mgg_msgs::srv::ReleaseClaims::Request> request,
       std::shared_ptr<mgg_msgs::srv::ReleaseClaims::Response> response);
-  /// One fleet step at `now_s`; fleet_timer_ calls it with the node's clock.
+  /// One fleet step at `now_s`; fleet_timer_ calls it with the node's clock,
+  /// read under planner_mutex_.
   void fleetTick(double now_s);
   /// This robot's bid content: every frontier cluster it knows, costed from
   /// where it joins the global graph (no heading penalty), its tour's
