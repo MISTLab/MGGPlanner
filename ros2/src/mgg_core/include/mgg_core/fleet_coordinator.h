@@ -120,7 +120,8 @@ class FleetCoordinator {
 
   /// Clock rollback (a simulation restart moves now_s backwards): a time
   /// after `now_s` becomes `now_s`, as ClaimRegistry::expire does for claims,
-  /// so a silent robot counts as just heard once and then ages normally.
+  /// so a silent robot counts as just heard once and then ages normally, and
+  /// the next bid, award or call waits at most one interval or deadline.
   /// Called first by every member that takes the time.
   void rebaseFutureTimes(double now_s);
   /// `robot_id` was heard at the local receipt time `now_s`.

@@ -89,6 +89,8 @@ struct Radio {
   std::vector<SimRobot*> robots;
   std::set<std::pair<int, int>> deaf;
   std::vector<std::pair<double, TourAwardData>> awards;
+  std::vector<std::pair<double, TourAwardData>> calls;
+  std::vector<std::pair<double, TourBidData>> bids;
 
   void cut(int a, int b) {
     deaf.insert({a, b});
@@ -107,6 +109,8 @@ struct Radio {
     }
     for (const auto& [from, out] : sent) {
       if (out.award && !out.award->call) awards.emplace_back(now, *out.award);
+      if (out.award && out.award->call) calls.emplace_back(now, *out.award);
+      if (out.bid) bids.emplace_back(now, *out.bid);
       for (SimRobot* r : robots) {
         if (r->id == from || deaf.count({from, r->id}) > 0) continue;
         if (out.bid) r->coordinator->onBid(*out.bid, now);
@@ -537,6 +541,53 @@ TEST(FleetCoordinator, AfterAClockRollbackASilentRobotsClaimAgesFromTheReset) {
   coordinator.tick(expired, nullptr, nullptr, nullptr);
   EXPECT_TRUE(coordinator.claimedByOthers(expired).empty());
   EXPECT_EQ(coordinator.group(expired), (std::vector<int>{1, 2}));
+}
+
+
+// The coordinator's own timers must not wait for the old clock either: after
+// a reset, an auction being collected is awarded within one bid deadline,
+// periodic bids resume within one auction interval, and auctions are called
+// again.
+TEST(FleetCoordinator, AfterAClockRollbackBidsAndAuctionsResume) {
+  const FleetParams params;
+  SimRobot r1(1, 0.0, 0.0, params), r2(2, 20.0, 0.0, params);
+  r1.known = {cluster(11, 1, 2.0)};
+  r2.known = {cluster(21, 2, 18.0)};
+  Radio radio{{&r1, &r2}};
+  double now = 10000.0;
+  radio.runUntil(now, 10005.0);
+  ASSERT_FALSE(radio.awards.empty());
+
+  // A new cluster makes robot 1 call an auction; the clocks reset to 10 s
+  // while it collects the bids.
+  r1.known.push_back(cluster(13, 1, 6.0));
+  const std::size_t calls_before = radio.calls.size();
+  for (; radio.calls.size() == calls_before && now < 10010.0; now += 0.1) {
+    radio.step(now);
+  }
+  ASSERT_GT(radio.calls.size(), calls_before);
+  const double reset = 10.0;
+  now = reset;
+  const std::size_t awards_before = radio.awards.size();
+  const std::size_t bids_before = radio.bids.size();
+  const std::size_t calls_at_reset = radio.calls.size();
+
+  radio.runUntil(now, reset + params.auction_interval_s + 0.15);
+  ASSERT_GT(radio.awards.size(), awards_before);
+  EXPECT_LE(radio.awards[awards_before].first,
+            reset + params.bid_deadline_s + 0.15);
+  EXPECT_EQ(idsOf(r1.coordinator->bundle()), (std::vector<ClusterId>{11, 13}));
+  std::set<int> bidders;
+  for (std::size_t i = bids_before; i < radio.bids.size(); ++i) {
+    bidders.insert(radio.bids[i].second.robot_id);
+  }
+  EXPECT_EQ(bidders, (std::set<int>{1, 2}));
+
+  // A new cluster of robot 2's is auctioned in the new clock epoch.
+  r2.known.push_back(cluster(22, 2, 14.0));
+  radio.runUntil(now, reset + 4.0 * params.auction_interval_s);
+  EXPECT_GT(radio.calls.size(), calls_at_reset);
+  EXPECT_EQ(idsOf(r2.coordinator->bundle()), (std::vector<ClusterId>{21, 22}));
 }
 
 }  // namespace

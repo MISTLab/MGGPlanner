@@ -38,6 +38,12 @@ void FleetCoordinator::rebaseFutureTimes(double now_s) {
   for (auto& [robot_id, heard_s] : last_heard_s_) {
     heard_s = std::min(heard_s, now_s);
   }
+  // Timers too, or bids, awards and calls would wait for the old clock.
+  last_bid_s_ = std::min(last_bid_s_, now_s);
+  last_auction_s_ = std::min(last_auction_s_, now_s);
+  if (collecting_) {
+    collecting_->started_s = std::min(collecting_->started_s, now_s);
+  }
 }
 
 void FleetCoordinator::noteHeard(int robot_id, double now_s) {
