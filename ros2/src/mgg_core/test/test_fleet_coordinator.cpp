@@ -590,4 +590,63 @@ TEST(FleetCoordinator, AfterAClockRollbackBidsAndAuctionsResume) {
   EXPECT_EQ(idsOf(r2.coordinator->bundle()), (std::vector<ClusterId>{21, 22}));
 }
 
+
+// Peers refuse a bid whose bundle or explored list is longer than
+// kMaxBidClusters, so this robot's own bid never carries more: the bundle
+// keeps its first clusters (visited next), and a longer explored list goes
+// out in turns so that no report is left out for good.
+TEST(FleetCoordinator, OwnBidsStayWithinTheBidClusterLimit) {
+  const FleetParams params;
+  FleetCoordinator coordinator(2, params, 0.2);
+  const std::size_t n = mgg::kMaxBidClusters + 1;
+  TourAwardData award;
+  award.auction_id = 1;
+  award.auctioneer_id = 1;
+  award.stamp_s = 0.0;
+  mgg::RobotBundle mine{2, {}, 0.0};
+  for (std::size_t i = 0; i < n; ++i) {
+    const ClusterId id = static_cast<ClusterId>(100 + i);
+    award.clusters.push_back(cluster(id, 1, static_cast<double>(i)));
+    mine.clusters.push_back(id);
+  }
+  award.bundles = {mine};
+  coordinator.onAward(award, 0.0);
+  ASSERT_EQ(coordinator.bundle().size(), n);
+
+  std::vector<ClusterId> explored;
+  for (std::size_t i = 0; i < n; ++i) {
+    explored.push_back(static_cast<ClusterId>(5000 + i));
+  }
+  const auto own_bid = [&explored] {
+    TourBidData bid;
+    bid.explored = explored;
+    return bid;
+  };
+  std::vector<TourBidData> bids;
+  for (double now = 0.0; now < 2.0 * params.auction_interval_s + 0.05;
+       now += 0.1) {
+    const mgg::FleetTickOutput out =
+        coordinator.tick(now, own_bid, nullptr, nullptr);
+    if (out.bid) bids.push_back(*out.bid);
+  }
+  ASSERT_GE(bids.size(), 2u);
+  std::set<ClusterId> reported;
+  for (const TourBidData& bid : bids) {
+    EXPECT_TRUE(bid.wellFormed());
+    ASSERT_EQ(bid.bundle.size(), mgg::kMaxBidClusters);
+    EXPECT_TRUE(std::equal(bid.bundle.begin(), bid.bundle.end(),
+                           mine.clusters.begin()));
+    EXPECT_EQ(bid.explored.size(), mgg::kMaxBidClusters);
+    reported.insert(bid.explored.begin(), bid.explored.end());
+  }
+  EXPECT_EQ(reported.size(), n);
+
+  // At the limit nothing is cut.
+  explored.pop_back();
+  const mgg::FleetTickOutput out =
+      coordinator.tick(10.0, own_bid, nullptr, nullptr);
+  ASSERT_TRUE(out.bid.has_value());
+  EXPECT_EQ(out.bid->explored, explored);
+}
+
 }  // namespace

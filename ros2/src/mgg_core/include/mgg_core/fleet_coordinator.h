@@ -127,6 +127,11 @@ class FleetCoordinator {
   /// `robot_id` was heard at the local receipt time `now_s`.
   void noteHeard(int robot_id, double now_s);
   void noteExplored(const std::vector<FleetCluster>& clusters);
+  /// Cuts this robot's own bid to what peers accept (kMaxBidClusters per
+  /// list): the bundle keeps its first clusters, the ones visited next; a
+  /// longer explored list is sent in turns, the next entries each bid, so
+  /// every report goes out.
+  void capBidLists(TourBidData& bid);
   void applyAward(const TourAwardData& award, double now_s);
   TourAwardData computeAward(double now_s, const CostEstimateFn& estimate,
                              const ExploredFn& explored);
@@ -160,6 +165,7 @@ class FleetCoordinator {
   std::uint64_t called_auction_ = 0;
   std::uint64_t bid_for_auction_ = 0;
   std::set<ClusterId> own_cluster_ids_;
+  std::size_t explored_turn_ = 0;
   bool requested_ = false;
   bool request_sent_ = false;
   bool answered_ = false;

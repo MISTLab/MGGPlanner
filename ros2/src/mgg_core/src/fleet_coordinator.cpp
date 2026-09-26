@@ -113,6 +113,7 @@ FleetTickOutput FleetCoordinator::tick(double now_s, const OwnBidFn& own_bid,
     bid.stamp_s = now_s;
     bid.auction_id = auction_id;
     bid.bundle = idsOf(bundle_);
+    capBidLists(bid);
     bid.request_auction = bid.request_auction || requesting;
     own_cluster_ids_.clear();
     for (const FleetCluster& c : bid.clusters) own_cluster_ids_.insert(c.id);
@@ -376,6 +377,18 @@ std::vector<FleetCluster> FleetCoordinator::claimedByOthers(double now_s) {
     ++assignment_version_;
   }
   return claims_.clustersExcept(robot_id_);
+}
+
+void FleetCoordinator::capBidLists(TourBidData& bid) {
+  if (bid.bundle.size() > kMaxBidClusters) bid.bundle.resize(kMaxBidClusters);
+  const std::size_t n = bid.explored.size();
+  if (n <= kMaxBidClusters) return;
+  const std::size_t first = explored_turn_ % n;
+  std::rotate(bid.explored.begin(),
+              bid.explored.begin() + static_cast<std::ptrdiff_t>(first),
+              bid.explored.end());
+  bid.explored.resize(kMaxBidClusters);
+  explored_turn_ = (first + kMaxBidClusters) % n;
 }
 
 void FleetCoordinator::noteExplored(const std::vector<FleetCluster>& clusters) {
