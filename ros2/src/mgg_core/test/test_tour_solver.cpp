@@ -221,12 +221,22 @@ TEST(OpenTour, SmallToursWithDisconnectedLegsAreOptimal) {
       const SplitCost split = splitCost(tour.order, scene);
       EXPECT_EQ(split.disconnected_legs, best.disconnected_legs)
           << n << " clusters, seed " << seed;
-      // Ties are judged relative to the whole cost, a billion per
-      // unreachable leg inside the search: millimetres here.
-      EXPECT_NEAR(split.metres, best.metres, 1e-2)
+      // Inside the search an unreachable leg costs a billion, so the metres
+      // are compared at that sum's resolution: micrometres.
+      EXPECT_NEAR(split.metres, best.metres, 1e-5)
           << n << " clusters, seed " << seed;
     }
   }
+}
+
+TEST(OpenTour, ExactSearchTakesTheCheaperFirstClusterBeforeAnUnreachableLeg) {
+  // Half a millimetre decides which cluster comes first, though the two do
+  // not connect.
+  const std::vector<double> from_start{1.0005, 1.0};
+  const std::vector<std::vector<double>> between{
+      {0.0, mgg::kUnreachableCost}, {mgg::kUnreachableCost, 0.0}};
+  const OpenTour tour = mgg::solveOpenTour(from_start, between);
+  EXPECT_EQ(tour.order, (std::vector<int>{1, 0}));
 }
 
 TEST(OpenTour, LocalImprovementOverDisconnectedRoomsConverges) {
@@ -263,9 +273,11 @@ TEST(OpenTour, LocalImprovementOverDisconnectedRoomsConverges) {
         mgg::improveOpenTour(order, scene.from_start, scene.between);
     ASSERT_EQ(tour.order.size(), static_cast<std::size_t>(n));
     EXPECT_FALSE(std::isfinite(tour.cost));
+    EXPECT_LT(tour.improving_moves, mgg::kMaxImprovingMoves);
   }
   const OpenTour solved = mgg::solveOpenTour(scene.from_start, scene.between);
   EXPECT_EQ(solved.order.size(), static_cast<std::size_t>(n));
+  EXPECT_LT(solved.improving_moves, mgg::kMaxImprovingMoves);
   const double ms = std::chrono::duration<double, std::milli>(
                         std::chrono::steady_clock::now() - start)
                         .count() /

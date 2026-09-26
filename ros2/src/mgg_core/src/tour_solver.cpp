@@ -10,19 +10,16 @@ namespace {
 /// Stands in for an unreachable leg inside the search, so every cost there
 /// stays finite and comparable; openTourCost reports the true sum.
 constexpr double kDisconnectedLegCost = 1e9;
-/// A move counts only when it lowers the cost by more than this, or by more
-/// than kRelativeImproveEps times the sum of the legs it compares, whichever
-/// is larger. The relative part keeps the threshold far above the rounding
-/// error of those sums (a few ulps of the sum, about 2e-16 each), which a
-/// fixed 1e-9 is not once a kDisconnectedLegCost leg is among them: then a
-/// tie could look like an improvement both ways round and the search would
-/// cycle until kMaxImprovingMoves.
+/// A local move counts only when it lowers the cost by more than this, or by
+/// more than kRelativeImproveEps times the sum of the legs it compares,
+/// whichever is larger. The relative part keeps the threshold far above the
+/// rounding error of those sums (a few ulps of the sum, about 2e-16 each),
+/// which a fixed 1e-9 is not once a kDisconnectedLegCost leg is among them:
+/// then a tie could look like an improvement both ways round and the search
+/// would cycle until kMaxImprovingMoves. With it every accepted move lowers
+/// the exact cost of the order, so no order repeats.
 constexpr double kImproveEps = 1e-9;
 constexpr double kRelativeImproveEps = 1e-12;
-/// Every accepted move lowers the exact cost of the order, so no order
-/// repeats and the search ends long before this; it only bounds a
-/// pathological input.
-constexpr int kMaxImprovingMoves = 100000;
 /// Pseudo-indices: where the robot stands, and the open end of the tour.
 constexpr int kStart = -1;
 constexpr int kEnd = -2;
@@ -127,12 +124,13 @@ OpenTour improveOpenTour(std::vector<int> order,
                          bool fixed_first) {
   const LegCost leg(from_start, between);
   const std::size_t lo = fixed_first ? 1 : 0;
-  for (int move = 0; move < kMaxImprovingMoves; ++move) {
-    if (twoOptMove(order, leg, lo)) continue;
-    if (orOptMove(order, leg, lo)) continue;
-    break;
+  int moves = 0;
+  while (moves < kMaxImprovingMoves &&
+         (twoOptMove(order, leg, lo) || orOptMove(order, leg, lo))) {
+    ++moves;
   }
   OpenTour tour;
+  tour.improving_moves = moves;
   tour.cost = openTourCost(order, from_start, between);
   tour.order = std::move(order);
   return tour;
@@ -168,7 +166,9 @@ OpenTour solveOpenTour(const std::vector<double>& from_start,
         cost += leg(previous, index);
         previous = index;
       }
-      if (improves(cost - best_cost, cost)) {
+      // Enumeration cannot cycle, so the tight absolute test: half a
+      // millimetre still picks the first cluster before a disconnected leg.
+      if (cost < best_cost - kImproveEps) {
         best_cost = cost;
         best = rest;
       }

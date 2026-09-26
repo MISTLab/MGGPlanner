@@ -23,6 +23,9 @@ inline constexpr double kUnreachableCost =
 /// Up to this many clusters after a fixed first one, solveOpenTour tries
 /// every order (7! = 5040).
 inline constexpr std::size_t kExactTourMaxClusters = 7;
+/// improveOpenTour stops after this many moves. Every move lowers the cost,
+/// so the search ends long before; it only bounds a pathological input.
+inline constexpr int kMaxImprovingMoves = 100000;
 
 struct OpenTour {
   /// Cluster indices in visiting order.
@@ -30,6 +33,10 @@ struct OpenTour {
   /// from_start of the first plus every leg between; kUnreachableCost when
   /// a leg is, or when a required first cluster cannot be reached.
   double cost = 0.0;
+  /// The 2-opt and Or-opt moves made; kMaxImprovingMoves when the search
+  /// stopped at its cap rather than converging. 0 when every order was
+  /// tried.
+  int improving_moves = 0;
 };
 
 /// Cost of visiting `order`: from_start[order[0]] plus `between` along it,
