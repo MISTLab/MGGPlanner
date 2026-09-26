@@ -129,4 +129,18 @@ TEST(FleetConversions, StampsSurviveTheRoundTrip) {
   EXPECT_EQ(mgg_ros::stampFromSeconds(std::nan("")).nanosec, 0u);
 }
 
+TEST(FleetConversions, UnrepresentableStampsBecomeZero) {
+  // ROS Time stores whole seconds in a signed 32-bit field. Reject before
+  // narrowing; an out-of-range floating-point to integer cast is undefined.
+  for (const double seconds : {2147483648.0, 1e300}) {
+    const auto stamp = mgg_ros::stampFromSeconds(seconds);
+    EXPECT_EQ(stamp.sec, 0);
+    EXPECT_EQ(stamp.nanosec, 0u);
+  }
+  const auto last_second = mgg_ros::stampFromSeconds(2147483647.0);
+  EXPECT_EQ(last_second.sec, 2147483647);
+  EXPECT_EQ(last_second.nanosec, 0u);
+  EXPECT_DOUBLE_EQ(mgg_ros::stampSeconds(last_second), 2147483647.0);
+}
+
 }  // namespace

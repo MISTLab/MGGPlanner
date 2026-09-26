@@ -18,7 +18,8 @@
 namespace mgg_ros {
 
 double stampSeconds(const builtin_interfaces::msg::Time& stamp);
-/// The zero stamp for a time that is not finite and positive.
+/// The zero stamp for a time that is not finite and positive, or whose
+/// whole seconds do not fit in ROS Time's signed 32-bit field.
 builtin_interfaces::msg::Time stampFromSeconds(double seconds);
 
 mgg::TourBidData fromTourBidMsg(const mgg_msgs::msg::TourBid& msg,

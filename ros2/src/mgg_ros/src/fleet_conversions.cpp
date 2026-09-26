@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <limits>
 
 #include "mgg_ros/conversions.h"
 
@@ -59,7 +60,11 @@ double stampSeconds(const builtin_interfaces::msg::Time& stamp) {
 
 builtin_interfaces::msg::Time stampFromSeconds(double seconds) {
   builtin_interfaces::msg::Time stamp;
-  if (!std::isfinite(seconds) || seconds <= 0.0) return stamp;
+  const double seconds_limit =
+      static_cast<double>(std::numeric_limits<std::int32_t>::max()) + 1.0;
+  if (!std::isfinite(seconds) || seconds <= 0.0 || seconds >= seconds_limit) {
+    return stamp;
+  }
   const double whole = std::floor(seconds);
   stamp.sec = static_cast<std::int32_t>(whole);
   stamp.nanosec = static_cast<std::uint32_t>(
