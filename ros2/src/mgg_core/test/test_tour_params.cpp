@@ -18,6 +18,7 @@ TEST(TourParams, DefaultsAreTheDesignTable) {
   EXPECT_DOUBLE_EQ(p.cluster_id_cell_m, 1.0);
   EXPECT_DOUBLE_EQ(p.recompute_interval_s, 1.0);
   EXPECT_DOUBLE_EQ(p.commit_margin, 0.2);
+  EXPECT_DOUBLE_EQ(p.route_retry_s, 30.0);
 }
 
 TEST(FleetParams, DefaultsAreTheDesignTable) {
@@ -38,12 +39,14 @@ TEST(TourParams, ClampingRepairsOutOfRangeValues) {
   p.heading_weight = std::numeric_limits<double>::quiet_NaN();
   p.recompute_interval_s = -1.0;
   p.commit_margin = 1.5;
+  p.route_retry_s = -3.0;
   mgg::clampTourParams(p);
   EXPECT_DOUBLE_EQ(p.min_cluster_gain, 0.0);
   EXPECT_DOUBLE_EQ(p.cluster_id_cell_m, mgg::kMinClusterCellM);
   EXPECT_DOUBLE_EQ(p.heading_weight, 2.0);  // NaN takes the default
   EXPECT_DOUBLE_EQ(p.recompute_interval_s, 0.0);
   EXPECT_DOUBLE_EQ(p.commit_margin, 0.95);
+  EXPECT_DOUBLE_EQ(p.route_retry_s, 0.0);
 
   mgg::TourParams in_range;
   in_range.commit_margin = 0.35;

@@ -296,6 +296,12 @@ class PlannerNode : public rclcpp::Node {
   /// tour last looked: most writers bump it only for new vertices, and an
   /// edge alone can make a cluster reachable (GraphDistanceCache).
   void noteGlobalGraphEdges();
+  /// Leaves the tour's cluster `id` out of its solves, and releases it as
+  /// the target, until the robot moves more than kTourSetAsideMoveM from
+  /// here, the graph revision changes or tour.route_retry_s passes: the
+  /// robot could not be routed to it, or stands on its representative (the
+  /// route's source, which the tour costs zero and no route leaves).
+  void setTourClusterAside(mgg::ClusterId id);
   /// Every frontier cluster of the global graph, other robots' included,
   /// under its stable name (tour-exploration design §2.1).
   std::vector<mgg::FrontierCluster> globalFrontierClusters();
@@ -519,6 +525,16 @@ class PlannerNode : public rclcpp::Node {
   /// The global graph's edge count when the tour last looked
   /// (noteGlobalGraphEdges).
   int tour_graph_edges_ = -1;
+  /// Clusters setTourClusterAside left out of the tour: where the robot
+  /// stood, the graph revision and the time then.
+  struct TourSetAside {
+    Eigen::Vector3d position = Eigen::Vector3d::Zero();
+    std::uint64_t graph_revision = 0;
+    double at_s = 0.0;
+  };
+  std::unordered_map<mgg::ClusterId, TourSetAside> tour_set_aside_;
+  /// Tour targets the robot could not be routed to.
+  int tour_routes_failed_ = 0;
 
   /// Frontiers reserved by peers, in the planning frame, and how long a
   /// message stays in force.

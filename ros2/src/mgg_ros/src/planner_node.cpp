@@ -37,6 +37,9 @@ constexpr double kLinkRadius = 1.5;
 // A goal only stands for a vertex it practically coincides with; any farther
 // and it gets its own vertex with checked edges.
 constexpr double kGoalLinkRadius = 0.1;
+/// A cluster set aside from the tour (setTourClusterAside) returns once the
+/// robot is this far from where it was set aside.
+constexpr double kTourSetAsideMoveM = 2.0;
 /// A robot that has moved less than this from its first odometry, and whose
 /// keyframes all lie within this of its home keyframe, has not left its
 /// start (PlannerNode::standingStart).
@@ -513,6 +516,14 @@ mgg::Vertex* PlannerNode::linkRobotToGlobalGraph() {
   return link;
 }
 
+void PlannerNode::setTourClusterAside(mgg::ClusterId id) {
+  // The revision it is set aside at includes any edge change so far.
+  noteGlobalGraphEdges();
+  tour_set_aside_[id] =
+      TourSetAside{current_state_.head<3>(), graph_revision_, now().seconds()};
+  tour_planner_->releaseTarget();
+}
+
 void PlannerNode::noteGlobalGraphEdges() {
   const int edges = global_graph_->getNumEdges();
   if (edges == tour_graph_edges_) return;
@@ -563,6 +574,25 @@ std::optional<mgg::FrontierCluster> PlannerNode::refreshTour(
   noteGlobalGraphEdges();
   std::vector<mgg::FrontierCluster> clusters =
       tourCandidates(globalFrontierClusters());
+  const double now_s = now().seconds();
+  // Clusters set aside stay out until something that could change the
+  // outcome has: the robot's position, the graph, or the retry deadline
+  // (a clock that went backwards counts as passed).
+  for (auto it = tour_set_aside_.begin(); it != tour_set_aside_.end();) {
+    const TourSetAside& aside = it->second;
+    const bool lapsed =
+        (current_state_.head<3>() - aside.position).norm() >
+            kTourSetAsideMoveM ||
+        graph_revision_ != aside.graph_revision || now_s < aside.at_s ||
+        now_s - aside.at_s >= tour_params_.route_retry_s;
+    it = lapsed ? tour_set_aside_.erase(it) : std::next(it);
+  }
+  clusters.erase(std::remove_if(clusters.begin(), clusters.end(),
+                                [this](const mgg::FrontierCluster& cluster) {
+                                  return tour_set_aside_.count(cluster.id) >
+                                         0;
+                                }),
+                 clusters.end());
   // Reached: within global_frontier_reach_m of it, as a repositioning's
   // frontier is (onPlanRequest). The next solve chooses freely. A target
   // released as reached once is not released again (tour_reached_cluster_).
@@ -576,7 +606,6 @@ std::optional<mgg::FrontierCluster> PlannerNode::refreshTour(
       break;
     }
   }
-  const double now_s = now().seconds();
   if (tour_planner_->needsSolve(clusters, graph_revision_,
                                 tour_assignment_version_, now_s)) {
     mgg::Vertex* link = linkRobotToGlobalGraph();
@@ -2541,7 +2570,16 @@ void PlannerNode::onPlanRequest(
         auto map_read = mapReadLease();
         const std::vector<mgg::StateVec> local_path = best_path_;
         std::string departure;
-        if (runGlobalPlanner(tour_target->representative_vertex_id, reason)) {
+        const mgg::Vertex* source = linkRobotToGlobalGraph();
+        if (source != nullptr &&
+            source->id == tour_target->representative_vertex_id) {
+          // The robot stands on the target's representative: reached, and
+          // local exploration has nothing here. The tour costs it zero and
+          // a route cannot leave from it, so it is set aside, not routed to.
+          setTourClusterAside(tour_target->id);
+          summary += "; the robot stands on the tour's target: reached";
+        } else if (runGlobalPlanner(tour_target->representative_vertex_id,
+                                    reason)) {
           tour_decided = true;
           low_gain_rounds_ = 0;
           if (depart_instead_of_turning_route(departure)) {
@@ -2557,8 +2595,9 @@ void PlannerNode::onPlanRequest(
           // cycle keeps what local exploration found.
           best_path_ = local_path;
           best_path_from_global_graph_ = false;
-          tour_planner_->releaseTarget();
-          summary += "; no route to the tour's target: " + reason;
+          ++tour_routes_failed_;
+          setTourClusterAside(tour_target->id);
+          summary += "; no route to the tour's target, set aside: " + reason;
         }
       }
     }

@@ -309,6 +309,7 @@ bool loadTourParams(const ParamLoader& p, const std::string& ns,
   p.get(ns + "/heading_weight", out.heading_weight);
   p.get(ns + "/recompute_interval_s", out.recompute_interval_s);
   p.get(ns + "/commit_margin", out.commit_margin);
+  p.get(ns + "/route_retry_s", out.route_retry_s);
   mgg::clampTourParams(out);
   return true;
 }

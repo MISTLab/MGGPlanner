@@ -56,6 +56,7 @@ class ParamFixture : public ::testing::Test {
         {"tour.enabled", false},
         {"tour.min_cluster_gain", 250.0},
         {"tour.commit_margin", 0.3},
+        {"tour.route_retry_s", 12.0},
         {"fleet.claim_ttl_s", 600},
         {"fleet.balance_weight", 0.5},
         {"fleet.cluster_merge_radius_m", 0.0},
@@ -143,6 +144,7 @@ TEST_F(ParamFixture, LoadsTourAndFleetParams) {
   EXPECT_FALSE(tour.enabled);
   EXPECT_DOUBLE_EQ(tour.min_cluster_gain, 250.0);
   EXPECT_DOUBLE_EQ(tour.commit_margin, 0.3);
+  EXPECT_DOUBLE_EQ(tour.route_retry_s, 12.0);
   // Absent from the overrides: the design default survives.
   EXPECT_DOUBLE_EQ(tour.cluster_id_cell_m, 1.0);
 

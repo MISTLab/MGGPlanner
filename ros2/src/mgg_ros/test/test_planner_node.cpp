@@ -476,6 +476,38 @@ class PlannerNodeTestPeer {
     node.global_graph_->addEdge(u, v,
                                 (u->state - v->state).head<3>().norm());
   }
+  /// A vertex of no edge at (x, y) at the root's height, as a merged or
+  /// quarantined remnant may be.
+  static int addIsolatedGlobalVertex(PlannerNode& node, double x, double y) {
+    const std::lock_guard<std::recursive_mutex> lock(node.planner_mutex_);
+    node.seedGlobalGraph();
+    auto* v = new mgg::Vertex(
+        node.global_graph_->generateVertexID(),
+        mgg::StateVec(x, y, node.global_graph_->getVertex(0)->state.z(), 0.0));
+    v->robot_id = static_cast<int>(node.planning_params_.robot_id);
+    node.global_graph_->addVertex(v);
+    ++node.graph_revision_;
+    return v->id;
+  }
+  static void markGlobalFrontier(PlannerNode& node, int id) {
+    const std::lock_guard<std::recursive_mutex> lock(node.planner_mutex_);
+    node.findGlobalVertex(id)->type = mgg::VertexType::kFrontier;
+    ++node.graph_revision_;
+  }
+  static int tourRoutesFailed(PlannerNode& node) {
+    const std::lock_guard<std::recursive_mutex> lock(node.planner_mutex_);
+    return node.tour_routes_failed_;
+  }
+  /// Where the tour's target is; NaN when it has none.
+  static Eigen::Vector3d tourTargetPosition(PlannerNode& node) {
+    const std::lock_guard<std::recursive_mutex> lock(node.planner_mutex_);
+    const mgg::TourPlan& plan = node.tour_planner_->plan();
+    if (node.tour_planner_->target() == mgg::kNoCluster ||
+        plan.clusters.empty()) {
+      return Eigen::Vector3d::Constant(std::nan(""));
+    }
+    return plan.clusters.front().position;
+  }
   static mgg::ClusterId tourTarget(PlannerNode& node) {
     const std::lock_guard<std::recursive_mutex> lock(node.planner_mutex_);
     return node.tour_planner_->target();
@@ -2276,6 +2308,58 @@ TEST_F(PlannerNodeTest, AnEdgeAloneThatConnectsAClusterReachesTheTour) {
   EXPECT_EQ(PlannerNodeTestPeer::refreshTour(*node), mgg::kNoCluster);
   PlannerNodeTestPeer::addGlobalEdgeOnly(*node, a, b);
   EXPECT_NE(PlannerNodeTestPeer::refreshTour(*node), mgg::kNoCluster);
+}
+
+TEST_F(PlannerNodeTest, ATourTargetThatCannotBeRoutedToIsSetAside) {
+  // Review r0, I-2: exploredDeadEnd, and a second frontier at (-0.5, 1.5)
+  // beyond the corridor's wall, the tour's first choice. A vertex of no
+  // edge was left at that very spot before it, and a route to a position
+  // ends at the vertex found there first: the tour costs the frontier's
+  // own vertex, the route cannot reach the one it finds. The failed target
+  // is set aside, the tour takes the frontier behind instead, and nothing
+  // changed that could make the first reachable: it is not tried again.
+  int behind = -1;
+  auto node = exploredDeadEnd("tour_route_fails", behind);
+  PlannerNodeTestPeer::addIsolatedGlobalVertex(*node, -0.5, 1.5);
+  PlannerNodeTestPeer::addGlobalChainToFrontier(
+      *node, {{-0.5, 0.75}, {-0.5, 1.5}}, M_PI / 2.0);
+  PlannerNodeTestPeer::setTour(*node, true, 0.0);
+
+  auto response = std::make_shared<mgg_msgs::srv::PlannerSrv::Response>();
+  PlannerNodeTestPeer::plan(*node, response);
+  EXPECT_EQ(PlannerNodeTestPeer::tourRoutesFailed(*node), 1);
+  EXPECT_EQ(PlannerNodeTestPeer::tourTarget(*node), mgg::kNoCluster);
+  for (int cycle = 0; cycle < 3; ++cycle) {
+    SCOPED_TRACE("cycle " + std::to_string(cycle + 2));
+    response = std::make_shared<mgg_msgs::srv::PlannerSrv::Response>();
+    PlannerNodeTestPeer::plan(*node, response);
+    EXPECT_EQ(PlannerNodeTestPeer::tourRoutesFailed(*node), 1);
+    const Eigen::Vector3d target =
+        PlannerNodeTestPeer::tourTargetPosition(*node);
+    EXPECT_NEAR(target.x(), -2.5, 1e-6);
+    EXPECT_NEAR(target.y(), 0.0, 1e-6);
+  }
+}
+
+TEST_F(PlannerNodeTest, ATourTargetTheRobotStandsOnIsReachedNotAFailedRoute) {
+  // Review r0, I-2: exploredDeadEnd with the root, where the robot stands,
+  // a frontier too. The tour costs that cluster zero, and a route from the
+  // robot's vertex to itself is "already at the goal". It counts as
+  // reached: set aside with no route tried, and the tour takes the
+  // frontier behind next.
+  int behind = -1;
+  auto node = exploredDeadEnd("tour_stands_on_target", behind);
+  PlannerNodeTestPeer::markGlobalFrontier(*node, 0);
+  PlannerNodeTestPeer::setTour(*node, true, 0.0);
+
+  auto response = std::make_shared<mgg_msgs::srv::PlannerSrv::Response>();
+  PlannerNodeTestPeer::plan(*node, response);
+  EXPECT_EQ(PlannerNodeTestPeer::tourRoutesFailed(*node), 0);
+  EXPECT_EQ(PlannerNodeTestPeer::tourTarget(*node), mgg::kNoCluster);
+  response = std::make_shared<mgg_msgs::srv::PlannerSrv::Response>();
+  PlannerNodeTestPeer::plan(*node, response);
+  EXPECT_EQ(PlannerNodeTestPeer::tourRoutesFailed(*node), 0);
+  EXPECT_NEAR(PlannerNodeTestPeer::tourTargetPosition(*node).x(), -2.5, 1e-6);
 }
 
 TEST_F(PlannerNodeTest, AReachedTourTargetThatIsStillAFrontierIsReleasedOnce) {

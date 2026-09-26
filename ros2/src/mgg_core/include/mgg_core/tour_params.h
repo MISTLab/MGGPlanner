@@ -32,6 +32,10 @@ struct TourParams {
   /// Fraction of the remaining tour cost a new first cluster must save to
   /// replace the current target.
   double commit_margin = 0.2;
+  /// A cluster the robot could not be routed to is left out of the tour
+  /// for at most this long, seconds; sooner when the robot moves or the
+  /// graph changes.
+  double route_retry_s = 30.0;
 };
 
 struct FleetParams {
@@ -78,6 +82,8 @@ inline void clampTourParams(TourParams& p) {
       0.0, detail::finiteOr(p.recompute_interval_s, d.recompute_interval_s));
   p.commit_margin = std::clamp(
       detail::finiteOr(p.commit_margin, d.commit_margin), 0.0, 0.95);
+  p.route_retry_s =
+      std::max(0.0, detail::finiteOr(p.route_retry_s, d.route_retry_s));
 }
 
 inline void clampFleetParams(FleetParams& p) {
