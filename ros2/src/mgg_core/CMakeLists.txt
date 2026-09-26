@@ -52,6 +52,7 @@ add_library(${PROJECT_NAME}
   src/tour_planner.cpp
   src/fleet_types.cpp
   src/fleet_auction.cpp
+  src/fleet_claims.cpp
   src/random_sampler.cpp
   src/log.cpp)
 target_include_directories(${PROJECT_NAME} PUBLIC
@@ -120,6 +121,8 @@ if(BUILD_TESTING)
   target_link_libraries(test_fleet_types ${PROJECT_NAME})
   ament_add_gtest(test_fleet_auction test/test_fleet_auction.cpp)
   target_link_libraries(test_fleet_auction ${PROJECT_NAME})
+  ament_add_gtest(test_fleet_claims test/test_fleet_claims.cpp)
+  target_link_libraries(test_fleet_claims ${PROJECT_NAME})
 endif()
 
 ament_package()
