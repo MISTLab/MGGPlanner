@@ -51,8 +51,12 @@ class ClaimRegistry {
   int releaseOldest(const std::set<int>& candidates);
 
   const Claim* find(int robot_id) const;
+  /// Holders in ascending robot ID.
   std::vector<int> robots() const;
+  /// The claimed clusters of `robots`, in ascending holder ID, each claim's
+  /// in its bundle order.
   std::vector<FleetCluster> clustersOf(const std::set<int>& robots) const;
+  /// Every claimed cluster not held by `robot_id`, in the same order.
   std::vector<FleetCluster> clustersExcept(int robot_id) const;
 
  private:

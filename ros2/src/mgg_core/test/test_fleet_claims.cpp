@@ -48,6 +48,19 @@ TEST(ClaimRegistry, RecordingKeepsTheLatestHeardTimeAndDropsAnEmptyBundle) {
   EXPECT_TRUE(claims.robots().empty());
 }
 
+// heard() sets the receipt time; an award's older time recorded afterwards
+// does not move it back.
+TEST(ClaimRegistry, AnOlderAwardTimeAfterHearingKeepsTheReceiptTime) {
+  ClaimRegistry claims;
+  claims.record(2, {cluster(21, 2, 10.0)}, 100.0);
+  claims.heard(2, 500.0);
+  claims.record(2, {cluster(22, 2, 12.0)}, 100.0);
+  ASSERT_NE(claims.find(2), nullptr);
+  EXPECT_DOUBLE_EQ(claims.find(2)->last_heard_s, 500.0);
+  ASSERT_EQ(claims.find(2)->clusters.size(), 1u);
+  EXPECT_EQ(claims.find(2)->clusters[0].id, 22u);
+}
+
 TEST(ClaimRegistry, ExploredClustersLeaveEveryClaim) {
   ClaimRegistry claims;
   claims.record(2, {cluster(21, 2, 10.0), cluster(22, 2, 20.0)}, 0.0);
@@ -82,6 +95,18 @@ TEST(ClaimRegistry, TheLongestSilentCandidateIsReleasedFirst) {
   EXPECT_NE(claims.find(4), nullptr);
 }
 
+// The coordinator finds the oldest claim itself and expects releaseOldest
+// to release the same one.
+TEST(ClaimRegistry, EquallySilentCandidatesAreReleasedLowerIdFirst) {
+  ClaimRegistry claims;
+  claims.record(5, {cluster(51, 5, 10.0)}, 20.0);
+  claims.record(3, {cluster(31, 3, 20.0)}, 20.0);
+  claims.record(4, {cluster(41, 4, 30.0)}, 20.0);
+  EXPECT_EQ(claims.releaseOldest({3, 4, 5}), 3);
+  EXPECT_EQ(claims.releaseOldest({3, 4, 5}), 4);
+  EXPECT_EQ(claims.releaseOldest({3, 4, 5}), 5);
+}
+
 TEST(ClaimRegistry, ClustersByHolder) {
   ClaimRegistry claims;
   claims.record(1, {cluster(11, 1, 1.0)}, 0.0);
@@ -92,6 +117,24 @@ TEST(ClaimRegistry, ClustersByHolder) {
   const std::vector<FleetCluster> others = claims.clustersExcept(1);
   ASSERT_EQ(others.size(), 3u);
   for (const FleetCluster& c : others) EXPECT_NE(c.owner_robot_id, 1);
+}
+
+// The auctioneer's pool is built from these lists: ascending holder ID, each
+// claim in its bundle order, whatever order the claims were recorded in.
+TEST(ClaimRegistry, ClustersComeByHolderIdThenInBundleOrder) {
+  ClaimRegistry claims;
+  claims.record(3, {cluster(32, 3, 4.0), cluster(31, 3, 5.0)}, 0.0);
+  claims.record(1, {cluster(11, 1, 1.0)}, 0.0);
+  claims.record(2, {cluster(22, 2, 3.0), cluster(21, 2, 2.0)}, 0.0);
+  const auto ids = [](const std::vector<FleetCluster>& clusters) {
+    std::vector<mgg::ClusterId> out;
+    for (const FleetCluster& c : clusters) out.push_back(c.id);
+    return out;
+  };
+  EXPECT_EQ(ids(claims.clustersExcept(1)),
+            (std::vector<mgg::ClusterId>{22, 21, 32, 31}));
+  EXPECT_EQ(ids(claims.clustersOf({3, 1})),
+            (std::vector<mgg::ClusterId>{11, 32, 31}));
 }
 
 // Keeping a pre-reset timestamp would delay expiry until the old clock
