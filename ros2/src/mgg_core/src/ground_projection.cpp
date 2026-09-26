@@ -463,10 +463,11 @@ bool GroundProjection::groundBridged(BridgeCells& cells,
     const double rise = ahead.z - behind.z;
     if (std::abs(rise) > (to_ahead + to_behind) * grade + 1e-9) continue;
     const double bridged = behind.z + rise * to_behind / (to_ahead + to_behind);
-    // A free voxel in the column deeper than kGroundBridgeHoleDepth under
-    // the bridged ground is a hole the lidar looked into, however deep.
+    // A free voxel in the column from kGroundBridgeHoleDepth to
+    // max_projection_length under the bridged ground is a hole the lidar
+    // looked into (review r1, P2: 5.0 m, not 5.3).
     const bool hole = freeInColumn(cell, bridged - kGroundBridgeHoleDepth,
-                                   max_projection_length);
+                                   bridged - max_projection_length);
     if (!hole) return true;
   }
   return false;
@@ -612,24 +613,35 @@ bool GroundProjection::footprintGroundBelow(const Eigen::Vector3d& point,
 }
 
 bool GroundProjection::freeInColumn(const Eigen::Vector2d& cell, double top,
-                                    double depth) const {
+                                    double bottom) const {
   const double resolution = map_.getResolution();
-  if (!(resolution > 0.0) || !(depth > 0.0) || !std::isfinite(top)) {
+  if (!(resolution > 0.0) || !std::isfinite(top) || !std::isfinite(bottom) ||
+      !(bottom < top)) {
     return false;
   }
+  // The column is sampled once per voxel, at heights (k + 1/2) resolution
+  // from `from` down to `to`, so that cached and uncached asks see the same
+  // samples and a voxel counts when its sample lies between the bounds.
   const auto sample = [&](double from, double to, std::vector<double>& free) {
-    for (double z = from - 0.5 * resolution; z >= to; z -= resolution) {
+    const auto highest =
+        static_cast<std::int64_t>(std::floor(from / resolution - 0.5));
+    const auto lowest =
+        static_cast<std::int64_t>(std::ceil(to / resolution - 0.5));
+    for (std::int64_t k = highest; k >= lowest; --k) {
+      const double z = (static_cast<double>(k) + 0.5) * resolution;
       if (map_.getVoxelStatus(Eigen::Vector3d(cell.x(), cell.y(), z)) ==
           VoxelStatus::kFree) {
         free.push_back(z);
       }
     }
   };
-  const double bottom = top - depth;
+  const auto between = [&](double z) {
+    return z <= top + 1e-9 && z >= bottom - 1e-9;
+  };
   if (!cache_footprint_ground_) {
     std::vector<double> free;
     sample(top, bottom, free);
-    return !free.empty();
+    return std::any_of(free.begin(), free.end(), between);
   }
   // A column is asked about again from nearly the same height, for each
   // footprint and neighbour that bridges it: sampled once with a metre to
@@ -642,8 +654,7 @@ bool GroundProjection::freeInColumn(const Eigen::Vector2d& cell, double top,
     column.free_z.clear();
     sample(column.top, column.bottom, column.free_z);
   }
-  return std::any_of(column.free_z.begin(), column.free_z.end(),
-                     [&](double z) { return z <= top && z >= bottom; });
+  return std::any_of(column.free_z.begin(), column.free_z.end(), between);
 }
 
 FootprintPlane GroundProjection::footprintPlane(

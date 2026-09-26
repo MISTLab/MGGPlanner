@@ -250,8 +250,8 @@ class GroundProjection {
   /// observed ground (the window reaching a cell's rise at max_inclination
   /// further down) whose two heights differ by no more than max_inclination
   /// over their distance, and no free voxel in the cell's column more than
-  /// kGroundBridgeHoleDepth under the ground interpolated between them, down
-  /// to max_projection_length under it. The
+  /// kGroundBridgeHoleDepth and no more than max_projection_length under
+  /// the ground interpolated between them. The
   /// lidar sees a ramp down past a crest only in patches (diag-ramp, run
   /// 7: 84 % of its cells 0-1 m down, 17 % 4-5 m down), and the crest read
   /// as a ledge. A drop has no observed ground on its far side at a
@@ -326,11 +326,12 @@ class GroundProjection {
   bool groundBridged(BridgeCells& cells, const Eigen::Vector2d& cell,
                      const Eigen::Vector2d& along, double from_z,
                      double lowest) const;
-  /// Whether the map has a free voxel in the column of `cell` from `top`
-  /// down to `top` - `depth` (to within a voxel), through the cache when
-  /// there is one.
+  /// Whether the map has a free voxel in the column of `cell` between the
+  /// heights `bottom` and `top`: sampled once per voxel, at (k + 1/2)
+  /// resolution, a voxel counts when its sample lies between them. Through
+  /// the cache when there is one.
   bool freeInColumn(const Eigen::Vector2d& cell, double top,
-                    double depth) const;
+                    double bottom) const;
   FootprintPlane measureFootprintPlane(const Eigen::Vector3d& point,
                                        const Eigen::Vector2d& heading,
                                        const Eigen::Vector3d& box_size) const;

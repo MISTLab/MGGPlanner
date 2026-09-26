@@ -2038,9 +2038,9 @@ enum class Trench {
   /// unobserved and its inside carved free, as a lidar looking into it
   /// leaves it.
   kSeenInto,
-  /// The same cells unobserved but for one free voxel 1.4 to 1.6 m down:
-  /// a lidar looked into it only from far off, through the trench's
-  /// width, and carved only its depth.
+  /// The same cells unobserved but for one free voxel, 1.4 to 1.6 m down
+  /// unless sparseRampCrest says otherwise: a lidar looked into it only
+  /// from far off, through the trench's width, and carved only its depth.
   kSeenDeepInto,
   /// The same cells unobserved, with nothing carved in them.
   kUnseen,
@@ -2058,10 +2058,12 @@ enum class Trench {
 /// the floor behind the crest. From `wall_from_x`, a wall 0.4 m thick
 /// crosses the ramp, observed; up to `air_seen_to_x`, the air over the
 /// ramp's unobserved cells is observed free, their ground still not.
+/// `seen_deep_iz` is the row of Trench::kSeenDeepInto's free voxel.
 std::unique_ptr<mgg::NativeMolaGrid> sparseRampCrest(
     Trench trench = Trench::kNone,
     double wall_from_x = std::numeric_limits<double>::infinity(),
-    double air_seen_to_x = -std::numeric_limits<double>::infinity()) {
+    double air_seen_to_x = -std::numeric_limits<double>::infinity(),
+    std::int64_t seen_deep_iz = -8) {
   constexpr double kResolution = 0.2;
   const double grade = std::tan(16.0 * M_PI / 180.0);
   std::vector<mgg::NativeMolaGrid::Cell> occupied;
@@ -2082,7 +2084,9 @@ std::unique_ptr<mgg::NativeMolaGrid> sparseRampCrest(
              trench == Trench::kSeenInto && iz < cell(2.0); ++iz) {
           free.push_back({ix, iy, iz});
         }
-        if (trench == Trench::kSeenDeepInto) free.push_back({ix, iy, -8});
+        if (trench == Trench::kSeenDeepInto) {
+          free.push_back({ix, iy, seen_deep_iz});
+        }
         continue;
       }
       if (x >= wall_from_x && x < wall_from_x + 0.4) {
@@ -2430,6 +2434,27 @@ TEST(ObservedGround, AHoleTheLidarLookedIntoIsNotBridged) {
     const mgg::GroundProjection deep_ground(*seen_deep, planning, cached);
     EXPECT_LT(deep_ground.observedGroundAhead(before, east, box),
               planning.min_observed_ground_fraction);
+  }
+  // Review r1 (P2): free space vetoes the bridge down to 5.0 m under the
+  // bridged floor (max_projection_length), not deeper: a free voxel 4.8 to
+  // 5.0 m down is a hole, one 5.0 to 5.2 m down is not looked at.
+  for (const bool cached : {false, true}) {
+    for (const std::int64_t row : {std::int64_t(-25), std::int64_t(-26)}) {
+      SCOPED_TRACE(std::string(cached ? "cached" : "uncached") + ", row " +
+                   std::to_string(row));
+      const auto at_depth = sparseRampCrest(
+          Trench::kSeenDeepInto, std::numeric_limits<double>::infinity(),
+          -std::numeric_limits<double>::infinity(), row);
+      const mgg::GroundProjection depth_ground(*at_depth, planning, cached);
+      ASSERT_DOUBLE_EQ(depth_ground.max_projection_length, 5.0);
+      const double fraction =
+          depth_ground.observedGroundAhead(before, east, box);
+      if (row == -25) {
+        EXPECT_LT(fraction, planning.min_observed_ground_fraction);
+      } else {
+        EXPECT_GE(fraction, planning.min_observed_ground_fraction);
+      }
+    }
   }
   // Not looked into, the same gap is bridged: 0.4 m between observed floor
   // at one height is taken for floor.
