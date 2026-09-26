@@ -34,17 +34,21 @@ std::vector<int> FleetCoordinator::group(double now_s) const {
   return members;
 }
 
-void FleetCoordinator::noteHeard(int robot_id, double now_s) {
-  const auto found = last_heard_s_.find(robot_id);
-  if (found == last_heard_s_.end()) {
-    last_heard_s_[robot_id] = now_s;
-  } else {
-    found->second = std::max(found->second, now_s);
+void FleetCoordinator::rebaseFutureTimes(double now_s) {
+  for (auto& [robot_id, heard_s] : last_heard_s_) {
+    heard_s = std::min(heard_s, now_s);
   }
+}
+
+void FleetCoordinator::noteHeard(int robot_id, double now_s) {
+  // The receipt time itself, even when earlier than the one kept: after a
+  // clock reset the kept time would hold the robot in the group.
+  last_heard_s_[robot_id] = now_s;
   claims_.heard(robot_id, now_s);
 }
 
 void FleetCoordinator::onBid(const TourBidData& bid, double now_s) {
+  rebaseFutureTimes(now_s);
   if (bid.robot_id == robot_id_ || !bid.wellFormed()) return;
   noteHeard(bid.robot_id, now_s);
   last_bids_[bid.robot_id] = bid;
@@ -55,6 +59,7 @@ void FleetCoordinator::onBid(const TourBidData& bid, double now_s) {
 }
 
 void FleetCoordinator::onAward(const TourAwardData& award, double now_s) {
+  rebaseFutureTimes(now_s);
   if (award.auctioneer_id == robot_id_) return;
   noteHeard(award.auctioneer_id, now_s);
   // A robot that left the sender's group, or whose group just merged with a
@@ -85,6 +90,7 @@ void FleetCoordinator::requestAuction() {
 FleetTickOutput FleetCoordinator::tick(double now_s, const OwnBidFn& own_bid,
                                        const CostEstimateFn& estimate,
                                        const ExploredFn& explored) {
+  rebaseFutureTimes(now_s);
   FleetTickOutput out;
   bool claims_changed = !claims_.expire(now_s, params_.claim_ttl_s).empty();
   if (explored && claims_.dropExplored(explored) > 0) claims_changed = true;
@@ -311,12 +317,14 @@ void FleetCoordinator::applyAward(const TourAwardData& award, double now_s) {
       continue;
     }
     // Last heard as the auctioneer knows it, so a silent robot's claim ages
-    // here as it does there.
+    // here as it does there; never after now, so that after a clock reset
+    // awards naming a silent robot do not keep its claim in the future.
     double heard_s = now_s - std::max(0.0, bundle.silent_s);
     const auto known = last_heard_s_.find(bundle.robot_id);
     if (known != last_heard_s_.end()) {
       heard_s = std::max(heard_s, known->second);
     }
+    heard_s = std::min(heard_s, now_s);
     claims_.record(bundle.robot_id, std::move(clusters), heard_s);
   }
   // A robot the award does not name (its bid missed the deadline) keeps its
@@ -336,6 +344,7 @@ void FleetCoordinator::applyAward(const TourAwardData& award, double now_s) {
 }
 
 bool FleetCoordinator::releaseClaims(int robot_id, double now_s) {
+  rebaseFutureTimes(now_s);
   if (auctioneer(now_s) != robot_id_) return false;
   claims_.release(robot_id);
   pending_releases_.push_back(robot_id);
@@ -344,6 +353,7 @@ bool FleetCoordinator::releaseClaims(int robot_id, double now_s) {
 }
 
 int FleetCoordinator::takeOverOldestClaim(double now_s) {
+  rebaseFutureTimes(now_s);
   const std::vector<int> members = group(now_s);
   std::set<int> silent;
   for (const int robot_id : claims_.robots()) {
@@ -355,6 +365,7 @@ int FleetCoordinator::takeOverOldestClaim(double now_s) {
 }
 
 std::vector<FleetCluster> FleetCoordinator::claimedByOthers(double now_s) {
+  rebaseFutureTimes(now_s);
   if (!claims_.expire(now_s, params_.claim_ttl_s).empty()) {
     ++assignment_version_;
   }

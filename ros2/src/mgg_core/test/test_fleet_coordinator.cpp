@@ -4,6 +4,7 @@
 // and their release. Time is simulated.
 
 #include <algorithm>
+#include <cstdint>
 #include <map>
 #include <memory>
 #include <set>
@@ -482,6 +483,60 @@ TEST(FleetCoordinator, AnOperatorReleaseIsForwardedInTheNextAward) {
   for (const FleetCluster& c : r1.coordinator->claimedByOthers(now)) {
     EXPECT_NE(c.id, 31u);
   }
+}
+
+
+bool holds(const std::vector<int>& robots, int robot_id) {
+  return std::find(robots.begin(), robots.end(), robot_id) != robots.end();
+}
+
+// A clock reset (a simulation restart) moves now_s backwards. The last time
+// a silent robot was heard, from before the reset, must neither keep its
+// claim alive nor keep it in the group while the auctioneer's awards keep
+// naming its claim.
+TEST(FleetCoordinator, AfterAClockRollbackASilentRobotsClaimAgesFromTheReset) {
+  FleetParams params;
+  params.claim_ttl_s = 600.0;
+  FleetCoordinator coordinator(2, params, 0.2);
+  // Robot 1 is the auctioneer; robot 3 holds cluster 31 and is silent for
+  // `silent_s` as robot 1 knows it.
+  const auto award = [](std::uint64_t auction_id, double stamp_s,
+                        double silent_s) {
+    TourAwardData a;
+    a.auction_id = auction_id;
+    a.auctioneer_id = 1;
+    a.stamp_s = stamp_s;
+    a.clusters = {cluster(31, 3, 22.0)};
+    a.bundles = {mgg::RobotBundle{2, {}, 0.0},
+                 mgg::RobotBundle{3, {31}, silent_s}};
+    return a;
+  };
+  TourBidData bid;
+  bid.robot_id = 3;
+  coordinator.onBid(bid, 10000.0);
+  std::uint64_t auction_id = 1;
+  coordinator.onAward(award(auction_id++, 10000.0, 0.0), 10000.0);
+  ASSERT_EQ(coordinator.group(10000.0), (std::vector<int>{1, 2, 3}));
+  ASSERT_EQ(idsOf(coordinator.claimedByOthers(10000.0)),
+            std::vector<ClusterId>{31});
+
+  // The clocks reset to 10 s and robot 3 is not heard again.
+  const double reset = 10.0;
+  for (double now = reset; now <= reset + params.claim_ttl_s; now += 2.0) {
+    coordinator.onAward(award(auction_id++, now, now - reset), now);
+    coordinator.tick(now, nullptr, nullptr, nullptr);
+    EXPECT_EQ(holds(coordinator.group(now), 3),
+              now - reset <= params.peer_timeout_s)
+        << "at " << now;
+    EXPECT_EQ(idsOf(coordinator.claimedByOthers(now)),
+              std::vector<ClusterId>{31})
+        << "at " << now;
+  }
+  const double expired = reset + params.claim_ttl_s + 2.0;
+  coordinator.onAward(award(auction_id++, expired, expired - reset), expired);
+  coordinator.tick(expired, nullptr, nullptr, nullptr);
+  EXPECT_TRUE(coordinator.claimedByOthers(expired).empty());
+  EXPECT_EQ(coordinator.group(expired), (std::vector<int>{1, 2}));
 }
 
 }  // namespace

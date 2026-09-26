@@ -85,6 +85,8 @@ class FleetCoordinator {
   int takeOverOldestClaim(double now_s);
 
   /// This robot and every robot heard within fleet.peer_timeout_s, sorted.
+  /// A robot last heard after `now_s` (the clock was reset) counts as just
+  /// heard.
   std::vector<int> group(double now_s) const;
   int auctioneer(double now_s) const { return group(now_s).front(); }
   bool inGroup(double now_s) const { return group(now_s).size() > 1; }
@@ -116,6 +118,12 @@ class FleetCoordinator {
     std::map<int, TourBidData> bids;
   };
 
+  /// Clock rollback (a simulation restart moves now_s backwards): a time
+  /// after `now_s` becomes `now_s`, as ClaimRegistry::expire does for claims,
+  /// so a silent robot counts as just heard once and then ages normally.
+  /// Called first by every member that takes the time.
+  void rebaseFutureTimes(double now_s);
+  /// `robot_id` was heard at the local receipt time `now_s`.
   void noteHeard(int robot_id, double now_s);
   void noteExplored(const std::vector<FleetCluster>& clusters);
   void applyAward(const TourAwardData& award, double now_s);
