@@ -178,6 +178,53 @@ TEST(ClusterPool, HoldsClaimedClustersNoBidNames) {
   EXPECT_EQ(pool.bid_to_pool.size(), 1u);
 }
 
+TEST(ClusterPool, OneIdIsOnePoolClusterWhereverItIsReported) {
+  // Robot 2 reports robot 1's cluster 100 ten metres from where robot 1
+  // does (a stale report or transform): one pool cluster, at the owner's
+  // position, awarded once.
+  const TourBidData a = bidAt(1, 0.0, {cluster(100, 1, 0.0)});
+  const TourBidData b = bidAt(2, 10.0, {cluster(100, 1, 10.0)});
+  const ClusterPool pool = mgg::buildClusterPool({b, a}, {}, 2.0, nullptr);
+  ASSERT_EQ(pool.clusters.size(), 1u);
+  EXPECT_EQ(pool.clusters[0].id, 100u);
+  EXPECT_DOUBLE_EQ(pool.clusters[0].position.x(), 0.0);
+  EXPECT_EQ(pool.bid_to_pool[0], std::vector<int>{0});
+  EXPECT_EQ(pool.bid_to_pool[1], std::vector<int>{0});
+  EXPECT_EQ(pool.conflicting_reports, 1u);
+  const auto straight = [](const Eigen::Vector3d& from,
+                           const Eigen::Vector3d& to) {
+    return (from - to).norm();
+  };
+  const AuctionResult result = mgg::runSequentialAuction(
+      {mgg::bidderCosts(b, pool.bid_to_pool[0], pool, straight),
+       mgg::bidderCosts(a, pool.bid_to_pool[1], pool, straight)},
+      {false}, 0.2, 0.0);
+  std::size_t awarded = 0;
+  for (const auto& [robot, bundle] : result.bundles) awarded += bundle.size();
+  EXPECT_EQ(awarded, 1u);
+
+  // Neither reporter owns it: the first report in the pool's order (owners'
+  // reports first, then by ID, then as given) places it.
+  const ClusterPool unowned = mgg::buildClusterPool(
+      {bidAt(1, 0.0, {cluster(300, 3, 0.0)}),
+       bidAt(2, 10.0, {cluster(300, 3, 10.0)})},
+      {}, 2.0, nullptr);
+  ASSERT_EQ(unowned.clusters.size(), 1u);
+  EXPECT_DOUBLE_EQ(unowned.clusters[0].position.x(), 0.0);
+  EXPECT_EQ(unowned.conflicting_reports, 1u);
+}
+
+TEST(ClusterPool, AHeldClusterABidAlsoNamesIsOnePoolCluster) {
+  const ClusterPool pool = mgg::buildClusterPool(
+      {bidAt(1, 0.0, {cluster(400, 4, 40.0)})}, {cluster(400, 4, 45.0)}, 2.0,
+      nullptr);
+  ASSERT_EQ(pool.clusters.size(), 1u);
+  EXPECT_EQ(pool.indexOf(400), 0);
+  EXPECT_EQ(pool.bid_to_pool[0], std::vector<int>{0});
+  EXPECT_EQ(pool.member_ids[0], std::vector<mgg::ClusterId>{400});
+  EXPECT_EQ(pool.conflicting_reports, 1u);
+}
+
 TEST(ClusterPool, BidderCostsComeFromTheBidOrTheEstimate) {
   const TourBidData a = bidAt(1, 0.0, {cluster(100, 1, 10.0)});
   const TourBidData b = bidAt(2, 20.0, {cluster(201, 2, 25.0)});

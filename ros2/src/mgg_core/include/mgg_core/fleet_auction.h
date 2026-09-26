@@ -4,9 +4,12 @@
 // Pool: every bid's clusters and the clusters held by robots that did not
 // bid, merged when closer than fleet.cluster_merge_radius_m (robots name one
 // place differently: a robot names a peer's merged frontier by its own
-// quantization), under the owner's own name when the owner bid it. A cluster
-// any bidder reports explored, or at which the auctioneer's own roadmap
-// shows explored space, is dropped.
+// quantization), under the owner's own name when the owner bid it. One ID is
+// one pool cluster: a report of an ID already pooled joins it wherever it
+// lies. The owner's report of its own cluster places it, otherwise the first
+// report in the pool's order (owners' reports first, then by ID, then bids
+// as given, then held clusters). A cluster any bidder reports explored, or
+// at which the auctioneer's own roadmap shows explored space, is dropped.
 //
 // Award: each bidder keeps its current target unless another bidder's cost
 // to it is lower by more than tour.commit_margin; the rest go by sequential
@@ -36,6 +39,9 @@ struct ClusterPool {
   std::vector<std::vector<int>> bid_to_pool;
   /// The clusters dropped as explored.
   std::vector<FleetCluster> dropped_explored;
+  /// Reports of a pooled ID farther than the merge radius from where the
+  /// pool places it (a stale report or transform); they join it anyway.
+  std::size_t conflicting_reports = 0;
 
   /// The pool cluster `id` was merged into, or -1.
   int indexOf(ClusterId id) const;

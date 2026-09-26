@@ -52,7 +52,8 @@ ClusterPool buildClusterPool(const std::vector<TourBidData>& bids,
   }
   for (const FleetCluster& c : held) entries.push_back({c, -1, -1, false});
   // Owners' own reports first, then by ID, so a place's name does not depend
-  // on the order the bids arrived in.
+  // on the order the bids arrived in. Equal keys keep bids as given, then
+  // held clusters.
   std::stable_sort(entries.begin(), entries.end(),
                    [](const Entry& a, const Entry& b) {
                      if (a.owner_report != b.owner_report) {
@@ -65,7 +66,17 @@ ClusterPool buildClusterPool(const std::vector<TourBidData>& bids,
   std::vector<int> entry_pool(entries.size(), -1);
   for (std::size_t k = 0; k < entries.size(); ++k) {
     const FleetCluster& c = entries[k].cluster;
-    int p = merged.indexNear(c.position, merge_radius_m);
+    // An ID already pooled joins its cluster wherever this report puts it:
+    // one ID is never two pool clusters, so never awarded twice.
+    int p = merged.indexOf(c.id);
+    if (p >= 0) {
+      if ((merged.clusters[p].position - c.position).norm() >
+          merge_radius_m) {
+        ++merged.conflicting_reports;
+      }
+    } else {
+      p = merged.indexNear(c.position, merge_radius_m);
+    }
     if (p < 0) {
       p = static_cast<int>(merged.clusters.size());
       merged.clusters.push_back(c);
@@ -73,7 +84,10 @@ ClusterPool buildClusterPool(const std::vector<TourBidData>& bids,
     } else {
       merged.clusters[p].gain = std::max(merged.clusters[p].gain, c.gain);
     }
-    merged.member_ids[p].push_back(c.id);
+    std::vector<ClusterId>& members = merged.member_ids[p];
+    if (std::find(members.begin(), members.end(), c.id) == members.end()) {
+      members.push_back(c.id);
+    }
     entry_pool[k] = p;
   }
 
@@ -82,6 +96,7 @@ ClusterPool buildClusterPool(const std::vector<TourBidData>& bids,
     explored_ids.insert(bid.explored.begin(), bid.explored.end());
   }
   ClusterPool pool;
+  pool.conflicting_reports = merged.conflicting_reports;
   std::vector<int> reindex(merged.clusters.size(), -1);
   for (std::size_t p = 0; p < merged.clusters.size(); ++p) {
     const bool named_explored = std::any_of(
