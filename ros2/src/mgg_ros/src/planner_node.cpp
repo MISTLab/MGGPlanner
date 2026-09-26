@@ -567,6 +567,7 @@ void PlannerNode::noteGlobalGraphEdges() {
 }
 
 std::vector<mgg::FrontierCluster> PlannerNode::globalFrontierClusters() {
+  auto map_read = mapReadLease();
   // Graph messages have no scalar gain. Score an imported frontier before
   // min_cluster_gain can discard it, even beyond the local re-check radius.
   // Keep positive scores: re-checking every distant peer frontier every

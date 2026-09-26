@@ -8,6 +8,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstdint>
+#include <future>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -25,8 +26,47 @@
 
 namespace mgg_ros {
 
+// Attempt snapshot retraction from another thread during a real gain scan.
+class PublicationProbeMap : public mgg::MolaMap {
+ public:
+  PublicationProbeMap()
+      : mgg::MolaMap(mgg::MolaMapConfig{"/tmp/frontier_lease_probe"}) {}
+  std::future<void> writer;
+  bool publication_blocked = false;
+  void getScanStatusIterative(
+      const Eigen::Vector3d& pos,
+      const std::vector<Eigen::Vector3d>& endpoints, mgg::GainCounts& gain,
+      std::vector<std::pair<Eigen::Vector3d, mgg::VoxelStatus>>& log,
+      const mgg::SensorModel& sensor) override {
+    std::promise<void> entered;
+    auto ready = entered.get_future();
+    writer = std::async(std::launch::async, [this, &entered]() {
+      entered.set_value();
+      requestSnapshot(mgg::MolaSnapshotRequest{});
+    });
+    ready.wait();
+    publication_blocked =
+        writer.wait_for(std::chrono::milliseconds(50)) == std::future_status::timeout;
+    mgg::MolaMap::getScanStatusIterative(pos, endpoints, gain, log, sensor);
+  }
+};
+
 class PlannerNodeTestPeer {
  public:
+  static std::vector<mgg::FrontierCluster> frontierClusters(PlannerNode& node) {
+    const std::lock_guard<std::recursive_mutex> lock(node.planner_mutex_);
+    return node.globalFrontierClusters();  // deliberately no caller-side lease
+  }
+  static void useMolaMap(PlannerNode& node, std::unique_ptr<mgg::MolaMap> map) {
+    node.mola_map_ = map.get();
+    node.cloud_map_ = nullptr;
+    node.map_ = std::move(map);
+    node.ground_ = std::make_unique<mgg::GroundProjection>(
+        *node.map_, node.planning_params_);
+  }
+  static void setFrontierOwner(PlannerNode& node, int id, int owner) {
+    node.global_graph_->getVertex(id)->robot_id = owner;
+  }
   static void configureGroundRobot(PlannerNode& node) {
     const std::lock_guard<std::recursive_mutex> lock(node.planner_mutex_);
     node.robot_params_.type = mgg::RobotType::kGroundRobot;
@@ -2691,6 +2731,23 @@ TEST_F(PlannerNodeTest, AwardsRequireARecentInRangeBidFromTheirAuctioneer) {
   EXPECT_EQ(PlannerNodeTestPeer::fleetGroup(*fleet.b), (std::vector<int>{1, 2}));
   EXPECT_EQ(PlannerNodeTestPeer::ownTourBidMsg(*fleet.b).auctioneer_id, 1);
   EXPECT_TRUE(PlannerNodeTestPeer::fleetHasAward(*fleet.b));
+}
+
+TEST_F(PlannerNodeTest, ImportedFrontierScoringExcludesSnapshotPublication) {
+  auto node = makeNode("frontier_map_lease");
+  PlannerNodeTestPeer::observeFloor(*node, -1.0, 4.0, -1.0, 1.0);
+  PlannerNodeTestPeer::acceptOdometry(*node, 0.0, 0.0, 1.0);
+  const int id = PlannerNodeTestPeer::addGlobalChainToFrontier(*node, {{3.0, 0.0}});
+  PlannerNodeTestPeer::setFrontierOwner(*node, id, 2);
+  auto map = std::make_unique<PublicationProbeMap>();
+  auto* probe = map.get();
+  PlannerNodeTestPeer::useMolaMap(*node, std::move(map));
+  PlannerNodeTestPeer::frontierClusters(*node);
+  ASSERT_TRUE(probe->writer.valid());
+  EXPECT_TRUE(probe->publication_blocked);
+  EXPECT_EQ(probe->writer.wait_for(std::chrono::seconds(1)),
+            std::future_status::ready);
+  probe->writer.get();
 }
 
 }  // namespace mgg_ros
