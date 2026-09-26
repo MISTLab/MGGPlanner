@@ -160,4 +160,26 @@ TEST(SensorParams, MountingRotationOffsetsTheRays) {
   EXPECT_NE(endpoints.front().norm(), 10.0);
 }
 
+// A ground robot's sensor stands mount_height over its ground, its x and y
+// offset turned with the robot; the offset's z, over the body, is not used.
+TEST(SensorParams, MountedRaysStartAtTheSensorOverTheGround) {
+  SensorParams s;
+  s.type = SensorType::kLidar;
+  s.max_range = 10.0;
+  s.fov = Eigen::Vector2d(2.0 * M_PI, M_PI / 4.0);
+  s.resolution = Eigen::Vector2d(M_PI / 36.0, M_PI / 36.0);
+  s.center_offset = Eigen::Vector3d(-0.15, 0.0, 0.52);
+  s.mount_height = 0.72;
+  s.update();
+  Eigen::Vector3d origin;
+  std::vector<Eigen::Vector3d> endpoints;
+  s.getMountedFrustumEndpoints(StateVec(1.0, 2.0, 0.6, M_PI / 2.0), 0.1,
+                               origin, endpoints);
+  EXPECT_TRUE(origin.isApprox(Eigen::Vector3d(1.0, 2.0 - 0.15, 0.82), 1e-12));
+  ASSERT_FALSE(endpoints.empty());
+  for (const Eigen::Vector3d& end : endpoints) {
+    EXPECT_NEAR((end - origin).norm(), 10.0, 1e-9);
+  }
+}
+
 }  // namespace

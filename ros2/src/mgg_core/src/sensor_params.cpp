@@ -133,6 +133,21 @@ void SensorParams::getFrustumEndpoints(
   }
 }
 
+void SensorParams::getMountedFrustumEndpoints(
+    const StateVec& state, double ground_z, Eigen::Vector3d& origin,
+    std::vector<Eigen::Vector3d>& endpoints) const {
+  const Eigen::Matrix3d rot_world_to_body = yawRotation(state[3]);
+  origin = Eigen::Vector3d(state[0], state[1], ground_z + mount_height) +
+           rot_world_to_body *
+               Eigen::Vector3d(center_offset.x(), center_offset.y(), 0.0);
+  endpoints.clear();
+  endpoints.reserve(frustum_endpoints_body_.size());
+  // The table holds each ray plus center_offset.
+  for (const Eigen::Vector3d& p : frustum_endpoints_body_) {
+    endpoints.push_back(origin + rot_world_to_body * (p - center_offset));
+  }
+}
+
 double SensorParams::uniqueVoxelsFullFov(double voxel_size) const {
   if (frustum_endpoints_body_.empty() || unique_voxel_counts_ == nullptr ||
       !std::isfinite(voxel_size) || voxel_size <= 0.0) {

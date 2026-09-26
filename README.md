@@ -80,7 +80,7 @@ In Ubuntu 18.04 with ROS Melodic, the gazebo node might crash when running the g
 In the ROS 2 port (`ros2/src`), a viewpoint's gain counts the unknown voxels its sensor could reveal from there (`mgg_core/src/gain.cpp`):
 
 - Each voxel counts once per viewpoint, however many rays cross it.
-- For a ground robot, only voxels up to `gain_max_height_above_ground` (0.8 m) over the vertex's floor count. The mapping carves free space with one ray per 5 x 5 degree bin, which leaves most of the air above that unknown even in an explored room; counted, it made explored rooms outscore corridors to unexplored space (run 6).
+- For a ground robot, the rays start at its sensor, `SensorParams.<name>.mount_height` over the ground under the vertex and `center_offset`'s x and y from the body centre (0 casts from the vertex). They count as far up as the sensor's vertical field of view reaches: the 0.8 m cap of run 6 (`gain_max_height_above_ground`) is gone. The unknown air it hid over explored rooms came from the planner grid dropping rays on a full rebuild (diag-sensor, run 7).
 - A vertex is a frontier when its distinct unknown voxels are at least `frontier_percentage_threshold` of those an all-unknown scan from a voxel centre reaches (`SensorParams::uniqueVoxelsFullFov`, walked as the planner grid walks rays, `mgg_core/voxel_walk.h`). For a ground robot, 0.5 m of unknown (three 0.2 m voxels) is also enough.
 - Below the vertex's floor, a voxel counts unless mapped ground lies over it. Ground falling away, such as a ramp down or a stairwell, keeps its gain down to `max(2 max_ground_height, 1 m)` below the vertex.
 

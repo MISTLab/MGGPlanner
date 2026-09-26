@@ -42,9 +42,11 @@ struct GainContext {
 /// Casts the sensor's rays, tallies what they pass through, discards anything
 /// outside the global bounds or inside a no-gain zone, and scores the rest
 /// with the per-type weights. Sets is_frontier when enough unknown volume is
-/// visible. A ground robot counts only the layer it explores: from below
-/// its floor, where no mapped ground covers it, up to
-/// PlanningParams::gain_max_height_above_ground over its floor.
+/// visible. A ground robot's rays start at its sensor, mount_height over
+/// the ground under the vertex when that is set
+/// (SensorParams::getMountedFrustumEndpoints), and it counts everything
+/// they reach but below its floor where mapped ground covers it, or deeper
+/// than max(2 max_ground_height, 1 m) under the vertex.
 ///
 /// `voxel_log`, when given, receives every counted voxel for visualisation.
 void computeVolumetricGain(

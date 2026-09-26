@@ -33,7 +33,6 @@ class ParamFixture : public ::testing::Test {
         {"PlanningParams.min_observed_ground_fraction", 0.6},
         {"PlanningParams.max_footprint_cell_rise", 0.13},
         {"PlanningParams.max_goal_ground_rise", 3.5},
-        {"PlanningParams.gain_max_height_above_ground", 0.6},
         {"RobotParams.type", std::string("kGroundRobot")},
         {"RobotParams.size", std::vector<double>{0.8, 0.8, 0.2}},
         {"RobotParams.bound_mode", std::string("kExtendedBound")},
@@ -46,6 +45,7 @@ class ParamFixture : public ::testing::Test {
         {"SensorParams.sensor_list", std::vector<std::string>{"VLP16"}},
         {"SensorParams.VLP16.type", std::string("kLidar")},
         {"SensorParams.VLP16.max_range", 20.0},
+        {"SensorParams.VLP16.mount_height", 0.72},
         {"SensorParams.VLP16.fov", std::vector<double>{6.283185307179586,
                                                        0.5235987755982988}},
         {"SensorParams.VLP16.resolution",
@@ -92,7 +92,6 @@ TEST_F(ParamFixture, LoadsPlanningParams) {
   EXPECT_DOUBLE_EQ(params.min_observed_ground_fraction, 0.6);
   EXPECT_DOUBLE_EQ(params.max_footprint_cell_rise, 0.13);
   EXPECT_DOUBLE_EQ(params.max_goal_ground_rise, 3.5);
-  EXPECT_DOUBLE_EQ(params.gain_max_height_above_ground, 0.6);
   // Absent from the overrides, so the struct default survives.
   EXPECT_DOUBLE_EQ(params.v_max, 0.2);
 }
@@ -125,6 +124,7 @@ TEST_F(ParamFixture, LoadsSensorsAndBuildsTheRayTable) {
   // struct with an uninitialised rotation.
   EXPECT_TRUE(s.isReady());
   EXPECT_DOUBLE_EQ(s.max_range, 20.0);
+  EXPECT_DOUBLE_EQ(s.mount_height, 0.72);
 }
 
 // An unconverted ROS 1 config reaches ROS 2 with rad()/deg() still as strings.

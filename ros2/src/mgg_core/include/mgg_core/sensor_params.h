@@ -44,6 +44,13 @@ class SensorParams {
   double max_range = 5.0;
   /// Offset from the body centre (odometry frame).
   Eigen::Vector3d center_offset = Eigen::Vector3d::Zero();
+  /// Height of the sensor over the ground under the robot, metres. For a
+  /// ground robot, when positive, its gain rays start there
+  /// (getMountedFrustumEndpoints), not at the vertex, which rides
+  /// max_ground_height over its ground: SwarmDeck's Bunker lidar sits at
+  /// 0.72 m, its vertex at 0.525 m (diag-sensor, run 7). 0 casts from the
+  /// vertex. Not an upstream parameter.
+  double mount_height = 0.0;
   /// Body to sensor, [yaw, pitch, roll] in radians, applied ZYX.
   Eigen::Vector3d rotations = Eigen::Vector3d::Zero();
   /// [horizontal, vertical] angles, radians.
@@ -80,6 +87,15 @@ class SensorParams {
   void getFrustumEndpoints(const StateVec& state,
                            std::vector<Eigen::Vector3d>& endpoints,
                            double range_scale) const;
+
+  /// Where a ground robot's sensor is, and its ray endpoints, for a robot
+  /// at `state` (x, y, yaw) standing on ground at height `ground_z`: the
+  /// sensor at mount_height over that ground, center_offset's x and y from
+  /// the body centre (its z is the offset over the body, which the planner
+  /// does not know). Empty until update().
+  void getMountedFrustumEndpoints(const StateVec& state, double ground_z,
+                                  Eigen::Vector3d& origin,
+                                  std::vector<Eigen::Vector3d>& endpoints) const;
 
   /// Frontier test: are the distinct unknown voxels seen from a viewpoint a
   /// large enough fraction, frontier_percentage_threshold, of the distinct

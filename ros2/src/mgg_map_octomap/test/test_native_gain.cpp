@@ -84,20 +84,25 @@ TEST(NativeGain, EachUnknownVoxelCountsOncePerViewpoint) {
 }
 
 /// A ground robot's gain, the voxels it counted, seen from `viewpoint`: a
-/// vertex 0.45 m over its floor at z = 0.05, with a 0.2 m robot, so the gain
-/// band's top is at z = 1.7, or `gain_max_height_above_ground` over the
-/// floor.
+/// vertex 0.45 m over its floor at z = 0.05. Its sensor is mounted
+/// `mount_height` over that floor (SensorParams::mount_height; 0 casts from
+/// the vertex), `center_offset` from the body centre.
 std::vector<std::pair<Eigen::Vector3d, VoxelStatus>> groundGain(
     mgg::MapInterface& map, const Eigen::Vector3d& viewpoint,
-    double gain_max_height_above_ground = 0.0) {
+    double mount_height = 0.0,
+    const Eigen::Vector3d& center_offset = Eigen::Vector3d::Zero(),
+    mgg::RobotType type = mgg::RobotType::kGroundRobot) {
   GainSetup setup(map);
   mgg::RobotParams robot;
-  robot.type = mgg::RobotType::kGroundRobot;
+  robot.type = type;
   robot.size = Eigen::Vector3d(0.5, 0.5, 0.3);
   setup.ctx.robot = &robot;
   setup.planning.robot_height = 0.2;
   setup.planning.max_ground_height = 0.45;
-  setup.planning.gain_max_height_above_ground = gain_max_height_above_ground;
+  mgg::SensorParams& sensor = setup.sensors["VLP16"];
+  sensor.mount_height = mount_height;
+  sensor.center_offset = center_offset;
+  sensor.update();
   mgg::VolumetricGain gain;
   std::vector<std::pair<Eigen::Vector3d, VoxelStatus>> counted;
   mgg::computeVolumetricGain(
@@ -180,49 +185,45 @@ TEST(NativeGain, UnderFloorGainDropsOnlyUnderMappedGround) {
   EXPECT_GT(beyondBetween(groundGain(stairwell, viewpoint), -0.5, -0.15), 30);
 }
 
-// Run 6: the planner grid leaves most of the air above 0.8 m unknown in a
-// room explored end to end, and a ground robot's gain rays found fresh
-// unknown voxels there from every new viewpoint: the explored hangar
-// outscored the corridors to unexplored space. A ground robot counts its
-// gain only up to gain_max_height_above_ground over its floor; an aerial
-// robot counts the whole view.
-TEST(NativeGain, AGroundRobotCountsGainOnlyUpToItsBandOverTheFloor) {
+/// The highest unknown voxel centre in `counted`.
+double highestUnknown(
+    const std::vector<std::pair<Eigen::Vector3d, VoxelStatus>>& counted) {
+  double top = -1e9;
+  for (const auto& entry : counted) {
+    if (entry.second == VoxelStatus::kUnknown) {
+      top = std::max(top, entry.first.z());
+    }
+  }
+  return top;
+}
+
+// Diag-sensor (run 7): a ground robot's gain stopped 0.8 m over its floor
+// (gain_max_height_above_ground, run 6), under a Spot's lidar, and cast
+// from the vertex, 0.2 m under a Bunker's lidar. It counts what its sensor
+// sees now: from the sensor, as far up as the field of view reaches. The
+// top ray of the 45 degree table climbs 17.5 degrees, 6.0 m in 20 m.
+TEST(NativeGain, AGroundRobotCountsWhatItsSensorSeesFromItsMount) {
   // A floor at z = [-0.2, 0) and unknown air over it; the vertex's floor is
-  // at z = 0.05, so 0.8 m over it is z = 0.85.
+  // at z = 0.05.
   auto floor = terrain([](std::int64_t, std::int64_t)
                            -> std::optional<std::int64_t> { return -1; });
   const Eigen::Vector3d viewpoint(0.1, 0.5, 0.5);
-  const auto highest = [](const auto& counted) {
-    double top = -1e9;
-    for (const auto& entry : counted) {
-      if (entry.second == VoxelStatus::kUnknown) {
-        top = std::max(top, entry.first.z());
-      }
-    }
-    return top;
-  };
-  const auto capped = groundGain(floor, viewpoint, 0.8);
-  ASSERT_FALSE(capped.empty());
-  EXPECT_LE(highest(capped), 0.85);
-  EXPECT_GT(highest(capped), 0.6);
-  // 0: up to the band's top, 1.2 m over the vertex.
-  const auto uncapped = groundGain(floor, viewpoint, 0.0);
-  EXPECT_GT(highest(uncapped), 1.4);
-  EXPECT_LE(highest(uncapped), 1.7);
-  EXPECT_GT(uncapped.size(), 2 * capped.size());
+  const double from_vertex = highestUnknown(groundGain(floor, viewpoint));
+  EXPECT_GT(from_vertex, 6.0);
+  EXPECT_LE(from_vertex, 0.5 + 20.0 * std::sin(17.5 * M_PI / 180.0) + 0.2);
 
-  // An aerial robot's view is not capped.
-  GainSetup aerial(floor);
-  mgg::RobotParams drone;
-  drone.type = mgg::RobotType::kAerialRobot;
-  aerial.ctx.robot = &drone;
-  aerial.planning.gain_max_height_above_ground = 0.8;
-  mgg::VolumetricGain gain;
-  std::vector<std::pair<Eigen::Vector3d, VoxelStatus>> counted;
-  mgg::computeVolumetricGain(
-      mgg::StateVec(viewpoint.x(), viewpoint.y(), viewpoint.z(), 0.0), gain,
-      aerial.ctx, &counted);
-  EXPECT_GT(highest(counted), 2.0);
+  // Mounted 2.0 m over the floor, 1.55 m over the vertex; center_offset's z,
+  // the offset over the body, plays no part.
+  const auto mounted =
+      groundGain(floor, viewpoint, 2.0, Eigen::Vector3d(-0.2, 0.0, 5.0));
+  EXPECT_NEAR(highestUnknown(mounted) - from_vertex, 1.55, 0.25);
+
+  // An aerial robot casts from its vertex, mount height or not.
+  EXPECT_DOUBLE_EQ(
+      highestUnknown(groundGain(floor, viewpoint, 2.0, Eigen::Vector3d::Zero(),
+                                mgg::RobotType::kAerialRobot)),
+      highestUnknown(groundGain(floor, viewpoint, 0.0, Eigen::Vector3d::Zero(),
+                                mgg::RobotType::kAerialRobot)));
 }
 
 // Review r0 (P1): with distinct voxels counted, the frontier test still

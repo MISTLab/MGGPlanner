@@ -105,7 +105,11 @@ void computeVolumetricGain(
     return;
   }
 
+  // The vertex, which for a ground robot rides max_ground_height over its
+  // ground. The gain band is measured from it.
   const Eigen::Vector3d origin(state[0], state[1], state[2]);
+  const bool ground_robot =
+      ctx.robot != nullptr && ctx.robot->type == RobotType::kGroundRobot;
 
   for (const std::string& sensor_name : ctx.planning->exp_sensor_list) {
     auto it = ctx.sensors->find(sensor_name);
@@ -115,8 +119,17 @@ void computeVolumetricGain(
     }
     const SensorParams& sensor = it->second;
 
+    // A ground robot's sensor sees from where it is mounted: rays from the
+    // vertex started 0.2 m low for a Bunker's lidar (diag-sensor, run 7).
+    Eigen::Vector3d ray_origin = origin;
     std::vector<Eigen::Vector3d> endpoints;
-    sensor.getFrustumEndpoints(state, endpoints);
+    if (ground_robot && sensor.mount_height > 0.0) {
+      sensor.getMountedFrustumEndpoints(
+          state, origin.z() - ctx.planning->max_ground_height, ray_origin,
+          endpoints);
+    } else {
+      sensor.getFrustumEndpoints(state, endpoints);
+    }
     if (endpoints.empty()) {
       logWarn("gain: sensor '" + sensor_name +
               "' has no rays; was update() called?");
@@ -129,21 +142,15 @@ void computeVolumetricGain(
     // unique on the captured Bistro grids, diag-viewpoint 2026-09-24).
     GainCounts raw;
     std::vector<std::pair<Eigen::Vector3d, VoxelStatus>> visited;
-    ctx.map->getScanStatusIterative(origin, endpoints, raw, visited,
+    ctx.map->getScanStatusIterative(ray_origin, endpoints, raw, visited,
                                     sensor.model());
-    const bool ground_robot =
-        ctx.robot != nullptr && ctx.robot->type == RobotType::kGroundRobot;
-    // Ground robots only explore the traversable ground layer: voxels high
-    // above the vertex, or deep below it, are irrelevant to them. Nor above
-    // gain_max_height_above_ground over the vertex's floor, which rides
-    // max_ground_height under it (run 6).
-    double max_h_above = std::max(ctx.planning->robot_height * 2.5, 1.2);
-    if (ctx.planning->gain_max_height_above_ground > 0.0) {
-      max_h_above = std::min(max_h_above,
-                             ctx.planning->gain_max_height_above_ground -
-                                 ctx.planning->max_ground_height);
-    }
-
+    // A ground robot's gain has no top: the sensor's vertical field of view
+    // bounds what it counts. The band once stopped 0.8 m over the floor,
+    // under a Spot's lidar, and dropped 85 % of the unknown ahead in a
+    // corridor, its upper walls and ceiling (diag-sensor, run 7). The run-6
+    // unknown air over an explored hangar it was added for came from the
+    // planner grid dropping rays on a rebuild, not from what a sensor sees.
+    //
     // Below the vertex, the band reaches max(2 max_ground_height, 1 m). A
     // vertex rides max_ground_height above its ground, and nothing under
     // mapped ground can be seen: 0.10 of the count at the captured plan
@@ -164,10 +171,7 @@ void computeVolumetricGain(
       if (inNoGainZone(ctx, voxel)) continue;
 
       if (ground_robot) {
-        if (voxel.z() - origin.z() > max_h_above ||
-            origin.z() - voxel.z() > max_h_below) {
-          continue;
-        }
+        if (origin.z() - voxel.z() > max_h_below) continue;
         // Deeper than a voxel under the vertex's own floor: counted unless
         // mapped ground lies over it. The band once ended one voxel under
         // that floor, and a ramp down or a stairwell lost its lower space.
