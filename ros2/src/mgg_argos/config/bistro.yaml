@@ -188,6 +188,11 @@
       occupied_voxel_gain: 0.0
       free_voxel_gain: 0.0
       unknown_voxel_gain: 60.0
+      # A ground robot's gain counts voxels up to this height over the floor
+      # under its viewpoint (metres). Higher, the planner grid leaves most
+      # of an explored room's air unknown, and explored rooms outscored
+      # corridors to unexplored space (run 6). 0: up to the old band's top.
+      gain_max_height_above_ground: 0.8
       nonuniform_ray_cast: true
       ray_cast_step_size_multiplier: 1.0
       freespace_cloud_enable: false

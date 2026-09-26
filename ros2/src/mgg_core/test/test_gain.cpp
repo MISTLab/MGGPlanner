@@ -223,6 +223,9 @@ TEST(Gain, AGroundRobotsFrontierNeedsHalfAMetreOfUnknown) {
     mgg::RobotParams robot;
     robot.type = mgg::RobotType::kGroundRobot;
     f.ctx.robot = &robot;
+    // The voxels lie level with the vertex, 0.5 m over its floor: within
+    // gain_max_height_above_ground.
+    f.planning.max_ground_height = 0.5;
     VolumetricGain g;
     computeVolumetricGain(StateVec(0, 0, 0, 0), g, f.ctx);
     EXPECT_EQ(g.num_unknown_voxels, count);

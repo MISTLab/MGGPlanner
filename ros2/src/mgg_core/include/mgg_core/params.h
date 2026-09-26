@@ -214,6 +214,19 @@ struct PlanningParams {
   double free_voxel_gain = 1.0;
   double occupied_voxel_gain = 1.0;
   double unknown_voxel_gain = 10.0;
+  /// A ground robot's gain counts no voxel higher than this above the
+  /// floor under its vertex, metres. The planner grid carves free space
+  /// with one ray per 5 degree bin per keyframe and leaves most of the air
+  /// above 0.8 m unknown, even in a room explored end to end (47 % at 0.8
+  /// to 1.0 m, 94 % at 1.4 to 1.6 m in run 6's hangar); a gain ray from any
+  /// new viewpoint finds fresh unknown voxels there, so an explored hangar
+  /// scored 2 to 3 times a corridor leading to unexplored space and robots
+  /// kept returning to its corners. At 0.8 m the hangar's viewpoints drop
+  /// from 0.7-1.3 M to 12-46 k while a real frontier keeps half its gain.
+  /// 0 counts up to the band's top, max(2.5 robot_height, 1.2 m) above
+  /// the vertex, as before. Aerial robots are not affected. Not an upstream
+  /// parameter.
+  double gain_max_height_above_ground = 0.8;
   double path_length_penalty = 0.0;
   double path_direction_penalty = 0.0;
   double hanging_vertex_penalty = 0.0;

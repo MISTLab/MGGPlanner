@@ -132,8 +132,15 @@ void computeVolumetricGain(
     const bool ground_robot =
         ctx.robot != nullptr && ctx.robot->type == RobotType::kGroundRobot;
     // Ground robots only explore the traversable ground layer: voxels high
-    // above the vertex, or deep below it, are irrelevant to them.
-    const double max_h_above = std::max(ctx.planning->robot_height * 2.5, 1.2);
+    // above the vertex, or deep below it, are irrelevant to them. Nor above
+    // gain_max_height_above_ground over the vertex's floor, which rides
+    // max_ground_height under it (run 6).
+    double max_h_above = std::max(ctx.planning->robot_height * 2.5, 1.2);
+    if (ctx.planning->gain_max_height_above_ground > 0.0) {
+      max_h_above = std::min(max_h_above,
+                             ctx.planning->gain_max_height_above_ground -
+                                 ctx.planning->max_ground_height);
+    }
     if (ground_robot) {
       // A lidar leaves unknown gaps in walls, and rays through them counted
       // the space behind: 0.39 of the count at the captured plan ends. Wall
