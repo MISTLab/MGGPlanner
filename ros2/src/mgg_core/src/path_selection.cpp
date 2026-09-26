@@ -258,6 +258,10 @@ PathSelectionResult selectBestPath(GraphManager& graph,
     // than the robot plus twice the margin, is the best path chosen as without
     // the check, so exploration goes on wherever it went on before. With no
     // gain anywhere there is still no path.
+    //
+    // Some whole path, to a leaf outside every reservation, may be driven
+    // and has gain: without one, no path is chosen, clear or not.
+    bool gain_reachable = false;
     // The fallback, chosen when no path ends clear: the best path as it is,
     // or, where its end is admitted only on a slope with no way back, cut
     // back to its last end with one (review r1, P1). Ranked by its own
@@ -284,6 +288,8 @@ PathSelectionResult selectBestPath(GraphManager& graph,
           ++result.paths_rejected_steep;
         } else if (!turns_ok(candidate.path)) {
           leaf.admissible = false;
+        } else if (leaf.gain > 0.0) {
+          gain_reachable = true;
         }
       }
       if (leaf.admissible) {
@@ -340,7 +346,7 @@ PathSelectionResult selectBestPath(GraphManager& graph,
     // A branch whose only gain lies in a peer's reservation is not pursued,
     // not even through a clear prefix: that is what reservations prevent.
     if (viewpoint_clear && have_clear &&
-        (!fallback_path.empty() || best_clear_gain > 0.0)) {
+        (gain_reachable || best_clear_gain > 0.0)) {
       result.best_gain = best_clear_gain;
       result.best_full_gain = best_clear_leads_to;
       result.best_path = best_clear_path;

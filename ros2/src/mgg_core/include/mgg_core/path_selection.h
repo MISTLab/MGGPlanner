@@ -218,7 +218,11 @@ constexpr int kMaxDetourSearchStates = 100000;
 /// `goal_reach` of the root, or on a path leading to no gain, goes nowhere
 /// (pathGoesNowhere) and does not count as clear: at the mouth of a
 /// passage too narrow to end a path in, the path into it is chosen
-/// unclear, not the robot's own place.
+/// unclear, not the robot's own place. A clear end carrying no gain of its
+/// own is chosen when its path leads to gain, even when that gain lies at
+/// an end with no way back. With no whole path to a leaf outside every
+/// reservation that may be driven and has gain, and no clear end with gain
+/// of its own, no path is chosen.
 ///
 /// With `turns_admissible` (PathTurnCheck), a candidate that fails it is not
 /// admissible, and outranks clearance: a path that turns only where it may

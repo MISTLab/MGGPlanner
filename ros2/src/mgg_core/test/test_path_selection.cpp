@@ -249,6 +249,23 @@ TEST(PathGoesNowhere, APulledBackPathLeadingToGainIsStillSent) {
   // Within the controller's goal tolerance of the robot, it does not.
   EXPECT_TRUE(mgg::pathGoesNowhere(r, Eigen::Vector3d(0.8, 0.0, 0.0), 0.3));
 
+  // Review r2 (P1): the leaf is clear too, but ends on a slope with no way
+  // back (SlopeEndRetreat), and the robot has room to turn nowhere. The
+  // clear inner vertex, with no gain of its own, still wins because its
+  // path leads to the leaf's gain, as it did before the way back was
+  // asked of the fallback.
+  mgg::SlopeEndRetreat retreat;
+  retreat.admitted_on_slope = [](const Vertex& v) { return v.id == 2; };
+  retreat.room_to_turn = [](const Vertex&) { return false; };
+  const auto refused = mgg::selectBestPath(
+      graph, makePlanning(), RobotParams(), flat, 0.2, 0.0, {}, 0.0,
+      [](const Vertex&) { return true; }, nullptr, nullptr, 0.0, retreat);
+  ASSERT_EQ(refused.best_path_id, 1);
+  EXPECT_FALSE(refused.unclear_viewpoint);
+  EXPECT_DOUBLE_EQ(refused.best_gain, 0.0);
+  EXPECT_DOUBLE_EQ(refused.best_full_gain, 100.0);
+  EXPECT_EQ(refused.slope_ends_without_way_back, 1);
+  EXPECT_FALSE(mgg::pathGoesNowhere(refused, root->state.head<3>(), 0.3));
 }
 
 TEST(PathSelection, AFallbackCutBackForItsWayBackNeverEndsInAReservation) {
