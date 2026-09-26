@@ -406,6 +406,8 @@ TourAwardData FleetCoordinator::computeAward(double now_s,
     if (named.insert(c.id).second) award.clusters.push_back(c);
     return c.id;
   };
+  // The auction result names every collected bidder, even an empty bundle:
+  // that explicit entry lets an idle bidder distinguish an answer from omission.
   for (const auto& [robot_id, indices] : result.bundles) {
     RobotBundle bundle;
     bundle.robot_id = robot_id;
@@ -505,7 +507,8 @@ void FleetCoordinator::applyAward(const TourAwardData& award, double now_s) {
   // A robot the award does not name (its bid missed the deadline) keeps its
   // previous bundle.
   if (requested_ && request_sent_ &&
-      award.auctioneer_id == request_auctioneer_) {
+      award.auctioneer_id == request_auctioneer_ &&
+      award.bundleOf(robot_id_) != nullptr) {
     answered_ = true;
   }
   if (!bundle_.empty()) {

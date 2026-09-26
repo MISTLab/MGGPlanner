@@ -91,9 +91,10 @@ class FleetCoordinator {
                        const CostEstimateFn& estimate,
                        const ExploredFn& explored);
 
-  /// §3.5: this robot's bundle is done; its bids ask for an auction. Any
-  /// award the auctioneer asked applies after the request went out answers
-  /// it; when the auctioneer changes first, the request goes to the new one.
+  /// §3.5: this robot's bundle is done; its bids ask for an auction. An
+  /// award from the auctioneer asked answers it only if it names this robot
+  /// (even with an empty bundle); when the auctioneer changes first, the
+  /// request goes to the new one.
   void requestAuction();
   /// A request is out and no award has answered it yet.
   bool awaitingAuction() const { return requested_ && !answered_; }

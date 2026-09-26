@@ -1385,3 +1385,37 @@ TEST(FleetCoordinator, AReleaseAwardOlderThanABidKeepsTheBidsClaim) {
 }
 
 }  // namespace
+
+TEST(FleetCoordinator, AnOmittedBidderKeepsRequestingUntilNamedInAnAward) {
+  FleetCoordinator leader(1, FleetParams{}, 0.2), follower(2, FleetParams{}, 0.2);
+  leader.onBid(emptyBid(2), 0.0);
+  follower.onBid(emptyBid(1), 0.0);
+  leader.tick(0.0, nullptr, nullptr, nullptr);  // call lost
+  follower.requestAuction();
+  auto reply = follower.tick(0.1, nullptr, nullptr, nullptr);
+  ASSERT_TRUE(reply.bid);
+  leader.onBid(*reply.bid, 0.1);  // not an answer to the current call
+  auto out = leader.tick(1.1, nullptr, nullptr, nullptr);
+  ASSERT_TRUE(out.award);
+  ASSERT_EQ(out.award->bundleOf(2), nullptr);
+  follower.onAward(*out.award, 1.1);
+  EXPECT_FALSE(follower.requestAnswered());
+  EXPECT_TRUE(follower.awaitingAuction());
+  reply = follower.tick(3.2, nullptr, nullptr, nullptr);
+  ASSERT_TRUE(reply.bid);
+  EXPECT_TRUE(reply.bid->request_auction);
+  leader.onBid(*reply.bid, 3.2);
+  out = leader.tick(3.2, nullptr, nullptr, nullptr);
+  ASSERT_TRUE(out.award && out.award->call);
+  follower.onAward(*out.award, 3.2);
+  reply = follower.tick(3.3, nullptr, nullptr, nullptr);
+  ASSERT_TRUE(reply.bid);
+  leader.onBid(*reply.bid, 3.3);
+  out = leader.tick(4.3, nullptr, nullptr, nullptr);
+  ASSERT_TRUE(out.award && !out.award->call);
+  ASSERT_NE(out.award->bundleOf(1), nullptr);
+  ASSERT_NE(out.award->bundleOf(2), nullptr);
+  EXPECT_TRUE(out.award->bundleOf(2)->clusters.empty());
+  follower.onAward(*out.award, 4.3);
+  EXPECT_TRUE(follower.requestAnswered());
+}

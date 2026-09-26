@@ -633,6 +633,15 @@ class PlannerNodeTestPeer {
     const std::lock_guard<std::recursive_mutex> lock(node.planner_mutex_);
     return node.fleet_->group(node.now().seconds());
   }
+  static bool settleIdle(PlannerNode& node, std::string& summary, bool& complete) {
+    const std::lock_guard<std::recursive_mutex> lock(node.planner_mutex_);
+    return node.settleIdleRobot(summary, complete);
+  }
+  static mgg::FleetTickOutput fleetStep(PlannerNode& node, double now_s) {
+    const std::lock_guard<std::recursive_mutex> lock(node.planner_mutex_);
+    return node.fleet_->tick(now_s, [&node]() { return node.ownTourBid(); },
+                             nullptr, nullptr);
+  }
   static void fleetTick(PlannerNode& node, double now_s) {
     node.fleetTick(now_s);
   }
@@ -2850,6 +2859,54 @@ TEST_F(PlannerNodeTest, ImportedFrontierScoringContinuesAfterItsTimeBudget) {
   clusters = PlannerNodeTestPeer::frontierClusters(*node);
   EXPECT_EQ(clusters.size(), 3u);
   EXPECT_EQ(slow->scanned_x.size(), 4u);
+}
+
+TEST_F(PlannerNodeTest, AMissedCallAwardDoesNotCompleteAnUnconsideredRobot) {
+  TwoPlanners fleet("missed_call");
+  PlannerNodeTestPeer::receiveTransform(*fleet.b, "robot_1/odom", "robot_0/odom", -5.0, 0.0);
+  mgg::FleetCoordinator leader(1, mgg::FleetParams{}, 0.2);
+  const double t = fleet.b->now().seconds();
+  leader.onBid(fromTourBidMsg(PlannerNodeTestPeer::ownTourBidMsg(*fleet.b),
+                             Eigen::Isometry3d::Identity()), t);
+  auto out = leader.tick(t, nullptr, nullptr, nullptr);
+  ASSERT_TRUE(out.bid && out.award && out.award->call);
+  PlannerNodeTestPeer::receiveTourBid(*fleet.b, toTourBidMsg(*out.bid, "robot_0/odom"));
+  // The call is lost. This idle robot requests after collection started.
+  bool complete = false;
+  std::string note;
+  ASSERT_TRUE(PlannerNodeTestPeer::settleIdle(*fleet.b, note, complete));
+  ASSERT_FALSE(complete);
+  auto reply = PlannerNodeTestPeer::fleetStep(*fleet.b, t + 0.1);
+  ASSERT_TRUE(reply.bid);
+  ASSERT_EQ(reply.bid->auction_id, 0u);
+  ASSERT_TRUE(reply.bid->request_auction);
+  leader.onBid(*reply.bid, t + 0.1);
+  out = leader.tick(t + 1.1, nullptr, nullptr, nullptr);
+  ASSERT_TRUE(out.award && !out.award->call);
+  ASSERT_EQ(out.award->bundleOf(2), nullptr);
+  PlannerNodeTestPeer::receiveTourAward(*fleet.b, toTourAwardMsg(*out.award, "robot_0/odom"));
+  ASSERT_TRUE(PlannerNodeTestPeer::settleIdle(*fleet.b, note, complete));
+  EXPECT_FALSE(complete) << "an award that omitted this robot cannot finish it";
+  // Its periodic bid keeps requesting; the next round collects it.
+  reply = PlannerNodeTestPeer::fleetStep(*fleet.b, t + 3.2);
+  ASSERT_TRUE(reply.bid);
+  EXPECT_TRUE(reply.bid->request_auction);
+  leader.onBid(*reply.bid, t + 3.2);
+  out = leader.tick(t + 3.2, nullptr, nullptr, nullptr);
+  ASSERT_TRUE(out.award && out.award->call);
+  PlannerNodeTestPeer::receiveTourAward(*fleet.b, toTourAwardMsg(*out.award, "robot_0/odom"));
+  reply = PlannerNodeTestPeer::fleetStep(*fleet.b, t + 3.3);
+  ASSERT_TRUE(reply.bid);
+  leader.onBid(*reply.bid, t + 3.3);
+  out = leader.tick(t + 4.3, nullptr, nullptr, nullptr);
+  ASSERT_TRUE(out.award && !out.award->call);
+  ASSERT_NE(out.award->bundleOf(1), nullptr);
+  ASSERT_NE(out.award->bundleOf(2), nullptr);
+  EXPECT_TRUE(out.award->bundleOf(2)->clusters.empty());
+  PlannerNodeTestPeer::receiveTourAward(*fleet.b, toTourAwardMsg(*out.award, "robot_0/odom"));
+  complete = false;
+  ASSERT_TRUE(PlannerNodeTestPeer::settleIdle(*fleet.b, note, complete));
+  EXPECT_TRUE(complete);
 }
 
 }  // namespace mgg_ros
