@@ -1337,11 +1337,13 @@ void PlannerNode::addFrontiers() {
   global_space_.setCenter(current_state_, /*use_extension=*/true);
   if (global_graph_->getNumVertices() != before) ++graph_revision_;
   RCLCPP_INFO(get_logger(),
-              "global graph: %d frontier(s) re-checked, %d demoted; %d local "
+              "global graph: %d frontier(s) re-checked, %d demoted, %d "
+              "peer frontier(s) left to their owners; %d local "
               "frontier(s) in %d cluster(s), %d path(s) added (%d vertices, "
               "%d edges)",
               report.global_frontiers_rechecked,
-              report.global_frontiers_demoted, report.local_frontiers,
+              report.global_frontiers_demoted,
+              report.global_frontiers_left_to_owners, report.local_frontiers,
               report.clusters, report.paths_added,
               global_graph_->getNumVertices(), global_graph_->getNumEdges());
 }

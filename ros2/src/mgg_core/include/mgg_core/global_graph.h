@@ -367,6 +367,9 @@ struct FrontierAdditionReport {
   /// frontiers.
   int global_frontiers_rechecked = 0;
   int global_frontiers_demoted = 0;
+  /// Merged peers' frontiers not re-checked: farther than update_radius
+  /// from every vertex of the local graph.
+  int global_frontiers_left_to_owners = 0;
   /// Frontier leaves of the local graph and the clusters they formed.
   int local_frontiers = 0;
   int clusters = 0;
@@ -378,8 +381,11 @@ struct FrontierAdditionReport {
 /// Rrg::addFrontiers), in the four steps its comment lists:
 ///   1) leaf and frontier marks on the local graph (Dijkstra from its root;
 ///      gain evaluation has already typed the frontiers),
-///   2) every global frontier is re-scored with `recompute_gain` and demoted
-///      to kUnvisited when it no longer borders unknown space,
+///   2) the global frontiers are re-scored with `recompute_gain` and demoted
+///      to kUnvisited when they no longer border unknown space: this
+///      robot's own (ctx.robot_id), and a merged peer's only within
+///      `update_radius` of a vertex of `local_graph`, where this robot's
+///      map may have changed; the rest are left to their owners,
 ///   3) the frontier leaves' paths are clustered, longest first,
 ///   4) each cluster's principal path joins the global graph unless the
 ///      frontier is surrounded: a global vertex within `range_check` of it

@@ -1014,13 +1014,26 @@ FrontierAdditionReport addFrontiers(GraphManager& global_graph,
                                     double update_radius) {
   FrontierAdditionReport report;
 
-  // 2) Re-update all previous frontiers in the graph: still a frontier, or
-  // now surrounded by known space (rrg.cpp:2411 to 2426).
+  // 2) Re-update the previous frontiers: still a frontier, or now
+  // surrounded by known space (rrg.cpp:2411 to 2426). Upstream re-checked
+  // every one; a merged peer's frontier is re-checked only near the new
+  // local graph, where this robot's map has changed, and otherwise left to
+  // its owner, whose next broadcast carries its type. Re-checked on this
+  // robot's map, where the peer's explored space is unknown, they were never
+  // demoted, and in run 6 their 529 re-checks took robot_3 4.3 s a plan.
   for (auto& entry : global_graph.vertices_map_) {
     Vertex* vertex = entry.second;
     if (vertex == nullptr || vertex->type != VertexType::kFrontier ||
         !global_graph.inService(*vertex)) {
       continue;
+    }
+    if (vertex->robot_id != ctx.robot_id) {
+      std::vector<Vertex*> near_local;
+      if (!local_graph.getNearestVertices(&vertex->state, update_radius,
+                                          &near_local)) {
+        ++report.global_frontiers_left_to_owners;
+        continue;
+      }
     }
     ++report.global_frontiers_rechecked;
     if (recompute_gain) recompute_gain(*vertex);

@@ -871,6 +871,44 @@ TEST(AddFrontiers, PrincipalFrontierPathIsAddedAndSurroundedOnesAreNot) {
   EXPECT_EQ(scene.fixture.global.getNumVertices(), before + 2);
 }
 
+TEST(AddFrontiers, APeersFrontierIsRecheckedOnlyNearTheNewLocalGraph) {
+  // Run 6: merged peers' frontiers were re-checked on this robot's map at
+  // every plan, where the peers' explored space is unknown, so none was
+  // ever demoted; robot_3 re-checked 529 of them in 4.3 s a plan. This
+  // robot's own frontiers are all re-checked; a peer's only within the
+  // update radius (3 m) of the new local graph, whose farthest vertex is
+  // at x = 2.
+  FrontierScene scene;
+  const auto peer_frontier = [&scene](double x, double y) {
+    auto* vertex = new Vertex(scene.fixture.global.generateVertexID(),
+                              StateVec(x, y, 0.0, 0.0));
+    vertex->robot_id = 2;
+    vertex->type = VertexType::kFrontier;
+    vertex->vol_gain.is_frontier = true;
+    scene.fixture.global.addVertex(vertex);
+    return vertex;
+  };
+  Vertex* near_peer = peer_frontier(4.5, 0.0);
+  Vertex* far_peer = peer_frontier(20.0, 0.0);
+  std::vector<int> rechecked;
+  const auto recompute = [&rechecked](Vertex& vertex) {
+    rechecked.push_back(vertex.id);
+    vertex.vol_gain.is_frontier = false;
+  };
+  const mgg::FrontierAdditionReport report = mgg::addFrontiers(
+      scene.fixture.global, scene.local, scene.fixture.ctx, recompute, 1.0);
+  EXPECT_EQ(report.global_frontiers_rechecked, 2);
+  EXPECT_EQ(report.global_frontiers_left_to_owners, 1);
+  EXPECT_EQ(report.global_frontiers_demoted, 2);
+  EXPECT_EQ(rechecked.size(), 2u);
+  // Its own, far from the local graph, and the peer's near it.
+  EXPECT_EQ(scene.stale->type, VertexType::kUnvisited);
+  EXPECT_EQ(near_peer->type, VertexType::kUnvisited);
+  // The far peer's is its owner's to re-check.
+  EXPECT_EQ(far_peer->type, VertexType::kFrontier);
+  EXPECT_TRUE(far_peer->vol_gain.is_frontier);
+}
+
 TEST(PerformShortestPathsClustering, SimilarPathsShareAClusterAndShortOnesFold) {
   Roadmap fixture;
   GraphManager local;
