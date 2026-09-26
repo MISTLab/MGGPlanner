@@ -2666,4 +2666,31 @@ TEST_F(PlannerNodeTest, APeerImportedFrontierWithUnknownVolumeFormsATourCluster)
   }
 }
 
+TEST_F(PlannerNodeTest, AwardsRequireARecentInRangeBidFromTheirAuctioneer) {
+  TwoPlanners fleet("award_range");
+  PlannerNodeTestPeer::receiveTransform(*fleet.b, "robot_1/odom",
+                                        "robot_0/odom", -5.0, 0.0);
+  auto bid = PlannerNodeTestPeer::ownTourBidMsg(*fleet.a);
+  bid.pose.position.x = 100.0;
+  PlannerNodeTestPeer::receiveTourBid(*fleet.b, bid);
+  mgg_msgs::msg::TourAward award;
+  award.header.frame_id = "robot_0/odom";
+  award.header.stamp = fleet.a->now();
+  award.auctioneer_id = 1;
+  award.auction_id = 1;
+  for (bool call : {true, false}) {
+    award.call = call;
+    PlannerNodeTestPeer::receiveTourAward(*fleet.b, award);
+    EXPECT_EQ(PlannerNodeTestPeer::fleetGroup(*fleet.b), std::vector<int>{2});
+    EXPECT_EQ(PlannerNodeTestPeer::ownTourBidMsg(*fleet.b).auctioneer_id, 2);
+    EXPECT_FALSE(PlannerNodeTestPeer::fleetHasAward(*fleet.b));
+  }
+  bid.pose.position.x = 0.0;
+  PlannerNodeTestPeer::receiveTourBid(*fleet.b, bid);
+  PlannerNodeTestPeer::receiveTourAward(*fleet.b, award);
+  EXPECT_EQ(PlannerNodeTestPeer::fleetGroup(*fleet.b), (std::vector<int>{1, 2}));
+  EXPECT_EQ(PlannerNodeTestPeer::ownTourBidMsg(*fleet.b).auctioneer_id, 1);
+  EXPECT_TRUE(PlannerNodeTestPeer::fleetHasAward(*fleet.b));
+}
+
 }  // namespace mgg_ros

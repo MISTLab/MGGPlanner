@@ -810,7 +810,9 @@ void PlannerNode::onTourBid(mgg_msgs::msg::TourBid::ConstSharedPtr msg) {
           communication_range_) {
     return;
   }
-  fleet_->onBid(bid, now().seconds());
+  const double now_s = now().seconds();
+  fleet_bid_received_s_[bid.robot_id] = now_s;
+  fleet_->onBid(bid, now_s);
 }
 
 void PlannerNode::onTourAward(mgg_msgs::msg::TourAward::ConstSharedPtr msg) {
@@ -824,8 +826,14 @@ void PlannerNode::onTourAward(mgg_msgs::msg::TourAward::ConstSharedPtr msg) {
                      t_ours_theirs)) {
     return;
   }
+  const double now_s = now().seconds();
+  const auto heard = fleet_bid_received_s_.find(msg->auctioneer_id);
+  if (heard == fleet_bid_received_s_.end()) return;
+  // Match the coordinator's clock-reset policy: future receipts age anew.
+  if (heard->second > now_s) heard->second = now_s;
+  if (now_s - heard->second > fleet_params_.peer_timeout_s) return;
   const std::uint64_t before = fleet_->assignmentVersion();
-  fleet_->onAward(fromTourAwardMsg(*msg, t_ours_theirs), now().seconds());
+  fleet_->onAward(fromTourAwardMsg(*msg, t_ours_theirs), now_s);
   if (!msg->call && fleet_->assignmentVersion() != before) {
     RCLCPP_INFO(get_logger(),
                 "fleet award %llu from robot %d: %zu cluster(s) for this "

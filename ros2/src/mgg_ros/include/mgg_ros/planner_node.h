@@ -329,7 +329,8 @@ class PlannerNode : public rclcpp::Node {
   /// Fleet frontier assignment (tour-exploration design §3, §4). A peer's
   /// bid or award is placed in this robot's frame with the transform its
   /// roadmap would merge with, and dropped without one, when malformed, or
-  /// (a bid) from beyond communication_range, as a roadmap is.
+  /// from beyond communication_range, as a roadmap is. Calls and awards
+  /// require an in-range bid heard within fleet.peer_timeout_s.
   void onTourBid(mgg_msgs::msg::TourBid::ConstSharedPtr msg);
   void onTourAward(mgg_msgs::msg::TourAward::ConstSharedPtr msg);
   /// §4 release 3: the operator releases a silent robot's claims on the
@@ -564,6 +565,8 @@ class PlannerNode : public rclcpp::Node {
   /// Fleet frontier assignment (tour-exploration design §3); null when
   /// fleet.enabled is false.
   std::unique_ptr<mgg::FleetCoordinator> fleet_;
+  /// Calls/awards require a recent bid admitted by the radio-range filter.
+  std::unordered_map<int, double> fleet_bid_received_s_;
   /// The target refreshTour last released as reached. A reached cluster
   /// that is still a frontier is released once: the free solve may take it
   /// again, and it is then kept until explored, reassigned or unroutable,
