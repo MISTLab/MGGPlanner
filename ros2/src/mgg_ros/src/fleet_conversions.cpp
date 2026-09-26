@@ -82,9 +82,12 @@ mgg::TourBidData fromTourBidMsg(const mgg_msgs::msg::TourBid& msg,
   const mgg::StateVec theirs = fromPoseMsg(msg.pose);
   const Eigen::Vector3d position =
       t_ours_theirs * Eigen::Vector3d(theirs.head<3>());
-  const Eigen::Matrix3d rotation = t_ours_theirs.linear();
-  const double yaw = std::remainder(
-      theirs[3] + std::atan2(rotation(1, 0), rotation(0, 0)), 2.0 * M_PI);
+  // The heading of the composed rotation, as the roadmap merge places a
+  // neighbour's vertex (graph_merge.cpp).
+  const Eigen::Matrix3d rotation =
+      t_ours_theirs.linear() *
+      Eigen::Matrix3d(Eigen::AngleAxisd(theirs[3], Eigen::Vector3d::UnitZ()));
+  const double yaw = std::atan2(rotation(1, 0), rotation(0, 0));
   bid.pose = mgg::StateVec(position.x(), position.y(), position.z(), yaw);
   bid.clusters = fromClusterMsgs(msg.clusters, t_ours_theirs);
   bid.costs_from_pose.assign(msg.costs_from_pose.begin(),

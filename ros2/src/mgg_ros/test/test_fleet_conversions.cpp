@@ -83,6 +83,25 @@ TEST(FleetConversions, ABidIsPlacedInTheReceiversFrame) {
   EXPECT_EQ(out.costs_between, sampleBid().costs_between);
 }
 
+TEST(FleetConversions, ABidsYawTurnsWithTheFrameAndWraps) {
+  TourBidData in = sampleBid();
+  in.pose[3] = 3.0;
+  Eigen::Isometry3d t_ours_theirs = Eigen::Isometry3d::Identity();
+  t_ours_theirs.linear() =
+      Eigen::AngleAxisd(M_PI / 2.0, Eigen::Vector3d::UnitZ()).toRotationMatrix();
+  const TourBidData turned = mgg_ros::fromTourBidMsg(
+      mgg_ros::toTourBidMsg(in, "robot_1/odom"), t_ours_theirs);
+  EXPECT_NEAR(turned.pose[3], 3.0 + M_PI / 2.0 - 2.0 * M_PI, 1e-9);
+  // A pitched frame: the heading is that of the composed rotation, as the
+  // roadmap merge places a neighbour's vertex (graph_merge.cpp).
+  in.pose[3] = M_PI / 4.0;
+  t_ours_theirs.linear() =
+      Eigen::AngleAxisd(0.5, Eigen::Vector3d::UnitY()).toRotationMatrix();
+  const TourBidData pitched = mgg_ros::fromTourBidMsg(
+      mgg_ros::toTourBidMsg(in, "robot_1/odom"), t_ours_theirs);
+  EXPECT_NEAR(pitched.pose[3], std::atan2(1.0, std::cos(0.5)), 1e-9);
+}
+
 TEST(FleetConversions, AnAwardRoundTripsWithBundlesExploredAndReleases) {
   TourAwardData in;
   in.auction_id = (std::uint64_t{1} << 40) | 3;
@@ -100,13 +119,25 @@ TEST(FleetConversions, AnAwardRoundTripsWithBundlesExploredAndReleases) {
   EXPECT_EQ(out.auctioneer_id, 1);
   EXPECT_NEAR(out.stamp_s, 42.5, 1e-9);
   EXPECT_FALSE(out.call);
+  ASSERT_EQ(out.clusters.size(), 2u);
+  for (std::size_t i = 0; i < in.clusters.size(); ++i) {
+    EXPECT_EQ(out.clusters[i].id, in.clusters[i].id);
+    EXPECT_EQ(out.clusters[i].owner_robot_id, in.clusters[i].owner_robot_id);
+    EXPECT_DOUBLE_EQ(out.clusters[i].gain, in.clusters[i].gain);
+  }
   ASSERT_EQ(out.bundles.size(), 2u);
+  EXPECT_EQ(out.bundles[0].robot_id, 1);
+  EXPECT_EQ(out.bundles[0].clusters, std::vector<mgg::ClusterId>{11});
+  EXPECT_DOUBLE_EQ(out.bundles[0].silent_s, 0.0);
   EXPECT_EQ(out.bundles[1].robot_id, 2);
   EXPECT_EQ(out.bundles[1].clusters, std::vector<mgg::ClusterId>{21});
   EXPECT_DOUBLE_EQ(out.bundles[1].silent_s, 7.5);
   ASSERT_NE(out.cluster(21), nullptr);
   EXPECT_TRUE(out.cluster(21)->position.isApprox(Eigen::Vector3d(9.0, 10.0, 0.5)));
   ASSERT_EQ(out.explored.size(), 1u);
+  EXPECT_EQ(out.explored[0].id, 31u);
+  EXPECT_EQ(out.explored[0].owner_robot_id, 3);
+  EXPECT_DOUBLE_EQ(out.explored[0].gain, 750.0);
   EXPECT_TRUE(out.explored[0].position.isApprox(Eigen::Vector3d(-4.0, 10.0, 0.5)));
   EXPECT_EQ(out.released_robot_ids, std::vector<int>{4});
 
@@ -124,9 +155,18 @@ TEST(FleetConversions, StampsSurviveTheRoundTrip) {
   EXPECT_EQ(stamp.sec, 12);
   EXPECT_EQ(stamp.nanosec, 250000000u);
   EXPECT_NEAR(mgg_ros::stampSeconds(stamp), 12.25, 1e-9);
+  // Just short of a second: the nanoseconds stop at 999999999 instead of
+  // rounding up to a whole second.
+  const auto last_nanosecond = mgg_ros::stampFromSeconds(12.9999999999);
+  EXPECT_EQ(last_nanosecond.sec, 12);
+  EXPECT_EQ(last_nanosecond.nanosec, 999999999u);
   // Not a time: the zero stamp.
-  EXPECT_EQ(mgg_ros::stampFromSeconds(-1.0).sec, 0);
-  EXPECT_EQ(mgg_ros::stampFromSeconds(std::nan("")).nanosec, 0u);
+  const double inf = std::numeric_limits<double>::infinity();
+  for (const double seconds : {-1.0, 0.0, std::nan(""), inf, -inf}) {
+    const auto zero = mgg_ros::stampFromSeconds(seconds);
+    EXPECT_EQ(zero.sec, 0) << seconds;
+    EXPECT_EQ(zero.nanosec, 0u) << seconds;
+  }
 }
 
 TEST(FleetConversions, UnrepresentableStampsBecomeZero) {
