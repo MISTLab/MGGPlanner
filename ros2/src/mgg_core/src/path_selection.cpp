@@ -198,6 +198,57 @@ PathSelectionResult selectBestPath(GraphManager& graph,
           });
     };
 
+    // What a candidate's whole path, to its leaf, scored.
+    struct Leaf {
+      /// The leaf lies in a reservation.
+      bool excluded = false;
+      /// The whole path is not too steep and turns only where it may.
+      bool admissible = false;
+      /// The whole path's gain, once scored.
+      double gain = 0.0;
+      /// The gain the whole path leads to, whether or not it may be driven
+      /// as it is: its gain when it is not too steep, else 0.
+      double leads_to = 0.0;
+    };
+    enum class Ending { kAdmissible, kInadmissible, kGoesNowhere };
+    // The one test of where a path may end, its leaf or a vertex it is cut
+    // back to, in the fallback and the clear selection alike: everything the
+    // leaf had to satisfy, checked where the path now ends (review r2).
+    //   * The end lies in no reservation; cut back from a reserved leaf, the
+    //     path must carry gain of its own, outside the reservation.
+    //   * With slope_end_retreat, an end admitted only on a slope has a way
+    //     back (way_back).
+    //   * The path up to there is not too steep and turns only where it
+    //     may.
+    //   * With `must_go_somewhere` (a clear end), the end lies beyond
+    //     goal_reach of the root and the path leads to gain; else it goes
+    //     nowhere (review r0, I-3).
+    // Fills `path`, the candidate up to `end`, and its `gain`.
+    const auto ending = [&](const Candidate& candidate, const Leaf& leaf,
+                            std::size_t end, bool must_go_somewhere,
+                            std::vector<Vertex*>& path, double& gain) {
+      path.assign(candidate.path.begin(), candidate.path.begin() + end + 1);
+      gain = 0.0;
+      if (end == 0 || excluded(path.back()) ||
+          !way_back(candidate.path, candidate.along, end, nullptr)) {
+        return Ending::kInadmissible;
+      }
+      if (end + 1 == candidate.path.size()) {
+        if (!leaf.admissible) return Ending::kInadmissible;
+        gain = leaf.gain;
+      } else if (!score(path, candidate.along, gain) || !turns_ok(path) ||
+                 (leaf.excluded && !(gain > 0.0))) {
+        return Ending::kInadmissible;
+      }
+      if (must_go_somewhere &&
+          ((path.back()->state.head<2>() - path.front()->state.head<2>())
+                   .norm() <= goal_reach ||
+           !(std::max(leaf.leads_to, gain) > 0.0))) {
+        return Ending::kGoesNowhere;
+      }
+      return Ending::kAdmissible;
+    };
+
     // Clearance is a preference that always wins while it can be had: the best
     // path ending with room for the robot, pulled back to its last clear vertex
     // where needed, is chosen whenever there is one, even when the prefix it
@@ -207,65 +258,59 @@ PathSelectionResult selectBestPath(GraphManager& graph,
     // than the robot plus twice the margin, is the best path chosen as without
     // the check, so exploration goes on wherever it went on before. With no
     // gain anywhere there is still no path.
+    // The fallback, chosen when no path ends clear: the best path as it is,
+    // or, where its end is admitted only on a slope with no way back, cut
+    // back to its last end with one (review r1, P1). Ranked by its own
+    // gain, then by the gain its whole path leads to.
+    std::vector<Vertex*> fallback_path;
+    double fallback_gain = 0.0;
+    double fallback_leads_to = 0.0;
     bool have_clear = false;
     double best_clear_gain = 0.0;
     double best_clear_full_gain = 0.0;
     double best_clear_leads_to = 0.0;
     std::vector<Vertex*> best_clear_path;
     for (const Candidate& candidate : candidates) {
-      std::vector<Vertex*> path = candidate.path;
-      if (path.size() <= 1) continue;  // needs at least root and leaf
-      const Vertex* leaf = path.back();
+      if (candidate.path.size() <= 1) continue;  // needs root and leaf
       // Reservations are checked where each candidate ends: the leaf for the
-      // path as it is, the vertex it is pulled back to for the clear one.
-      const bool leaf_excluded = excluded(leaf);
-      double path_gain = 0.0;
-      bool admissible = false;
-      // The gain the whole path leads to, whether or not it may be driven
-      // as it is.
-      double leads_to = 0.0;
-      if (!leaf_excluded) {
+      // path as it is, the vertex it is cut back to otherwise.
+      Leaf leaf;
+      leaf.excluded = excluded(candidate.path.back());
+      if (!leaf.excluded) {
         ++result.leaves_evaluated;
-        admissible = score(path, candidate.along, path_gain);
-        if (admissible) leads_to = path_gain;
-        if (!admissible) {
+        leaf.admissible = score(candidate.path, candidate.along, leaf.gain);
+        if (leaf.admissible) leaf.leads_to = leaf.gain;
+        if (!leaf.admissible) {
           ++result.paths_rejected_steep;
-        } else if (!turns_ok(path)) {
-          admissible = false;
-        } else {
-          // The path as it is, which is chosen when no path ends clear. An
-          // end admitted only on a slope needs its way back even then: the
-          // path is cut back to its last end that has one, or is no
-          // fallback (review r1, P1). Other clearance failures are kept.
-          std::vector<Vertex*> fallback = path;
-          double fallback_gain = path_gain;
-          std::size_t end = path.size() - 1;
-          while (end > 0 && !way_back(path, candidate.along, end, nullptr)) {
-            --end;
-          }
-          if (end + 1 < path.size()) {
-            fallback.resize(end + 1);
-            if (end == 0 ||
-                !score(fallback, candidate.along, fallback_gain) ||
-                !turns_ok(fallback)) {
-              fallback.clear();
-            }
-          }
-          if (!fallback.empty() && fallback_gain > result.best_gain) {
-            result.best_gain = fallback_gain;
-            result.best_full_gain = path_gain;
-            result.best_path = fallback;
-          }
+        } else if (!turns_ok(candidate.path)) {
+          leaf.admissible = false;
         }
       }
-      const double full_gain = admissible ? path_gain : 0.0;
+      if (leaf.admissible) {
+        std::size_t end = candidate.path.size() - 1;
+        while (end > 0 &&
+               !way_back(candidate.path, candidate.along, end, nullptr)) {
+          --end;
+        }
+        std::vector<Vertex*> path;
+        double gain = 0.0;
+        if (ending(candidate, leaf, end, false, path, gain) ==
+                Ending::kAdmissible &&
+            std::max(gain, leaf.leads_to) > 0.0 &&
+            (fallback_path.empty() || gain > fallback_gain ||
+             (gain == fallback_gain && leaf.leads_to > fallback_leads_to))) {
+          fallback_path = std::move(path);
+          fallback_gain = gain;
+          fallback_leads_to = leaf.leads_to;
+        }
+      }
       if (!viewpoint_clear) continue;
 
       // The robot stops where the path ends; the root is where it stands.
-      std::size_t end = path.size() - 1;
+      std::size_t end = candidate.path.size() - 1;
       while (end > 0 &&
-             !(clear(path[end]) &&
-               way_back(path, candidate.along, end,
+             !(clear(candidate.path[end]) &&
+               way_back(candidate.path, candidate.along, end,
                         &result.slope_ends_without_way_back))) {
         --end;
       }
@@ -273,49 +318,37 @@ PathSelectionResult selectBestPath(GraphManager& graph,
         ++result.paths_without_clear_viewpoint;
         continue;
       }
-      if (end + 1 < path.size()) {
-        path.resize(end + 1);
-        ++result.paths_pulled_back;
-        admissible = !excluded(path.back()) && score(path, candidate.along, path_gain) &&
-                     turns_ok(path);
-        // Toward a reserved leaf, only gain outside the reservation counts.
-        if (leaf_excluded && !(path_gain > 0.0)) continue;
-      } else if (leaf_excluded) {
-        continue;
-      }
-      // A clear end that goes nowhere, within the controller's goal
-      // tolerance of the robot or leading to no gain, is no clear end: the
-      // robot at the mouth of a passage too narrow to end in is sent in,
-      // unclear, rather than to where it stands (review r0, I-3). A dead
-      // end inside is left to the boxed-in departure.
-      if (admissible &&
-          ((path.back()->state.head<2>() - path.front()->state.head<2>())
-                   .norm() <= goal_reach ||
-           !(std::max(leads_to, path_gain) > 0.0))) {
+      if (end + 1 < candidate.path.size()) ++result.paths_pulled_back;
+      std::vector<Vertex*> path;
+      double gain = 0.0;
+      const Ending status = ending(candidate, leaf, end, true, path, gain);
+      if (status == Ending::kGoesNowhere) {
         ++result.paths_without_clear_viewpoint;
         continue;
       }
-      if (admissible &&
-          (!have_clear || path_gain > best_clear_gain ||
-           (path_gain == best_clear_gain && full_gain > best_clear_full_gain))) {
+      if (status != Ending::kAdmissible) continue;
+      const double full_gain = leaf.admissible ? leaf.gain : 0.0;
+      if (!have_clear || gain > best_clear_gain ||
+          (gain == best_clear_gain && full_gain > best_clear_full_gain)) {
         have_clear = true;
-        best_clear_gain = path_gain;
+        best_clear_gain = gain;
         best_clear_full_gain = full_gain;
-        best_clear_leads_to = std::max(leads_to, path_gain);
-        best_clear_path = path;
+        best_clear_leads_to = std::max(leaf.leads_to, gain);
+        best_clear_path = std::move(path);
       }
     }
     // A branch whose only gain lies in a peer's reservation is not pursued,
     // not even through a clear prefix: that is what reservations prevent.
-    if (viewpoint_clear &&
-        (!result.best_path.empty() || best_clear_gain > 0.0)) {
-      if (!have_clear) {
-        result.unclear_viewpoint = true;
-      } else {
-        result.best_gain = best_clear_gain;
-        result.best_full_gain = best_clear_leads_to;
-        result.best_path = best_clear_path;
-      }
+    if (viewpoint_clear && have_clear &&
+        (!fallback_path.empty() || best_clear_gain > 0.0)) {
+      result.best_gain = best_clear_gain;
+      result.best_full_gain = best_clear_leads_to;
+      result.best_path = best_clear_path;
+    } else if (!fallback_path.empty()) {
+      result.best_gain = fallback_gain;
+      result.best_full_gain = fallback_leads_to;
+      result.best_path = fallback_path;
+      result.unclear_viewpoint = static_cast<bool>(viewpoint_clear);
     }
     return result;
   };

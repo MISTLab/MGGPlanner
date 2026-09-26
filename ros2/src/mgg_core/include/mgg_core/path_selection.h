@@ -208,7 +208,10 @@ constexpr int kMaxDetourSearchStates = 100000;
 /// `slope_end_retreat`, an end it admits only on a slope must also have a
 /// way back along the path (SlopeEndRetreat), and so must the end of a path
 /// chosen with no path ending clear: that path is cut back to its last end
-/// with one, or is not chosen. The best path ending
+/// with one, or is not chosen. Wherever a path ends, its leaf or a vertex
+/// it was cut back to, that end is held to what the leaf was: outside every
+/// reservation, the way back, not too steep, turning only where it may.
+/// The best path ending
 /// clear wins; only when there is none is the best path chosen without the
 /// check, flagged unclear_viewpoint, so that clearance never stops
 /// exploration where it would have gone on. A clear end within

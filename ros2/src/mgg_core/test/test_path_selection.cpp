@@ -248,6 +248,47 @@ TEST(PathGoesNowhere, APulledBackPathLeadingToGainIsStillSent) {
   EXPECT_FALSE(mgg::pathGoesNowhere(r, root->state.head<3>(), 0.3));
   // Within the controller's goal tolerance of the robot, it does not.
   EXPECT_TRUE(mgg::pathGoesNowhere(r, Eigen::Vector3d(0.8, 0.0, 0.0), 0.3));
+
+}
+
+TEST(PathSelection, AFallbackCutBackForItsWayBackNeverEndsInAReservation) {
+  // Review r2 (P1): no end is clear, so the path is chosen as without the
+  // check, but its leaf ends on a slope with no way back and it is cut
+  // back to the inner vertex, which holds the gain. That vertex lies in a
+  // peer's reservation: the cut path may not end there either.
+  GraphManager graph;
+  auto* root = new Vertex(0, StateVec(0, 0, 0, 0));
+  graph.addVertex(root);
+  auto* inner = new Vertex(1, StateVec(1.0, 0.0, 0.0, 0.0));
+  inner->vol_gain.gain = 50.0;
+  graph.addVertex(inner);
+  graph.addEdge(inner, root, 1.0);
+  auto* leaf = new Vertex(2, StateVec(2.0, 0.0, 0.0, 0.0));
+  graph.addVertex(leaf);
+  graph.addEdge(leaf, inner, 1.0);
+  EdgeInclinations flat;
+  const mgg::ViewpointClearFn nowhere_clear = [](const Vertex&) {
+    return false;
+  };
+  mgg::SlopeEndRetreat retreat;
+  retreat.admitted_on_slope = [](const Vertex& v) { return v.id == 2; };
+  retreat.room_to_turn = [](const Vertex&) { return false; };
+  // Unreserved, the cut path ends at the inner vertex, unclear.
+  const auto free = mgg::selectBestPath(
+      graph, makePlanning(), RobotParams(), flat, 0.2, 0.0, {}, 0.0,
+      nowhere_clear, nullptr, nullptr, 0.0, retreat);
+  ASSERT_EQ(free.best_path_id, 1);
+  EXPECT_TRUE(free.unclear_viewpoint);
+  EXPECT_DOUBLE_EQ(free.best_gain, 50.0);
+  // Reserved, there is no path.
+  const auto reserved = mgg::selectBestPath(
+      graph, makePlanning(), RobotParams(), flat, 0.2, 0.0,
+      {Eigen::Vector3d(1.0, 0.0, 0.0)}, 0.3, nowhere_clear, nullptr, nullptr,
+      0.0, retreat);
+  EXPECT_TRUE(reserved.best_path.empty())
+      << "ends at vertex " << reserved.best_path_id;
+  EXPECT_EQ(reserved.best_path_id, -1);
+  EXPECT_FALSE(reserved.unclear_viewpoint);
 }
 
 TEST(PathSelection, AClearEndLeadingToNoGainIsNoClearEnd) {
