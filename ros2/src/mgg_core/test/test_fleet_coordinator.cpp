@@ -745,4 +745,53 @@ TEST(FleetCoordinator, ACallReusingAnAuctionIdWithANewStampIsAnswered) {
   EXPECT_FALSE(coordinator.tick(2.5, nullptr, nullptr, nullptr).bid);
 }
 
+/// A well-formed bid from `robot_id` naming nothing: a peer heard.
+TourBidData emptyBid(int robot_id) {
+  TourBidData bid;
+  bid.robot_id = robot_id;
+  return bid;
+}
+
+// §3.5: the request is answered by an award of the auctioneer asked, even
+// when the award of the round the robot first bid in was lost.
+TEST(FleetCoordinator, ARequestIsAnsweredByALaterAwardWhenTheFirstIsLost) {
+  FleetCoordinator coordinator(2, FleetParams{}, 0.2);
+  coordinator.requestAuction();
+  coordinator.onAward(makeCall(1, 100, 0.0), 0.0);
+  ASSERT_TRUE(coordinator.tick(0.0, nullptr, nullptr, nullptr).bid);
+  // Round 100's award is lost.
+  coordinator.onAward(makeCall(1, 101, 2.0), 2.0);
+  const mgg::FleetTickOutput out =
+      coordinator.tick(2.0, nullptr, nullptr, nullptr);
+  ASSERT_TRUE(out.bid.has_value());
+  EXPECT_TRUE(out.bid->request_auction);
+  EXPECT_TRUE(coordinator.awaitingAuction());
+  EXPECT_FALSE(coordinator.requestAnswered());
+  coordinator.onAward(
+      makeAward(1, 101, 3.0, {mgg::RobotBundle{2, {}, 0.0}}, {}), 3.0);
+  EXPECT_FALSE(coordinator.awaitingAuction());
+  EXPECT_TRUE(coordinator.requestAnswered());
+}
+
+// The auctioneer asked falls silent: the request goes to the next one, here
+// this robot, whose award answers it.
+TEST(FleetCoordinator, ARequestFollowsTheAuctioneerWhenItChanges) {
+  const FleetParams params;
+  FleetCoordinator coordinator(2, params, 0.2);
+  coordinator.onBid(emptyBid(3), 0.0);
+  coordinator.requestAuction();
+  coordinator.onAward(makeCall(1, 100, 0.0), 0.0);
+  ASSERT_TRUE(coordinator.tick(0.0, nullptr, nullptr, nullptr).bid);
+  for (double now = 0.1; now < 12.0; now += 0.1) {
+    coordinator.onBid(emptyBid(3), now);  // robot 1 is not heard again
+    coordinator.tick(now, nullptr, nullptr, nullptr);
+    if (now < params.peer_timeout_s) {
+      EXPECT_TRUE(coordinator.awaitingAuction()) << "at " << now;
+    }
+  }
+  EXPECT_EQ(coordinator.auctioneer(12.0), 2);
+  EXPECT_FALSE(coordinator.awaitingAuction());
+  EXPECT_TRUE(coordinator.requestAnswered());
+}
+
 }  // namespace

@@ -73,11 +73,14 @@ class FleetCoordinator {
                        const CostEstimateFn& estimate,
                        const ExploredFn& explored);
 
-  /// §3.5: this robot's bundle is done; its bids ask for an auction.
+  /// §3.5: this robot's bundle is done; its bids ask for an auction. Any
+  /// award the auctioneer asked applies after the request went out answers
+  /// it; when the auctioneer changes first, the request goes to the new one.
   void requestAuction();
-  /// A request is out and the auction answering it has not been awarded.
+  /// A request is out and no award has answered it yet.
   bool awaitingAuction() const { return requested_ && !answered_; }
-  /// The auction this robot asked for was awarded and left it nothing.
+  /// The auctioneer answered the request with an award that left this robot
+  /// nothing.
   bool requestAnswered() const { return requested_ && answered_; }
   /// §4 release 3, on the auctioneer only: `robot_id`'s claims are released
   /// here and forwarded in the next award. False when this robot is not the
@@ -186,8 +189,8 @@ class FleetCoordinator {
   bool requested_ = false;
   bool request_sent_ = false;
   bool answered_ = false;
-  std::uint64_t answer_auction_ = 0;
-  int answer_auctioneer_ = -1;
+  // The auctioneer the request went to.
+  int request_auctioneer_ = -1;
 
   // Auctioneering.
   std::optional<Collection> collecting_;

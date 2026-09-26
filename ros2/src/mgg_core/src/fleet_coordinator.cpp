@@ -104,8 +104,7 @@ void FleetCoordinator::requestAuction() {
   requested_ = true;
   request_sent_ = false;
   answered_ = false;
-  answer_auction_ = 0;
-  answer_auctioneer_ = -1;
+  request_auctioneer_ = -1;
 }
 
 FleetTickOutput FleetCoordinator::tick(double now_s, const OwnBidFn& own_bid,
@@ -120,6 +119,10 @@ FleetTickOutput FleetCoordinator::tick(double now_s, const OwnBidFn& own_bid,
   const std::vector<int> members = group(now_s);
   const bool leader = members.size() > 1 && members.front() == robot_id_;
   const bool requesting = requested_ && !answered_;
+  // The auctioneer asked is gone: ask the new one.
+  if (requesting && request_sent_ && request_auctioneer_ != members.front()) {
+    request_sent_ = false;
+  }
 
   const auto makeBid = [&](std::uint64_t auction_id) {
     TourBidData bid = own_bid ? own_bid() : TourBidData{};
@@ -132,10 +135,6 @@ FleetTickOutput FleetCoordinator::tick(double now_s, const OwnBidFn& own_bid,
     bid.request_auction = bid.request_auction || requesting;
     own_cluster_ids_.clear();
     for (const FleetCluster& c : bid.clusters) own_cluster_ids_.insert(c.id);
-    if (requesting && auction_id != 0 && answer_auction_ == 0) {
-      answer_auction_ = auction_id;
-      answer_auctioneer_ = members.front();
-    }
     return bid;
   };
 
@@ -148,7 +147,10 @@ FleetTickOutput FleetCoordinator::tick(double now_s, const OwnBidFn& own_bid,
     out.bid = makeBid(called ? called_auction_ : 0);
     last_bid_s_ = now_s;
     if (called) answered_round_ = called_round_;
-    if (requesting) request_sent_ = true;
+    if (requesting) {
+      request_sent_ = true;
+      request_auctioneer_ = members.front();
+    }
   }
 
   if (!leader) {
@@ -350,16 +352,15 @@ void FleetCoordinator::applyAward(const TourAwardData& award, double now_s) {
   }
   // A robot the award does not name (its bid missed the deadline) keeps its
   // previous bundle.
-  if (requested_ && award.auction_id == answer_auction_ &&
-      award.auctioneer_id == answer_auctioneer_) {
+  if (requested_ && request_sent_ &&
+      award.auctioneer_id == request_auctioneer_) {
     answered_ = true;
   }
   if (!bundle_.empty()) {
     requested_ = false;
     answered_ = false;
     request_sent_ = false;
-    answer_auction_ = 0;
-    answer_auctioneer_ = -1;
+    request_auctioneer_ = -1;
   }
   ++assignment_version_;
 }
