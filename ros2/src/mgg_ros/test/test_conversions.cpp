@@ -3,6 +3,7 @@
 #include <cmath>
 #include <memory>
 
+#include <Eigen/Geometry>
 #include <gtest/gtest.h>
 
 #include "mgg_ros/conversions.h"
@@ -29,6 +30,24 @@ TEST(Conversions, YawMatchesTheQuaternionConvention) {
   q.z = std::sin(M_PI / 4.0);   // a quarter turn about z
   q.w = std::cos(M_PI / 4.0);
   EXPECT_NEAR(mgg_ros::yawFromQuaternion(q), M_PI / 2.0, 1e-12);
+}
+
+TEST(Conversions, TiltIsRollAndPitchWhateverTheYaw) {
+  geometry_msgs::msg::Quaternion q;
+  // A quarter turn about z: level.
+  q.x = 0.0; q.y = 0.0;
+  q.z = std::sin(M_PI / 4.0);
+  q.w = std::cos(M_PI / 4.0);
+  EXPECT_NEAR(mgg_ros::tiltFromQuaternion(q), 0.0, 1e-12);
+  // 5 degrees of pitch about y, then a yaw of 60 degrees about z.
+  const Eigen::Quaterniond pitched =
+      Eigen::AngleAxisd(M_PI / 3.0, Eigen::Vector3d::UnitZ()) *
+      Eigen::AngleAxisd(5.0 * M_PI / 180.0, Eigen::Vector3d::UnitY());
+  q.x = 2.0 * pitched.x(); q.y = 2.0 * pitched.y();  // not normalised
+  q.z = 2.0 * pitched.z(); q.w = 2.0 * pitched.w();
+  EXPECT_NEAR(mgg_ros::tiltFromQuaternion(q), 5.0 * M_PI / 180.0, 1e-9);
+  q.x = q.y = q.z = q.w = 0.0;
+  EXPECT_EQ(mgg_ros::tiltFromQuaternion(q), 0.0);
 }
 
 TEST(Conversions, GraphMsgRoundTripsThroughTheExchangeStruct) {

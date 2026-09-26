@@ -19,6 +19,7 @@
 #include <array>
 #include <cstdint>
 #include <functional>
+#include <optional>
 #include <unordered_map>
 #include <vector>
 
@@ -77,6 +78,25 @@ enum class EdgeTravel {
   /// From `start` to `end` only: a departure, a shortcut segment, an edge
   /// out of the robot's own position.
   kForward,
+};
+
+/// Where a ground robot stands before it has moved: the disk of `radius`
+/// round `center` (x, y) that its lidar cannot see the ground in, its
+/// initial ground reach (the planner node's hanging_root_edge_length_max).
+/// In run 6 robot_3 (Spot) stood 2.4 m from observed ground on every side
+/// for the whole run, and robot_1 (Bunker) for 18 minutes: no way out
+/// crossed observed ground (min_observed_ground_fraction), so they were
+/// boxed in where they had been placed. The robot rests on that ground, so
+/// in the disk a map cell with no ground found under it counts as observed
+/// ground (observedGroundAhead, turnSpaceObserved); ground observed too far
+/// down is still a drop. Elsewhere unknown stays unknown.
+struct StandingStart {
+  Eigen::Vector2d center = Eigen::Vector2d::Zero();
+  double radius = 0.0;
+  /// Whether `point` (x, y) lies in the disk.
+  bool covers(const Eigen::Vector2d& point) const {
+    return (point - center).norm() <= radius;
+  }
 };
 
 /// How getProjectedEdgeStatus checks the body on an edge other than with
@@ -209,8 +229,9 @@ class GroundProjection {
   /// (`box_size` x long along `heading`, y wide, centred on `point` at
   /// driving height; the cells whose centre lies under it, ahead of or on
   /// its centre line) with observed ground: an occupied voxel the ground ray
-  /// meets within 2 max_ground_height below `point`. 0 when the map's cells
-  /// cannot be enumerated.
+  /// meets within 2 max_ground_height below `point`, or, in the disk of a
+  /// standing start (setStandingStart), no ground found at all. 0 when the
+  /// map's cells cannot be enumerated.
   double observedGroundAhead(const Eigen::Vector3d& point,
                              const Eigen::Vector2d& heading,
                              const Eigen::Vector3d& box_size) const;
@@ -231,6 +252,16 @@ class GroundProjection {
 
   /// How far down projectSample looks. Was a bare 5.0 in the original.
   double max_projection_length = 5.0;
+
+  /// The robot stands at its start: see StandingStart. Cleared with
+  /// std::nullopt, once it has moved.
+  void setStandingStart(const std::optional<StandingStart>& standing) {
+    standing_start_ = standing;
+  }
+  /// Null when the robot is not standing at its start.
+  const StandingStart* standingStart() const {
+    return standing_start_ ? &*standing_start_ : nullptr;
+  }
 
  private:
   using ColumnKey = std::array<std::int64_t, 2>;
@@ -262,6 +293,7 @@ class GroundProjection {
   const MapInterface& map_;
   const PlanningParams& params_;
   const bool cache_footprint_ground_ = false;
+  std::optional<StandingStart> standing_start_;
   mutable std::unordered_map<ColumnKey, std::vector<GroundFromHeight>,
                              CacheKeyHash>
       ground_below_column_;

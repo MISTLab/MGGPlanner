@@ -735,6 +735,67 @@ TEST(TurnSpaceObserved, NeedsObservedGroundUnderTheTurningCircle) {
                                      mgg::StateVec(0.4, 0.1, 0.525, 0.0)));
 }
 
+TEST(GroundProjection, AStandingStartCountsItsDiskAsObservedGround) {
+  // Run 6: a robot placed on level ground has never seen the ground within
+  // 1.2 m of itself, its lidar's blind disk. A ledge 2.6 m ahead drops into
+  // unobserved space, and a pit 4 m deep, observed, opens 0.4 m ahead.
+  std::map<std::pair<std::int64_t, std::int64_t>, double> tops;
+  for (std::int64_t x = -12; x < 13; ++x) {
+    for (std::int64_t y = -12; y < 12; ++y) {
+      const Eigen::Vector2d centre((x + 0.5) * 0.2, (y + 0.5) * 0.2);
+      if (centre.norm() < 1.2) continue;  // the blind disk
+      tops[{x, y}] = 0.0;
+    }
+  }
+  const mgg_test::TerrainFixture blind(0.2, tops);
+  mgg::RobotParams bunker;
+  bunker.type = mgg::RobotType::kGroundRobot;
+  bunker.size = Eigen::Vector3d(1.023, 0.778, 0.4);
+  PlanningParams params = makeParams();
+  params.max_ground_height = 0.525;
+  const Eigen::Vector3d box(1.073, 0.828, 0.45);
+  const Eigen::Vector3d here(0.0, 0.1, 0.525);
+  const Eigen::Vector3d before_ledge(2.4, 0.1, 0.525);
+  const mgg::StateVec standing_pose(0.0, 0.1, 0.525, 0.0);
+
+  GroundProjection gp(blind, params);
+  EXPECT_DOUBLE_EQ(gp.observedGroundAhead(here, {1.0, 0.0}, box), 0.0);
+  const double ledge_ahead =
+      gp.observedGroundAhead(before_ledge, {1.0, 0.0}, box);
+  EXPECT_LT(ledge_ahead, params.min_observed_ground_fraction);
+  EXPECT_FALSE(mgg::turnSpaceObserved(blind, bunker, params, standing_pose));
+
+  // Standing at its start, the disk of its initial ground reach counts.
+  const mgg::StandingStart standing{Eigen::Vector2d(0.0, 0.1), 2.0};
+  gp.setStandingStart(standing);
+  ASSERT_NE(gp.standingStart(), nullptr);
+  EXPECT_DOUBLE_EQ(gp.observedGroundAhead(here, {1.0, 0.0}, box), 1.0);
+  EXPECT_TRUE(mgg::turnSpaceObserved(blind, bunker, params, standing_pose,
+                                     &standing));
+  EXPECT_TRUE(mgg::roomToTurn(blind, bunker, params, standing_pose,
+                              &standing));
+  // Beyond the disk unknown stays unknown: the ledge is refused as before.
+  EXPECT_DOUBLE_EQ(gp.observedGroundAhead(before_ledge, {1.0, 0.0}, box),
+                   ledge_ahead);
+
+  // Ground seen to fall away is a drop, in the disk too.
+  for (std::int64_t x = 2; x < 6; ++x) {
+    for (std::int64_t y = -4; y < 4; ++y) tops[{x, y}] = -4.0;
+  }
+  const mgg_test::TerrainFixture pit(0.2, tops);
+  GroundProjection over_pit(pit, params);
+  over_pit.setStandingStart(standing);
+  EXPECT_NEAR(over_pit.observedGroundAhead(here, {1.0, 0.0}, box), 2.0 / 3.0,
+              1e-9);
+  EXPECT_FALSE(mgg::turnSpaceObserved(
+      pit, bunker, params, mgg::StateVec(0.6, 0.1, 0.525, 0.0), &standing));
+
+  // Once the robot has moved, nothing is exempt.
+  gp.setStandingStart(std::nullopt);
+  EXPECT_EQ(gp.standingStart(), nullptr);
+  EXPECT_DOUBLE_EQ(gp.observedGroundAhead(here, {1.0, 0.0}, box), 0.0);
+}
+
 TEST(GroundProjection, ARockEdgeRisesMoreBetweenCellsThanARamp) {
   // Item 8: a Scout's edge up a 16 degree ramp rises 0.057 m from one
   // 0.2 m cell to the next; one onto a 0.2 m rock 0.2 m in one step.

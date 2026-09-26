@@ -22,7 +22,9 @@
 #include <array>
 #include <functional>
 #include <map>
+#include <optional>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 #include <Eigen/Dense>
@@ -92,14 +94,17 @@ bool turnClear(const MapInterface& map, const RobotParams& robot,
 /// the wall's foot. A column observed only in part counts as observed: the
 /// planner grids carve free space more sparsely higher up (robot_1's run-5
 /// grid leaves 23 % of the voxels 0.6 to 0.8 m over the floor unknown). True
-/// when the fraction is 0.
+/// when the fraction is 0. With `standing`, a cell in its disk counts as
+/// observed ground unless ground was found under it too far down.
 bool turnSpaceObserved(const MapInterface& map, const RobotParams& robot,
-                       const PlanningParams& planning, const StateVec& state);
+                       const PlanningParams& planning, const StateVec& state,
+                       const StandingStart* standing = nullptr);
 
 /// Whether a ground robot may turn in place at `state`: turnClear, and
 /// turnSpaceObserved. Unknown space passes turnClear alone.
 bool roomToTurn(const MapInterface& map, const RobotParams& robot,
-                const PlanningParams& planning, const StateVec& state);
+                const PlanningParams& planning, const StateVec& state,
+                const StandingStart* standing = nullptr);
 
 /// Whether a path turns sharply only where it may.
 using PathTurnsFn = std::function<bool(const std::vector<Vertex*>&)>;
@@ -181,6 +186,16 @@ class PathTurnCheck {
   /// there and, with `room_to_turn`, the robot has room to turn.
   bool sharpTurnAllowedAt(const Eigen::Vector3d& position);
 
+  /// The robot stands at `position`, tilted `tilt` radians from level (the
+  /// roll and pitch of its odometry). Where the slope there cannot be
+  /// measured (kUnknownSlopeRad) and `tilt` is below kLevelGroundSlopeRad,
+  /// `tilt` is its slope: the robot rests on that ground. In run 6 the
+  /// lattice had no vertex with ground within a robot's length of robot_3
+  /// and robot_1 at their starts, and every path turning there was refused
+  /// as on a slope. Elsewhere an unknown slope stays steep. Call before the
+  /// first check.
+  void setRobotTilt(const Eigen::Vector3d& position, double tilt);
+
   /// Candidate paths refused for a sharp turn on a slope, and for one
   /// without room to turn.
   int refused_on_slope = 0;
@@ -200,6 +215,7 @@ class PathTurnCheck {
   TurnRoomFn room_to_turn_;
   SlopeFn slope_;
   std::map<PositionKey, double> slope_at_;
+  std::optional<std::pair<PositionKey, double>> robot_tilt_;
   std::map<PositionKey, bool> room_at_;
 };
 

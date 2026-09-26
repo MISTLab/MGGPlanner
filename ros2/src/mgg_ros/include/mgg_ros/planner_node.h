@@ -254,6 +254,14 @@ class PlannerNode : public rclcpp::Node {
   /// A ground robot's state at driving height above the floor its base
   /// stands on, for where the map shows no ground yet.
   mgg::StateVec physicalAnchorAtDrivingHeight(const mgg::StateVec& base_pose) const;
+  /// A ground robot that has not moved kStandingStartMoveM since its first
+  /// odometry, and stands within that of home (the global graph's vertex
+  /// 0, the home keyframe once the graph was rebuilt, so a planner
+  /// restarted mid-run does not count), stands at its start: the disk of
+  /// hanging_root_edge_length_max round where it stands counts as observed
+  /// ground (mgg::StandingStart) for its lattice, turns and departures.
+  /// nullopt otherwise, and without a hanging_root_edge_length_max.
+  std::optional<mgg::StandingStart> standingStart() const;
   /// Dijkstra through a fresh local lattice from the robot to a goal inside
   /// the lattice box, the goal linked in with checked edges; under the turn
   /// rule as routeOverGlobalGraph.
@@ -319,6 +327,13 @@ class PlannerNode : public rclcpp::Node {
 
   std::string map_backend_ = "cloud_octomap";
   mgg::StateVec current_state_ = mgg::StateVec::Zero();
+  /// How far the robot is tilted from level, radians: its odometry's roll
+  /// and pitch (mgg::PathTurnCheck::setRobotTilt).
+  double current_tilt_ = 0.0;
+  /// Where the first odometry placed the robot, until it moves
+  /// kStandingStartMoveM from there (standingStart()).
+  std::optional<Eigen::Vector2d> standing_start_xy_;
+  bool left_standing_start_ = false;
   bool have_odometry_ = false;
   std::int64_t last_odometry_stamp_ns_ = 0;
   std::chrono::steady_clock::time_point last_odometry_received_{};

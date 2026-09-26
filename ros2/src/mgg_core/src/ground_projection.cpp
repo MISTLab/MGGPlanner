@@ -346,8 +346,9 @@ double GroundProjection::observedGroundAhead(
     Eigen::Vector3d ground;
     if (footprintGroundBelow(
             Eigen::Vector3d(cell.center.x(), cell.center.y(), point.z()),
-            ground) &&
-        ground.z() >= lowest) {
+            ground)) {
+      if (ground.z() >= lowest) ++observed;
+    } else if (standing_start_ && standing_start_->covers(cell.center)) {
       ++observed;
     }
   }

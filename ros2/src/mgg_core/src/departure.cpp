@@ -198,7 +198,7 @@ bool findDeparture(const MapInterface& map, const GroundProjection& ground,
         if (!step_free(departure.path.back(), to, i == 1)) break;
         departure.path.push_back(to);
         if (out >= kDepartureMinM - 1e-9 &&
-            roomToTurn(map, robot, planning, to)) {
+            roomToTurn(map, robot, planning, to, ground.standingStart())) {
           departure.reverse = backwards;
           return true;
         }

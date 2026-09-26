@@ -5,7 +5,8 @@ planner grids (SDMGRID1).
 usage: make_departure_fixtures.py <grid dir> <output dir>
 
 <grid dir> holds r0.sdpg and r1.sdpg from diag-run5/data, and r0n.sdpg and
-r1n.sdpg, robot_0's r1490 and robot_1's r1615 grids of the same run.
+r1n.sdpg, robot_0's r1490 and robot_1's r1615 grids of the same run; and
+r3r15.sdpg, robot_3's r15 grid of run 6 (diag-run6/data/r3).
 
 Each fixture is the part of a robot's planner grid within 3 m (in x and y)
 of where it stood boxed in, between 0.6 m below and 1.2 m above the ground
@@ -36,8 +37,21 @@ CASES = [
      "foot it had not yet observed",
      [((379, -220), 1, 4), ((379, -219), 1, 4), ((379, -218), 1, 4),
       ((380, -218), 1, 4), ((380, -217), 1, 4), ((381, -216), 1, 4)]),
+    # Run 6: robot_3 (Spot) at its start, never moved, and robot_1 (Bunker)
+    # 2 m east of it. robot_3's lidar had seen no ground within about 2.4 m
+    # (4.8 m east, behind robot_1), so the ground under it is given: the
+    # hangar floor, 0.975 m under its driving height.
+    ("standing_r3.txt", "r3r15.sdpg", -2.02, -2.00,
+     "robot_3 (Spot) at its start in run 6, with robot_1's start 2 m east, "
+     "the ground within about 2.4 m of it never observed", []),
 ]
-HALF_WINDOWS = {"ledge_r0.txt": 2.5, "turn_r1.txt": 2.5}
+HALF_WINDOWS = {"ledge_r0.txt": 2.5, "turn_r1.txt": 2.5, "standing_r3.txt": 3.5}
+# Where the window is centred, when not on the robot; the ground under the
+# robot, when nothing is mapped there; the band above the ground, when a
+# taller robot's body must be in it.
+WINDOW_CENTRES = {"standing_r3.txt": (-1.0, -2.0)}
+GROUND_Z = {"standing_r3.txt": -0.16}
+ABOVE = {"standing_r3.txt": 2.0}
 HALF_WINDOW_M = 3.0
 BELOW_M, ABOVE_M = 0.6, 1.2
 
@@ -62,8 +76,9 @@ def main(src, dst):
     for name, grid, x, y, what, unknown in CASES:
         res, occ, free, surf = load(f"{src}/{grid}")
         half = HALF_WINDOWS.get(name, HALF_WINDOW_M)
-        i0, i1 = math.floor((x - half) / res), math.floor((x + half) / res)
-        j0, j1 = math.floor((y - half) / res), math.floor((y + half) / res)
+        cx, cy = WINDOW_CENTRES.get(name, (x, y))
+        i0, i1 = math.floor((cx - half) / res), math.floor((cx + half) / res)
+        j0, j1 = math.floor((cy - half) / res), math.floor((cy + half) / res)
         inside = lambda a: (a[:, 0] >= i0) & (a[:, 0] <= i1) & (a[:, 1] >= j0) & (a[:, 1] <= j1)
         o = occ[inside(occ)]
         top = {}
@@ -73,8 +88,11 @@ def main(src, dst):
                 top[k] = max(top.get(k, -1e9), float(sz))
         # The ground under the robot: the highest surface in its column below 1 m.
         ci, cj = math.floor(x / res), math.floor(y / res)
-        ground = max(v for (a, b, c), v in top.items() if a == ci and b == cj and v < 1.0)
-        k0, k1 = math.floor((ground - BELOW_M) / res), math.floor((ground + ABOVE_M) / res)
+        ground = GROUND_Z.get(name)
+        if ground is None:
+            ground = max(v for (a, b, c), v in top.items() if a == ci and b == cj and v < 1.0)
+        k0 = math.floor((ground - BELOW_M) / res)
+        k1 = math.floor((ground + ABOVE.get(name, ABOVE_M)) / res)
         band = lambda a: a[(a[:, 2] >= k0) & (a[:, 2] <= k1)]
         o = band(o)
         f = band(free[inside(free)])

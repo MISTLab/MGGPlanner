@@ -21,6 +21,11 @@ namespace mgg_ros {
 /// ROS 2.
 double yawFromQuaternion(const geometry_msgs::msg::Quaternion& q);
 
+/// How far a quaternion tilts the body's z axis from the world's, radians
+/// in [0, pi]: its roll and pitch together, whatever its yaw. A zero
+/// quaternion is not tilted.
+double tiltFromQuaternion(const geometry_msgs::msg::Quaternion& q);
+
 geometry_msgs::msg::Pose toPoseMsg(const mgg::StateVec& state);
 mgg::StateVec fromPoseMsg(const geometry_msgs::msg::Pose& pose);
 

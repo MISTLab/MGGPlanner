@@ -104,8 +104,10 @@ struct Departure {
 /// the start at the new heading; a controller such as SwarmDeck's DWB
 /// blends that turn into the drive rather than turning in place first, so
 /// the body it drives is not exactly the one checked, and its own costmap
-/// stays the collision authority (review r0, M-6). Returns false, with
-/// `departure.path` empty, when there is no way out.
+/// stays the collision authority (review r0, M-6). The ground observed
+/// ahead and the room to turn count the disk of `ground`'s standing start
+/// (GroundProjection::setStandingStart) as observed ground. Returns false,
+/// with `departure.path` empty, when there is no way out.
 bool findDeparture(const MapInterface& map, const GroundProjection& ground,
                    const RobotParams& robot, const PlanningParams& planning,
                    const StateVec& start, Departure& departure);

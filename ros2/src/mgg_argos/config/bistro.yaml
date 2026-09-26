@@ -258,6 +258,8 @@
       # pose of an edge this fraction of the cells under the leading half of
       # its footprint, and where it turns in place of its turning circle, must
       # have observed ground, and the turning circle no unobserved column.
+      # Until the robot first moves, the ground within its initial ground
+      # reach (the node's hanging_root_edge_length_max) counts as observed.
       # 0 turns it off.
       min_observed_ground_fraction: 0.75
       auto_global_planner_enable: true

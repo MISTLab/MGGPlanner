@@ -12,6 +12,10 @@ namespace {
 
 constexpr double kMinMove = 1e-9;
 
+/// How far down turnSpaceObserved looks for the ground under a standing
+/// start: GroundProjection's max_projection_length.
+constexpr double kStandingGroundDepth = 5.0;
+
 double headingBetween(const Eigen::Vector3d& from, const Eigen::Vector3d& to) {
   return std::atan2(to.y() - from.y(), to.x() - from.x());
 }
@@ -290,7 +294,8 @@ bool turnClear(const MapInterface& map, const RobotParams& robot,
 }
 
 bool turnSpaceObserved(const MapInterface& map, const RobotParams& robot,
-                       const PlanningParams& planning, const StateVec& state) {
+                       const PlanningParams& planning, const StateVec& state,
+                       const StandingStart* standing) {
   const double min_ground = planning.min_observed_ground_fraction;
   if (!(min_ground > 0.0)) return true;
   const Eigen::Vector3d center = state.head<3>() + robot.center_offset;
@@ -306,7 +311,11 @@ bool turnSpaceObserved(const MapInterface& map, const RobotParams& robot,
   const double lowest = center.z() - 2.0 * planning.max_ground_height;
   int observed_ground = 0;
   for (const XYCellCenter& cell : cells) {
-    bool observed = false;
+    // The ground the robot stands on at its start, which its lidar has not
+    // seen: observed unless it was seen to fall away.
+    const bool standing_on =
+        standing != nullptr && standing->covers(cell.center);
+    bool observed = standing_on;
     for (double z = center.z() - 0.5 * height;
          z <= center.z() + 0.5 * height + 1e-9 && !observed;
          z += resolution) {
@@ -315,12 +324,17 @@ bool turnSpaceObserved(const MapInterface& map, const RobotParams& robot,
                  VoxelStatus::kUnknown;
     }
     if (!observed) return false;
+    // Under the standing start, as far down as ground projection looks
+    // (GroundProjection::max_projection_length), so that ground seen far
+    // below is a drop, not ground never seen.
+    const double depth =
+        standing_on ? kStandingGroundDepth : 2.0 * planning.max_ground_height;
     const Eigen::Vector3d from(cell.center.x(), cell.center.y(), center.z());
     Eigen::Vector3d ground;
-    if (map.getGroundRayStatus(
-            from, from - Eigen::Vector3d(0.0, 0.0, 2.0 * planning.max_ground_height),
-            false, ground) == VoxelStatus::kOccupied &&
-        ground.z() >= lowest) {
+    if (map.getGroundRayStatus(from, from - Eigen::Vector3d(0.0, 0.0, depth),
+                               false, ground) == VoxelStatus::kOccupied) {
+      if (ground.z() >= lowest) ++observed_ground;
+    } else if (standing_on) {
       ++observed_ground;
     }
   }
@@ -328,9 +342,10 @@ bool turnSpaceObserved(const MapInterface& map, const RobotParams& robot,
 }
 
 bool roomToTurn(const MapInterface& map, const RobotParams& robot,
-                const PlanningParams& planning, const StateVec& state) {
+                const PlanningParams& planning, const StateVec& state,
+                const StandingStart* standing) {
   return turnClear(map, robot, state) &&
-         turnSpaceObserved(map, robot, planning, state);
+         turnSpaceObserved(map, robot, planning, state, standing);
 }
 
 PathTurnCheck::PathTurnCheck(GraphManager& graph, const RobotParams& robot,
@@ -355,9 +370,25 @@ double PathTurnCheck::slopeAt(const Eigen::Vector3d& position) {
   const PositionKey key = positionKey(position);
   const auto found = slope_at_.find(key);
   if (found != slope_at_.end()) return found->second;
-  if (slope_) return slope_at_[key] = slope_(position);
-  const Vertex probe(-1, StateVec(position.x(), position.y(), position.z(), 0));
-  return slope_at_[key] = terrainSlope(graph_, probe, window_);
+  double slope = 0.0;
+  if (slope_) {
+    slope = slope_(position);
+  } else {
+    const Vertex probe(-1,
+                       StateVec(position.x(), position.y(), position.z(), 0));
+    slope = terrainSlope(graph_, probe, window_);
+  }
+  if (slope >= kUnknownSlopeRad && robot_tilt_ && robot_tilt_->first == key &&
+      robot_tilt_->second < kLevelGroundSlopeRad) {
+    slope = robot_tilt_->second;
+  }
+  return slope_at_[key] = slope;
+}
+
+void PathTurnCheck::setRobotTilt(const Eigen::Vector3d& position,
+                                 double tilt) {
+  robot_tilt_.emplace(positionKey(position), std::abs(tilt));
+  slope_at_.erase(robot_tilt_->first);
 }
 
 bool PathTurnCheck::roomAt(const Eigen::Vector3d& position) {

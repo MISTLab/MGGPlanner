@@ -37,6 +37,9 @@ constexpr double kLinkRadius = 1.5;
 // A goal only stands for a vertex it practically coincides with; any farther
 // and it gets its own vertex with checked edges.
 constexpr double kGoalLinkRadius = 0.1;
+/// A robot that has moved less than this from its first odometry has not
+/// left its start (PlannerNode::standingStart).
+constexpr double kStandingStartMoveM = 0.5;
 
 double secondsSince(const std::chrono::steady_clock::time_point& then) {
   return std::chrono::duration<double>(std::chrono::steady_clock::now() - then)
@@ -280,6 +283,8 @@ PlannerNode::PlannerNode(const rclcpp::NodeOptions& options)
   // the physical driving height (base height above the assumed floor) as a
   // hanging vertex, and one edge from it may reach up to this far to the
   // first supported vertex; every other check on that edge still applies.
+  // Until the robot first moves, the ground within this reach of it counts
+  // as observed (standingStart()).
   hanging_root_edge_length_max_ = std::max(
       0.0, declareOrGet<double>(this, "hanging_root_edge_length_max",
                                 hanging_root_edge_length_max_));
@@ -531,6 +536,20 @@ mgg::StateVec PlannerNode::physicalAnchorAtDrivingHeight(
   return anchor;
 }
 
+std::optional<mgg::StandingStart> PlannerNode::standingStart() const {
+  std::optional<mgg::StandingStart> standing;
+  const mgg::Vertex* home = findGlobalVertex(0);
+  if (robot_params_.type == mgg::RobotType::kGroundRobot &&
+      standing_start_xy_ && hanging_root_edge_length_max_ > 0.0 &&
+      home != nullptr &&
+      (home->state.head<2>() - current_state_.head<2>()).norm() <
+          kStandingStartMoveM) {
+    standing = mgg::StandingStart{current_state_.head<2>(),
+                                  hanging_root_edge_length_max_};
+  }
+  return standing;
+}
+
 std::vector<Eigen::Vector3d> PlannerNode::selectionExclusions() {
   if (have_coordination_exclusions_ &&
       secondsSince(coordination_exclusions_received_) <=
@@ -578,6 +597,14 @@ void PlannerNode::onOdometry(nav_msgs::msg::Odometry::ConstSharedPtr msg) {
   }
   last_odometry_stamp_ns_ = stamp_ns;
   current_state_ = state;
+  current_tilt_ = tiltFromQuaternion(msg->pose.pose.orientation);
+  if (!left_standing_start_) {
+    if (!standing_start_xy_) standing_start_xy_ = state.head<2>();
+    if ((state.head<2>() - *standing_start_xy_).norm() >= kStandingStartMoveM) {
+      standing_start_xy_.reset();
+      left_standing_start_ = true;
+    }
+  }
   have_odometry_ = true;
   last_odometry_received_ = std::chrono::steady_clock::now();
 
@@ -1455,12 +1482,15 @@ std::string PlannerNode::buildLocalGraph() {
   root->is_hanging = root_hanging;
   local_graph_->addVertex(root);
   ++planner_trigger_count_;
+  const std::optional<mgg::StandingStart> standing = standingStart();
+  const mgg::StandingStart* standing_on = standing ? &*standing : nullptr;
 
   // The lattice checks each vertex's footprint from every edge that meets
   // it. Its ground lookups are shared for this plan only: the map is held
   // still by the lease above and the lock, and the cache goes with the plan.
-  const mgg::GroundProjection plan_ground(*map_, planning_params_,
-                                          /*cache_footprint_ground=*/true);
+  mgg::GroundProjection plan_ground(*map_, planning_params_,
+                                    /*cache_footprint_ground=*/true);
+  plan_ground.setStandingStart(standing);
   mgg::ExpandContext ctx = makeContext();
   ctx.ground = &plan_ground;
   const auto t_global = Clock::now();
@@ -1502,9 +1532,12 @@ std::string PlannerNode::buildLocalGraph() {
   // place; a path that turns elsewhere is taken only when no other path
   // would be.
   mgg::PathTurnCheck turn_check(
-      *local_graph_, robot_params_, [this](const mgg::StateVec& pose) {
-        return mgg::roomToTurn(*map_, robot_params_, planning_params_, pose);
+      *local_graph_, robot_params_,
+      [this, standing_on](const mgg::StateVec& pose) {
+        return mgg::roomToTurn(*map_, robot_params_, planning_params_, pose,
+                               standing_on);
       });
+  turn_check.setRobotTilt(root_state.head<3>(), current_tilt_);
   mgg::PathTurnsFn turns_admissible;
   mgg::SharpTurnAllowedFn sharp_turn_allowed;
   if (robot_params_.type == mgg::RobotType::kGroundRobot) {
@@ -1607,7 +1640,7 @@ std::string PlannerNode::buildLocalGraph() {
   const bool is_boxed_in = (sel.sharp_turn_fallback || goes_nowhere) &&
                            turns_admissible &&
                            !mgg::roomToTurn(*map_, robot_params_, planning_params_,
-                                            root_state);
+                                            root_state, standing_on);
   if (is_boxed_in) {
     boxed_in = departBoxedIn(root_state, goes_nowhere
                                              ? "its best path goes nowhere"
@@ -1749,7 +1782,9 @@ std::string PlannerNode::departBoxedIn(const mgg::StateVec& root_state,
 
 bool PlannerNode::straightDeparture(const mgg::StateVec& start,
                                     mgg::Departure& departure) {
-  return mgg::findDeparture(*map_, *ground_, robot_params_, planning_params_,
+  mgg::GroundProjection ground(*map_, planning_params_);
+  ground.setStandingStart(standingStart());
+  return mgg::findDeparture(*map_, ground, robot_params_, planning_params_,
                             start, departure);
 }
 
@@ -1989,8 +2024,9 @@ bool PlannerNode::routeOverLocalLattice(const mgg::StateVec& goal,
   root->is_hanging = root_hanging;
   local_graph_->addVertex(root);
   // One plan's shared footprint lookups, as in buildLocalGraph.
-  const mgg::GroundProjection plan_ground(*map_, planning_params_,
-                                          /*cache_footprint_ground=*/true);
+  mgg::GroundProjection plan_ground(*map_, planning_params_,
+                                    /*cache_footprint_ground=*/true);
+  plan_ground.setStandingStart(standingStart());
   mgg::ExpandContext ctx = makeContext();
   ctx.ground = &plan_ground;
   const mgg::GridGraphResult r = buildGridGraph(
@@ -2046,15 +2082,21 @@ mgg::PathOkFn PlannerNode::applyRouteTurnRule(
       return mgg::groundSlope(*ground_, position, radius);
     };
   }
+  const std::optional<mgg::StandingStart> standing = standingStart();
   const auto check = std::make_shared<mgg::PathTurnCheck>(
       graph, robot_params_,
-      [this](const mgg::StateVec& pose) {
-        return mgg::roomToTurn(*map_, robot_params_, planning_params_, pose);
+      [this, standing](const mgg::StateVec& pose) {
+        return mgg::roomToTurn(*map_, robot_params_, planning_params_, pose,
+                               standing ? &*standing : nullptr);
       },
       slope);
   const double start_heading = current_state_[3];
   std::vector<Eigen::Vector3d> lead_in_points;
   for (const mgg::StateVec& s : lead_in) lead_in_points.push_back(s.head<3>());
+  // Where the route starts is where the robot stands.
+  check->setRobotTilt(lead_in_points.empty() ? route.front()->state.head<3>()
+                                             : lead_in_points.front(),
+                      current_tilt_);
   const mgg::RouteTurnChoice choice = mgg::chooseTurnCompliantRoute(
       graph, *check, lead_in_points, start_heading, route,
       mgg::kMaxDetourSearchStates);
@@ -2076,7 +2118,8 @@ mgg::PathOkFn PlannerNode::applyRouteTurnRule(
         !turns.empty() && turns.front() > mgg::kSharpTurnRad + 1e-9 &&
         !mgg::roomToTurn(*map_, robot_params_, planning_params_,
                          mgg::StateVec(points.front().x(), points.front().y(),
-                                       points.front().z(), start_heading));
+                                       points.front().z(), start_heading),
+                         standing ? &*standing : nullptr);
     RCLCPP_WARN(get_logger(),
                 "%s to (%.2f, %.2f, %.2f) turns sharply on a slope or "
                 "without room to turn: no route turns only where it may; "

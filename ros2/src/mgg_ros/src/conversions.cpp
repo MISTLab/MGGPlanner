@@ -1,5 +1,6 @@
 #include "mgg_ros/conversions.h"
 
+#include <algorithm>
 #include <cmath>
 
 namespace mgg_ros {
@@ -9,6 +10,14 @@ double yawFromQuaternion(const geometry_msgs::msg::Quaternion& q) {
   const double siny_cosp = 2.0 * (q.w * q.z + q.x * q.y);
   const double cosy_cosp = 1.0 - 2.0 * (q.y * q.y + q.z * q.z);
   return std::atan2(siny_cosp, cosy_cosp);
+}
+
+double tiltFromQuaternion(const geometry_msgs::msg::Quaternion& q) {
+  const double norm2 = q.x * q.x + q.y * q.y + q.z * q.z + q.w * q.w;
+  if (!(norm2 > 0.0)) return 0.0;
+  // The z component of the body's z axis in the world frame, R(2, 2).
+  const double up = 1.0 - 2.0 * (q.x * q.x + q.y * q.y) / norm2;
+  return std::acos(std::clamp(up, -1.0, 1.0));
 }
 
 geometry_msgs::msg::Pose toPoseMsg(const mgg::StateVec& state) {

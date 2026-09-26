@@ -134,6 +134,49 @@ TEST(TerrainSlope, FailsClosedWhereNoPlaneCanBeFitted) {
   for (Vertex* v : path) delete v;
 }
 
+TEST(PathTurnCheck, TheRobotsTiltIsItsSlopeWhereTheLatticeCannotMeasureIt) {
+  // Run 6: robot_3 and robot_1 stood where the lattice had no vertex with
+  // ground within a robot's length, and every path turning there was
+  // refused as on a slope, for the whole run. Where the robot stands, its
+  // own tilt is the slope of the ground it rests on.
+  GraphManager sparse;
+  auto* root = new Vertex(0, StateVec(0, 0, 0.5, 0));
+  root->is_hanging = true;
+  sparse.addVertex(root);
+  sparse.addVertex(new Vertex(1, StateVec(2.0, 0, 0.5, 0)));
+  const Eigen::Vector3d at_root(0, 0, 0.5);
+  const Eigen::Vector3d elsewhere(2.0, 0, 0.5);
+  const auto turning_path = [](int first_id) {
+    return std::vector<Vertex*>{new Vertex(first_id, StateVec(0, 0, 0.5, 0)),
+                                new Vertex(first_id + 1,
+                                           StateVec(0, 0.8, 0.5, 0))};
+  };
+
+  PathTurnCheck level(sparse, robot());
+  level.setRobotTilt(at_root, 3.0 * M_PI / 180.0);
+  EXPECT_TRUE(level.sharpTurnAllowedAt(at_root));
+  auto path = turning_path(10);
+  EXPECT_TRUE(level(path));
+  // Elsewhere an unknown slope stays steep.
+  EXPECT_FALSE(level.sharpTurnAllowedAt(elsewhere));
+
+  // Tilted past the level-ground limit, the turn is refused as before.
+  PathTurnCheck tilted(sparse, robot());
+  tilted.setRobotTilt(at_root, 10.0 * M_PI / 180.0);
+  EXPECT_FALSE(tilted.sharpTurnAllowedAt(at_root));
+  EXPECT_FALSE(tilted(path));
+  EXPECT_EQ(tilted.refused_on_slope, 1);
+
+  // A slope the lattice measures wins over the tilt.
+  GraphManager ramp;
+  addRampLattice(ramp);
+  PathTurnCheck on_ramp(ramp, robot());
+  const Eigen::Vector3d mid_ramp(1.0, 0.0, rampGround(1.0) + 0.5);
+  on_ramp.setRobotTilt(mid_ramp, 0.0);
+  EXPECT_FALSE(on_ramp.sharpTurnAllowedAt(mid_ramp));
+  for (Vertex* v : path) delete v;
+}
+
 /// Vertices at the given (x, y) lattice points over the ramp, chained.
 std::vector<Vertex*> rampPath(const std::vector<Eigen::Vector2d>& at,
                               double heading, int first_id = 0) {

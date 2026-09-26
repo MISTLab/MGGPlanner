@@ -798,6 +798,56 @@ TEST_F(PlannerNodeTest, BlindStartPlansFromThePhysicalAnchor) {
   EXPECT_EQ(response->status, PlannerNode::kStatusNoPath);
 }
 
+TEST_F(PlannerNodeTest, AStandingStartInItsLidarsBlindDiskIsNotBoxedIn) {
+  // Run 6: robot_3 stood where it was placed for the whole run, robot_1
+  // for 18 minutes. Their lidars never saw the ground within about 2 m of
+  // them, and a wall (for robot_3, a peer's shadow) stood ahead: every way
+  // out turned where they stood, over ground not observed, so each was
+  // boxed in with no departure. Here the floor is observed from 0.6 m out,
+  // and a wall 0.8 m ahead of the robot, which faces +y, blocks the way
+  // straight on. Standing at its start, it turns out east or west.
+  const auto scene = [](const std::string& name) {
+    auto node = makeNode(name);
+    PlannerNodeTestPeer::observeRaisedRing(*node, 0.6, 3.5, 0.0);
+    PlannerNodeTestPeer::observeWall(*node, -1.0, 1.0, 0.8);
+    PlannerNodeTestPeer::setHangingRootReach(*node, 1.2);
+    return node;
+  };
+  const auto facing_north = [](double x, int stamp) {
+    auto msg = std::make_shared<nav_msgs::msg::Odometry>();
+    msg->header.stamp.sec = stamp;
+    msg->pose.pose.position.x = x;
+    msg->pose.pose.position.z = 0.075;
+    msg->pose.pose.orientation.z = std::sin(M_PI / 4.0);
+    msg->pose.pose.orientation.w = std::cos(M_PI / 4.0);
+    return msg;
+  };
+
+  auto standing = scene("standing_start");
+  PlannerNodeTestPeer::acceptOdometry(*standing, facing_north(0.0, 1));
+  auto response = std::make_shared<mgg_msgs::srv::PlannerSrv::Response>();
+  PlannerNodeTestPeer::plan(*standing, response);
+  EXPECT_EQ(response->status, mgg_msgs::srv::PlannerSrv::Response::FORWARD);
+  ASSERT_GE(response->path.size(), 2u);
+  // Out of the blind square, on this side of the wall.
+  const geometry_msgs::msg::Point& end = response->path.back().position;
+  EXPECT_GE(std::max(std::abs(end.x), std::abs(end.y)), 0.6)
+      << end.x << ", " << end.y;
+  EXPECT_LT(end.y, 0.8);
+  EXPECT_EQ(PlannerNodeTestPeer::boxedInWithoutDeparture(*standing), 0);
+
+  // The same place, reached from 0.6 m west: the robot has left its start,
+  // and the ground it never saw is unobserved. Boxed in, with no way out.
+  auto moved = scene("moved_from_start");
+  PlannerNodeTestPeer::acceptOdometry(*moved, facing_north(-0.6, 1));
+  PlannerNodeTestPeer::acceptOdometry(*moved, facing_north(0.0, 2));
+  response = std::make_shared<mgg_msgs::srv::PlannerSrv::Response>();
+  PlannerNodeTestPeer::plan(*moved, response);
+  EXPECT_TRUE(response->path.empty())
+      << "path of " << response->path.size() << " poses";
+  EXPECT_EQ(PlannerNodeTestPeer::boxedInWithoutDeparture(*moved), 1);
+}
+
 namespace {
 
 /// Two planners in separate odometry frames: robot 1 at the origin of

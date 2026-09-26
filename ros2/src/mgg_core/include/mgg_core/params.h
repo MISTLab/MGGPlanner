@@ -263,7 +263,10 @@ struct PlanningParams {
   /// column of that circle may be unobserved over the height of its
   /// collision box. On the run-5 grids 0.4 to 3.4 % of the poses the robots
   /// drove had less than 0.75 ahead, and robot_0's ledge, where it tipped
-  /// into a 4 m pit, 1/9. 0 turns it off. Not an upstream parameter.
+  /// into a 4 m pit, 1/9. A robot standing at its start has not observed
+  /// the ground it stands on: within its initial ground reach
+  /// (mgg::StandingStart) that ground counts as observed. 0 turns it off.
+  /// Not an upstream parameter.
   double min_observed_ground_fraction = 0.75;
 
   // Global planner.

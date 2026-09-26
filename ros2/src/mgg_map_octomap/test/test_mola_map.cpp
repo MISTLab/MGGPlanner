@@ -2032,12 +2032,71 @@ TEST(ObservedGround, Run5Robot0IsNotParkedAtTheLedge) {
   EXPECT_FALSE(mgg::roomToTurn(
       *fixture.map, robot, planning,
       mgg::StateVec(ledge.x(), ledge.y(), ledge.z(), -M_PI / 2.0)));
+  // robot_0 had driven 130 m from its start: no standing start is set,
+  // and one elsewhere, its disk short of the ledge, changes nothing.
+  mgg::GroundProjection away(*fixture.map, planning);
+  away.setStandingStart(
+      mgg::StandingStart{back.head<2>() + Eigen::Vector2d(0.0, 2.5), 2.0});
+  EXPECT_DOUBLE_EQ(
+      away.observedGroundAhead(ledge, south, robot.getPlanningSize()),
+      at_ledge);
+  EXPECT_EQ(away.getProjectedEdgeStatus(back, ledge, robot.getPlanningSize(),
+                                        false, path, false),
+            mgg::ProjectedEdgeStatus::kGroundUnobserved);
   // Without the check, nothing else refuses the edge onto the ledge.
   planning.min_observed_ground_fraction = 0.0;
   EXPECT_EQ(ground.getProjectedEdgeStatus(back, ledge,
                                           robot.getPlanningSize(), false,
                                           path, false),
             mgg::ProjectedEdgeStatus::kAdmissible);
+}
+
+TEST(ObservedGround, Run6StandingStartsHaveRoomToTurn) {
+  // Run 6: robot_3 (Spot) was boxed in where it was placed for the whole
+  // run, and robot_1 (Bunker), 2 m east of it, for 18 minutes. robot_3's
+  // grid holds no ground within about 2.4 m of it, 4.8 m east behind
+  // robot_1's body: every turning circle there was unobserved, so neither
+  // had room to turn. robot_1's own grid was not kept; robot_3's leaves
+  // robot_1's surroundings unobserved too, as robot_1's did. Standing at
+  // their starts, the disk of their initial ground reach
+  // (hanging_root_edge_length_max: 2.5 m for a Spot, 2.0 m for a Bunker)
+  // counts as observed ground, and both have room to turn. Beyond it the
+  // unobserved ground stays unobserved.
+  const BoxedInFixture fixture("standing_r3.txt");
+  mgg::RobotParams spot = bunker();
+  spot.size = Eigen::Vector3d(1.1, 0.5, 1.0);
+  mgg::PlanningParams spot_planning = bunkerPlanning();
+  spot_planning.max_ground_height = 0.5 + 0.3 + 0.175;
+  spot_planning.max_step_height = 0.3;
+  const mgg::PlanningParams bunker_planning = bunkerPlanning();
+  struct Standing {
+    const char* name;
+    mgg::RobotParams robot;
+    const mgg::PlanningParams* planning;
+    Eigen::Vector2d at;
+    double reach;
+  };
+  for (const Standing& start :
+       {Standing{"robot_3", spot, &spot_planning, {-2.02, -2.00}, 2.5},
+        Standing{"robot_1", bunker(), &bunker_planning, {-0.01, -2.00}, 2.0}}) {
+    SCOPED_TRACE(start.name);
+    const mgg::PlanningParams& planning = *start.planning;
+    const mgg::StateVec pose(start.at.x(), start.at.y(),
+                             fixture.robot.z() + planning.max_ground_height,
+                             0.0);
+    EXPECT_TRUE(mgg::turnClear(*fixture.map, start.robot, pose));
+    EXPECT_FALSE(mgg::roomToTurn(*fixture.map, start.robot, planning, pose));
+    const mgg::StandingStart standing{start.at, start.reach};
+    EXPECT_TRUE(mgg::roomToTurn(*fixture.map, start.robot, planning, pose,
+                                &standing));
+  }
+  // 3 m east of robot_3, behind robot_1, out of robot_3's disk.
+  const mgg::StandingStart robot_3{Eigen::Vector2d(-2.02, -2.00), 2.5};
+  EXPECT_FALSE(mgg::turnSpaceObserved(
+      *fixture.map, spot, spot_planning,
+      mgg::StateVec(0.98, -2.00,
+                    fixture.robot.z() + spot_planning.max_ground_height, 0.0),
+      &robot_3));
 }
 
 TEST(ObservedGround, Run5Robot1HasNoRoomToTurnBesideAnUnobservedWall) {
