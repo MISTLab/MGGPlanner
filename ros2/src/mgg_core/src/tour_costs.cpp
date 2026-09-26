@@ -9,9 +9,10 @@ namespace mgg {
 const ShortestPathsReport* GraphDistanceCache::from(GraphManager& graph,
                                                     std::uint64_t revision,
                                                     int source_id) {
-  if (!valid_ || revision != revision_) {
+  if (!valid_ || &graph != graph_ || revision != revision_) {
     reports_.clear();
     failed_.clear();
+    graph_ = &graph;
     revision_ = revision;
     valid_ = true;
   }

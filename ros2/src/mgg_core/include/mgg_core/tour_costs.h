@@ -25,12 +25,12 @@ namespace mgg {
 inline constexpr double kFirstLegLookaheadM = 2.0;
 
 /// Dijkstra reports over one graph, one per source vertex, dropped when the
-/// graph revision changes.
+/// graph instance or its revision changes.
 class GraphDistanceCache {
  public:
-  /// The report from `source_id`, solved on first use in this `revision`;
-  /// null when the source is not in the graph or Dijkstra cannot run (a
-  /// graph of fewer than two vertices).
+  /// The report from `source_id`, solved on first use in this `graph` at
+  /// this `revision`; null when the source is not in the graph or Dijkstra
+  /// cannot run (a graph of fewer than two vertices).
   const ShortestPathsReport* from(GraphManager& graph, std::uint64_t revision,
                                   int source_id);
   /// Dijkstra runs so far.
@@ -38,6 +38,8 @@ class GraphDistanceCache {
 
  private:
   bool valid_ = false;
+  /// Identity only, never dereferenced: which graph the reports came from.
+  const GraphManager* graph_ = nullptr;
   std::uint64_t revision_ = 0;
   std::unordered_map<int, ShortestPathsReport> reports_;
   std::unordered_set<int> failed_;

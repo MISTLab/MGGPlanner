@@ -83,6 +83,44 @@ TEST(TourCosts, DistancesAreSolvedOncePerGraphRevision) {
   EXPECT_EQ(cache.solves(), 6u);
 }
 
+TEST(TourCosts, AnotherGraphAtTheSameRevisionIsSolvedAfresh) {
+  // Two graphs with the same vertex IDs and revision: the cache must not
+  // hand the second graph the first one's distances.
+  GraphManager near_graph;
+  Vertex* near_root = add(near_graph, 0.0, 0.0);
+  Vertex* near_goal =
+      add(near_graph, 5.0, 0.0, near_root, VertexType::kFrontier);
+  GraphManager far_graph;
+  Vertex* far_root = add(far_graph, 0.0, 0.0);
+  Vertex* far_goal = add(far_graph, 20.0, 0.0, far_root, VertexType::kFrontier);
+  ASSERT_EQ(near_goal->id, far_goal->id);
+  GraphDistanceCache cache;
+  EXPECT_DOUBLE_EQ(mgg::computeTourCosts(near_graph, 1, cache, near_root->id,
+                                         0.0, {clusterAt(near_goal)}, 0.0)
+                       .from_robot[0],
+                   5.0);
+  EXPECT_DOUBLE_EQ(mgg::computeTourCosts(far_graph, 1, cache, far_root->id,
+                                         0.0, {clusterAt(far_goal)}, 0.0)
+                       .from_robot[0],
+                   20.0);
+}
+
+TEST(TourCosts, AFailedSourceInAnotherGraphAtTheSameRevisionIsRetried) {
+  // A lone vertex cannot be solved; a linked graph with the same IDs and
+  // revision can.
+  GraphManager lone;
+  Vertex* only = add(lone, 0.0, 0.0);
+  GraphManager linked;
+  Vertex* root = add(linked, 0.0, 0.0);
+  Vertex* goal = add(linked, 5.0, 0.0, root, VertexType::kFrontier);
+  ASSERT_EQ(only->id, root->id);
+  GraphDistanceCache cache;
+  EXPECT_EQ(cache.from(lone, 1, only->id), nullptr);
+  const TourCostMatrix costs = mgg::computeTourCosts(
+      linked, 1, cache, root->id, 0.0, {clusterAt(goal)}, 0.0);
+  EXPECT_DOUBLE_EQ(costs.from_robot[0], 5.0);
+}
+
 TEST(TourCosts, AnUnlinkedSourceLeavesEveryClusterUnreachable) {
   // Review Focus 4: the robot's pose joined no vertex, or the graph is a
   // lone root. No cluster is reachable and the tour is empty.
