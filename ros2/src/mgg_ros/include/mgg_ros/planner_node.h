@@ -309,6 +309,12 @@ class PlannerNode : public rclcpp::Node {
   bool tourKeepsRoute(int vertex_id) const;
   /// The robot's pose, then its clusters' representatives in tour order.
   void publishTour();
+  /// §2.4: whether the local path ending at `viewpoint` serves the tour's
+  /// `target`. The lattice is laid out along the robot's heading
+  /// (buildGridGraph), so both offsets from the robot are turned into its
+  /// frame before mgg::localPathServesTarget compares them with its bounds.
+  bool localPathServesTour(const Eigen::Vector3d& viewpoint,
+                           const Eigen::Vector3d& target) const;
 
   // Core state. None of these know about ROS.
   std::unique_ptr<mgg::MapInterface> map_;

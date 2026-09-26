@@ -443,6 +443,14 @@ class PlannerNodeTestPeer {
     const std::lock_guard<std::recursive_mutex> lock(node.planner_mutex_);
     return node.tour_planner_->targetSince();
   }
+  /// localPathServesTour with the robot at the origin facing `yaw`.
+  static bool localPathServesTour(PlannerNode& node, double yaw,
+                                  const Eigen::Vector3d& viewpoint,
+                                  const Eigen::Vector3d& target) {
+    const std::lock_guard<std::recursive_mutex> lock(node.planner_mutex_);
+    node.current_state_ = mgg::StateVec(0.0, 0.0, 0.0, yaw);
+    return node.localPathServesTour(viewpoint, target);
+  }
   static bool bestPathFromGlobalGraph(PlannerNode& node) {
     const std::lock_guard<std::recursive_mutex> lock(node.planner_mutex_);
     return node.best_path_from_global_graph_;
@@ -2181,6 +2189,28 @@ TEST_F(PlannerNodeTest, LocalExplorationTowardTheTourTargetIsKept) {
   EXPECT_FALSE(PlannerNodeTestPeer::bestPathFromGlobalGraph(*node));
   EXPECT_NE(PlannerNodeTestPeer::tourTarget(*node), mgg::kNoCluster);
   EXPECT_GT(response->path.back().position.x, 0.0);
+}
+
+TEST_F(PlannerNodeTest, TheTourTargetIsJudgedInTheLatticeFrameAtTheRobotsHeading) {
+  // Review r0, I-1: the lattice spans x in [-1, 3] and y in [-1, 1] along
+  // the robot's heading (buildGridGraph turns it by the heading). Facing
+  // +y, its box covers world x in [-1, 1] and y in [-1, 3].
+  auto node = makeNode("tour_lattice_frame");
+  PlannerNodeTestPeer::setLattice(*node, {-1.0, -1.0}, {3.0, 1.0});
+  const double north = M_PI / 2.0;
+  // (2, 0) is 2 m to the robot's right, outside the box, and a path north
+  // heads 90 degrees away from it.
+  EXPECT_FALSE(PlannerNodeTestPeer::localPathServesTour(
+      *node, north, {0.0, 2.0, 0.0}, {2.0, 0.0, 0.0}));
+  // (0, 2) is 2 m ahead, inside the box: any local path serves it.
+  EXPECT_TRUE(PlannerNodeTestPeer::localPathServesTour(
+      *node, north, {-1.0, 0.0, 0.0}, {0.0, 2.0, 0.0}));
+  // Far ahead, served by a path heading its way.
+  EXPECT_TRUE(PlannerNodeTestPeer::localPathServesTour(
+      *node, north, {0.3, 2.0, 0.0}, {0.0, 20.0, 0.0}));
+  // Facing +x, (2, 0) is inside the box.
+  EXPECT_TRUE(PlannerNodeTestPeer::localPathServesTour(
+      *node, 0.0, {0.0, 2.0, 0.0}, {2.0, 0.0, 0.0}));
 }
 
 TEST_F(PlannerNodeTest, AReachedTourTargetThatIsStillAFrontierIsReleasedOnce) {

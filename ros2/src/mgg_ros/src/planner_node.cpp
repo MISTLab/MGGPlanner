@@ -620,6 +620,17 @@ bool PlannerNode::tourKeepsRoute(int vertex_id) const {
   return true;
 }
 
+bool PlannerNode::localPathServesTour(const Eigen::Vector3d& viewpoint,
+                                      const Eigen::Vector3d& target) const {
+  const Eigen::Vector3d robot = current_state_.head<3>();
+  const Eigen::AngleAxisd to_lattice(-current_state_[3],
+                                     Eigen::Vector3d::UnitZ());
+  return mgg::localPathServesTarget(
+      Eigen::Vector3d::Zero(), to_lattice * (viewpoint - robot),
+      to_lattice * (target - robot), grid_params_.min_val,
+      grid_params_.max_val);
+}
+
 void PlannerNode::publishTour() {
   nav_msgs::msg::Path msg;
   msg.header.stamp = now();
@@ -2508,10 +2519,8 @@ void PlannerNode::onPlanRequest(
     if (tour_target.has_value() && !departed &&
         !boxed_in_without_departure_now_ && !withheld_without_departure) {
       if (!best_path_.empty() &&
-          mgg::localPathServesTarget(
-              current_state_.head<3>(), best_path_.back().head<3>(),
-              tour_target->position, grid_params_.min_val,
-              grid_params_.max_val)) {
+          localPathServesTour(best_path_.back().head<3>(),
+                              tour_target->position)) {
         tour_decided = true;
         summary += "; exploring locally toward the tour's target";
       } else {
