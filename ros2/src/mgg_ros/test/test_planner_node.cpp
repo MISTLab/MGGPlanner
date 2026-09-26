@@ -494,6 +494,17 @@ class PlannerNodeTestPeer {
     node.findGlobalVertex(id)->type = mgg::VertexType::kFrontier;
     ++node.graph_revision_;
   }
+  /// A peer's reservation of (x, y), in the planning frame.
+  static void receiveReservation(PlannerNode& node, double x, double y) {
+    auto msg = std::make_shared<geometry_msgs::msg::PoseArray>();
+    msg->header.frame_id = node.world_frame_;
+    geometry_msgs::msg::Pose pose;
+    pose.position.x = x;
+    pose.position.y = y;
+    pose.orientation.w = 1.0;
+    msg->poses.push_back(pose);
+    node.onCoordinationExclusions(msg);
+  }
   static int tourRoutesFailed(PlannerNode& node) {
     const std::lock_guard<std::recursive_mutex> lock(node.planner_mutex_);
     return node.tour_routes_failed_;
@@ -2360,6 +2371,45 @@ TEST_F(PlannerNodeTest, ATourTargetTheRobotStandsOnIsReachedNotAFailedRoute) {
   PlannerNodeTestPeer::plan(*node, response);
   EXPECT_EQ(PlannerNodeTestPeer::tourRoutesFailed(*node), 0);
   EXPECT_NEAR(PlannerNodeTestPeer::tourTargetPosition(*node).x(), -2.5, 1e-6);
+}
+
+TEST_F(PlannerNodeTest, AResumedTourRouteIsGivenUpWhenAPeerReservesItsTarget) {
+  // Review r0, I-3: the lattice (x in [-1, 3]) explores ahead, and the
+  // tour's target is a frontier 8 m behind, outside the lattice, taken
+  // before the lattice's own frontier ahead joined the graph (the next
+  // solve is a recompute interval away): the robot routes to it over the
+  // global graph and resumes that route. A peer then reserves the
+  // frontier; the next request gives the route up rather than resume it,
+  // although refreshTour does not run while a route is resumed.
+  auto node = makeNode("tour_resume_reserved");
+  PlannerNodeTestPeer::setLattice(*node, {-1.0, -1.5}, {3.0, 1.5});
+  PlannerNodeTestPeer::observeFloor(*node, -9.0, 4.0, -1.5, 1.5);
+  PlannerNodeTestPeer::acceptOdometry(*node, 0.0, 0.0, 1.0);
+  const int frontier = PlannerNodeTestPeer::addGlobalChainToFrontier(
+      *node, {{-1.0, 0.0}, {-2.0, 0.0}, {-3.0, 0.0}, {-4.0, 0.0},
+              {-5.0, 0.0}, {-6.0, 0.0}, {-7.0, 0.0}, {-8.0, 0.0}},
+      M_PI);
+  PlannerNodeTestPeer::setTour(*node, true, 0.0);
+  ASSERT_NE(PlannerNodeTestPeer::refreshTour(*node), mgg::kNoCluster);
+
+  const auto plan = [&node]() {
+    auto response = std::make_shared<mgg_msgs::srv::PlannerSrv::Response>();
+    PlannerNodeTestPeer::plan(*node, response);
+    return response;
+  };
+  auto response = plan();
+  ASSERT_EQ(response->status, mgg_msgs::srv::PlannerSrv::Response::FORWARD);
+  ASSERT_TRUE(PlannerNodeTestPeer::bestPathFromGlobalGraph(*node));
+  ASSERT_EQ(PlannerNodeTestPeer::repositioningTarget(*node), frontier);
+  response = plan();  // resumed
+  ASSERT_TRUE(PlannerNodeTestPeer::bestPathFromGlobalGraph(*node));
+  ASSERT_EQ(PlannerNodeTestPeer::repositioningTarget(*node), frontier);
+
+  PlannerNodeTestPeer::receiveReservation(*node, -8.0, 0.0);
+  response = plan();
+  EXPECT_FALSE(PlannerNodeTestPeer::repositioningOngoing(*node));
+  EXPECT_FALSE(PlannerNodeTestPeer::bestPathFromGlobalGraph(*node));
+  EXPECT_FALSE(PlannerNodeTestPeer::tourTargetPosition(*node).x() < -7.0);
 }
 
 TEST_F(PlannerNodeTest, AReachedTourTargetThatIsStillAFrontierIsReleasedOnce) {

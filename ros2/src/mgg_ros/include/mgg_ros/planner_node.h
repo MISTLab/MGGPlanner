@@ -315,8 +315,11 @@ class PlannerNode : public rclcpp::Node {
   /// or nothing when it has none. `note` is for the plan summary.
   std::optional<mgg::FrontierCluster> refreshTour(std::string& note);
   /// Whether a repositioning to global vertex `vertex_id` still heads for
-  /// the tour's target (always, when the tour is off or has no target).
-  bool tourKeepsRoute(int vertex_id) const;
+  /// the tour's target (always, when the tour is off or has no target). A
+  /// resumed route skips refreshTour, so the target is checked against the
+  /// graph and the peers' reservations as they are now: not when a peer
+  /// reserved it or it no longer holds `vertex_id`.
+  bool tourKeepsRoute(int vertex_id);
   /// The robot's pose, then its clusters' representatives in tour order.
   void publishTour();
   /// §2.4: whether the local path ending at `viewpoint` serves the tour's

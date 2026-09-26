@@ -650,17 +650,18 @@ std::optional<mgg::FrontierCluster> PlannerNode::refreshTour(
   return std::nullopt;
 }
 
-bool PlannerNode::tourKeepsRoute(int vertex_id) const {
+bool PlannerNode::tourKeepsRoute(int vertex_id) {
   if (!tour_params_.enabled) return true;
   const mgg::ClusterId target = tour_planner_->target();
   if (target == mgg::kNoCluster) return true;
-  for (const mgg::FrontierCluster& cluster : tour_clusters_) {
+  for (const mgg::FrontierCluster& cluster :
+       tourCandidates(globalFrontierClusters())) {
     if (cluster.id != target) continue;
     return std::find(cluster.member_vertex_ids.begin(),
                      cluster.member_vertex_ids.end(),
                      vertex_id) != cluster.member_vertex_ids.end();
   }
-  return true;
+  return false;  // explored, reserved by a peer, or no longer this robot's
 }
 
 bool PlannerNode::localPathServesTour(const Eigen::Vector3d& viewpoint,
