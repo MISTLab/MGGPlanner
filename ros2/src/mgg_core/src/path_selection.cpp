@@ -88,11 +88,12 @@ PathSelectionResult selectBestPath(GraphManager& graph,
     if (found != by_id.end()) return found->second;
     return by_id[v->id] = ask(*v);
   };
-  // Whether path[end], clear, may end the path: an end admitted only on a
-  // slope needs room to turn within kDepartureMaxM back along it.
+  // Whether path[end] may end the path: an end admitted only on a slope
+  // needs room to turn within kDepartureMaxM back along it. A refusal
+  // counts in `refused`, when given.
   const auto way_back = [&](const std::vector<Vertex*>& path,
                             const std::vector<double>& along,
-                            std::size_t end, int& refused) {
+                            std::size_t end, int* refused) {
     if (!retreat_checked ||
         !cached(on_slope_by_id, path[end],
                 slope_end_retreat.admitted_on_slope)) {
@@ -104,7 +105,7 @@ PathSelectionResult selectBestPath(GraphManager& graph,
         return true;
       }
     }
-    ++refused;
+    if (refused != nullptr) ++*refused;
     return false;
   };
 
@@ -231,10 +232,30 @@ PathSelectionResult selectBestPath(GraphManager& graph,
           ++result.paths_rejected_steep;
         } else if (!turns_ok(path)) {
           admissible = false;
-        } else if (path_gain > result.best_gain) {
-          result.best_gain = path_gain;
-          result.best_full_gain = path_gain;
-          result.best_path = path;
+        } else {
+          // The path as it is, which is chosen when no path ends clear. An
+          // end admitted only on a slope needs its way back even then: the
+          // path is cut back to its last end that has one, or is no
+          // fallback (review r1, P1). Other clearance failures are kept.
+          std::vector<Vertex*> fallback = path;
+          double fallback_gain = path_gain;
+          std::size_t end = path.size() - 1;
+          while (end > 0 && !way_back(path, candidate.along, end, nullptr)) {
+            --end;
+          }
+          if (end + 1 < path.size()) {
+            fallback.resize(end + 1);
+            if (end == 0 ||
+                !score(fallback, candidate.along, fallback_gain) ||
+                !turns_ok(fallback)) {
+              fallback.clear();
+            }
+          }
+          if (!fallback.empty() && fallback_gain > result.best_gain) {
+            result.best_gain = fallback_gain;
+            result.best_full_gain = path_gain;
+            result.best_path = fallback;
+          }
         }
       }
       const double full_gain = admissible ? path_gain : 0.0;
@@ -245,7 +266,7 @@ PathSelectionResult selectBestPath(GraphManager& graph,
       while (end > 0 &&
              !(clear(path[end]) &&
                way_back(path, candidate.along, end,
-                        result.slope_ends_without_way_back))) {
+                        &result.slope_ends_without_way_back))) {
         --end;
       }
       if (end == 0) {

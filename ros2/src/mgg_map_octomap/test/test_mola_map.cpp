@@ -2115,7 +2115,9 @@ std::unique_ptr<mgg::NativeMolaGrid> sparseRampCrest(
 /// driving height, facing `yaw`, as buildLocalGraph makes it: the lattice,
 /// PathTurnCheck, viewpointClear with the slope the lattice measures and
 /// SlopeEndRetreat. Each vertex scores by how far it lies below
-/// `crest_height` (a driving height).
+/// `crest_height` (a driving height). The lattice reaches `lattice_behind`
+/// and `lattice_ahead` along x from `start`; without `room_anywhere` the
+/// robot has room to turn nowhere.
 struct SparseCrestPlan {
   mgg::PlanningParams planning;
   mgg::GraphManager graph;
@@ -2129,7 +2131,8 @@ struct SparseCrestPlan {
 std::unique_ptr<SparseCrestPlan> planOnSparseCrest(
     const mgg::NativeMolaGrid& map, const mgg::RobotParams& robot,
     const mgg::PlanningParams& planning, const Eigen::Vector3d& start,
-    double yaw, double crest_height) {
+    double yaw, double crest_height, double lattice_behind = 3.0,
+    double lattice_ahead = 6.0, bool room_anywhere = true) {
   auto plan = std::make_unique<SparseCrestPlan>();
   mgg::PlanningParams& q = plan->planning;
   q = planning;
@@ -2155,8 +2158,8 @@ std::unique_ptr<SparseCrestPlan> planOnSparseCrest(
   context.root_footprint_exempt = true;
   context.root_is_robot = true;
   mgg::GridGraphParams grid;
-  grid.min_val = {-3.0, -3.0, 0.0};
-  grid.max_val = {6.0, 3.0, 0.0};
+  grid.min_val = {-lattice_behind, -3.0, 0.0};
+  grid.max_val = {lattice_ahead, 3.0, 0.0};
   grid.resolution = {0.4, 0.4, 0.1};
   mgg::buildGridGraph(plan->graph, plan->graph.getVertex(0)->state, grid,
                       context, yaw);
@@ -2168,8 +2171,9 @@ std::unique_ptr<SparseCrestPlan> planOnSparseCrest(
   }
   const mgg::MapInterface& m = map;
   plan->turns = std::make_unique<mgg::PathTurnCheck>(
-      plan->graph, robot, [&m, &robot, &q](const mgg::StateVec& pose) {
-        return mgg::roomToTurn(m, robot, q, pose);
+      plan->graph, robot,
+      [&m, &robot, &q, room_anywhere](const mgg::StateVec& pose) {
+        return room_anywhere && mgg::roomToTurn(m, robot, q, pose);
       });
   mgg::PathTurnCheck& turns = *plan->turns;
   mgg::SlopeEndRetreat retreat;
@@ -2178,7 +2182,7 @@ std::unique_ptr<SparseCrestPlan> planOnSparseCrest(
            !mgg::turnSpaceObserved(map, robot, q, v.state);
   };
   retreat.room_to_turn = [&](const mgg::Vertex& v) {
-    return mgg::roomToTurn(map, robot, q, v.state);
+    return room_anywhere && mgg::roomToTurn(map, robot, q, v.state);
   };
   plan->selection = mgg::selectBestPath(
       plan->graph, q, robot, plan->inclinations, map.getResolution(), yaw, {},
@@ -2283,6 +2287,45 @@ TEST(ObservedGround, ADownRampSeenInRingsPastACrestIsDriven) {
   EXPECT_LE(wayBackAlong(*map, robot, planning, selection.best_path),
             mgg::kDepartureMaxM + 1e-9);
   EXPECT_GT(selection.slope_ends_without_way_back, 0);
+}
+
+TEST(ObservedGround, ASlopeEndWithNoWayBackIsNoFallback) {
+  // Review r1 (P1): with no path ending clear, the best path was chosen as
+  // it was, unclear, before the slope-end rule looked at it: a path ending
+  // on the ramp with no room to turn within kDepartureMaxM behind was
+  // still sent. The robot stands 1.5 m down the sparse ramp, the lattice
+  // stays on the ramp, and the robot has room to turn nowhere: every end
+  // admitted on the slope lacks a way back, and none is chosen, clear or
+  // not.
+  const auto map = sparseRampCrest();
+  const mgg::RobotParams robot = bunker();
+  const mgg::PlanningParams planning = bunkerPlanning();
+  const double grade = std::tan(16.0 * M_PI / 180.0);
+  const Eigen::Vector3d start(1.5, 0.1,
+                              -1.5 * grade + planning.max_ground_height);
+  const auto plan = planOnSparseCrest(*map, robot, planning, start, 0.0,
+                                      start.z(), 0.0, 3.0, false);
+  const mgg::PathSelectionResult& selection = plan->selection;
+  const auto admitted_on_slope = [&](const mgg::StateVec& state) {
+    return mgg::slopeExemptsTurnSpace(plan->turns->slopeAt(state.head<3>())) &&
+           !mgg::turnSpaceObserved(*map, robot, plan->planning, state);
+  };
+  int on_slope = 0;
+  for (const auto& [id, vertex] : plan->graph.vertices_map_) {
+    if (vertex != nullptr && id != 0 && admitted_on_slope(vertex->state)) {
+      ++on_slope;
+    }
+  }
+  std::printf("no way back: %d vertices admitted on the slope, %d refused "
+              "ends, best path %zu vertices%s\n",
+              on_slope, selection.slope_ends_without_way_back,
+              selection.best_path.size(),
+              selection.unclear_viewpoint ? ", unclear" : "");
+  ASSERT_GT(on_slope, 10);
+  EXPECT_GT(selection.slope_ends_without_way_back, 0);
+  if (!selection.best_path.empty()) {
+    EXPECT_FALSE(admitted_on_slope(selection.best_path.back()->state));
+  }
 }
 
 TEST(ObservedGround, ASlopeEndBlockedAheadBacksOutOrWaits) {

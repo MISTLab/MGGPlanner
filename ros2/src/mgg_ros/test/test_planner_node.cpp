@@ -217,6 +217,45 @@ class PlannerNodeTestPeer {
     node.onPlanRequest(std::make_shared<mgg_msgs::srv::PlannerSrv::Request>(),
                        response);
   }
+  /// A floor rising along +x at `grade` (rise over run) over [xmin, xmax] x
+  /// [ymin, ymax], observed by vertical rays at the centre of every 0.1 m
+  /// voxel but one in nine, (x, y) index 1 modulo 3 both ways. The
+  /// columns left out stay wholly unknown, so no turning circle is
+  /// observed (turnSpaceObserved), while the ground between is bridged.
+  static void observeSparseSlope(PlannerNode& node, double xmin, double xmax,
+                                 double ymin, double ymax, double grade) {
+    const std::lock_guard<std::recursive_mutex> lock(node.planner_mutex_);
+    std::vector<Eigen::Vector3d> floor;
+    const auto index = [](double v) {
+      return static_cast<long>(std::floor(v / 0.10 + 1e-6));
+    };
+    for (long ix = index(xmin); ix <= index(xmax); ++ix) {
+      for (long iy = index(ymin); iy <= index(ymax); ++iy) {
+        if (((ix % 3) + 3) % 3 == 1 && ((iy % 3) + 3) % 3 == 1) continue;
+        const double x = (ix + 0.5) * 0.10;
+        floor.emplace_back(x, (iy + 0.5) * 0.10, grade * x);
+      }
+    }
+    for (int repeat = 0; repeat < 6; ++repeat) {
+      for (const Eigen::Vector3d& p : floor) {
+        node.cloud_map_->insertPointCloud(
+            {p}, Eigen::Vector3d(p.x(), p.y(), p.z() + 1.5));
+      }
+    }
+    ++node.map_revision_;
+  }
+  /// The lattice's body may cross unknown space, as SwarmDeck deploys it.
+  static void allowUnknownLatticeBody(PlannerNode& node) {
+    node.allow_unknown_lattice_body_ = true;
+  }
+  /// Whether the robot has room to turn in place at `state`: roomToTurn,
+  /// its turn space observed.
+  static bool roomToTurnObserved(PlannerNode& node,
+                                 const mgg::StateVec& state) {
+    const std::lock_guard<std::recursive_mutex> lock(node.planner_mutex_);
+    return mgg::roomToTurn(*node.map_, node.robot_params_,
+                           node.planning_params_, state);
+  }
   /// The test lidar's SensorParams::mount_height.
   static void setSensorMountHeight(PlannerNode& node, double height) {
     const std::lock_guard<std::recursive_mutex> lock(node.planner_mutex_);
@@ -580,6 +619,35 @@ TEST_F(PlannerNodeTest, AMountedLidarStillFindsTheFrontierAhead) {
     EXPECT_GE(std::hypot(response->path.back().position.x,
                          response->path.back().position.y),
               1.0);
+  }
+}
+
+TEST_F(PlannerNodeTest, ASlopeWithNoRoomToTurnWithinReachGetsNoPathNotComplete) {
+  // Review r1 (P1): the robot stands on an 11 degree slope whose every
+  // turning circle holds an unobserved column: no vertex has room to turn,
+  // the root included. Every path end is admitted on the slope without its
+  // turn space observed, and none has room to turn within kDepartureMaxM
+  // back along its path. The fallback for when no path ends clear sent the
+  // best of them anyway; it must not. No path, retried, and not
+  // exploration complete, not even with the global planner consulted.
+  auto node = makeNode("slope_no_way_back");
+  PlannerNodeTestPeer::setRobotFootprint(*node, 0.6, 0.2);
+  PlannerNodeTestPeer::allowUnknownLatticeBody(*node);
+  PlannerNodeTestPeer::observeSparseSlope(*node, -1.5, 4.0, -1.5, 1.5, 0.2);
+  PlannerNodeTestPeer::acceptOdometry(*node, 0.0, 0.0, 1.0);
+  const mgg::StateVec root =
+      PlannerNodeTestPeer::drivingState(*node, 0.0, 0.0, 0.0);
+  ASSERT_FALSE(PlannerNodeTestPeer::roomToTurnObserved(*node, root));
+  for (int cycle = 0; cycle < 2; ++cycle) {
+    SCOPED_TRACE(cycle);
+    if (cycle == 1) PlannerNodeTestPeer::consultGlobalPlannerAtOnce(*node);
+    auto response = std::make_shared<mgg_msgs::srv::PlannerSrv::Response>();
+    PlannerNodeTestPeer::plan(*node, response);
+    EXPECT_TRUE(response->path.empty())
+        << "path of " << response->path.size() << " poses to ("
+        << response->path.back().position.x << ", "
+        << response->path.back().position.y << ")";
+    EXPECT_EQ(response->status, PlannerNode::kStatusNoPath);
   }
 }
 
