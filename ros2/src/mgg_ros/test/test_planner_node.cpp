@@ -2638,4 +2638,32 @@ TEST_F(PlannerNodeTest, InAPersistentChainOthersClaimsOverrideOurAwardedTour) {
   }
 }
 
+TEST_F(PlannerNodeTest, APeerImportedFrontierWithUnknownVolumeFormsATourCluster) {
+  TwoPlanners fleet("peer_frontier_gain");
+  PlannerNodeTestPeer::gainFromUnknownVoxelsOnly(*fleet.a);
+  // The frontier is at x=9 in a's frame, far from a's local lattice.
+  // Graph/Vertex messages carry counts and the mark, but no scalar gain.
+  auto graph = PlannerNodeTestPeer::ownGraph(*fleet.b);
+  auto frontier = std::max_element(
+      graph.vertices.begin(), graph.vertices.end(),
+      [](const auto& a, const auto& b) {
+        return a.pose.position.x < b.pose.position.x;
+      });
+  ASSERT_NE(frontier, graph.vertices.end());
+  ASSERT_NEAR(frontier->pose.position.x, 4.0, 1e-6);
+  frontier->is_frontier = true;
+  PlannerNodeTestPeer::receiveTransform(*fleet.a, "robot_0/odom",
+                                        "robot_1/odom", 5.0, 0.0);
+  PlannerNodeTestPeer::setTour(*fleet.a, true, 1.0);
+  for (int broadcast = 0; broadcast < 2; ++broadcast) {
+    PlannerNodeTestPeer::receiveGraph(*fleet.a, graph);
+    const auto bid = PlannerNodeTestPeer::ownTourBidMsg(*fleet.a);
+    ASSERT_EQ(bid.clusters.size(), 1u);
+    EXPECT_EQ(bid.clusters.front().owner_robot_id, 2);
+    EXPECT_NEAR(bid.clusters.front().position.x, 9.0, 1e-6);
+    EXPECT_GT(bid.clusters.front().gain, 1.0);
+    EXPECT_NE(PlannerNodeTestPeer::refreshTour(*fleet.a), mgg::kNoCluster);
+  }
+}
+
 }  // namespace mgg_ros

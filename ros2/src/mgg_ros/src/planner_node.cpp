@@ -567,6 +567,25 @@ void PlannerNode::noteGlobalGraphEdges() {
 }
 
 std::vector<mgg::FrontierCluster> PlannerNode::globalFrontierClusters() {
+  // Graph messages have no scalar gain. Score an imported frontier before
+  // min_cluster_gain can discard it, even beyond the local re-check radius.
+  // Keep positive scores: re-checking every distant peer frontier every
+  // cycle is expensive and remains its owner's job (addFrontiers).
+  const auto score = globalFrontierGain();
+  for (const auto& entry : global_graph_->vertices_map_) {
+    mgg::Vertex* vertex = entry.second;
+    if (vertex == nullptr || vertex->type != mgg::VertexType::kFrontier ||
+        vertex->robot_id == static_cast<int>(planning_params_.robot_id) ||
+        !global_graph_->inService(*vertex) || vertex->vol_gain.gain > 0.0) {
+      continue;
+    }
+    score(*vertex);
+    if (!vertex->vol_gain.is_frontier) {
+      vertex->type = mgg::VertexType::kUnvisited;
+    }
+    ++graph_revision_;
+  }
+  global_space_.setCenter(current_state_, /*use_extension=*/true);
   std::vector<mgg::FrontierCluster> clusters = mgg::extractFrontierClusters(
       *global_graph_, fleet_params_.cluster_merge_radius_m,
       tour_params_.min_cluster_gain, tour_params_.cluster_id_cell_m);
