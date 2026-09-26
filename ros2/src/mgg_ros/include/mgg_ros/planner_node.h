@@ -62,6 +62,10 @@
 #include "mgg_core/random_sampler.h"
 #include "mgg_core/sensor_params.h"
 #include "mgg_core/trajectory.h"
+#include "mgg_core/frontier_clusters.h"
+#include "mgg_core/tour_costs.h"
+#include "mgg_core/tour_params.h"
+#include "mgg_core/tour_planner.h"
 #include "mgg_map_octomap/mola_map.h"
 #include "mgg_ros/keyframe_trajectory.h"
 
@@ -285,6 +289,26 @@ class PlannerNode : public rclcpp::Node {
   /// blocks an edge.
   mgg::ExpandContext makeGlobalContext();
   mgg::Vertex* findGlobalVertex(int id) const;
+  /// Links where the robot stands into the global graph, as a route out of
+  /// here does (mgg::linkDeparture); null when nothing links.
+  mgg::Vertex* linkRobotToGlobalGraph();
+  /// Every frontier cluster of the global graph, other robots' included,
+  /// under its stable name (tour-exploration design §2.1).
+  std::vector<mgg::FrontierCluster> globalFrontierClusters();
+  /// Of `clusters`, those this robot's tour may visit: without fleet
+  /// assignment, its own, or every robot's once none of its own is left
+  /// (as kGlobalOtherRobotPenalty preferred them), less those a peer's
+  /// reservation excludes.
+  std::vector<mgg::FrontierCluster> tourCandidates(
+      std::vector<mgg::FrontierCluster> clusters);
+  /// §2.3: solves the tour again when due and returns its current target,
+  /// or nothing when it has none. `note` is for the plan summary.
+  std::optional<mgg::FrontierCluster> refreshTour(std::string& note);
+  /// Whether a repositioning to global vertex `vertex_id` still heads for
+  /// the tour's target (always, when the tour is off or has no target).
+  bool tourKeepsRoute(int vertex_id) const;
+  /// The robot's pose, then its clusters' representatives in tour order.
+  void publishTour();
 
   // Core state. None of these know about ROS.
   std::unique_ptr<mgg::MapInterface> map_;
@@ -458,6 +482,30 @@ class PlannerNode : public rclcpp::Node {
   /// The last cycle's frontier paths join the global graph before that
   /// graph is rebuilt (rrg.cpp:121 Rrg::reset).
   bool add_frontiers_to_global_graph_ = false;
+  /// Tour-based exploration (tour-exploration design §2): its parameters,
+  /// the fleet's (cluster_merge_radius_m groups the clusters), the stable
+  /// names of the global frontier clusters, the tour over them, and the
+  /// graph distances it was costed with, one Dijkstra per cluster per graph
+  /// revision.
+  mgg::TourParams tour_params_;
+  mgg::FleetParams fleet_params_;
+  mgg::ClusterIdRegistry cluster_ids_;
+  std::unique_ptr<mgg::TourPlanner> tour_planner_;
+  mgg::GraphDistanceCache tour_distances_;
+  /// The clusters the last refreshTour offered the tour.
+  std::vector<mgg::FrontierCluster> tour_clusters_;
+  /// Changes when the clusters this robot may visit change for a reason
+  /// other than the graph (the fleet's assignment); the tour solves again.
+  std::uint64_t tour_assignment_version_ = 0;
+  /// The last tour's costing and solving time, for the plan summary.
+  double tour_solve_ms_ = 0.0;
+  /// The target refreshTour last released as reached. A reached cluster
+  /// that is still a frontier is released once: the free solve may take it
+  /// again, and it is then kept until explored, reassigned or unroutable,
+  /// rather than released and taken again every cycle, which would solve
+  /// every cycle and restamp its claim (targetSince). Cleared once the
+  /// target is another cluster.
+  mgg::ClusterId tour_reached_cluster_ = mgg::kNoCluster;
 
   /// Frontiers reserved by peers, in the planning frame, and how long a
   /// message stays in force.
@@ -512,6 +560,7 @@ class PlannerNode : public rclcpp::Node {
   rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr
       marker_pub_;
   rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr path_pub_;
+  rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr tour_pub_;
   rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr build_srv_;
   rclcpp::Service<mgg_msgs::srv::PlannerSrv>::SharedPtr plan_srv_;
   rclcpp::Service<mgg_msgs::srv::PlanObjective>::SharedPtr objective_srv_;

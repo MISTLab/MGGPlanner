@@ -246,6 +246,10 @@ PlannerNode::PlannerNode(const rclcpp::NodeOptions& options)
   // cycle.
   path_pub_ = create_publisher<nav_msgs::msg::Path>(
       "best_path", rclcpp::QoS(1).transient_local());
+  // The tour (tour-exploration design §2), latched as best_path is.
+  tour_planner_ = std::make_unique<mgg::TourPlanner>(tour_params_);
+  tour_pub_ = create_publisher<nav_msgs::msg::Path>(
+      "tour", rclcpp::QoS(1).transient_local());
 
   build_srv_ = create_service<std_srvs::srv::Trigger>(
       "build_local_graph",
@@ -429,6 +433,8 @@ void PlannerNode::loadParameters() {
   if (!loadSensorSet(p, "SensorParams", sensors_)) {
     RCLCPP_WARN(get_logger(), "no sensors loaded from SensorParams");
   }
+  loadTourParams(p, "tour", tour_params_);
+  loadFleetParams(p, "fleet", fleet_params_);
   world_frame_ = planning_params_.global_frame_id;
   communication_range_ =
       declareOrGet<double>(this, "communication_range", 15.0);
@@ -487,6 +493,148 @@ mgg::ExpandContext PlannerNode::makeGlobalContext() {
 mgg::Vertex* PlannerNode::findGlobalVertex(int id) const {
   const auto it = global_graph_->vertices_map_.find(id);
   return it == global_graph_->vertices_map_.end() ? nullptr : it->second;
+}
+
+mgg::Vertex* PlannerNode::linkRobotToGlobalGraph() {
+  mgg::StateVec current = current_state_;
+  if (!projectToDrivingHeight(current)) {
+    current = physicalAnchorAtDrivingHeight(current_state_);
+  }
+  const int before = global_graph_->getNumVertices();
+  mgg::Vertex* link = mgg::linkDeparture(*global_graph_, current,
+                                         makeGlobalContext(), kLinkRadius)
+                          .vertex;
+  if (global_graph_->getNumVertices() != before) ++graph_revision_;
+  return link;
+}
+
+std::vector<mgg::FrontierCluster> PlannerNode::globalFrontierClusters() {
+  std::vector<mgg::FrontierCluster> clusters = mgg::extractFrontierClusters(
+      *global_graph_, fleet_params_.cluster_merge_radius_m,
+      tour_params_.min_cluster_gain, tour_params_.cluster_id_cell_m);
+  cluster_ids_.stabilize(clusters, fleet_params_.cluster_merge_radius_m);
+  return clusters;
+}
+
+std::vector<mgg::FrontierCluster> PlannerNode::tourCandidates(
+    std::vector<mgg::FrontierCluster> clusters) {
+  const std::vector<Eigen::Vector3d> reserved = selectionExclusions();
+  clusters.erase(
+      std::remove_if(clusters.begin(), clusters.end(),
+                     [&](const mgg::FrontierCluster& cluster) {
+                       return std::any_of(
+                           reserved.begin(), reserved.end(),
+                           [&](const Eigen::Vector3d& point) {
+                             return (cluster.position - point).norm() <=
+                                    reservation_exclusion_radius_m_;
+                           });
+                     }),
+      clusters.end());
+  const int own_id = static_cast<int>(planning_params_.robot_id);
+  const auto others = [own_id](const mgg::FrontierCluster& cluster) {
+    return cluster.owner_robot_id != own_id;
+  };
+  if (!std::all_of(clusters.begin(), clusters.end(), others)) {
+    clusters.erase(std::remove_if(clusters.begin(), clusters.end(), others),
+                   clusters.end());
+  }
+  return clusters;
+}
+
+std::optional<mgg::FrontierCluster> PlannerNode::refreshTour(
+    std::string& note) {
+  note.clear();
+  if (!tour_params_.enabled || global_graph_->getNumVertices() <= 1) {
+    tour_clusters_.clear();
+    return std::nullopt;
+  }
+  std::vector<mgg::FrontierCluster> clusters =
+      tourCandidates(globalFrontierClusters());
+  // Reached: within global_frontier_reach_m of it, as a repositioning's
+  // frontier is (onPlanRequest). The next solve chooses freely. A target
+  // released as reached once is not released again (tour_reached_cluster_).
+  for (const mgg::FrontierCluster& cluster : clusters) {
+    if (cluster.id == tour_planner_->target() &&
+        cluster.id != tour_reached_cluster_ &&
+        (cluster.position - current_state_.head<3>()).norm() <=
+            global_frontier_reach_m_) {
+      tour_reached_cluster_ = cluster.id;
+      tour_planner_->releaseTarget();
+      break;
+    }
+  }
+  const double now_s = now().seconds();
+  if (tour_planner_->needsSolve(clusters, graph_revision_,
+                                tour_assignment_version_, now_s)) {
+    mgg::Vertex* link = linkRobotToGlobalGraph();
+    if (link == nullptr) {
+      tour_clusters_.clear();
+      note = "; tour: the robot's pose cannot be linked to the global graph";
+      return std::nullopt;
+    }
+    const auto started = std::chrono::steady_clock::now();
+    const mgg::TourCostMatrix costs = mgg::computeTourCosts(
+        *global_graph_, graph_revision_, tour_distances_, link->id,
+        current_state_[3], clusters, tour_params_.heading_weight);
+    tour_planner_->solve(clusters, costs, graph_revision_,
+                         tour_assignment_version_, now_s);
+    tour_solve_ms_ = std::chrono::duration<double, std::milli>(
+                         std::chrono::steady_clock::now() - started)
+                         .count();
+    if (tour_planner_->target() != tour_reached_cluster_) {
+      tour_reached_cluster_ = mgg::kNoCluster;
+    }
+    publishTour();
+  }
+  tour_clusters_ = clusters;
+  const mgg::TourPlan& plan = tour_planner_->plan();
+  for (const mgg::FrontierCluster& cluster : tour_clusters_) {
+    if (cluster.id != tour_planner_->target()) continue;
+    char buf[256];
+    std::snprintf(buf, sizeof(buf),
+                  "; tour: %zu of %zu cluster(s), %.1f m%s, target %016llx "
+                  "at (%.2f, %.2f, %.2f), costed and solved in %.1f ms",
+                  plan.clusters.size(), tour_clusters_.size(), plan.cost,
+                  plan.kept_target ? " (target kept)" : "",
+                  static_cast<unsigned long long>(cluster.id),
+                  cluster.position.x(), cluster.position.y(),
+                  cluster.position.z(), tour_solve_ms_);
+    note = buf;
+    return cluster;
+  }
+  note = tour_clusters_.empty() ? "; tour: no cluster"
+                                : "; tour: no reachable cluster";
+  return std::nullopt;
+}
+
+bool PlannerNode::tourKeepsRoute(int vertex_id) const {
+  if (!tour_params_.enabled) return true;
+  const mgg::ClusterId target = tour_planner_->target();
+  if (target == mgg::kNoCluster) return true;
+  for (const mgg::FrontierCluster& cluster : tour_clusters_) {
+    if (cluster.id != target) continue;
+    return std::find(cluster.member_vertex_ids.begin(),
+                     cluster.member_vertex_ids.end(),
+                     vertex_id) != cluster.member_vertex_ids.end();
+  }
+  return true;
+}
+
+void PlannerNode::publishTour() {
+  nav_msgs::msg::Path msg;
+  msg.header.stamp = now();
+  msg.header.frame_id = world_frame_;
+  geometry_msgs::msg::PoseStamped pose;
+  pose.header = msg.header;
+  pose.pose = toPoseMsg(current_state_);
+  msg.poses.push_back(pose);
+  for (const mgg::FrontierCluster& cluster : tour_planner_->plan().clusters) {
+    pose.pose = toPoseMsg(mgg::StateVec(cluster.position.x(),
+                                        cluster.position.y(),
+                                        cluster.position.z(), 0.0));
+    msg.poses.push_back(pose);
+  }
+  tour_pub_->publish(msg);
 }
 
 mgg::MolaMap::ReadLease PlannerNode::mapReadLease() const {
@@ -2294,7 +2442,8 @@ void PlannerNode::onPlanRequest(
     const mgg::Vertex* target = findGlobalVertex(current_global_vertex_id_);
     if (target != nullptr &&
         (current_state_.head<3>() - target->state.head<3>()).norm() >
-            global_frontier_reach_m_) {
+            global_frontier_reach_m_ &&
+        tourKeepsRoute(current_global_vertex_id_)) {
       resume_global = true;
     } else {
       global_exploration_ongoing_ = false;
@@ -2341,7 +2490,55 @@ void PlannerNode::onPlanRequest(
     }
   }
   if (best_path_.empty()) {
+    const int departures_before = boxed_in_departures_;
     summary = buildLocalGraph() + resumed;
+    // A boxed-in robot sent a straight departure (buildLocalGraph) keeps it.
+    const bool departed = boxed_in_departures_ != departures_before;
+    // Tour-exploration design §2.4: the tour's target, not low_gain_rounds,
+    // decides when the robot leaves local exploration for the global graph:
+    // as soon as the lattice has no path toward the target.
+    std::optional<mgg::FrontierCluster> tour_target;
+    if (tour_params_.enabled && local_graph_->getNumVertices() > 1) {
+      auto map_read = mapReadLease();
+      std::string tour_note;
+      tour_target = refreshTour(tour_note);
+      summary += tour_note;
+    }
+    bool tour_decided = false;
+    if (tour_target.has_value() && !departed &&
+        !boxed_in_without_departure_now_ && !withheld_without_departure) {
+      if (!best_path_.empty() &&
+          mgg::localPathServesTarget(
+              current_state_.head<3>(), best_path_.back().head<3>(),
+              tour_target->position, grid_params_.min_val,
+              grid_params_.max_val)) {
+        tour_decided = true;
+        summary += "; exploring locally toward the tour's target";
+      } else {
+        auto map_read = mapReadLease();
+        const std::vector<mgg::StateVec> local_path = best_path_;
+        std::string departure;
+        if (runGlobalPlanner(tour_target->representative_vertex_id, reason)) {
+          tour_decided = true;
+          low_gain_rounds_ = 0;
+          if (depart_instead_of_turning_route(departure)) {
+            summary +=
+                "; the route to the tour's target starts with a turn the "
+                "robot has no room for" +
+                departure;
+          } else {
+            summary += "; routing to the tour's target over the global graph";
+          }
+        } else {
+          // No route after all: the next solve chooses again, and this
+          // cycle keeps what local exploration found.
+          best_path_ = local_path;
+          best_path_from_global_graph_ = false;
+          tour_planner_->releaseTarget();
+          summary += "; no route to the tour's target: " + reason;
+        }
+      }
+    }
     // An empty lattice is a map that does not yet show the robot's
     // surroundings, not an explored one: PCI retries as the map grows. The
     // global planner is consulted once the lattice existed and saw nothing
@@ -2349,8 +2546,11 @@ void PlannerNode::onPlanRequest(
     const bool low_gain =
         best_path_.empty() && local_graph_->getNumVertices() > 1 &&
         low_gain_rounds_ >= auto_global_planner_low_gain_rounds_;
-    if (low_gain &&
-        (boxed_in_without_departure_now_ || withheld_without_departure)) {
+    if (tour_decided) {
+      // The tour decided this cycle.
+    } else if (low_gain &&
+               (boxed_in_without_departure_now_ ||
+                withheld_without_departure)) {
       // Boxed in with no way out: the global planner's route would start
       // with the turn the robot cannot make, and failing to find one would
       // not make exploration complete. No path, and the robot's own

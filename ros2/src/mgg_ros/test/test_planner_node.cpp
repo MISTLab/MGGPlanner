@@ -5,6 +5,7 @@
 
 #include <gtest/gtest.h>
 
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <memory>
@@ -418,9 +419,33 @@ class PlannerNodeTestPeer {
     ++node.graph_revision_;
     return previous->id;
   }
-  /// The global planner runs as soon as the lattice has no frontier.
+  /// The global planner runs as soon as the lattice has no frontier. That
+  /// is the low-gain rule, which the tour replaces (tour-exploration design
+  /// §2.4), so the tour is off.
   static void consultGlobalPlannerAtOnce(PlannerNode& node) {
     node.auto_global_planner_low_gain_rounds_ = 0;
+    node.tour_params_.enabled = false;
+  }
+  /// The tour on or off, and the least cluster gain it takes: a frontier
+  /// added by a test has no gain until the first re-check scores it.
+  static void setTour(PlannerNode& node, bool enabled,
+                      double min_cluster_gain) {
+    const std::lock_guard<std::recursive_mutex> lock(node.planner_mutex_);
+    node.tour_params_.enabled = enabled;
+    node.tour_params_.min_cluster_gain = min_cluster_gain;
+    node.tour_planner_ = std::make_unique<mgg::TourPlanner>(node.tour_params_);
+  }
+  static mgg::ClusterId tourTarget(PlannerNode& node) {
+    const std::lock_guard<std::recursive_mutex> lock(node.planner_mutex_);
+    return node.tour_planner_->target();
+  }
+  static double tourTargetSince(PlannerNode& node) {
+    const std::lock_guard<std::recursive_mutex> lock(node.planner_mutex_);
+    return node.tour_planner_->targetSince();
+  }
+  static bool bestPathFromGlobalGraph(PlannerNode& node) {
+    const std::lock_guard<std::recursive_mutex> lock(node.planner_mutex_);
+    return node.best_path_from_global_graph_;
   }
   /// A global repositioning to `target_id` under way, and resumed while
   /// the robot is more than a metre from it.
@@ -2105,6 +2130,90 @@ TEST_F(PlannerNodeTest, TheFirstFailedSearchAfterARebuildDroppedFrontiersIsNotCo
   };
   EXPECT_EQ(plan(), PlannerNode::kStatusNoPath);
   EXPECT_EQ(plan(), PlannerNode::kStatusComplete);
+}
+
+TEST_F(PlannerNodeTest, TheTourHeadsForItsTargetWithoutWaitingForLowGainRounds) {
+  // exploredDeadEnd: the lattice has no gain, and the tour's only cluster
+  // is the frontier 2.5 m behind the robot. The low-gain rule waits
+  // auto_global_planner_low_gain_rounds (15) cycles and sends nothing; the
+  // tour routes to the frontier at once (tour-exploration design §2.4).
+  // That route starts with a turn the robot has no room for, so it backs
+  // out toward the frontier first, as any withheld route does.
+  for (const bool tour : {false, true}) {
+    SCOPED_TRACE(tour ? "tour on" : "tour off");
+    int frontier = -1;
+    auto node =
+        exploredDeadEnd(tour ? "tour_at_once" : "tour_off_waits", frontier);
+    PlannerNodeTestPeer::setTour(*node, tour, 0.0);
+
+    auto response = std::make_shared<mgg_msgs::srv::PlannerSrv::Response>();
+    PlannerNodeTestPeer::plan(*node, response);
+    if (!tour) {
+      EXPECT_EQ(response->status, PlannerNode::kStatusNoPath);
+      EXPECT_EQ(PlannerNodeTestPeer::routeSharpTurnFallbacks(*node), 0);
+      EXPECT_EQ(PlannerNodeTestPeer::tourTarget(*node), mgg::kNoCluster);
+      continue;
+    }
+    EXPECT_NE(PlannerNodeTestPeer::tourTarget(*node), mgg::kNoCluster);
+    EXPECT_EQ(PlannerNodeTestPeer::routeSharpTurnFallbacks(*node), 1);
+    expectReverseDepartureFromDeadEnd(*node, *response);
+  }
+}
+
+TEST_F(PlannerNodeTest, LocalExplorationTowardTheTourTargetIsKept) {
+  // Floor mapped to x = 4 and unknown beyond: the lattice has gain ahead,
+  // and so does the tour: a global frontier 3.5 m ahead, and the frontier
+  // the accepted lattice path leaves in the global graph. The robot
+  // explores locally toward its target rather than taking the global
+  // route.
+  auto node = makeNode("tour_local_toward");
+  PlannerNodeTestPeer::observeFloor(*node, -1.5, 4.0, -1.5, 1.5);
+  PlannerNodeTestPeer::acceptOdometry(*node, 0.0, 0.0, 1.0);
+  PlannerNodeTestPeer::addGlobalChainToFrontier(
+      *node, {{0.5, 0.0}, {1.0, 0.0}, {1.5, 0.0}, {2.0, 0.0}, {2.5, 0.0},
+              {3.0, 0.0}, {3.5, 0.0}});
+  PlannerNodeTestPeer::setTour(*node, true, 0.0);
+
+  auto response = std::make_shared<mgg_msgs::srv::PlannerSrv::Response>();
+  PlannerNodeTestPeer::plan(*node, response);
+  ASSERT_EQ(response->status, mgg_msgs::srv::PlannerSrv::Response::FORWARD);
+  ASSERT_GE(response->path.size(), 2u);
+  EXPECT_FALSE(PlannerNodeTestPeer::bestPathFromGlobalGraph(*node));
+  EXPECT_NE(PlannerNodeTestPeer::tourTarget(*node), mgg::kNoCluster);
+  EXPECT_GT(response->path.back().position.x, 0.0);
+}
+
+TEST_F(PlannerNodeTest, AReachedTourTargetThatIsStillAFrontierIsReleasedOnce) {
+  // The robot stands within global_frontier_reach_m of the frontier 3.5 m
+  // ahead, which stays a frontier: it is released once, when first found
+  // reached, and the free solve may take it again. After that it is kept
+  // until it is explored, reassigned or cannot be routed to: releasing it
+  // every cycle would solve every cycle and restamp the target's claim
+  // (targetSince) each time.
+  auto node = makeNode("tour_reached_once");
+  PlannerNodeTestPeer::observeFloor(*node, -1.5, 4.0, -1.5, 1.5);
+  PlannerNodeTestPeer::acceptOdometry(*node, 0.0, 0.0, 1.0);
+  PlannerNodeTestPeer::addGlobalChainToFrontier(
+      *node, {{0.5, 0.0}, {1.0, 0.0}, {1.5, 0.0}, {2.0, 0.0}, {2.5, 0.0},
+              {3.0, 0.0}, {3.5, 0.0}});
+  PlannerNodeTestPeer::setTour(*node, true, 0.0);
+
+  const auto plan = [&node]() {
+    auto response = std::make_shared<mgg_msgs::srv::PlannerSrv::Response>();
+    PlannerNodeTestPeer::plan(*node, response);
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+  };
+  plan();  // the first solve: the target is taken
+  ASSERT_NE(PlannerNodeTestPeer::tourTarget(*node), mgg::kNoCluster);
+  plan();  // found reached: released, and taken again
+  const mgg::ClusterId target = PlannerNodeTestPeer::tourTarget(*node);
+  ASSERT_NE(target, mgg::kNoCluster);
+  const double since = PlannerNodeTestPeer::tourTargetSince(*node);
+  for (int cycle = 0; cycle < 3; ++cycle) {
+    plan();
+    EXPECT_EQ(PlannerNodeTestPeer::tourTarget(*node), target);
+    EXPECT_DOUBLE_EQ(PlannerNodeTestPeer::tourTargetSince(*node), since);
+  }
 }
 
 }  // namespace mgg_ros
