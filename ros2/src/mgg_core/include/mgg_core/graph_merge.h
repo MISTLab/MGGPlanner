@@ -168,7 +168,9 @@ constexpr double kNeighbourRestartToleranceM = 0.05;
 /// moved (kNeighbourReplaceToleranceM; one pass over the neighbour's vertices
 /// per call and one index rebuild only when something moves) and then judge
 /// its links and its own edges again, and cut the old graph out when
-/// the neighbour restarted (kNeighbourRestartToleranceM).
+/// the neighbour restarted (kNeighbourRestartToleranceM). A refreshed vertex
+/// takes the neighbour's frontier mark both ways: marked, it is a frontier;
+/// unmarked, a frontier here is demoted to kUnvisited.
 /// `incoming` is a complete snapshot of the neighbour's graph.
 MergeResult mergeNeighbourGraph(GraphManager& global_graph,
                                 const GraphExchange& incoming,

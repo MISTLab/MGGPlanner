@@ -360,7 +360,8 @@ struct FrontierAdditionReport {
 ///      to kUnvisited when they no longer border unknown space: this
 ///      robot's own (ctx.robot_id), and a merged peer's only within
 ///      `update_radius` of a vertex of `local_graph`, where this robot's
-///      map may have changed; the rest are left to their owners,
+///      map may have changed; the rest are left to their owners, whose
+///      broadcasts demote them (mergeNeighbourGraph),
 ///   3) the frontier leaves' paths are clustered, longest first,
 ///   4) each cluster's principal path joins the global graph unless the
 ///      frontier is surrounded: a global vertex within `range_check` of it

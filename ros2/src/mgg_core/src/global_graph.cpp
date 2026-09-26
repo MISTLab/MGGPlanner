@@ -916,7 +916,8 @@ FrontierAdditionReport addFrontiers(GraphManager& global_graph,
   // surrounded by known space (rrg.cpp:2411 to 2426). Upstream re-checked
   // every one; a merged peer's frontier is re-checked only near the new
   // local graph, where this robot's map has changed, and otherwise left to
-  // its owner, whose next broadcast carries its type. Re-checked on this
+  // its owner: a broadcast in which the owner no longer marks it a frontier
+  // demotes it here (mergeNeighbourGraph). Re-checked on this
   // robot's map, where the peer's explored space is unknown, they were never
   // demoted, and in run 6 their 529 re-checks took robot_3 4.3 s a plan.
   for (auto& entry : global_graph.vertices_map_) {

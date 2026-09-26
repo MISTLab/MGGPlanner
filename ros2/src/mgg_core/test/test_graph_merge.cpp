@@ -147,6 +147,28 @@ TEST(GraphMerge, SecondCallUpdatesRatherThanDuplicates) {
   EXPECT_TRUE(gm.getNeighbourVertex(1, 2)->vol_gain.is_frontier);
 }
 
+TEST(GraphMerge, AFrontierItsOwnerDemotedIsNoLongerAFrontierHere) {
+  // Review r0, M-1: a merged vertex was only ever promoted to a frontier.
+  // When its owner found it surrounded by known space, the receiver kept it
+  // as a frontier, and, re-checked on its own map where the owner's
+  // explored space is unknown, it stayed one and drew robots there.
+  GraphManager gm;
+  buildOwnGraph(gm);
+  StaticPoseSource poses;
+  poses.setOffset(2, 0.0, 1.0);
+  GraphExchange first = neighbourGraph();
+  first.vertices[2].is_frontier = true;
+  mergeNeighbourGraph(gm, first, poses, kAlwaysAdmissible);
+  ASSERT_EQ(gm.getNeighbourVertex(2, 2)->type, mgg::VertexType::kFrontier);
+
+  const auto r = mergeNeighbourGraph(gm, neighbourGraph(), poses,
+                                     kAlwaysAdmissible);
+  EXPECT_TRUE(r.merged);
+  EXPECT_EQ(r.vertices_updated, 3);
+  EXPECT_EQ(gm.getNeighbourVertex(2, 2)->type, mgg::VertexType::kUnvisited);
+  EXPECT_FALSE(gm.getNeighbourVertex(2, 2)->vol_gain.is_frontier);
+}
+
 // The ROS 1 offsets translated x and y only, so two robots facing different
 // directions merged their graphs rotated. A full transform fixes that.
 TEST(GraphMerge, RotationBetweenRobotFramesIsApplied) {

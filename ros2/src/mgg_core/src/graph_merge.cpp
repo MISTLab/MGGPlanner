@@ -54,7 +54,14 @@ void refreshVertex(Vertex* vertex, const GraphExchangeVertex& v) {
   vertex->vol_gain.num_free_voxels = v.num_free_voxels;
   vertex->vol_gain.is_frontier = v.is_frontier;
   vertex->robot_id = v.robot_id;
-  if (v.is_frontier) vertex->type = VertexType::kFrontier;
+  // The owner's word on its frontier, both ways: it re-checks it on its own
+  // map, where its explored space is known. This robot re-checks a peer's
+  // frontier only near its own new local graph (addFrontiers).
+  if (v.is_frontier) {
+    vertex->type = VertexType::kFrontier;
+  } else if (vertex->type == VertexType::kFrontier) {
+    vertex->type = VertexType::kUnvisited;
+  }
 }
 
 /// Looks a neighbour vertex up without the operator[] insertion that made the
