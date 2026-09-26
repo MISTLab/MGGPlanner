@@ -522,7 +522,10 @@ void FleetCoordinator::applyAward(const TourAwardData& award, double now_s) {
 
 bool FleetCoordinator::releaseClaims(int robot_id, double now_s) {
   rebaseFutureTimes(now_s);
-  if (auctioneer(now_s) != robot_id_) return false;
+  if (auctioneer(now_s) != robot_id_ || robot_id == robot_id_ ||
+      (last_heard_s_.count(robot_id) == 0 && claim_stamp_s_.count(robot_id) == 0)) {
+    return false;
+  }
   claims_.release(robot_id);
   noteReleased(robot_id, now_s);
   pending_releases_.push_back(robot_id);

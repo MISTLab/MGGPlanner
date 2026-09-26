@@ -873,15 +873,24 @@ void PlannerNode::onReleaseClaims(
     return;
   }
   const double now_s = now().seconds();
-  if (!fleet_->releaseClaims(request->robot_id, now_s)) {
+  if (fleet_->auctioneer(now_s) != static_cast<int>(planning_params_.robot_id)) {
     response->success = false;
     response->message = "not the auctioneer: robot " +
                         std::to_string(fleet_->auctioneer(now_s)) + " is";
     return;
   }
+  if (!fleet_->releaseClaims(request->robot_id, now_s)) {
+    response->success = false;
+    response->message = request->robot_id == static_cast<int>(planning_params_.robot_id)
+                            ? "cannot release this robot's own claims"
+                            : "unknown robot " + std::to_string(request->robot_id);
+    return;
+  }
   response->success = true;
   response->message = "robot " + std::to_string(request->robot_id) +
-                      "'s claims released; forwarded in the next award";
+      (fleet_->inGroup(now_s)
+           ? "'s claims released; forwarded in the next award"
+           : "'s claims released locally; no peers, nothing forwarded");
   RCLCPP_INFO(get_logger(), "%s", response->message.c_str());
 }
 

@@ -2633,6 +2633,7 @@ TEST_F(PlannerNodeTest, OnlyTheAuctioneerReleasesClaims) {
                                         "robot_0/odom", -5.0, 0.0);
   PlannerNodeTestPeer::receiveTourBid(
       *fleet.b, PlannerNodeTestPeer::ownTourBidMsg(*fleet.a));
+  PlannerNodeTestPeer::hearPeer(*fleet.a, 3);
   EXPECT_TRUE(PlannerNodeTestPeer::releaseClaims(*fleet.a, 3)->success);
   const auto refused = PlannerNodeTestPeer::releaseClaims(*fleet.b, 3);
   EXPECT_FALSE(refused->success);
@@ -3016,6 +3017,27 @@ TEST_F(PlannerNodeTest, AnEmptyFleetAwardIsNotCompleteWhileLocalGainRemains) {
   PlannerNodeTestPeer::localGainRemains(*node, false);
   ASSERT_TRUE(PlannerNodeTestPeer::settleIdle(*node, note, complete));
   EXPECT_TRUE(complete);
+}
+
+TEST_F(PlannerNodeTest, ReleaseClaimsRejectsUnknownAndOwnRobotIds) {
+  auto node = makeNode("invalid_release");
+  const double now = node->now().seconds();
+  PlannerNodeTestPeer::claim(*node, 2, {21, 2, {3.0, 0.0, 0.0}, 1000.0}, now - 30.0);
+  EXPECT_FALSE(PlannerNodeTestPeer::releaseClaims(*node, 99)->success);
+  EXPECT_FALSE(PlannerNodeTestPeer::releaseClaims(*node, 1)->success);
+  EXPECT_EQ(PlannerNodeTestPeer::fleetExclusions(*node).size(), 1u);
+}
+
+TEST_F(PlannerNodeTest, ASoloReleaseReportsThatItAppliedLocally) {
+  auto node = makeNode("local_release");
+  const double now = node->now().seconds();
+  PlannerNodeTestPeer::claim(*node, 2, {21, 2, {3.0, 0.0, 0.0}, 1000.0}, now - 30.0);
+  ASSERT_EQ(PlannerNodeTestPeer::fleetGroup(*node), std::vector<int>{1});
+  auto response = PlannerNodeTestPeer::releaseClaims(*node, 2);
+  EXPECT_TRUE(response->success);
+  EXPECT_TRUE(PlannerNodeTestPeer::fleetExclusions(*node).empty());
+  EXPECT_NE(response->message.find("locally"), std::string::npos);
+  EXPECT_NE(response->message.find("nothing forwarded"), std::string::npos);
 }
 
 }  // namespace mgg_ros

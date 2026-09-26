@@ -102,8 +102,8 @@ class FleetCoordinator {
   /// nothing.
   bool requestAnswered() const { return requested_ && answered_; }
   /// §4 release 3, on the auctioneer only: `robot_id`'s claims are released
-  /// here and forwarded in the next award. False when this robot is not the
-  /// group's auctioneer.
+  /// here and forwarded in the next award. False for this robot's own ID,
+  /// an ID never heard or named by an award, or when not the auctioneer.
   bool releaseClaims(int robot_id, double now_s);
   /// §3.5 and §4 release 2 for a robot alone: the claim of the robot silent
   /// longest is released so this robot may take its clusters over. Returns

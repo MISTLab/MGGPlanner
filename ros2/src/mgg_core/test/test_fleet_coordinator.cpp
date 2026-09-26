@@ -1419,3 +1419,13 @@ TEST(FleetCoordinator, AnOmittedBidderKeepsRequestingUntilNamedInAnAward) {
   follower.onAward(*out.award, 4.3);
   EXPECT_TRUE(follower.requestAnswered());
 }
+
+TEST(FleetCoordinator, ReleaseClaimsRejectsOwnAndUnknownIdsWithoutChangingAssignment) {
+  FleetCoordinator coordinator(1, FleetParams{}, 0.2);
+  const auto version = coordinator.assignmentVersion();
+  EXPECT_FALSE(coordinator.releaseClaims(1, 0.0));
+  EXPECT_FALSE(coordinator.releaseClaims(99, 0.0));
+  EXPECT_EQ(coordinator.assignmentVersion(), version);
+  coordinator.onBid(emptyBid(2), 0.0);
+  EXPECT_TRUE(coordinator.releaseClaims(2, 0.0));
+}
