@@ -888,12 +888,16 @@ TEST(FleetCoordinator, AClaimFromABidKeepsWhatATruncatedBundleLeavesOut) {
 
   std::vector<ClusterId> sent(bundle.clusters.begin(),
                               bundle.clusters.begin() + mgg::kMaxBidClusters);
-  coordinator.onBid(bidFrom(2, 0.0, {}, 0, sent), 1.0);
+  TourBidData cut = bidFrom(2, 0.0, {}, 0, sent);
+  cut.stamp_s = 1.0;
+  coordinator.onBid(cut, 1.0);
   EXPECT_EQ(coordinator.claimedByOthers(1.0).size(), held.size());
 
   // A bundle within the limit is the whole claim; an unknown ID is skipped.
-  coordinator.onBid(
-      bidFrom(2, 0.0, {cluster(900, 2, 50.0)}, 0, {100, 900, 5000}), 2.0);
+  TourBidData whole =
+      bidFrom(2, 0.0, {cluster(900, 2, 50.0)}, 0, {100, 900, 5000});
+  whole.stamp_s = 2.0;
+  coordinator.onBid(whole, 2.0);
   EXPECT_EQ(idsOf(coordinator.claimedByOthers(2.0)),
             (std::vector<ClusterId>{100, 900}));
 }
@@ -1115,6 +1119,79 @@ TEST(FleetCoordinator, ARestartedAuctioneerIsStillFollowed) {
     EXPECT_EQ(r->coordinator->auctioneer(now), 1) << "robot " << r->id;
   }
   EXPECT_EQ(idsOf(r1.coordinator->bundle()), (std::vector<ClusterId>{11, 13}));
+}
+
+// A claim is as fresh as the message it came from. Robot 2's bid sent
+// before the award that moved it from 21 to 22 arrives after that award: it
+// must not restore 21, or the next auction, which robot 2's answer misses,
+// would give 22 away while robot 2 tours it.
+TEST(FleetCoordinator, ABidOlderThanTheAwardDoesNotReplaceItsClaim) {
+  const FleetParams params;
+  FleetCoordinator coordinator(1, params, 0.2);
+  SimRobot self(1, 0.0, 0.0, params);
+  const auto own_bid = [&self] { return self.ownBid(); };
+  const auto bid2 = [](double stamp_s, std::vector<FleetCluster> known,
+                       std::uint64_t auction_id,
+                       std::vector<ClusterId> bundle) {
+    TourBidData bid = bidFrom(2, 20.0, std::move(known), auction_id,
+                              std::move(bundle));
+    bid.stamp_s = stamp_s;
+    bid.auctioneer_id = 1;
+    return bid;
+  };
+  coordinator.onBid(bid2(0.0, {cluster(21, 2, 18.0)}, 0, {21}), 0.0);
+  const mgg::FleetTickOutput call =
+      coordinator.tick(0.0, own_bid, euclid, nullptr);
+  ASSERT_TRUE(call.award && call.award->call);
+  // Robot 2 answers; 21 is gone from its map meanwhile.
+  coordinator.onBid(
+      bid2(0.5, {cluster(22, 2, 14.0)}, call.award->auction_id, {21}), 0.5);
+  const mgg::FleetTickOutput award =
+      coordinator.tick(1.0, own_bid, euclid, nullptr);
+  ASSERT_TRUE(award.award && !award.award->call);
+  ASSERT_NE(award.award->bundleOf(2), nullptr);
+  ASSERT_EQ(award.award->bundleOf(2)->clusters, std::vector<ClusterId>{22});
+
+  // Robot 2's bid of 0.8, sent before it heard the award, arrives late.
+  coordinator.onBid(
+      bid2(0.8, {cluster(21, 2, 18.0), cluster(22, 2, 14.0)}, 0, {21}), 1.5);
+  EXPECT_EQ(idsOf(coordinator.claimedByOthers(1.5)),
+            std::vector<ClusterId>{22});
+
+  // Robot 1 now knows 22 too and auctions; robot 2 misses the call.
+  self.known = {cluster(22, 2, 14.0)};
+  std::vector<TourAwardData> awards;
+  for (double now = 2.0; now < 4.55; now += 0.5) {
+    const mgg::FleetTickOutput out =
+        coordinator.tick(now, own_bid, euclid, nullptr);
+    if (out.award && !out.award->call) awards.push_back(*out.award);
+  }
+  ASSERT_FALSE(awards.empty());
+  for (const TourAwardData& later : awards) {
+    const mgg::RobotBundle* own = later.bundleOf(1);
+    ASSERT_NE(own, nullptr);
+    EXPECT_TRUE(own->clusters.empty());
+    const mgg::RobotBundle* held = later.bundleOf(2);
+    ASSERT_NE(held, nullptr);
+    EXPECT_EQ(held->clusters, std::vector<ClusterId>{22});
+  }
+}
+
+// After a clock reset the source stamp of a claim is pulled back to now, so
+// the next bid, stamped on the new clock, replaces the claim.
+TEST(FleetCoordinator, AfterAClockRollbackTheNextBidReplacesAClaim) {
+  FleetCoordinator coordinator(1, FleetParams{}, 0.2);
+  TourBidData before = bidFrom(2, 20.0, {cluster(21, 2, 18.0)}, 0, {21});
+  before.stamp_s = 10000.0;
+  coordinator.onBid(before, 10000.0);
+  ASSERT_EQ(idsOf(coordinator.claimedByOthers(10000.0)),
+            std::vector<ClusterId>{21});
+  TourBidData after = bidFrom(2, 20.0, {cluster(22, 2, 14.0)}, 0, {22});
+  after.stamp_s = 10.5;
+  coordinator.onBid(emptyBid(3), 10.0);  // any message at the new time
+  coordinator.onBid(after, 10.5);
+  EXPECT_EQ(idsOf(coordinator.claimedByOthers(10.5)),
+            std::vector<ClusterId>{22});
 }
 
 }  // namespace

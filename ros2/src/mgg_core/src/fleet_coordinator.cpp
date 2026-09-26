@@ -90,6 +90,9 @@ void FleetCoordinator::rebaseFutureTimes(double now_s) {
   if (collecting_) {
     collecting_->started_s = std::min(collecting_->started_s, now_s);
   }
+  for (auto& [robot_id, stamp_s] : claim_stamp_s_) {
+    stamp_s = std::min(stamp_s, now_s);
+  }
   if (now_s < round_heard_s_) {
     applied_stamp_s_.clear();
     answered_round_.reset();
@@ -122,6 +125,9 @@ void FleetCoordinator::onBid(const TourBidData& bid, double now_s) {
 }
 
 void FleetCoordinator::recordBidClaim(const TourBidData& bid, double now_s) {
+  const auto source = claim_stamp_s_.find(bid.robot_id);
+  if (source != claim_stamp_s_.end() && bid.stamp_s <= source->second) return;
+  claim_stamp_s_[bid.robot_id] = bid.stamp_s;
   std::vector<ClusterId> ids;
   if (bid.current_target != kNoCluster) ids.push_back(bid.current_target);
   for (const ClusterId id : bid.bundle) {
@@ -446,6 +452,12 @@ void FleetCoordinator::applyAward(const TourAwardData& award, double now_s) {
       bundle_ = std::move(clusters);
       continue;
     }
+    // A bid newer than this award named the robot's claim since.
+    const auto source = claim_stamp_s_.find(bundle.robot_id);
+    if (source != claim_stamp_s_.end() && award.stamp_s < source->second) {
+      continue;
+    }
+    claim_stamp_s_[bundle.robot_id] = award.stamp_s;
     // Last heard as the auctioneer knows it, so a silent robot's claim ages
     // here as it does there; never after now, so that after a clock reset
     // awards naming a silent robot do not keep its claim in the future.

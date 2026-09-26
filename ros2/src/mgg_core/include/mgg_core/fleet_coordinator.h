@@ -66,7 +66,9 @@ class FleetCoordinator {
   /// A peer's bid, in this robot's frame. Malformed bids are dropped. A bid
   /// answering this robot's call is collected only if received before
   /// fleet.bid_deadline_s has passed. The bid's current target and bundle
-  /// are the bidder's claim until a later bid or award (§4). The clusters
+  /// replace the bidder's claim (§4) if the bid is newer than the message
+  /// the claim came from: a bid sent before an award arrives after it
+  /// changes nothing but the time the bidder was heard. The clusters
   /// it reports explored are kept for this robot's next auction (at most
   /// kMaxExploredElsewhere, the oldest go); one the last award named makes
   /// an auction due.
@@ -159,14 +161,15 @@ class FleetCoordinator {
   /// so a silent robot counts as just heard once and then ages normally, and
   /// the next bid, award or call waits at most one interval or deadline. The
   /// rounds applied and answered are forgotten, as their stamps are of the
-  /// old clock.
+  /// old clock, and a claim's source stamp in the future becomes `now_s`.
   /// Called first by every member that takes the time.
   void rebaseFutureTimes(double now_s);
   /// `robot_id` was heard at the local receipt time `now_s`.
   void noteHeard(int robot_id, double now_s);
   /// The bidder holds its current target and bundle, as named by its own
   /// clusters, the last award or its claim; IDs none names are skipped. A
-  /// bundle cut at kMaxBidClusters keeps the rest of the claim.
+  /// bundle cut at kMaxBidClusters keeps the rest of the claim. Only a bid
+  /// newer than the claim's source replaces it.
   void recordBidClaim(const TourBidData& bid, double now_s);
   /// Keeps explored IDs a bid reports for the next auction.
   void noteReportedExplored(const std::vector<ClusterId>& ids);
@@ -191,6 +194,10 @@ class FleetCoordinator {
   std::map<int, TourBidData> last_bids_;
   // The auctioneer each robot's latest bid, call or award names.
   std::map<int, int> follows_;
+  // Per robot, the stamp of the bid or award its claim last came from. A bid
+  // replaces the claim only when newer; an award unless older (an award
+  // wins a tie: a bid sent at its stamp did not know it).
+  std::map<int, double> claim_stamp_s_;
   ClaimRegistry claims_;
   std::vector<FleetCluster> bundle_;
   std::vector<FleetCluster> award_clusters_;
