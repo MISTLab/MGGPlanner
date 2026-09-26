@@ -217,6 +217,13 @@ class PlannerNodeTestPeer {
     node.onPlanRequest(std::make_shared<mgg_msgs::srv::PlannerSrv::Request>(),
                        response);
   }
+  /// The test lidar's SensorParams::mount_height.
+  static void setSensorMountHeight(PlannerNode& node, double height) {
+    const std::lock_guard<std::recursive_mutex> lock(node.planner_mutex_);
+    mgg::SensorParams& sensor = node.sensors_.at("test_lidar");
+    sensor.mount_height = height;
+    sensor.update();
+  }
   static void setDrivingHeight(PlannerNode& node, double height) {
     node.planning_params_.max_ground_height = height;
   }
@@ -553,6 +560,27 @@ TEST_F(PlannerNodeTest, ExplorationReturnsTheWholeLatticePath) {
   EXPECT_LT(std::hypot(response->path.front().position.x - first.back().position.x,
                        response->path.front().position.y - first.back().position.y),
             0.30);
+}
+
+TEST_F(PlannerNodeTest, AMountedLidarStillFindsTheFrontierAhead) {
+  // Lane mgg-sensor (review r0): gain rays cast from the lidar's mount
+  // instead of the vertex (0.30 m over the floor here) must not make an
+  // explored floor with unknown space ahead look finished. Below and above
+  // the vertex, the plan goes forward, to the lattice's edge.
+  for (const double mount : {0.0, 0.45, 1.2}) {
+    SCOPED_TRACE(mount);
+    auto node = makeNode("mounted_" + std::to_string(int(mount * 100)));
+    PlannerNodeTestPeer::setSensorMountHeight(*node, mount);
+    PlannerNodeTestPeer::observeFloor(*node, -1.5, 4.0, -1.5, 1.5);
+    PlannerNodeTestPeer::acceptOdometry(*node, 0.0, 0.0, 1.0);
+    auto response = std::make_shared<mgg_msgs::srv::PlannerSrv::Response>();
+    PlannerNodeTestPeer::plan(*node, response);
+    ASSERT_EQ(response->status, mgg_msgs::srv::PlannerSrv::Response::FORWARD);
+    ASSERT_GE(response->path.size(), 2u);
+    EXPECT_GE(std::hypot(response->path.back().position.x,
+                         response->path.back().position.y),
+              1.0);
+  }
 }
 
 TEST_F(PlannerNodeTest, ExplorationGoesTheWayTheRobotFaces) {
