@@ -50,6 +50,15 @@ class ParamFixture : public ::testing::Test {
                                                        0.5235987755982988}},
         {"SensorParams.VLP16.resolution",
          std::vector<double>{0.08726646259971647, 0.08726646259971647}},
+        // Tour and fleet parameters under their design names. claim_ttl_s
+        // is a YAML integer, as SwarmDeck's SubT override (600) is written;
+        // the merge radius is out of range and is clamped.
+        {"tour.enabled", false},
+        {"tour.min_cluster_gain", 250.0},
+        {"tour.commit_margin", 0.3},
+        {"fleet.claim_ttl_s", 600},
+        {"fleet.balance_weight", 0.5},
+        {"fleet.cluster_merge_radius_m", 0.0},
         // A rad() expression that was never evaluated: what an unconverted
         // ROS 1 config looks like from ROS 2's side.
         {"Broken.angle", std::string("rad(2.0*pi)")},
@@ -125,6 +134,24 @@ TEST_F(ParamFixture, LoadsSensorsAndBuildsTheRayTable) {
   EXPECT_TRUE(s.isReady());
   EXPECT_DOUBLE_EQ(s.max_range, 20.0);
   EXPECT_DOUBLE_EQ(s.mount_height, 0.72);
+}
+
+TEST_F(ParamFixture, LoadsTourAndFleetParams) {
+  ParamLoader p(node_.get());
+  mgg::TourParams tour;
+  ASSERT_TRUE(mgg_ros::loadTourParams(p, "tour", tour));
+  EXPECT_FALSE(tour.enabled);
+  EXPECT_DOUBLE_EQ(tour.min_cluster_gain, 250.0);
+  EXPECT_DOUBLE_EQ(tour.commit_margin, 0.3);
+  // Absent from the overrides: the design default survives.
+  EXPECT_DOUBLE_EQ(tour.cluster_id_cell_m, 1.0);
+
+  mgg::FleetParams fleet;
+  ASSERT_TRUE(mgg_ros::loadFleetParams(p, "fleet", fleet));
+  EXPECT_TRUE(fleet.enabled);
+  EXPECT_DOUBLE_EQ(fleet.claim_ttl_s, 600.0);
+  EXPECT_DOUBLE_EQ(fleet.balance_weight, 0.5);
+  EXPECT_DOUBLE_EQ(fleet.cluster_merge_radius_m, mgg::kMinClusterCellM);
 }
 
 // An unconverted ROS 1 config reaches ROS 2 with rad()/deg() still as strings.

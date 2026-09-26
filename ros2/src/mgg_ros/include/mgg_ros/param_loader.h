@@ -30,6 +30,7 @@
 #include "mgg_core/grid_graph.h"
 #include "mgg_core/params.h"
 #include "mgg_core/sensor_params.h"
+#include "mgg_core/tour_params.h"
 
 namespace mgg_ros {
 
@@ -94,6 +95,14 @@ bool loadSensorParams(const ParamLoader& p, const std::string& ns,
 /// Loads every sensor named in `<ns>/sensor_list`.
 bool loadSensorSet(const ParamLoader& p, const std::string& ns,
                    std::unordered_map<std::string, mgg::SensorParams>& out);
+/// The tour's parameters under `<ns>/` (the design's `tour.` names), clamped
+/// with mgg::clampTourParams.
+bool loadTourParams(const ParamLoader& p, const std::string& ns,
+                    mgg::TourParams& out);
+/// The fleet's parameters under `<ns>/` (the design's `fleet.` names),
+/// clamped with mgg::clampFleetParams.
+bool loadFleetParams(const ParamLoader& p, const std::string& ns,
+                     mgg::FleetParams& out);
 
 }  // namespace mgg_ros
 

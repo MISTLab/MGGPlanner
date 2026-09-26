@@ -301,4 +301,29 @@ bool loadPlanningParams(const ParamLoader& p, const std::string& ns,
   return true;
 }
 
+bool loadTourParams(const ParamLoader& p, const std::string& ns,
+                    mgg::TourParams& out) {
+  p.get(ns + "/enabled", out.enabled);
+  p.get(ns + "/min_cluster_gain", out.min_cluster_gain);
+  p.get(ns + "/cluster_id_cell_m", out.cluster_id_cell_m);
+  p.get(ns + "/heading_weight", out.heading_weight);
+  p.get(ns + "/recompute_interval_s", out.recompute_interval_s);
+  p.get(ns + "/commit_margin", out.commit_margin);
+  mgg::clampTourParams(out);
+  return true;
+}
+
+bool loadFleetParams(const ParamLoader& p, const std::string& ns,
+                     mgg::FleetParams& out) {
+  p.get(ns + "/enabled", out.enabled);
+  p.get(ns + "/cluster_merge_radius_m", out.cluster_merge_radius_m);
+  p.get(ns + "/balance_weight", out.balance_weight);
+  p.get(ns + "/auction_interval_s", out.auction_interval_s);
+  p.get(ns + "/bid_deadline_s", out.bid_deadline_s);
+  p.get(ns + "/peer_timeout_s", out.peer_timeout_s);
+  p.get(ns + "/claim_ttl_s", out.claim_ttl_s);
+  mgg::clampFleetParams(out);
+  return true;
+}
+
 }  // namespace mgg_ros
