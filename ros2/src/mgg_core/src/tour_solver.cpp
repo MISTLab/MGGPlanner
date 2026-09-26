@@ -10,14 +10,27 @@ namespace {
 /// Stands in for an unreachable leg inside the search, so every cost there
 /// stays finite and comparable; openTourCost reports the true sum.
 constexpr double kDisconnectedLegCost = 1e9;
-/// A move counts only when it lowers the cost by more than this.
+/// A move counts only when it lowers the cost by more than this, or by more
+/// than kRelativeImproveEps times the sum of the legs it compares, whichever
+/// is larger. The relative part keeps the threshold far above the rounding
+/// error of those sums (a few ulps of the sum, about 2e-16 each), which a
+/// fixed 1e-9 is not once a kDisconnectedLegCost leg is among them: then a
+/// tie could look like an improvement both ways round and the search would
+/// cycle until kMaxImprovingMoves.
 constexpr double kImproveEps = 1e-9;
-/// Every move lowers the cost, so the search ends long before this; it only
-/// bounds a pathological input.
+constexpr double kRelativeImproveEps = 1e-12;
+/// Every accepted move lowers the exact cost of the order, so no order
+/// repeats and the search ends long before this; it only bounds a
+/// pathological input.
 constexpr int kMaxImprovingMoves = 100000;
 /// Pseudo-indices: where the robot stands, and the open end of the tour.
 constexpr int kStart = -1;
 constexpr int kEnd = -2;
+
+/// Whether `delta`, computed from legs summing to `legs`, lowers the cost.
+bool improves(double delta, double legs) {
+  return delta < -std::max(kImproveEps, kRelativeImproveEps * legs);
+}
 
 class LegCost {
  public:
@@ -43,9 +56,9 @@ bool twoOptMove(std::vector<int>& order, const LegCost& leg, std::size_t lo) {
     const int before = i == 0 ? kStart : order[i - 1];
     for (std::size_t j = i + 1; j < n; ++j) {
       const int after = j + 1 < n ? order[j + 1] : kEnd;
-      const double delta = leg(before, order[j]) + leg(order[i], after) -
-                           leg(before, order[i]) - leg(order[j], after);
-      if (delta < -kImproveEps) {
+      const double added = leg(before, order[j]) + leg(order[i], after);
+      const double removed = leg(before, order[i]) + leg(order[j], after);
+      if (improves(added - removed, added + removed)) {
         std::reverse(order.begin() + i, order.begin() + j + 1);
         return true;
       }
@@ -78,7 +91,11 @@ bool orOptMove(std::vector<int>& order, const LegCost& leg, std::size_t lo) {
         const double forward = leg(u, first) + leg(last, v) - base;
         const double backward = leg(u, last) + leg(first, v) - base;
         const bool reverse = backward < forward;
-        if ((reverse ? backward : forward) - removed < -kImproveEps) {
+        const double delta = (reverse ? backward : forward) - removed;
+        if (delta < -kImproveEps &&
+            improves(delta, leg(a, first) + leg(last, b) + leg(a, b) +
+                                leg(u, first) + leg(last, v) +
+                                leg(u, last) + leg(first, v) + base)) {
           std::vector<int> segment(order.begin() + i, order.begin() + k + 1);
           if (reverse) std::reverse(segment.begin(), segment.end());
           rest.insert(rest.begin() + p, segment.begin(), segment.end());
@@ -151,7 +168,7 @@ OpenTour solveOpenTour(const std::vector<double>& from_start,
         cost += leg(previous, index);
         previous = index;
       }
-      if (cost < best_cost - kImproveEps) {
+      if (improves(cost - best_cost, cost)) {
         best_cost = cost;
         best = rest;
       }

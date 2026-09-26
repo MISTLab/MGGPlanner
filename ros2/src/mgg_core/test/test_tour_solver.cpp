@@ -163,6 +163,116 @@ TEST(OpenTour, DisconnectedLegsStillGiveAWholeTour) {
   EXPECT_FALSE(std::isfinite(tour.cost));
 }
 
+/// An order's unreachable legs and the metres of the rest.
+struct SplitCost {
+  int disconnected_legs = 0;
+  double metres = 0.0;
+};
+
+SplitCost splitCost(const std::vector<int>& order, const Scene& scene) {
+  SplitCost split;
+  const auto add = [&split](double cost) {
+    if (std::isfinite(cost)) {
+      split.metres += cost;
+    } else {
+      ++split.disconnected_legs;
+    }
+  };
+  if (order.empty()) return split;
+  add(scene.from_start[order.front()]);
+  for (std::size_t i = 1; i < order.size(); ++i) {
+    add(scene.between[order[i - 1]][order[i]]);
+  }
+  return split;
+}
+
+/// Clusters in `rooms` rooms that do not connect to each other; the robot
+/// reaches every one.
+Scene disconnectedRooms(std::size_t n, unsigned seed, int rooms) {
+  Scene scene = randomScene(n, seed);
+  for (std::size_t i = 0; i < n; ++i) {
+    for (std::size_t j = 0; j < n; ++j) {
+      if (static_cast<int>(i) % rooms != static_cast<int>(j) % rooms) {
+        scene.between[i][j] = mgg::kUnreachableCost;
+      }
+    }
+  }
+  return scene;
+}
+
+TEST(OpenTour, SmallToursWithDisconnectedLegsAreOptimal) {
+  // The fewest unreachable legs first, then the fewest metres.
+  for (std::size_t n = 2; n <= 7; ++n) {
+    for (unsigned seed = 1; seed <= 10; ++seed) {
+      const Scene scene = disconnectedRooms(n, seed, 2 + seed % 3);
+      std::vector<int> order(n);
+      std::iota(order.begin(), order.end(), 0);
+      SplitCost best{static_cast<int>(n) + 1, 0.0};
+      do {
+        const SplitCost split = splitCost(order, scene);
+        if (split.disconnected_legs < best.disconnected_legs ||
+            (split.disconnected_legs == best.disconnected_legs &&
+             split.metres < best.metres)) {
+          best = split;
+        }
+      } while (std::next_permutation(order.begin(), order.end()));
+      const OpenTour tour = mgg::solveOpenTour(scene.from_start, scene.between);
+      ASSERT_EQ(tour.order.size(), n);
+      const SplitCost split = splitCost(tour.order, scene);
+      EXPECT_EQ(split.disconnected_legs, best.disconnected_legs)
+          << n << " clusters, seed " << seed;
+      // Ties are judged relative to the whole cost, a billion per
+      // unreachable leg inside the search: millimetres here.
+      EXPECT_NEAR(split.metres, best.metres, 1e-2)
+          << n << " clusters, seed " << seed;
+    }
+  }
+}
+
+TEST(OpenTour, LocalImprovementOverDisconnectedRoomsConverges) {
+  // Forty clusters on a grid in four rooms that do not connect to each
+  // other: many exact ties among orders whose unreachable legs cost a
+  // billion each inside the search, where a fixed 1e-9 threshold is below
+  // double resolution and the search cycled until its move cap (seconds).
+  constexpr int kRooms = 4;
+  constexpr int kPerRoom = 10;
+  constexpr int n = kRooms * kPerRoom;
+  const auto room = [](int i) { return i / kPerRoom; };
+  const auto at = [](int i) {
+    return Eigen::Vector2d(i % kPerRoom % 5, i % kPerRoom / 5);
+  };
+  Scene scene;
+  for (int i = 0; i < n; ++i) {
+    scene.from_start.push_back(0.1 * (room(i) + 1) + at(i).lpNorm<1>());
+    scene.between.emplace_back();
+    for (int j = 0; j < n; ++j) {
+      scene.between.back().push_back(
+          i == j                ? 0.0
+          : room(i) == room(j) ? 0.1 + (at(i) - at(j)).lpNorm<1>()
+                               : mgg::kUnreachableCost);
+    }
+  }
+  constexpr int kRuns = 10;
+  std::mt19937 rng(11);
+  std::vector<int> order(n);
+  std::iota(order.begin(), order.end(), 0);
+  const auto start = std::chrono::steady_clock::now();
+  for (int run = 0; run < kRuns; ++run) {
+    std::shuffle(order.begin(), order.end(), rng);
+    const OpenTour tour =
+        mgg::improveOpenTour(order, scene.from_start, scene.between);
+    ASSERT_EQ(tour.order.size(), static_cast<std::size_t>(n));
+    EXPECT_FALSE(std::isfinite(tour.cost));
+  }
+  const OpenTour solved = mgg::solveOpenTour(scene.from_start, scene.between);
+  EXPECT_EQ(solved.order.size(), static_cast<std::size_t>(n));
+  const double ms = std::chrono::duration<double, std::milli>(
+                        std::chrono::steady_clock::now() - start)
+                        .count() /
+                    (kRuns + 1);
+  EXPECT_LT(ms, 10.0);
+}
+
 TEST(OpenTour, CheapestInsertionFindsTheGapAndKeepsAKeptFirst) {
   const Scene line = euclidean({{1.0, 0.0}, {2.0, 0.0}, {3.0, 0.0}});
   const mgg::Insertion gap =
