@@ -7,7 +7,10 @@ namespace mgg {
 
 bool TourBidData::wellFormed() const {
   const std::size_t n = clusters.size();
-  if (n > kMaxBidClusters) return false;
+  if (n > kMaxBidClusters || bundle.size() > kMaxBidClusters ||
+      explored.size() > kMaxBidClusters) {
+    return false;
+  }
   if (costs_from_pose.size() != n || costs_between.size() != n * n) {
     return false;
   }
@@ -16,6 +19,11 @@ bool TourBidData::wellFormed() const {
     if (cluster.id == kNoCluster || !cluster.position.allFinite()) {
       return false;
     }
+  }
+  const auto unnamed = [](ClusterId id) { return id == kNoCluster; };
+  if (std::any_of(bundle.begin(), bundle.end(), unnamed) ||
+      std::any_of(explored.begin(), explored.end(), unnamed)) {
+    return false;
   }
   const auto valid = [](double cost) {
     return !std::isnan(cost) && cost >= 0.0;

@@ -66,6 +66,43 @@ TEST(FleetTypes, WellFormedRejectsInconsistentOrInvalidBids) {
   EXPECT_TRUE(TourBidData{}.wellFormed());
 }
 
+TEST(FleetTypes, WellFormedRejectsUnnamedBundleAndExploredEntries) {
+  const TourBidData bid = twoClusterBid();
+  TourBidData b = bid;
+  b.bundle = {11, mgg::kNoCluster};
+  EXPECT_FALSE(b.wellFormed());
+  b = bid;
+  b.explored = {mgg::kNoCluster};
+  EXPECT_FALSE(b.wellFormed());
+  // No current target is kNoCluster.
+  b = bid;
+  b.current_target = mgg::kNoCluster;
+  EXPECT_TRUE(b.wellFormed());
+}
+
+TEST(FleetTypes, WellFormedCapsEveryListAtTheBidClusterLimit) {
+  const auto bidWith = [](std::size_t n) {
+    TourBidData bid;
+    for (std::size_t i = 0; i < n; ++i) {
+      bid.clusters.push_back(cluster(i + 1, static_cast<double>(i)));
+    }
+    bid.costs_from_pose.assign(n, 0.0);
+    bid.costs_between.assign(n * n, 0.0);
+    return bid;
+  };
+  EXPECT_TRUE(bidWith(mgg::kMaxBidClusters).wellFormed());
+  EXPECT_FALSE(bidWith(mgg::kMaxBidClusters + 1).wellFormed());
+  TourBidData b;
+  b.bundle.assign(mgg::kMaxBidClusters, 11);
+  b.explored.assign(mgg::kMaxBidClusters, 12);
+  EXPECT_TRUE(b.wellFormed());
+  b.bundle.push_back(11);
+  EXPECT_FALSE(b.wellFormed());
+  b.bundle.pop_back();
+  b.explored.push_back(12);
+  EXPECT_FALSE(b.wellFormed());
+}
+
 TEST(FleetTypes, CostBetweenReadsTheRowMajorMatrix) {
   TourBidData bid = twoClusterBid();
   bid.costs_between = {0.0, 4.0, 5.0, 0.0};

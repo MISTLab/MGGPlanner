@@ -60,9 +60,11 @@ struct TourBidData {
   double costBetween(std::size_t i, std::size_t j) const {
     return costs_between[i * clusters.size() + j];
   }
-  /// At most kMaxBidClusters clusters, cost arrays sized to them, a finite
-  /// pose, finite positions and non-zero IDs; costs may be +inf, never NaN
-  /// or negative.
+  /// At most kMaxBidClusters clusters, bundle entries and explored entries;
+  /// cost arrays sized to the clusters; a finite pose and finite cluster
+  /// positions; costs may be +inf, never NaN or negative. The IDs in
+  /// clusters, bundle and explored must not be kNoCluster; current_target
+  /// may be (no target). IDs are not checked against each other.
   bool wellFormed() const;
 };
 
