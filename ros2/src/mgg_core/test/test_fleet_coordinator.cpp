@@ -778,8 +778,10 @@ TEST(FleetCoordinator, ARequestIsAnsweredByALaterAwardWhenTheFirstIsLost) {
   EXPECT_TRUE(out.bid->request_auction);
   EXPECT_TRUE(coordinator.awaitingAuction());
   EXPECT_FALSE(coordinator.requestAnswered());
+  // The award echoes the seq of the bid it collected from this robot.
   coordinator.onAward(
-      makeAward(1, 101, 3.0, {mgg::RobotBundle{2, {}, 0.0}}, {}), 3.0);
+      makeAward(1, 101, 3.0, {mgg::RobotBundle{2, {}, 0.0, out.bid->seq}}, {}),
+      3.0);
   EXPECT_FALSE(coordinator.awaitingAuction());
   EXPECT_TRUE(coordinator.requestAnswered());
 }
@@ -1478,4 +1480,128 @@ TEST(FleetCoordinator, AnEmptyHolderEntryDoesNotAnswerARequest) {
   radio.runUntil(now, now + 6.0);
   EXPECT_TRUE(r2.coordinator->requestAnswered());
   EXPECT_TRUE(r2.coordinator->bundle().empty());
+}
+
+// Review r0 I-1: auction IDs are reused by a restarted auctioneer, so they
+// cannot tell which round answers a request. The award of a round bid in
+// before the request, delayed past the request and a new call reusing its
+// ID, echoes an older bid's seq and does not answer it.
+TEST(FleetCoordinator, ADelayedAwardOfARoundBeforeTheRequestDoesNotAnswerIt) {
+  FleetCoordinator coordinator(2, FleetParams{}, 0.2);
+  coordinator.onAward(makeCall(1, 7, 10.0), 10.0);
+  const mgg::FleetTickOutput before =
+      coordinator.tick(10.0, nullptr, nullptr, nullptr);
+  ASSERT_TRUE(before.bid);
+  ASSERT_EQ(before.bid->auction_id, 7u);
+  ASSERT_FALSE(before.bid->request_auction);
+  // Round 7's award, stamped 11, is delayed. The robot then asks.
+  coordinator.requestAuction();
+  const mgg::FleetTickOutput request =
+      coordinator.tick(10.5, nullptr, nullptr, nullptr);
+  ASSERT_TRUE(request.bid);
+  ASSERT_TRUE(request.bid->request_auction);
+  // The auctioneer restarted and calls auction 7 again; the robot answers.
+  coordinator.onAward(makeCall(1, 7, 12.0), 12.0);
+  const mgg::FleetTickOutput answer =
+      coordinator.tick(12.0, nullptr, nullptr, nullptr);
+  ASSERT_TRUE(answer.bid);
+  ASSERT_EQ(answer.bid->auction_id, 7u);
+  coordinator.onAward(
+      makeAward(1, 7, 11.0, {mgg::RobotBundle{2, {}, 0.0, before.bid->seq}},
+                {}),
+      12.1);
+  EXPECT_FALSE(coordinator.requestAnswered());
+  EXPECT_TRUE(coordinator.awaitingAuction());
+  coordinator.onAward(
+      makeAward(1, 7, 13.0, {mgg::RobotBundle{2, {}, 0.0, answer.bid->seq}},
+                {}),
+      13.0);
+  EXPECT_TRUE(coordinator.requestAnswered());
+}
+
+// Review r0 M-1: an answer to the call that reaches the auctioneer after
+// the deadline is not collected. The robot is a holder in that round, with
+// no bid seq, and its empty holder entry does not answer the request.
+TEST(FleetCoordinator, ALateAnswerLeavesAHolderEntryThatDoesNotAnswerTheRequest) {
+  const FleetParams params;
+  SimRobot r1(1, 0.0, 0.0, params), r2(2, 20.0, 0.0, params);
+  r1.known = {cluster(11, 1, 2.0)};
+  r2.known = {cluster(21, 2, 18.0)};
+  Radio radio{{&r1, &r2}};
+  double now = 0.0;
+  radio.runUntil(now, 5.0);
+  ASSERT_EQ(r2.front(), 21u);
+
+  // Robot 2 explores its cluster and asks for more; robot 1 finds a new
+  // cluster and calls. Robot 2 hears the call, but its answer is late.
+  r2.known.clear();
+  r2.explored = {21};
+  r2.coordinator->requestAuction();
+  r1.known.push_back(cluster(12, 1, 6.0));
+  now += 2.5;
+  mgg::FleetTickOutput out =
+      r1.coordinator->tick(now, [&r1] { return r1.ownBid(); }, euclid, nullptr);
+  ASSERT_TRUE(out.award && out.award->call);
+  if (out.bid) r2.coordinator->onBid(*out.bid, now);
+  r2.coordinator->onAward(*out.award, now);
+  const mgg::FleetTickOutput answer = r2.coordinator->tick(
+      now + 0.05, [&r2] { return r2.ownBid(); }, euclid, nullptr);
+  ASSERT_TRUE(answer.bid);
+  ASSERT_EQ(answer.bid->auction_id, out.award->auction_id);
+  ASSERT_TRUE(answer.bid->request_auction);
+  r1.coordinator->onBid(*answer.bid, now + params.bid_deadline_s + 0.05);
+  now += params.bid_deadline_s + 0.1;
+  out = r1.coordinator->tick(now, [&r1] { return r1.ownBid(); }, euclid,
+                             nullptr);
+  ASSERT_TRUE(out.award && !out.award->call);
+  const mgg::RobotBundle* held = out.award->bundleOf(2);
+  ASSERT_NE(held, nullptr);
+  EXPECT_TRUE(held->clusters.empty());
+  EXPECT_EQ(held->bid_seq, 0u);
+  EXPECT_NE(out.award->bundleOf(1)->bid_seq, 0u);
+  r2.coordinator->onAward(*out.award, now);
+  EXPECT_FALSE(r2.coordinator->requestAnswered());
+  EXPECT_TRUE(r2.coordinator->awaitingAuction());
+
+  // A later round collects its bid on time and answers it.
+  const std::size_t first = radio.awards.size();
+  radio.runUntil(now, now + 6.0);
+  EXPECT_TRUE(r2.coordinator->requestAnswered());
+  bool collected = false;
+  for (std::size_t i = first; i < radio.awards.size(); ++i) {
+    const mgg::RobotBundle* bundle = radio.awards[i].second.bundleOf(2);
+    collected |= bundle != nullptr && bundle->bid_seq != 0;
+  }
+  EXPECT_TRUE(collected);
+}
+
+// After a clock rollback the request is sent again, and only an award that
+// collected a bid sent since answers it: the rounds before the reset are
+// forgotten with the rest of the round state.
+TEST(FleetCoordinator, AfterAClockRollbackARequestIsSentAgain) {
+  FleetCoordinator coordinator(2, FleetParams{}, 0.2);
+  coordinator.onAward(makeCall(1, 100, 100.0), 100.0);
+  coordinator.requestAuction();
+  const mgg::FleetTickOutput first =
+      coordinator.tick(100.0, nullptr, nullptr, nullptr);
+  ASSERT_TRUE(first.bid);
+  ASSERT_TRUE(first.bid->request_auction);
+  // The clock goes back: the request goes out again at once.
+  const mgg::FleetTickOutput again =
+      coordinator.tick(5.0, nullptr, nullptr, nullptr);
+  ASSERT_TRUE(again.bid);
+  EXPECT_TRUE(again.bid->request_auction);
+  EXPECT_GT(again.bid->seq, first.bid->seq);
+  // An award collecting the bid sent before the reset does not answer it.
+  coordinator.onAward(
+      makeAward(1, 100, 6.0, {mgg::RobotBundle{2, {}, 0.0, first.bid->seq}},
+                {}),
+      6.0);
+  EXPECT_FALSE(coordinator.requestAnswered());
+  EXPECT_TRUE(coordinator.awaitingAuction());
+  coordinator.onAward(
+      makeAward(1, 101, 7.0, {mgg::RobotBundle{2, {}, 0.0, again.bid->seq}},
+                {}),
+      7.0);
+  EXPECT_TRUE(coordinator.requestAnswered());
 }

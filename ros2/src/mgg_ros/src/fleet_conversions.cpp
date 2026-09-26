@@ -137,7 +137,7 @@ mgg::TourAwardData fromTourAwardMsg(const mgg_msgs::msg::TourAward& msg,
         {bundle.robot_id,
          std::vector<mgg::ClusterId>(bundle.clusters.begin(),
                                      bundle.clusters.end()),
-         bundle.silent_s});
+         bundle.silent_s, bundle.bid_seq});
   }
   award.explored = fromClusterMsgs(msg.explored, t_ours_theirs);
   award.released_robot_ids.assign(msg.released_robot_ids.begin(),
@@ -159,6 +159,7 @@ mgg_msgs::msg::TourAward toTourAwardMsg(const mgg::TourAwardData& award,
     out.robot_id = bundle.robot_id;
     out.clusters.assign(bundle.clusters.begin(), bundle.clusters.end());
     out.silent_s = bundle.silent_s;
+    out.bid_seq = bundle.bid_seq;
     msg.bundles.push_back(out);
   }
   msg.explored = toClusterMsgs(award.explored);

@@ -92,11 +92,11 @@ class FleetCoordinator {
                        const ExploredFn& explored);
 
   /// §3.5: this robot's bundle is done; its bids ask for an auction. An
-  /// award from the auctioneer asked answers it only if it is the award of
-  /// the latest round this robot bid in since the request (answering the
-  /// call, or in its own auction) and names this robot, even with an empty
-  /// bundle; a holder's entry in another round does not. When the
-  /// auctioneer changes first, the request goes to the new one.
+  /// award from the auctioneer asked answers it only if the bid it collected
+  /// from this robot (RobotBundle::bid_seq) is the first one sent with the
+  /// request or newer, even with an empty bundle; a holder's entry, or one
+  /// collecting an older bid, does not. When the auctioneer changes first,
+  /// or the clock goes back, the request goes out again.
   void requestAuction();
   /// A request is out and no award has answered it yet.
   bool awaitingAuction() const { return requested_ && !answered_; }
@@ -160,8 +160,9 @@ class FleetCoordinator {
   /// so a silent robot counts as just heard once and then ages normally, and
   /// the next bid, award or call waits at most one interval or deadline. The
   /// rounds applied and answered are forgotten, as their stamps are of the
-  /// old clock, and a claim's source stamp in the future becomes `now_s`.
-  /// Called first by every member that takes the time.
+  /// old clock, a pending request is sent again, and a claim's source stamp
+  /// in the future becomes `now_s`. Called first by every member that takes
+  /// the time.
   void rebaseFutureTimes(double now_s);
   /// `robot_id` was heard at the local receipt time `now_s`.
   void noteHeard(int robot_id, double now_s);
@@ -231,10 +232,11 @@ class FleetCoordinator {
   bool requested_ = false;
   bool request_sent_ = false;
   bool answered_ = false;
-  // The auctioneer the request went to, and the latest of its auctions this
-  // robot bid in since.
+  // The auctioneer the request went to, and the seq of the first bid that
+  // carried it there: an award answers the request only if the bid it
+  // collected from this robot is that one or newer.
   int request_auctioneer_ = -1;
-  std::optional<std::uint64_t> request_round_;
+  std::uint64_t request_seq_ = 0;
 
   // Auctioneering.
   std::optional<Collection> collecting_;

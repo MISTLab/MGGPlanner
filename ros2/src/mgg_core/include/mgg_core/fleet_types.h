@@ -78,6 +78,9 @@ struct RobotBundle {
   /// How long the auctioneer has not heard this robot; 0 when it bid on
   /// time.
   double silent_s = 0.0;
+  /// The seq of this robot's bid the auctioneer collected in this round; 0
+  /// when it collected none (the robot only holds its claim here).
+  std::uint64_t bid_seq = 0;
 };
 
 /// An auction call (call = true, nothing else set) or an award (§3.4).

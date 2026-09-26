@@ -110,7 +110,7 @@ TEST(FleetConversions, AnAwardRoundTripsWithBundlesExploredAndReleases) {
   in.auctioneer_id = 1;
   in.stamp_s = 42.5;
   in.clusters = {cluster(11, 1, 2.0, 0.0), cluster(21, 2, 9.0, 0.0)};
-  in.bundles = {{1, {11}, 0.0}, {2, {21}, 7.5}};
+  in.bundles = {{1, {11}, 0.0, 42}, {2, {21}, 7.5, 0}};
   in.explored = {cluster(31, 3, -4.0, 0.0)};
   in.released_robot_ids = {4};
   Eigen::Isometry3d t_ours_theirs = Eigen::Isometry3d::Identity();
@@ -131,9 +131,11 @@ TEST(FleetConversions, AnAwardRoundTripsWithBundlesExploredAndReleases) {
   EXPECT_EQ(out.bundles[0].robot_id, 1);
   EXPECT_EQ(out.bundles[0].clusters, std::vector<mgg::ClusterId>{11});
   EXPECT_DOUBLE_EQ(out.bundles[0].silent_s, 0.0);
+  EXPECT_EQ(out.bundles[0].bid_seq, 42u);
   EXPECT_EQ(out.bundles[1].robot_id, 2);
   EXPECT_EQ(out.bundles[1].clusters, std::vector<mgg::ClusterId>{21});
   EXPECT_DOUBLE_EQ(out.bundles[1].silent_s, 7.5);
+  EXPECT_EQ(out.bundles[1].bid_seq, 0u);
   ASSERT_NE(out.cluster(21), nullptr);
   EXPECT_TRUE(out.cluster(21)->position.isApprox(Eigen::Vector3d(9.0, 10.0, 0.5)));
   ASSERT_EQ(out.explored.size(), 1u);

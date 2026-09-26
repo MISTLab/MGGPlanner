@@ -72,6 +72,9 @@ void FleetCoordinator::rebaseFutureTimes(double now_s) {
     answered_call_s_.clear();
     called_round_.reset();
     round_heard_s_ = now_s;
+    // A pending request goes out again, and only an award that collected a
+    // bid sent since answers it.
+    request_sent_ = false;
   }
 }
 
@@ -193,7 +196,6 @@ void FleetCoordinator::requestAuction() {
   request_sent_ = false;
   answered_ = false;
   request_auctioneer_ = -1;
-  request_round_.reset();
 }
 
 FleetTickOutput FleetCoordinator::tick(double now_s, const OwnBidFn& own_bid,
@@ -212,7 +214,6 @@ FleetTickOutput FleetCoordinator::tick(double now_s, const OwnBidFn& own_bid,
   // The auctioneer asked is gone: ask the new one.
   if (requesting && request_sent_ && request_auctioneer_ != elected) {
     request_sent_ = false;
-    request_round_.reset();
   }
 
   const auto makeBid = [&](std::uint64_t auction_id,
@@ -248,9 +249,9 @@ FleetTickOutput FleetCoordinator::tick(double now_s, const OwnBidFn& own_bid,
       answered_call_s_[called_round_->auctioneer_id] = called_round_->stamp_s;
     }
     if (requesting) {
+      if (!request_sent_) request_seq_ = out.bid->seq;
       request_sent_ = true;
       request_auctioneer_ = elected;
-      if (called) request_round_ = called_auction_;
     }
   }
 
@@ -289,7 +290,6 @@ FleetTickOutput FleetCoordinator::tick(double now_s, const OwnBidFn& own_bid,
   collection.signature = signature;
   collection.bids[robot_id_] =
       makeBid(collection.auction_id, collected_explored_turn_);
-  if (requesting) request_round_ = collection.auction_id;
   TourAwardData call;
   call.auction_id = collection.auction_id;
   call.auctioneer_id = robot_id_;
@@ -410,11 +410,16 @@ TourAwardData FleetCoordinator::computeAward(double now_s,
     if (named.insert(c.id).second) award.clusters.push_back(c);
     return c.id;
   };
-  // The auction result names every collected bidder, even an empty bundle:
-  // that explicit entry lets an idle bidder distinguish an answer from omission.
+  // The auction result names every collected bidder, even an empty bundle,
+  // with the seq of the bid collected: a robot that asked for an auction
+  // knows the award considered its request. Holders get no seq.
   for (const auto& [robot_id, indices] : result.bundles) {
     RobotBundle bundle;
     bundle.robot_id = robot_id;
+    const auto collected = collection.bids.find(robot_id);
+    if (collected != collection.bids.end()) {
+      bundle.bid_seq = collected->second.seq;
+    }
     for (const int p : indices) bundle.clusters.push_back(name(p));
     award.bundles.push_back(std::move(bundle));
   }
@@ -509,13 +514,15 @@ void FleetCoordinator::applyAward(const TourAwardData& award, double now_s) {
     claims_.record(bundle.robot_id, std::move(clusters), heard_s);
   }
   // A robot the award does not name (its bid missed the deadline) keeps its
-  // previous bundle. Only the award of a round this robot bid in answers
-  // its request: in another round it is at most a holder, whose entry is
-  // empty once the clusters it held are explored.
+  // previous bundle. Only an award that collected a bid this robot sent
+  // with its request, or later, answers the request: a holder's entry (no
+  // bid seq) or one collecting an older bid is from a round that did not
+  // consider it. Auction IDs cannot tell: a restarted auctioneer reuses
+  // them.
+  const RobotBundle* own = award.bundleOf(robot_id_);
   if (requested_ && request_sent_ &&
-      award.auctioneer_id == request_auctioneer_ && request_round_ &&
-      award.auction_id == *request_round_ &&
-      award.bundleOf(robot_id_) != nullptr) {
+      award.auctioneer_id == request_auctioneer_ && own != nullptr &&
+      own->bid_seq != 0 && own->bid_seq >= request_seq_) {
     answered_ = true;
   }
   if (!bundle_.empty()) {
@@ -523,7 +530,6 @@ void FleetCoordinator::applyAward(const TourAwardData& award, double now_s) {
     answered_ = false;
     request_sent_ = false;
     request_auctioneer_ = -1;
-    request_round_.reset();
   }
   ++assignment_version_;
 }

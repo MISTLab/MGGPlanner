@@ -5,3 +5,6 @@ uint64[] clusters
 # time. A silent robot's claim expires fleet.claim_ttl_s after it was last
 # heard (§4), wherever the award is received.
 float64 silent_s
+# The seq of this robot's bid the auctioneer collected in this round; 0 when
+# it collected none (a robot that only holds its claim).
+uint64 bid_seq
