@@ -417,25 +417,6 @@ TEST(ViewpointClear, AGroundRobotsPathEndsOnlyWhereItCanTurn) {
   EXPECT_TRUE(mgg::viewpointClear(wall, bunker, planning, at_055));
 }
 
-TEST(ObstacleClearance, IsTheDistanceToTheNearestWallUpToTheLimit) {
-  // A wall's face at y = 0.6.
-  const Walls wall([](double, double y) { return y > 0.65; });
-  const RobotParams r = robot();
-  EXPECT_NEAR(mgg::obstacleClearance(wall, r, StateVec(0.1, 0.05, 0.5, 0.0),
-                                     1.0),
-              0.55, 1.0 / 16.0);
-  EXPECT_NEAR(mgg::obstacleClearance(wall, r, StateVec(0.1, -0.2, 0.5, 0.0),
-                                     1.0),
-              0.8, 1.0 / 16.0);
-  EXPECT_DOUBLE_EQ(
-      mgg::obstacleClearance(wall, r, StateVec(0.1, -1.0, 0.5, 0.0), 1.0),
-      1.0);
-  // Above the wall's height nothing is near.
-  EXPECT_DOUBLE_EQ(
-      mgg::obstacleClearance(wall, r, StateVec(0.1, 0.05, 3.0, 0.0), 1.0),
-      1.0);
-}
-
 /// Open space over ground at `height`(x, y), where it has a value; the
 /// map has no ground elsewhere. Only the ground below a point is answered.
 class Ground : public Walls {

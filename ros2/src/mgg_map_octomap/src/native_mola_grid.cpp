@@ -128,24 +128,6 @@ NativeMolaGrid::NativeMolaGrid(double r, std::vector<Cell> o,
   std::sort(occupied_.begin(), occupied_.end());
   std::sort(free_.begin(), free_.end());
   cell_index_.build(occupied_, free_);
-  for (std::size_t first = 0; first < occupied_.size();) {
-    std::size_t last = first + 1;
-    while (last < occupied_.size() && occupied_[last].x == occupied_[first].x &&
-           occupied_[last].y == occupied_[first].y)
-      ++last;
-    occupied_columns_.emplace(
-        std::make_pair(occupied_[first].x, occupied_[first].y),
-        std::make_pair(first, last));
-    for (std::size_t i = first + 1; i < last; ++i) {
-      const Cell& low = occupied_[i - 1];
-      const Cell& high = occupied_[i];
-      if (high.z - low.z > kMaxWallGapVoxels + 1) continue;
-      for (auto z = low.z + 1; z < high.z; ++z)
-        gap_candidates_.push_back({low.x, low.y, z});
-    }
-    first = last;
-  }
-  gap_candidate_index_.build(gap_candidates_, no_cells_);
   for (const auto& v : s)
     if (std::isfinite(v.max_z)) {
       auto it = surface_max_z_.find(v.cell);
@@ -154,10 +136,6 @@ NativeMolaGrid::NativeMolaGrid(double r, std::vector<Cell> o,
       else
         it->second = std::max(it->second, v.max_z);
     }
-}
-std::size_t NativeMolaGrid::ColumnHash::operator()(
-    const std::pair<std::int64_t, std::int64_t>& column) const {
-  return CellHash()({column.first, column.second, 0});
 }
 bool NativeMolaGrid::key(const Eigen::Vector3d& p, Cell& k) const {
   VoxelIndex v;
@@ -389,65 +367,16 @@ void NativeMolaGrid::getScanStatusIterative(
     const Eigen::Vector3d& p, const std::vector<Eigen::Vector3d>& ends,
     GainCounts& g, std::vector<std::pair<Eigen::Vector3d, VoxelStatus>>& log,
     const SensorModel&) {
-  scanUnique(p, ends, nullptr, g, log);
-}
-void NativeMolaGrid::getVisibleScanStatus(
-    const Eigen::Vector3d& p, const std::vector<Eigen::Vector3d>& ends,
-    const WallBand& wall, GainCounts& g,
-    std::vector<std::pair<Eigen::Vector3d, VoxelStatus>>& log,
-    const SensorModel&) {
-  scanUnique(p, ends, &wall, g, log);
+  scanUnique(p, ends, g, log);
 }
 void NativeMolaGrid::scanUnique(
     const Eigen::Vector3d& p, const std::vector<Eigen::Vector3d>& ends,
-    const WallBand* wall, GainCounts& g,
+    GainCounts& g,
     std::vector<std::pair<Eigen::Vector3d, VoxelStatus>>& log) const {
   g = {};
-  // The wall band, a band of heights along wall->up: the caller's vertical
-  // in this grid's frame, which a tilted frame makes lean. A band that is
-  // not finite or inverted, or along a vertical tilted more than 60
-  // degrees, turns the wall rule off rather than making every gap a wall's
-  // or none.
-  const bool walls =
-      wall != nullptr && std::isfinite(wall->min_z) &&
-      std::isfinite(wall->max_z) && wall->min_z <= wall->max_z &&
-      wall->up.allFinite() && wall->up.z() > 0.5 * wall->up.norm();
-  // A wall return is an occupied voxel whose centre's height is in the band.
-  const auto inBand = [&](const Cell& c) {
-    const double height = wall->up.dot(center(c));
-    return height >= wall->min_z && height <= wall->max_z;
-  };
-  // The nearest wall return below, then one above close enough to it, from
-  // the column's occupied voxels. Most unknown voxels are no gap candidate.
-  const auto isWallGap = [&](const Cell& k) {
-    if (gap_candidate_index_.status(k, gap_candidates_, no_cells_) == 0)
-      return false;
-    const auto column = occupied_columns_.find({k.x, k.y});
-    if (column == occupied_columns_.end()) return false;
-    const auto first = occupied_.begin() + column->second.first;
-    const auto last = occupied_.begin() + column->second.second;
-    const auto above = std::upper_bound(
-        first, last, k.z,
-        [](std::int64_t z, const Cell& cell) { return z < cell.z; });
-    std::int64_t below = 0;
-    for (auto it = above; it != first;) {
-      --it;
-      if (k.z - it->z > kMaxWallGapVoxels + 1) break;
-      if (it->z < k.z && inBand(*it)) {
-        below = k.z - it->z;
-        break;
-      }
-    }
-    if (below == 0) return false;
-    for (auto it = above; it != last; ++it) {
-      if (below + (it->z - k.z) - 1 > kMaxWallGapVoxels) break;
-      if (inBand(*it)) return true;
-    }
-    return false;
-  };
-  // A cell's status and the wall rule are decided on its first visit; a
-  // later ray only needs the verdict.
-  enum : std::uint8_t { kNew = 0, kCounted, kCountedOccupied, kWallGap };
+  // A cell's status is decided on its first visit; a later ray only needs
+  // to know whether it passes.
+  enum : std::uint8_t { kNew = 0, kCounted, kCountedOccupied };
   thread_local ScanCells cells;
   cells.reset();
   for (const auto& e : ends) {
@@ -455,11 +384,6 @@ void NativeMolaGrid::scanUnique(
       std::uint8_t& state = cells[k];
       if (state != kNew) return state == kCounted;
       const auto s = status(k);
-      // A gap in a wall hides what is behind it, for every ray.
-      if (walls && s == VoxelStatus::kUnknown && isWallGap(k)) {
-        state = kWallGap;
-        return false;
-      }
       state = s == VoxelStatus::kOccupied ? kCountedOccupied : kCounted;
       log.emplace_back(center(k), s);
       if (s == VoxelStatus::kOccupied)

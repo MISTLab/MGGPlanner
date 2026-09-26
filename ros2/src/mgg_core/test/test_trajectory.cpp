@@ -23,13 +23,6 @@ TEST(Trajectory, DtwOfIdenticalPathsIsZero) {
   EXPECT_NEAR(mgg::computeDTWDistance(p, p), 0.0, 1e-12);
 }
 
-TEST(Trajectory, DirectionEstimateFollowsThePath) {
-  const PathType east{{0,0,0},{1,0,0},{2,0,0}};
-  EXPECT_NEAR(mgg::estimateDirectionFromPath(east), 0.0, 1e-6);
-  const PathType north{{0,0,0},{0,1,0},{0,2,0}};
-  EXPECT_NEAR(mgg::estimateDirectionFromPath(north), M_PI / 2.0, 1e-6);
-}
-
 TEST(Trajectory, TruncateYawWraps) {
   double a = 3.5 * M_PI / 2.0;
   mgg::truncateYaw(a);

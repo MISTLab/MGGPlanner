@@ -265,6 +265,18 @@ class PlannerNodeTestPeer {
     node.grid_params_.min_val.head<2>() = lo;
     node.grid_params_.max_val.head<2>() = hi;
   }
+  /// The test lidar sees all round, so no direction has more gain for the
+  /// way a viewpoint faces.
+  static void seeAllRound(PlannerNode& node) {
+    mgg::SensorParams& sensor = node.sensors_["test_lidar"];
+    sensor.fov.x() = 2.0 * M_PI;
+    sensor.update();
+  }
+  static void setExplorationTarget(PlannerNode& node,
+                                   const Eigen::Vector3d& target) {
+    const std::lock_guard<std::recursive_mutex> lock(node.planner_mutex_);
+    node.exploration_target_ = target;
+  }
   static void setSensorRange(PlannerNode& node, double range) {
     mgg::SensorParams& sensor = node.sensors_["test_lidar"];
     sensor.max_range = range;
@@ -416,34 +428,6 @@ class PlannerNodeTestPeer {
     }
     return false;
   }
-  /// A frontier of this robot's global graph within `within` of (x, y).
-  static bool globalFrontierNear(PlannerNode& node, double x, double y,
-                                 double within) {
-    const std::lock_guard<std::recursive_mutex> lock(node.planner_mutex_);
-    for (const auto& entry : node.global_graph_->vertices_map_) {
-      const mgg::Vertex* v = entry.second;
-      if (v != nullptr && v->type == mgg::VertexType::kFrontier &&
-          std::hypot(v->state.x() - x, v->state.y() - y) <= within) {
-        return true;
-      }
-    }
-    return false;
-  }
-  /// An own frontier at (x, y), at driving height, joined to nothing.
-  static void addLoneGlobalFrontier(PlannerNode& node, double x, double y) {
-    const std::lock_guard<std::recursive_mutex> lock(node.planner_mutex_);
-    mgg::StateVec state(x, y, 0.075, 0.0);
-    EXPECT_TRUE(node.projectToDrivingHeight(state));
-    auto* v = new mgg::Vertex(node.global_graph_->generateVertexID(), state);
-    v->robot_id = static_cast<int>(node.planning_params_.robot_id);
-    v->type = mgg::VertexType::kFrontier;
-    node.global_graph_->addVertex(v);
-    ++node.graph_revision_;
-  }
-  static int frontiersLostInRebuild(PlannerNode& node) {
-    const std::lock_guard<std::recursive_mutex> lock(node.planner_mutex_);
-    return node.frontiersLostInRebuild();
-  }
   static bool repositioningOngoing(PlannerNode& node) {
     return node.global_exploration_ongoing_;
   }
@@ -545,6 +529,46 @@ TEST_F(PlannerNodeTest, ExplorationReturnsTheWholeLatticePath) {
   EXPECT_LT(std::hypot(response->path.front().position.x - first.back().position.x,
                        response->path.front().position.y - first.back().position.y),
             0.30);
+}
+
+TEST_F(PlannerNodeTest, ExplorationGoesTheWayTheRobotFaces) {
+  // Run 6: a path back the way the robot came kept about 20 % of its score,
+  // measured from the last path sent, and robots turned back into an
+  // explored hangar. Paths are now measured from the robot's heading. Here
+  // the floor and the lattice are the same all round the robot and its
+  // lidar sees all round: whichever way it faces, it goes on that way, also
+  // right after a path the other way. Toward an exploration target, the
+  // target's bearing wins over the heading.
+  auto node = makeNode("heading_reference");
+  PlannerNodeTestPeer::observeFloor(*node, -2.5, 2.5, -2.5, 2.5);
+  PlannerNodeTestPeer::setLattice(*node, {-2.0, -2.0}, {2.0, 2.0});
+  PlannerNodeTestPeer::seeAllRound(*node);
+  int stamp = 1;
+  const auto plan_facing = [&](double yaw) {
+    auto msg = std::make_shared<nav_msgs::msg::Odometry>();
+    msg->header.stamp.sec = stamp++;
+    msg->pose.pose.position.z = 0.075;
+    msg->pose.pose.orientation.z = std::sin(yaw / 2.0);
+    msg->pose.pose.orientation.w = std::cos(yaw / 2.0);
+    PlannerNodeTestPeer::acceptOdometry(*node, msg);
+    auto response = std::make_shared<mgg_msgs::srv::PlannerSrv::Response>();
+    PlannerNodeTestPeer::plan(*node, response);
+    EXPECT_EQ(response->status, mgg_msgs::srv::PlannerSrv::Response::FORWARD);
+    return response->path.empty()
+               ? Eigen::Vector2d(0.0, 0.0)
+               : Eigen::Vector2d(response->path.back().position.x,
+                                 response->path.back().position.y);
+  };
+  for (const double yaw : {0.0, M_PI, M_PI / 2.0, -M_PI / 2.0}) {
+    SCOPED_TRACE(yaw);
+    const Eigen::Vector2d end = plan_facing(yaw);
+    const Eigen::Vector2d ahead(std::cos(yaw), std::sin(yaw));
+    EXPECT_GT(end.dot(ahead), 1.0) << end.transpose();
+  }
+  // Facing east, with a target to the west.
+  PlannerNodeTestPeer::setExplorationTarget(*node,
+                                            Eigen::Vector3d(-10.0, 0.0, 0.0));
+  EXPECT_LT(plan_facing(0.0).x(), -1.0);
 }
 
 TEST_F(PlannerNodeTest, APathEndingWithinTheGoalToleranceIsNoPath) {
@@ -804,8 +828,8 @@ TEST_F(PlannerNodeTest, AStandingStartInItsLidarsBlindDiskIsNotBoxedIn) {
   // them, and a wall (for robot_3, a peer's shadow) stood ahead: every way
   // out turned where they stood, over ground not observed, so each was
   // boxed in with no departure. Here the floor is observed from 0.6 m out,
-  // and a wall 0.8 m ahead of the robot, which faces +y, blocks the way
-  // straight on. Standing at its start, it turns out east or west.
+  // and a wall 0.8 m ahead of the robot, which faces +y. Standing at its
+  // start, it has room to turn and gets a path, on this side of the wall.
   const auto scene = [](const std::string& name) {
     auto node = makeNode(name);
     PlannerNodeTestPeer::observeRaisedRing(*node, 0.6, 3.5, 0.0);
@@ -829,10 +853,8 @@ TEST_F(PlannerNodeTest, AStandingStartInItsLidarsBlindDiskIsNotBoxedIn) {
   PlannerNodeTestPeer::plan(*standing, response);
   EXPECT_EQ(response->status, mgg_msgs::srv::PlannerSrv::Response::FORWARD);
   ASSERT_GE(response->path.size(), 2u);
-  // Out of the blind square, on this side of the wall.
   const geometry_msgs::msg::Point& end = response->path.back().position;
-  EXPECT_GE(std::max(std::abs(end.x), std::abs(end.y)), 0.6)
-      << end.x << ", " << end.y;
+  EXPECT_GE(std::hypot(end.x, end.y), 0.4) << end.x << ", " << end.y;
   EXPECT_LT(end.y, 0.8);
   EXPECT_EQ(PlannerNodeTestPeer::boxedInWithoutDeparture(*standing), 0);
 
@@ -1779,37 +1801,6 @@ TEST_F(PlannerNodeTest, ARebuiltGraphThatDoesNotLinkThePoseIsNotSwappedIn) {
             mgg_msgs::srv::PlanObjective::Response::SUCCEEDED);
   EXPECT_EQ(PlannerNodeTestPeer::roadmapRebuilds(*node), 0);
   EXPECT_EQ(PlannerNodeTestPeer::globalVertices(*node), vertices);
-}
-
-TEST_F(PlannerNodeTest, FrontiersSurviveARebuild) {
-  // Review r0, I-1b: the old graph leads south from home to a frontier
-  // off the robot's track. The rebuild carries it over with its path, so
-  // the global planner can still reposition to it.
-  auto node = robotBehindAWall("rebuild_keeps_frontiers", kRoundTheWall,
-                               {{0.5, 0.0}, {0.5, -0.5}, {0.5, -1.0}});
-  ASSERT_TRUE(PlannerNodeTestPeer::globalFrontierNear(*node, 0.5, -1.0, 1e-6));
-  const auto response = returnHome(*node, 0.0, 0.0);
-  ASSERT_EQ(response->status,
-            mgg_msgs::srv::PlanObjective::Response::SUCCEEDED)
-      << response->reason;
-  EXPECT_EQ(PlannerNodeTestPeer::roadmapRebuilds(*node), 1);
-  EXPECT_TRUE(PlannerNodeTestPeer::globalFrontierNear(*node, 0.5, -1.0, 1e-6));
-  EXPECT_EQ(PlannerNodeTestPeer::frontiersLostInRebuild(*node), 0);
-}
-
-TEST_F(PlannerNodeTest, AFrontierARebuildCannotCarryKeepsExplorationOpen) {
-  // Review r0, I-1: a frontier joined to nothing the rebuilt graph meets is
-  // lost by the rebuild. While it still looks into unknown space it is
-  // remembered, and a failed global search is not exploration complete.
-  auto node = robotBehindAWall("rebuild_lost_frontier", kRoundTheWall);
-  PlannerNodeTestPeer::addLoneGlobalFrontier(*node, -1.2, -1.2);
-  const auto response = returnHome(*node, 0.0, 0.0);
-  ASSERT_EQ(response->status,
-            mgg_msgs::srv::PlanObjective::Response::SUCCEEDED)
-      << response->reason;
-  ASSERT_EQ(PlannerNodeTestPeer::roadmapRebuilds(*node), 1);
-  EXPECT_FALSE(PlannerNodeTestPeer::globalFrontierNear(*node, -1.2, -1.2, 0.1));
-  EXPECT_EQ(PlannerNodeTestPeer::frontiersLostInRebuild(*node), 1);
 }
 
 TEST_F(PlannerNodeTest, ReturnHomeWithNoGoalRoutesToTheRebuiltHome) {

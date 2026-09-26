@@ -182,7 +182,12 @@
       # neighbours (robot_1, 2026-09-17); at 0.25 a 10 m route keeps 8 percent
       # of its gain and a 3 m route 47 percent.
       path_length_penalty: 0.25
-      path_direction_penalty: 0.3
+      # Paths are discounted by exp(-penalty * their deviation from the
+      # robot's heading): exploration goes on the way the robot faces. At 0.3
+      # a path back the way it came kept about 20 percent, and robots turned
+      # back into an explored hangar (run 6); 1.0 keeps corridor runs going
+      # forward on the run-6 probe cases, as 1.5 does, without a harder bias.
+      path_direction_penalty: 1.0
       hanging_vertex_penalty: 5.0
       exp_gain_voxel_size: 0.5
       occupied_voxel_gain: 0.0
@@ -252,13 +257,6 @@
       # turns only where it may, drives straight out ahead or, with this,
       # straight back, until it has room. Nav2's DWB reverses (min_vel_x < 0).
       departure_reverse_allowed: true
-      # A ground robot's exploration path scores less the closer it passes
-      # known obstacles: times a factor that is 1 at this clearance or more
-      # along the path and its end, falling linearly to the floor at none. At
-      # similar gain a path down the middle wins over one along a wall or a
-      # rock pile. 0 turns it off.
-      path_clearance_distance: 1.5
-      path_clearance_min_factor: 0.2
       # A ground robot never drives or turns onto unobserved space: at every
       # pose of an edge this fraction of the cells under the leading half of
       # its footprint, and where it turns in place of its turning circle, must

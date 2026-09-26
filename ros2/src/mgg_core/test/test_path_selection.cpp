@@ -222,56 +222,6 @@ TEST(PathSelection, ZeroGainClearPrefixWinsOverAnUnclearEndpoint) {
   EXPECT_FALSE(r.unclear_viewpoint);
 }
 
-TEST(PathSelection, AtSimilarGainAGroundRobotTakesThePathAwayFromObstacles) {
-  // The +x branch runs 0.2 m from a wall, the +y branch 1.5 m from anything.
-  // Their gain differs by 10 %; the clearance factor at 0.2 m of a 1 m
-  // preference floored at 0.5 is 0.6 (the defaults, 1.5 m and 0.2, weigh
-  // clearance more).
-  Fork f;
-  for (Vertex* v : f.x_branch) v->vol_gain.gain = 100.0;
-  for (Vertex* v : f.y_branch) v->vol_gain.gain = 90.0;
-  EdgeInclinations flat;
-  RobotParams ground;
-  ground.type = RobotType::kGroundRobot;
-  const mgg::VertexClearanceFn clearance = [](const Vertex& v) {
-    return v.state.y() == 0.0 ? 0.2 : 1.5;
-  };
-  PlanningParams planning = makePlanning();
-  planning.path_clearance_distance = 1.0;
-  planning.path_clearance_min_factor = 0.5;
-  EXPECT_DOUBLE_EQ(mgg::pathClearanceFactor(0.2, planning), 0.6);
-  EXPECT_DOUBLE_EQ(mgg::pathClearanceFactor(1.5, planning), 1.0);
-  const auto without = mgg::selectBestPath(f.graph, planning, ground, flat,
-                                           0.2, 0.0);
-  EXPECT_EQ(without.best_path_id, 3);
-  const auto with = mgg::selectBestPath(f.graph, planning, ground, flat, 0.2,
-                                        0.0, {}, 0.0, nullptr, nullptr,
-                                        nullptr, clearance);
-  EXPECT_EQ(with.best_path_id, 6);
-  EXPECT_DOUBLE_EQ(with.best_gain, 270.0);
-
-  // A branch worth far more still wins beside the wall...
-  for (Vertex* v : f.y_branch) v->vol_gain.gain = 10.0;
-  EXPECT_EQ(mgg::selectBestPath(f.graph, planning, ground, flat, 0.2, 0.0, {},
-                                0.0, nullptr, nullptr, nullptr, clearance)
-                .best_path_id,
-            3);
-  // ...and the preference is off at distance 0, and for aerial robots.
-  for (Vertex* v : f.y_branch) v->vol_gain.gain = 90.0;
-  PlanningParams off = planning;
-  off.path_clearance_distance = 0.0;
-  EXPECT_EQ(mgg::selectBestPath(f.graph, off, ground, flat, 0.2, 0.0, {}, 0.0,
-                                nullptr, nullptr, nullptr, clearance)
-                .best_path_id,
-            3);
-  RobotParams aerial;
-  aerial.type = RobotType::kAerialRobot;
-  EXPECT_EQ(mgg::selectBestPath(f.graph, planning, aerial, flat, 0.2, 0.0, {},
-                                0.0, nullptr, nullptr, nullptr, clearance)
-                .best_path_id,
-            3);
-}
-
 TEST(PathGoesNowhere, APulledBackPathLeadingToGainIsStillSent) {
   // The zero-gain-prefix fixture: with leaf-only gain the path pulled back
   // to its clear vertex scores nothing itself, but it leads to the leaf's
@@ -346,13 +296,13 @@ TEST(PathSelection, AClearEndWithinTheGoalToleranceIsNoClearEnd) {
   };
   const auto within = mgg::selectBestPath(
       graph, makePlanning(), RobotParams(), flat, 0.2, 0.0, {}, 0.0, clear,
-      nullptr, nullptr, nullptr, 0.3);
+      nullptr, nullptr, 0.3);
   EXPECT_EQ(within.best_path_id, 5);
   EXPECT_TRUE(within.unclear_viewpoint);
   // Farther from the mouth than the tolerance, the robot is sent to it.
   const auto beyond = mgg::selectBestPath(
       graph, makePlanning(), RobotParams(), flat, 0.2, 0.0, {}, 0.0, clear,
-      nullptr, nullptr, nullptr, 0.2);
+      nullptr, nullptr, 0.2);
   EXPECT_EQ(beyond.best_path_id, 1);
   EXPECT_FALSE(beyond.unclear_viewpoint);
 }

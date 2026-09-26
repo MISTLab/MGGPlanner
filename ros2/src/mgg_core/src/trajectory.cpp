@@ -132,35 +132,6 @@ bool interpolatePath(const PathType& path, double discrete_length,
   return true;
 }
 
-double estimateDirectionFromPath(const PathType& path) {
-  // First approach: sum up from each edge
-  // Modified approach: sum up from first vertex towards each vertex
-  const double kAlpha = 0.9;  // depends more on close vertices.
-  if (path.size() <= 1) return 0.0;
-  double yaw = 0;
-  if (path.size() >= 2) {
-    Eigen::Vector3d cur_dir(path[1][0] - path[0][0], path[1][1] - path[0][1],
-                            path[1][2] - path[0][2]);
-    yaw = atan2(cur_dir[1], cur_dir[0]);
-  }
-
-  for (int i = 2; i < path.size(); ++i) {
-    // 1
-    // Eigen::Vector3d cur_dir(path[i][0] - path[i - 1][0],
-    //                         path[i][1] - path[i - 1][1],
-    //                         path[i][2] - path[i - 1][2]);
-    // 2
-    Eigen::Vector3d cur_dir(path[i][0] - path[0][0], path[i][1] - path[0][1],
-                            path[i][2] - path[0][2]);
-    double yaw_tmp = atan2(cur_dir[1], cur_dir[0]);
-    double dyaw = yaw_tmp - yaw;
-    truncateYaw(dyaw);
-    yaw = yaw + (1 - kAlpha) * dyaw;
-    truncateYaw(yaw);
-  }
-  return yaw;
-}
-
 double computeDTWDistance(const PathType& pa, const PathType& pb) {
   const int n = static_cast<int>(pa.size());
   const int m = static_cast<int>(pb.size());

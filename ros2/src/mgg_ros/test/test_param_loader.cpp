@@ -30,8 +30,6 @@ class ParamFixture : public ::testing::Test {
         {"PlanningParams.max_footprint_tilt", 0.3491},
         {"PlanningParams.max_footprint_step", 0.12},
         {"PlanningParams.departure_reverse_allowed", false},
-        {"PlanningParams.path_clearance_distance", 0.8},
-        {"PlanningParams.path_clearance_min_factor", 0.6},
         {"PlanningParams.min_observed_ground_fraction", 0.6},
         {"PlanningParams.max_footprint_cell_rise", 0.13},
         {"PlanningParams.max_goal_ground_rise", 3.5},
@@ -91,8 +89,6 @@ TEST_F(ParamFixture, LoadsPlanningParams) {
   EXPECT_DOUBLE_EQ(params.max_footprint_tilt, 0.3491);
   EXPECT_DOUBLE_EQ(params.max_footprint_step, 0.12);
   EXPECT_FALSE(params.departure_reverse_allowed);
-  EXPECT_DOUBLE_EQ(params.path_clearance_distance, 0.8);
-  EXPECT_DOUBLE_EQ(params.path_clearance_min_factor, 0.6);
   EXPECT_DOUBLE_EQ(params.min_observed_ground_fraction, 0.6);
   EXPECT_DOUBLE_EQ(params.max_footprint_cell_rise, 0.13);
   EXPECT_DOUBLE_EQ(params.max_goal_ground_rise, 3.5);

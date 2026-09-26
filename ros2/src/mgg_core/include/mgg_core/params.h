@@ -228,7 +228,13 @@ struct PlanningParams {
   /// parameter.
   double gain_max_height_above_ground = 0.8;
   double path_length_penalty = 0.0;
-  double path_direction_penalty = 0.0;
+  /// How strongly selectBestPath prefers paths along the robot's heading:
+  /// a path's score is multiplied by exp(-this * its deviation from the
+  /// heading, a length-normalised DTW distance). Upstream's default was 0,
+  /// and 0.3 let a 5 times richer path back the way the robot came win;
+  /// robots in run 6 turned back into an explored hangar. At 1.0 corridor
+  /// runs go on forward on the run-6 probe cases; 1.5 chose the same ends.
+  double path_direction_penalty = 1.0;
   double hanging_vertex_penalty = 0.0;
   bool leafs_only_for_volumetric_gain = false;
   bool cluster_vertices_for_gain = false;
@@ -253,17 +259,6 @@ struct PlanningParams {
   /// controllers drive backwards (DWB min_vel_x below zero). Not an
   /// upstream parameter.
   bool departure_reverse_allowed = true;
-  /// A ground robot's exploration path is worth less the closer it passes
-  /// known obstacles (selectBestPath): its score is multiplied by a factor
-  /// that is 1 where the least clearance (obstacleClearance) of its end and
-  /// of its vertices farther than this distance from the root is at least
-  /// this distance, metres, and falls linearly to path_clearance_min_factor
-  /// at none.
-  /// Unknown voxels pooled around walls and rocks pull path ends onto them;
-  /// at similar gain, a path down the middle wins. 0 turns it off. Not
-  /// upstream parameters.
-  double path_clearance_distance = 1.5;
-  double path_clearance_min_factor = 0.2;
   /// A ground robot never drives or turns onto space it has not observed
   /// (operator decision after run 5, 2026-09-25). At every pose of an edge
   /// (GroundProjection::getProjectedEdgeStatus), at least this fraction of

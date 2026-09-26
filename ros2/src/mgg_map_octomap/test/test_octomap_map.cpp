@@ -556,36 +556,6 @@ TEST(OctomapMap, IterativeVariantDeduplicatesSharedVoxels) {
   EXPECT_GT(plain.free, iterative.free);
 }
 
-TEST(OctomapMap, VisibleScanStopsAtAGapInAWallColumn) {
-  // Returns at (2.1, 0.5, 0.5) and (2.1, 0.5, 0.9): their column is a wall
-  // at z = [0.4, 0.6) and [0.8, 1.0), with an unknown gap between.
-  OctomapConfig cfg;
-  cfg.resolution = 0.2;
-  cfg.max_range = 30.0;
-  OctomapMap map(cfg);
-  const Eigen::Vector3d origin(0.1, 0.5, 0.5);
-  map.insertPointCloud(
-      {Eigen::Vector3d(2.1, 0.5, 0.5), Eigen::Vector3d(2.1, 0.5, 0.9)},
-      origin);
-
-  // One ray rising through the gap at z = [0.6, 0.8) over the column.
-  const std::vector<Eigen::Vector3d> ray{{10.1, 0.5, 1.3}};
-  const auto behindTheWall = [&](const mgg::WallBand& wall) {
-    GainCounts counts;
-    std::vector<std::pair<Eigen::Vector3d, VoxelStatus>> log;
-    map.getVisibleScanStatus(origin, ray, wall, counts, log, kVlp16);
-    int behind = 0;
-    for (const auto& entry : log)
-      if (entry.second == VoxelStatus::kUnknown && entry.first.x() > 2.2)
-        ++behind;
-    return behind;
-  };
-  // A band that holds both returns: the gap is a wall's.
-  EXPECT_EQ(behindTheWall({0.25, 1.7}), 0);
-  // A band that holds only the lower return: nothing above it is inferred.
-  EXPECT_GT(behindTheWall({0.25, 0.65}), 30);
-}
-
 TEST(OctomapMap, AugmentFreeBoxClearsUnknownFootprint) {
   OctomapConfig cfg;
   cfg.resolution = 0.2;

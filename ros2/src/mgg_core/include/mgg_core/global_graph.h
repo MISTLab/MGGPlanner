@@ -273,31 +273,6 @@ RoadmapRebuildReport rebuildRoadmapFromTrajectory(
     GraphManager& graph, const std::vector<TrajectoryKeyframe>& keyframes,
     const ExpandContext& ctx, const RoadmapRebuildParams& params);
 
-/// What carryFrontiersOver brought across from the old roadmap.
-struct FrontierCarryReport {
-  /// The robot's own frontiers in the old roadmap, and those carried over.
-  int frontiers = 0;
-  int carried = 0;
-  /// Vertices the carried paths added to the new roadmap.
-  int vertices_added = 0;
-  /// Where the frontiers not carried over were.
-  std::vector<Eigen::Vector3d> lost;
-};
-
-/// Carries the robot's own frontiers from `old_graph` into `graph`, a
-/// roadmap rebuilt from the trajectory, so a rebuild does not forget where
-/// exploration was to go next. Each frontier comes with the old roadmap's
-/// shortest path to it from where the two roadmaps meet: an old vertex
-/// within edge_length_max of a vertex of `graph`. The path joins `graph`
-/// as a verified path (addRefPathToGraph): linked with the roadmap edge
-/// check of `ctx`, its vertices' types and gains carried. A frontier the
-/// old roadmap does not join to such a vertex, or whose path does not
-/// link, is lost.
-FrontierCarryReport carryFrontiersOver(GraphManager& graph,
-                                       GraphManager& old_graph,
-                                       const ExpandContext& ctx,
-                                       double vertex_spacing);
-
 /// The edge check of a roadmap rebuilt from the robot's trajectory, the
 /// roadmap edge check (roadmapEdgeTraversable) with two differences, both
 /// because the robot drove this trajectory: unobserved space does not

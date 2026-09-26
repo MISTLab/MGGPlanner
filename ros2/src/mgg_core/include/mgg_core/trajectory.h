@@ -82,9 +82,6 @@ double computeDistanceBetweenTwoTrajectories(const PathType& path_1,
                                              bool shorten_to_same_length = true,
                                              bool scale_with_length = true);
 
-/// Heading implied by a path, weighted towards its early section.
-double estimateDirectionFromPath(const PathType& path);
-
 /// How far `path` deviates from travelling along `heading`.
 ///
 /// Compares the path against a straight reference ray of the same length

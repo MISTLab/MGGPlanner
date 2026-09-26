@@ -84,9 +84,9 @@ TEST(NativeGain, EachUnknownVoxelCountsOncePerViewpoint) {
 }
 
 /// A ground robot's gain, the voxels it counted, seen from `viewpoint`: a
-/// vertex 0.45 m over its floor at z = 0.05, with a 0.2 m robot, so the wall
-/// band runs from z = 0.25 to the top of the gain band at z = 1.7, or to
-/// `gain_max_height_above_ground` over the floor.
+/// vertex 0.45 m over its floor at z = 0.05, with a 0.2 m robot, so the gain
+/// band's top is at z = 1.7, or `gain_max_height_above_ground` over the
+/// floor.
 std::vector<std::pair<Eigen::Vector3d, VoxelStatus>> groundGain(
     mgg::MapInterface& map, const Eigen::Vector3d& viewpoint,
     double gain_max_height_above_ground = 0.0) {
@@ -104,135 +104,6 @@ std::vector<std::pair<Eigen::Vector3d, VoxelStatus>> groundGain(
       mgg::StateVec(viewpoint.x(), viewpoint.y(), viewpoint.z(), 0.0), gain,
       setup.ctx, &counted);
   return counted;
-}
-
-/// A floor at z = [-0.2, 0), air mapped free up to x = 2.0 and z = 2.0, and
-/// at x = [2.0, 2.2) the occupied rows `rows(y)` of each column: a wall,
-/// a sill or a rail. Beyond it the map is unknown. Everything runs 20 m to
-/// either side, so that no 20 m ray passes its ends.
-mgg::NativeMolaGrid street(
-    const std::function<std::vector<std::int64_t>(std::int64_t)>& rows) {
-  std::vector<Cell> occupied, free;
-  for (std::int64_t y = -100; y < 100; ++y) {
-    for (std::int64_t x = -9; x < 110; ++x) occupied.push_back({x, y, -1});
-    for (std::int64_t z : rows(y)) occupied.push_back({10, y, z});
-    for (std::int64_t x = -9; x < 10; ++x)
-      for (std::int64_t z = 0; z < 10; ++z) free.push_back({x, y, z});
-  }
-  return mgg::NativeMolaGrid(kResolution, occupied, free, {});
-}
-
-/// Unknown voxels counted beyond x = 2.2 and above `height`.
-int beyondAndAbove(
-    const std::vector<std::pair<Eigen::Vector3d, VoxelStatus>>& counted,
-    double height) {
-  return static_cast<int>(std::count_if(
-      counted.begin(), counted.end(), [height](const auto& entry) {
-        return entry.second == VoxelStatus::kUnknown &&
-               entry.first.x() > 2.2 && entry.first.z() > height;
-      }));
-}
-
-// Diagnosis 2026-09-24 (diag-viewpoint, Q2): only occupied voxels stopped a
-// gain ray, and a wall keeps unknown gaps between the voxels its lidar
-// returns landed in. Rays went through them and counted the space behind the
-// wall, 0.39 of the count at the captured plan ends.
-TEST(NativeGain, WallGapsHideWhatIsBehindAndADoorwayDoesNot) {
-  // The wall's returns landed at every other row up to 1.8 m, leaving
-  // unknown gaps at z = [0.4, 0.6), [0.8, 1.0) and [1.2, 1.4). Columns over
-  // y = [0, 1) hold no return: a doorway.
-  const Eigen::Vector3d viewpoint(0.1, 0.5, 0.5);
-  auto map = street([](std::int64_t y) {
-    return y >= 0 && y < 5 ? std::vector<std::int64_t>{}
-                           : std::vector<std::int64_t>{0, 1, 3, 5, 7, 8};
-  });
-  int through_doorway = 0, through_gaps = 0;
-  for (const auto& entry : groundGain(map, viewpoint)) {
-    const Eigen::Vector3d& v = entry.first;
-    if (entry.second != VoxelStatus::kUnknown || v.x() < 2.2) continue;
-    // Where the line of sight crosses the wall; a cell of slack either side
-    // of the doorway for the rays grazing its edges.
-    const double crossing = viewpoint.y() + (v.y() - viewpoint.y()) *
-                                                (2.1 - viewpoint.x()) /
-                                                (v.x() - viewpoint.x());
-    if (crossing >= -0.2 && crossing <= 1.2)
-      ++through_doorway;
-    else
-      ++through_gaps;
-  }
-  EXPECT_EQ(through_gaps, 0);
-  EXPECT_GT(through_doorway, 200);
-}
-
-// Review r1 (P1), accepted as a minimum opening height: a framed opening of
-// at most kMaxWallGapVoxels (0.6 m at 0.2 m) is taken for a gap between
-// lidar rings in a wall, and hides what is beyond it; a taller one does not.
-TEST(NativeGain, FramedOpeningsUpToTheWallGapLimitHideWhatIsBeyond) {
-  static_assert(mgg::kMaxWallGapVoxels == 3);
-  const Eigen::Vector3d viewpoint(0.1, 0.5, 0.5);
-  // Returns in every row from the wall base to z = 1.8 but the opening's.
-  const auto framed = [](std::int64_t low, std::int64_t high) {
-    return street([low, high](std::int64_t) {
-      std::vector<std::int64_t> rows;
-      for (std::int64_t z = 0; z < 9; ++z)
-        if (z < low || z > high) rows.push_back(z);
-      return rows;
-    });
-  };
-  // 0.4 m, z = [0.4, 0.8), and 0.6 m, z = [0.4, 1.0): wall gaps.
-  auto low_window = framed(2, 3);
-  EXPECT_EQ(beyondAndAbove(groundGain(low_window, viewpoint), -1.0), 0);
-  auto limit_window = framed(2, 4);
-  EXPECT_EQ(beyondAndAbove(groundGain(limit_window, viewpoint), -1.0), 0);
-  // 0.8 m, z = [0.4, 1.2): a window, seen through.
-  auto window = framed(2, 5);
-  EXPECT_GT(beyondAndAbove(groundGain(window, viewpoint), -1.0), 200);
-}
-
-// Review r0 (P1): a single return in a column made the whole column a wall,
-// so rays over a window sill, a railing or a rising ramp saw nothing beyond.
-// Only a gap between two returns hides what is behind it.
-TEST(NativeGain, OpenSpaceOverASillARailingAndARampStaysVisible) {
-  const Eigen::Vector3d viewpoint(0.1, 0.5, 0.5);
-  // A sill whose top is at 0.6 m.
-  auto sill = street([](std::int64_t) {
-    return std::vector<std::int64_t>{0, 1, 2};
-  });
-  EXPECT_GT(beyondAndAbove(groundGain(sill, viewpoint), 0.6), 200);
-  // A rail at z = [0.6, 0.8), and nothing under it but the floor.
-  auto railing = street([](std::int64_t) {
-    return std::vector<std::int64_t>{3};
-  });
-  const auto past_railing = groundGain(railing, viewpoint);
-  EXPECT_GT(beyondAndAbove(past_railing, 0.8), 100);
-  EXPECT_GT(beyondAndAbove(past_railing, 0.0) -
-                beyondAndAbove(past_railing, 0.6), 100);
-
-  // A 16 degree ramp rising from x = 0.6: one occupied voxel per column at
-  // its surface, air mapped free over it up to x = 2.0, unknown beyond.
-  const double slope = std::tan(16.0 * M_PI / 180.0);
-  const auto surface_row = [slope](std::int64_t x) {
-    const double rise = std::max(0.0, ((x + 0.5) * kResolution - 0.6) * slope);
-    return static_cast<std::int64_t>(std::floor(rise / kResolution));
-  };
-  std::vector<Cell> occupied, free;
-  for (std::int64_t y = -100; y < 100; ++y)
-    for (std::int64_t x = -9; x < 110; ++x) {
-      const std::int64_t top = x < 3 ? -1 : surface_row(x);
-      occupied.push_back({x, y, top});
-      if (x < 10)
-        for (std::int64_t z = top + 1; z < 10; ++z) free.push_back({x, y, z});
-    }
-  mgg::NativeMolaGrid ramp(kResolution, occupied, free, {});
-  int over_ramp = 0;
-  for (const auto& entry : groundGain(ramp, viewpoint)) {
-    const Eigen::Vector3d& v = entry.first;
-    const std::int64_t x = std::lround(std::floor(v.x() / kResolution));
-    if (entry.second == VoxelStatus::kUnknown && v.x() > 2.2 &&
-        v.z() > (surface_row(x) + 1) * kResolution)
-      ++over_ramp;
-  }
-  EXPECT_GT(over_ramp, 100);
 }
 
 /// A floor at z = [-0.2, 0) except where `ground_row(x, y)` says otherwise:

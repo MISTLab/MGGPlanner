@@ -1349,45 +1349,6 @@ TEST(OdometryIngestion, ExpandGraphWiresTheOdometryStateToEveryReachableNeighbou
   EXPECT_EQ(walled.global.getNumEdges(), 2);
 }
 
-TEST(CarryFrontiersOver, AFrontierComesWithItsPathAndADisconnectedOneIsLost) {
-  // Review r0, I-1: a rebuild must not forget where exploration was to go.
-  // The old roadmap runs from home along x and branches north to a
-  // frontier at (2, 2); another frontier at (10, 10) is joined to nothing.
-  // The rebuilt roadmap holds only the track from (0, 0) to (1, 0).
-  Roadmap fixture;
-  GraphManager& old_graph = fixture.global;
-  Vertex* a = fixture.add(old_graph, StateVec(1.0, 0.0, 0.0, 0.0),
-                          old_graph.getVertex(0), VertexType::kVisited);
-  Vertex* b = fixture.add(old_graph, StateVec(2.0, 0.0, 0.0, 0.0), a);
-  Vertex* c = fixture.add(old_graph, StateVec(2.0, 1.0, 0.0, 0.0), b);
-  fixture.add(old_graph, StateVec(2.0, 2.0, 0.0, 0.0), c,
-              VertexType::kFrontier);
-  fixture.add(old_graph, StateVec(10.0, 10.0, 0.0, 0.0), nullptr,
-              VertexType::kFrontier);
-
-  GraphManager rebuilt;
-  fixture.add(rebuilt, StateVec(0.0, 0.0, 0.0, 0.0), nullptr,
-              VertexType::kVisited);
-  fixture.add(rebuilt, StateVec(1.0, 0.0, 0.0, 0.0), rebuilt.getVertex(0),
-              VertexType::kVisited);
-
-  const mgg::FrontierCarryReport report =
-      mgg::carryFrontiersOver(rebuilt, old_graph, fixture.ctx, 1.0);
-  EXPECT_EQ(report.frontiers, 2);
-  EXPECT_EQ(report.carried, 1);
-  ASSERT_EQ(report.lost.size(), 1u);
-  EXPECT_NEAR(report.lost.front().x(), 10.0, 1e-9);
-  EXPECT_GT(report.vertices_added, 0);
-
-  const StateVec at(2.0, 2.0, 0.0, 0.0);
-  Vertex* carried = nullptr;
-  ASSERT_TRUE(rebuilt.getNearestVertexInRange(&at, 1e-6, &carried));
-  EXPECT_EQ(carried->type, VertexType::kFrontier);
-  ShortestPathsReport rep;
-  ASSERT_TRUE(rebuilt.findShortestPaths(0, rep));
-  EXPECT_NE(rep.parent_id_map.at(carried->id), carried->id);
-}
-
 /// A Bunker on mapped level ground (0.2 m columns, top at z = 0) over
 /// x in [-2, 14) and y in [-2, 4). `obstacle` raises chosen columns: a
 /// rock, or a wall. Keyframes are base poses 0.1 m above the ground.

@@ -217,11 +217,10 @@ class PlannerNode : public rclcpp::Node {
   /// Replaces the global graph with one rebuilt from the robot's keyframe
   /// trajectory (mgg::rebuildRoadmapFromTrajectory), vertex 0 at its home
   /// keyframe, when the trajectory is for the map in service and home has
-  /// mapped ground. The old graph's own frontiers, with the roadmap paths
-  /// to them, are carried over (mgg::carryFrontiersOver); those that are
-  /// not, and merged neighbours' frontiers, are remembered as lost
-  /// (frontiers_lost_in_rebuild_). With `links_what_failed`, the rebuilt
-  /// graph replaces the old one only when it links what the old one could
+  /// mapped ground. The old graph's frontiers are not carried over: the
+  /// rebuilt graph's come from exploration, and merged neighbours' with
+  /// their next broadcast. With `links_what_failed`, the rebuilt graph
+  /// replaces the old one only when it links what the old one could
   /// not (the robot's pose, an exploration path), which it may add to it;
   /// otherwise the old graph is kept. `why`, for the log, says what
   /// triggered it. At most once per roadmap_rebuild_min_interval_s_ for
@@ -235,10 +234,6 @@ class PlannerNode : public rclcpp::Node {
   /// edge_length_max of `state`: the graph reaches there, and a link
   /// refused there (a wedged robot's box) is no reason to rebuild it.
   bool globalGraphReaches(const mgg::StateVec& state) const;
-  /// Frontiers a rebuild could not carry over that still look into unknown
-  /// space and are not back in the graph (re-merged or re-found). While
-  /// any remain, a failed global search is not exploration complete.
-  int frontiersLostInRebuild();
   /// This robot's own vertices in the global graph.
   std::size_t ownGlobalVertices() const;
   /// rrg.cpp:2535 expandGlobalGraphTimerCallback, idle while its inputs
@@ -381,8 +376,6 @@ class PlannerNode : public rclcpp::Node {
   std::chrono::steady_clock::time_point
       last_roadmap_rebuild_attempt_[kRoadmapRebuildTriggers] = {};
   std::string last_roadmap_rebuild_inputs_[kRoadmapRebuildTriggers];
-  /// See frontiersLostInRebuild().
-  std::vector<Eigen::Vector3d> frontiers_lost_in_rebuild_;
   /// Global graphs rebuilt from the trajectory since the node started.
   int roadmap_rebuilds_ = 0;
 
@@ -462,11 +455,9 @@ class PlannerNode : public rclcpp::Node {
   double peer_body_radius_m_ = 0.6;
   double peer_body_ttl_s_ = 3.0;
 
-  /// Heading the robot has been travelling, for the direction penalty.
-  double exploring_direction_ = 0.0;
   /// A goal the robot has no known route to yet, in the world frame. While
-  /// set, local path selection is biased toward it instead of along the last
-  /// path, and global frontiers nearer to it rank higher. Soft: nothing is
+  /// set, local path selection is biased toward it instead of along the
+  /// robot's heading, and global frontiers nearer to it rank higher. Soft: nothing is
   /// excluded, so a way round that first leads away stays open.
   std::optional<Eigen::Vector3d> exploration_target_;
   mgg::EdgeInclinations edge_inclinations_;

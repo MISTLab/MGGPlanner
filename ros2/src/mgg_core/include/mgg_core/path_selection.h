@@ -87,25 +87,6 @@ bool viewpointClear(const MapInterface& map, const RobotParams& robot,
 /// Whether an exploration path may end at a vertex, e.g. viewpointClear.
 using ViewpointClearFn = std::function<bool(const Vertex&)>;
 
-/// How far from `state` the nearest known occupied voxel lies in the xy
-/// plane, over the height of the robot's collision box, up to `limit`
-/// metres: the largest radius of the occupied-only cylinder check
-/// (MapInterface::getOccupiedOnlyCylinderPathStatus, as viewpointClear asks
-/// it) that is clear, found to within limit / 16. `limit` when nothing is
-/// that close, 0 when the check fails at any radius. Unknown space and a
-/// query the map cannot answer count as clear.
-double obstacleClearance(const MapInterface& map, const RobotParams& robot,
-                         const StateVec& state, double limit);
-
-/// The clearance of a vertex, e.g. obstacleClearance.
-using VertexClearanceFn = std::function<double(const Vertex&)>;
-
-/// The factor selectBestPath multiplies a ground robot's path score by for
-/// the least clearance along it, metres: 1 at path_clearance_distance or
-/// more, falling linearly to path_clearance_min_factor at 0; 1 when
-/// path_clearance_distance is 0.
-double pathClearanceFactor(double clearance, const PlanningParams& planning);
-
 /// Ends `route` at its last pose that passes `clear`, dropping the poses
 /// after it; the first pose, where the robot stands, is never asked. Returns
 /// false, leaving `route` untouched, when no pose after the first passes.
@@ -175,9 +156,10 @@ constexpr int kMaxDetourSearchStates = 100000;
 
 /// Scores every root-to-leaf path and returns the best.
 ///
-/// `exploring_direction` is the heading the robot has been travelling, used to
-/// penalise paths that double back. Gain must already have been computed, for
-/// instance by computeExplorationGain. Paths ending within
+/// `exploring_direction` is the direction paths are penalised for leaving,
+/// by path_direction_penalty: the planner node passes the robot's heading,
+/// or the bearing to an exploration target. Gain must already have been
+/// computed, for instance by computeExplorationGain. Paths ending within
 /// `exclusion_radius` of an `excluded_endpoints` point are skipped; a path
 /// pulled back is checked where it now ends.
 ///
@@ -201,11 +183,6 @@ constexpr int kMaxDetourSearchStates = 100000;
 /// frontier then wins over the short one that turns where it may not.
 /// Only when that too chooses nothing is the selection made without the
 /// check, flagged sharp_turn_fallback.
-///
-/// With `clearance`, a ground robot's path score is multiplied by
-/// pathClearanceFactor of the least clearance of its end and of its
-/// vertices farther than PlanningParams::path_clearance_distance from the
-/// root: nearer the robot, every path passes the obstacles it stands by.
 PathSelectionResult selectBestPath(GraphManager& graph,
                                    const PlanningParams& planning,
                                    const RobotParams& robot,
@@ -221,8 +198,6 @@ PathSelectionResult selectBestPath(GraphManager& graph,
                                        nullptr,
                                    const SharpTurnAllowedFn&
                                        sharp_turn_allowed = nullptr,
-                                   const VertexClearanceFn& clearance =
-                                       nullptr,
                                    double goal_reach = 0.0);
 
 }  // namespace mgg

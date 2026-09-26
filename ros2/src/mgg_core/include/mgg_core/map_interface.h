@@ -66,28 +66,6 @@ inline bool authorityTiltAcceptable(const Eigen::Matrix3d& rotation) {
   return std::isfinite(tilt) && tilt <= kMaxAuthorityTiltRad;
 }
 
-/// Heights at which an occupied voxel is evidence of a wall for
-/// getVisibleScanStatus. The band starts above the floor, so that floor
-/// returns are never taken for a wall. A voxel belongs to the band when its
-/// centre's height, `up` dotted with it, lies in [min_z, max_z]. `up` is the
-/// caller's vertical, in the frame of the scan: a backend whose grid is
-/// tilted from the caller's frame passes the band on with its own
-/// coordinates of that vertical.
-struct WallBand {
-  double min_z = 0.0;
-  double max_z = 0.0;
-  Eigen::Vector3d up = Eigen::Vector3d::UnitZ();
-};
-
-/// Most voxels, stacked in a column between two wall returns, that
-/// getVisibleScanStatus takes for a gap in the wall: 0.6 m at 0.2 m. A
-/// mapping that carves free space with one ray per 5 x 5 degree bin leaves
-/// gaps of that size between lidar rings a few metres away (5 degrees is
-/// 0.6 m at 6.9 m). This is a minimum opening height: a framed opening of
-/// at most this many voxels, a low window, is taken for a wall gap, and
-/// what lies beyond it is not counted. A taller opening stays visible.
-inline constexpr int kMaxWallGapVoxels = 3;
-
 struct XYCellCenter {
   Eigen::Vector2d center = Eigen::Vector2d::Zero();
   std::int64_t grid_x = 0;
@@ -358,26 +336,6 @@ class MapInterface {
       GainCounts& gain, std::vector<std::pair<Eigen::Vector3d, VoxelStatus>>&
                             voxel_log,
       const SensorModel& sensor) = 0;
-
-  /// getScanStatusIterative for rays that see only what the sensor could.
-  /// A lidar leaves unknown gaps in a wall between the voxels its returns
-  /// landed in, and a ray through such a gap counts the space behind the
-  /// wall. So an unknown voxel with an occupied voxel of `wall` below it and
-  /// another above it in its XY column, with at most kMaxWallGapVoxels
-  /// voxels between the two, ends the ray as an occupied voxel does, and is
-  /// neither counted nor logged. Nothing is inferred above a column's highest
-  /// return or below its lowest: the open space over a window sill, a
-  /// railing or a rising ramp, and a doorway, still let rays through.
-  /// Backends without this override scan as getScanStatusIterative does.
-  virtual void getVisibleScanStatus(
-      const Eigen::Vector3d& pos,
-      const std::vector<Eigen::Vector3d>& multiray_endpoints,
-      const WallBand& wall, GainCounts& gain,
-      std::vector<std::pair<Eigen::Vector3d, VoxelStatus>>& voxel_log,
-      const SensorModel& sensor) {
-    (void)wall;
-    getScanStatusIterative(pos, multiray_endpoints, gain, voxel_log, sensor);
-  }
 
   // ----------------------------------------------------------- mutation
 

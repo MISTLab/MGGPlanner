@@ -129,6 +129,8 @@ void computeVolumetricGain(
     // unique on the captured Bistro grids, diag-viewpoint 2026-09-24).
     GainCounts raw;
     std::vector<std::pair<Eigen::Vector3d, VoxelStatus>> visited;
+    ctx.map->getScanStatusIterative(origin, endpoints, raw, visited,
+                                    sensor.model());
     const bool ground_robot =
         ctx.robot != nullptr && ctx.robot->type == RobotType::kGroundRobot;
     // Ground robots only explore the traversable ground layer: voxels high
@@ -140,21 +142,6 @@ void computeVolumetricGain(
       max_h_above = std::min(max_h_above,
                              ctx.planning->gain_max_height_above_ground -
                                  ctx.planning->max_ground_height);
-    }
-    if (ground_robot) {
-      // A lidar leaves unknown gaps in walls, and rays through them counted
-      // the space behind: 0.39 of the count at the captured plan ends. Wall
-      // evidence is a return above the floor (a vertex rides
-      // max_ground_height over it) and within the gain band; a gap is
-      // inferred only between two such returns in a column.
-      const double floor_z = origin.z() - ctx.planning->max_ground_height;
-      const WallBand wall{floor_z + ctx.map->getResolution(),
-                          origin.z() + max_h_above};
-      ctx.map->getVisibleScanStatus(origin, endpoints, wall, raw, visited,
-                                    sensor.model());
-    } else {
-      ctx.map->getScanStatusIterative(origin, endpoints, raw, visited,
-                                      sensor.model());
     }
 
     // Below the vertex, the band reaches max(2 max_ground_height, 1 m). A
