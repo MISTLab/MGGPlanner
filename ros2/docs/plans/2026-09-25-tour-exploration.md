@@ -16,7 +16,7 @@
 - Fleet assignment lives entirely inside MGG, independent of SwarmDeck, with no central server: each connected group of robots runs its own.
 - MGG does not choose the shared-frame source: it uses whatever neighbour transforms it receives.
 - `Graph.msg` is unchanged, so MGG versions without this feature still interoperate.
-- Unchanged: local exploration, terrain and turn checks, boxed-in departures, and the run-5 fixes. The tour only decides where the robot goes next.
+- Unchanged: local exploration, terrain and turn checks, boxed-in departures, and the run-5 and run-6 fixes (among them the failed global search's no-path exceptions, `local_gain_remains_now_` and `frontiers_dropped_in_rebuild_`, which the fleet's "exploration complete for this robot" honours too: Task 11). The tour only decides where the robot goes next.
 - Out of scope: changing local exploration, gain computation, or terrain/turn checks; optimal multi-robot TSP (the sequential auction heuristic is deliberate); selecting the shared-frame source inside MGG.
 - Parameter names and defaults are the spec's §5 table verbatim: `tour.enabled` true, `tour.min_cluster_gain` tuned, `tour.cluster_id_cell_m` 1.0, `tour.heading_weight` tuned, `tour.recompute_interval_s` 1.0, `tour.commit_margin` 0.2, `fleet.enabled` true, `fleet.cluster_merge_radius_m` 2.0, `fleet.balance_weight` tuned, `fleet.auction_interval_s` 2.0, `fleet.bid_deadline_s` 1.0, `fleet.peer_timeout_s` 5.0, `fleet.claim_ttl_s` 1800.
 - Tour solve target: < 10 ms for 50 clusters. Median plan time stays under about 350 ms.
@@ -40,15 +40,23 @@ These five inputs are implied by the spec but no requirement names them; each ha
 
 ## Before Task 1
 
-- [ ] **Rebase onto the run-5 fixes.** A parallel lane (`run5-fixes`, `~/Projects/swarmdeck-lanes/mgg-run5`) changes `planner_node.cpp` (`straightDeparture` moves to `mgg_core/departure.*`, a "path goes nowhere" rule in `buildLocalGraph`), `path_selection.cpp` and `ground_projection.cpp`. Execution starts only after that lane has landed on `ros2`:
+- [ ] **Start from `ros2` at 4777a17 or later.** This plan was refreshed against `ros2` 4777a17 ("Centre the standing-start disk where the robot stood"): the run-5 fixes, the roadmap rebuild from the keyframes, and the run-6 simplification. Every task's code was applied to that tree, built and tested on tuf (2026-09-26): the OFF gate `Summary: 429 tests, 0 errors, 0 failures, 0 skipped`, the ON gate `Summary: 510 tests, 0 errors, 0 failures, 0 skipped` with `test_planner_node` at 51 tests and `test_fleet_exploration` passing in about 8 s. `test_fleet_exploration` failed 3 of about 40 runs on a loaded host, when a late bid let one award hand a peer's fresh frontier to the auctioneer; Task 12 Step 2 describes it.
 
 ```bash
 git fetch origin
 git rebase origin/ros2
-git log --oneline -3 origin/ros2   # must include "Treat an exploration path that goes nowhere as no path"
+git merge-base --is-ancestor 4777a17 HEAD && echo ok   # must print ok
 ```
 
-Tasks 6, 11 and 12 touch `planner_node.cpp`/`.h` and `test_planner_node.cpp`; they name their anchors (functions and member lines), not line numbers, so they still apply after the rebase. Where a task's snippet quotes surrounding code, re-read the current code first and keep the run-5 changes (`goes_nowhere`, `mgg::Departure`) intact.
+What the refresh found in 4777a17, and where the tasks account for it:
+
+- **The low-gain branch of `onPlanRequest` gained two no-path exceptions** (2702fae and 7cf98fe, review r0 I-2): a failed global search is no path, not exploration complete, while `local_gain_remains_now_` holds or the first time after a rebuild dropped this robot's frontiers (`frontiers_dropped_in_rebuild_`). Task 6's replacement block keeps both. The tour's target replaces the low-gain trigger only when the tour has a target; with none, the low-gain rule and its exceptions run as before. Task 11's `settleIdleRobot`, which reports "exploration complete for this robot" when an award leaves it nothing, honours the same two exceptions (a guard and a test that the first version of this plan did not have).
+- **Roadmap rebuilds** (`rebuildGlobalGraphFromKeyframes`) replace the global graph, bump `graph_revision_` and drop this robot's frontiers (aeec9aa removed the carry-over). The tour costs with a cache keyed by `graph_revision_` (Task 4), re-finds its target by stable ID every cycle (Task 6's `refreshTour` reads the representative vertex from the fresh clusters), and `runGlobalPlanner` gives a route up when routing rebuilt the graph, after which Task 6 releases the target. Nothing to change.
+- **Merged frontiers** (89d3f6c, 3452122): `refreshVertex` takes the owner's frontier mark both ways, so a frontier its owner explored is demoted on every peer by the owner's next broadcast, and `addFrontiers` re-checks a peer's frontier only near the new local graph. A frontier explored by a robot other than its owner is still not demoted: the owner's map does not show that ground, the owner keeps marking it, and its broadcasts re-mark every merged copy. Task 10's memory of explored clusters is kept for that case; its comment and its test now describe it (the test's frontier is the bidder's own, explored by its peer).
+- **The heading reference is the current heading** (aeec9aa removed `estimateDirectionFromPath` and `exploring_direction_`, with clearance scoring and the visible-gain wall rule). Task 4's first-leg penalty already takes `current_state_[3]`, the robot's current yaw, so the tour and local path selection prefer the same direction.
+- `gain_max_height_above_ground` (7dcf1f9) and the standing-start exemption (4f5bf95, 383c884, 4777a17) change what gain a frontier has and whether a standing robot is boxed in; the tour reads gains and the boxed-in flags as they are. Nothing to change.
+
+Tasks 6, 11 and 12 touch `planner_node.cpp`/`.h` and `test_planner_node.cpp`; they name their anchors (functions and member lines), not line numbers. Where a task's snippet quotes surrounding code, re-read the current code first and keep the run-5 and run-6 changes (`goes_nowhere`, `mgg::Departure`, `local_gain_remains_now_`, `frontiers_dropped_in_rebuild_`, the rebuild triggers) intact.
 
 ## Build and test
 
@@ -2287,7 +2295,7 @@ git commit -m "Keep the tour's target unless a new start saves the commit margin
 ---
 ### Task 6: Wire the tour into the planner node (delivery step 1)
 
-> **Rebase with care.** This task edits `PlannerNode::onPlanRequest` (the resume check and the low-gain branch) and adds `PlannerNodeTestPeer` helpers, which the run-5 lane also touched. Apply each edit by its anchor after re-reading the current code; keep the run-5 changes (`goes_nowhere`, `mgg::Departure`, `paths_going_nowhere_`) as they are. `buildLocalGraph`, `departBoxedIn`, `straightDeparture` and `path_selection.cpp` are not touched.
+> **Apply by anchor.** This task edits `PlannerNode::onPlanRequest` (the resume check and the head of the low-gain block) and adds `PlannerNodeTestPeer` helpers. Apply each edit by its anchor after re-reading the current code; keep the run-5 and run-6 changes (`goes_nowhere`, `mgg::Departure`, `paths_going_nowhere_`, `local_gain_remains_now_`, `frontiers_dropped_in_rebuild_`) as they are. `buildLocalGraph`, `departBoxedIn`, `straightDeparture`, `runGlobalPlanner` and `path_selection.cpp` are not touched. Checked against 4777a17: every anchor below exists once, and the tour's first-leg heading penalty takes `current_state_[3]`, the current heading that local path selection also prefers since aeec9aa.
 
 **Files:**
 - Modify: `ros2/src/mgg_ros/include/mgg_ros/planner_node.h` (includes, six member functions, eight members, one publisher)
@@ -2651,7 +2659,23 @@ with:
       resume_global = true;
 ```
 
-Then replace the whole `if (best_path_.empty()) { ... }` block that follows the resume block (it starts with `summary = buildLocalGraph() + resumed;` and ends after the `else if (low_gain) { ... }` branch) with:
+Then, in the `if (best_path_.empty()) {` block that follows the resume block, replace its head, from the block's first line through the condition of its boxed-in branch:
+
+```cpp
+  if (best_path_.empty()) {
+    summary = buildLocalGraph() + resumed;
+    // An empty lattice is a map that does not yet show the robot's
+    // surroundings, not an explored one: PCI retries as the map grows. The
+    // global planner is consulted once the lattice existed and saw nothing
+    // new for long enough.
+    const bool low_gain =
+        best_path_.empty() && local_graph_->getNumVertices() > 1 &&
+        low_gain_rounds_ >= auto_global_planner_low_gain_rounds_;
+    if (low_gain &&
+        (boxed_in_without_departure_now_ || withheld_without_departure)) {
+```
+
+with:
 
 ```cpp
   if (best_path_.empty()) {
@@ -2716,31 +2740,9 @@ Then replace the whole `if (best_path_.empty()) { ... }` block that follows the 
     } else if (low_gain &&
                (boxed_in_without_departure_now_ ||
                 withheld_without_departure)) {
-      // Boxed in with no way out: the global planner's route would start
-      // with the turn the robot cannot make, and failing to find one would
-      // not make exploration complete. No path, and the robot's own
-      // recovery runs.
-      summary += "; boxed in: no global repositioning";
-    } else if (low_gain) {
-      // No leaf with gain for long enough: the global planner routes to the
-      // best global frontier (rrg.cpp:2119, mggplanner.cpp:217).
-      auto map_read = mapReadLease();
-      low_gain_rounds_ = 0;
-      std::string departure;
-      if (!runGlobalPlanner(-1, reason)) {
-        complete = true;
-        summary += "; exploration complete: " + reason;
-      } else if (depart_instead_of_turning_route(departure)) {
-        summary +=
-            "; no local gain, and the global route starts with a turn the "
-            "robot has no room for" +
-            departure;
-      } else {
-        summary += "; no local gain, repositioning over the global graph";
-      }
-    }
-  }
 ```
+
+The rest of the block stays as it is: the boxed-in branch's body, and the `else if (low_gain) { ... }` branch with its two no-path exceptions (`local_gain_remains_now_`, `frontiers_dropped_in_rebuild_`) before `exploration complete`. The first version of this plan replaced the whole block with a copy of the run-5 low-gain branch, which drops those exceptions: `AFailedGlobalSearchWithLocalGainLeftIsNotExplorationComplete` and `TheFirstFailedSearchAfterARebuildDroppedFrontiersIsNotComplete` (tour off through `consultGlobalPlannerAtOnce`) would then get exploration complete where they expect no path.
 
 - [ ] **Step 6: Run the new tests to verify they pass**
 
@@ -4669,7 +4671,7 @@ Protocol decisions the spec leaves open, made here and pinned by tests:
 - Auction IDs are `robot_id << 40 | counter`. An award is applied once, identified by (auctioneer, auction ID, stamp): an auctioneer that restarts and counts from 1 again is still followed (Review Focus 5).
 - A robot follows only its current auctioneer's calls and awards: after a group splits or merges, a stale auctioneer's award is ignored.
 - One silent claim is released per auction for idle bidders (§3.5, §4 release 2), the longest silent first; its clusters join that auction's pool.
-- A cluster once reported explored stays out of every later pool at the auctioneer (its `exploredElsewhere` list). A peer's roadmap merged into another robot's graph keeps a frontier typed as one after its owner explored it (`graph_merge`'s refresh sets frontiers but never clears them). Without this memory, a robot that has stopped planning keeps bidding that stale frontier, and the award flip-flops between it and the report that it is explored.
+- A cluster once reported explored stays out of every later pool at the auctioneer (its `exploredElsewhere` list). Since 89d3f6c a frontier its owner explored is demoted on every peer by the owner's next broadcast (`refreshVertex` takes the owner's mark both ways), so that case needs no memory. A frontier explored by a robot other than its owner still does: the owner's map does not show that robot's ground, so the owner keeps marking it, bidding it and broadcasting it, which re-marks every merged copy. Without this memory the owner keeps bidding it, and the award flip-flops between it and the report that it is explored. The test `AClusterReportedExploredStaysOutOfLaterAuctions` pins that case: robot 1 bids its own frontier after robot 2 reported it explored.
 - A robot that requested an auction (`requestAuction`) is "answered" once the award of an auction it bid in with the request flag set is applied; if that award leaves it empty, exploration is complete for it (§3.5). An award that gives it clusters clears the request.
 
 - [ ] **Step 1: Write the failing test**
@@ -4931,11 +4933,12 @@ TEST(FleetCoordinator, ClustersInAPeersExploredSpaceAreDropped) {
 }
 
 TEST(FleetCoordinator, AClusterReportedExploredStaysOutOfLaterAuctions) {
-  // Robot 1 still bids robot 2's old frontier (a stale merged copy) after
-  // robot 2 reported it explored once.
+  // Robot 2 explored ground robot 1 marked a frontier and reported it once.
+  // Robot 1's own map does not show robot 2's ground, so robot 1 keeps
+  // marking the frontier and bidding it.
   const FleetParams params;
   SimRobot r1(1, 0.0, 0.0, params), r2(2, 20.0, 0.0, params);
-  r1.known = {cluster(11, 1, 2.0), cluster(22, 2, 14.0)};
+  r1.known = {cluster(11, 1, 2.0), cluster(22, 1, 14.0)};
   r2.known = {cluster(21, 2, 18.0)};
   r2.explored = {22};
   Radio radio{{&r1, &r2}};
@@ -5550,10 +5553,12 @@ TourAwardData FleetCoordinator::computeAward(double now_s,
   std::vector<int> released = pending_releases_;
   pending_releases_.clear();
 
-  // A cluster once reported explored stays out of the pool: a peer's
-  // roadmap merged here keeps a frontier typed as one after its owner
-  // explored it (graph_merge refreshes a frontier but never demotes one),
-  // and a robot that has stopped planning no longer re-checks it.
+  // A cluster once reported explored stays out of the pool. A frontier its
+  // owner explored is demoted everywhere by the owner's next broadcast
+  // (graph_merge takes the owner's mark both ways), but one another robot
+  // explored is not: the owner's map does not show that robot's ground, so
+  // the owner keeps marking it, bidding it and broadcasting it as a
+  // frontier, which re-marks every merged copy of it.
   const ExploredFn explored_anywhere = [this,
                                         &explored](const Eigen::Vector3d& p) {
     if (explored && explored(p)) return true;
@@ -5784,14 +5789,14 @@ git commit -m "Elect the lowest ID as auctioneer and run one-round frontier auct
 ---
 ### Task 11: Wire fleet assignment into the planner node
 
-> **Rebase with care.** This task edits `PlannerNode::onPlanRequest` (the branch after the tour, from Task 6), `PlannerNode::runGlobalPlanner` (the exclusions its frontier search takes) and `PlannerNode::tourCandidates` (Task 6), and adds `PlannerNodeTestPeer` helpers. Re-read the current code before each edit; `buildLocalGraph`, `straightDeparture` and `path_selection.cpp` are not touched.
+> **Apply by anchor.** This task edits `PlannerNode::onPlanRequest` (the branch after the tour, from Task 6), `PlannerNode::runGlobalPlanner` (the exclusions its frontier search takes; checked against 4777a17, the `searchGlobalFrontier` call quoted in Step 6 is verbatim) and `PlannerNode::tourCandidates` (Task 6), and adds `PlannerNodeTestPeer` helpers. Re-read the current code before each edit; `buildLocalGraph`, `straightDeparture` and `path_selection.cpp` are not touched. The `else if (low_gain)` branch after it keeps its no-path exceptions; `settleIdleRobot` applies the same two before it reports exploration complete.
 
 **Files:**
 - Create: `ros2/src/mgg_msgs/srv/ReleaseClaims.srv`
 - Modify: `ros2/src/mgg_msgs/CMakeLists.txt` (one service)
 - Modify: `ros2/src/mgg_ros/include/mgg_ros/planner_node.h` (includes, ten member functions, the coordinator, topics, service, timer)
 - Modify: `ros2/src/mgg_ros/src/planner_node.cpp` (constructor, new functions after `publishTour`, `tourCandidates`, `runGlobalPlanner`, `onPlanRequest`)
-- Test: `ros2/src/mgg_ros/test/test_planner_node.cpp` (six helpers, four tests)
+- Test: `ros2/src/mgg_ros/test/test_planner_node.cpp` (seven helpers, five tests)
 
 **Interfaces:**
 - Consumes: `mgg::FleetCoordinator`, `mgg::FleetTickOutput` (Task 10); `mgg_ros::fromTourBidMsg`, `toTourBidMsg`, `fromTourAwardMsg`, `toTourAwardMsg` (Task 7); `mgg::exploredInGraph` (Task 2); `mgg::computeTourCosts`, `mgg::GraphDistanceCache::from`, `mgg::reachedDistance` (Task 4); `PlannerNode::globalFrontierClusters`, `linkRobotToGlobalGraph`, `tourCandidates`, `tour_planner_`, `tour_distances_`, `tour_assignment_version_` (Task 6); existing `refreshNeighbourTransform`, `poses_`, `communication_range_`, `selectionExclusions`.
@@ -5799,9 +5804,9 @@ git commit -m "Elect the lowest ID as auctioneer and run one-round frontier auct
   - service `mgg_msgs/srv/ReleaseClaims` (`int32 robot_id` → `bool success`, `string message`), served as `release_claims`
   - topics `tour_bid_out`/`tour_bid_in` (`mgg_msgs/TourBid`) and `tour_award_out`/`tour_award_in` (`mgg_msgs/TourAward`); a deployment remaps each pair to one shared topic, as it does `neighbour_graph_out`/`neighbour_graph_in`
   - `void PlannerNode::fleetTick(double now_s)`, `mgg::TourBidData PlannerNode::ownTourBid()`, `bool PlannerNode::settleIdleRobot(std::string& summary, bool& complete)`, `void PlannerNode::onTourBid(...)`, `void PlannerNode::onTourAward(...)`, `void PlannerNode::onReleaseClaims(...)`, `mgg::CostEstimateFn PlannerNode::roadmapCostEstimate()`, `mgg::ExploredFn PlannerNode::exploredByRoadmap()`, `bool PlannerNode::peerTransform(int, const std::string&, Eigen::Isometry3d&)`, `std::vector<Eigen::Vector3d> PlannerNode::fleetExclusions()`
-  - test helpers `PlannerNodeTestPeer::ownTourBidMsg`, `receiveTourBid`, `fleetGroup`, `fleetTick`, `fleetHasAward`, `releaseClaims`
+  - test helpers `PlannerNodeTestPeer::ownTourBidMsg`, `receiveTourBid`, `fleetGroup`, `fleetTick`, `fleetHasAward`, `hearPeer`, `releaseClaims`
 
-Behaviour: with `fleet.enabled` (the default) the node bids, auctions and follows awards on a 0.1 s timer. A peer's messages count only with a neighbour transform to it and (bids) within `communication_range`, the conditions under which its roadmap merges today. The tour's candidates become: its awarded bundle, plus, in a group with an award, frontiers it found itself that no award named yet; never clusters other robots hold, and never clusters peers reported explored, even when an older award put them in its bundle. A robot with nothing on its tour and no local path asks for an auction and gets no path until the award answers; if that award leaves it nothing, exploration is complete for it. Alone, it takes over the longest-silent claim first. The greedy fallback (`runGlobalPlanner(-1)`) also skips clusters other robots hold or peers explored. SwarmDeck's reservation leases are still honoured when sent (spec §3.6: SwarmDeck stops sending them in delivery step 3).
+Behaviour: with `fleet.enabled` (the default) the node bids, auctions and follows awards on a 0.1 s timer. A peer's messages count only with a neighbour transform to it and (bids) within `communication_range`, the conditions under which its roadmap merges today. The tour's candidates become: its awarded bundle, plus, in a group with an award, frontiers it found itself that no award named yet; never clusters other robots hold, and never clusters peers reported explored, even when an older award put them in its bundle. A robot with nothing on its tour and no local path asks for an auction and gets no path until the award answers; if that award leaves it nothing, exploration is complete for it, except as for a failed global search (Global Constraints): while the lattice still sees gain (`local_gain_remains_now_`), and the first time after a rebuild dropped this robot's frontiers (`frontiers_dropped_in_rebuild_`, reset there as the low-gain branch resets it), it is no path. Alone, it takes over the longest-silent claim first. The greedy fallback (`runGlobalPlanner(-1)`) also skips clusters other robots hold or peers explored. SwarmDeck's reservation leases are still honoured when sent (spec §3.6: SwarmDeck stops sending them in delivery step 3).
 
 - [ ] **Step 1: Write the service**
 
@@ -5851,6 +5856,14 @@ In `ros2/src/mgg_ros/test/test_planner_node.cpp`, add `#include "mgg_ros/fleet_c
   static bool fleetHasAward(PlannerNode& node) {
     const std::lock_guard<std::recursive_mutex> lock(node.planner_mutex_);
     return node.fleet_->hasAward();
+  }
+  /// Robot `robot_id` heard now, bidding nothing: this robot is in a group,
+  /// whose auctioneer is the lower ID of the two.
+  static void hearPeer(PlannerNode& node, int robot_id) {
+    const std::lock_guard<std::recursive_mutex> lock(node.planner_mutex_);
+    mgg::TourBidData bid;
+    bid.robot_id = robot_id;
+    node.fleet_->onBid(bid, node.now().seconds());
   }
   static std::shared_ptr<mgg_msgs::srv::ReleaseClaims::Response>
   releaseClaims(PlannerNode& node, int robot_id) {
@@ -5919,11 +5932,47 @@ TEST_F(PlannerNodeTest, TheAuctioneerCallsAndAwardsOnItsFleetTimer) {
   PlannerNodeTestPeer::fleetTick(*fleet.a, t0 + 1.1);  // past the deadline
   EXPECT_TRUE(PlannerNodeTestPeer::fleetHasAward(*fleet.a));
 }
+
+TEST_F(PlannerNodeTest, AnEmptyAwardAfterARebuildDroppedFrontiersIsNotYetComplete) {
+  // TheFirstFailedSearchAfterARebuildDroppedFrontiersIsNotComplete, in a
+  // group: the award answering this robot's request is its failed search.
+  // The first one after the rebuild is no path; the next is exploration
+  // complete.
+  auto node = makeNode("fleet_rebuild_dropped");
+  PlannerNodeTestPeer::gainFromUnknownVoxelsOnly(*node);
+  PlannerNodeTestPeer::observeFloor(*node, -3.55, 5.55, -2.55, 2.55);
+  PlannerNodeTestPeer::acceptOdometry(*node, 0.0, 0.0, 1.0);
+  PlannerNodeTestPeer::addGlobalChainToFrontier(*node, {{-0.5, 0.0}, {-1.0, 0.0}});
+  PlannerNodeTestPeer::serveMap(*node, "component:test", 0);
+  auto source = std::make_unique<TrajectoryInMemory>();
+  source->trajectory = keyframesAlongX(0.0, 1.0);
+  PlannerNodeTestPeer::setKeyframeSource(*node, std::move(source));
+  ASSERT_TRUE(PlannerNodeTestPeer::rebuildRoadmap(
+      *node, PlannerNode::RoadmapRebuildTrigger::kPoseUnlinkable));
+  PlannerNodeTestPeer::setTour(*node, true, 0.0);
+  PlannerNodeTestPeer::hearPeer(*node, 2);
+
+  const auto plan = [&node]() {
+    auto response = std::make_shared<mgg_msgs::srv::PlannerSrv::Response>();
+    PlannerNodeTestPeer::plan(*node, response);
+    EXPECT_TRUE(response->path.empty())
+        << "path of " << response->path.size() << " poses";
+    return response->status;
+  };
+  // Nothing on its tour and no local path: it asks for an auction.
+  EXPECT_EQ(plan(), PlannerNode::kStatusNoPath);
+  const double t0 = node->now().seconds();
+  PlannerNodeTestPeer::fleetTick(*node, t0);        // the call
+  PlannerNodeTestPeer::fleetTick(*node, t0 + 1.1);  // the award: nothing
+  ASSERT_TRUE(PlannerNodeTestPeer::fleetHasAward(*node));
+  EXPECT_EQ(plan(), PlannerNode::kStatusNoPath);
+  EXPECT_EQ(plan(), PlannerNode::kStatusComplete);
+}
 ```
 
 - [ ] **Step 3: Run them to verify they fail**
 
-Run: `/tmp/mgg-tour/tuf-run.sh on quick mgg_ros test_planner_node '*Fleet*:*Bid*:*Claims*'`
+Run: `/tmp/mgg-tour/tuf-run.sh on quick mgg_ros test_planner_node '*Fleet*:*Bid*:*Claims*:*EmptyAward*'`
 Expected: FAIL at compile time with `'class mgg_ros::PlannerNode' has no member named 'ownTourBid'`.
 
 - [ ] **Step 4: Declare the fleet in the node's header**
@@ -5980,7 +6029,9 @@ After the declaration `void publishTour();` add:
   std::vector<Eigen::Vector3d> fleetExclusions();
   /// §3.5 for a robot with no tour target and no local path. In a group it
   /// asks for an auction and gets no path until the award answers; if that
-  /// award leaves it nothing, exploration is complete for it. Alone, it
+  /// award leaves it nothing, exploration is complete for it, with the
+  /// failed global search's exceptions: local gain remains, or a graph
+  /// rebuild dropped frontiers since (review r0, I-2). Alone, it
   /// takes over the claim of the robot silent longest. False when it is
   /// alone with no claim to take over: the low-gain rule decides.
   bool settleIdleRobot(std::string& summary, bool& complete);
@@ -6242,10 +6293,25 @@ bool PlannerNode::settleIdleRobot(std::string& summary, bool& complete) {
   const double now_s = now().seconds();
   if (fleet_->inGroup(now_s)) {
     if (fleet_->requestAnswered()) {
-      complete = true;
-      summary +=
-          "; exploration complete for this robot: the fleet's award leaves "
-          "it nothing";
+      // As a failed global search is (review r0, I-2): not exploration
+      // complete while the lattice still sees gain it cannot send a path
+      // to, nor the first time after a graph rebuild dropped frontiers.
+      if (local_gain_remains_now_) {
+        summary +=
+            "; the fleet's award leaves it nothing, but local gain remains: "
+            "no path";
+      } else if (frontiers_dropped_in_rebuild_ > 0) {
+        summary += "; the fleet's award leaves it nothing, but a graph "
+                   "rebuild dropped " +
+                   std::to_string(frontiers_dropped_in_rebuild_) +
+                   " frontier(s): no path";
+        frontiers_dropped_in_rebuild_ = 0;
+      } else {
+        complete = true;
+        summary +=
+            "; exploration complete for this robot: the fleet's award "
+            "leaves it nothing";
+      }
     } else {
       if (!fleet_->awaitingAuction()) fleet_->requestAuction();
       summary += "; its bundle is done: waiting for the auction it asked for";
@@ -6382,7 +6448,7 @@ with:
 - [ ] **Step 7: Run the tests to verify they pass**
 
 Run: `/tmp/mgg-tour/tuf-run.sh on quick mgg_ros test_planner_node '*'`
-Expected: every test `OK`, including `APeersBidJoinsTheGroupOnlyWithATransformToIt`, `AMalformedBidIsIgnored`, `OnlyTheAuctioneerReleasesClaims` and `TheAuctioneerCallsAndAwardsOnItsFleetTimer`.
+Expected: every test `OK` (51 on 4777a17), including `APeersBidJoinsTheGroupOnlyWithATransformToIt`, `AMalformedBidIsIgnored`, `OnlyTheAuctioneerReleasesClaims`, `TheAuctioneerCallsAndAwardsOnItsFleetTimer` and `AnEmptyAwardAfterARebuildDroppedFrontiersIsNotYetComplete`. Without the two exceptions in `settleIdleRobot`, the last fails at its second plan with `-3` (complete) for `-2` (no path).
 
 - [ ] **Step 8: Run both gates**
 
@@ -6402,7 +6468,7 @@ git commit -m "Bid, auction and follow awards in the planner node"
 ---
 ### Task 12: Two planners explore one corridor together (integration test)
 
-> **Rebase with care.** This task adds a test binary and a CMake entry inside `mgg_ros`'s `if(mgg_map_octomap_WITH_OCTOMAP)` block, next to `test_planner_node`, which the run-5 lane also touched. It changes no production code.
+> **Apply by anchor.** This task adds a test binary and a CMake entry inside `mgg_ros`'s `if(mgg_map_octomap_WITH_OCTOMAP)` block, after `ament_target_dependencies(test_planner_node rclcpp mgg_msgs)` (present once on 4777a17). It changes no production code.
 
 **Files:**
 - Create: `ros2/src/mgg_ros/test/test_fleet_exploration.cpp`
@@ -6412,7 +6478,7 @@ git commit -m "Bid, auction and follow awards in the planner node"
 - Consumes: everything from Tasks 1 to 11 through the real node: `PlannerNode` with `tour.*`/`fleet.*` parameters, the `tour_bid_*`/`tour_award_*`/`neighbour_graph_*` topics, `mgg_msgs/TourAward`.
 - Produces: `test_fleet_exploration` (spec §6: "two or three planner nodes on a synthetic map with a shared frame, through the real message path; they split the frontiers and the map is fully explored").
 
-The scene is built around how MGG ingests frontiers. `addFrontiers` keeps no frontier within 1.5 m of a visited vertex, and event E1 marks every vertex within 3 m of the track visited, so a robot's first frontiers lie ahead of it. The two robots therefore start back to back in the middle of a 20 m corridor, each half longer than E1's 3 m. The test world is scaled to the test robot (0.2 m body, 0.5 m lattice), so `fleet.cluster_merge_radius_m` is 0.5 there: at the default 2 m, clusters 1.7 m apart on either side of the start merge into one. The discriminating check is that each robot finishes its own half without crossing into the other's. With `fleet.enabled` false each robot drives into the other's half, because its merged copy of the peer's frontiers is never demoted. Each robot's own map still shows the peer's half unknown.
+The scene is built around how MGG ingests frontiers. `addFrontiers` keeps no frontier within 1.5 m of a visited vertex, and event E1 marks every vertex within 3 m of the track visited, so a robot's first frontiers lie ahead of it. The two robots therefore start back to back in the middle of a 20 m corridor, each half longer than E1's 3 m. The test world is scaled to the test robot (0.2 m body, 0.5 m lattice), so `fleet.cluster_merge_radius_m` is 0.5 there: at the default 2 m, clusters 1.7 m apart on either side of the start merge into one. The discriminating check is that each robot finishes its own half without crossing into the other's. With `fleet.enabled` false each robot, once none of its own clusters is left, tours the peer's (Task 6's `tourCandidates` takes other robots' clusters then) and drives into the other's half: its own map still shows that half unknown, and nothing tells it the peer holds or explored them. The owner's broadcasts demote a merged frontier only once the owner itself no longer marks it (89d3f6c), which does not keep the other robot out. Checked on 4777a17: fleet on, the test passes in about 8 s; fleet off (Step 3), it fails as described below.
 
 - [ ] **Step 1: Write the test**
 
@@ -6797,10 +6863,12 @@ Expected: `[       OK ] FleetExploration.TwoPlannersSplitTheFrontiersAndExploreT
 
 This test passes on correct code as written. If it fails, read the `plan request:` summaries (`tour: ...`, `its bundle is done ...`) and the auctioneer's `fleet award N: ...` lines in its output to find the fault in Tasks 6 to 11. Do not loosen its assertions without the supervisor's approval.
 
+Known on 4777a17 (refresh, 2026-09-26): about 40 runs on tuf while the SwarmDeck stack was running there, with `--cpus 4`. Three failed, all with one signature: one or two awards in mid-run (the fifth and sixth) gave robot 1 robot 2's frontiers at x = -4.85 or -6.35. The next award corrected it, and robot 1 never drove there, so only the award check `cluster.position.x > -1.5` failed. An instrumented run showed the cause. Those awards name one robot (`1 cluster(s) to 1 robot(s)`): robot 2's bid missed the deadline, and its previous bundle was empty. The only other listing of its fresh frontiers was robot 1's merged copy of robot 2's roadmap, so robot 1 won them. That is the spec's rule (§3.4: a late bidder keeps only its previous bundle). In this test, `fleet.bid_deadline_s` (0.1 s) equals the node's `kFleetTickPeriodS` (0.1 s), so a peer that ticks just after the call answers at the deadline. A deadline of a few tick periods (for example 0.3 s) would likely remove the flake, but that changes the test. If the test fails with this signature, report it to the supervisor; do not change the deadline or the assertion on your own.
+
 - [ ] **Step 3: Check that it tests the fleet**
 
 Temporarily add `rclcpp::Parameter("fleet.enabled", false),` to `makeFleetNode`'s overrides, and change `ASSERT_FALSE(awards.empty());` to `EXPECT_TRUE(awards.empty());`, then run it again.
-Expected: FAIL with `robot 1 went west to ...` and `robot 2 went east to ...` (each robot crosses into the other's half), and `won` is 0. Revert both edits (`git diff ros2/src/mgg_ros/test/test_fleet_exploration.cpp` shows only the new file as created in Step 1).
+Expected: FAIL with `robot 1 went west to ...` and `robot 2 went east to ...` (each robot crosses into the other's half; on 4777a17 to -8.35 and 8.35), `won` is 0, and neither robot completes within `kMaxCycles` (it loops over the peer's frontiers, so this run takes about 3 minutes). Revert both edits (`git diff ros2/src/mgg_ros/test/test_fleet_exploration.cpp` shows only the new file as created in Step 1).
 
 - [ ] **Step 4: Run both gates**
 
