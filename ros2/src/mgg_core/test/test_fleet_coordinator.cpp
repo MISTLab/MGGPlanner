@@ -649,4 +649,34 @@ TEST(FleetCoordinator, OwnBidsStayWithinTheBidClusterLimit) {
   EXPECT_EQ(out.bid->explored, explored);
 }
 
+// An award naming kNoCluster (a broken peer) must not put it in this robot's
+// bundle, claims or award clusters, whence its next bid would carry it and
+// be refused.
+TEST(FleetCoordinator, AnAwardsUnnamedClustersAreIgnored) {
+  const FleetParams params;
+  FleetCoordinator coordinator(2, params, 0.2);
+  TourAwardData award;
+  award.auction_id = 1;
+  award.auctioneer_id = 1;
+  award.stamp_s = 0.0;
+  award.clusters = {cluster(mgg::kNoCluster, 1, 1.0), cluster(21, 2, 2.0),
+                    cluster(31, 3, 3.0)};
+  award.bundles = {mgg::RobotBundle{2, {mgg::kNoCluster, 21}, 0.0},
+                   mgg::RobotBundle{3, {31, mgg::kNoCluster}, 0.0}};
+  award.explored = {cluster(mgg::kNoCluster, 1, 40.0), cluster(41, 4, 50.0)};
+  coordinator.onAward(award, 0.0);
+  EXPECT_EQ(idsOf(coordinator.bundle()), std::vector<ClusterId>{21});
+  EXPECT_EQ(idsOf(coordinator.claimedByOthers(0.0)),
+            std::vector<ClusterId>{31});
+  EXPECT_EQ(idsOf(coordinator.lastAwardClusters()),
+            (std::vector<ClusterId>{21, 31}));
+  EXPECT_EQ(idsOf(coordinator.exploredElsewhere()),
+            std::vector<ClusterId>{41});
+  const mgg::FleetTickOutput out =
+      coordinator.tick(0.0, nullptr, nullptr, nullptr);
+  ASSERT_TRUE(out.bid.has_value());
+  EXPECT_TRUE(out.bid->wellFormed());
+  EXPECT_EQ(out.bid->bundle, std::vector<ClusterId>{21});
+}
+
 }  // namespace

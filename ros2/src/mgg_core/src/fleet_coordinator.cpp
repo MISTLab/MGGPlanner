@@ -13,6 +13,17 @@ std::vector<ClusterId> idsOf(const std::vector<FleetCluster>& clusters) {
   return ids;
 }
 
+/// kNoCluster names no cluster (a broken peer's award): dropped, or this
+/// robot's next bid would carry it and peers would refuse the bid.
+std::vector<FleetCluster> namedOnly(const std::vector<FleetCluster>& clusters) {
+  std::vector<FleetCluster> named;
+  named.reserve(clusters.size());
+  for (const FleetCluster& c : clusters) {
+    if (c.id != kNoCluster) named.push_back(c);
+  }
+  return named;
+}
+
 bool isMember(const std::vector<int>& members, int robot_id) {
   return std::find(members.begin(), members.end(), robot_id) != members.end();
 }
@@ -311,12 +322,13 @@ void FleetCoordinator::applyAward(const TourAwardData& award, double now_s) {
   applied_auction_id_ = award.auction_id;
   applied_stamp_s_ = award.stamp_s;
   has_award_ = true;
-  award_clusters_ = award.clusters;
-  noteExplored(award.explored);
+  award_clusters_ = namedOnly(award.clusters);
+  noteExplored(namedOnly(award.explored));
   for (const int robot_id : award.released_robot_ids) claims_.release(robot_id);
   for (const RobotBundle& bundle : award.bundles) {
     std::vector<FleetCluster> clusters;
     for (const ClusterId id : bundle.clusters) {
+      if (id == kNoCluster) continue;
       if (const FleetCluster* c = award.cluster(id)) clusters.push_back(*c);
     }
     if (bundle.robot_id == robot_id_) {
