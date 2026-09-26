@@ -1104,6 +1104,19 @@ bool PlannerNode::rebuildGlobalGraphFromKeyframes(
                 report.components);
     return false;
   }
+  // The old graph's own frontiers go with it (none is carried over); the
+  // next failed global search is then not exploration complete.
+  int dropped = 0;
+  const int own = static_cast<int>(planning_params_.robot_id);
+  for (const auto& entry : global_graph_->vertices_map_) {
+    const mgg::Vertex* vertex = entry.second;
+    if (vertex != nullptr && vertex->robot_id == own &&
+        vertex->type == mgg::VertexType::kFrontier &&
+        global_graph_->inService(*vertex)) {
+      ++dropped;
+    }
+  }
+  if (dropped > 0) frontiers_dropped_in_rebuild_ = dropped;
   global_graph_ = rebuilt;
   global_root_supported_ = true;
   global_exploration_ongoing_ = false;
@@ -2333,6 +2346,15 @@ void PlannerNode::onPlanRequest(
           // not a finished exploration. No path, and PCI retries.
           summary += "; no global route (" + reason +
                      "), but local gain remains: no path";
+        } else if (frontiers_dropped_in_rebuild_ > 0) {
+          // A graph rebuild dropped this robot's frontiers since: the
+          // first failed search after it is not exploration complete
+          // (review r0, I-2). No path, and the next one may be.
+          summary += "; no global route (" + reason + "), but a graph " +
+                     "rebuild dropped " +
+                     std::to_string(frontiers_dropped_in_rebuild_) +
+                     " frontier(s): no path";
+          frontiers_dropped_in_rebuild_ = 0;
         } else {
           complete = true;
           summary += "; exploration complete: " + reason;

@@ -1975,4 +1975,34 @@ TEST_F(PlannerNodeTest, EachRebuildTriggerHasItsOwnRateLimit) {
   EXPECT_EQ(PlannerNodeTestPeer::roadmapRebuilds(*node), 2);
 }
 
+TEST_F(PlannerNodeTest, TheFirstFailedSearchAfterARebuildDroppedFrontiersIsNotComplete) {
+  // Review r0, I-2: a rebuild replaces the global graph, and this robot's
+  // frontiers go with it. The next low-gain round, in a room explored end
+  // to end, found no frontier and made exploration complete. The first
+  // failed global search after a rebuild that dropped any is no path; the
+  // next one, with nothing found since, is exploration complete.
+  auto node = makeNode("rebuild_dropped_frontiers");
+  PlannerNodeTestPeer::gainFromUnknownVoxelsOnly(*node);
+  PlannerNodeTestPeer::observeFloor(*node, -3.55, 5.55, -2.55, 2.55);
+  PlannerNodeTestPeer::acceptOdometry(*node, 0.0, 0.0, 1.0);
+  PlannerNodeTestPeer::addGlobalChainToFrontier(*node, {{-0.5, 0.0}, {-1.0, 0.0}});
+  PlannerNodeTestPeer::serveMap(*node, "component:test", 0);
+  auto source = std::make_unique<TrajectoryInMemory>();
+  source->trajectory = keyframesAlongX(0.0, 1.0);
+  PlannerNodeTestPeer::setKeyframeSource(*node, std::move(source));
+  ASSERT_TRUE(PlannerNodeTestPeer::rebuildRoadmap(
+      *node, PlannerNode::RoadmapRebuildTrigger::kPoseUnlinkable));
+
+  const auto plan = [&node]() {
+    PlannerNodeTestPeer::consultGlobalPlannerAtOnce(*node);
+    auto response = std::make_shared<mgg_msgs::srv::PlannerSrv::Response>();
+    PlannerNodeTestPeer::plan(*node, response);
+    EXPECT_TRUE(response->path.empty())
+        << "path of " << response->path.size() << " poses";
+    return response->status;
+  };
+  EXPECT_EQ(plan(), PlannerNode::kStatusNoPath);
+  EXPECT_EQ(plan(), PlannerNode::kStatusComplete);
+}
+
 }  // namespace mgg_ros

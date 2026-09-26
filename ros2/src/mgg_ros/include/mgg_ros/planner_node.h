@@ -219,7 +219,8 @@ class PlannerNode : public rclcpp::Node {
   /// keyframe, when the trajectory is for the map in service and home has
   /// mapped ground. The old graph's frontiers are not carried over: the
   /// rebuilt graph's come from exploration, and merged neighbours' with
-  /// their next broadcast. With `links_what_failed`, the rebuilt graph
+  /// their next broadcast; how many of its own it dropped is kept
+  /// (frontiers_dropped_in_rebuild_). With `links_what_failed`, the rebuilt graph
   /// replaces the old one only when it links what the old one could
   /// not (the robot's pose, an exploration path), which it may add to it;
   /// otherwise the old graph is kept. `why`, for the log, says what
@@ -387,6 +388,10 @@ class PlannerNode : public rclcpp::Node {
   std::string last_roadmap_rebuild_inputs_[kRoadmapRebuildTriggers];
   /// Global graphs rebuilt from the trajectory since the node started.
   int roadmap_rebuilds_ = 0;
+  /// This robot's in-service frontiers the last rebuild that dropped any
+  /// replaced, until the next failed global search, which is then no path
+  /// rather than exploration complete (review r0, I-2).
+  int frontiers_dropped_in_rebuild_ = 0;
 
   /// Below this displacement the robot is standing still for the expansion
   /// sampler: its other inputs are the graph and map revisions.
