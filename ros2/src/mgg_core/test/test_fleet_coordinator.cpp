@@ -1429,3 +1429,53 @@ TEST(FleetCoordinator, ReleaseClaimsRejectsOwnAndUnknownIdsWithoutChangingAssign
   coordinator.onBid(emptyBid(2), 0.0);
   EXPECT_TRUE(coordinator.releaseClaims(2, 0.0));
 }
+
+// A request that reaches the auctioneer mid-collection makes its sender a
+// holder in that round, not a bidder. Its claim is on a cluster it reported
+// explored, so the holder entry is empty; that entry does not answer the
+// request. The award of a round it bid in does.
+TEST(FleetCoordinator, AnEmptyHolderEntryDoesNotAnswerARequest) {
+  const FleetParams params;
+  SimRobot r1(1, 0.0, 0.0, params), r2(2, 20.0, 0.0, params);
+  r1.known = {cluster(11, 1, 2.0)};
+  r2.known = {cluster(21, 2, 18.0)};
+  Radio radio{{&r1, &r2}};
+  double now = 0.0;
+  radio.runUntil(now, 5.0);
+  ASSERT_EQ(r2.front(), 21u);
+
+  // Robot 2 explores its cluster and asks for more. Robot 1 finds a new
+  // cluster and calls an auction, but robot 2 misses the call.
+  r2.known.clear();
+  r2.explored = {21};
+  r2.coordinator->requestAuction();
+  r1.known.push_back(cluster(12, 1, 6.0));
+  now += 2.5;
+  mgg::FleetTickOutput out =
+      r1.coordinator->tick(now, [&r1] { return r1.ownBid(); }, euclid, nullptr);
+  ASSERT_TRUE(out.award && out.award->call);
+  if (out.bid) r2.coordinator->onBid(*out.bid, now);
+  const mgg::FleetTickOutput request = r2.coordinator->tick(
+      now + 0.05, [&r2] { return r2.ownBid(); }, euclid, nullptr);
+  ASSERT_TRUE(request.bid);
+  ASSERT_EQ(request.bid->auction_id, 0u);
+  ASSERT_TRUE(request.bid->request_auction);
+  ASSERT_EQ(request.bid->bundle, std::vector<ClusterId>{21});
+  r1.coordinator->onBid(*request.bid, now + 0.05);
+  now += 1.0;
+  out = r1.coordinator->tick(now, [&r1] { return r1.ownBid(); }, euclid,
+                             nullptr);
+  ASSERT_TRUE(out.award && !out.award->call);
+  const mgg::RobotBundle* held = out.award->bundleOf(2);
+  ASSERT_NE(held, nullptr);
+  EXPECT_TRUE(held->clusters.empty());
+  r2.coordinator->onAward(*out.award, now);
+  EXPECT_FALSE(r2.coordinator->requestAnswered());
+  EXPECT_TRUE(r2.coordinator->awaitingAuction());
+
+  // Its next bid still asks; it bids in the round that follows, and that
+  // round's award answers it.
+  radio.runUntil(now, now + 6.0);
+  EXPECT_TRUE(r2.coordinator->requestAnswered());
+  EXPECT_TRUE(r2.coordinator->bundle().empty());
+}

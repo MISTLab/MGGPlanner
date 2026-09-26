@@ -193,6 +193,7 @@ void FleetCoordinator::requestAuction() {
   request_sent_ = false;
   answered_ = false;
   request_auctioneer_ = -1;
+  request_round_.reset();
 }
 
 FleetTickOutput FleetCoordinator::tick(double now_s, const OwnBidFn& own_bid,
@@ -211,6 +212,7 @@ FleetTickOutput FleetCoordinator::tick(double now_s, const OwnBidFn& own_bid,
   // The auctioneer asked is gone: ask the new one.
   if (requesting && request_sent_ && request_auctioneer_ != elected) {
     request_sent_ = false;
+    request_round_.reset();
   }
 
   const auto makeBid = [&](std::uint64_t auction_id,
@@ -248,6 +250,7 @@ FleetTickOutput FleetCoordinator::tick(double now_s, const OwnBidFn& own_bid,
     if (requesting) {
       request_sent_ = true;
       request_auctioneer_ = elected;
+      if (called) request_round_ = called_auction_;
     }
   }
 
@@ -286,6 +289,7 @@ FleetTickOutput FleetCoordinator::tick(double now_s, const OwnBidFn& own_bid,
   collection.signature = signature;
   collection.bids[robot_id_] =
       makeBid(collection.auction_id, collected_explored_turn_);
+  if (requesting) request_round_ = collection.auction_id;
   TourAwardData call;
   call.auction_id = collection.auction_id;
   call.auctioneer_id = robot_id_;
@@ -505,9 +509,12 @@ void FleetCoordinator::applyAward(const TourAwardData& award, double now_s) {
     claims_.record(bundle.robot_id, std::move(clusters), heard_s);
   }
   // A robot the award does not name (its bid missed the deadline) keeps its
-  // previous bundle.
+  // previous bundle. Only the award of a round this robot bid in answers
+  // its request: in another round it is at most a holder, whose entry is
+  // empty once the clusters it held are explored.
   if (requested_ && request_sent_ &&
-      award.auctioneer_id == request_auctioneer_ &&
+      award.auctioneer_id == request_auctioneer_ && request_round_ &&
+      award.auction_id == *request_round_ &&
       award.bundleOf(robot_id_) != nullptr) {
     answered_ = true;
   }
@@ -516,6 +523,7 @@ void FleetCoordinator::applyAward(const TourAwardData& award, double now_s) {
     answered_ = false;
     request_sent_ = false;
     request_auctioneer_ = -1;
+    request_round_.reset();
   }
   ++assignment_version_;
 }
