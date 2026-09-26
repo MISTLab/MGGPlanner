@@ -85,16 +85,43 @@ inline constexpr double kViewpointArrivalSlack = 0.05;
 /// `slope` is the ground's measured slope at the viewpoint, radians
 /// (terrainSlope, PathTurnCheck::slopeAt). Where it is steeper than
 /// kLevelGroundSlopeRad the robot may not turn (PathTurnCheck), so the end
-/// does not need turnSpaceObserved: on a ramp down past a crest the air
-/// over the ground is carved in patches, and every end on it had a wholly
-/// unknown column in its turning circle (diag-ramp, run 7). A slope that
-/// was not measured (kUnknownSlopeRad, the default) is not exempt.
+/// does not need turnSpaceObserved (slopeExemptsTurnSpace): on a ramp down
+/// past a crest the air over the ground is carved in patches, and every end
+/// on it had a wholly unknown column in its turning circle (diag-ramp, run
+/// 7). A slope that was not measured (kUnknownSlopeRad, the default) is
+/// not exempt. Such an end needs a way back, which only the path to it can
+/// tell: selectBestPath's SlopeEndRetreat.
 bool viewpointClear(const MapInterface& map, const RobotParams& robot,
                     const PlanningParams& planning, const StateVec& viewpoint,
                     double slope = kUnknownSlopeRad);
 
+/// Whether a ground robot's `slope` at a path end, measured (terrainSlope),
+/// exempts the end from turnSpaceObserved in viewpointClear: steeper than
+/// kLevelGroundSlopeRad, where the robot may not turn, and not
+/// kUnknownSlopeRad.
+inline bool slopeExemptsTurnSpace(double slope) {
+  return slope > kLevelGroundSlopeRad && slope < kUnknownSlopeRad;
+}
+
 /// Whether an exploration path may end at a vertex, e.g. viewpointClear.
 using ViewpointClearFn = std::function<bool(const Vertex&)>;
+
+/// How selectBestPath gives a path end on a slope, admitted by viewpointClear
+/// without its turn space observed, a way back (review r0, P1; controller
+/// ruling): such an end is clear only if the path has, within kDepartureMaxM
+/// of path length back from it, a vertex (the root included) where the robot
+/// has room to turn. The robot, which may not turn on the slope, can back
+/// out to there straight, as a boxed-in robot departs, and goes down a ramp
+/// in steps of at most kDepartureMaxM, the lidar of each observing the turn
+/// space the next needs. Both are needed, or no end needs a way back.
+struct SlopeEndRetreat {
+  /// Whether viewpoint_clear admits the vertex only because it stands on a
+  /// slope (slopeExemptsTurnSpace, and not turnSpaceObserved).
+  std::function<bool(const Vertex&)> admitted_on_slope;
+  /// Whether the robot has room to turn in place at a vertex, e.g.
+  /// roomToTurn.
+  std::function<bool(const Vertex&)> room_to_turn;
+};
 
 /// Ends `route` at its last pose that passes `clear`, dropping the poses
 /// after it; the first pose, where the robot stands, is never asked. Returns
@@ -124,6 +151,10 @@ struct PathSelectionResult {
   /// path to the last vertex that passes, and those with none past the root.
   int paths_pulled_back = 0;
   int paths_without_clear_viewpoint = 0;
+  /// Path ends viewpoint_clear admitted on a slope but refused for having
+  /// no room to turn within kDepartureMaxM back along the path
+  /// (SlopeEndRetreat), counted once per candidate end.
+  int slope_ends_without_way_back = 0;
   /// No admissible path ended clear, so the best path was chosen without
   /// the clearance check.
   bool unclear_viewpoint = false;
@@ -173,7 +204,9 @@ constexpr int kMaxDetourSearchStates = 100000;
 /// pulled back is checked where it now ends.
 ///
 /// With `viewpoint_clear`, a path whose leaf fails it ends at the last vertex
-/// along it that passes, and is scored up to there. The best path ending
+/// along it that passes, and is scored up to there. With
+/// `slope_end_retreat`, an end it admits only on a slope must also have a
+/// way back along the path (SlopeEndRetreat). The best path ending
 /// clear wins; only when there is none is the best path chosen without the
 /// check, flagged unclear_viewpoint, so that clearance never stops
 /// exploration where it would have gone on. A clear end within
@@ -207,7 +240,9 @@ PathSelectionResult selectBestPath(GraphManager& graph,
                                        nullptr,
                                    const SharpTurnAllowedFn&
                                        sharp_turn_allowed = nullptr,
-                                   double goal_reach = 0.0);
+                                   double goal_reach = 0.0,
+                                   const SlopeEndRetreat& slope_end_retreat =
+                                       {});
 
 }  // namespace mgg
 

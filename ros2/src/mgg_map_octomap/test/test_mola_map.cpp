@@ -2055,9 +2055,13 @@ enum class Trench {
 /// the cells, with free air carved over those cells only. The rest is
 /// unknown. (Ground projection finds each unobserved cell's ground 0.4 m
 /// to its side, at its height.) 3 m either side of y = 0. `trench` cuts
-/// the floor behind the crest.
+/// the floor behind the crest. From `wall_from_x`, a wall 0.4 m thick
+/// crosses the ramp, observed; up to `air_seen_to_x`, the air over the
+/// ramp's unobserved cells is observed free, their ground still not.
 std::unique_ptr<mgg::NativeMolaGrid> sparseRampCrest(
-    Trench trench = Trench::kNone) {
+    Trench trench = Trench::kNone,
+    double wall_from_x = std::numeric_limits<double>::infinity(),
+    double air_seen_to_x = -std::numeric_limits<double>::infinity()) {
   constexpr double kResolution = 0.2;
   const double grade = std::tan(16.0 * M_PI / 180.0);
   std::vector<mgg::NativeMolaGrid::Cell> occupied;
@@ -2081,7 +2085,20 @@ std::unique_ptr<mgg::NativeMolaGrid> sparseRampCrest(
         if (trench == Trench::kSeenDeepInto) free.push_back({ix, iy, -8});
         continue;
       }
-      if (!observed) continue;
+      if (x >= wall_from_x && x < wall_from_x + 0.4) {
+        for (std::int64_t iz = cell(ground - 1e-6); iz < cell(ground + 2.0);
+             ++iz) {
+          occupied.push_back({ix, iy, iz});
+        }
+        continue;
+      }
+      if (!observed) {
+        for (std::int64_t iz = cell(ground - 1e-6) + 1;
+             x <= air_seen_to_x && iz < cell(ground + 2.0); ++iz) {
+          free.push_back({ix, iy, iz});
+        }
+        continue;
+      }
       const mgg::NativeMolaGrid::Cell top{ix, iy, cell(ground - 1e-6)};
       occupied.push_back(top);
       surfaces.push_back({top, ground});
@@ -2092,6 +2109,103 @@ std::unique_ptr<mgg::NativeMolaGrid> sparseRampCrest(
   }
   return std::make_unique<mgg::NativeMolaGrid>(kResolution, occupied, free,
                                                surfaces);
+}
+
+/// The planner node's local plan for a Bunker on `map` from `start`, at
+/// driving height, facing `yaw`, as buildLocalGraph makes it: the lattice,
+/// PathTurnCheck, viewpointClear with the slope the lattice measures and
+/// SlopeEndRetreat. Each vertex scores by how far it lies below
+/// `crest_height` (a driving height).
+struct SparseCrestPlan {
+  mgg::PlanningParams planning;
+  mgg::GraphManager graph;
+  mgg::EdgeInclinations inclinations;
+  std::unique_ptr<mgg::PathTurnCheck> turns;
+  mgg::PathSelectionResult selection;
+  /// Vertices more than 0.25 m below the crest.
+  int down_the_ramp = 0;
+};
+
+std::unique_ptr<SparseCrestPlan> planOnSparseCrest(
+    const mgg::NativeMolaGrid& map, const mgg::RobotParams& robot,
+    const mgg::PlanningParams& planning, const Eigen::Vector3d& start,
+    double yaw, double crest_height) {
+  auto plan = std::make_unique<SparseCrestPlan>();
+  mgg::PlanningParams& q = plan->planning;
+  q = planning;
+  q.edge_length_min = 0.05;
+  q.edge_length_max = 2.0;
+  q.nearest_range = 0.6;
+  q.nearest_range_z = 0.15;
+  q.nearest_range_min = 0.05;
+  q.nearest_range_max = 1.0;
+  q.num_vertices_max = 1500;
+  q.num_edges_max = 50000;
+  const mgg::GroundProjection ground(map, q, true);
+  plan->graph.addVertex(
+      new mgg::Vertex(0, mgg::StateVec(start.x(), start.y(), start.z(), yaw)));
+  mgg::ExpandContext context;
+  context.map = &map;
+  context.planning = &q;
+  context.robot = &robot;
+  context.ground = &ground;
+  context.inclinations = &plan->inclinations;
+  context.robot_box_size = robot.getPlanningSize();
+  context.allow_unknown_lattice_body = true;
+  context.root_footprint_exempt = true;
+  context.root_is_robot = true;
+  mgg::GridGraphParams grid;
+  grid.min_val = {-3.0, -3.0, 0.0};
+  grid.max_val = {6.0, 3.0, 0.0};
+  grid.resolution = {0.4, 0.4, 0.1};
+  mgg::buildGridGraph(plan->graph, plan->graph.getVertex(0)->state, grid,
+                      context, yaw);
+  for (auto& [id, vertex] : plan->graph.vertices_map_) {
+    if (vertex == nullptr) continue;
+    const double drop = crest_height - vertex->state.z();
+    vertex->vol_gain.gain = 1.0 + 1000.0 * std::max(0.0, drop);
+    if (drop > 0.25) ++plan->down_the_ramp;
+  }
+  const mgg::MapInterface& m = map;
+  plan->turns = std::make_unique<mgg::PathTurnCheck>(
+      plan->graph, robot, [&m, &robot, &q](const mgg::StateVec& pose) {
+        return mgg::roomToTurn(m, robot, q, pose);
+      });
+  mgg::PathTurnCheck& turns = *plan->turns;
+  mgg::SlopeEndRetreat retreat;
+  retreat.admitted_on_slope = [&](const mgg::Vertex& v) {
+    return mgg::slopeExemptsTurnSpace(turns.slopeAt(v.state.head<3>())) &&
+           !mgg::turnSpaceObserved(map, robot, q, v.state);
+  };
+  retreat.room_to_turn = [&](const mgg::Vertex& v) {
+    return mgg::roomToTurn(map, robot, q, v.state);
+  };
+  plan->selection = mgg::selectBestPath(
+      plan->graph, q, robot, plan->inclinations, map.getResolution(), yaw, {},
+      0.0,
+      [&](const mgg::Vertex& v) {
+        return mgg::viewpointClear(map, robot, q, v.state,
+                                   turns.slopeAt(v.state.head<3>()));
+      },
+      std::ref(turns),
+      [&](const mgg::Vertex& v) {
+        return turns.sharpTurnAllowedAt(v.state.head<3>());
+      },
+      0.3, retreat);
+  return plan;
+}
+
+/// Path length back from the end of `path` to its last vertex with room
+/// to turn; infinity with none.
+double wayBackAlong(const mgg::MapInterface& map, const mgg::RobotParams& robot,
+                    const mgg::PlanningParams& planning,
+                    const std::vector<mgg::Vertex*>& path) {
+  double back = 0.0;
+  for (std::size_t i = path.size(); i-- > 0;) {
+    if (mgg::roomToTurn(map, robot, planning, path[i]->state)) return back;
+    if (i > 0) back += (path[i]->state - path[i - 1]->state).head<3>().norm();
+  }
+  return std::numeric_limits<double>::infinity();
 }
 
 TEST(ObservedGround, ADownRampSeenInRingsPastACrestIsDriven) {
@@ -2140,70 +2254,111 @@ TEST(ObservedGround, ADownRampSeenInRingsPastACrestIsDriven) {
   EXPECT_FALSE(mgg::viewpointClear(*map, robot, planning, end_state, 0.0));
 
   // The node's local plan from the level floor 0.5 m before the crest,
-  // facing it, scored by depth: it ends down the ramp. The lattice's
+  // facing it, scored by depth: it ends down the ramp, within
+  // kDepartureMaxM of room to turn back along its path. The lattice's
   // points lie on cell centres.
   const Eigen::Vector3d start = driving(-0.5);
-  const double yaw = 0.0;
-  mgg::GraphManager graph;
-  graph.addVertex(
-      new mgg::Vertex(0, mgg::StateVec(start.x(), start.y(), start.z(), yaw)));
-  mgg::EdgeInclinations inclinations;
-  planning.edge_length_min = 0.05;
-  planning.edge_length_max = 2.0;
-  planning.nearest_range = 0.6;
-  planning.nearest_range_z = 0.15;
-  planning.nearest_range_min = 0.05;
-  planning.nearest_range_max = 1.0;
-  planning.num_vertices_max = 1500;
-  planning.num_edges_max = 50000;
-  mgg::ExpandContext context;
-  context.map = map.get();
-  context.planning = &planning;
-  context.robot = &robot;
-  context.ground = &ground;
-  context.inclinations = &inclinations;
-  context.robot_box_size = box;
-  context.allow_unknown_lattice_body = true;
-  context.root_footprint_exempt = true;
-  context.root_is_robot = true;
-  mgg::GridGraphParams grid;
-  grid.min_val = {-2.0, -3.0, 0.0};
-  grid.max_val = {6.0, 3.0, 0.0};
-  grid.resolution = {0.4, 0.4, 0.1};
-  mgg::buildGridGraph(graph, graph.getVertex(0)->state, grid, context, yaw);
-  const double start_floor = start.z() - planning.max_ground_height;
-  int down_the_ramp = 0;
-  for (auto& [id, vertex] : graph.vertices_map_) {
-    if (vertex == nullptr) continue;
-    const double drop =
-        start_floor - (vertex->state.z() - planning.max_ground_height);
-    vertex->vol_gain.gain = 1.0 + 1000.0 * std::max(0.0, drop);
-    if (drop > 0.25) ++down_the_ramp;
-  }
-  ASSERT_GT(down_the_ramp, 0);
-  mgg::PathTurnCheck turns(graph, robot, [&](const mgg::StateVec& pose) {
-    return mgg::roomToTurn(*map, robot, planning, pose);
-  });
-  const mgg::PathSelectionResult selection = mgg::selectBestPath(
-      graph, planning, robot, inclinations, map->getResolution(), yaw, {},
-      0.0,
-      [&](const mgg::Vertex& v) {
-        return mgg::viewpointClear(*map, robot, planning, v.state,
-                                   turns.slopeAt(v.state.head<3>()));
-      },
-      std::ref(turns),
-      [&](const mgg::Vertex& v) {
-        return turns.sharpTurnAllowedAt(v.state.head<3>());
-      });
+  const auto plan = planOnSparseCrest(*map, robot, planning, start, 0.0,
+                                      start.z());
+  const mgg::PathSelectionResult& selection = plan->selection;
   ASSERT_FALSE(selection.best_path.empty());
   const mgg::StateVec& best = selection.best_path.back()->state;
+  const double start_floor = start.z() - planning.max_ground_height;
   std::printf("sparse crest: %d vertices down the ramp, the plan ends at "
-              "(%.2f, %.2f), %.2f m below the crest\n",
-              down_the_ramp, best.x(), best.y(),
-              start_floor - (best.z() - planning.max_ground_height));
+              "(%.2f, %.2f), %.2f m below the crest; %d slope ends without "
+              "a way back\n",
+              plan->down_the_ramp, best.x(), best.y(),
+              start_floor - (best.z() - planning.max_ground_height),
+              selection.slope_ends_without_way_back);
   EXPECT_GT(best.x(), 1.0);
   EXPECT_LT(best.z() - planning.max_ground_height, start_floor - 0.25);
   EXPECT_FALSE(selection.unclear_viewpoint);
+  // The end's slope, measured over the lattice, exempts it; the root's,
+  // on the level floor, does not.
+  EXPECT_TRUE(
+      mgg::slopeExemptsTurnSpace(plan->turns->slopeAt(best.head<3>())));
+  EXPECT_FALSE(mgg::slopeExemptsTurnSpace(
+      plan->turns->slopeAt(selection.best_path.front()->state.head<3>())));
+  EXPECT_FALSE(mgg::turnSpaceObserved(*map, robot, planning, best));
+  EXPECT_LE(wayBackAlong(*map, robot, planning, selection.best_path),
+            mgg::kDepartureMaxM + 1e-9);
+  EXPECT_GT(selection.slope_ends_without_way_back, 0);
+}
+
+TEST(ObservedGround, ASlopeEndBlockedAheadBacksOutOrWaits) {
+  // Review r0 (P1): a path end on the ramp, admitted without its turn space
+  // observed, must leave the robot a way on. The robot arrives where the
+  // first plan down the sparse crest ends, and finds a wall 1 m ahead. The
+  // next cycle, as the node runs it (buildLocalGraph: selection, then the
+  // boxed-in departure where the robot has no room to turn), must not turn
+  // on the slope: a path that turns only where it may, a straight departure
+  // back to room to turn, or no path, which the node answers as
+  // kStatusNoPath, retried (PlannerNodeTest.
+  // ExplorationBoxedInSendsNoPathThatStartsWithATurn), never as exploration
+  // complete.
+  const mgg::RobotParams robot = bunker();
+  const mgg::PlanningParams planning = bunkerPlanning();
+  const Eigen::Vector3d crest(-0.5, 0.1, planning.max_ground_height);
+  const auto first_map = sparseRampCrest();
+  const auto first =
+      planOnSparseCrest(*first_map, robot, planning, crest, 0.0, crest.z());
+  ASSERT_FALSE(first->selection.best_path.empty());
+  const mgg::StateVec arrived = first->selection.best_path.back()->state;
+  ASSERT_GT(arrived.x(), 0.5);
+  const double wall = arrived.x() + 1.0;
+
+  for (const bool air_seen : {false, true}) {
+    // Unseen, the ramp's air stays as the crest saw it; seen, the lidar
+    // carved it down to 0.6 m past the robot on its way down.
+    SCOPED_TRACE(air_seen ? "air seen on the way down" : "air unseen");
+    const auto map = sparseRampCrest(
+        Trench::kNone, wall,
+        air_seen ? arrived.x() + 0.6
+                 : -std::numeric_limits<double>::infinity());
+    const Eigen::Vector3d at = arrived.head<3>();
+    ASSERT_FALSE(mgg::roomToTurn(*map, robot, planning, arrived));
+    const auto plan =
+        planOnSparseCrest(*map, robot, planning, at, 0.0, crest.z());
+    const mgg::PathSelectionResult& selection = plan->selection;
+    const bool goes_nowhere = mgg::pathGoesNowhere(selection, at, 0.3);
+    std::printf("slope end (%.2f, %.2f), %.2f m down, wall at x %.2f, %s: "
+                "%zu poses, fallback %d, nowhere %d, unclear %d\n",
+                at.x(), at.y(), -(at.z() - crest.z()), wall,
+                air_seen ? "air seen" : "air unseen",
+                selection.best_path.size(), int(selection.sharp_turn_fallback),
+                int(goes_nowhere), int(selection.unclear_viewpoint));
+    if (selection.best_path.empty()) continue;  // no path, retried
+    if (!selection.sharp_turn_fallback && !goes_nowhere) {
+      // Sent: it turns only where it may, from the robot's heading on.
+      std::vector<Eigen::Vector3d> points;
+      for (const mgg::Vertex* v : selection.best_path) {
+        points.push_back(v->state.head<3>());
+      }
+      EXPECT_TRUE(plan->turns->admissible(points, 0.0));
+      for (const Eigen::Vector3d& p : points) EXPECT_LT(p.x(), wall);
+      continue;
+    }
+    // Boxed in: a straight departure back, or none and no path. (Here
+    // none: the departure's level body meets the ramp uphill of it.)
+    mgg::Departure departure;
+    const mgg::GroundProjection ground(*map, planning);
+    if (mgg::findDeparture(*map, ground, robot, planning, arrived,
+                           departure)) {
+      std::printf("  departs %.2f m %s, turning %.0f deg\n",
+                  (departure.path.back() - departure.path.front())
+                      .head<2>()
+                      .norm(),
+                  departure.reverse ? "back" : "ahead",
+                  departure.turn * 180.0 / M_PI);
+      EXPECT_TRUE(departure.reverse);
+      EXPECT_EQ(departure.turn, 0.0);
+      EXPECT_TRUE(mgg::roomToTurn(*map, robot, planning,
+                                  departure.path.back()));
+      EXPECT_LT(departure.path.back().x(), arrived.x());
+    } else {
+      std::printf("  no departure: no path\n");
+    }
+  }
 }
 
 TEST(ObservedGround, AHoleTheLidarLookedIntoIsNotBridged) {

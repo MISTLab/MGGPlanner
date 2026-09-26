@@ -1534,10 +1534,25 @@ std::string PlannerNode::buildLocalGraph() {
   turn_check.setRobotTilt(root_state.head<3>(), current_tilt_);
   mgg::PathTurnsFn turns_admissible;
   mgg::SharpTurnAllowedFn sharp_turn_allowed;
+  // A path end on a slope, which needs no observed turn space, needs room
+  // to turn within kDepartureMaxM back along its path (review r0, P1).
+  mgg::SlopeEndRetreat slope_end_retreat;
   if (robot_params_.type == mgg::RobotType::kGroundRobot) {
     turns_admissible = std::ref(turn_check);
     sharp_turn_allowed = [&turn_check](const mgg::Vertex& v) {
       return turn_check.sharpTurnAllowedAt(v.state.head<3>());
+    };
+    slope_end_retreat.admitted_on_slope = [this, &turn_check](
+                                              const mgg::Vertex& v) {
+      return mgg::slopeExemptsTurnSpace(
+                 turn_check.slopeAt(v.state.head<3>())) &&
+             !mgg::turnSpaceObserved(*map_, robot_params_, planning_params_,
+                                     v.state);
+    };
+    slope_end_retreat.room_to_turn = [this,
+                                      standing_on](const mgg::Vertex& v) {
+      return mgg::roomToTurn(*map_, robot_params_, planning_params_, v.state,
+                             standing_on);
     };
   }
   const mgg::PathSelectionResult sel = mgg::selectBestPath(
@@ -1551,7 +1566,8 @@ std::string PlannerNode::buildLocalGraph() {
                                    v.state,
                                    turn_check.slopeAt(v.state.head<3>()));
       },
-      turns_admissible, sharp_turn_allowed, reach_distance_);
+      turns_admissible, sharp_turn_allowed, reach_distance_,
+      slope_end_retreat);
   for (const mgg::Vertex* v : sel.best_path) {
     if (v != nullptr) best_path_.push_back(v->state);
   }

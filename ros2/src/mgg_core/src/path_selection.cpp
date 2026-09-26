@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cmath>
 
+#include "mgg_core/departure.h"
 #include "mgg_core/trajectory.h"
 
 namespace mgg {
@@ -24,9 +25,7 @@ bool viewpointClear(const MapInterface& map, const RobotParams& robot,
   }
   // Where it can turn, as roomToTurn has it: with the space it would turn
   // in observed (item 7). Not on a measured slope, where it may not turn.
-  const bool may_turn =
-      !(slope > kLevelGroundSlopeRad && slope < kUnknownSlopeRad);
-  if (robot.type == RobotType::kGroundRobot && may_turn &&
+  if (robot.type == RobotType::kGroundRobot && !slopeExemptsTurnSpace(slope) &&
       !turnSpaceObserved(map, robot, planning, viewpoint)) {
     return false;
   }
@@ -69,13 +68,44 @@ PathSelectionResult selectBestPath(GraphManager& graph,
                                    const PathTurnsFn& turns_admissible,
                                    const SharpTurnAllowedFn&
                                        sharp_turn_allowed,
-                                   double goal_reach) {
+                                   double goal_reach,
+                                   const SlopeEndRetreat& slope_end_retreat) {
   // Leaves share their paths' inner vertices; check each vertex once.
   std::unordered_map<int, bool> clear_by_id;
   const auto clear = [&](const Vertex* v) {
     const auto found = clear_by_id.find(v->id);
     if (found != clear_by_id.end()) return found->second;
     return clear_by_id[v->id] = viewpoint_clear(*v);
+  };
+  const bool retreat_checked =
+      static_cast<bool>(slope_end_retreat.admitted_on_slope) &&
+      static_cast<bool>(slope_end_retreat.room_to_turn);
+  std::unordered_map<int, bool> on_slope_by_id;
+  std::unordered_map<int, bool> room_by_id;
+  const auto cached = [](std::unordered_map<int, bool>& by_id,
+                         const Vertex* v, const auto& ask) {
+    const auto found = by_id.find(v->id);
+    if (found != by_id.end()) return found->second;
+    return by_id[v->id] = ask(*v);
+  };
+  // Whether path[end], clear, may end the path: an end admitted only on a
+  // slope needs room to turn within kDepartureMaxM back along it.
+  const auto way_back = [&](const std::vector<Vertex*>& path,
+                            const std::vector<double>& along,
+                            std::size_t end, int& refused) {
+    if (!retreat_checked ||
+        !cached(on_slope_by_id, path[end],
+                slope_end_retreat.admitted_on_slope)) {
+      return true;
+    }
+    for (std::size_t i = end; i-- > 0;) {
+      if (along[end] - along[i] > kDepartureMaxM + 1e-9) break;
+      if (cached(room_by_id, path[i], slope_end_retreat.room_to_turn)) {
+        return true;
+      }
+    }
+    ++refused;
+    return false;
   };
 
   ShortestPathsReport rep;
@@ -212,7 +242,12 @@ PathSelectionResult selectBestPath(GraphManager& graph,
 
       // The robot stops where the path ends; the root is where it stands.
       std::size_t end = path.size() - 1;
-      while (end > 0 && !clear(path[end])) --end;
+      while (end > 0 &&
+             !(clear(path[end]) &&
+               way_back(path, candidate.along, end,
+                        result.slope_ends_without_way_back))) {
+        --end;
+      }
       if (end == 0) {
         ++result.paths_without_clear_viewpoint;
         continue;
