@@ -37,8 +37,9 @@ constexpr double kLinkRadius = 1.5;
 // A goal only stands for a vertex it practically coincides with; any farther
 // and it gets its own vertex with checked edges.
 constexpr double kGoalLinkRadius = 0.1;
-/// A robot that has moved less than this from its first odometry has not
-/// left its start (PlannerNode::standingStart).
+/// A robot that has moved less than this from its first odometry, and whose
+/// keyframes all lie within this of its home keyframe, has not left its
+/// start (PlannerNode::standingStart).
 constexpr double kStandingStartMoveM = 0.5;
 
 double secondsSince(const std::chrono::steady_clock::time_point& then) {
@@ -283,8 +284,8 @@ PlannerNode::PlannerNode(const rclcpp::NodeOptions& options)
   // the physical driving height (base height above the assumed floor) as a
   // hanging vertex, and one edge from it may reach up to this far to the
   // first supported vertex; every other check on that edge still applies.
-  // Until the robot first moves, the ground within this reach of it counts
-  // as observed (standingStart()).
+  // Until the robot first moves, as its keyframe trajectory shows, the
+  // ground within this reach of it counts as observed (standingStart()).
   hanging_root_edge_length_max_ = std::max(
       0.0, declareOrGet<double>(this, "hanging_root_edge_length_max",
                                 hanging_root_edge_length_max_));
@@ -536,18 +537,47 @@ mgg::StateVec PlannerNode::physicalAnchorAtDrivingHeight(
   return anchor;
 }
 
-std::optional<mgg::StandingStart> PlannerNode::standingStart() const {
-  std::optional<mgg::StandingStart> standing;
-  const mgg::Vertex* home = findGlobalVertex(0);
-  if (robot_params_.type == mgg::RobotType::kGroundRobot &&
-      standing_start_xy_ && hanging_root_edge_length_max_ > 0.0 &&
-      home != nullptr &&
-      (home->state.head<2>() - current_state_.head<2>()).norm() <
-          kStandingStartMoveM) {
-    standing = mgg::StandingStart{current_state_.head<2>(),
-                                  hanging_root_edge_length_max_};
+std::optional<mgg::StandingStart> PlannerNode::standingStart() {
+  if (robot_params_.type != mgg::RobotType::kGroundRobot ||
+      !standing_start_xy_ || !(hanging_root_edge_length_max_ > 0.0) ||
+      keyframe_source_ == nullptr || !have_mapping_snapshot_) {
+    return std::nullopt;
   }
-  return standing;
+  KeyframeTrajectory trajectory;
+  std::string error;
+  if (!keyframe_source_->read(trajectory, error) || trajectory.poses.empty() ||
+      trajectory.component_id != mapping_snapshot_.component_id ||
+      trajectory.epoch != mapping_snapshot_.epoch) {
+    return std::nullopt;
+  }
+  const Eigen::Isometry3d navigation_from_component = navigationFromComponent();
+  const Eigen::Vector2d home =
+      (navigation_from_component * trajectory.poses.front().translation())
+          .head<2>();
+  for (const Eigen::Isometry3d& pose : trajectory.poses) {
+    if (((navigation_from_component * pose.translation()).head<2>() - home)
+            .norm() >= kStandingStartMoveM) {
+      // The robot has left its start, whatever odometry says since.
+      standing_start_xy_.reset();
+      left_standing_start_ = true;
+      return std::nullopt;
+    }
+  }
+  if ((current_state_.head<2>() - home).norm() >= kStandingStartMoveM) {
+    return std::nullopt;
+  }
+  return mgg::StandingStart{current_state_.head<2>(),
+                            hanging_root_edge_length_max_};
+}
+
+Eigen::Isometry3d PlannerNode::navigationFromComponent() const {
+  const auto& t = mapping_snapshot_.component_from_navigation.translation;
+  const auto& q = mapping_snapshot_.component_from_navigation.rotation;
+  Eigen::Isometry3d component_from_navigation = Eigen::Isometry3d::Identity();
+  component_from_navigation.linear() =
+      Eigen::Quaterniond(q.w, q.x, q.y, q.z).normalized().toRotationMatrix();
+  component_from_navigation.translation() = Eigen::Vector3d(t.x, t.y, t.z);
+  return component_from_navigation.inverse();
 }
 
 std::vector<Eigen::Vector3d> PlannerNode::selectionExclusions() {
@@ -1034,14 +1064,7 @@ bool PlannerNode::rebuildGlobalGraphFromKeyframes(
 
   // T_navigation_keyframe = T_component_navigation^-1 T_component_keyframe,
   // the same transform that places the map in the planning frame.
-  const auto& t = mapping_snapshot_.component_from_navigation.translation;
-  const auto& q = mapping_snapshot_.component_from_navigation.rotation;
-  Eigen::Isometry3d component_from_navigation = Eigen::Isometry3d::Identity();
-  component_from_navigation.linear() =
-      Eigen::Quaterniond(q.w, q.x, q.y, q.z).normalized().toRotationMatrix();
-  component_from_navigation.translation() = Eigen::Vector3d(t.x, t.y, t.z);
-  const Eigen::Isometry3d navigation_from_component =
-      component_from_navigation.inverse();
+  const Eigen::Isometry3d navigation_from_component = navigationFromComponent();
   // Roll and pitch are kept: where the robot tipped, the map may show
   // nothing to tip on.
   std::vector<mgg::TrajectoryKeyframe> keyframes;

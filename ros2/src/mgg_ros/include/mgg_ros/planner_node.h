@@ -249,14 +249,23 @@ class PlannerNode : public rclcpp::Node {
   /// A ground robot's state at driving height above the floor its base
   /// stands on, for where the map shows no ground yet.
   mgg::StateVec physicalAnchorAtDrivingHeight(const mgg::StateVec& base_pose) const;
-  /// A ground robot that has not moved kStandingStartMoveM since its first
-  /// odometry, and stands within that of home (the global graph's vertex
-  /// 0, the home keyframe once the graph was rebuilt, so a planner
-  /// restarted mid-run does not count), stands at its start: the disk of
-  /// hanging_root_edge_length_max round where it stands counts as observed
+  /// A ground robot stands at its start when it has not moved
+  /// kStandingStartMoveM since its first odometry and its keyframe
+  /// trajectory, which outlives the planner process, shows it never left:
+  /// the trajectory is for the map in service, none of its keyframes lies
+  /// kStandingStartMoveM or more from its home keyframe, and the robot
+  /// stands within that of home. A planner restarted mid-run, whose first
+  /// odometry is wherever the robot then is, so does not count it as
+  /// standing at its start (review r0, I-1). Then the disk of
+  /// hanging_root_edge_length_max round where it stood counts as observed
   /// ground (mgg::StandingStart) for its lattice, turns and departures.
-  /// nullopt otherwise, and without a hanging_root_edge_length_max.
-  std::optional<mgg::StandingStart> standingStart() const;
+  /// nullopt otherwise: without a keyframe trajectory source (the rebuild
+  /// turned off, or a backend without keyframes), without a trajectory to
+  /// read, and without a hanging_root_edge_length_max. Once the trajectory
+  /// shows the robot left, it never stands at its start again.
+  std::optional<mgg::StandingStart> standingStart();
+  /// T_navigation_component of the map in service (mapping_snapshot_).
+  Eigen::Isometry3d navigationFromComponent() const;
   /// Dijkstra through a fresh local lattice from the robot to a goal inside
   /// the lattice box, the goal linked in with checked edges; under the turn
   /// rule as routeOverGlobalGraph.

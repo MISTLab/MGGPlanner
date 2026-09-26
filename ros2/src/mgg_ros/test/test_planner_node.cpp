@@ -9,6 +9,7 @@
 #include <cstdint>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <thread>
 #include <vector>
@@ -184,6 +185,29 @@ class PlannerNodeTestPeer {
       }
     }
     return edges;
+  }
+  /// Space this robot has seen empty: a box of `size` centred on `center`.
+  static void observeFreeBox(PlannerNode& node, const Eigen::Vector3d& center,
+                             const Eigen::Vector3d& size) {
+    const std::lock_guard<std::recursive_mutex> lock(node.planner_mutex_);
+    node.cloud_map_->augmentFreeBox(center, size);
+    ++node.map_revision_;
+  }
+  static std::optional<mgg::StandingStart> standingStart(PlannerNode& node) {
+    const std::lock_guard<std::recursive_mutex> lock(node.planner_mutex_);
+    return node.standingStart();
+  }
+  /// An edge's status as the node's lattice checks it, with its standing
+  /// start.
+  static mgg::ProjectedEdgeStatus edgeStatus(PlannerNode& node,
+                                             const Eigen::Vector3d& from,
+                                             const Eigen::Vector3d& to) {
+    const std::lock_guard<std::recursive_mutex> lock(node.planner_mutex_);
+    mgg::GroundProjection ground(*node.map_, node.planning_params_);
+    ground.setStandingStart(node.standingStart());
+    std::vector<Eigen::Vector3d> path;
+    return ground.getProjectedEdgeStatus(
+        from, to, node.robot_params_.getPlanningSize(), false, path, false);
   }
   static void setHangingRootReach(PlannerNode& node, double reach) {
     node.hanging_root_edge_length_max_ = reach;
@@ -820,54 +844,6 @@ TEST_F(PlannerNodeTest, BlindStartPlansFromThePhysicalAnchor) {
   response = std::make_shared<mgg_msgs::srv::PlannerSrv::Response>();
   PlannerNodeTestPeer::plan(*strict, response);
   EXPECT_EQ(response->status, PlannerNode::kStatusNoPath);
-}
-
-TEST_F(PlannerNodeTest, AStandingStartInItsLidarsBlindDiskIsNotBoxedIn) {
-  // Run 6: robot_3 stood where it was placed for the whole run, robot_1
-  // for 18 minutes. Their lidars never saw the ground within about 2 m of
-  // them, and a wall (for robot_3, a peer's shadow) stood ahead: every way
-  // out turned where they stood, over ground not observed, so each was
-  // boxed in with no departure. Here the floor is observed from 0.6 m out,
-  // and a wall 0.8 m ahead of the robot, which faces +y. Standing at its
-  // start, it has room to turn and gets a path, on this side of the wall.
-  const auto scene = [](const std::string& name) {
-    auto node = makeNode(name);
-    PlannerNodeTestPeer::observeRaisedRing(*node, 0.6, 3.5, 0.0);
-    PlannerNodeTestPeer::observeWall(*node, -1.0, 1.0, 0.8);
-    PlannerNodeTestPeer::setHangingRootReach(*node, 1.2);
-    return node;
-  };
-  const auto facing_north = [](double x, int stamp) {
-    auto msg = std::make_shared<nav_msgs::msg::Odometry>();
-    msg->header.stamp.sec = stamp;
-    msg->pose.pose.position.x = x;
-    msg->pose.pose.position.z = 0.075;
-    msg->pose.pose.orientation.z = std::sin(M_PI / 4.0);
-    msg->pose.pose.orientation.w = std::cos(M_PI / 4.0);
-    return msg;
-  };
-
-  auto standing = scene("standing_start");
-  PlannerNodeTestPeer::acceptOdometry(*standing, facing_north(0.0, 1));
-  auto response = std::make_shared<mgg_msgs::srv::PlannerSrv::Response>();
-  PlannerNodeTestPeer::plan(*standing, response);
-  EXPECT_EQ(response->status, mgg_msgs::srv::PlannerSrv::Response::FORWARD);
-  ASSERT_GE(response->path.size(), 2u);
-  const geometry_msgs::msg::Point& end = response->path.back().position;
-  EXPECT_GE(std::hypot(end.x, end.y), 0.4) << end.x << ", " << end.y;
-  EXPECT_LT(end.y, 0.8);
-  EXPECT_EQ(PlannerNodeTestPeer::boxedInWithoutDeparture(*standing), 0);
-
-  // The same place, reached from 0.6 m west: the robot has left its start,
-  // and the ground it never saw is unobserved. Boxed in, with no way out.
-  auto moved = scene("moved_from_start");
-  PlannerNodeTestPeer::acceptOdometry(*moved, facing_north(-0.6, 1));
-  PlannerNodeTestPeer::acceptOdometry(*moved, facing_north(0.0, 2));
-  response = std::make_shared<mgg_msgs::srv::PlannerSrv::Response>();
-  PlannerNodeTestPeer::plan(*moved, response);
-  EXPECT_TRUE(response->path.empty())
-      << "path of " << response->path.size() << " poses";
-  EXPECT_EQ(PlannerNodeTestPeer::boxedInWithoutDeparture(*moved), 1);
 }
 
 namespace {
@@ -1643,6 +1619,120 @@ std::shared_ptr<mgg_msgs::srv::PlanObjective::Response> returnHome(
   auto response = std::make_shared<mgg_msgs::srv::PlanObjective::Response>();
   PlannerNodeTestPeer::objective(node, request, response);
   return response;
+}
+
+TEST_F(PlannerNodeTest, AStandingStartInItsLidarsBlindDiskIsNotBoxedIn) {
+  // Run 6: robot_3 stood where it was placed for the whole run, robot_1
+  // for 18 minutes. Their lidars never saw the ground within about 2 m of
+  // them, and a wall (for robot_3, a peer's shadow) stood ahead: every way
+  // out turned where they stood, over ground not observed, so each was
+  // boxed in with no departure. Here the floor is observed from 0.6 m out,
+  // and a wall 0.8 m ahead of the robot, which faces +y. Standing at its
+  // start, as its keyframes show, it has room to turn and gets a path, on
+  // this side of the wall.
+  const auto scene = [](const std::string& name,
+                        const KeyframeTrajectory& keyframes) {
+    auto node = makeNode(name);
+    PlannerNodeTestPeer::observeRaisedRing(*node, 0.6, 3.5, 0.0);
+    PlannerNodeTestPeer::observeWall(*node, -1.0, 1.0, 0.8);
+    PlannerNodeTestPeer::setHangingRootReach(*node, 1.2);
+    PlannerNodeTestPeer::serveMap(*node, "component:test", 0);
+    auto source = std::make_unique<TrajectoryInMemory>();
+    source->trajectory = keyframes;
+    PlannerNodeTestPeer::setKeyframeSource(*node, std::move(source));
+    return node;
+  };
+  const auto facing_north = [](double x, int stamp) {
+    auto msg = std::make_shared<nav_msgs::msg::Odometry>();
+    msg->header.stamp.sec = stamp;
+    msg->pose.pose.position.x = x;
+    msg->pose.pose.position.z = 0.075;
+    msg->pose.pose.orientation.z = std::sin(M_PI / 4.0);
+    msg->pose.pose.orientation.w = std::cos(M_PI / 4.0);
+    return msg;
+  };
+
+  auto standing = scene("standing_start", keyframesAlong({{0.0, 0.0}}));
+  PlannerNodeTestPeer::acceptOdometry(*standing, facing_north(0.0, 1));
+  auto response = std::make_shared<mgg_msgs::srv::PlannerSrv::Response>();
+  PlannerNodeTestPeer::plan(*standing, response);
+  EXPECT_EQ(response->status, mgg_msgs::srv::PlannerSrv::Response::FORWARD);
+  ASSERT_GE(response->path.size(), 2u);
+  const geometry_msgs::msg::Point& end = response->path.back().position;
+  EXPECT_GE(std::hypot(end.x, end.y), 0.4) << end.x << ", " << end.y;
+  EXPECT_LT(end.y, 0.8);
+  EXPECT_EQ(PlannerNodeTestPeer::boxedInWithoutDeparture(*standing), 0);
+
+  // The same place, reached from 0.6 m west: the robot has left its start,
+  // and the ground it never saw is unobserved. Boxed in, with no way out.
+  auto moved =
+      scene("moved_from_start", keyframesAlong({{-0.6, 0.0}, {0.0, 0.0}}));
+  PlannerNodeTestPeer::acceptOdometry(*moved, facing_north(-0.6, 1));
+  PlannerNodeTestPeer::acceptOdometry(*moved, facing_north(0.0, 2));
+  response = std::make_shared<mgg_msgs::srv::PlannerSrv::Response>();
+  PlannerNodeTestPeer::plan(*moved, response);
+  EXPECT_TRUE(response->path.empty())
+      << "path of " << response->path.size() << " poses";
+  EXPECT_EQ(PlannerNodeTestPeer::boxedInWithoutDeparture(*moved), 1);
+}
+
+TEST_F(PlannerNodeTest, APlannerRestartedBesideAnUnobservedDropIsNotAtItsStart) {
+  // Review r0, I-1: a planner restarted mid-run takes its first odometry
+  // wherever the robot then is, here 0.3 m from a drop whose bottom it
+  // never saw (robot_0's run-5 ledge). The edge 0.2 m on to the ledge ends
+  // on the floor, with the drop under the leading half of the 0.6 m body.
+  // Without keyframes that show the robot never left its start (the
+  // rebuild turned off, so no trajectory source; or a trajectory that left
+  // home), no disk counts as observed ground, and the edge stays
+  // unobserved. Only keyframes all at the robot's start exempt it.
+  const auto scene = [](const std::string& name,
+                        std::vector<rclcpp::Parameter> extra = {}) {
+    auto node = makeNode(name, "world", std::move(extra));
+    PlannerNodeTestPeer::setRobotFootprint(*node, 0.6, 0.2);
+    PlannerNodeTestPeer::observeFloor(*node, -2.0, 0.3, -1.0, 1.0);
+    // The drop: open space down to 0.5 m below the floor, nothing seen
+    // under it.
+    PlannerNodeTestPeer::observeFreeBox(*node, Eigen::Vector3d(1.0, 0.0, 0.1),
+                                        Eigen::Vector3d(1.4, 2.0, 1.2));
+    PlannerNodeTestPeer::setHangingRootReach(*node, 2.0);
+    return node;
+  };
+  const auto onto_the_drop = [](PlannerNode& node) {
+    return PlannerNodeTestPeer::edgeStatus(
+        node, PlannerNodeTestPeer::drivingState(node, 0.0, 0.0, 0.0).head<3>(),
+        PlannerNodeTestPeer::drivingState(node, 0.2, 0.0, 0.0).head<3>());
+  };
+  const auto with_keyframes = [](PlannerNode& node,
+                                 const KeyframeTrajectory& keyframes) {
+    PlannerNodeTestPeer::serveMap(node, "component:test", 0);
+    auto source = std::make_unique<TrajectoryInMemory>();
+    source->trajectory = keyframes;
+    PlannerNodeTestPeer::setKeyframeSource(node, std::move(source));
+  };
+
+  auto no_rebuild = scene("restart_no_rebuild",
+                          {rclcpp::Parameter("roadmap_rebuild.enable", false)});
+  PlannerNodeTestPeer::acceptOdometry(*no_rebuild, 0.0, 0.0, 1.0);
+  EXPECT_FALSE(PlannerNodeTestPeer::standingStart(*no_rebuild).has_value());
+  EXPECT_EQ(onto_the_drop(*no_rebuild),
+            mgg::ProjectedEdgeStatus::kGroundUnobserved);
+
+  // Keyframes from home 1.5 m back to here: the robot left its start.
+  auto left_home = scene("restart_left_home");
+  with_keyframes(*left_home, keyframesAlong({{-1.5, 0.0}, {0.0, 0.0}}));
+  PlannerNodeTestPeer::acceptOdometry(*left_home, 0.0, 0.0, 1.0);
+  EXPECT_FALSE(PlannerNodeTestPeer::standingStart(*left_home).has_value());
+  EXPECT_EQ(onto_the_drop(*left_home),
+            mgg::ProjectedEdgeStatus::kGroundUnobserved);
+
+  // Every keyframe here: the robot never left its start, and its disk
+  // counts as observed ground.
+  auto at_start = scene("restart_at_start");
+  with_keyframes(*at_start, keyframesAlong({{0.0, 0.0}}));
+  PlannerNodeTestPeer::acceptOdometry(*at_start, 0.0, 0.0, 1.0);
+  ASSERT_TRUE(PlannerNodeTestPeer::standingStart(*at_start).has_value());
+  EXPECT_NE(onto_the_drop(*at_start),
+            mgg::ProjectedEdgeStatus::kGroundUnobserved);
 }
 
 TEST_F(PlannerNodeTest, AGraphHoldingOnlyItsSeedIsRebuiltFromTheKeyframes) {
