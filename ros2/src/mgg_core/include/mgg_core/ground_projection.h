@@ -70,7 +70,9 @@ inline constexpr double kMaxGoalGroundRise = 6.0;
 inline constexpr int kGroundBridgeCells = 3;
 
 /// How far below the ground bridged over a cell, metres, a free voxel in
-/// its column shows a hole the lidar looked into, which is not bridged.
+/// its column shows a hole the lidar looked into, which is not bridged. The
+/// column is looked at from there down as far as ground projection looks
+/// (GroundProjection::max_projection_length).
 inline constexpr double kGroundBridgeHoleDepth = 0.3;
 
 /// The collision check of the body moved straight between two points at
@@ -248,7 +250,8 @@ class GroundProjection {
   /// observed ground (the window reaching a cell's rise at max_inclination
   /// further down) whose two heights differ by no more than max_inclination
   /// over their distance, and no free voxel in the cell's column more than
-  /// kGroundBridgeHoleDepth under the ground interpolated between them. The
+  /// kGroundBridgeHoleDepth under the ground interpolated between them, down
+  /// to max_projection_length under it. The
   /// lidar sees a ramp down past a crest only in patches (diag-ramp, run
   /// 7: 84 % of its cells 0-1 m down, 17 % 4-5 m down), and the crest read
   /// as a ledge. A drop has no observed ground on its far side at a
@@ -298,6 +301,14 @@ class GroundProjection {
       return hash;
     }
   };
+  /// The free voxels of a map cell's column between two heights: the
+  /// heights at which the column was sampled, once per voxel, and found
+  /// free.
+  struct FreeInColumn {
+    double top = 0.0;
+    double bottom = 0.0;
+    std::vector<double> free_z;
+  };
   /// One ground ray cast down a map cell's column.
   struct GroundFromHeight {
     double from_z = 0.0;  ///< where the ray started
@@ -315,6 +326,11 @@ class GroundProjection {
   bool groundBridged(BridgeCells& cells, const Eigen::Vector2d& cell,
                      const Eigen::Vector2d& along, double from_z,
                      double lowest) const;
+  /// Whether the map has a free voxel in the column of `cell` from `top`
+  /// down to `top` - `depth` (to within a voxel), through the cache when
+  /// there is one.
+  bool freeInColumn(const Eigen::Vector2d& cell, double top,
+                    double depth) const;
   FootprintPlane measureFootprintPlane(const Eigen::Vector3d& point,
                                        const Eigen::Vector2d& heading,
                                        const Eigen::Vector3d& box_size) const;
@@ -326,6 +342,8 @@ class GroundProjection {
   mutable std::unordered_map<ColumnKey, std::vector<GroundFromHeight>,
                              CacheKeyHash>
       ground_below_column_;
+  mutable std::unordered_map<ColumnKey, FreeInColumn, CacheKeyHash>
+      free_in_column_;
   mutable std::unordered_map<PlaneKey, FootprintPlane, CacheKeyHash>
       footprint_planes_;
 };

@@ -464,15 +464,9 @@ bool GroundProjection::groundBridged(BridgeCells& cells,
     if (std::abs(rise) > (to_ahead + to_behind) * grade + 1e-9) continue;
     const double bridged = behind.z + rise * to_behind / (to_ahead + to_behind);
     // A free voxel in the column deeper than kGroundBridgeHoleDepth under
-    // the bridged ground, looked for over four voxels, is a hole the lidar
-    // looked into.
-    bool hole = false;
-    for (int j = 0; j < 4 && !hole; ++j) {
-      const double z =
-          bridged - kGroundBridgeHoleDepth - (j + 0.5) * resolution;
-      hole = map_.getVoxelStatus(Eigen::Vector3d(cell.x(), cell.y(), z)) ==
-             VoxelStatus::kFree;
-    }
+    // the bridged ground is a hole the lidar looked into, however deep.
+    const bool hole = freeInColumn(cell, bridged - kGroundBridgeHoleDepth,
+                                   max_projection_length);
     if (!hole) return true;
   }
   return false;
@@ -615,6 +609,41 @@ bool GroundProjection::footprintGroundBelow(const Eigen::Vector3d& point,
   column.push_back(cast);
   ground = cast.ground;
   return cast.found;
+}
+
+bool GroundProjection::freeInColumn(const Eigen::Vector2d& cell, double top,
+                                    double depth) const {
+  const double resolution = map_.getResolution();
+  if (!(resolution > 0.0) || !(depth > 0.0) || !std::isfinite(top)) {
+    return false;
+  }
+  const auto sample = [&](double from, double to, std::vector<double>& free) {
+    for (double z = from - 0.5 * resolution; z >= to; z -= resolution) {
+      if (map_.getVoxelStatus(Eigen::Vector3d(cell.x(), cell.y(), z)) ==
+          VoxelStatus::kFree) {
+        free.push_back(z);
+      }
+    }
+  };
+  const double bottom = top - depth;
+  if (!cache_footprint_ground_) {
+    std::vector<double> free;
+    sample(top, bottom, free);
+    return !free.empty();
+  }
+  // A column is asked about again from nearly the same height, for each
+  // footprint and neighbour that bridges it: sampled once with a metre to
+  // spare either way.
+  FreeInColumn& column =
+      free_in_column_[ColumnKey{micro(cell.x()), micro(cell.y())}];
+  if (!(column.top >= top && column.bottom <= bottom)) {
+    column.top = top + 1.0;
+    column.bottom = bottom - 1.0;
+    column.free_z.clear();
+    sample(column.top, column.bottom, column.free_z);
+  }
+  return std::any_of(column.free_z.begin(), column.free_z.end(),
+                     [&](double z) { return z <= top && z >= bottom; });
 }
 
 FootprintPlane GroundProjection::footprintPlane(
