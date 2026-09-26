@@ -1,6 +1,7 @@
 #include "mgg_core/fleet_coordinator.h"
 
 #include <algorithm>
+#include <chrono>
 #include <utility>
 
 namespace mgg {
@@ -30,9 +31,21 @@ bool isMember(const std::vector<int>& members, int robot_id) {
 
 }  // namespace
 
+std::uint64_t wallClockSeqSeed() {
+  const auto since_epoch = std::chrono::duration_cast<std::chrono::microseconds>(
+      std::chrono::system_clock::now().time_since_epoch());
+  return since_epoch.count() > 0
+             ? static_cast<std::uint64_t>(since_epoch.count())
+             : 0;
+}
+
 FleetCoordinator::FleetCoordinator(int robot_id, const FleetParams& params,
-                                   double commit_margin)
-    : robot_id_(robot_id), params_(params), commit_margin_(commit_margin) {}
+                                   double commit_margin,
+                                   std::uint64_t seq_seed)
+    : robot_id_(robot_id),
+      params_(params),
+      commit_margin_(commit_margin),
+      seq_(seq_seed) {}
 
 std::vector<int> FleetCoordinator::group(double now_s) const {
   std::vector<int> members{robot_id_};

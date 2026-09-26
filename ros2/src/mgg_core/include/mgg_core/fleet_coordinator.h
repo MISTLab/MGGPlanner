@@ -58,10 +58,20 @@ struct FleetTickOutput {
 /// Clusters peers explored, remembered at most this many (the oldest go).
 inline constexpr std::size_t kMaxExploredElsewhere = 4096;
 
+/// The wall clock in microseconds since the epoch: where a coordinator's
+/// bid seqs start.
+std::uint64_t wallClockSeqSeed();
+
 class FleetCoordinator {
  public:
+  /// Bid seqs continue from `seq_seed`. The default, the wall clock, keeps
+  /// them growing across restarts of this robot, so an award answering a
+  /// previous lifetime's bid (RobotBundle::bid_seq) cannot answer a request
+  /// of this one; only a wall clock set back across a restart breaks that.
+  /// Tests inject a seed.
   FleetCoordinator(int robot_id, const FleetParams& params,
-                   double commit_margin);
+                   double commit_margin,
+                   std::uint64_t seq_seed = wallClockSeqSeed());
 
   /// A peer's bid, in this robot's frame. Malformed bids are dropped. A bid
   /// answering this robot's call is collected only if received before
@@ -219,7 +229,7 @@ class FleetCoordinator {
   double round_heard_s_ = kNever;
 
   // Bidding.
-  std::uint64_t seq_ = 0;
+  std::uint64_t seq_;
   double last_bid_s_ = kNever;
   std::uint64_t called_auction_ = 0;
   // The call to answer, and per auctioneer the stamp of the last call

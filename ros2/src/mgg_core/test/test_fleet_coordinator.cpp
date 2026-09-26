@@ -4,6 +4,7 @@
 // and their release. Time is simulated.
 
 #include <algorithm>
+#include <chrono>
 #include <cstdint>
 #include <limits>
 #include <map>
@@ -1604,4 +1605,74 @@ TEST(FleetCoordinator, AfterAClockRollbackARequestIsSentAgain) {
                 {}),
       7.0);
   EXPECT_TRUE(coordinator.requestAnswered());
+}
+
+// Review r1 R1-I1: a restarted requester must not take an acknowledgement
+// from its previous lifetime for one of its new request. Bid seqs start
+// from the wall clock, so the new lifetime's bids are newer than any bid
+// the old one sent (bid_seq 42 here).
+TEST(FleetCoordinator, ARestartedRequesterIgnoresAnAwardOfItsPreviousLifetime) {
+  FleetCoordinator restarted(2, FleetParams{}, 0.2);
+  restarted.requestAuction();
+  restarted.onAward(makeCall(1, 8, 12.0), 12.0);
+  const mgg::FleetTickOutput answer =
+      restarted.tick(12.0, nullptr, nullptr, nullptr);
+  ASSERT_TRUE(answer.bid);
+  ASSERT_TRUE(answer.bid->request_auction);
+  EXPECT_GT(answer.bid->seq, 42u);
+  // The previous lifetime's award of auction 7, delayed.
+  restarted.onAward(
+      makeAward(1, 7, 11.0, {mgg::RobotBundle{2, {}, 0.0, 42}}, {}), 12.1);
+  EXPECT_FALSE(restarted.requestAnswered());
+  EXPECT_TRUE(restarted.awaitingAuction());
+  restarted.onAward(
+      makeAward(1, 8, 13.0, {mgg::RobotBundle{2, {}, 0.0, answer.bid->seq}},
+                {}),
+      13.0);
+  EXPECT_TRUE(restarted.requestAnswered());
+}
+
+// Production seeds bid seqs with the wall clock in microseconds since the
+// epoch, so they keep growing across restarts.
+TEST(FleetCoordinator, BidSeqsStartFromTheWallClock) {
+  const auto before = static_cast<std::uint64_t>(
+      std::chrono::duration_cast<std::chrono::microseconds>(
+          std::chrono::system_clock::now().time_since_epoch())
+          .count());
+  FleetCoordinator coordinator(2, FleetParams{}, 0.2);
+  const mgg::FleetTickOutput out =
+      coordinator.tick(0.0, nullptr, nullptr, nullptr);
+  ASSERT_TRUE(out.bid);
+  EXPECT_GT(out.bid->seq, before);
+}
+
+// The same with injected seeds: the previous lifetime really sent bid 42 in
+// auction 7; the requester restarts with a later seed.
+TEST(FleetCoordinator, ARequesterRestartedWithALaterSeedIgnoresItsOldAward) {
+  mgg::FleetTickOutput old_bid;
+  {
+    FleetCoordinator previous(2, FleetParams{}, 0.2, /*seq_seed=*/41);
+    previous.onAward(makeCall(1, 7, 10.0), 10.0);
+    old_bid = previous.tick(10.0, nullptr, nullptr, nullptr);
+    ASSERT_TRUE(old_bid.bid);
+    ASSERT_EQ(old_bid.bid->seq, 42u);
+  }
+  FleetCoordinator restarted(2, FleetParams{}, 0.2, /*seq_seed=*/1000);
+  restarted.requestAuction();
+  restarted.onAward(makeCall(1, 8, 12.0), 12.0);
+  const mgg::FleetTickOutput answer =
+      restarted.tick(12.0, nullptr, nullptr, nullptr);
+  ASSERT_TRUE(answer.bid);
+  EXPECT_EQ(answer.bid->seq, 1001u);
+  restarted.onAward(
+      makeAward(1, 7, 11.0,
+                {mgg::RobotBundle{2, {}, 0.0, old_bid.bid->seq}}, {}),
+      12.1);
+  EXPECT_FALSE(restarted.requestAnswered());
+  EXPECT_TRUE(restarted.awaitingAuction());
+  restarted.onAward(
+      makeAward(1, 8, 13.0, {mgg::RobotBundle{2, {}, 0.0, answer.bid->seq}},
+                {}),
+      13.0);
+  EXPECT_TRUE(restarted.requestAnswered());
 }
