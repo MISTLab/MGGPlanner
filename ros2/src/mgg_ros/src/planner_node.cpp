@@ -9,6 +9,7 @@
 #include <geometry_msgs/msg/transform_stamped.hpp>
 #include <random>
 #include <regex>
+#include <unordered_set>
 #include <sensor_msgs/msg/point_cloud2.hpp>
 #include <sensor_msgs/point_cloud2_iterator.hpp>
 #include <tf2/exceptions.hpp>
@@ -572,24 +573,42 @@ std::vector<mgg::FrontierCluster> PlannerNode::globalFrontierClusters() {
   // min_cluster_gain can discard it, even beyond the local re-check radius.
   // Keep positive scores: re-checking every distant peer frontier every
   // cycle is expensive and remains its owner's job (addFrontiers).
-  const auto score = globalFrontierGain();
-  for (const auto& entry : global_graph_->vertices_map_) {
-    mgg::Vertex* vertex = entry.second;
-    if (vertex == nullptr || vertex->type != mgg::VertexType::kFrontier ||
-        vertex->robot_id == static_cast<int>(planning_params_.robot_id) ||
-        !global_graph_->inService(*vertex) || vertex->vol_gain.gain > 0.0) {
-      continue;
+  using Clock = std::chrono::steady_clock;
+  const auto started = Clock::now();
+  std::vector<int> pending;
+  for (const auto& [id, vertex] : global_graph_->vertices_map_) {
+    if (vertex != nullptr && vertex->type == mgg::VertexType::kFrontier &&
+        vertex->robot_id != static_cast<int>(planning_params_.robot_id) &&
+        global_graph_->inService(*vertex) && !(vertex->vol_gain.gain > 0.0)) {
+      pending.push_back(id);
     }
+  }
+  std::sort(pending.begin(), pending.end());
+  const auto next = std::upper_bound(pending.begin(), pending.end(),
+                                    peer_frontier_score_after_id_);
+  const std::size_t start = static_cast<std::size_t>(next - pending.begin());
+  std::unordered_set<int> unscored(pending.begin(), pending.end());
+  const auto score = globalFrontierGain();
+  for (std::size_t i = 0; i < pending.size(); ++i) {
+    const int id = pending[(start + i) % pending.size()];
+    mgg::Vertex* vertex = global_graph_->getVertex(id);
     score(*vertex);
+    unscored.erase(id);
+    peer_frontier_score_after_id_ = id;
     if (!vertex->vol_gain.is_frontier) {
       vertex->type = mgg::VertexType::kUnvisited;
     }
     // Gain/type changes alter the cluster set, not graph topology.
+    // Finish one scan even when it exceeds the budget, then resume by ID
+    // on the next call (iterators/pointers cannot survive a graph merge).
+    if (std::chrono::duration<double>(Clock::now() - started).count() >=
+        kPeerFrontierScoreBudgetS) break;
   }
   global_space_.setCenter(current_state_, /*use_extension=*/true);
   std::vector<mgg::FrontierCluster> clusters = mgg::extractFrontierClusters(
       *global_graph_, fleet_params_.cluster_merge_radius_m,
-      tour_params_.min_cluster_gain, tour_params_.cluster_id_cell_m);
+      tour_params_.min_cluster_gain, tour_params_.cluster_id_cell_m,
+      [&unscored](const mgg::Vertex& v) { return unscored.count(v.id) == 0; });
   cluster_ids_.stabilize(clusters, fleet_params_.cluster_merge_radius_m);
   return clusters;
 }

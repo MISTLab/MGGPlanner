@@ -29,12 +29,13 @@ ClusterId makeClusterId(int robot_id, const Eigen::Vector3d& position,
 std::vector<FrontierCluster> extractFrontierClusters(GraphManager& graph,
                                                      double merge_radius_m,
                                                      double min_cluster_gain,
-                                                     double cluster_id_cell_m) {
+                                                     double cluster_id_cell_m,
+    const std::function<bool(const Vertex&)>& eligible) {
   std::vector<Vertex*> frontiers;
   for (auto& entry : graph.vertices_map_) {
     Vertex* vertex = entry.second;
     if (vertex == nullptr || vertex->type != VertexType::kFrontier ||
-        !graph.inService(*vertex)) {
+        !graph.inService(*vertex) || (eligible && !eligible(*vertex))) {
       continue;
     }
     frontiers.push_back(vertex);

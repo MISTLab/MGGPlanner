@@ -19,6 +19,7 @@
 #define MGG_CORE_FRONTIER_CLUSTERS_H_
 
 #include <cstdint>
+#include <functional>
 #include <vector>
 
 #include <Eigen/Dense>
@@ -53,11 +54,13 @@ struct FrontierCluster {
 /// within `merge_radius_m` of it joins. Ties in gain go to the lower vertex
 /// id. Clusters whose representative gain is below `min_cluster_gain` are
 /// dropped. Returned best gain first, with raw IDs (makeClusterId; a second
-/// representative in the same cell takes the next free ID).
+/// representative in the same cell takes the next free ID). An optional
+/// eligibility predicate excludes vertices before grouping; empty admits all.
 std::vector<FrontierCluster> extractFrontierClusters(GraphManager& graph,
                                                      double merge_radius_m,
                                                      double min_cluster_gain,
-                                                     double cluster_id_cell_m);
+                                                     double cluster_id_cell_m,
+    const std::function<bool(const Vertex&)>& eligible = {});
 
 /// Keeps each cluster's ID across graph revisions: a cluster whose
 /// representative lies within `match_radius_m` of one named last time takes

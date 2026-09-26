@@ -179,3 +179,14 @@ TEST(FrontierClusters, ExploredInGraphNeedsRoadmapAndNoFrontierNearby) {
 }
 
 }  // namespace
+
+TEST(FrontierClusters, IneligibleVerticesNeitherRepresentNorAbsorbClusters) {
+  GraphManager graph;
+  auto* ignored = addVertex(graph, 3.0, 0.0, VertexType::kFrontier, 1000.0);
+  auto* kept = addVertex(graph, 3.5, 0.0, VertexType::kFrontier, 100.0);
+  const auto clusters = mgg::extractFrontierClusters(
+      graph, 2.0, 0.0, 1.0, [ignored](const Vertex& v) { return v.id != ignored->id; });
+  ASSERT_EQ(clusters.size(), 1u);
+  EXPECT_EQ(clusters.front().representative_vertex_id, kept->id);
+  EXPECT_EQ(clusters.front().member_vertex_ids, std::vector<int>{kept->id});
+}

@@ -51,6 +51,20 @@ class PublicationProbeMap : public mgg::MolaMap {
   }
 };
 
+class SlowScanMap : public mgg::OctomapMap {
+ public:
+  std::vector<double> scanned_x;
+  void getScanStatusIterative(
+      const Eigen::Vector3d& pos,
+      const std::vector<Eigen::Vector3d>& endpoints, mgg::GainCounts& gain,
+      std::vector<std::pair<Eigen::Vector3d, mgg::VoxelStatus>>& log,
+      const mgg::SensorModel& sensor) override {
+    scanned_x.push_back(pos.x());
+    std::this_thread::sleep_for(std::chrono::milliseconds(25));
+    mgg::OctomapMap::getScanStatusIterative(pos, endpoints, gain, log, sensor);
+  }
+};
+
 class PlannerNodeTestPeer {
  public:
   static std::vector<mgg::FrontierCluster> frontierClusters(PlannerNode& node) {
@@ -63,6 +77,18 @@ class PlannerNodeTestPeer {
     node.map_ = std::move(map);
     node.ground_ = std::make_unique<mgg::GroundProjection>(
         *node.map_, node.planning_params_);
+  }
+  static void useCloudMap(PlannerNode& node, std::unique_ptr<mgg::OctomapMap> map) {
+    node.cloud_map_ = map.get();
+    node.mola_map_ = nullptr;
+    node.map_ = std::move(map);
+    node.ground_ = std::make_unique<mgg::GroundProjection>(
+        *node.map_, node.planning_params_);
+  }
+  static void resetFrontierGain(PlannerNode& node, int id) {
+    auto* v = node.global_graph_->getVertex(id);
+    v->type = mgg::VertexType::kFrontier;
+    v->vol_gain.gain = 0.0;
   }
   static void setTourAside(PlannerNode& node, mgg::ClusterId id) {
     node.setTourClusterAside(id);
@@ -2795,6 +2821,35 @@ TEST_F(PlannerNodeTest, PeerFrontierRescoringDoesNotLapseATourSetAside) {
   EXPECT_EQ(PlannerNodeTestPeer::globalEdges(*fleet.a), edges + 1);
   EXPECT_GT(PlannerNodeTestPeer::graphRevision(*fleet.a), revision);
   EXPECT_EQ(PlannerNodeTestPeer::refreshTour(*fleet.a), target);
+}
+
+TEST_F(PlannerNodeTest, ImportedFrontierScoringContinuesAfterItsTimeBudget) {
+  auto node = makeNode("score_budget");
+  PlannerNodeTestPeer::observeFloor(*node, -1.0, 4.0, -1.0, 1.0);
+  PlannerNodeTestPeer::acceptOdometry(*node, 0.0, 0.0, 1.0);
+  PlannerNodeTestPeer::setTour(*node, true, 0.0);  // zero must not admit unscored peers
+  for (double x : {3.0, 8.0, 13.0}) {
+    int id = PlannerNodeTestPeer::addGlobalChainToFrontier(*node, {{x, 0.0}});
+    PlannerNodeTestPeer::setFrontierOwner(*node, id, 2);
+  }
+  auto map = std::make_unique<SlowScanMap>();
+  auto* slow = map.get();
+  PlannerNodeTestPeer::useCloudMap(*node, std::move(map));
+  auto clusters = PlannerNodeTestPeer::frontierClusters(*node);
+  ASSERT_EQ(slow->scanned_x.size(), 1u);  // one scan may exceed the budget
+  ASSERT_EQ(clusters.size(), 1u);
+  EXPECT_GT(clusters.front().gain, 0.0);
+  // A fresh zero-gain report for the first vertex cannot starve later ones.
+  PlannerNodeTestPeer::resetFrontierGain(*node, clusters.front().representative_vertex_id);
+  PlannerNodeTestPeer::frontierClusters(*node);
+  PlannerNodeTestPeer::frontierClusters(*node);
+  ASSERT_EQ(slow->scanned_x.size(), 3u);
+  EXPECT_NE(slow->scanned_x[0], slow->scanned_x[1]);
+  EXPECT_NE(slow->scanned_x[0], slow->scanned_x[2]);
+  EXPECT_NE(slow->scanned_x[1], slow->scanned_x[2]);
+  clusters = PlannerNodeTestPeer::frontierClusters(*node);
+  EXPECT_EQ(clusters.size(), 3u);
+  EXPECT_EQ(slow->scanned_x.size(), 4u);
 }
 
 }  // namespace mgg_ros
