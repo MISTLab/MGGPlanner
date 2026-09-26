@@ -96,6 +96,12 @@ if(BUILD_TESTING)
     ament_add_gtest(test_planner_node test/test_planner_node.cpp)
     target_link_libraries(test_planner_node ${PROJECT_NAME})
     ament_target_dependencies(test_planner_node rclcpp mgg_msgs)
+    # Two planners exploring one corridor over real topics: seconds, not
+    # milliseconds.
+    ament_add_gtest(test_fleet_exploration test/test_fleet_exploration.cpp
+      TIMEOUT 600)
+    target_link_libraries(test_fleet_exploration ${PROJECT_NAME})
+    ament_target_dependencies(test_fleet_exploration rclcpp mgg_msgs)
   endif()
 endif()
 
