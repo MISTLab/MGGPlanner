@@ -30,6 +30,7 @@ TourBidData sampleBid() {
   bid.seq = 17;
   bid.stamp_s = 123.25;
   bid.auction_id = 9;
+  bid.auctioneer_id = 1;
   bid.pose = mgg::StateVec(1.0, 0.0, 0.3, 0.0);
   bid.clusters = {cluster(21, 2, 2.0, 0.0), cluster(22, 3, 4.0, 1.0)};
   bid.costs_from_pose = {1.0, std::numeric_limits<double>::infinity()};
@@ -52,6 +53,7 @@ TEST(FleetConversions, ABidRoundTripsInItsOwnFrame) {
   EXPECT_EQ(out.seq, 17u);
   EXPECT_NEAR(out.stamp_s, 123.25, 1e-9);
   EXPECT_EQ(out.auction_id, 9u);
+  EXPECT_EQ(out.auctioneer_id, 1);
   EXPECT_TRUE(out.pose.isApprox(in.pose, 1e-12));
   ASSERT_EQ(out.clusters.size(), 2u);
   EXPECT_EQ(out.clusters[1].id, 22u);

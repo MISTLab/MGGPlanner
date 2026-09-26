@@ -1039,4 +1039,82 @@ TEST(FleetCoordinator, AMalformedAwardIsRefusedWhole) {
   EXPECT_EQ(idsOf(coordinator.bundle()), std::vector<ClusterId>{22});
 }
 
+// SubT radio is often a chain. With 1-2 and 2-3 in contact and 1-3 not,
+// robot 2 follows robot 1 and says so in its bids, so robot 3, which does
+// not hear robot 1, runs its own auctions instead of waiting for robot 2:
+// every robot has an award.
+TEST(FleetCoordinator, InAChainEveryRobotHasAnAward) {
+  const FleetParams params;
+  SimRobot r1(1, 0.0, 0.0, params), r2(2, 10.0, 0.0, params),
+      r3(3, 20.0, 0.0, params);
+  r1.known = {cluster(11, 1, 2.0)};
+  r2.known = {cluster(21, 2, 12.0)};
+  r3.known = {cluster(31, 3, 22.0)};
+  Radio radio{{&r1, &r2, &r3}};
+  radio.cut(1, 3);
+  double now = 0.0;
+  radio.runUntil(now, 10.0);
+  EXPECT_EQ(r1.coordinator->auctioneer(now), 1);
+  EXPECT_EQ(r2.coordinator->auctioneer(now), 1);
+  EXPECT_EQ(r3.coordinator->auctioneer(now), 3);
+  EXPECT_EQ(r1.front(), 11u);
+  EXPECT_EQ(r2.front(), 21u);
+  EXPECT_EQ(r3.front(), 31u);
+  // Robot 3 respects the claim it knows from robot 2's bids.
+  EXPECT_EQ(idsOf(r3.coordinator->claimedByOthers(now)),
+            std::vector<ClusterId>{21});
+}
+
+// Nothing changes for a long time: no auction runs, and still nobody stops
+// following the auctioneer.
+TEST(FleetCoordinator, ASettledGroupKeepsItsAuctioneerThroughALongQuiet) {
+  const FleetParams params;
+  SimRobot r1(1, 0.0, 0.0, params), r2(2, 10.0, 0.0, params),
+      r3(3, 20.0, 0.0, params);
+  r1.known = {cluster(11, 1, 2.0)};
+  r2.known = {cluster(21, 2, 12.0)};
+  r3.known = {cluster(31, 3, 22.0)};
+  Radio radio{{&r1, &r2, &r3}};
+  double now = 0.0;
+  radio.runUntil(now, 5.0);
+  const std::size_t awards = radio.awards.size();
+  const std::size_t calls = radio.calls.size();
+  radio.runUntil(now, 120.0);
+  EXPECT_EQ(radio.awards.size(), awards);
+  EXPECT_EQ(radio.calls.size(), calls);
+  for (const SimRobot* r : radio.robots) {
+    EXPECT_EQ(r->coordinator->auctioneer(now), 1) << "robot " << r->id;
+  }
+}
+
+// The auctioneer restarts: its peers keep following it, and nobody else
+// calls an auction meanwhile.
+TEST(FleetCoordinator, ARestartedAuctioneerIsStillFollowed) {
+  const FleetParams params;
+  SimRobot r1(1, 0.0, 0.0, params), r2(2, 10.0, 0.0, params),
+      r3(3, 20.0, 0.0, params);
+  r1.known = {cluster(11, 1, 2.0)};
+  r2.known = {cluster(21, 2, 12.0)};
+  r3.known = {cluster(31, 3, 22.0)};
+  Radio radio{{&r1, &r2, &r3}};
+  double now = 0.0;
+  radio.runUntil(now, 5.0);
+  r1.coordinator = std::make_unique<FleetCoordinator>(1, params, 0.2);
+  r1.known.push_back(cluster(13, 1, 6.0));
+  const std::size_t awards = radio.awards.size();
+  const std::size_t calls = radio.calls.size();
+  radio.runUntil(now, 15.0);
+  ASSERT_GT(radio.awards.size(), awards);
+  for (std::size_t i = calls; i < radio.calls.size(); ++i) {
+    EXPECT_EQ(radio.calls[i].second.auctioneer_id, 1);
+  }
+  for (std::size_t i = awards; i < radio.awards.size(); ++i) {
+    EXPECT_EQ(radio.awards[i].second.auctioneer_id, 1);
+  }
+  for (const SimRobot* r : radio.robots) {
+    EXPECT_EQ(r->coordinator->auctioneer(now), 1) << "robot " << r->id;
+  }
+  EXPECT_EQ(idsOf(r1.coordinator->bundle()), (std::vector<ClusterId>{11, 13}));
+}
+
 }  // namespace

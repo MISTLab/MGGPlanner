@@ -71,6 +71,15 @@ std::vector<int> FleetCoordinator::group(double now_s) const {
   return members;
 }
 
+int FleetCoordinator::auctioneer(double now_s) const {
+  for (const int robot_id : group(now_s)) {
+    if (robot_id == robot_id_) return robot_id;
+    const auto named = follows_.find(robot_id);
+    if (named == follows_.end() || named->second == robot_id) return robot_id;
+  }
+  return robot_id_;
+}
+
 void FleetCoordinator::rebaseFutureTimes(double now_s) {
   for (auto& [robot_id, heard_s] : last_heard_s_) {
     heard_s = std::min(heard_s, now_s);
@@ -99,6 +108,7 @@ void FleetCoordinator::onBid(const TourBidData& bid, double now_s) {
   rebaseFutureTimes(now_s);
   if (bid.robot_id == robot_id_ || !bid.wellFormed()) return;
   noteHeard(bid.robot_id, now_s);
+  follows_[bid.robot_id] = bid.auctioneer_id;
   recordBidClaim(bid, now_s);
   noteReportedExplored(bid.explored);
   last_bids_[bid.robot_id] = bid;
@@ -166,6 +176,7 @@ void FleetCoordinator::onAward(const TourAwardData& award, double now_s) {
   rebaseFutureTimes(now_s);
   if (award.auctioneer_id == robot_id_ || !wellFormedAward(award)) return;
   noteHeard(award.auctioneer_id, now_s);
+  follows_[award.auctioneer_id] = award.auctioneer_id;
   // A robot that left the sender's group, or whose group just merged with a
   // lower ID, ignores it.
   if (award.auctioneer_id != auctioneer(now_s)) return;
@@ -199,10 +210,11 @@ FleetTickOutput FleetCoordinator::tick(double now_s, const OwnBidFn& own_bid,
   if (claims_changed) ++assignment_version_;
 
   const std::vector<int> members = group(now_s);
-  const bool leader = members.size() > 1 && members.front() == robot_id_;
+  const int elected = auctioneer(now_s);
+  const bool leader = members.size() > 1 && elected == robot_id_;
   const bool requesting = requested_ && !answered_;
   // The auctioneer asked is gone: ask the new one.
-  if (requesting && request_sent_ && request_auctioneer_ != members.front()) {
+  if (requesting && request_sent_ && request_auctioneer_ != elected) {
     request_sent_ = false;
   }
 
@@ -213,6 +225,7 @@ FleetTickOutput FleetCoordinator::tick(double now_s, const OwnBidFn& own_bid,
     bid.seq = ++seq_;
     bid.stamp_s = now_s;
     bid.auction_id = auction_id;
+    bid.auctioneer_id = elected;
     bid.bundle = idsOf(bundle_);
     capBidLists(bid, explored_turn);
     bid.request_auction = bid.request_auction || requesting;
@@ -232,7 +245,7 @@ FleetTickOutput FleetCoordinator::tick(double now_s, const OwnBidFn& own_bid,
     if (called) answered_round_ = called_round_;
     if (requesting) {
       request_sent_ = true;
-      request_auctioneer_ = members.front();
+      request_auctioneer_ = elected;
     }
   }
 

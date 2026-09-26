@@ -5,6 +5,7 @@ std_msgs/Header header             # stamp; frame_id: the sender's planning fram
 int32 robot_id
 uint64 seq
 uint64 auction_id                  # the auction called; 0 for a periodic bid
+int32 auctioneer_id                # the auctioneer it follows; robot_id when it leads
 geometry_msgs/Pose pose            # the sender's pose, in its planning frame
 TourCluster[] clusters             # every frontier cluster it knows
 float64[] costs_from_pose          # one per cluster; .inf when unreachable

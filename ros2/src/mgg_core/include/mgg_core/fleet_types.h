@@ -42,6 +42,9 @@ struct TourBidData {
   double stamp_s = 0.0;
   /// The auction it answers; 0 for a periodic bid.
   std::uint64_t auction_id = 0;
+  /// The auctioneer the bidder follows, robot_id when it leads; -1 names
+  /// none. A robot following another is no candidate (FleetCoordinator).
+  int auctioneer_id = -1;
   StateVec pose = StateVec::Zero();
   /// Every frontier cluster the bidder knows.
   std::vector<FleetCluster> clusters;

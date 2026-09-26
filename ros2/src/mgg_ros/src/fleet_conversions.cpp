@@ -79,6 +79,7 @@ mgg::TourBidData fromTourBidMsg(const mgg_msgs::msg::TourBid& msg,
   bid.seq = msg.seq;
   bid.stamp_s = stampSeconds(msg.header.stamp);
   bid.auction_id = msg.auction_id;
+  bid.auctioneer_id = msg.auctioneer_id;
   const mgg::StateVec theirs = fromPoseMsg(msg.pose);
   const Eigen::Vector3d position =
       t_ours_theirs * Eigen::Vector3d(theirs.head<3>());
@@ -109,6 +110,7 @@ mgg_msgs::msg::TourBid toTourBidMsg(const mgg::TourBidData& bid,
   msg.robot_id = bid.robot_id;
   msg.seq = bid.seq;
   msg.auction_id = bid.auction_id;
+  msg.auctioneer_id = bid.auctioneer_id;
   msg.pose = toPoseMsg(bid.pose);
   msg.clusters = toClusterMsgs(bid.clusters);
   msg.costs_from_pose.assign(bid.costs_from_pose.begin(),

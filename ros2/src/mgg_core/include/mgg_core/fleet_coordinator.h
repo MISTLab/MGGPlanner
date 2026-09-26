@@ -7,7 +7,14 @@
 // within fleet.peer_timeout_s. The ROS layer delivers only messages from
 // robots it holds a neighbour transform to, placed in this robot's frame, so
 // a robot without a shared frame is alone and tours alone. The auctioneer is
-// the group's lowest robot ID. It calls an auction when the pool's clusters,
+// the group's lowest robot ID that is a candidate: this robot itself, a
+// robot not yet heard naming an auctioneer, or one whose latest message
+// names itself (its bid's auctioneer_id is its own ID, or it sent a call or
+// award). A robot whose bid names another follows another auctioneer and is
+// no candidate: in a chain 1-2-3 where 3 does not hear 1, robot 2 follows 1
+// and robot 3 auctions itself, respecting the claims it knows, rather than
+// wait for robot 2. Every bid names the auctioneer its sender follows.
+// The auctioneer calls an auction when the pool's clusters,
 // the membership, a robot's request or an operator release changed, at most
 // every fleet.auction_interval_s; takes one bid per member for
 // fleet.bid_deadline_s; and awards bundles to the bidders, with the claims
@@ -104,7 +111,8 @@ class FleetCoordinator {
   /// A robot last heard after `now_s` (the clock was reset) counts as just
   /// heard.
   std::vector<int> group(double now_s) const;
-  int auctioneer(double now_s) const { return group(now_s).front(); }
+  /// The group's lowest candidate (see the top of this file).
+  int auctioneer(double now_s) const;
   bool inGroup(double now_s) const { return group(now_s).size() > 1; }
   bool hasAward() const { return has_award_; }
   /// This robot's bundle from the last award it applied.
@@ -181,6 +189,8 @@ class FleetCoordinator {
 
   std::map<int, double> last_heard_s_;
   std::map<int, TourBidData> last_bids_;
+  // The auctioneer each robot's latest bid, call or award names.
+  std::map<int, int> follows_;
   ClaimRegistry claims_;
   std::vector<FleetCluster> bundle_;
   std::vector<FleetCluster> award_clusters_;
