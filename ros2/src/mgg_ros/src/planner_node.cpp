@@ -1467,22 +1467,32 @@ void PlannerNode::onNeighbourTransforms(
 }
 
 void PlannerNode::readmitQuarantinedNeighbours() {
-  if (global_graph_->numQuarantined() == 0) return;
-  for (const auto& [robot, frame] : neighbour_frames_) {
-    if (!global_graph_->isQuarantined(robot)) continue;
+  if (roadmaps_to_readmit_.empty()) return;
+  for (auto it = roadmaps_to_readmit_.begin();
+       it != roadmaps_to_readmit_.end();) {
+    const int robot = *it;
+    const auto frame = neighbour_frames_.find(robot);
     const auto roadmap = neighbour_roadmaps_.find(robot);
-    if (roadmap == neighbour_roadmaps_.end() ||
-        !refreshNeighbourTransform(robot, frame)) {
+    if (frame == neighbour_frames_.end() ||
+        roadmap == neighbour_roadmaps_.end()) {
+      // Nothing cached to merge again: the next roadmap received merges.
+      ++it;
+      continue;
+    }
+    if (!refreshNeighbourTransform(robot, frame->second)) {
+      ++it;
       continue;
     }
     auto map_read = mapReadLease();
     const mgg::MergeResult r = mergeNeighbourRoadmap(roadmap->second);
-    if (global_graph_->isQuarantined(robot)) {
+    if (!r.merged || global_graph_->isQuarantined(robot)) {
+      ++it;
       RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 30000,
                            "robot %d's transform returned, but its roadmap "
                            "joins ours nowhere yet: it stays quarantined",
                            robot);
     } else {
+      it = roadmaps_to_readmit_.erase(it);
       RCLCPP_INFO(get_logger(),
                   "robot %d's transform returned: its quarantined roadmap is "
                   "merged again (+%d edges)",
@@ -1492,8 +1502,12 @@ void PlannerNode::readmitQuarantinedNeighbours() {
 }
 
 std::string PlannerNode::completionWithheld() const {
-  if (global_graph_->numQuarantined() > 0) {
-    return std::to_string(global_graph_->numQuarantined()) +
+  const std::size_t outstanding =
+      std::max<std::size_t>(roadmaps_to_readmit_.size(),
+                            static_cast<std::size_t>(
+                                global_graph_->numQuarantined()));
+  if (outstanding > 0) {
+    return std::to_string(outstanding) +
            " neighbour roadmap(s) quarantined until their transforms return";
   }
   if (global_search_cut_short_) {
@@ -1531,6 +1545,7 @@ void PlannerNode::withdrawUnplacedNeighbours() {
     // whether or not it is joined to ours: quarantined until a current one
     // places it again.
     const int cut = global_graph_->disconnectNeighbourGraph(robot);
+    roadmaps_to_readmit_.insert(robot);
     ++graph_revision_;
     RCLCPP_INFO(get_logger(),
                 "robot %d's transform was withdrawn: its roadmap is "
@@ -1606,6 +1621,9 @@ void PlannerNode::onNeighbourGraph(mgg_msgs::msg::Graph::ConstSharedPtr msg) {
   const mgg::GraphExchange incoming = fromGraphMsg(*msg);
   neighbour_roadmaps_[sender] = incoming;
   const mgg::MergeResult r = mergeNeighbourRoadmap(incoming);
+  if (r.merged && !global_graph_->isQuarantined(sender)) {
+    roadmaps_to_readmit_.erase(sender);
+  }
 
   if (r.transform_unavailable) {
     RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 5000,
@@ -1821,6 +1839,14 @@ bool PlannerNode::rebuildGlobalGraphFromKeyframes(
     }
   }
   if (dropped > 0) frontiers_dropped_in_rebuild_ = dropped;
+  // Neighbours whose roadmap the old graph held, joined or quarantined.
+  for (const auto& entry : neighbour_roadmaps_) {
+    const auto merged = global_graph_->merged_graphs_.find(entry.first);
+    if ((merged != global_graph_->merged_graphs_.end() && merged->second) ||
+        global_graph_->isQuarantined(entry.first)) {
+      roadmaps_to_readmit_.insert(entry.first);
+    }
+  }
   global_graph_ = rebuilt;
   global_graph_->setEdgeBlocked(
       [this](const mgg::Vertex& a, const mgg::Vertex& b) {
@@ -1832,6 +1858,11 @@ bool PlannerNode::rebuildGlobalGraphFromKeyframes(
   last_state_marker_ = current_state_;
   ++graph_revision_;
   ++roadmap_rebuilds_;
+  // The rebuilt graph holds no neighbour roadmap: every one the old graph
+  // held, joined or quarantined, is merged again from its cached copy, now
+  // where its transform is current and when it returns otherwise (review
+  // r0, I-7); until then exploration is not complete.
+  readmitQuarantinedNeighbours();
   static const char* const kRefusals[8] = {
       "", "steep", "occupied", "unknown", "hanging", "cross slope",
       "footprint plane", "ground unobserved"};

@@ -27,6 +27,7 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <set>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -433,6 +434,12 @@ class PlannerNode : public rclcpp::Node {
   /// The last roadmap received within communication range from each
   /// neighbour, to re-admit it from when its transform returns.
   std::unordered_map<int, mgg::GraphExchange> neighbour_roadmaps_;
+  /// Neighbours whose roadmap was merged and is not in the current global
+  /// graph: quarantined when its transform expired, or dropped by a roadmap
+  /// rebuild. Kept across rebuilds; readmitQuarantinedNeighbours merges
+  /// each cached roadmap again once its transform is current, and until
+  /// then exploration is not complete.
+  std::set<int> roadmaps_to_readmit_;
   /// The last global frontier search was cut short by
   /// global_search_time_budget_s (runGlobalPlanner), found a frontier or
   /// not.

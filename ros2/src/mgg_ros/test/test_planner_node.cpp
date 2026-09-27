@@ -2764,6 +2764,42 @@ TEST_F(PlannerNodeTest, TheFirstFailedSearchAfterARebuildDroppedFrontiersIsNotCo
   EXPECT_EQ(plan(), PlannerNode::kStatusComplete);
 }
 
+TEST_F(PlannerNodeTest, AQuarantinedRoadmapSurvivesARebuildAndReturnsWithItsTransform) {
+  // Review r0, I-7: a roadmap rebuild replaced the global graph and with it
+  // the quarantine, so neither the completion guard nor the re-admission on
+  // the transform's return knew of the neighbour any more. Robot 2's
+  // transform expires while it is out of range; the graph is rebuilt from
+  // the keyframes; exploration may not be complete until the transform
+  // returns, which merges the cached roadmap into the rebuilt graph.
+  TwoPlanners fleet("rebuild_quarantine", /*transform_ttl_s=*/1.0);
+  fleet.share();
+  ASSERT_GT(PlannerNodeTestPeer::neighbourEdges(*fleet.a, 2), 0u);
+  PlannerNodeTestPeer::setCommunicationRange(*fleet.a, 1.0);
+  std::this_thread::sleep_for(std::chrono::milliseconds(1200));
+  auto response = std::make_shared<mgg_msgs::srv::PlannerSrv::Response>();
+  PlannerNodeTestPeer::plan(*fleet.a, response);
+  ASSERT_TRUE(PlannerNodeTestPeer::isQuarantined(*fleet.a, 2));
+
+  PlannerNodeTestPeer::serveMap(*fleet.a, "component:test", 0);
+  auto source = std::make_unique<TrajectoryInMemory>();
+  source->trajectory = keyframesAlongX(0.0, 4.0);
+  PlannerNodeTestPeer::setKeyframeSource(*fleet.a, std::move(source));
+  ASSERT_TRUE(PlannerNodeTestPeer::rebuildRoadmap(
+      *fleet.a, PlannerNode::RoadmapRebuildTrigger::kPoseUnlinkable));
+  EXPECT_EQ(PlannerNodeTestPeer::neighbourEdges(*fleet.a, 2), 0u);
+  EXPECT_FALSE(PlannerNodeTestPeer::completionWithheld(*fleet.a).empty());
+
+  // Its next roadmap is out of range; its transform returns.
+  PlannerNodeTestPeer::receiveGraph(*fleet.a,
+                                    PlannerNodeTestPeer::ownGraph(*fleet.b));
+  EXPECT_FALSE(PlannerNodeTestPeer::completionWithheld(*fleet.a).empty());
+  PlannerNodeTestPeer::receiveTransform(*fleet.a, "robot_0/odom",
+                                        "robot_1/odom", 5.0, 0.0);
+  EXPECT_GT(PlannerNodeTestPeer::neighbourEdges(*fleet.a, 2), 0u);
+  EXPECT_TRUE(PlannerNodeTestPeer::completionWithheld(*fleet.a).empty())
+      << PlannerNodeTestPeer::completionWithheld(*fleet.a);
+}
+
 TEST_F(PlannerNodeTest, TheTourHeadsForItsTargetWithoutWaitingForLowGainRounds) {
   // exploredDeadEnd: the lattice has no gain, and the tour's only cluster
   // is the frontier 2.5 m behind the robot. The low-gain rule waits
