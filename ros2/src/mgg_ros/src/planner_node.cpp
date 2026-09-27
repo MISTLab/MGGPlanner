@@ -1191,6 +1191,7 @@ mgg::RecomputeGainFn PlannerNode::globalFrontierGain() {
   return [this](mgg::Vertex& vertex) {
     if (vertex.robot_id != static_cast<int>(planning_params_.robot_id)) {
       auto& gain = vertex.vol_gain;
+      gain.is_frontier = gain.is_frontier && !vertex.locally_explored;
       gain.gain = gain.is_frontier
           ? std::max(0, gain.num_unknown_voxels) * planning_params_.unknown_voxel_gain +
             std::max(0, gain.num_free_voxels) * planning_params_.free_voxel_gain +
@@ -2067,7 +2068,22 @@ void PlannerNode::addFrontiers() {
   // for an SMB whose trajectory was sampled every metre; scale them with the
   // trajectory spacing so a foot-bot configuration keeps the same proportions.
   const mgg::FrontierAdditionReport report = mgg::addFrontiers(
-      *global_graph_, *local_graph_, makeGlobalContext(), globalFrontierGain(),
+      *global_graph_, *local_graph_, makeGlobalContext(),
+      [this, owner_gain = globalFrontierGain()](mgg::Vertex& vertex) {
+        owner_gain(vertex);
+        if (vertex.robot_id == static_cast<int>(planning_params_.robot_id) ||
+            vertex.locally_explored) return;
+        // addFrontiers calls this for peers only near the new local graph,
+        // where this robot has fresh observations. Preserve owner counts.
+        global_space_.setCenter(vertex.state, /*use_extension=*/true);
+        mgg::VolumetricGain local_gain;
+        mgg::computeVolumetricGain(vertex.state, local_gain, makeGainContext());
+        if (!local_gain.is_frontier) {
+          vertex.locally_explored = true;
+          vertex.vol_gain.is_frontier = false;
+          vertex.vol_gain.gain = 0.0;
+        }
+      },
       global_vertex_spacing_, 1.0 * global_vertex_spacing_,
       3.0 * global_vertex_spacing_);
   global_space_.setCenter(current_state_, /*use_extension=*/true);

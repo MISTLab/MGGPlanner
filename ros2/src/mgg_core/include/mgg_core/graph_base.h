@@ -120,6 +120,9 @@ struct Vertex {
   /// left uninitialised by the ROS 1 constructor.
   int robot_id = 0;
   VolumetricGain vol_gain;
+  /// Receiver-only evidence: this peer frontier was explored on our map.
+  /// Owner broadcasts refresh counts but cannot undo this local demotion.
+  bool locally_explored = false;
   /// NBVP legacy, kept in case a tree is wanted for comparison.
   Vertex* parent = nullptr;
   std::vector<Vertex*> children;

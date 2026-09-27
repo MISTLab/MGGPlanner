@@ -52,12 +52,12 @@ void refreshVertex(Vertex* vertex, const GraphExchangeVertex& v) {
   vertex->vol_gain.num_unknown_voxels = v.num_unknown_voxels;
   vertex->vol_gain.num_occupied_voxels = v.num_occupied_voxels;
   vertex->vol_gain.num_free_voxels = v.num_free_voxels;
-  vertex->vol_gain.is_frontier = v.is_frontier;
+  vertex->vol_gain.is_frontier = v.is_frontier && !vertex->locally_explored;
   vertex->robot_id = v.robot_id;
-  // The owner's word on its frontier, both ways: it re-checks it on its own
-  // map, where its explored space is known. This robot re-checks a peer's
-  // frontier only near its own new local graph (addFrontiers).
-  if (v.is_frontier) {
+  // Owner evidence can demote a frontier. Receiver evidence from a local
+  // addFrontiers re-check can also demote it, and survives rebroadcasts:
+  // the owner may never observe the space this robot already explored.
+  if (vertex->vol_gain.is_frontier) {
     vertex->type = VertexType::kFrontier;
   } else if (vertex->type == VertexType::kFrontier) {
     vertex->type = VertexType::kUnvisited;

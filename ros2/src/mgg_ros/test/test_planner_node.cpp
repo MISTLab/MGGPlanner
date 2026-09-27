@@ -260,6 +260,15 @@ class PlannerNodeTestPeer {
     node.ground_ = std::make_unique<mgg::GroundProjection>(
         *node.map_, node.planning_params_);
   }
+  static void recheckFrontiersNear(PlannerNode& node, double x) {
+    node.local_graph_->reset();
+    auto* a = new mgg::Vertex(0, mgg::StateVec(x - 0.5, 0, 0.35, 0));
+    auto* b = new mgg::Vertex(1, mgg::StateVec(x, 0, 0.35, 0));
+    node.local_graph_->addVertex(a);
+    node.local_graph_->addVertex(b);
+    node.local_graph_->addEdge(a, b, 0.5);
+    node.addFrontiers();
+  }
   static void setReportedUnknown(PlannerNode& node, int id, int count) {
     auto& gain = node.global_graph_->getVertex(id)->vol_gain;
     gain.num_unknown_voxels = count;
@@ -3983,14 +3992,16 @@ TEST_F(PlannerNodeTest, PeerFrontierRescoringDoesNotLapseATourSetAside) {
   PlannerNodeTestPeer::observeFloor(*fleet.a, -3.55, 10.55, -3.55, 3.55);
   PlannerNodeTestPeer::setTour(*fleet.a, true, 0.0);
   PlannerNodeTestPeer::solveTourOnEveryChange(*fleet.a);
-  PlannerNodeTestPeer::addGlobalChainToFrontier(*fleet.a, {{-2.0, 0.0}});
+  PlannerNodeTestPeer::addGlobalChainToFrontier(*fleet.a, {{-2.0, 0.0}}, M_PI);
   auto graph = PlannerNodeTestPeer::ownGraph(*fleet.b);
   auto frontier = std::max_element(graph.vertices.begin(), graph.vertices.end(),
       [](const auto& a, const auto& b) { return a.pose.position.x < b.pose.position.x; });
   ASSERT_NE(frontier, graph.vertices.end());
   frontier->is_frontier = true;
+  frontier->num_unknown_voxels = 1000;
   PlannerNodeTestPeer::receiveTransform(*fleet.a, "robot_0/odom", "robot_1/odom", 0.0, 0.0);
   PlannerNodeTestPeer::receiveGraph(*fleet.a, graph);
+  PlannerNodeTestPeer::recheckFrontiersNear(*fleet.a, 4.0);
   const auto target = PlannerNodeTestPeer::refreshTour(*fleet.a);
   ASSERT_NE(target, mgg::kNoCluster);
   ASSERT_LT(PlannerNodeTestPeer::tourTargetPosition(*fleet.a).x(), 0.0);
@@ -3999,7 +4010,7 @@ TEST_F(PlannerNodeTest, PeerFrontierRescoringDoesNotLapseATourSetAside) {
   for (int broadcast = 0; broadcast < 3; ++broadcast) {
     PlannerNodeTestPeer::receiveGraph(*fleet.a, graph);
     const auto clusters = PlannerNodeTestPeer::frontierClusters(*fleet.a);
-    ASSERT_EQ(clusters.size(), 1u);  // owner reports zero unknown gain
+    ASSERT_EQ(clusters.size(), 1u);  // peer frontier was explored here
     EXPECT_EQ(PlannerNodeTestPeer::refreshTour(*fleet.a), mgg::kNoCluster);
     EXPECT_EQ(PlannerNodeTestPeer::graphRevision(*fleet.a), revision);
   }
@@ -4016,6 +4027,29 @@ TEST_F(PlannerNodeTest, PeerFrontierRescoringDoesNotLapseATourSetAside) {
   EXPECT_EQ(PlannerNodeTestPeer::globalEdges(*fleet.a), edges + 1);
   EXPECT_GT(PlannerNodeTestPeer::graphRevision(*fleet.a), revision);
   EXPECT_EQ(PlannerNodeTestPeer::refreshTour(*fleet.a), target);
+}
+
+TEST_F(PlannerNodeTest, ReceiverExplorationDemotesAPeerDespiteRepeatedUnknownReports) {
+  TwoPlanners fleet("receiver_explored");
+  PlannerNodeTestPeer::gainFromUnknownVoxelsOnly(*fleet.a);
+  PlannerNodeTestPeer::setTour(*fleet.a, true, 1.0);
+  auto graph = PlannerNodeTestPeer::ownGraph(*fleet.b);
+  auto frontier = std::max_element(graph.vertices.begin(), graph.vertices.end(),
+      [](const auto& a, const auto& b) { return a.pose.position.x < b.pose.position.x; });
+  ASSERT_NE(frontier, graph.vertices.end());
+  frontier->is_frontier = true;
+  frontier->num_unknown_voxels = 1000;
+  PlannerNodeTestPeer::receiveTransform(*fleet.a, "robot_0/odom", "robot_1/odom", 5, 0);
+  PlannerNodeTestPeer::receiveGraph(*fleet.a, graph);
+  ASSERT_EQ(PlannerNodeTestPeer::frontierClusters(*fleet.a).size(), 1u);
+  PlannerNodeTestPeer::observeFloor(*fleet.a, 5.55, 12.55, -3.55, 3.55);
+  PlannerNodeTestPeer::recheckFrontiersNear(*fleet.a, 9.0);
+  EXPECT_TRUE(PlannerNodeTestPeer::frontierClusters(*fleet.a).empty());
+  for (int broadcast = 0; broadcast < 3; ++broadcast) {
+    PlannerNodeTestPeer::receiveGraph(*fleet.a, graph);
+    EXPECT_TRUE(PlannerNodeTestPeer::frontierClusters(*fleet.a).empty());
+    EXPECT_EQ(PlannerNodeTestPeer::refreshTour(*fleet.a), mgg::kNoCluster);
+  }
 }
 
 TEST_F(PlannerNodeTest, ImportedFrontierCountsNeedNoScanningBudget) {
