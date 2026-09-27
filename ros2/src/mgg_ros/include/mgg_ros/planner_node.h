@@ -296,16 +296,21 @@ class PlannerNode : public rclcpp::Node {
   /// mapped ground. The old graph's frontiers are not carried over: the
   /// rebuilt graph's come from exploration, and merged neighbours' with
   /// their next broadcast; how many of its own it dropped is kept
-  /// (frontiers_dropped_in_rebuild_). With `links_what_failed`, the rebuilt graph
-  /// replaces the old one only when it links what the old one could
+  /// (frontiers_dropped_in_rebuild_). With `link_what_failed`, the rebuilt
+  /// graph replaces the old one only when it links what the old one could
   /// not (the robot's pose, an exploration path), which it may add to it;
-  /// otherwise the old graph is kept. `why`, for the log, says what
-  /// triggered it. At most once per roadmap_rebuild_min_interval_s_ for
-  /// each trigger, and not again on the same trajectory revision and map.
-  /// Returns true when the graph was replaced.
+  /// the function returns the vertex that links it, or null. Nor does it
+  /// replace an old graph whose home reaches its other vertices when it
+  /// would cut home off from that vertex (or, without one, from every
+  /// other vertex) or split places the old graph connects to home
+  /// (rebuildLosesHome; roadmap_rebuilds_refused_). Otherwise the old graph
+  /// is kept. `why`, for the log, says what triggered it. At most once per
+  /// roadmap_rebuild_min_interval_s_ for each trigger, and not again on the
+  /// same trajectory revision and map. Returns true when the graph was
+  /// replaced.
   bool rebuildGlobalGraphFromKeyframes(
       RoadmapRebuildTrigger trigger, const char* why,
-      const std::function<bool(mgg::GraphManager&)>& links_what_failed =
+      const std::function<mgg::Vertex*(mgg::GraphManager&)>& link_what_failed =
           nullptr);
   /// Whether an own in-service vertex of the global graph lies within
   /// edge_length_max of `state`: the graph reaches there, and a link
@@ -563,6 +568,10 @@ class PlannerNode : public rclcpp::Node {
   std::string last_roadmap_rebuild_inputs_[kRoadmapRebuildTriggers];
   /// Global graphs rebuilt from the trajectory since the node started.
   int roadmap_rebuilds_ = 0;
+  /// Rebuilt graphs refused because they would have cut home off from what
+  /// the rebuild was for, or split places the current graph connects to
+  /// home (rebuildLosesHome).
+  int roadmap_rebuilds_refused_ = 0;
   /// This robot's in-service frontiers the last rebuild that dropped any
   /// replaced, until the next failed global search, which is then no path
   /// rather than exploration complete (review r0, I-2).

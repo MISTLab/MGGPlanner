@@ -49,6 +49,94 @@ constexpr double kStandingStartMoveM = 0.5;
 /// seedGlobalGraph creates the global graph's root, home, as vertex 0.
 constexpr int kHomeVertexId = 0;
 
+/// The connected parts of `robot_id`'s in-service vertices in `graph`, over
+/// the edges between them: a part number per vertex id.
+std::unordered_map<int, int> ownParts(const mgg::GraphManager& graph,
+                                      int robot_id) {
+  const auto own = [&graph, robot_id](int id) {
+    const auto it = graph.vertices_map_.find(id);
+    return it != graph.vertices_map_.end() && it->second != nullptr &&
+           it->second->robot_id == robot_id && graph.inService(*it->second);
+  };
+  std::unordered_map<int, int> part_of;
+  int parts = 0;
+  for (const auto& entry : graph.vertices_map_) {
+    if (!own(entry.first) || part_of.count(entry.first) > 0) continue;
+    const int part = parts++;
+    part_of[entry.first] = part;
+    std::vector<int> stack{entry.first};
+    while (!stack.empty()) {
+      const int at = stack.back();
+      stack.pop_back();
+      const auto edges = graph.edge_map_.find(at);
+      if (edges == graph.edge_map_.end()) continue;
+      for (const auto& edge : edges->second) {
+        if (own(edge.first) && part_of.emplace(edge.first, part).second) {
+          stack.push_back(edge.first);
+        }
+      }
+    }
+  }
+  return part_of;
+}
+
+/// Why a keyframe rebuild must not replace `current` with `rebuilt`, or
+/// empty when it may. In the drone smoke test (drone scout Task 17, C) a
+/// rebuild swapped a graph whose home Return Home reached for one of three
+/// parts with home alone in one, and Return Home failed from then on. So
+/// when home reaches another of this robot's vertices in `current`, the
+/// rebuilt graph must reach `linked` from home (what the rebuild was for;
+/// without it, any other vertex), and must keep together the places
+/// `current` connects to home: the rebuilt vertices nearest them, within
+/// `match_radius`, must lie in one part.
+std::string rebuildLosesHome(const mgg::GraphManager& current,
+                             mgg::GraphManager& rebuilt,
+                             const mgg::Vertex* linked, int robot_id,
+                             double match_radius) {
+  const std::unordered_map<int, int> current_parts =
+      ownParts(current, robot_id);
+  const auto current_home = current_parts.find(kHomeVertexId);
+  if (current_home == current_parts.end()) return "";
+  std::vector<const mgg::Vertex*> connected;
+  for (const auto& [id, part] : current_parts) {
+    if (part == current_home->second) {
+      connected.push_back(current.vertices_map_.at(id));
+    }
+  }
+  if (connected.size() < 2) return "";
+  const std::unordered_map<int, int> rebuilt_parts =
+      ownParts(rebuilt, robot_id);
+  const auto rebuilt_home = rebuilt_parts.find(kHomeVertexId);
+  if (rebuilt_home == rebuilt_parts.end()) return "has no home";
+  if (linked != nullptr) {
+    const auto link = rebuilt_parts.find(linked->id);
+    if (link == rebuilt_parts.end() || link->second != rebuilt_home->second) {
+      return "would not reach home from where it links";
+    }
+  } else if (std::none_of(rebuilt_parts.begin(), rebuilt_parts.end(),
+                          [&rebuilt_home](const auto& entry) {
+                            return entry.first != kHomeVertexId &&
+                                   entry.second == rebuilt_home->second;
+                          })) {
+    return "would cut home off";
+  }
+  std::unordered_set<int> parts_reached;
+  for (const mgg::Vertex* vertex : connected) {
+    mgg::StateVec state = vertex->state;
+    mgg::Vertex* nearest = nullptr;
+    if (!rebuilt.getNearestVertexInRange(&state, match_radius, &nearest) ||
+        nearest == nullptr) {
+      continue;
+    }
+    const auto part = rebuilt_parts.find(nearest->id);
+    if (part != rebuilt_parts.end()) parts_reached.insert(part->second);
+  }
+  if (parts_reached.size() > 1) {
+    return "would split places the current graph connects to home";
+  }
+  return "";
+}
+
 double secondsSince(const std::chrono::steady_clock::time_point& then) {
   return std::chrono::duration<double>(std::chrono::steady_clock::now() - then)
       .count();
@@ -1809,7 +1897,7 @@ bool PlannerNode::globalGraphReaches(const mgg::StateVec& state) const {
 
 bool PlannerNode::rebuildGlobalGraphFromKeyframes(
     RoadmapRebuildTrigger trigger, const char* why,
-    const std::function<bool(mgg::GraphManager&)>& links_what_failed) {
+    const std::function<mgg::Vertex*(mgg::GraphManager&)>& link_what_failed) {
   if (keyframe_source_ == nullptr || !have_mapping_snapshot_ ||
       !map_->getStatus()) {
     return false;
@@ -1885,12 +1973,33 @@ bool PlannerNode::rebuildGlobalGraphFromKeyframes(
                          keyframes.front().pose.y(), keyframes.front().pose.z());
     return false;
   }
-  if (links_what_failed && !links_what_failed(*rebuilt)) {
+  mgg::Vertex* linked = nullptr;
+  if (link_what_failed) {
+    linked = link_what_failed(*rebuilt);
+    if (linked == nullptr) {
+      RCLCPP_WARN(get_logger(),
+                  "global graph kept (%s): the graph rebuilt from %d "
+                  "keyframes does not link it either (%d vertices, %d "
+                  "components)",
+                  why, report.keyframes, rebuilt->getNumVertices(),
+                  report.components);
+      return false;
+    }
+  }
+  const std::string loses_home = rebuildLosesHome(
+      *global_graph_, *rebuilt, linked,
+      static_cast<int>(planning_params_.robot_id),
+      std::min(roadmap_rebuild_params_.link_radius,
+               planning_params_.edge_length_max));
+  if (!loses_home.empty()) {
+    ++roadmap_rebuilds_refused_;
     RCLCPP_WARN(get_logger(),
                 "global graph kept (%s): the graph rebuilt from %d keyframes "
-                "does not link it either (%d vertices, %d components)",
-                why, report.keyframes, rebuilt->getNumVertices(),
-                report.components);
+                "%s (%d vertices, %d components, home's %d vertices); %d "
+                "rebuild(s) refused so far",
+                why, report.keyframes, loses_home.c_str(),
+                rebuilt->getNumVertices(), report.components,
+                report.home_component_vertices, roadmap_rebuilds_refused_);
     return false;
   }
   // The old graph's own frontiers go with it (none is carried over); the
@@ -2088,15 +2197,18 @@ void PlannerNode::addRefPathToGraph(const std::vector<mgg::StateVec>& path) {
     const bool rebuilt = rebuildGlobalGraphFromKeyframes(
         RoadmapRebuildTrigger::kPathUnlinkable,
         "an exploration path could not be linked",
-        [&](mgg::GraphManager& graph) {
+        [&](mgg::GraphManager& graph) -> mgg::Vertex* {
           rebuilt_before = graph.getNumVertices();
-          return lattice.empty()
-                     ? mgg::addRefPathToGraph(graph, path, ctx,
-                                              global_vertex_spacing_,
-                                              &rebuilt_added)
-                     : mgg::addRefPathToGraph(graph, lattice, ctx,
-                                              global_vertex_spacing_,
-                                              &rebuilt_added, carries_gain);
+          const bool joined =
+              lattice.empty()
+                  ? mgg::addRefPathToGraph(graph, path, ctx,
+                                           global_vertex_spacing_,
+                                           &rebuilt_added)
+                  : mgg::addRefPathToGraph(graph, lattice, ctx,
+                                           global_vertex_spacing_,
+                                           &rebuilt_added, carries_gain);
+          return joined && !rebuilt_added.empty() ? rebuilt_added.front()
+                                                  : nullptr;
         });
     if (rebuilt) {
       before = rebuilt_before;
@@ -2682,14 +2794,19 @@ bool PlannerNode::routeOverGlobalGraph(const mgg::StateVec goal,
       mgg::linkDeparture(*global_graph_, current, ctx, kLinkRadius);
   // Only when no vertex of the graph is within an edge of the robot: a
   // robot wedged beside a healthy graph (its box refused) keeps it. The
-  // rebuilt graph replaces it only if the robot's pose links to it.
-  if (departure.vertex == nullptr && !globalGraphReaches(current) &&
+  // rebuilt graph replaces it only if the robot's pose links to it. Not
+  // for an aerial robot, which relinks as it flies (odometry, exploration
+  // paths): its keyframes start on the pad, whose floor its box sits in,
+  // and a rebuild cut the drone's home off (drone scout Task 17, C).
+  if (departure.vertex == nullptr &&
+      robot_params_.type == mgg::RobotType::kGroundRobot &&
+      !globalGraphReaches(current) &&
       rebuildGlobalGraphFromKeyframes(
           RoadmapRebuildTrigger::kPoseUnlinkable,
           "the current pose cannot be linked",
           [&current, &ctx](mgg::GraphManager& graph) {
             return mgg::linkDeparture(graph, current, ctx, kLinkRadius)
-                       .vertex != nullptr;
+                .vertex;
           })) {
     departure = mgg::linkDeparture(*global_graph_, current, ctx, kLinkRadius);
   }
