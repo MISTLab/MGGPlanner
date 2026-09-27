@@ -2000,6 +2000,7 @@ std::string PlannerNode::buildLocalGraph() {
   best_path_from_global_graph_ = false;
   boxed_in_without_departure_now_ = false;
   local_gain_remains_now_ = false;
+  low_gain_path_now_ = false;
   if (!have_odometry_) return "no odometry received yet";
   if (!map_->getStatus()) {
     if (mola_map_ != nullptr) {
@@ -2303,13 +2304,21 @@ std::string PlannerNode::buildLocalGraph() {
   // towards the global planner; a round with one counts back. A round with
   // frontiers but no path to send counts as one without: the lattice sees
   // gain it cannot reach, which is local gain left, not a finished
-  // exploration, and not a reason never to reposition either.
+  // exploration, and not a reason never to reposition either. So does a
+  // path scoring under low_gain_voxels (run 8: with every vertex a
+  // frontier, robot_3 lapped an explored hangar on 2 to 150 voxels' gain).
+  const double low_gain_score =
+      planning_params_.low_gain_voxels * planning_params_.unknown_voxel_gain;
   if (local_graph_->getNumVertices() <= 1) {
     // Nothing was scored; this round says nothing about the frontier.
   } else if (frontiers == 0 || goes_nowhere || best_path_.empty()) {
     ++low_gain_rounds_;
     local_gain_remains_now_ =
         frontiers > 0 || (goes_nowhere && sel.best_full_gain > 0.0);
+  } else if (!is_boxed_in && sel.best_gain < low_gain_score) {
+    ++low_gain_rounds_;
+    low_gain_path_now_ = true;
+    local_gain_remains_now_ = true;
   } else if (low_gain_rounds_ > 0) {
     --low_gain_rounds_;
   }
@@ -2715,7 +2724,8 @@ mgg::PathOkFn PlannerNode::applyRouteTurnRule(
   };
 }
 
-bool PlannerNode::runGlobalPlanner(int target_id, std::string& reason) {
+bool PlannerNode::runGlobalPlanner(int target_id, std::string& reason,
+                                   double min_gain) {
   best_path_.clear();
   best_path_from_global_graph_ = false;
   if (global_graph_->getNumVertices() <= 1) {
@@ -2770,6 +2780,15 @@ bool PlannerNode::runGlobalPlanner(int target_id, std::string& reason) {
                     "%d global frontier(s), none reachable with gain (%d "
                     "re-checked out)",
                     report.frontiers, report.demoted);
+      reason = why;
+      return false;
+    }
+    if (report.best_gain < min_gain) {
+      char why[192];
+      std::snprintf(why, sizeof(why),
+                    "the best of %d global frontier(s) has gain %.1f, under "
+                    "the low-gain threshold %.1f",
+                    report.frontiers, report.best_gain, min_gain);
       reason = why;
       return false;
     }
@@ -2989,6 +3008,16 @@ void PlannerNode::onPlanRequest(
         }
       }
     }
+    // A low-gain lattice path, once the low-gain rounds are due and the
+    // tour has not decided, is set aside for the fleet and the global
+    // planner below, as no path would be; it is sent only when neither
+    // gives the robot anywhere to go.
+    std::vector<mgg::StateVec> low_gain_path;
+    if (!tour_decided && low_gain_path_now_ && !best_path_.empty() &&
+        local_graph_->getNumVertices() > 1 &&
+        low_gain_rounds_ >= auto_global_planner_low_gain_rounds_) {
+      low_gain_path.swap(best_path_);
+    }
     // An empty lattice is a map that does not yet show the robot's
     // surroundings, not an explored one: PCI retries as the map grows. The
     // global planner is consulted once the lattice existed and saw nothing
@@ -3021,7 +3050,13 @@ void PlannerNode::onPlanRequest(
       auto map_read = mapReadLease();
       low_gain_rounds_ = 0;
       std::string departure;
-      if (!runGlobalPlanner(-1, reason)) {
+      // A low-gain path set aside is handed over only for a frontier worth
+      // more than the threshold it fell under.
+      const double min_gain =
+          low_gain_path.empty() ? 0.0
+                                : planning_params_.low_gain_voxels *
+                                      planning_params_.unknown_voxel_gain;
+      if (!runGlobalPlanner(-1, reason, min_gain)) {
         if (local_gain_remains_now_) {
           // The lattice still sees gain it cannot send a path to; that is
           // not a finished exploration. No path, and PCI retries.
@@ -3047,6 +3082,16 @@ void PlannerNode::onPlanRequest(
             departure;
       } else {
         summary += "; no local gain, repositioning over the global graph";
+      }
+    }
+    if (!low_gain_path.empty()) {
+      if (best_path_.empty()) {
+        best_path_.swap(low_gain_path);
+        best_path_from_global_graph_ = false;
+        summary += "; keeps its low-gain local path";
+      } else {
+        ++low_gain_handoffs_;
+        summary += "; low-gain local path handed over";
       }
     }
   }

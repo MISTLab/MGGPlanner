@@ -175,8 +175,11 @@ class PlannerNode : public rclcpp::Node {
   /// Dijkstra over the global graph to the best frontier (rrg.cpp:5559
   /// Rrg::runGlobalPlanner), or to `target_id` when the current global
   /// repositioning is resumed. Fills best_path_; returns false with a reason
-  /// when no route exists.
-  bool runGlobalPlanner(int target_id, std::string& reason);
+  /// when no route exists, or when the best frontier's discounted gain is
+  /// under `min_gain` (a low-gain lattice path is handed over only for a
+  /// frontier worth more than it).
+  bool runGlobalPlanner(int target_id, std::string& reason,
+                        double min_gain = 0.0);
   /// Dijkstra over the global graph from the robot to `goal`, linking both
   /// ends into the graph first: the goal stands for the vertex within
   /// `goal_tolerance` of it, or (tolerance zero, or none there) gets its own
@@ -491,13 +494,22 @@ class PlannerNode : public rclcpp::Node {
   int planner_trigger_count_ = 0;
 
   /// rrg.cpp:2098 to 2120: rounds without a frontier among the local
-  /// leaves; at the configured count the global planner runs.
+  /// leaves, or whose best path scores under low_gain_voxels; at the
+  /// configured count the global planner runs.
   int low_gain_rounds_ = 0;
   /// Whether the last lattice path chosen turned back: the next selection
   /// then bounds no direction penalty.
   mgg::TurnBackHysteresis turn_back_hysteresis_;
   /// Lattice paths chosen that turned back, since the node started.
   int paths_turning_back_ = 0;
+  /// This cycle's lattice path scores under low_gain_voxels
+  /// (buildLocalGraph resets it). Once the low-gain rounds are due, the
+  /// global planner is consulted first and the path is kept only when it
+  /// finds no route.
+  bool low_gain_path_now_ = false;
+  /// Low-gain lattice paths replaced by a global repositioning, since the
+  /// node started.
+  int low_gain_handoffs_ = 0;
   /// Exploration paths and global routes sent to end where no pose had
   /// viewpoint clearance (mgg::viewpointClear), since the node started.
   int unclear_viewpoints_selected_ = 0;

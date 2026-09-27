@@ -443,6 +443,17 @@ class PlannerNodeTestPeer {
   static int lowGainRounds(PlannerNode& node) {
     return node.low_gain_rounds_;
   }
+  static int lowGainHandoffs(PlannerNode& node) {
+    return node.low_gain_handoffs_;
+  }
+  /// A path scoring under `voxels` unknown voxels is a low-gain round.
+  static void setLowGainVoxels(PlannerNode& node, double voxels) {
+    node.planning_params_.low_gain_voxels = voxels;
+  }
+  /// The low-gain rounds are due at once; the tour is left as it is.
+  static void lowGainRoundsDueAtOnce(PlannerNode& node) {
+    node.auto_global_planner_low_gain_rounds_ = 0;
+  }
   /// Gain is counted at leaves only, as bistro.yaml has it.
   static void gainAtLeavesOnly(PlannerNode& node) {
     node.planning_params_.leafs_only_for_volumetric_gain = true;
@@ -997,6 +1008,94 @@ TEST_F(PlannerNodeTest, APathEndingWithinTheGoalToleranceIsNoPath) {
   EXPECT_EQ(response->status, mgg_msgs::srv::PlannerSrv::Response::FORWARD);
   ASSERT_GE(response->path.size(), 2u);
   EXPECT_LT(response->path.back().position.x, -1.0);
+}
+
+TEST_F(PlannerNodeTest, APathWithLittleGainCountsTowardsGlobalRepositioning) {
+  // Run 8, robot_3: every lattice vertex was a frontier, so rounds with a
+  // few voxels' gain never counted as low gain, and the robot lapped an
+  // explored hangar. A path scoring under low_gain_voxels is a low-gain
+  // round, and is still sent while the rounds are not due; one above it
+  // counts back.
+  auto node = makeNode("little_gain_counts");
+  PlannerNodeTestPeer::observeFloor(*node, -1.5, 4.0, -1.5, 1.5);
+  PlannerNodeTestPeer::acceptOdometry(*node, 0.0, 0.0, 1.0);
+  PlannerNodeTestPeer::setLowGainVoxels(*node, 1e9);
+  auto response = std::make_shared<mgg_msgs::srv::PlannerSrv::Response>();
+  PlannerNodeTestPeer::plan(*node, response);
+  ASSERT_EQ(response->status, mgg_msgs::srv::PlannerSrv::Response::FORWARD);
+  EXPECT_GE(response->path.size(), 2u);
+  EXPECT_EQ(PlannerNodeTestPeer::lowGainRounds(*node), 1);
+  EXPECT_EQ(PlannerNodeTestPeer::lowGainHandoffs(*node), 0);
+
+  PlannerNodeTestPeer::setLowGainVoxels(*node, 0.0);
+  response = std::make_shared<mgg_msgs::srv::PlannerSrv::Response>();
+  PlannerNodeTestPeer::plan(*node, response);
+  ASSERT_EQ(response->status, mgg_msgs::srv::PlannerSrv::Response::FORWARD);
+  EXPECT_EQ(PlannerNodeTestPeer::lowGainRounds(*node), 0);
+}
+
+TEST_F(PlannerNodeTest, ALowGainPathIsHandedOverToTheGlobalPlannerWhenDue) {
+  // The low-gain rounds due, a low-gain lattice path is set aside for the
+  // global planner: with a global frontier behind the robot worth more than
+  // the threshold, it is routed there over the global graph instead. The
+  // lattice path scores 721 and the frontier 938 (discounted), so a
+  // threshold of 80 voxels at unknown_voxel_gain 10 lies between them.
+  auto node = makeNode("low_gain_handoff");
+  PlannerNodeTestPeer::observeFloor(*node, -1.5, 4.0, -1.5, 1.5);
+  PlannerNodeTestPeer::acceptOdometry(*node, 0.0, 0.0, 1.0);
+  PlannerNodeTestPeer::addGlobalChainToFrontier(
+      *node, {{-0.5, 0.0}, {-1.0, 0.0}, {-1.5, 0.0}}, M_PI);
+  PlannerNodeTestPeer::consultGlobalPlannerAtOnce(*node);
+  PlannerNodeTestPeer::setLowGainVoxels(*node, 80.0);
+  auto response = std::make_shared<mgg_msgs::srv::PlannerSrv::Response>();
+  PlannerNodeTestPeer::plan(*node, response);
+  ASSERT_EQ(response->status, mgg_msgs::srv::PlannerSrv::Response::FORWARD);
+  ASSERT_GE(response->path.size(), 2u);
+  EXPECT_TRUE(PlannerNodeTestPeer::bestPathFromGlobalGraph(*node));
+  EXPECT_EQ(PlannerNodeTestPeer::lowGainHandoffs(*node), 1);
+  EXPECT_EQ(PlannerNodeTestPeer::lowGainRounds(*node), 0);
+}
+
+TEST_F(PlannerNodeTest, ALowGainPathTowardTheTourTargetIsLeftToTheTour) {
+  // Tour-exploration design §2.4: the tour's target decides when the robot
+  // leaves local exploration. A low-gain lattice path toward the target is
+  // kept, however many low-gain rounds are due; the greedy global planner
+  // does not overrule the tour.
+  auto node = makeNode("low_gain_tour");
+  PlannerNodeTestPeer::observeFloor(*node, -1.5, 4.0, -1.5, 1.5);
+  PlannerNodeTestPeer::acceptOdometry(*node, 0.0, 0.0, 1.0);
+  PlannerNodeTestPeer::addGlobalChainToFrontier(
+      *node, {{0.5, 0.0}, {1.0, 0.0}, {1.5, 0.0}, {2.0, 0.0}, {2.5, 0.0},
+              {3.0, 0.0}, {3.5, 0.0}});
+  PlannerNodeTestPeer::setTour(*node, true, 0.0);
+  PlannerNodeTestPeer::lowGainRoundsDueAtOnce(*node);
+  PlannerNodeTestPeer::setLowGainVoxels(*node, 1e9);
+  auto response = std::make_shared<mgg_msgs::srv::PlannerSrv::Response>();
+  PlannerNodeTestPeer::plan(*node, response);
+  ASSERT_EQ(response->status, mgg_msgs::srv::PlannerSrv::Response::FORWARD);
+  ASSERT_GE(response->path.size(), 2u);
+  EXPECT_FALSE(PlannerNodeTestPeer::bestPathFromGlobalGraph(*node));
+  EXPECT_NE(PlannerNodeTestPeer::tourTarget(*node), mgg::kNoCluster);
+  EXPECT_EQ(PlannerNodeTestPeer::lowGainHandoffs(*node), 0);
+  EXPECT_GT(response->path.back().position.x, 0.0);
+}
+
+TEST_F(PlannerNodeTest, ALowGainPathIsKeptWhenNoGlobalFrontierIsWorthMore) {
+  // The rounds due, and the only global frontier, the one the lattice path
+  // itself leaves, is worth less than the threshold: it is not handed over
+  // for that, and the low-gain path is sent after all, not exploration
+  // complete.
+  auto node = makeNode("low_gain_kept");
+  PlannerNodeTestPeer::observeFloor(*node, -1.5, 4.0, -1.5, 1.5);
+  PlannerNodeTestPeer::acceptOdometry(*node, 0.0, 0.0, 1.0);
+  PlannerNodeTestPeer::consultGlobalPlannerAtOnce(*node);
+  PlannerNodeTestPeer::setLowGainVoxels(*node, 1e9);
+  auto response = std::make_shared<mgg_msgs::srv::PlannerSrv::Response>();
+  PlannerNodeTestPeer::plan(*node, response);
+  ASSERT_EQ(response->status, mgg_msgs::srv::PlannerSrv::Response::FORWARD);
+  ASSERT_GE(response->path.size(), 2u);
+  EXPECT_EQ(PlannerNodeTestPeer::lowGainHandoffs(*node), 0);
+  EXPECT_FALSE(PlannerNodeTestPeer::bestPathFromGlobalGraph(*node));
 }
 
 TEST_F(PlannerNodeTest, WithGainAtLeavesOnlyAPlanWithPathsPulledBackStillSendsOne) {
