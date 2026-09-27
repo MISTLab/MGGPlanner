@@ -1584,6 +1584,49 @@ TEST(FleetCoordinator, LeaveOrderingUsesStampThenSeqAndAllowsARestartToRejoin) {
   EXPECT_EQ(peer.group(11.2), (std::vector<int>{1, 2}));
 }
 
+TEST(FleetCoordinator, AfterAClockRollbackPeersCanRejoinAndLeaveOnTheNewClock) {
+  FleetCoordinator peer(1, FleetParams{}, 0.2);
+  TourBidData normal = noClusters();
+  normal.robot_id = 3;
+  normal.seq = 30;
+  normal.stamp_s = 100.0;
+  normal.clusters = {cluster(77, 3, 5.0)};
+  normal.costs_from_pose = {5.0};
+  normal.costs_between = {0.0};
+  normal.bundle = {77};
+  peer.onBid(normal, 100.0);
+  TourBidData leaving;
+  leaving.robot_id = 2;
+  leaving.seq = 20;
+  leaving.stamp_s = 100.0;
+  leaving.leaving = true;
+  peer.onBid(leaving, 100.0);
+
+  peer.tick(1.0, noClusters, euclid, nullptr);  // simulation clock reset
+  // Rebasing keeps seq: an older message at the rebased stamp stays stale.
+  auto rejoin = noClusters();
+  rejoin.robot_id = 2;
+  rejoin.stamp_s = 1.0;
+  rejoin.seq = 19;
+  peer.onBid(rejoin, 1.0);
+  leaving.robot_id = 3;
+  leaving.stamp_s = 1.0;
+  leaving.seq = 29;
+  peer.onBid(leaving, 1.0);
+  EXPECT_EQ(peer.group(1.0), (std::vector<int>{1, 3}));
+  EXPECT_EQ(peer.claimedByOthers(1.0).size(), 1u);
+
+  rejoin.stamp_s = 1.1;
+  rejoin.seq = 21;
+  peer.onBid(rejoin, 1.1);
+  EXPECT_EQ(peer.group(1.1), (std::vector<int>{1, 2, 3}));
+  leaving.stamp_s = 1.1;
+  leaving.seq = 31;
+  peer.onBid(leaving, 1.1);
+  EXPECT_EQ(peer.group(1.1), (std::vector<int>{1, 2}));
+  EXPECT_TRUE(peer.claimedByOthers(1.1).empty());
+}
+
 TEST(FleetCoordinator, AnAwardCannotResurrectTheClaimOfAPeerKnownToHaveLeft) {
   FleetCoordinator peer(3, FleetParams{}, 0.2);
   const auto award = makeAward(1, 1, 1.0, {{2, {77}}},

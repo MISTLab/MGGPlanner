@@ -83,6 +83,12 @@ void FleetCoordinator::rebaseFutureTimes(double now_s) {
   for (auto& [robot_id, stamp_s] : claim_stamp_s_) {
     stamp_s = std::min(stamp_s, now_s);
   }
+  for (auto& [robot_id, order] : away_) {
+    order.first = std::min(order.first, now_s);
+  }
+  for (auto& [robot_id, order] : last_normal_bid_) {
+    order.first = std::min(order.first, now_s);
+  }
   if (now_s < round_heard_s_) {
     applied_stamp_s_.clear();
     answered_call_s_.clear();

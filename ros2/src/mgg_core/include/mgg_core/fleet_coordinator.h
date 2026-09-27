@@ -90,7 +90,8 @@ class FleetCoordinator {
   /// An exit older than the latest normal bid is ignored. Between normal
   /// bids the existing timestamp-based claim policy is unchanged.
   /// While a peer is away, its calls/awards and claims in others' awards
-  /// cannot restore it. Ordering assumes the sender clock has not reset.
+  /// cannot restore it. On clock rollback, future order stamps are clamped
+  /// to the local receipt time; seq is kept to break ties on the new clock.
   void onBid(const TourBidData& bid, double now_s);
   /// A peer's call or award, in this robot's frame. A malformed one (a
   /// non-finite position, a non-finite or negative silence, a bundle ID no
@@ -190,7 +191,8 @@ class FleetCoordinator {
   /// the next bid, award or call waits at most one interval or deadline. The
   /// rounds applied and answered are forgotten, as their stamps are of the
   /// old clock, a pending request is sent again, and a claim's source stamp
-  /// in the future becomes `now_s`. Called first by every member that takes
+  /// in the future becomes `now_s`, as do leave/normal bid order stamps
+  /// (their seqs are kept). Called first by every member that takes
   /// the time.
   void rebaseFutureTimes(double now_s);
   /// `robot_id` was heard at the local receipt time `now_s`.
