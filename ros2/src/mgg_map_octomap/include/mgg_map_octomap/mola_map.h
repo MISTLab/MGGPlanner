@@ -8,6 +8,7 @@
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -22,6 +23,19 @@
 
 namespace mgg {
 
+/// One new grid put in service (MolaMap installs it on its worker thread).
+struct MolaInstallation {
+  /// Steady-clock seconds from receiving the authority heartbeat whose
+  /// product this grid is (requestSnapshot) to its installation.
+  double authority_to_install_s = 0.0;
+  /// The product's newest keyframe stamp (the manifest's newest submap
+  /// observed_at_ns, which the grid's source_stamp_ns must equal), in the
+  /// mapping clock; 0 when the product has none.
+  std::uint64_t source_stamp_ns = 0;
+  std::string component_id;
+  std::uint64_t graph_revision = 0;
+};
+
 struct MolaMapConfig {
   std::string peer_root;
   double resolution = 0.2;
@@ -35,6 +49,9 @@ struct MolaMapConfig {
   std::size_t max_grid_bytes = 256u * 1024u * 1024u;
   std::size_t max_voxels = 2000000u;
   std::chrono::milliseconds max_load_time{2000};
+  /// Called once per new grid installed, on the worker thread, outside
+  /// every lock; not for a same-grid reload or a retained predecessor.
+  std::function<void(const MolaInstallation&)> on_install{};
 };
 
 /// Exact authority identity associated with one MappingSnapshot message.

@@ -114,6 +114,30 @@ PlannerNode::PlannerNode(const rclcpp::NodeOptions& options)
     map_cfg.max_load_time = std::chrono::milliseconds(std::clamp(
         declareOrGet<std::int64_t>(this, "map.mola.max_load_ms", 2000),
         std::int64_t{1}, std::int64_t{10000}));
+    // Map freshness, one line per grid installed (run-9 measurement):
+    // steady-clock time from the authority heartbeat to installation, and
+    // the node clock (sim time in simulation) less the product's newest
+    // keyframe stamp. Captures no `this`: it runs on the map's worker.
+    // The robot is the namespace's first segment (/robot_1/mgg), else the
+    // node's name.
+    std::string robot = get_namespace();
+    const std::size_t first = robot.find_first_not_of('/');
+    robot = first == std::string::npos ? "" : robot.substr(first);
+    robot = robot.substr(0, robot.find('/'));
+    if (robot.empty()) robot = get_name();
+    map_cfg.on_install = [logger = get_logger(), clock = get_clock(),
+                          robot](const mgg::MolaInstallation& installed) {
+      char source_age[32] = "null";
+      if (installed.source_stamp_ns > 0) {
+        std::snprintf(source_age, sizeof(source_age), "%.3f",
+                      clock->now().seconds() -
+                          static_cast<double>(installed.source_stamp_ns) * 1e-9);
+      }
+      RCLCPP_INFO(logger,
+                  "mapping_age {\"robot_id\":\"%s\",\"authority_to_mgg_age_s\":%.3f,"
+                  "\"source_to_mgg_age_s\":%s}",
+                  robot.c_str(), installed.authority_to_install_s, source_age);
+    };
     auto backend = std::make_unique<mgg::MolaMap>(map_cfg);
     mola_map_ = backend.get();
     map_ = std::move(backend);

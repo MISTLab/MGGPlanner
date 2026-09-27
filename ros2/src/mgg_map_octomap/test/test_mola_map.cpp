@@ -19,6 +19,7 @@
 #include <memory>
 #include <sstream>
 #include <string>
+#include <mutex>
 #include <thread>
 #include <utility>
 #include <vector>
@@ -1061,6 +1062,47 @@ TEST(MolaMap, CorrectedSnapshotAtomicallyRetractsOldGeometry) {
     return !provider.getStatus() && !provider.lastError().empty();
   }));
   EXPECT_NE(provider.lastError().find("cannot open MOLA index"), std::string::npos);
+}
+
+// The run-9 freshness measurement: one call per new grid installed, with
+// the time since its authority heartbeat and the product's newest keyframe
+// stamp; none for a heartbeat that only confirms the grid in service.
+TEST(MolaMap, EachNewGridInstalledIsReportedOnce) {
+  Publication publication;
+  std::mutex mutex;
+  std::vector<mgg::MolaInstallation> installs;
+  MolaMapConfig cfg = config(publication);
+  cfg.on_install = [&](const mgg::MolaInstallation& installed) {
+    std::lock_guard<std::mutex> lock(mutex);
+    installs.push_back(installed);
+  };
+  const auto count = [&]() {
+    std::lock_guard<std::mutex> lock(mutex);
+    return installs.size();
+  };
+  MolaMap provider(cfg);
+  const auto first = publication.publish(0, {{5, 0, 0}}, freeBlock());
+  ASSERT_GT(first.source_stamp_ns, 0u);
+  provider.requestSnapshot(first);
+  ASSERT_TRUE(waitFor([&]() { return count() == 1; })) << provider.lastError();
+  {
+    std::lock_guard<std::mutex> lock(mutex);
+    EXPECT_EQ(installs[0].source_stamp_ns, first.source_stamp_ns);
+    EXPECT_EQ(installs[0].graph_revision, first.graph_revision);
+    EXPECT_GE(installs[0].authority_to_install_s, 0.0);
+    EXPECT_LT(installs[0].authority_to_install_s, 5.0);
+  }
+  // The same heartbeat again is confirmed by stat: nothing installed.
+  provider.requestSnapshot(first);
+  std::this_thread::sleep_for(std::chrono::milliseconds(100));
+  EXPECT_EQ(count(), 1u);
+  // A successor is.
+  const auto second = publication.publish(1, {{8, 0, 0}}, freeBlock());
+  provider.requestSnapshot(second);
+  ASSERT_TRUE(waitFor([&]() { return count() == 2; })) << provider.lastError();
+  std::lock_guard<std::mutex> lock(mutex);
+  EXPECT_EQ(installs[1].graph_revision, second.graph_revision);
+  EXPECT_EQ(installs[1].source_stamp_ns, second.source_stamp_ns);
 }
 
 TEST(MolaMap, ReadLeaseKeepsOneSnapshotAcrossAQueryTransaction) {

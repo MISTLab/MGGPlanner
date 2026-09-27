@@ -1,5 +1,7 @@
 #include "mgg_map_octomap/mola_map.h"
 
+#include <optional>
+
 #include <nlohmann/json.hpp>
 #include <openssl/evp.h>
 
@@ -547,6 +549,7 @@ void MolaMap::workerLoop() {
       if (stopping_) return;
       pending = std::move(pending_);
     }
+    std::optional<MolaInstallation> installed;
     try {
       auto loaded = load(*pending);
       const std::lock_guard<std::recursive_mutex> publication_lock(
@@ -573,6 +576,13 @@ void MolaMap::workerLoop() {
           prior == nullptr || !sameIdentity(prior->request, loaded->request) ||
           prior->artifact_digest != loaded->artifact_digest ||
           !sameTransform(prior->request, loaded->request);
+      if (semantic_change) {
+        installed = MolaInstallation{
+            std::chrono::duration<double>(Clock::now() - pending->received_at)
+                .count(),
+            loaded->request.source_stamp_ns, loaded->request.component_id,
+            loaded->request.graph_revision};
+      }
       std::atomic_store(&active_, std::move(loaded));
       if (semantic_change)
         active_generation_.fetch_add(1, std::memory_order_release);
@@ -583,6 +593,7 @@ void MolaMap::workerLoop() {
     } catch (const std::exception& error) {
       failIfLatest(pending->generation, error.what());
     }
+    if (installed && config_.on_install) config_.on_install(*installed);
   }
 }
 
