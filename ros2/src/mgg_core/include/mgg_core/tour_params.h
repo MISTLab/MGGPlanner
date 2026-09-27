@@ -17,15 +17,15 @@ namespace mgg {
 struct TourParams {
   /// Use the tour instead of low-gain-triggered greedy repositioning.
   bool enabled = true;
-  /// Clusters whose representative's gain is below this are dropped. Tuned
-  /// in the SubT simulation; the starting value is ten unknown voxels at the
-  /// deployed unknown_voxel_gain of 60.
-  double min_cluster_gain = 600.0;
+  /// Clusters whose representative's gain is below this are dropped. Chosen
+  /// on SubT exploration metrics (§5.1); the plan-time gate is deferred.
+  /// Equivalent to twenty unknown voxels at unknown_voxel_gain 60.
+  double min_cluster_gain = 1200.0;
   /// Grid a representative's position is quantized on for its stable ID,
   /// metres.
   double cluster_id_cell_m = 1.0;
-  /// Cost of the first leg's heading change, metres per radian. Tuned; the
-  /// starting value makes a U-turn cost about 6 m of driving.
+  /// Cost of the first leg's heading change, metres per radian. Chosen on
+  /// SubT exploration metrics (§5.1); a U-turn costs about 6 m of driving.
   double heading_weight = 2.0;
   /// Minimum interval between tour solves, seconds.
   double recompute_interval_s = 1.0;
@@ -44,8 +44,9 @@ struct FleetParams {
   /// Clusters closer than this are one: in the tour's clustering, in the
   /// auction pool, and when matching a cluster to a claim, metres.
   double cluster_merge_radius_m = 2.0;
-  /// Balance penalty on a bidder's bundle tour cost. Tuned.
-  double balance_weight = 0.3;
+  /// Balance penalty on a bidder's bundle tour cost. Chosen on SubT
+  /// exploration metrics (§5.1); the plan-time gate is deferred.
+  double balance_weight = 0.6;
   /// Minimum interval between auctions, and between periodic bids, seconds.
   double auction_interval_s = 2.0;
   /// How long the auctioneer waits for bids, seconds.

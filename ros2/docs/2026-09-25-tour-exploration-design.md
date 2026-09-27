@@ -183,21 +183,156 @@ on, and keeps leases for operator goals and Return Home.
 | Parameter | Default | Meaning |
 |---|---|---|
 | `tour.enabled` | true | Use the tour instead of low-gain-triggered greedy repositioning |
-| `tour.min_cluster_gain` | tuned | Drop clusters below this gain |
+| `tour.min_cluster_gain` | 1200 | Drop clusters below this gain |
 | `tour.cluster_id_cell_m` | 1.0 | Quantization for stable cluster IDs |
-| `tour.heading_weight` | tuned | Cost per radian of first-leg heading change |
+| `tour.heading_weight` | 2.0 | Cost per radian of first-leg heading change |
 | `tour.recompute_interval_s` | 1.0 | Minimum interval between tour solves |
 | `tour.commit_margin` | 0.2 | Fractional cost gain needed to switch target |
 | `fleet.enabled` | true | Bid, run and follow frontier auctions |
 | `fleet.cluster_merge_radius_m` | 2.0 | Clusters closer than this are one |
-| `fleet.balance_weight` | tuned | Balance penalty on bundle tour cost |
+| `fleet.balance_weight` | 0.6 | Balance penalty on bundle tour cost |
 | `fleet.auction_interval_s` | 2.0 | Minimum interval between auctions |
 | `fleet.bid_deadline_s` | 1.0 | How long the auctioneer waits for bids |
 | `fleet.peer_timeout_s` | 5.0 | A robot not heard for this long leaves the group (its claims stay, see TTL) |
 | `fleet.claim_ttl_s` | 1800 | Claim lifetime of a silent peer (SwarmDeck SubT sim: 600) |
 
-"Tuned" values are set from the SubT simulation during implementation and
-recorded here.
+### 5.1 Tuning record
+
+**Chosen on exploration metrics; plan-time gate deferred, not passed.**
+Measured on 2026-09-27 in SwarmDeck's SubT finals simulation, four robots,
+30 simulated minutes per run, `--render gpu --odometry drift
+--robot-poses ground_truth`, `fleet.claim_ttl_s=600`, reservation leases
+still on. MGG `81e33447db01c729491a8277963b5861873e8ff3`; SwarmDeck
+`48c0c9ef304e8d94cc98084e4b1097bb76638c1d`. Inter-robot C-SLAM merges
+remain deferred to delivery step 3.
+
+The original rule excluded median plan times above 350 ms. The baseline
+and all three gain candidates exceeded it. The supervisor deferred that
+exclusion for this tuning, attributing it to the base planner's duplicated,
+size-limited lattice (the separate run-8 fixes lane). **Re-check the timing
+gate after those fixes merge.** A4 subsequently measured 341 ms, but three
+of its robots spent most of the run stationary; that is not evidence that
+the feature generally meets the timing goal.
+
+The remaining rule was fixed before comparison: highest coverage at
+20 minutes; within two percentage points, fewer re-driven metres.
+Gain candidates were 300/600/1200 at heading 2, then headings 1/2/4 at
+gain 1200, then balance weights 0.1/0.3/0.6 at gain 1200, heading 2.
+
+| Run | Parameters | Explored at 20 min | 90 % at | 99 % at | Re-driven m | Median plan ms | Longest unassigned while idle |
+|---|---|---:|---|---|---:|---:|---|
+| baseline | tour off, fleet off | 62.03% | not reached | not reached | 1345.9 | 697 (contended) | not applicable: fleet off |
+| A1 | gain 300, heading 2, fleet off | 49.45% | not reached | not reached | 640.8 | 581 | not applicable: fleet off |
+| A2 | gain 600, heading 2, fleet off | 42.24% | not reached | not reached | 1687.9 | 723 | not applicable: fleet off |
+| A3 | gain 1200, heading 2, fleet off | 65.18% | not reached | not reached | 798.1 | 740 | not applicable: fleet off |
+| A4 | gain 1200, heading 1, fleet off | 49.99% | not reached | not reached | 143.9 | 341 | not applicable: fleet off |
+| A5 | gain 1200, heading 4, fleet off | 52.78% | not reached | not reached | 2003.8 | 795 | not applicable: fleet off |
+| B1 | gain 1200, heading 2, balance 0.1 | 40.24% | not reached | not reached | 965.5 | 625 | 0 s logged overlap* |
+| B2 | gain 1200, heading 2, balance 0.3 | 46.19% | not reached | not reached | 1608.6 | 783 | 0 s logged overlap* |
+| B3 | gain 1200, heading 2, balance 0.6 | 48.27% | not reached | not reached | 582.3 | 574 | 0 s logged overlap* |
+| baseline repeat | tour off, fleet off; uncontended | 33.28% | not reached | not reached | 1396.3 | 613 | not applicable: fleet off |
+
+Use **613 ms** as the uncontended baseline timing reference. Its exploration
+outcome differs materially from the original baseline, so both observations
+are retained rather than combining one run's coverage with another's timing.
+The original baseline had intermittent colcon/test contention; candidate
+runs and the repeat had none observed. Every run's early real-time factor
+was at least 0.97. Whole-run factors were 0.890 for B2, 0.990 for A5, and
+approximately 1.000 otherwise. All windows used `/clock`, not wall time.
+
+| Run | Coverage at 5 / 10 / 30 min | Longest tour costing + solve ms | Re-driven m, robots 0 / 1 / 2 / 3 |
+|---|---|---:|---|
+| baseline | 26.02 / 41.07 / 64.31% | not applicable: tour off | 156.1 / 401.8 / 384.2 / 403.9 |
+| A1 | 20.82 / 45.83 / 49.45% | 92.6 | 60.0 / 351.0 / 134.5 / 95.3 |
+| A2 | 18.79 / 33.80 / 55.37% | 168.2 | 90.7 / 554.8 / 665.7 / 376.7 |
+| A3 | 23.97 / 45.50 / 65.18% | 81.1 | 51.7 / 108.6 / 297.5 / 340.4 |
+| A4 | 24.67 / 33.98 / 61.59% | 36.3 | 0.0 / 0.0 / 142.6 / 1.3 |
+| A5 | 24.01 / 39.16 / 67.21% | 749.8 | 491.9 / 652.8 / 653.3 / 205.7 |
+| B1 | 20.28 / 25.04 / 65.24% | 121.0 | 212.9 / 0.0 / 176.6 / 576.1 |
+| B2 | 23.03 / 35.16 / 56.60% | 110.9 | 627.7 / 411.2 / 321.3 / 248.4 |
+| B3 | 19.55 / 40.09 / 61.65% | 88.6 | 429.3 / 20.9 / 132.0 / 0.0 |
+| baseline repeat | 10.02 / 20.82 / 33.73% | not applicable: tour off | 39.7 / 572.0 / 564.1 / 220.5 |
+
+**Measurement procedure and limitations.** The earlier run-5/run-6 reports
+contain plan-time diagnostics, but no coverage/re-driving procedure or
+reference figures. The supervisor approved these replacements before runs:
+
+- Read-only, coherent SDMGRID1 grid/source/index snapshots every 60 simulated
+  seconds. A floor-proxy column has a measured surface endpoint with two
+  contiguous free 0.2-m voxels immediately above its occupied voxel. Union
+  the 0.2-m XY columns across robots, placed using their configured ground-truth
+  starts. This is projected observed floor, not a traversability oracle;
+  different levels collapse in XY and odometry drift affects placement.
+  The earlier fixed-height corridor floor proxies do not cover this multi-level
+  course. On the baseline, 4023/4104 trajectory-overlapping counted columns
+  (98.03%) had an endpoint within ±0.5 m of ground-truth base height, using
+  the configured +0.15-m vertical frame placement.
+- Denominator: union of final coverage over all ten runs, **3396.08 m²**
+  (84,902 columns). Numerators are intersections with that denominator;
+  90%/99% times are first observed 60-s samples, with no interpolation.
+  Final maps were captured after Stop (8–17 simulated seconds later, usually 11);
+  the 30-min column reports that post-stop snapshot. All 29 intermediate
+  sampling operations in every run began at their scheduled simulated second.
+  Robots were copied sequentially from their latest published products, not
+  an atomic fleet-wide map; source timestamps are retained in metadata.
+- Ground-truth positions at 1 Hz, 1801 samples per robot per run, maximum gap
+  1 s. Credit a full 3D segment as re-driven if its endpoint is within 2 m
+  of any own/peer trajectory point strictly older than 60 simulated seconds.
+- Lower median of logged `plan request: ...; N ms (global ...)` summaries;
+  maximum logged `costed and solved in N ms`. Logs were restricted to the
+  exploration window. Docker timestamps were mapped to recorded simulation
+  time for award/idle intervals.
+- *B1/B2/B3 had 86/45/5 positive-unassigned award lines, respectively, but
+  **no** `its bundle is done` or `exploration complete for this robot` lines.
+  Thus there was no logged overlap. Actual starvation while a controller is
+  blocked is **not measured** by this log proxy; this is not a pass of the
+  two-minute no-starvation goal.
+- At this SwarmDeck revision `--explore 1800` was inert. The scratch runner
+  waited for four ready adapters, then sent the UI's WebSocket commands
+  `{"type":"start_explore","robot_id":"robot_N"}` for N=0..3 at `/ws`,
+  and corresponding `stop_explore` commands after 1800 `/clock` seconds.
+  Each mission was fresh and ended with `sim-up --down`. A first baseline
+  at real-time factor 0.2 was discarded before adopting GPU/drift for all
+  measured runs.
+
+Stage decision denominators were 2905.28 m² (gain), 3221.60 m² (heading),
+and 3383.88 m² (balance): winners A3, A3, B3, respectively, with no two-point
+contender. Recomputing against the final union did not change any winner.
+**Chosen: `tour.min_cluster_gain=1200`, `tour.heading_weight=2.0`,
+`fleet.balance_weight=0.6`.** These are exploration-metric choices, not
+validated evidence of the §1 success goals.
+
+Known problems were retained, not fixed. Counts below are full traversals
+of the entrance corridor's x=-2..2 m segment with |y|≤3 m (multiple passages
+show backtracking), and the longest continuous period within 0.5 m of a
+stationary anchor; all tuples are robots 0/1/2/3, in simulated seconds.
+
+| Run | Corridor passages | Longest stationary span s | Notable recorded event |
+|---|---|---|---|
+| baseline | 1/1/3/1 | 620/23/454/209 | r0 tilt stop; r2/r3 progress failures |
+| A1 | 1/1/1/1 | 995/758/1037/1193 | r2 slope-turn/no-departure trap at planner (78.57,-37.33,0.43) |
+| A2 | 1/3/5/3 | 947/28/39/268 | corridor backtracking; r0 tilt stop |
+| A3 | 1/1/1/5 | 763/963/589/794 | r2 terminal 31° tilt; r3 backtracking/progress failure |
+| A4 | 1/0/1/0 | 1487/1745/43/1745 | r0 slope-turn/no-departure trap at planner (22.71,-62.79,-0.33) |
+| A5 | 3/3/5/1 | 25/11/53/24 | repeated corridor backtracking; no long final stall |
+| B1 | 1/0/1/3 | 186/1759/877/32 | r1 near-start tilt stop; r2 tilt escalation |
+| B2 | 9/2/1/3 | 32/290/47/1140 | r0 repeated backtracking; r1 terminal tilt; r3 controller failure |
+| B3 | 5/1/1/0 | 29/1268/982/1771 | r1 unsupported rising path; r3 replacement-path timeout |
+| baseline repeat | 1/3/7/3 | 1560/40/22/1019 | r0 controller failure; r2 repeated backtracking |
+
+The chosen tour alone (A3) exceeded the original baseline's 20-min proxy
+coverage by 3.15 points and reduced re-driving by 40.7%. Adding fleet
+assignment (B3) reduced coverage relative to A3 and the original baseline;
+its lower re-driving is confounded by stopped robots. No run reached 90% or
+99%. Baseline repeat variability is large. These single trials do not
+establish robust improvement, the historical run-5 comparison is not
+measured, and timing/starvation acceptance remains open.
+
+Reproduction evidence: tuf `/tmp/mgg-tour/runs/<run>/` (mission IDs,
+parameters, clocks, trajectory CSVs, snapshots, logs, metrics); scripts
+`/tmp/mgg-tour/metrics/`, also copied with the external Task-13 report.
+The report records the full commit IDs, gates, decision snapshots and
+cleanup. No SwarmDeck changes were committed.
 
 ## 6. Testing
 
