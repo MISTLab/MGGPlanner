@@ -324,11 +324,15 @@ The chosen tour alone (A3) exceeded the original baseline's 20-min proxy
 coverage by 3.15 points and reduced re-driving by 40.7%. Adding fleet
 assignment (B3) reduced coverage relative to A3 and the original baseline;
 its lower re-driving is confounded by stopped robots. No run reached 90% or
-99%. Baseline repeat variability is large. These single trials do not
+99%. Baseline repeat variability is large: the same configuration scored
+62.03% and 33.28% at 20 minutes, a 28.75-point spread that exceeds every
+stage's winning margin (gain 15.73, heading 12.40, balance 2.08 points). The
+three values are therefore provisional until repeated (at least three runs
+per configuration) after the run-8 planner fixes. These single trials do not
 establish robust improvement, the historical run-5 comparison is not
 measured, and timing/starvation acceptance remains open.
 
-Reproduction evidence: tuf `/tmp/mgg-tour/runs/<run>/` (mission IDs,
+Reproduction evidence (temporary scratch, not archived): tuf `/tmp/mgg-tour/runs/<run>/` (mission IDs,
 parameters, clocks, trajectory CSVs, snapshots, logs, metrics); scripts
 `/tmp/mgg-tour/metrics/`, also copied with the external Task-13 report.
 The report records the full commit IDs, gates, decision snapshots and

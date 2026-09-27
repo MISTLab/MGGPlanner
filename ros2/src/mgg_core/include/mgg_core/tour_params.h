@@ -18,7 +18,8 @@ struct TourParams {
   /// Use the tour instead of low-gain-triggered greedy repositioning.
   bool enabled = true;
   /// Clusters whose representative's gain is below this are dropped. Chosen
-  /// on SubT exploration metrics (§5.1); the plan-time gate is deferred.
+  /// on SubT exploration metrics (§5.1), provisional (single runs); the
+  /// plan-time gate is deferred.
   /// Equivalent to twenty unknown voxels at unknown_voxel_gain 60.
   double min_cluster_gain = 1200.0;
   /// Grid a representative's position is quantized on for its stable ID,
@@ -45,7 +46,8 @@ struct FleetParams {
   /// auction pool, and when matching a cluster to a claim, metres.
   double cluster_merge_radius_m = 2.0;
   /// Balance penalty on a bidder's bundle tour cost. Chosen on SubT
-  /// exploration metrics (§5.1); the plan-time gate is deferred.
+  /// exploration metrics (§5.1), provisional (single runs); the plan-time
+  /// gate is deferred.
   double balance_weight = 0.6;
   /// Minimum interval between auctions, and between periodic bids, seconds.
   double auction_interval_s = 2.0;
