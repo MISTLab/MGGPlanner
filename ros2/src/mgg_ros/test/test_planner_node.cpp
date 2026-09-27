@@ -1127,6 +1127,12 @@ class PlannerNodeTestPeer {
   static int roadmapRebuildsRefused(PlannerNode& node) {
     return node.roadmap_rebuilds_refused_;
   }
+  /// The flight state SwarmDeck's adapter publishes on flight_state.
+  static void setFlightState(PlannerNode& node, const std::string& state) {
+    auto msg = std::make_shared<std_msgs::msg::String>();
+    msg->data = state;
+    node.onFlightState(msg);
+  }
   static void setAerialRobot(PlannerNode& node) {
     const std::lock_guard<std::recursive_mutex> lock(node.planner_mutex_);
     node.robot_params_.type = mgg::RobotType::kAerialRobot;
@@ -4596,15 +4602,18 @@ TEST_F(PlannerNodeTest, ARegionsLatticeUpdatesAnInsideFrontierByItsWholeView) {
 }
 
 /// A drone's planner with aerial_home_height_m `anchor`, over an observed
-/// floor with observed air up to 2 m.
+/// floor with observed air up to 2 m (or over a map that has seen nothing).
 std::shared_ptr<PlannerNode> droneOverAFloor(const std::string& name,
-                                             double anchor) {
+                                             double anchor,
+                                             bool observed = true) {
   auto node = makeNode(name, "world",
                        {rclcpp::Parameter("aerial_home_height_m", anchor)});
   PlannerNodeTestPeer::setAerialRobot(*node);
-  PlannerNodeTestPeer::observeFloor(*node, -1.5, 6.0, -1.5, 1.5);
-  PlannerNodeTestPeer::observeFreeBox(*node, {2.25, 0.0, 1.2},
-                                      {7.5, 3.0, 1.6});
+  if (observed) {
+    PlannerNodeTestPeer::observeFloor(*node, -1.5, 6.0, -1.5, 1.5);
+    PlannerNodeTestPeer::observeFreeBox(*node, {2.25, 0.0, 1.2},
+                                        {7.5, 3.0, 1.6});
+  }
   return node;
 }
 
@@ -4612,16 +4621,18 @@ TEST_F(PlannerNodeTest, ADronesPadStartAnchorsHomeWhereItFliesSoReachIsUsable) {
   // Review r0, P1: a drone's home, seeded on the pad, has its box in the
   // floor; no edge joins it, every cluster is unreachable from home, and a
   // finite reach leaves the drone no candidate. With aerial_home_height_m,
-  // a drone starting at rest on the pad has its home that high over it,
-  // where it takes off to, and its flight links there.
+  // a drone SwarmDeck reports landed when home is seeded has its home that
+  // high over it, where it takes off to, and its flight links there.
   for (const double anchor : {0.0, 1.0}) {
     SCOPED_TRACE(anchor);
     auto node = droneOverAFloor(
         "drone_pad_home_" + std::to_string(int(anchor * 10)), anchor);
+    PlannerNodeTestPeer::setFlightState(*node, "landed");
     PlannerNodeTestPeer::acceptOdometry(*node, odometryAt(0.0, 0.0, 0.075, 1));
     const mgg::StateVec home = PlannerNodeTestPeer::globalVertexState(*node, 0);
     EXPECT_NEAR(home.x(), 0.0, 1e-9);
     EXPECT_NEAR(home.z(), 0.075 + anchor, 1e-9);
+    PlannerNodeTestPeer::setFlightState(*node, "flying");
     int stamp = 2;
     PlannerNodeTestPeer::acceptOdometry(*node,
                                         odometryAt(0.0, 0.0, 1.075, stamp++));
@@ -4643,33 +4654,83 @@ TEST_F(PlannerNodeTest, ADronesPadStartAnchorsHomeWhereItFliesSoReachIsUsable) {
   }
 }
 
-TEST_F(PlannerNodeTest, ADronesPlannerStartedInFlightSeedsHomeWhereItIs) {
-  // A planner restarted mid-flight takes its first odometry in the air or
-  // on the move: that is no pad, and home is where the drone is.
-  auto hovering = droneOverAFloor("drone_restart_hovering", 1.0);
-  PlannerNodeTestPeer::acceptOdometry(*hovering, odometryAt(2.0, 0.0, 1.3, 1));
-  EXPECT_NEAR(PlannerNodeTestPeer::globalVertexState(*hovering, 0).z(), 1.3,
-              1e-9);
-  auto moving = droneOverAFloor("drone_restart_moving", 1.0);
-  PlannerNodeTestPeer::acceptOdometry(*moving,
-                                      odometryAt(0.0, 0.0, 0.075, 1, 1.0));
-  EXPECT_NEAR(PlannerNodeTestPeer::globalVertexState(*moving, 0).z(), 0.075,
+TEST_F(PlannerNodeTest, ADronesHomeIsLiftedOnlyWhenSwarmDeckSaysItIsLanded) {
+  // Review r1, P1: at rest and low is not landed. A drone hovering 0.4 m
+  // over the floor, or standing where the map has seen nothing, gave no
+  // evidence of the pad and had its home lifted into the air. Only the
+  // flight state SwarmDeck publishes, landed when home is seeded, lifts
+  // it; without one, or with any other, home is where the drone is.
+  struct Case {
+    const char* name;
+    std::optional<std::string> state;
+    double z;
+    bool observed;
+    bool lifted;
+  };
+  const std::vector<Case> cases{
+      {"landed", std::string("landed"), 0.075, true, true},
+      {"no_state_on_the_pad", std::nullopt, 0.075, true, false},
+      {"low_hover", std::string("flying"), 0.4, true, false},
+      {"low_hover_no_state", std::nullopt, 0.4, true, false},
+      {"unknown_map", std::nullopt, 0.075, false, false},
+      {"restart_while_flying", std::string("flying"), 1.3, true, false},
+  };
+  for (const Case& c : cases) {
+    SCOPED_TRACE(c.name);
+    auto node = droneOverAFloor(std::string("drone_home_") + c.name, 1.0,
+                                c.observed);
+    if (c.state) PlannerNodeTestPeer::setFlightState(*node, *c.state);
+    PlannerNodeTestPeer::acceptOdometry(*node, odometryAt(0.0, 0.0, c.z, 1));
+    EXPECT_NEAR(PlannerNodeTestPeer::globalVertexState(*node, 0).z(),
+                c.z + (c.lifted ? 1.0 : 0.0), 1e-9);
+  }
+  // Landed reported after home was seeded lifts nothing afterwards.
+  auto late = droneOverAFloor("drone_home_landed_late", 1.0);
+  PlannerNodeTestPeer::acceptOdometry(*late, odometryAt(0.0, 0.0, 0.075, 1));
+  PlannerNodeTestPeer::setFlightState(*late, "landed");
+  PlannerNodeTestPeer::acceptOdometry(*late, odometryAt(0.0, 0.0, 0.075, 2));
+  EXPECT_NEAR(PlannerNodeTestPeer::globalVertexState(*late, 0).z(), 0.075,
               1e-9);
 }
 
-TEST_F(PlannerNodeTest, ADronesRebuiltHomeIsAnchoredOverItsPadKeyframe) {
-  // The keyframe rebuild makes the first keyframe home: for a drone, the
-  // pad, which gets the same anchor. The planner here restarted in flight.
-  auto node = droneOverAFloor("drone_rebuilt_home", 1.0);
-  PlannerNodeTestPeer::serveMap(*node, "component:test", 0);
-  auto source = std::make_unique<TrajectoryInMemory>();
-  source->trajectory = keyframesAlongX(0.0, 4.0);
-  PlannerNodeTestPeer::setKeyframeSource(*node, std::move(source));
-  PlannerNodeTestPeer::acceptOdometry(*node, odometryAt(4.0, 0.0, 1.3, 1));
-  ASSERT_EQ(PlannerNodeTestPeer::roadmapRebuilds(*node), 1);
-  const mgg::StateVec home = PlannerNodeTestPeer::globalVertexState(*node, 0);
-  EXPECT_NEAR(home.x(), 0.0, 1e-9);
-  EXPECT_NEAR(home.z(), 1.075, 1e-9);
+TEST_F(PlannerNodeTest, ADronesRebuiltHomeIsLiftedAsItsSeedWas) {
+  // The keyframe rebuild makes the first keyframe home. It is lifted when
+  // home was seeded landed, and only then: a first keyframe recorded low
+  // and moving, or a planner restarted in flight (whose keyframes may start
+  // on the pad, recorded before it started), keeps it where it is.
+  struct Case {
+    const char* name;
+    const char* state;
+    double first_z;  // the first keyframe's and first odometry's height
+    Eigen::Vector3d first_odometry;
+    double speed;
+    double home_z;
+  };
+  const std::vector<Case> cases{
+      {"landed", "landed", 0.075, {0.0, 0.0, 0.075}, 0.0, 1.075},
+      {"moving_first_keyframe", "flying", 0.3, {0.0, 0.0, 0.3}, 1.0, 0.3},
+      {"restarted_in_flight", "flying", 0.075, {4.0, 0.0, 1.3}, 0.0, 0.075},
+  };
+  for (const Case& c : cases) {
+    SCOPED_TRACE(c.name);
+    auto node = droneOverAFloor(std::string("drone_rebuilt_home_") + c.name,
+                                1.0);
+    PlannerNodeTestPeer::serveMap(*node, "component:test", 0);
+    auto source = std::make_unique<TrajectoryInMemory>();
+    source->trajectory = keyframesAlongX(0.0, 4.0);
+    for (Eigen::Isometry3d& pose : source->trajectory.poses) {
+      pose.translation().z() = c.first_z;
+    }
+    PlannerNodeTestPeer::setKeyframeSource(*node, std::move(source));
+    PlannerNodeTestPeer::setFlightState(*node, c.state);
+    PlannerNodeTestPeer::acceptOdometry(
+        *node, odometryAt(c.first_odometry.x(), c.first_odometry.y(),
+                          c.first_odometry.z(), 1, c.speed));
+    ASSERT_EQ(PlannerNodeTestPeer::roadmapRebuilds(*node), 1);
+    const mgg::StateVec home = PlannerNodeTestPeer::globalVertexState(*node, 0);
+    EXPECT_NEAR(home.x(), 0.0, 1e-9);
+    EXPECT_NEAR(home.z(), c.home_z, 1e-9);
+  }
 }
 
 TEST_F(PlannerNodeTest, ADronesRebuildJudgesHomeByTheRoutesItsGraphHas) {

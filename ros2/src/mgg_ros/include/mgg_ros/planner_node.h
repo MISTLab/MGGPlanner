@@ -39,6 +39,7 @@
 #include <sensor_msgs/msg/point_cloud2.hpp>
 #include <rclcpp/rclcpp.hpp>
 #include <std_msgs/msg/float64.hpp>
+#include <std_msgs/msg/string.hpp>
 #include <std_srvs/srv/trigger.hpp>
 #include <tf2_msgs/msg/tf_message.hpp>
 #include <tf2_ros/buffer.h>
@@ -213,6 +214,9 @@ class PlannerNode : public rclcpp::Node {
   /// Metres of flight left for exploring and coming home (drone scout
   /// §4.3), from the drone's adapter; +inf until one arrives.
   void onFlightReach(const std_msgs::msg::Float64::SharedPtr msg);
+  /// A drone's flight state from SwarmDeck's adapter (its supervisor's
+  /// state: "landed", "flying", ...), kept as latest_flight_state_.
+  void onFlightState(const std_msgs::msg::String::SharedPtr msg);
   /// `clusters` without those outside the exploration region, if one is set.
   std::vector<mgg::FrontierCluster> insideExplorationRegion(
       std::vector<mgg::FrontierCluster> clusters) const;
@@ -288,14 +292,9 @@ class PlannerNode : public rclcpp::Node {
   /// roadmap around it visited.
   void ingestOdometryIntoGlobalGraph();
   /// The root of the global graph is home: the first odometry, dropped onto
-  /// the terrain once the map shows ground under it; for a drone that
-  /// started on its pad, aerial_pad_home_.
+  /// the terrain once the map shows ground under it; for a drone reported
+  /// landed then, aerial_home_height_m_ over it (home_seeded_landed_).
   void seedGlobalGraph();
-  /// Whether an aerial robot at `pose` stands on the ground: the map shows
-  /// ground within kPadGroundGapM under it, or, where it shows nothing
-  /// there, the pose is within that of the odometry frame's origin height
-  /// (odometry starts on the pad).
-  bool onTheGround(const mgg::StateVec& pose) const;
   /// Replaces the global graph with one rebuilt from the robot's keyframe
   /// trajectory (mgg::rebuildRoadmapFromTrajectory), vertex 0 at its home
   /// keyframe, when the trajectory is for the map in service and home has
@@ -668,10 +667,10 @@ class PlannerNode : public rclcpp::Node {
   /// off to, where its flight links (drone scout Task 17, fix round 1).
   /// Zero: home is where the first odometry is.
   double aerial_home_height_m_ = 0.0;
-  /// The home a drone gets when its first odometry finds it at rest on the
-  /// ground: aerial_home_height_m_ over it. Unset for a planner started in
-  /// flight, and for every ground robot.
-  std::optional<mgg::StateVec> aerial_pad_home_;
+  /// Home was seeded while flight_state was "landed" (a drone on its pad,
+  /// with aerial_home_height_m_ set), so it is that high over the pose. The
+  /// keyframe rebuild lifts its first keyframe on this decision alone.
+  bool home_seeded_landed_ = false;
   /// The last cycle's frontier paths join the global graph before that
   /// graph is rebuilt (rrg.cpp:121 Rrg::reset).
   bool add_frontiers_to_global_graph_ = false;
@@ -802,6 +801,9 @@ class PlannerNode : public rclcpp::Node {
   std::optional<mgg::BoundedSpaceParams> exploration_region_;
   rclcpp::Subscription<std_msgs::msg::Float64>::SharedPtr flight_reach_sub_;
   double flight_reach_m_ = std::numeric_limits<double>::infinity();
+  rclcpp::Subscription<std_msgs::msg::String>::SharedPtr flight_state_sub_;
+  /// The latest flight_state received; none until one arrives.
+  std::optional<std::string> latest_flight_state_;
   rclcpp::TimerBase::SharedPtr graph_timer_;
   /// rrg.h:367 global_graph_update_timer_.
   rclcpp::TimerBase::SharedPtr global_graph_update_timer_;
