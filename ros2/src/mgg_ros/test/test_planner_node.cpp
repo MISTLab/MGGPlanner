@@ -1127,6 +1127,28 @@ class PlannerNodeTestPeer {
   static int roadmapRebuildsRefused(PlannerNode& node) {
     return node.roadmap_rebuilds_refused_;
   }
+  /// The callback group the flight_state subscription is in, found among
+  /// the node's groups, or null.
+  static rclcpp::CallbackGroup::SharedPtr flightStateGroup(PlannerNode& node) {
+    rclcpp::CallbackGroup::SharedPtr found;
+    node.get_node_base_interface()->for_each_callback_group(
+        [&node, &found](const rclcpp::CallbackGroup::SharedPtr& group) {
+          if (group->find_subscription_ptrs_if(
+                  [&node](const rclcpp::SubscriptionBase::SharedPtr& sub) {
+                    return sub == node.flight_state_sub_;
+                  })) {
+            found = group;
+          }
+        });
+    return found;
+  }
+  static rclcpp::CallbackGroup::SharedPtr reentrantGroup(PlannerNode& node) {
+    return node.callback_group_;
+  }
+  static std::optional<std::string> latestFlightState(PlannerNode& node) {
+    const std::lock_guard<std::recursive_mutex> lock(node.planner_mutex_);
+    return node.latest_flight_state_;
+  }
   /// The flight state SwarmDeck's adapter publishes on flight_state.
   static void setFlightState(PlannerNode& node, const std::string& state) {
     auto msg = std::make_shared<std_msgs::msg::String>();
@@ -4807,6 +4829,51 @@ TEST_F(PlannerNodeTest, APlannerWithoutAPositiveSpeedDoesNotStart) {
   PlannerNodeTestPeer::observeFloor(*node, -1.5, 4.0, -1.5, 1.5);
   PlannerNodeTestPeer::acceptOdometry(*node, 0.0, 0.0, 1.0);
   EXPECT_EQ(PlannerNodeTestPeer::ownTourBidMsg(*node).speed_mps, 1.5);
+}
+
+TEST_F(PlannerNodeTest, FlightStatesAreHandledInTheOrderTakenSoTheLatestSeedsHome) {
+  // Review r2, P1: in the node's reentrant group an older "landed" could
+  // take the planner mutex after a newer "flying" and put "landed" back,
+  // and home was lifted for a drone in the air. The subscription has a
+  // mutually exclusive group of its own, as no_go_zones has.
+  auto node = droneOverAFloor("drone_flight_state_order", 1.0);
+  const rclcpp::CallbackGroup::SharedPtr group =
+      PlannerNodeTestPeer::flightStateGroup(*node);
+  ASSERT_NE(group, nullptr);
+  EXPECT_EQ(group->type(), rclcpp::CallbackGroupType::MutuallyExclusive);
+  EXPECT_NE(group, PlannerNodeTestPeer::reentrantGroup(*node));
+
+  // "landed" then "flying", delivered through the subscription, before
+  // home is seeded: home stays where the drone is.
+  auto publisher_node =
+      std::make_shared<rclcpp::Node>("flight_state_publisher");
+  rclcpp::executors::MultiThreadedExecutor executor(
+      rclcpp::ExecutorOptions(), 4);
+  executor.add_node(node);
+  std::thread spinner([&executor]() { executor.spin(); });
+  auto publisher = publisher_node->create_publisher<std_msgs::msg::String>(
+      "flight_state", rclcpp::QoS(1).transient_local().reliable());
+  std_msgs::msg::String state;
+  state.data = "landed";
+  publisher->publish(state);
+  state.data = "flying";
+  publisher->publish(state);
+  const auto deadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds(5);
+  while (std::chrono::steady_clock::now() < deadline &&
+         PlannerNodeTestPeer::latestFlightState(*node) !=
+             std::optional<std::string>("flying")) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+  }
+  // Nothing older arrives after it.
+  std::this_thread::sleep_for(std::chrono::milliseconds(50));
+  executor.cancel();
+  spinner.join();
+  ASSERT_EQ(PlannerNodeTestPeer::latestFlightState(*node),
+            std::optional<std::string>("flying"));
+  PlannerNodeTestPeer::acceptOdometry(*node, odometryAt(0.0, 0.0, 1.3, 1));
+  EXPECT_NEAR(PlannerNodeTestPeer::globalVertexState(*node, 0).z(), 1.3,
+              1e-9);
 }
 
 }  // namespace mgg_ros

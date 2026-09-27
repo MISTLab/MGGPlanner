@@ -354,13 +354,21 @@ PlannerNode::PlannerNode(const rclcpp::NodeOptions& options)
       },
       no_go_opts);
   // Latched: SwarmDeck's adapter publishes the drone's flight state on each
-  // change; a planner started later gets the current one.
+  // change; a planner started later gets the current one. Each state
+  // replaces the last, so, as no_go_zones, they are handled one at a time,
+  // in the order taken, in a group of their own: in the reentrant group an
+  // older "landed" could take the planner mutex after a newer "flying" and
+  // lift the home of a drone in the air (Task 17 review r2, P1).
+  flight_state_group_ =
+      create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
+  rclcpp::SubscriptionOptions flight_state_opts;
+  flight_state_opts.callback_group = flight_state_group_;
   flight_state_sub_ = create_subscription<std_msgs::msg::String>(
       "flight_state", rclcpp::QoS(1).transient_local(),
       [this](const std_msgs::msg::String::SharedPtr msg) {
         onFlightState(msg);
       },
-      sub_opts);
+      flight_state_opts);
   flight_reach_sub_ = create_subscription<std_msgs::msg::Float64>(
       "flight_reach_m", rclcpp::QoS(10),
       [this](const std_msgs::msg::Float64::SharedPtr msg) {

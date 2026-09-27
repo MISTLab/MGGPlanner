@@ -816,6 +816,8 @@ class PlannerNode : public rclcpp::Node {
   /// no_go_zones alone: its messages replace one another, so they are
   /// handled one at a time.
   rclcpp::CallbackGroup::SharedPtr no_go_zones_group_;
+  /// flight_state alone, for the same reason.
+  rclcpp::CallbackGroup::SharedPtr flight_state_group_;
 };
 
 }  // namespace mgg_ros
