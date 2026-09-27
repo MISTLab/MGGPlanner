@@ -2,7 +2,10 @@
 
 #include <algorithm>
 #include <chrono>
+#include <string>
 #include <utility>
+
+#include "mgg_core/log.h"
 
 namespace mgg {
 namespace {
@@ -214,6 +217,17 @@ void FleetCoordinator::requestAuction() {
 FleetTickOutput FleetCoordinator::tick(double now_s, const OwnBidFn& own_bid,
                                        const CostEstimateFn& estimate,
                                        const ExploredFn& explored) {
+  // Its own bid is what this robot sends and what it enters in its own
+  // auctions; without a provider it has none to send (an empty one has no
+  // speed, and every peer refuses it), so it sends nothing at all.
+  if (!own_bid) {
+    if (!missing_own_bid_logged_) {
+      missing_own_bid_logged_ = true;
+      logError("fleet coordinator of robot " + std::to_string(robot_id_) +
+               ": no own-bid provider; sending no bids or auctions");
+    }
+    return FleetTickOutput{};
+  }
   rebaseFutureTimes(now_s);
   FleetTickOutput out;
   bool claims_changed = !claims_.expire(now_s, params_.claim_ttl_s).empty();
@@ -231,7 +245,7 @@ FleetTickOutput FleetCoordinator::tick(double now_s, const OwnBidFn& own_bid,
 
   const auto makeBid = [&](std::uint64_t auction_id,
                            std::size_t& explored_turn) {
-    TourBidData bid = own_bid ? own_bid() : TourBidData{};
+    TourBidData bid = own_bid();
     bid.robot_id = robot_id_;
     bid.seq = ++seq_;
     bid.stamp_s = now_s;

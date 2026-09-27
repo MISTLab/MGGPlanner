@@ -96,7 +96,9 @@ class FleetCoordinator {
   /// One step. Returns this robot's bid when an auction was called, every
   /// fleet.auction_interval_s, and at once when it requests an auction; as
   /// auctioneer, a call when one is due and the award once the bid deadline
-  /// has passed (applied here too). `own_bid` is called only for a bid.
+  /// has passed (applied here too). `own_bid` is called only for a bid; it
+  /// is required: without it the step sends and does nothing, and says so
+  /// once.
   FleetTickOutput tick(double now_s, const OwnBidFn& own_bid,
                        const CostEstimateFn& estimate,
                        const ExploredFn& explored);
@@ -220,6 +222,8 @@ class FleetCoordinator {
   std::vector<FleetCluster> award_clusters_;
   std::vector<FleetCluster> explored_elsewhere_;
   bool has_award_ = false;
+  /// A tick without an own-bid provider was reported.
+  bool missing_own_bid_logged_ = false;
   std::uint64_t assignment_version_ = 0;
   std::size_t last_unassigned_ = 0;
 

@@ -7,6 +7,7 @@
 #include <chrono>
 #include <cstdint>
 #include <limits>
+#include <string>
 #include <map>
 #include <memory>
 #include <set>
@@ -17,6 +18,7 @@
 #include <gtest/gtest.h>
 
 #include "mgg_core/fleet_coordinator.h"
+#include "mgg_core/log.h"
 
 namespace {
 
@@ -1397,6 +1399,33 @@ TEST(FleetCoordinator, AReleaseAwardOlderThanABidKeepsTheBidsClaim) {
   release.stamp_s = 32.0;
   coordinator.onAward(release, 32.0);
   EXPECT_TRUE(coordinator.claimedByOthers(32.0).empty());
+}
+
+// Review r1, P2: without an own-bid provider the coordinator built an
+// empty bid with no speed, which every peer refuses as malformed, and sent
+// it. It sends nothing instead, neither a bid nor, as auctioneer, a call,
+// and says so once.
+TEST(FleetCoordinator, WithoutAnOwnBidProviderNothingIsSent) {
+  std::vector<std::string> errors;
+  mgg::setLogSink([&errors](mgg::LogLevel level, const std::string& message) {
+    if (level == mgg::LogLevel::kError) errors.push_back(message);
+  });
+  FleetCoordinator coordinator(1, FleetParams{}, 0.2);
+  coordinator.onBid(emptyBid(2), 0.0);  // in a group, the auctioneer
+  for (double now = 0.0; now < 12.0; now += 0.5) {
+    const mgg::FleetTickOutput out =
+        coordinator.tick(now, nullptr, nullptr, nullptr);
+    EXPECT_FALSE(out.bid.has_value()) << now;
+    EXPECT_FALSE(out.award.has_value()) << now;
+    coordinator.onBid(emptyBid(2), now);
+  }
+  mgg::setLogSink(nullptr);
+  EXPECT_EQ(errors.size(), 1u);
+  // With one, it bids and calls as ever.
+  const mgg::FleetTickOutput out =
+      coordinator.tick(12.0, noClusters, nullptr, nullptr);
+  ASSERT_TRUE(out.bid.has_value());
+  EXPECT_TRUE(out.bid->wellFormed());
 }
 
 }  // namespace
