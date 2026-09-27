@@ -906,3 +906,51 @@ TEST(GridGraph, HeadingAlignedBodyAndCrossNudgeEnterANarrowNorthPassage) {
     EXPECT_GT(reach, 2.0);
   }
 }
+
+TEST(GridGraph, CrossNudgesCannotEnterAGapNarrowerThanTheOrientedBody) {
+  // A 0.4 m gap cannot fit the full 0.6 m body width at any cross-offset,
+  // including the shifted mouth that needs nudges in the wider-gap test.
+  for (double offset : {0.0, 0.15}) {
+    SCOPED_TRACE(offset);
+    std::map<std::pair<std::int64_t, std::int64_t>, double> tops;
+    for (int x = -30; x < 30; ++x) {
+      for (int y = -30; y < 80; ++y) {
+        const double px = (x + 0.5) * 0.05;
+        const double py = (y + 0.5) * 0.05;
+        tops[{x, y}] = py > 0.8 && std::abs(px - offset) > 0.2 ? 0.4 : 0.0;
+      }
+    }
+    mgg_test::TerrainFixture map(0.05, tops);
+    RobotParams robot;
+    robot.type = RobotType::kGroundRobot;
+    robot.size = Eigen::Vector3d(1.2, 0.6, 0.3);
+    PlanningParams planning;
+    planning.max_ground_height = 0.4;
+    planning.max_step_height = 0.15;
+    planning.edge_length_min = 0.05;
+    planning.edge_length_max = 0.6;
+    planning.edge_overshoot = 0;
+    planning.min_observed_ground_fraction = 0;
+    mgg::GroundProjection ground(map, planning);
+    ExpandContext ctx;
+    ctx.map = &map; ctx.robot = &robot; ctx.planning = &planning;
+    ctx.ground = &ground; ctx.robot_box_size = robot.getPlanningSize();
+    GraphManager graph;
+    const StateVec root(0, 0, 0.4, M_PI / 2);
+    graph.addVertex(new Vertex(0, root));
+    GridGraphParams grid;
+    grid.min_val = Eigen::Vector3d::Zero();
+    grid.max_val = Eigen::Vector3d(2.8, 0, 0);
+    grid.resolution = Eigen::Vector3d::Constant(0.4);
+    const auto result = buildGridGraph(graph, root, grid, ctx, M_PI / 2);
+    // Diagnostics count the eight nominal cells, not the retry offers.
+    EXPECT_LE(result.free_cells, 8);
+    int offers = result.merged_duplicates;
+    for (int count : result.rejected) offers += count;
+    EXPECT_LE(offers, 8);
+    double reach = 0;
+    for (const auto& entry : graph.vertices_map_)
+      reach = std::max(reach, entry.second->state.y());
+    EXPECT_LE(reach, 0.8);
+  }
+}
