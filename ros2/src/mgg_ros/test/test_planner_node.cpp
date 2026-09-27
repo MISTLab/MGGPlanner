@@ -1536,16 +1536,17 @@ TEST_F(PlannerNodeTest, APathEndingWithinTheGoalToleranceIsNoPath) {
   EXPECT_EQ(PlannerNodeTestPeer::pathsGoingNowhere(*node), 1);
   EXPECT_EQ(PlannerNodeTestPeer::lowGainRounds(*node), 1);
 
-  // With the global planner due, the robot is repositioned over the global
-  // graph instead.
+  // With the global planner due, it tries the global graph instead. That
+  // frontier is also inside the 10 m tolerance: no usable route exists
+  // here, so the answer stays retryable, not exploration complete.
   PlannerNodeTestPeer::addGlobalChainToFrontier(
       *node, {{-0.5, 0.0}, {-1.0, 0.0}, {-1.5, 0.0}}, M_PI);
   PlannerNodeTestPeer::consultGlobalPlannerAtOnce(*node);
   response = std::make_shared<mgg_msgs::srv::PlannerSrv::Response>();
   PlannerNodeTestPeer::plan(*node, response);
-  EXPECT_EQ(response->status, mgg_msgs::srv::PlannerSrv::Response::FORWARD);
-  ASSERT_GE(response->path.size(), 2u);
-  EXPECT_LT(response->path.back().position.x, -1.0);
+  EXPECT_EQ(response->status, PlannerNode::kStatusNoPath);
+  EXPECT_TRUE(response->path.empty());
+  EXPECT_FALSE(PlannerNodeTestPeer::completionWithheld(*node).empty());
 }
 
 TEST_F(PlannerNodeTest, APathWithLittleGainCountsTowardsGlobalRepositioning) {
@@ -4478,6 +4479,34 @@ TEST_F(PlannerNodeTest, AnUndrivableRouteToTheTourTargetKeepsTheLocalPathAndSets
   EXPECT_FALSE(PlannerNodeTestPeer::tourTargetPosition(*node).x() < -1.5);
 }
 
+TEST_F(PlannerNodeTest, ANoProgressTourDepartureKeepsTheMovingLocalPath) {
+  // The global route ends beyond the configured tolerance, but its first
+  // turn needs a straight departure instead. That departure ends within
+  // the tolerance and must not displace the useful local path ahead.
+  auto node = boxedIn("tour_departure_no_progress", -0.4, 2.5);
+  PlannerNodeTestPeer::setLowGainVoxels(*node, 0.0);
+  PlannerNodeTestPeer::setReachDistance(*node, 1.2);
+  PlannerNodeTestPeer::setGlobalFrontierReach(*node, 1.0);
+  PlannerNodeTestPeer::acceptOdometry(*node, 0.0, 0.0, 1.0);
+  const int behind = PlannerNodeTestPeer::addGlobalChainToFrontier(
+      *node, {{-0.5, 0.0}, {-1.0, 0.0}, {-1.5, 0.0}, {-2.0, 0.0}}, M_PI);
+  PlannerNodeTestPeer::setVertexGain(*node, behind, 1e6);
+  PlannerNodeTestPeer::setTour(*node, true, 1e5);
+  const auto target = PlannerNodeTestPeer::refreshTour(*node);
+  ASSERT_NE(target, mgg::kNoCluster);
+
+  auto response = std::make_shared<mgg_msgs::srv::PlannerSrv::Response>();
+  PlannerNodeTestPeer::plan(*node, response);
+  EXPECT_EQ(PlannerNodeTestPeer::routeSharpTurnFallbacks(*node), 1);
+  ASSERT_EQ(response->status, mgg_msgs::srv::PlannerSrv::Response::FORWARD);
+  ASSERT_GE(response->path.size(), 2u);
+  EXPECT_GT(response->path.back().position.x, 2.5);
+  EXPECT_FALSE(PlannerNodeTestPeer::bestPathFromGlobalGraph(*node));
+  EXPECT_EQ(PlannerNodeTestPeer::tourTarget(*node), mgg::kNoCluster);
+  EXPECT_GT(PlannerNodeTestPeer::tourAsideRetry(*node, target), 0.0);
+  EXPECT_EQ(PlannerNodeTestPeer::tourRoutesFailed(*node), 1);
+}
+
 TEST_F(PlannerNodeTest, AnUndrivableTourRouteWithNoLocalPathLeavesTheChoiceToTheGreedyPlanner) {
   // exploredDeadEnd with no reversing: the lattice has no path, and the
   // route to the tour's only target, behind, starts with a turn the robot
@@ -4613,6 +4642,75 @@ TEST_F(PlannerNodeTest, TheTourNoLongerExploresAwayFromANearTargetAndRoutesBack)
     robot = end;
     PlannerNodeTestPeer::acceptOdometry(*node, robot.x(), robot.y(),
                                         2.0 + cycle);
+  }
+}
+
+TEST_F(PlannerNodeTest, ANearHighGainTourTargetKeepsTheMovingLocalPathAndStaysAside) {
+  // Run 11: the target is inside PCI's 0.3 m goal tolerance, but is
+  // still a high-gain frontier. The useful local path heads away from it.
+  // Routing back must not replace that path with a goal PCI rejects.
+  auto node = makeNode("tour_no_progress");
+  PlannerNodeTestPeer::setLowGainVoxels(*node, 0.0);
+  PlannerNodeTestPeer::observeFloor(*node, -1.5, 4.0, -1.5, 1.5);
+  PlannerNodeTestPeer::acceptOdometry(*node, 0.0, 0.0, 1.0);
+  const int frontier = PlannerNodeTestPeer::addGlobalChainToFrontier(
+      *node, {{-0.25, 0.0}}, M_PI);
+  PlannerNodeTestPeer::setVertexGain(*node, frontier, 1e6);
+  PlannerNodeTestPeer::setTour(*node, true, 1e5);
+  PlannerNodeTestPeer::setTourRetry(*node, 60.0);
+  const auto target = PlannerNodeTestPeer::refreshTour(*node);
+  ASSERT_NE(target, mgg::kNoCluster);
+
+  double aside_at = 0.0;
+  for (int cycle = 0; cycle < 3; ++cycle) {
+    SCOPED_TRACE(cycle);
+    auto response = std::make_shared<mgg_msgs::srv::PlannerSrv::Response>();
+    PlannerNodeTestPeer::plan(*node, response);
+    ASSERT_EQ(response->status, mgg_msgs::srv::PlannerSrv::Response::FORWARD);
+    ASSERT_GE(response->path.size(), 2u);
+    EXPECT_GT(response->path.back().position.x, 0.3);
+    EXPECT_FALSE(PlannerNodeTestPeer::bestPathFromGlobalGraph(*node));
+    EXPECT_FALSE(PlannerNodeTestPeer::repositioningOngoing(*node));
+    EXPECT_NE(PlannerNodeTestPeer::tourTarget(*node), target);
+    EXPECT_DOUBLE_EQ(PlannerNodeTestPeer::tourAsideRetry(*node, target), 60.0);
+    if (cycle == 0) aside_at = PlannerNodeTestPeer::tourAsideAt(*node, target);
+    EXPECT_DOUBLE_EQ(PlannerNodeTestPeer::tourAsideAt(*node, target), aside_at);
+    EXPECT_NE(PlannerNodeTestPeer::refreshTour(*node), target);
+  }
+}
+
+TEST_F(PlannerNodeTest, LocalTourDecisionsNeedProgressBeyondTheConfiguredPciTolerance) {
+  auto node = makeNode("local_tour_no_progress", "world",
+                       {rclcpp::Parameter("reach_distance", 0.8)});
+  // Moving toward the target is not enough: PCI judges planar distance
+  // from the robot, inclusively, regardless of the path's driving height.
+  EXPECT_FALSE(PlannerNodeTestPeer::localPathServesTour(
+      *node, 0.0, {0.8, 0.0, 1.0}, {2.0, 0.0, 1.0}));
+  EXPECT_TRUE(PlannerNodeTestPeer::localPathServesTour(
+      *node, 0.0, {0.81, 0.0, 1.0}, {2.0, 0.0, 1.0}));
+}
+
+TEST_F(PlannerNodeTest, GlobalRepositioningRejectsAnEndInsideTheConfiguredPciTolerance) {
+  // Non-tour routing must use the configured planar tolerance, not a
+  // hard-coded 0.3 m or the route's length (or its driving-height offset).
+  for (const double reach : {0.3, 0.8}) {
+    SCOPED_TRACE(reach);
+    auto node = makeNode("global_no_progress", "world",
+                         {rclcpp::Parameter("reach_distance", reach)});
+    PlannerNodeTestPeer::observeFloor(*node, -1.5, 4.0, -1.5, 1.5);
+    PlannerNodeTestPeer::acceptOdometry(*node, 0.0, 0.0, 1.0);
+    const int frontier = PlannerNodeTestPeer::addGlobalChainToFrontier(
+        *node, {{-reach, 0.0}}, M_PI);
+    PlannerNodeTestPeer::setVertexGain(*node, frontier, 1e6);
+    PlannerNodeTestPeer::setTour(*node, false, 0.0);
+    std::string reason;
+    EXPECT_FALSE(PlannerNodeTestPeer::runGlobalPlanner(*node, reason));
+    EXPECT_FALSE(PlannerNodeTestPeer::repositioningOngoing(*node));
+    EXPECT_FALSE(PlannerNodeTestPeer::bestPathFromGlobalGraph(*node));
+    EXPECT_FALSE(PlannerNodeTestPeer::completionWithheld(*node).empty());
+    // The frontier remains unexplored; a smaller tolerance admits it.
+    PlannerNodeTestPeer::setReachDistance(*node, reach - 0.05);
+    EXPECT_TRUE(PlannerNodeTestPeer::runGlobalPlanner(*node, reason)) << reason;
   }
 }
 

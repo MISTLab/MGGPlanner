@@ -860,6 +860,9 @@ bool PlannerNode::tourKeepsRoute(int vertex_id) {
 bool PlannerNode::localPathServesTour(const Eigen::Vector3d& viewpoint,
                                       const Eigen::Vector3d& target) const {
   const Eigen::Vector3d robot = current_state_.head<3>();
+  // PCI checks the endpoint against its planar reach_distance, not how
+  // far the path travels or how much closer it gets to the tour target.
+  if ((viewpoint - robot).head<2>().norm() <= reach_distance_) return false;
   const Eigen::AngleAxisd to_lattice(-current_state_[3],
                                      Eigen::Vector3d::UnitZ());
   return mgg::localPathServesTarget(
@@ -3478,6 +3481,21 @@ bool PlannerNode::runGlobalPlanner(int target_id, std::string& reason,
       return mgg::viewpointClear(*map_, robot_params_, planning_params_, pose);
     });
   }
+  // Check the final end, after shortcutting and all viewpoint cutbacks.
+  // Run 11: a nearby high-gain tour target repeatedly replaced a useful
+  // local path with a route PCI rejected as already reached. The same
+  // planar tolerance applies to non-tour repositioning as well.
+  if (best_path_.empty() ||
+      (best_path_.back().head<2>() - current_state_.head<2>()).norm() <=
+          reach_distance_) {
+    best_path_.clear();
+    global_frontier_not_routed_ = true;
+    global_exploration_ongoing_ = false;
+    current_global_vertex_id_ = -1;
+    reason = "the global route makes no progress beyond the controller goal "
+             "tolerance";
+    return false;
+  }
   best_path_from_global_graph_ = true;
   // rrg.cpp:5838 to 5843: this frontier is the target until it is reached.
   current_global_vertex_id_ = target_vertex_id;
@@ -3648,7 +3666,9 @@ void PlannerNode::onPlanRequest(
             tour_decided = true;
             low_gain_rounds_ = 0;
             summary += "; routing to the tour's target over the global graph";
-          } else if (!best_path_.empty()) {
+          } else if (!best_path_.empty() &&
+                     (best_path_.back().head<2>() - current_state_.head<2>())
+                             .norm() > reach_distance_) {
             tour_decided = true;
             low_gain_rounds_ = 0;
             summary +=
@@ -3658,17 +3678,19 @@ void PlannerNode::onPlanRequest(
           } else {
             // Run 10b, robot_0: a route that starts with a turn the robot
             // has no room for, and no departure out, is no route at all.
+            // Nor is a departure ending within PCI's tolerance (run 11).
             // The tour fails as it does when no route exists: the target is
             // set aside and the local path already checked is kept. Without
             // one, the choices without the tour follow; they judge their
             // own routes' first turns, not this one's.
+            best_path_.clear();
             ++tour_routes_failed_;
             setTourClusterAside(*tour_target, tour_params_.route_retry_s);
             boxed_in_without_departure_now_ = false;
             summary +=
                 "; the route to the tour's target starts with a turn the "
-                "robot has no room for and it has no straight departure: "
-                "the target is set aside";
+                "robot has no room for and it has no straight departure "
+                "beyond the controller goal tolerance: the target is set aside";
             if (!local_path.empty()) {
               best_path_ = local_path;
               best_path_from_global_graph_ = false;
