@@ -1099,6 +1099,28 @@ class PlannerNodeTestPeer {
                                PlannerNode::RoadmapRebuildTrigger trigger) {
     return node.roadmap_rebuild_attempted_[static_cast<int>(trigger)];
   }
+  /// A global vertex of `robot_id` at (x, y, z), joined to `neighbours`;
+  /// its id. Another robot's vertex enters as a merged one.
+  static int addGlobalVertex(PlannerNode& node, int robot_id, double x,
+                             double y, double z,
+                             const std::vector<int>& neighbours) {
+    const std::lock_guard<std::recursive_mutex> lock(node.planner_mutex_);
+    auto* vertex = new mgg::Vertex(node.global_graph_->generateVertexID(),
+                                   mgg::StateVec(x, y, z, 0.0));
+    vertex->robot_id = robot_id;
+    if (robot_id == static_cast<int>(node.planning_params_.robot_id)) {
+      node.global_graph_->addVertex(vertex);
+    } else {
+      node.global_graph_->addNeighbourVertex(vertex, vertex->id);
+    }
+    for (const int id : neighbours) {
+      mgg::Vertex* other = node.findGlobalVertex(id);
+      node.global_graph_->addEdge(
+          vertex, other, (vertex->state - other->state).head<3>().norm());
+    }
+    ++node.graph_revision_;
+    return vertex->id;
+  }
   static int roadmapRebuildsRefused(PlannerNode& node) {
     return node.roadmap_rebuilds_refused_;
   }
@@ -4639,6 +4661,46 @@ TEST_F(PlannerNodeTest, ADronesRebuiltHomeIsAnchoredOverItsPadKeyframe) {
   const mgg::StateVec home = PlannerNodeTestPeer::globalVertexState(*node, 0);
   EXPECT_NEAR(home.x(), 0.0, 1e-9);
   EXPECT_NEAR(home.z(), 1.075, 1e-9);
+}
+
+TEST_F(PlannerNodeTest, ADronesRebuildJudgesHomeByTheRoutesItsGraphHas) {
+  // Review r0, P1: whether home reaches a place is what a route over the
+  // graph finds. Through a peer's vertex it does, though no edge of this
+  // robot's joins them: a rebuild cutting home off is refused. Across an
+  // edge a no-go zone blocks it does not: a rebuild dropping that place
+  // takes nothing a route had.
+  auto bridged = makeNode("drone_rebuild_peer_bridge");
+  PlannerNodeTestPeer::setAerialRobot(*bridged);
+  PlannerNodeTestPeer::observeFloor(*bridged, -1.5, 6.0, -1.5, 1.5);
+  PlannerNodeTestPeer::acceptOdometry(*bridged, odometryAt(0.0, 0.0, 0.4, 1));
+  const int peer =
+      PlannerNodeTestPeer::addGlobalVertex(*bridged, 7, 0.5, 0.0, 0.4, {0});
+  int previous = PlannerNodeTestPeer::addGlobalVertex(*bridged, 1, 1.0, 0.0,
+                                                      0.4, {peer});
+  for (double x = 1.5; x <= 4.0 + 1e-9; x += 0.5) {
+    previous = PlannerNodeTestPeer::addGlobalVertex(*bridged, 1, x, 0.0, 0.4,
+                                                    {previous});
+  }
+  PlannerNodeTestPeer::observeWallAlongY(*bridged, -1.5, 1.5, 0.25);
+  PlannerNodeTestPeer::serveMap(*bridged, "component:test", 0);
+  auto source = std::make_unique<TrajectoryInMemory>();
+  source->trajectory = keyframesAlongX(0.0, 4.0);
+  for (Eigen::Isometry3d& pose : source->trajectory.poses) {
+    pose.translation().z() = 0.4;
+  }
+  PlannerNodeTestPeer::setKeyframeSource(*bridged, std::move(source));
+  EXPECT_FALSE(PlannerNodeTestPeer::rebuildRoadmap(
+      *bridged, PlannerNode::RoadmapRebuildTrigger::kPathUnlinkable));
+  EXPECT_EQ(PlannerNodeTestPeer::roadmapRebuildsRefused(*bridged), 1);
+
+  // The track at 2.25 is split by a wall now, but a no-go zone there
+  // already cut the graph's routes beyond 1.5 off from home.
+  auto blocked = connectedGraphAndAWallAcrossTheTrack(
+      "drone_rebuild_blocked_edge", 2.25, true);
+  PlannerNodeTestPeer::receiveNoGoZones(*blocked, "world", {{2.25, 0.0}});
+  EXPECT_TRUE(PlannerNodeTestPeer::rebuildRoadmap(
+      *blocked, PlannerNode::RoadmapRebuildTrigger::kPathUnlinkable));
+  EXPECT_EQ(PlannerNodeTestPeer::roadmapRebuildsRefused(*blocked), 0);
 }
 
 }  // namespace mgg_ros

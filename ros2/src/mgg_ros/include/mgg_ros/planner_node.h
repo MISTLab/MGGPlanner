@@ -576,7 +576,7 @@ class PlannerNode : public rclcpp::Node {
   int roadmap_rebuilds_ = 0;
   /// Rebuilt graphs refused because they would have cut home off from what
   /// the rebuild was for, or split places the current graph connects to
-  /// home (rebuildLosesHome).
+  /// home (rebuildLosesHome; aerial robots only).
   int roadmap_rebuilds_refused_ = 0;
   /// This robot's in-service frontiers the last rebuild that dropped any
   /// replaced, until the next failed global search, which is then no path

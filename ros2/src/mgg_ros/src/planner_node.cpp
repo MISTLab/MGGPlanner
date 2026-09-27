@@ -53,90 +53,65 @@ constexpr double kPadRestSpeedMps = 0.1;
 /// A drone with ground at most this far under it stands on the ground.
 constexpr double kPadGroundGapM = 0.5;
 
-/// The connected parts of `robot_id`'s in-service vertices in `graph`, over
-/// the edges between them: a part number per vertex id.
-std::unordered_map<int, int> ownParts(const mgg::GraphManager& graph,
-                                      int robot_id) {
-  const auto own = [&graph, robot_id](int id) {
-    const auto it = graph.vertices_map_.find(id);
-    return it != graph.vertices_map_.end() && it->second != nullptr &&
-           it->second->robot_id == robot_id && graph.inService(*it->second);
-  };
-  std::unordered_map<int, int> part_of;
-  int parts = 0;
+/// The in-service vertices of `graph` a route from home reaches: Dijkstra
+/// over its edges, those a no-go zone blocks left out and other robots'
+/// vertices passed through, as routeOverGlobalGraph searches. Home itself
+/// is always in it when the graph has one.
+std::unordered_set<int> reachedFromHome(mgg::GraphManager& graph) {
+  std::unordered_set<int> reached;
+  if (graph.vertices_map_.count(kHomeVertexId) == 0) return reached;
+  reached.insert(kHomeVertexId);
+  mgg::ShortestPathsReport report;
+  if (graph.getNumVertices() < 2 ||
+      !graph.findShortestPaths(kHomeVertexId, report) || !report.status) {
+    return reached;
+  }
   for (const auto& entry : graph.vertices_map_) {
-    if (!own(entry.first) || part_of.count(entry.first) > 0) continue;
-    const int part = parts++;
-    part_of[entry.first] = part;
-    std::vector<int> stack{entry.first};
-    while (!stack.empty()) {
-      const int at = stack.back();
-      stack.pop_back();
-      const auto edges = graph.edge_map_.find(at);
-      if (edges == graph.edge_map_.end()) continue;
-      for (const auto& edge : edges->second) {
-        if (own(edge.first) && part_of.emplace(edge.first, part).second) {
-          stack.push_back(edge.first);
-        }
-      }
+    if (entry.second != nullptr && graph.inService(*entry.second) &&
+        std::isfinite(mgg::reachedDistance(report, entry.first))) {
+      reached.insert(entry.first);
     }
   }
-  return part_of;
+  return reached;
 }
 
 /// Why a keyframe rebuild must not replace `current` with `rebuilt`, or
 /// empty when it may. In the drone smoke test (drone scout Task 17, C) a
 /// rebuild swapped a graph whose home Return Home reached for one of three
 /// parts with home alone in one, and Return Home failed from then on. So
-/// when home reaches another of this robot's vertices in `current`, the
-/// rebuilt graph must reach `linked` from home (what the rebuild was for;
-/// without it, any other vertex), and must keep together the places
-/// `current` connects to home: the rebuilt vertices nearest them, within
-/// `match_radius`, must lie in one part.
-std::string rebuildLosesHome(const mgg::GraphManager& current,
+/// when a route from home reaches another of this robot's vertices in
+/// `current` (reachedFromHome), a route from home in `rebuilt` must reach
+/// `linked` (what the rebuild was for; without it, any other vertex), and
+/// every such place: the rebuilt vertex nearest it, within
+/// `match_radius`, where there is one.
+std::string rebuildLosesHome(mgg::GraphManager& current,
                              mgg::GraphManager& rebuilt,
                              const mgg::Vertex* linked, int robot_id,
                              double match_radius) {
-  const std::unordered_map<int, int> current_parts =
-      ownParts(current, robot_id);
-  const auto current_home = current_parts.find(kHomeVertexId);
-  if (current_home == current_parts.end()) return "";
-  std::vector<const mgg::Vertex*> connected;
-  for (const auto& [id, part] : current_parts) {
-    if (part == current_home->second) {
-      connected.push_back(current.vertices_map_.at(id));
+  std::vector<const mgg::Vertex*> places;
+  for (const int id : reachedFromHome(current)) {
+    const mgg::Vertex* vertex = current.vertices_map_.at(id);
+    if (id != kHomeVertexId && vertex->robot_id == robot_id) {
+      places.push_back(vertex);
     }
   }
-  if (connected.size() < 2) return "";
-  const std::unordered_map<int, int> rebuilt_parts =
-      ownParts(rebuilt, robot_id);
-  const auto rebuilt_home = rebuilt_parts.find(kHomeVertexId);
-  if (rebuilt_home == rebuilt_parts.end()) return "has no home";
+  if (places.empty()) return "";
+  const std::unordered_set<int> reached = reachedFromHome(rebuilt);
+  if (reached.empty()) return "has no home";
   if (linked != nullptr) {
-    const auto link = rebuilt_parts.find(linked->id);
-    if (link == rebuilt_parts.end() || link->second != rebuilt_home->second) {
+    if (reached.count(linked->id) == 0) {
       return "would not reach home from where it links";
     }
-  } else if (std::none_of(rebuilt_parts.begin(), rebuilt_parts.end(),
-                          [&rebuilt_home](const auto& entry) {
-                            return entry.first != kHomeVertexId &&
-                                   entry.second == rebuilt_home->second;
-                          })) {
+  } else if (reached.size() < 2) {
     return "would cut home off";
   }
-  std::unordered_set<int> parts_reached;
-  for (const mgg::Vertex* vertex : connected) {
-    mgg::StateVec state = vertex->state;
+  for (const mgg::Vertex* place : places) {
+    mgg::StateVec state = place->state;
     mgg::Vertex* nearest = nullptr;
-    if (!rebuilt.getNearestVertexInRange(&state, match_radius, &nearest) ||
-        nearest == nullptr) {
-      continue;
+    if (rebuilt.getNearestVertexInRange(&state, match_radius, &nearest) &&
+        nearest != nullptr && reached.count(nearest->id) == 0) {
+      return "would cut off places the current graph connects to home";
     }
-    const auto part = rebuilt_parts.find(nearest->id);
-    if (part != rebuilt_parts.end()) parts_reached.insert(part->second);
-  }
-  if (parts_reached.size() > 1) {
-    return "would split places the current graph connects to home";
   }
   return "";
 }
@@ -2033,6 +2008,11 @@ bool PlannerNode::rebuildGlobalGraphFromKeyframes(
       return false;
     }
   }
+  // Routes over the rebuilt graph leave no-go edges out, as over the
+  // current one.
+  rebuilt->setEdgeBlocked([this](const mgg::Vertex& a, const mgg::Vertex& b) {
+    return noGoBlocksEdge(a, b);
+  });
   // Only for an aerial robot: a ground robot's rebuild corrects a graph
   // whose connections the map may no longer support (a wall seen since),
   // and replaces it as before (review r0, P1).
@@ -2076,10 +2056,6 @@ bool PlannerNode::rebuildGlobalGraphFromKeyframes(
     }
   }
   global_graph_ = rebuilt;
-  global_graph_->setEdgeBlocked(
-      [this](const mgg::Vertex& a, const mgg::Vertex& b) {
-        return noGoBlocksEdge(a, b);
-      });
   global_root_supported_ = true;
   global_exploration_ongoing_ = false;
   current_global_vertex_id_ = -1;
