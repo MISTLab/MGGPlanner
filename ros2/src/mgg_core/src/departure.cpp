@@ -102,6 +102,10 @@ VoxelStatus orientedBoxPathStatus(const MapInterface& map,
       !std::isfinite(resolution) || resolution <= 0.0) {
     return VoxelStatus::kUnknown;
   }
+  if (map.dynamicSweepBlocked(start, end,
+                              0.5 * std::max(box.size.x(), box.size.y()))) {
+    return VoxelStatus::kOccupied;
+  }
   const double length = (end - start).norm();
   const double steps_d = std::max(1.0, std::ceil(length / resolution));
   if (!std::isfinite(steps_d) || steps_d > double(kMaxSweepCells)) {
@@ -130,14 +134,14 @@ VoxelStatus orientedBoxPathStatus(const MapInterface& map,
           !entersBeyondStanding(cell.center, resolution, swept, *standing)) {
         continue;
       }
-      const VoxelStatus status = map.getBoxStatus(
+      const VoxelStatus status = map.getStaticBoxStatus(
           Eigen::Vector3d(cell.center.x(), cell.center.y(), swept.center.z()),
           Eigen::Vector3d(0.0, 0.0, swept.size.z()), stop_at_unknown_voxel);
       if (status == VoxelStatus::kOccupied) return status;
       if (status == VoxelStatus::kUnknown) unknown = true;
     }
   }
-  return unknown && stop_at_unknown_voxel ? VoxelStatus::kUnknown
+  return unknown ? VoxelStatus::kUnknown
                                           : VoxelStatus::kFree;
 }
 

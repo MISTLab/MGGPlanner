@@ -2749,6 +2749,9 @@ std::shared_ptr<PlannerNode> exploredDeadEnd(const std::string& name,
   PlannerNodeTestPeer::gainFromUnknownVoxelsOnly(*node);
   // At voxel centres, as boxedIn along y: a row of floor left unseen is
   // unknown ground, and a viewpoint that sees it has gain.
+  // Keep the lattice inside the explored corridor. Oriented edges can
+  // otherwise reach off-axis viewpoints outside this fixture's mapped view.
+  PlannerNodeTestPeer::setLattice(*node, {-1.0, 0.0}, {0.5, 0.0});
   PlannerNodeTestPeer::observeFloor(*node, -3.55, 1.05, -2.55, 2.55);
   PlannerNodeTestPeer::observeWall(*node, -0.4, 1.0, 0.25);
   PlannerNodeTestPeer::observeWall(*node, -0.4, 1.0, -0.25);

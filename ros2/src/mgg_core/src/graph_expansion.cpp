@@ -1,4 +1,5 @@
 #include "mgg_core/graph_expansion.h"
+#include "mgg_core/departure.h"
 
 #include <cmath>
 #include <utility>
@@ -66,10 +67,19 @@ bool edgeTraversable(const ExpandContext& ctx, const Eigen::Vector3d& start,
     return ctx.map->getPathStatus(start, end, ctx.robot_box_size,
                                   stop_at_unknown) == VoxelStatus::kFree;
   }
+  // Keep the extended body aligned with travel, as for driven roadmap
+  // edges; the terrain and observed-ground checks remain unchanged.
+  OrientedBox body;
+  body.heading = std::atan2(end.y() - start.y(), end.x() - start.x());
+  body.size = ctx.robot_box_size;
+  EdgeBodyCheck check;
+  check.sweep = [&](const Eigen::Vector3d& a, const Eigen::Vector3d& b) {
+    return orientedBoxPathStatus(*ctx.map, a, b, body, stop_at_unknown, nullptr);
+  };
   // Ground robot: the edge has to follow the terrain.
   const ProjectedEdgeStatus es = ctx.ground->getProjectedEdgeStatus(
       start, end, ctx.robot_box_size, stop_at_unknown, projected_edge,
-      is_hanging, preserve_start_height, nullptr, travel);
+      is_hanging, preserve_start_height, &check, travel);
   ++rep.edge_status[static_cast<int>(es)];
   if (es == ProjectedEdgeStatus::kAdmissible) return true;
   if (es == ProjectedEdgeStatus::kSteep) ++rep.steep_edges;

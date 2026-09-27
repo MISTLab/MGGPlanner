@@ -158,6 +158,18 @@ class MapInterface {
     return !centers.empty();
   }
 
+  /// Separate dynamic margins from static boxes for an oriented sweep.
+  /// Backends without dynamic obstacles retain their ordinary box query.
+  virtual bool dynamicSweepBlocked(const Eigen::Vector3d&,
+                                   const Eigen::Vector3d&, double) const {
+    return false;
+  }
+  virtual VoxelStatus getStaticBoxStatus(const Eigen::Vector3d& center,
+                                         const Eigen::Vector3d& size,
+                                         bool stop_at_unknown) const {
+    return getBoxStatus(center, size, stop_at_unknown);
+  }
+
   /// Whether the map has received enough data to be queried meaningfully.
   virtual bool getStatus() const = 0;
 

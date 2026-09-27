@@ -107,7 +107,7 @@ class LatticeColumnGround {
 
 /// Retry passes over the cells the sweep refused an edge (GridGraphResult::
 /// retried_joined); each stops the retries when it joins nothing.
-inline constexpr int kGridGraphRetryPasses = 3;
+inline constexpr int kGridGraphRetryPasses = 4;
 
 /// Sweeps the lattice around `state` and grows `graph` through it.
 ///

@@ -1216,6 +1216,14 @@ bool MolaMap::discSetBlocksBox(
   return false;
 }
 
+bool MolaMap::dynamicSweepBlocked(const Eigen::Vector3d& start,
+                                   const Eigen::Vector3d& end,
+                                   double half_width) const {
+  // Both peer bodies and no-go margins retain getPathStatus's outward-only
+  // departure exemption. Static measured obstacles never get it.
+  return discsBlockSweep(start, end, half_width);
+}
+
 VoxelStatus MolaMap::getBoxStatus(const Eigen::Vector3d& center,
                                   const Eigen::Vector3d& size,
                                   const bool stop_at_unknown_voxel) const {
@@ -1224,6 +1232,15 @@ VoxelStatus MolaMap::getBoxStatus(const Eigen::Vector3d& center,
   if (!center.allFinite() || !size.allFinite() || (size.array() < 0.0).any())
     return VoxelStatus::kUnknown;
   if (discsBlockBox(center, size)) return VoxelStatus::kOccupied;
+  return getStaticBoxStatus(center, size, stop_at_unknown_voxel);
+}
+
+VoxelStatus MolaMap::getStaticBoxStatus(const Eigen::Vector3d& center,
+                                        const Eigen::Vector3d& size,
+                                        bool stop_at_unknown_voxel) const {
+  const auto snapshot = current();
+  if (snapshot == nullptr || !center.allFinite() || !size.allFinite() ||
+      (size.array() < 0.0).any()) return VoxelStatus::kUnknown;
   const auto& transform = snapshot->request.component_from_navigation;
   return snapshot->map->getBoxStatus(transform * center,
                                      enclosingSize(transform.linear(), size),

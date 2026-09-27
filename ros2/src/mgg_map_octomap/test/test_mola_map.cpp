@@ -452,6 +452,15 @@ TEST(MolaMap, NoGoDiscsStayUntilReplacedAndCoexistWithPeerBodies) {
                                Eigen::Vector3d(0.3, -0.4, 0.1), body, true),
             VoxelStatus::kFree);
 
+  mgg::OrientedBox oriented;
+  oriented.size = body;
+  oriented.heading = -M_PI / 2;
+  const Eigen::Vector3d inside(0.3, 0.2, 0.1), outside(0.3, -0.4, 0.1);
+  EXPECT_EQ(mgg::orientedBoxPathStatus(*map, inside, outside, oriented, true, nullptr),
+            VoxelStatus::kFree);
+  EXPECT_EQ(mgg::orientedBoxPathStatus(*map, outside, inside, oriented, true, nullptr),
+            VoxelStatus::kOccupied);
+
   // A peer body elsewhere, with a short TTL: both sets hold at once.
   provider.setTransientDiscs({Eigen::Vector2d(-0.9, 0.1)}, 0.1, 0.05);
   EXPECT_EQ(map->getPathStatus(west, far_west, body, true),

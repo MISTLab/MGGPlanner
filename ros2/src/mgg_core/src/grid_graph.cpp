@@ -1,4 +1,5 @@
 #include "mgg_core/grid_graph.h"
+#include "mgg_core/departure.h"
 
 #include <algorithm>
 #include <cmath>
@@ -120,7 +121,7 @@ GridGraphResult buildGridGraph(GraphManager& graph, const StateVec& state,
       if (ground_status == VoxelStatus::kOccupied &&
           column_ground.holds(i, j, driving_z)) {
         if (first_pass) ++result.merged_duplicates;
-        return;
+        return false;
       }
       other_level = ground_status == VoxelStatus::kOccupied &&
                     std::abs(driving_z - state.z()) >
@@ -156,8 +157,34 @@ GridGraphResult buildGridGraph(GraphManager& graph, const StateVec& state,
                rep.status == ExpandGraphStatus::kErrorCollisionEdge) {
       retries.push_back({cell, i, j});
     }
+    return rep.edge_status[static_cast<int>(ProjectedEdgeStatus::kOccupied)] > 0;
   };
 
+  const auto try_cell = [&](const Eigen::Vector3d& candidate, int i, int j, bool& added) {
+    OrientedBox body;
+    body.heading = heading;
+    StateVec query(candidate.x(), candidate.y(), candidate.z(), heading);
+    Vertex* nearest = nullptr;
+    if (ground_robot && graph.getNearestVertex(&query, &nearest) &&
+        nearest != nullptr &&
+        (candidate.head<2>() - nearest->state.head<2>()).norm() > 1e-9) {
+      body.heading = std::atan2(candidate.y() - nearest->state.y(),
+                                candidate.x() - nearest->state.x());
+    }
+    body.size = ctx.robot_box_size;
+    const Eigen::Vector3d center = candidate + ctx.robot->center_offset;
+    VoxelStatus status = ctx.map->getBoxStatus(
+        center, ctx.robot_box_size, !ctx.allow_unknown_lattice_body);
+    if (ground_robot && status == VoxelStatus::kOccupied) {
+      status = orientedBoxPathStatus(*ctx.map, center, center, body,
+                                     !ctx.allow_unknown_lattice_body, nullptr);
+    }
+    if (status != VoxelStatus::kFree) return status == VoxelStatus::kOccupied;
+    ++result.free_cells;
+    return offer(candidate, i, j, /*first_pass=*/true, added);
+  };
+
+  std::vector<Retry> nudges;
   for (const auto& [unused_distance, i, j] : columns) {
     (void)unused_distance;
     for (int k = 0; k < num_nodes[2]; ++k) {
@@ -176,15 +203,9 @@ GridGraphResult buildGridGraph(GraphManager& graph, const StateVec& state,
       const double z_world = z_val + state.z();
 
       const Eigen::Vector3d cell(x_val, y_val, z_world);
-      const VoxelStatus body_status = ctx.map->getBoxStatus(
-          cell + ctx.robot->center_offset, ctx.robot_box_size,
-          !ctx.allow_unknown_lattice_body);
-      if (body_status != VoxelStatus::kFree) {
-        continue;
-      }
-      ++result.free_cells;
       bool added = false;
-      offer(cell, i, j, /*first_pass=*/true, added);
+      const bool refused = try_cell(cell, i, j, added);
+      if (ground_robot && refused && !added) nudges.push_back({cell, i, j});
     }
   }
 
@@ -206,6 +227,18 @@ GridGraphResult buildGridGraph(GraphManager& graph, const StateVec& state,
     result.retried_joined += joined;
     retries.swap(left);
     if (joined == 0) break;
+  }
+  // Original cells and other-level links get their first chance before
+  // nudges spend any of the shared budget or change nearest neighbours.
+  for (const Retry& retry : nudges) {
+    for (double offset : {0.1, -0.1, 0.2, -0.2}) {
+      if (!charge()) return result;
+      bool added = false;
+      const Eigen::Vector3d shifted =
+          retry.cell + offset * Eigen::Vector3d(-sin_h, cos_h, 0.0);
+      try_cell(shifted, retry.i, retry.j, added);
+      if (added) break;
+    }
   }
   return result;
 }

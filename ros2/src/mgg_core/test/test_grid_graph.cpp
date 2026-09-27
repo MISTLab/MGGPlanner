@@ -38,6 +38,12 @@ class OpenSpace : public MapInterface {
   explicit OpenSpace(double wall_x = 1e9) : wall_x_(wall_x) {}
 
   double getResolution() const override { return 0.2; }
+  bool getAxisAlignedXYCellCenter(const Eigen::Vector2d& p,
+                                 Eigen::Vector2d& center) const override {
+    center = (p.array() / 0.2).floor().matrix() * 0.2 +
+             Eigen::Vector2d::Constant(0.1);
+    return true;
+  }
   bool getStatus() const override { return true; }
   VoxelStatus getVoxelStatus(const Eigen::Vector3d& p) const override {
     return p.x() >= wall_x_ ? VoxelStatus::kOccupied : VoxelStatus::kFree;
@@ -852,3 +858,46 @@ TEST(GridGraph, ADeckOverTheFloorReachedOnlyByGoingOutwardFirstIsJoined) {
 }
 
 }  // namespace
+
+TEST(GridGraph, HeadingAlignedBodyAndCrossNudgeEnterANarrowNorthPassage) {
+  // A long body fits northwards, not map-aligned. With the second mouth
+  // offset, only the +0.1 m centre-line retry fits the same full-size body.
+  for (double offset : {0.0, 0.15}) {
+    SCOPED_TRACE(offset);
+    std::map<std::pair<std::int64_t, std::int64_t>, double> tops;
+    for (int x = -30; x < 30; ++x) {
+      for (int y = -30; y < 80; ++y) {
+        const double px = (x + 0.5) * 0.05;
+        const double py = (y + 0.5) * 0.05;
+        tops[{x, y}] = py > 0.8 && std::abs(px - offset) > 0.45 ? 0.4 : 0.0;
+      }
+    }
+    mgg_test::TerrainFixture map(0.05, tops);
+    RobotParams robot;
+    robot.type = RobotType::kGroundRobot;
+    robot.size = Eigen::Vector3d(1.2, 0.6, 0.3);
+    PlanningParams planning;
+    planning.max_ground_height = 0.4;
+    planning.max_step_height = 0.15;
+    planning.edge_length_min = 0.05;
+    planning.edge_length_max = 0.6;
+    planning.edge_overshoot = 0;
+    planning.min_observed_ground_fraction = 0;
+    mgg::GroundProjection ground(map, planning);
+    ExpandContext ctx;
+    ctx.map = &map; ctx.robot = &robot; ctx.planning = &planning;
+    ctx.ground = &ground; ctx.robot_box_size = robot.getPlanningSize();
+    GraphManager graph;
+    const StateVec root(0, 0, 0.4, M_PI / 2);
+    graph.addVertex(new Vertex(0, root));
+    GridGraphParams grid;
+    grid.min_val = Eigen::Vector3d::Zero();
+    grid.max_val = Eigen::Vector3d(2.8, 0, 0);
+    grid.resolution = Eigen::Vector3d::Constant(0.4);
+    buildGridGraph(graph, root, grid, ctx, M_PI / 2);
+    double reach = 0;
+    for (const auto& entry : graph.vertices_map_)
+      reach = std::max(reach, entry.second->state.y());
+    EXPECT_GT(reach, 2.0);
+  }
+}
