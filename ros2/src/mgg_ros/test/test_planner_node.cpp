@@ -314,6 +314,11 @@ class PlannerNodeTestPeer {
     const std::lock_guard<std::recursive_mutex> lock(node.planner_mutex_);
     node.tour_params_.route_retry_s = seconds;
   }
+  /// Peer diagnoses run since the node started.
+  static int peerDiagnoses(PlannerNode& node) {
+    const std::lock_guard<std::recursive_mutex> lock(node.planner_mutex_);
+    return node.peer_diagnoses_;
+  }
   /// How long a peer_bodies message stays in force.
   static void setPeerBodyTtl(PlannerNode& node, double seconds) {
     const std::lock_guard<std::recursive_mutex> lock(node.planner_mutex_);
@@ -2283,6 +2288,98 @@ TEST_F(PlannerNodeTest, TourCostsFollowPeerExpiryAndSmallMovesOnAnUnchangedRoadm
   PlannerNodeTestPeer::receivePeerBodies(*node, {{-3.0, 0.75}});
   EXPECT_EQ(PlannerNodeTestPeer::refreshTour(*node), target);
   EXPECT_EQ(PlannerNodeTestPeer::graphRevision(*node), beside);
+}
+
+namespace {
+
+/// peerFloorNode over x in [-12, 1.5], y in [-6, 6], the robot at the
+/// origin facing west, and a roadmap: a chain west through (-1, 0), (-2, 0)
+/// and (-3, 0) into a grid of 0.25 m cells over x in [-11.5, -4], y in
+/// [-5.5, 5.5], some 1400 vertices, whose only way in is the chain.
+std::shared_ptr<PlannerNode> largeRoadmapBehindAChain(
+    const std::string& name, std::unique_ptr<MolaFloorProduct>& product) {
+  auto node = peerFloorNode(name, -12.0, 1.5, -6.0, 6.0, product);
+  PlannerNodeTestPeer::acceptOdometryFacing(*node, 0.0, 0.0, M_PI, 1.0);
+  PlannerNodeTestPeer::addGlobalChainToFrontier(
+      *node, {{-1.0, 0.0}, {-2.0, 0.0}, {-3.0, 0.0}}, M_PI);
+  std::vector<std::vector<int>> grid;
+  for (int i = 0; i <= 30; ++i) {
+    grid.emplace_back();
+    for (int j = 0; j <= 44; ++j) {
+      grid[i].push_back(PlannerNodeTestPeer::addIsolatedGlobalVertex(
+          *node, -4.0 - 0.25 * i, -5.5 + 0.25 * j));
+      if (j > 0) {
+        PlannerNodeTestPeer::addGlobalEdgeOnly(*node, grid[i][j - 1],
+                                               grid[i][j]);
+      }
+      if (i > 0) {
+        PlannerNodeTestPeer::addGlobalEdgeOnly(*node, grid[i - 1][j],
+                                               grid[i][j]);
+      }
+    }
+  }
+  PlannerNodeTestPeer::addGlobalEdgeOnly(
+      *node, PlannerNodeTestPeer::globalVertexAt(*node, -3.0, 0.0),
+      PlannerNodeTestPeer::globalVertexAt(*node, -4.0, 0.0));
+  PlannerNodeTestPeer::setTour(*node, false, 0.0);
+  return node;
+}
+
+}  // namespace
+
+TEST_F(PlannerNodeTest, APeerOnlyDiagnosisIsBoundedByTheSearchBudget) {
+  // Review r0, I4: whether only a peer keeps the robot from a goal is a
+  // second search of the roadmap, with the peers' edges open. It is bound
+  // by global_search_time_budget_s, as the frontier search is. With the
+  // budget spent at once, a Navigate into the large roadmap behind a peer
+  // parked on its only way in is answered BLOCKED, retryable, saying the
+  // check was cut short; with a budget, BLOCKED by the peer; and the peer
+  // gone, a route.
+  using Service = mgg_msgs::srv::PlanObjective;
+  std::unique_ptr<MolaFloorProduct> product;
+  auto node = largeRoadmapBehindAChain("peer_diagnosis_budget", product);
+  PlannerNodeTestPeer::receivePeerBodies(*node, {{-2.5, 0.0}});
+  PlannerNodeTestPeer::setGlobalSearchBudget(*node, 0.0);
+  auto response =
+      peerObjective(*node, Service::Request::NAVIGATE, -9.0, 2.0);
+  EXPECT_EQ(response->status, Service::Response::BLOCKED) << response->reason;
+  EXPECT_NE(response->reason.find("cut short"), std::string::npos)
+      << response->reason;
+
+  PlannerNodeTestPeer::setGlobalSearchBudget(*node, 5.0);
+  response = peerObjective(*node, Service::Request::NAVIGATE, -9.0, 2.0);
+  EXPECT_EQ(response->status, Service::Response::BLOCKED) << response->reason;
+  EXPECT_EQ(response->reason.find("cut short"), std::string::npos)
+      << response->reason;
+
+  PlannerNodeTestPeer::receivePeerBodies(*node, {{1.0, 5.5}});
+  response = peerObjective(*node, Service::Request::NAVIGATE, -9.0, 2.0);
+  EXPECT_EQ(response->status, Service::Response::SUCCEEDED)
+      << response->reason;
+}
+
+TEST_F(PlannerNodeTest, NoPeerDiagnosisRunsWithoutPeersInForce) {
+  // Review r0, I4: largeRoadmapBehindAChain with its chain cut: the goal is
+  // unreachable, peers or none. With no peer in force the refusal costs no
+  // second search; with one, the diagnosis runs and the goal is still
+  // UNREACHABLE.
+  using Service = mgg_msgs::srv::PlanObjective;
+  std::unique_ptr<MolaFloorProduct> product;
+  auto node = largeRoadmapBehindAChain("peer_diagnosis_skip", product);
+  PlannerNodeTestPeer::removeGlobalEdge(
+      *node, PlannerNodeTestPeer::globalVertexAt(*node, -3.0, 0.0),
+      PlannerNodeTestPeer::globalVertexAt(*node, -4.0, 0.0));
+  auto response =
+      peerObjective(*node, Service::Request::NAVIGATE, -9.0, 2.0);
+  EXPECT_EQ(response->status, Service::Response::UNREACHABLE)
+      << response->reason;
+  EXPECT_EQ(PlannerNodeTestPeer::peerDiagnoses(*node), 0);
+
+  PlannerNodeTestPeer::receivePeerBodies(*node, {{1.0, 5.5}});
+  response = peerObjective(*node, Service::Request::NAVIGATE, -9.0, 2.0);
+  EXPECT_EQ(response->status, Service::Response::UNREACHABLE)
+      << response->reason;
+  EXPECT_GT(PlannerNodeTestPeer::peerDiagnoses(*node), 0);
 }
 
 TEST_F(PlannerNodeTest, ATourTargetBehindAParkedPeerIsSetAsideBriefly) {

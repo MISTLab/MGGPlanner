@@ -1,6 +1,7 @@
 #include "mgg_core/graph.h"
 
 #include <iostream>
+#include <memory>
 
 namespace mgg {
 
@@ -72,9 +73,12 @@ bool Graph::edgeExists(int u_id, int v_id){
   return boost::edge(vertex_descriptors_[u_id], vertex_descriptors_[v_id],graph_).second;
 }
 
-bool Graph::findDijkstraShortestPaths(int src_id, ShortestPathsReport& rep) {
+bool Graph::findDijkstraShortestPaths(
+    int src_id, ShortestPathsReport& rep,
+    const std::chrono::steady_clock::time_point* deadline) {
   rep.source_id = src_id;
   rep.status = false;
+  rep.cut_short = false;
   if (vertex_descriptors_.size() <= src_id) {
     std::cout << "Source index [" << src_id << "] is not in the graph."
               << std::endl;
@@ -84,7 +88,7 @@ bool Graph::findDijkstraShortestPaths(int src_id, ShortestPathsReport& rep) {
   std::vector<VertexDescriptor> shortest_paths;
   std::vector<double> shortest_distances;
   if (findDijkstraShortestPaths(vertex_descriptors_[src_id], shortest_paths,
-                                shortest_distances)) {
+                                shortest_distances, deadline, rep.cut_short)) {
     rep.status = true;
     rep.parent_id_map.clear();
     rep.distance_map.clear();
@@ -98,9 +102,33 @@ bool Graph::findDijkstraShortestPaths(int src_id, ShortestPathsReport& rep) {
   return rep.status;
 }
 
+namespace {
+
+/// Thrown by DeadlineVisitor to stop a search at its deadline.
+struct SearchDeadlinePassed {};
+
+/// Stops a Dijkstra search once `deadline` has passed, checked every
+/// Graph::kDeadlineCheckVertices vertices settled; no deadline, never.
+struct DeadlineVisitor : boost::default_dijkstra_visitor {
+  const std::chrono::steady_clock::time_point* deadline = nullptr;
+  std::shared_ptr<int> settled = std::make_shared<int>(0);
+  template <class Vertex, class G>
+  void examine_vertex(Vertex, const G&) {
+    if (deadline == nullptr) return;
+    if (++*settled % Graph::kDeadlineCheckVertices == 0 &&
+        std::chrono::steady_clock::now() >= *deadline) {
+      throw SearchDeadlinePassed{};
+    }
+  }
+};
+
+}  // namespace
+
 bool Graph::findDijkstraShortestPaths(
     VertexDescriptor& source, std::vector<VertexDescriptor>& shortest_paths,
-    std::vector<double>& shortest_distances) {
+    std::vector<double>& shortest_distances,
+    const std::chrono::steady_clock::time_point* deadline, bool& cut_short) {
+  cut_short = false;
   num_vertices_ = boost::num_vertices(graph_);
   if (num_vertices_ < 2) return false;
   shortest_paths.clear();
@@ -108,6 +136,8 @@ bool Graph::findDijkstraShortestPaths(
   shortest_paths.resize(num_vertices_);
   shortest_distances.resize(num_vertices_);
 
+  DeadlineVisitor visitor;
+  visitor.deadline = deadline;
   const auto parameters =
       boost::predecessor_map(
           boost::make_iterator_property_map(shortest_paths.begin(),
@@ -115,24 +145,30 @@ bool Graph::findDijkstraShortestPaths(
           .distance_map(boost::make_iterator_property_map(
               shortest_distances.begin(), get(boost::vertex_index, graph_)))
           .weight_map(get(boost::edge_weight, graph_))
-          .vertex_index_map(get(boost::vertex_index, graph_));
-  if (!edge_blocked_) {
-    boost::dijkstra_shortest_paths(graph_, source, parameters);
-    return true;
-  }
-  // Blocked edges are left out of this search only.
-  struct Open {
-    const GraphType* graph = nullptr;
-    const EdgeBlockedFn* blocked = nullptr;
-    bool operator()(const EdgeDescriptor& e) const {
-      const auto index = boost::get(boost::vertex_index, *graph);
-      return !(*blocked)(boost::get(index, boost::source(e, *graph)),
-                         boost::get(index, boost::target(e, *graph)));
+          .vertex_index_map(get(boost::vertex_index, graph_))
+          .visitor(visitor);
+  try {
+    if (!edge_blocked_) {
+      boost::dijkstra_shortest_paths(graph_, source, parameters);
+      return true;
     }
-  };
-  const boost::filtered_graph<GraphType, Open> open(graph_,
-                                                    Open{&graph_, &edge_blocked_});
-  boost::dijkstra_shortest_paths(open, source, parameters);
+    // Blocked edges are left out of this search only.
+    struct Open {
+      const GraphType* graph = nullptr;
+      const EdgeBlockedFn* blocked = nullptr;
+      bool operator()(const EdgeDescriptor& e) const {
+        const auto index = boost::get(boost::vertex_index, *graph);
+        return !(*blocked)(boost::get(index, boost::source(e, *graph)),
+                           boost::get(index, boost::target(e, *graph)));
+      }
+    };
+    const boost::filtered_graph<GraphType, Open> open(
+        graph_, Open{&graph_, &edge_blocked_});
+    boost::dijkstra_shortest_paths(open, source, parameters);
+  } catch (const SearchDeadlinePassed&) {
+    cut_short = true;
+    return false;
+  }
   return true;
 }
 

@@ -123,6 +123,10 @@ class GraphManager {
 
   bool findShortestPaths(ShortestPathsReport& rep);
   bool findShortestPaths(int source_id, ShortestPathsReport& rep);
+  /// Stopped once `deadline` passes: false, rep.cut_short
+  /// (Graph::findDijkstraShortestPaths).
+  bool findShortestPaths(int source_id, ShortestPathsReport& rep,
+                         std::chrono::steady_clock::time_point deadline);
   /// Whether the edge between two vertices is closed to every search
   /// (findShortestPaths), though it stays in the graph: an edge through a
   /// no-go zone. An empty function opens them all.

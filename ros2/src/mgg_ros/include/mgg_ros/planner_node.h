@@ -207,6 +207,14 @@ class PlannerNode : public rclcpp::Node {
   /// bodies (peerBlocksSegment): the last check on every path and route
   /// sent, as noGoAdmissible is for the zones.
   bool peerAdmissible(const std::vector<mgg::StateVec>& path) const;
+  /// Whether any peer body is in force (a request's pinned set, or those
+  /// published and not expired): without, no peer diagnosis runs.
+  bool peersInForce() const;
+  /// A peer diagnosis: the roadmap search from `source_id` with the peers'
+  /// edges open, stopped at peer_diagnosis_deadline_, or else
+  /// global_search_time_budget_s from now (review r0, I4). False when cut
+  /// short, which sets peer_diagnosis_cut_short_.
+  bool diagnosePeerSearch(int source_id, mgg::ShortestPathsReport& rep);
   /// The global graph's edge test (GraphManager::setEdgeBlocked): a no-go
   /// zone or a peer body closes the edge from `a` to `b` for this search,
   /// and the roadmap keeps it. Records each edge a peer closes in
@@ -678,6 +686,13 @@ class PlannerNode : public rclcpp::Node {
   /// Peer bodies are left out of peerBlocksSegment: set only to ask whether
   /// a failed search would have succeeded without them.
   bool peer_edges_open_ = false;
+  /// While an objective is routed again without peers to tell whether they
+  /// alone stopped it, every roadmap search stops here (diagnosePeerSearch).
+  std::optional<std::chrono::steady_clock::time_point> peer_diagnosis_deadline_;
+  /// A peer diagnosis was cut short since last reset.
+  bool peer_diagnosis_cut_short_ = false;
+  /// Peer diagnoses run since the node started.
+  int peer_diagnoses_ = 0;
   /// Changes whenever the peer bodies in force change
   /// (refreshPeerGeneration): the tour's route costs are cached by it and
   /// the graph revision (review r0, I3). Its key: the centres, quantized

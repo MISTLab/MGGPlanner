@@ -299,6 +299,12 @@ bool GraphManager::findShortestPaths(int source_id, ShortestPathsReport& rep) {
   return graph_->findDijkstraShortestPaths(source_id, rep);
 }
 
+bool GraphManager::findShortestPaths(
+    int source_id, ShortestPathsReport& rep,
+    std::chrono::steady_clock::time_point deadline) {
+  return graph_->findDijkstraShortestPaths(source_id, rep, &deadline);
+}
+
 void GraphManager::getShortestPath(int target_id,
                                    const ShortestPathsReport& rep,
                                    bool source_to_target_order,

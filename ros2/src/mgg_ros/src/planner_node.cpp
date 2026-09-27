@@ -1564,6 +1564,29 @@ bool PlannerNode::peerAdmissible(const std::vector<mgg::StateVec>& path) const {
   return true;
 }
 
+bool PlannerNode::peersInForce() const {
+  return mola_map_ != nullptr &&
+         !mola_map_->activeTransientDiscs().centres.empty();
+}
+
+bool PlannerNode::diagnosePeerSearch(int source_id,
+                                     mgg::ShortestPathsReport& rep) {
+  ++peer_diagnoses_;
+  const auto deadline =
+      peer_diagnosis_deadline_.value_or(
+          std::chrono::steady_clock::now() +
+          std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+              std::chrono::duration<double>(std::max(
+                  0.0, planning_params_.global_search_time_budget_s))));
+  const bool open = peer_edges_open_;
+  peer_edges_open_ = true;
+  rep = mgg::ShortestPathsReport();
+  global_graph_->findShortestPaths(source_id, rep, deadline);
+  peer_edges_open_ = open;
+  if (rep.cut_short) peer_diagnosis_cut_short_ = true;
+  return !rep.cut_short;
+}
+
 bool PlannerNode::globalEdgeBlocked(const mgg::Vertex& a,
                                     const mgg::Vertex& b) {
   if (noGoBlocksEdge(a, b)) return true;
@@ -2827,7 +2850,13 @@ bool PlannerNode::routeOverGlobalGraph(const mgg::StateVec goal,
   mgg::ShortestPathsReport rep;
   const auto search = [this, &rep, link_vertex]() {
     rep.status = false;
-    global_graph_->findShortestPaths(link_vertex->id, rep);
+    if (peer_diagnosis_deadline_.has_value()) {
+      // A route only asked for to tell whether peers alone stop one:
+      // bounded as every peer diagnosis is (review r0, I4).
+      diagnosePeerSearch(link_vertex->id, rep);
+    } else {
+      global_graph_->findShortestPaths(link_vertex->id, rep);
+    }
   };
   const auto reaches = [&rep, link_vertex](const mgg::Vertex& vertex) {
     if (vertex.id == link_vertex->id) return true;
@@ -2913,12 +2942,15 @@ bool PlannerNode::routeOverGlobalGraph(const mgg::StateVec goal,
   if (!reaches(*goal_vertex)) {
     reason = "no route over the global graph reaches the goal";
     // Whether only peer bodies close the way: the same search with them
-    // left out reaches the goal. Then the route is to be tried again.
-    if (mola_map_ != nullptr) {
-      peer_edges_open_ = true;
-      search();
-      peer_edges_open_ = false;
-      if (reaches(*goal_vertex)) {
+    // left out reaches the goal. Then the route is to be tried again. Only
+    // with peers in force, and within the search budget: cut short, it is
+    // retried as well (review r0, I4).
+    if (peersInForce() && !peer_edges_open_) {
+      if (!diagnosePeerSearch(link_vertex->id, rep)) {
+        last_route_blocked_by_peer_ = true;
+        reason += "; whether only a peer blocks it was cut short by the "
+                  "search budget";
+      } else if (reaches(*goal_vertex)) {
         last_route_blocked_by_peer_ = true;
         reason = "every route over the global graph to the goal is blocked "
                  "by a peer";
@@ -3289,12 +3321,17 @@ bool PlannerNode::runGlobalPlanner(int target_id, std::string& reason,
                         : "");
       reason = why;
       // Frontiers only peer bodies keep the robot from are still to be
-      // explored: the search is retried, not exploration complete.
-      if (mola_map_ != nullptr && !report.cut_short()) {
-        mgg::ShortestPathsReport open;
-        peer_edges_open_ = true;
-        global_graph_->findShortestPaths(link_vertex->id, open);
-        peer_edges_open_ = false;
+      // explored: the search is retried, not exploration complete. Only
+      // with peers in force, and within the search budget: cut short, the
+      // search is retried as well (review r0, I4).
+      mgg::ShortestPathsReport open;
+      if (peersInForce() && !report.cut_short() &&
+          !diagnosePeerSearch(link_vertex->id, open)) {
+        global_frontier_not_routed_ = true;
+        last_route_blocked_by_peer_ = true;
+        reason += "; whether frontiers lie behind a peer was cut short by "
+                  "the search budget";
+      } else if (open.status) {
         for (const auto& [id, vertex] : global_graph_->vertices_map_) {
           if (vertex == nullptr || vertex->type != mgg::VertexType::kFrontier ||
               !global_graph_->inService(*vertex) ||
@@ -3954,10 +3991,23 @@ void PlannerNode::onObjectiveRequest(
     // route's check), is BLOCKED, which the caller retries until its
     // deadline, not UNREACHABLE (review r0, I2): the same routing with no
     // peer bodies finds a route.
-    if (mola_map_ != nullptr &&
-        !mola_map_->activeTransientDiscs().centres.empty()) {
+    // The routing may have told already, within its search budget; the
+    // routing again is bound by it too, and cut short is retryable as well
+    // (review r0, I4).
+    if (peersInForce()) {
+      if (last_route_blocked_by_peer_) {
+        response->status = Service::Response::BLOCKED;
+        response->reason = "blocked by a peer: " + reason;
+        return;
+      }
       const mgg::MolaMap::TransientDiscPin no_peers(*mola_map_, {}, 0.0);
       peer_edges_open_ = true;
+      peer_diagnosis_cut_short_ = false;
+      peer_diagnosis_deadline_ =
+          std::chrono::steady_clock::now() +
+          std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+              std::chrono::duration<double>(std::max(
+                  0.0, planning_params_.global_search_time_budget_s)));
       std::vector<mgg::StateVec> open_route;
       mgg::PathOkFn open_turns_ok;
       std::string open_reason;
@@ -3967,10 +4017,19 @@ void PlannerNode::onObjectiveRequest(
                                  open_reason)) ||
           routeOverGlobalGraph(goal, tolerance, open_route, open_turns_ok,
                                open_reason);
+      peer_diagnosis_deadline_.reset();
       peer_edges_open_ = false;
       if (open_routed) {
         response->status = Service::Response::BLOCKED;
         response->reason = "blocked by a peer: " + reason;
+        return;
+      }
+      if (peer_diagnosis_cut_short_) {
+        response->status = Service::Response::BLOCKED;
+        response->reason =
+            "blocked by a peer, or not: the check was cut short by the "
+            "search budget: " +
+            reason;
         return;
       }
     }

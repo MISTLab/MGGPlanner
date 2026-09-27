@@ -1751,4 +1751,28 @@ TEST(RebuildRoadmapFromTrajectory, NothingIsBuiltWithoutGroundUnderHome) {
   EXPECT_EQ(scene.graph.getNumVertices(), 0);
 }
 
+TEST(GraphDeadline, APassedDeadlineCutsALargeSearchShort) {
+  // Review r0, I4: the peer diagnoses search with a deadline. On a chain
+  // of 500 vertices a deadline already passed stops the search at its
+  // first check; none completes it.
+  GraphManager graph;
+  Vertex* previous = new Vertex(0, StateVec(0.0, 0.0, 0.0, 0.0));
+  graph.addVertex(previous);
+  for (int i = 1; i < 500; ++i) {
+    Vertex* next = new Vertex(i, StateVec(0.5 * i, 0.0, 0.0, 0.0));
+    graph.addVertex(next);
+    graph.addEdge(previous, next, 0.5);
+    previous = next;
+  }
+  ShortestPathsReport report;
+  EXPECT_FALSE(graph.findShortestPaths(0, report,
+                                       std::chrono::steady_clock::now()));
+  EXPECT_TRUE(report.cut_short);
+  EXPECT_FALSE(report.status);
+  EXPECT_TRUE(graph.findShortestPaths(
+      0, report, std::chrono::steady_clock::now() + std::chrono::hours(1)));
+  EXPECT_FALSE(report.cut_short);
+  EXPECT_NEAR(report.distance_map.at(499), 249.5, 1e-9);
+}
+
 }  // namespace

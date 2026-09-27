@@ -8,6 +8,7 @@
 #ifndef MGG_CORE_GRAPH_H_
 #define MGG_CORE_GRAPH_H_
 
+#include <chrono>
 #include <functional>
 #include <unordered_map>
 
@@ -30,8 +31,13 @@ namespace mgg {
 // Result of the Dijkstra shortest path calculation, one to all vertices.
 struct ShortestPathsReport {
   ShortestPathsReport() : status(false), source_id(0) {}
-  void reset() { status = false; }
+  void reset() {
+    status = false;
+    cut_short = false;
+  }
   bool status;    // False if can not run the shortest path algorithm.
+  /// The search stopped at its deadline (status false): no answer.
+  bool cut_short = false;
   int source_id;  // ID of the source vertex.
   // Direct parent ID related to the shortest path corresponding to each ID in
   // the id_list
@@ -72,7 +78,12 @@ class Graph {
   void removeEdge(int u_id, int v_id);
   bool edgeExists(int u_id, int v_id);
 
-  bool findDijkstraShortestPaths(int src_id, ShortestPathsReport& rep);
+  /// With `deadline`, the search stops once it has passed, checked every
+  /// kDeadlineCheckVertices vertices settled: status false, cut_short.
+  bool findDijkstraShortestPaths(
+      int src_id, ShortestPathsReport& rep,
+      const std::chrono::steady_clock::time_point* deadline = nullptr);
+  static constexpr int kDeadlineCheckVertices = 64;
   /// Whether the edge between two vertex ids is closed to every search
   /// (findDijkstraShortestPaths), though it stays in the graph.
   using EdgeBlockedFn = std::function<bool(int, int)>;
@@ -103,9 +114,11 @@ class Graph {
   int robot_id_;
   EdgeBlockedFn edge_blocked_;
 
-  bool findDijkstraShortestPaths(VertexDescriptor& source,
-                                 std::vector<VertexDescriptor>& shortest_paths,
-                                 std::vector<double>& shortest_distances);
+  /// False when it cannot run, or, `cut_short` set, stopped at `deadline`.
+  bool findDijkstraShortestPaths(
+      VertexDescriptor& source, std::vector<VertexDescriptor>& shortest_paths,
+      std::vector<double>& shortest_distances,
+      const std::chrono::steady_clock::time_point* deadline, bool& cut_short);
 };
 
 }  // namespace mgg
