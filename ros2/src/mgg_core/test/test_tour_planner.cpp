@@ -147,18 +147,57 @@ TEST(TourPlanner, AClockThatWentBackwardsDoesNotStallTheSolve) {
   EXPECT_FALSE(planner.needsSolve(clusters, 1, 0, 0.5));  // nothing changed
 }
 
-TEST(LocalPathServesTarget, AheadOrInsideTheLatticeOnly) {
+TEST(LocalPathServesTarget, AheadOrInsideTheLatticeAndCloserOnly) {
   const Eigen::Vector3d lo(-1.0, -1.0, 0.0);
   const Eigen::Vector3d hi(3.0, 1.0, 0.0);
   const Eigen::Vector3d robot = Eigen::Vector3d::Zero();
   const Eigen::Vector3d far(20.0, 0.0, 0.0);
-  EXPECT_TRUE(mgg::localPathServesTarget(robot, {2.0, 0.5, 0.0}, far, lo, hi));
-  EXPECT_FALSE(mgg::localPathServesTarget(robot, {-2.0, 0.0, 0.0}, far, lo, hi));
-  EXPECT_FALSE(mgg::localPathServesTarget(robot, {0.0, 2.0, 0.0}, far, lo, hi));
-  EXPECT_FALSE(mgg::localPathServesTarget(robot, robot, far, lo, hi));
-  // A target inside the lattice box is served by whatever local path.
-  EXPECT_TRUE(mgg::localPathServesTarget(robot, {-1.0, 0.0, 0.0},
-                                         {2.0, 0.5, 0.0}, lo, hi));
+  EXPECT_TRUE(
+      mgg::localPathServesTarget(robot, {2.0, 0.5, 0.0}, far, lo, hi, 5.0));
+  EXPECT_FALSE(
+      mgg::localPathServesTarget(robot, {-2.0, 0.0, 0.0}, far, lo, hi, 5.0));
+  EXPECT_FALSE(
+      mgg::localPathServesTarget(robot, {0.0, 2.0, 0.0}, far, lo, hi, 5.0));
+  EXPECT_FALSE(mgg::localPathServesTarget(robot, robot, far, lo, hi, 5.0));
+  // A target inside the lattice box is served by a local path that gets
+  // closer to it, and no longer by whatever local path.
+  const Eigen::Vector3d inside(2.0, 0.5, 0.0);
+  EXPECT_TRUE(
+      mgg::localPathServesTarget(robot, {1.5, 0.5, 0.0}, inside, lo, hi, 5.0));
+  EXPECT_FALSE(
+      mgg::localPathServesTarget(robot, {-1.0, 0.0, 0.0}, inside, lo, hi, 5.0));
+}
+
+TEST(LocalPathServesTarget, OnlyAPathThatGetsCloserServesTheTarget) {
+  // Run 10b, robot_3: its target lay 2 m away, inside the lattice (+-6 m),
+  // and every local path served it, the one ending 5 m the other way too.
+  const Eigen::Vector3d lo(-6.0, -6.0, 0.0);
+  const Eigen::Vector3d hi(6.0, 6.0, 0.0);
+  const Eigen::Vector3d robot = Eigen::Vector3d::Zero();
+  const Eigen::Vector3d near(2.0, 0.0, 0.0);
+  EXPECT_FALSE(
+      mgg::localPathServesTarget(robot, {-3.0, 0.0, 0.0}, near, lo, hi, 5.0));
+  // Within its reach but farther from it than the robot: not served.
+  EXPECT_FALSE(
+      mgg::localPathServesTarget(robot, {-1.5, 0.0, 0.0}, near, lo, hi, 5.0));
+  // A quarter of the way closer, 0.5 m of 2 m, serves it.
+  EXPECT_FALSE(
+      mgg::localPathServesTarget(robot, {0.4, 0.0, 0.0}, near, lo, hi, 0.5));
+  EXPECT_TRUE(
+      mgg::localPathServesTarget(robot, {0.6, 0.0, 0.0}, near, lo, hi, 0.5));
+  // Far off, a metre closer serves it and less does not.
+  const Eigen::Vector3d far(20.0, 0.0, 0.0);
+  EXPECT_FALSE(
+      mgg::localPathServesTarget(robot, {0.8, 0.0, 0.0}, far, lo, hi, 5.0));
+  EXPECT_TRUE(
+      mgg::localPathServesTarget(robot, {1.2, 0.0, 0.0}, far, lo, hi, 5.0));
+  // Ending within its reach, and closer than the robot, serves it however
+  // little closer.
+  const Eigen::Vector3d beyond_reach(5.3, 0.0, 0.0);
+  EXPECT_TRUE(mgg::localPathServesTarget(robot, {0.5, 0.0, 0.0}, beyond_reach,
+                                         lo, hi, 5.0));
+  EXPECT_FALSE(mgg::localPathServesTarget(robot, {0.5, 0.0, 0.0}, beyond_reach,
+                                          lo, hi, 4.0));
 }
 
 }  // namespace

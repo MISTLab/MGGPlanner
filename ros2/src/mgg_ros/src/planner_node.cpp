@@ -833,7 +833,7 @@ bool PlannerNode::localPathServesTour(const Eigen::Vector3d& viewpoint,
   return mgg::localPathServesTarget(
       Eigen::Vector3d::Zero(), to_lattice * (viewpoint - robot),
       to_lattice * (target - robot), grid_params_.min_val,
-      grid_params_.max_val);
+      grid_params_.max_val, global_frontier_reach_m_);
 }
 
 void PlannerNode::publishTour() {

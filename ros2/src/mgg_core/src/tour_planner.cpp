@@ -1,5 +1,6 @@
 #include "mgg_core/tour_planner.h"
 
+#include <algorithm>
 #include <cmath>
 
 #include "mgg_core/tour_solver.h"
@@ -75,8 +76,19 @@ bool localPathServesTarget(const Eigen::Vector3d& robot,
                            const Eigen::Vector3d& viewpoint,
                            const Eigen::Vector3d& target,
                            const Eigen::Vector3d& lattice_min,
-                           const Eigen::Vector3d& lattice_max) {
+                           const Eigen::Vector3d& lattice_max,
+                           const double reach_m) {
   const Eigen::Vector2d offset = (target - robot).head<2>();
+  // Planar: the robot's pose and the lattice's viewpoints are at different
+  // heights (its base, their driving height).
+  const double from_robot = offset.norm();
+  const double from_viewpoint = (target - viewpoint).head<2>().norm();
+  const bool progress =
+      from_robot - from_viewpoint >=
+          std::min(kTowardTargetMinProgressM,
+                   kTowardTargetMinFraction * from_robot) ||
+      (from_viewpoint <= reach_m && from_viewpoint <= from_robot);
+  if (!progress) return false;
   if (offset.x() >= lattice_min.x() && offset.x() <= lattice_max.x() &&
       offset.y() >= lattice_min.y() && offset.y() <= lattice_max.y()) {
     return true;

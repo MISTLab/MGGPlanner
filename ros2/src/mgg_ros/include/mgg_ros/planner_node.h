@@ -442,7 +442,8 @@ class PlannerNode : public rclcpp::Node {
   /// §2.4: whether the local path ending at `viewpoint` serves the tour's
   /// `target`. The lattice is laid out along the robot's heading
   /// (buildGridGraph), so both offsets from the robot are turned into its
-  /// frame before mgg::localPathServesTarget compares them with its bounds.
+  /// frame before mgg::localPathServesTarget compares them with its bounds;
+  /// the target's reach is global_frontier_reach_m.
   bool localPathServesTour(const Eigen::Vector3d& viewpoint,
                            const Eigen::Vector3d& target) const;
 

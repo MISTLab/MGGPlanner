@@ -935,6 +935,16 @@ class PlannerNodeTestPeer {
     }
     return plan.clusters.front().position;
   }
+  /// Where the tour's target cluster is as the last refreshTour offered it
+  /// (its representative may have changed since the solve); NaN when it
+  /// has none.
+  static Eigen::Vector3d tourTargetClusterPosition(PlannerNode& node) {
+    const std::lock_guard<std::recursive_mutex> lock(node.planner_mutex_);
+    for (const mgg::FrontierCluster& cluster : node.tour_clusters_) {
+      if (cluster.id == node.tour_planner_->target()) return cluster.position;
+    }
+    return Eigen::Vector3d::Constant(std::nan(""));
+  }
   static mgg::ClusterId tourTarget(PlannerNode& node) {
     const std::lock_guard<std::recursive_mutex> lock(node.planner_mutex_);
     return node.tour_planner_->target();
@@ -3981,19 +3991,62 @@ TEST_F(PlannerNodeTest, TheTourTargetIsJudgedInTheLatticeFrameAtTheRobotsHeading
   auto node = makeNode("tour_lattice_frame");
   PlannerNodeTestPeer::setLattice(*node, {-1.0, -1.0}, {3.0, 1.0});
   const double north = M_PI / 2.0;
-  // (2, 0) is 2 m to the robot's right, outside the box, and a path north
-  // heads 90 degrees away from it.
+  // A path ending at (0.41, 1.13) gets a little closer to (2, 0), heading
+  // 70 degrees from it. Facing north, (2, 0) is 2 m to the robot's right,
+  // outside the box: the path does not head its way.
+  const Eigen::Vector3d off_bearing(0.41, 1.13, 0.0);
   EXPECT_FALSE(PlannerNodeTestPeer::localPathServesTour(
-      *node, north, {0.0, 2.0, 0.0}, {2.0, 0.0, 0.0}));
-  // (0, 2) is 2 m ahead, inside the box: any local path serves it.
+      *node, north, off_bearing, {2.0, 0.0, 0.0}));
+  // Facing +x, (2, 0) is inside the box, and the path gets closer.
   EXPECT_TRUE(PlannerNodeTestPeer::localPathServesTour(
+      *node, 0.0, off_bearing, {2.0, 0.0, 0.0}));
+  // (0, 2) is 2 m ahead, inside the box: a path moving away from it does
+  // not serve it (run 10b, robot_3).
+  EXPECT_FALSE(PlannerNodeTestPeer::localPathServesTour(
       *node, north, {-1.0, 0.0, 0.0}, {0.0, 2.0, 0.0}));
   // Far ahead, served by a path heading its way.
   EXPECT_TRUE(PlannerNodeTestPeer::localPathServesTour(
       *node, north, {0.3, 2.0, 0.0}, {0.0, 20.0, 0.0}));
-  // Facing +x, (2, 0) is inside the box.
-  EXPECT_TRUE(PlannerNodeTestPeer::localPathServesTour(
-      *node, 0.0, {0.0, 2.0, 0.0}, {2.0, 0.0, 0.0}));
+}
+
+TEST_F(PlannerNodeTest, TheTourNoLongerExploresAwayFromANearTargetAndRoutesBack) {
+  // Run 10b, robot_3 from 155 s to 402 s: its target 2 m off, inside the
+  // lattice, counted as served by a local path that drove 5 m away; from
+  // there it routed back to it over the global graph, and again, four
+  // times. Here the target is a frontier 1 m behind the robot, inside the
+  // lattice, and the lattice's path runs ahead into the unmapped floor.
+  // Each cycle the robot is taken to the end of the path it was sent: no
+  // path sent for the target (its cluster's representative as it is then)
+  // ends farther from it than the robot stood.
+  auto node = makeNode("tour_sawtooth");
+  PlannerNodeTestPeer::setLowGainVoxels(*node, 0.0);  // non-low gain case
+  PlannerNodeTestPeer::setGlobalFrontierReach(*node, 0.5);
+  PlannerNodeTestPeer::observeFloor(*node, -1.5, 4.0, -1.5, 1.5);
+  PlannerNodeTestPeer::acceptOdometry(*node, 0.0, 0.0, 1.0);
+  PlannerNodeTestPeer::addGlobalChainToFrontier(*node, {{-0.5, 0.0}, {-1.0, 0.0}},
+                                                M_PI);
+  PlannerNodeTestPeer::setTour(*node, true, 0.0);
+  const mgg::ClusterId target = PlannerNodeTestPeer::refreshTour(*node);
+  ASSERT_NE(target, mgg::kNoCluster);
+  Eigen::Vector2d robot(0.0, 0.0);
+  for (int cycle = 0; cycle < 3; ++cycle) {
+    SCOPED_TRACE("cycle " + std::to_string(cycle + 1));
+    auto response = std::make_shared<mgg_msgs::srv::PlannerSrv::Response>();
+    PlannerNodeTestPeer::plan(*node, response);
+    if (response->path.empty() ||
+        PlannerNodeTestPeer::tourTarget(*node) != target) {
+      break;
+    }
+    const Eigen::Vector3d at =
+        PlannerNodeTestPeer::tourTargetClusterPosition(*node);
+    const Eigen::Vector2d end(response->path.back().position.x,
+                              response->path.back().position.y);
+    EXPECT_LE((end - at.head<2>()).norm(), (robot - at.head<2>()).norm() + 1e-6)
+        << "path to (" << end.x() << ", " << end.y() << ")";
+    robot = end;
+    PlannerNodeTestPeer::acceptOdometry(*node, robot.x(), robot.y(),
+                                        2.0 + cycle);
+  }
 }
 
 TEST_F(PlannerNodeTest, AnEdgeAloneThatConnectsAClusterReachesTheTour) {

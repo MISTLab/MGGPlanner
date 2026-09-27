@@ -74,17 +74,29 @@ class TourPlanner {
 /// A local path's viewpoint serves the target when it heads within this of
 /// the target's bearing from the robot.
 inline constexpr double kTowardTargetMaxAngleRad = 1.0471975511965976;  // pi/3
+/// A local path serving the target ends this much closer to it than the
+/// robot stands, metres, or kTowardTargetMinFraction of the robot's
+/// distance when that is less: a target 2 m away needs 0.5 m.
+inline constexpr double kTowardTargetMinProgressM = 1.0;
+inline constexpr double kTowardTargetMinFraction = 0.25;
 
 /// §2.4: whether the local exploration path ending at `viewpoint` serves the
-/// tour's `target`: the target lies within the lattice box around the robot
-/// (`lattice_min`/`lattice_max`, offsets in x and y, as the grid graph lays
-/// it out), or the viewpoint lies within kTowardTargetMaxAngleRad of the
-/// target's bearing.
+/// tour's `target`: it makes progress toward the target, and, for a target
+/// outside the lattice box around the robot (`lattice_min`/`lattice_max`,
+/// offsets in x and y, as the grid graph lays it out), the viewpoint lies
+/// within kTowardTargetMaxAngleRad of the target's bearing. Progress is
+/// planar distance to the target: the viewpoint ends at least
+/// min(kTowardTargetMinProgressM, kTowardTargetMinFraction * the robot's
+/// distance) closer to it than the robot is, or within `reach_m` of it
+/// (global_frontier_reach_m, where the tour counts it reached) and no
+/// farther than the robot. Run 10b, robot_3: with a target inside the box
+/// taken as served by any local path, it drove 5 m away from a target 2 m
+/// off, routed back to it over the global graph, and did so four times.
 bool localPathServesTarget(const Eigen::Vector3d& robot,
                            const Eigen::Vector3d& viewpoint,
                            const Eigen::Vector3d& target,
                            const Eigen::Vector3d& lattice_min,
-                           const Eigen::Vector3d& lattice_max);
+                           const Eigen::Vector3d& lattice_max, double reach_m);
 
 }  // namespace mgg
 
