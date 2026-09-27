@@ -61,6 +61,8 @@ struct TourCostMatrix {
   /// Per cluster: graph distance from the robot's vertex plus
   /// heading_weight times the first leg's heading change.
   std::vector<double> from_robot;
+  /// Per cluster: the graph distance alone, the flight a leg takes.
+  std::vector<double> distance_from_robot;
   /// Graph distances between representatives; symmetric, zero diagonal.
   std::vector<std::vector<double>> between;
 };
@@ -76,8 +78,10 @@ TourCostMatrix computeTourCosts(GraphManager& graph, std::uint64_t revision,
 
 /// A robot with limited flight left (a drone on battery, drone scout design
 /// §4.3) does not take clusters it could reach but not return from: those
-/// whose cost from the robot plus `cluster_to_home` exceeds `reach_m` become
-/// kUnreachableCost. An infinite reach changes nothing.
+/// whose distance from the robot (distance_from_robot, without the heading
+/// preference, which only orders the tour) plus `cluster_to_home` exceeds
+/// `reach_m` get a from_robot cost of kUnreachableCost. An infinite reach
+/// changes nothing.
 void capTourCostsByReach(TourCostMatrix& costs,
                          const std::vector<double>& cluster_to_home,
                          double reach_m);

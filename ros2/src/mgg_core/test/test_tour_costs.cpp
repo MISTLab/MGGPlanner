@@ -195,13 +195,24 @@ TEST(TourCosts, TheFirstLegHeadingLooksPastTheFirstVertex) {
 TEST(TourCosts, ReachCapsClustersTheRobotCouldNotReturnFrom) {
   TourCostMatrix costs;
   costs.from_robot = {5.0, 10.0, mgg::kUnreachableCost};
+  costs.distance_from_robot = costs.from_robot;
   costs.between = {{0.0, 5.0, 1.0}, {5.0, 0.0, 1.0}, {1.0, 1.0, 0.0}};
   mgg::capTourCostsByReach(costs, {5.0, 10.0, 1.0}, 16.0);
   EXPECT_EQ(costs.from_robot[0], 5.0);  // 5 there + 5 back
   EXPECT_EQ(costs.from_robot[1], mgg::kUnreachableCost);  // 10 + 10
   EXPECT_EQ(costs.from_robot[2], mgg::kUnreachableCost);
+  // Review r0, P2: the heading preference orders the tour; it does not
+  // spend flight. A cluster 5 m behind the robot and 5 m from home, its
+  // cost 5 + 2 pi, is within a reach of 12 m.
+  TourCostMatrix behind;
+  behind.from_robot = {5.0 + 2.0 * M_PI};
+  behind.distance_from_robot = {5.0};
+  behind.between = {{0.0}};
+  mgg::capTourCostsByReach(behind, {5.0}, 12.0);
+  EXPECT_DOUBLE_EQ(behind.from_robot[0], 5.0 + 2.0 * M_PI);
   TourCostMatrix unlimited;
   unlimited.from_robot = {50.0};
+  unlimited.distance_from_robot = {50.0};
   unlimited.between = {{0.0}};
   mgg::capTourCostsByReach(unlimited, {50.0},
                            std::numeric_limits<double>::infinity());

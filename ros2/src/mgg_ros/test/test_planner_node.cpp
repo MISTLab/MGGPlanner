@@ -4711,4 +4711,22 @@ TEST_F(PlannerNodeTest, ADronesRebuildJudgesHomeByTheRoutesItsGraphHas) {
   EXPECT_EQ(PlannerNodeTestPeer::roadmapRebuildsRefused(*blocked), 0);
 }
 
+TEST_F(PlannerNodeTest, AClusterBehindTheRobotWithinReachStaysInTheTour) {
+  // Review r0, P2: the robot at home faces +x; the frontier is 5 m behind
+  // it, so 5 m out and 5 m back. With the tour's heading weight (2) its
+  // cost is about 5 + 2 pi, but a reach of 12 m covers the 10 m flown.
+  auto node = makeNode("reach_behind_the_robot");
+  PlannerNodeTestPeer::observeFloor(*node, -6.0, 1.5, -1.5, 1.5);
+  PlannerNodeTestPeer::acceptOdometry(*node, 0.0, 0.0, 1.0);
+  PlannerNodeTestPeer::addGlobalChainToFrontier(
+      *node, {{-1.0, 0.0}, {-2.0, 0.0}, {-3.0, 0.0}, {-4.0, 0.0}, {-5.0, 0.0}},
+      M_PI);
+  PlannerNodeTestPeer::setTour(*node, true, 0.0);
+  PlannerNodeTestPeer::solveTourOnEveryChange(*node);
+  PlannerNodeTestPeer::setFlightReach(*node, 12.0);
+  EXPECT_NE(PlannerNodeTestPeer::refreshTour(*node), mgg::kNoCluster);
+  PlannerNodeTestPeer::setFlightReach(*node, 9.0);
+  EXPECT_EQ(PlannerNodeTestPeer::refreshTour(*node), mgg::kNoCluster);
+}
+
 }  // namespace mgg_ros

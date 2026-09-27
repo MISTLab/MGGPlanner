@@ -88,6 +88,7 @@ TourCostMatrix computeTourCosts(GraphManager& graph, std::uint64_t revision,
   const std::size_t n = clusters.size();
   TourCostMatrix costs;
   costs.from_robot.assign(n, kUnreachableCost);
+  costs.distance_from_robot.assign(n, kUnreachableCost);
   costs.between.assign(n, std::vector<double>(n, kUnreachableCost));
   for (std::size_t i = 0; i < n; ++i) costs.between[i][i] = 0.0;
 
@@ -98,6 +99,7 @@ TourCostMatrix computeTourCosts(GraphManager& graph, std::uint64_t revision,
       const int target = clusters[i].representative_vertex_id;
       const double distance = reachedDistance(*robot, target);
       if (!std::isfinite(distance)) continue;
+      costs.distance_from_robot[i] = distance;
       costs.from_robot[i] =
           distance + heading_weight * firstLegHeadingChange(graph, *robot,
                                                             target, robot_yaw);
@@ -123,7 +125,10 @@ void capTourCostsByReach(TourCostMatrix& costs,
   if (!std::isfinite(reach_m)) return;
   for (std::size_t i = 0;
        i < costs.from_robot.size() && i < cluster_to_home.size(); ++i) {
-    if (costs.from_robot[i] + cluster_to_home[i] > reach_m) {
+    const double out = i < costs.distance_from_robot.size()
+                           ? costs.distance_from_robot[i]
+                           : kUnreachableCost;
+    if (out + cluster_to_home[i] > reach_m) {
       costs.from_robot[i] = kUnreachableCost;
     }
   }
