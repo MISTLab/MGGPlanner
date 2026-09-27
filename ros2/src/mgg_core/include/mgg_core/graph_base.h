@@ -122,6 +122,10 @@ struct Vertex {
   VolumetricGain vol_gain;
   /// Receiver-only evidence: this peer frontier was explored on our map.
   /// Owner broadcasts refresh counts but cannot undo this local demotion.
+  /// One-way, like this robot's own demoted frontiers: nothing re-promotes
+  /// it for the life of the vertex (a roadmap rebuild or re-admission makes
+  /// a new vertex). Accepted by the controller: a map loses knowledge only
+  /// when its snapshot or component changes, which usually rebuilds anyway.
   bool locally_explored = false;
   /// NBVP legacy, kept in case a tree is wanted for comparison.
   Vertex* parent = nullptr;
