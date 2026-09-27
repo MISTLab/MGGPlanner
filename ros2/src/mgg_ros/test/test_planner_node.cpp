@@ -327,6 +327,10 @@ class PlannerNodeTestPeer {
     node.expandGlobalGraphTimerCallback();
     return globalVertices(node) - before;
   }
+  static void seedExpansionSampler(PlannerNode& node, unsigned seed) {
+    const std::lock_guard<std::recursive_mutex> lock(node.planner_mutex_);
+    node.random_sampler_.reset(seed);
+  }
   /// The expansion's sampler draws offsets in [lo, hi] from a centroid.
   static void setExpansionSamplerBound(PlannerNode& node,
                                        const Eigen::Vector3d& lo,
@@ -2501,6 +2505,7 @@ TEST_F(PlannerNodeTest, APeerLeavingLetsTheBackgroundExpansionRunAgain) {
                                            mgg::VertexType::kUnvisited);
   PlannerNodeTestPeer::setExpansionSamplerBound(
       *node, {5.1, -0.4, 0.0}, {5.9, 0.4, 0.0});
+  PlannerNodeTestPeer::seedExpansionSampler(*node, 42);
   PlannerNodeTestPeer::receivePeerBodies(*node, {{13.5, 0.0}});
 
   EXPECT_EQ(PlannerNodeTestPeer::expandGlobalGraph(*node), 0);
@@ -2511,6 +2516,10 @@ TEST_F(PlannerNodeTest, APeerLeavingLetsTheBackgroundExpansionRunAgain) {
   PlannerNodeTestPeer::receivePeerBodies(*node, {});
   EXPECT_EQ(PlannerNodeTestPeer::graphRevision(*node), revision);
   EXPECT_EQ(PlannerNodeTestPeer::globalEdges(*node), edges);
+  // The blocked pass consumes a load-dependent number of random draws
+  // before its time budget expires. Restart the same sample sequence here
+  // too, not just at startup; seeding must not invalidate the skip key.
+  PlannerNodeTestPeer::seedExpansionSampler(*node, 42);
   EXPECT_GT(PlannerNodeTestPeer::expandGlobalGraph(*node), 0);
   EXPECT_GT(PlannerNodeTestPeer::globalFrontiersBeyond(*node, 8.1), 0);
 }
