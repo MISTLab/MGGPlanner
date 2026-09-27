@@ -4505,4 +4505,37 @@ TEST_F(PlannerNodeTest, AnAerialPoseTheGraphCannotReachDoesNotRebuildIt) {
   }
 }
 
+TEST_F(PlannerNodeTest, ARegionsLatticeUpdatesAnInsideFrontierByItsWholeView) {
+  // Review r0, P1: a viewpoint inside the region whose unknown space lies
+  // outside it has no gain in the region's lattice. Joining the roadmap on
+  // this robot's frontier, that gain must not demote it: the frontier
+  // takes the gain of all it sees. Where it sees nothing unknown at all
+  // (gain counted only within 0.3 m of it, all observed), it is explored,
+  // and the update demotes it as without a region.
+  for (const bool explored : {false, true}) {
+    SCOPED_TRACE(explored ? "explored" : "looking outside the region");
+    auto node = makeNode(explored ? "region_inside_explored"
+                                  : "region_inside_looks_out");
+    PlannerNodeTestPeer::observeFloor(*node, -3.55, 4.55, -1.55, 1.55);
+    PlannerNodeTestPeer::acceptOdometry(*node, 0.0, 0.0, 1.0);
+    const int frontier = PlannerNodeTestPeer::addGlobalChainToFrontier(
+        *node, {{-1.0, 0.0}, {-2.0, 0.0}}, M_PI);
+    if (explored) {
+      PlannerNodeTestPeer::setGainSpace(*node, {-0.3, -0.3, -0.25},
+                                        {0.3, 0.3, 0.25});
+    }
+    const mgg::StateVec root = PlannerNodeTestPeer::globalVertexState(*node, 0);
+    const mgg::StateVec inside =
+        PlannerNodeTestPeer::globalVertexState(*node, frontier);
+    ASSERT_TRUE(PlannerNodeTestPeer::setExplorationRegion(
+                    *node, true, {-2.5, -0.5, -1.0}, {-1.5, 0.5, 1.5})
+                    ->success);
+    const mgg::StateVec middle(-1.0, 0.0, root.z(), M_PI);
+    PlannerNodeTestPeer::setSeenLattice(*node, {root, middle, inside});
+    PlannerNodeTestPeer::addExplorationPath(*node, {root, middle, inside});
+    EXPECT_EQ(PlannerNodeTestPeer::isGlobalFrontier(*node, frontier),
+              !explored);
+  }
+}
+
 }  // namespace mgg_ros

@@ -2167,10 +2167,29 @@ void PlannerNode::addRefPathToGraph(const std::vector<mgg::StateVec>& path) {
   // (buildLocalGraph): carried across, it would demote the roadmap's own
   // frontiers outside the region for good. Those vertices enter as poses.
   mgg::UsableVertexFn carries_gain;
+  // Those inside it counted only what they see inside it, which may leave a
+  // frontier at the boundary without gain (review r0, P1): they carry the
+  // gain of all they see instead, scored as a frontier re-check scores it,
+  // so an update that finds them explored still demotes them.
+  std::vector<std::unique_ptr<mgg::Vertex>> unrestricted;
   if (exploration_region_) {
     carries_gain = [region = *exploration_region_](const mgg::Vertex& vertex) {
       return region.isInsideSpace(vertex.state.head<3>());
     };
+    const mgg::RecomputeGainFn whole_view = globalFrontierGain();
+    for (mgg::Vertex*& vertex : lattice) {
+      if (!carries_gain(*vertex)) continue;
+      auto rescored = std::make_unique<mgg::Vertex>(*vertex);
+      whole_view(*rescored);
+      if (rescored->vol_gain.is_frontier) {
+        rescored->type = mgg::VertexType::kFrontier;
+      } else if (rescored->type == mgg::VertexType::kFrontier) {
+        rescored->type = mgg::VertexType::kUnvisited;
+      }
+      vertex = rescored.get();
+      unrestricted.push_back(std::move(rescored));
+    }
+    global_space_.setCenter(current_state_, /*use_extension=*/true);
   }
   std::vector<mgg::Vertex*> added_vertices;
   const auto add = [&]() {
