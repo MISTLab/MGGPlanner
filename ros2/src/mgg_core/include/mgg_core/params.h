@@ -243,10 +243,17 @@ struct PlanningParams {
   /// not: it counts towards auto_global_planner_low_gain_rounds, and once
   /// those are due the global planner is consulted before the path is
   /// sent. In run 8 every lattice vertex was a frontier, so robot_3 lapped
-  /// an explored hangar on 2 to 150 voxels' gain and never repositioned.
-  /// 0 counts only rounds without a frontier, as upstream. Not an upstream
+  /// an explored hangar on 2 to 150 voxels' gain and never repositioned;
+  /// on its logged hangar laps 150 hands over twice, 50 never. 0 counts
+  /// only rounds without a frontier, as upstream. Not an upstream
   /// parameter.
-  double low_gain_voxels = 50.0;
+  double low_gain_voxels = 150.0;
+  /// The least a global frontier must be worth, in unknown voxels (times
+  /// unknown_voxel_gain, after the global planner's distance discount), to
+  /// take over a low-gain local path. Separate from low_gain_voxels, so
+  /// that raising the local threshold does not reject more global
+  /// alternatives. Not an upstream parameter.
+  double low_gain_handoff_min_voxels = 50.0;
   bool leafs_only_for_volumetric_gain = false;
   bool cluster_vertices_for_gain = false;
   double clustering_radius = 2.0;

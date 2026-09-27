@@ -3204,11 +3204,12 @@ void PlannerNode::onPlanRequest(
       low_gain_rounds_ = 0;
       std::string departure;
       // A low-gain path set aside is handed over only for a frontier worth
-      // more than the threshold it fell under.
+      // low_gain_handoff_min_voxels.
       const double min_gain =
-          low_gain_path.empty() ? 0.0
-                                : planning_params_.low_gain_voxels *
-                                      planning_params_.unknown_voxel_gain;
+          low_gain_path.empty()
+              ? 0.0
+              : planning_params_.low_gain_handoff_min_voxels *
+                    planning_params_.unknown_voxel_gain;
       if (!runGlobalPlanner(-1, reason, min_gain)) {
         if (local_gain_remains_now_) {
           // The lattice still sees gain it cannot send a path to; that is

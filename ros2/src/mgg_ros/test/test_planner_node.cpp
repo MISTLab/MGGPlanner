@@ -484,6 +484,11 @@ class PlannerNodeTestPeer {
   static void setLowGainVoxels(PlannerNode& node, double voxels) {
     node.planning_params_.low_gain_voxels = voxels;
   }
+  /// A global frontier takes over a low-gain path only when worth more than
+  /// `voxels` unknown voxels.
+  static void setLowGainHandoffMinVoxels(PlannerNode& node, double voxels) {
+    node.planning_params_.low_gain_handoff_min_voxels = voxels;
+  }
   /// The low-gain rounds are due at once; the tour is left as it is.
   static void lowGainRoundsDueAtOnce(PlannerNode& node) {
     node.auto_global_planner_low_gain_rounds_ = 0;
@@ -1090,6 +1095,36 @@ TEST_F(PlannerNodeTest, ALowGainPathIsHandedOverToTheGlobalPlannerWhenDue) {
   EXPECT_EQ(PlannerNodeTestPeer::lowGainRounds(*node), 0);
 }
 
+TEST_F(PlannerNodeTest, TheHandoffTakesAGlobalFrontierByItsOwnMinimumGain) {
+  // Review r0, I-1: the global frontier a low-gain path is handed over for
+  // must be worth low_gain_handoff_min_voxels (50), not low_gain_voxels,
+  // so that raising the local threshold does not reject more global
+  // alternatives. The lattice path scores 721 and the frontier behind the
+  // robot 938: with the local threshold far above both, the frontier is
+  // still taken; with the handoff minimum above it, it is not.
+  for (const bool minimum_above_frontier : {false, true}) {
+    SCOPED_TRACE(minimum_above_frontier ? "minimum above" : "default minimum");
+    auto node = makeNode(minimum_above_frontier ? "handoff_min_above"
+                                                : "handoff_min_default");
+    PlannerNodeTestPeer::observeFloor(*node, -1.5, 4.0, -1.5, 1.5);
+    PlannerNodeTestPeer::acceptOdometry(*node, 0.0, 0.0, 1.0);
+    PlannerNodeTestPeer::addGlobalChainToFrontier(
+        *node, {{-0.5, 0.0}, {-1.0, 0.0}, {-1.5, 0.0}}, M_PI);
+    PlannerNodeTestPeer::consultGlobalPlannerAtOnce(*node);
+    PlannerNodeTestPeer::setLowGainVoxels(*node, 1e9);
+    if (minimum_above_frontier) {
+      PlannerNodeTestPeer::setLowGainHandoffMinVoxels(*node, 1e9);
+    }
+    auto response = std::make_shared<mgg_msgs::srv::PlannerSrv::Response>();
+    PlannerNodeTestPeer::plan(*node, response);
+    ASSERT_EQ(response->status, mgg_msgs::srv::PlannerSrv::Response::FORWARD);
+    EXPECT_EQ(PlannerNodeTestPeer::bestPathFromGlobalGraph(*node),
+              !minimum_above_frontier);
+    EXPECT_EQ(PlannerNodeTestPeer::lowGainHandoffs(*node),
+              minimum_above_frontier ? 0 : 1);
+  }
+}
+
 TEST_F(PlannerNodeTest, ALowGainPathTowardTheTourTargetIsLeftToTheTour) {
   // Tour-exploration design §2.4: the tour's target decides when the robot
   // leaves local exploration. A low-gain lattice path toward the target is
@@ -1116,9 +1151,9 @@ TEST_F(PlannerNodeTest, ALowGainPathTowardTheTourTargetIsLeftToTheTour) {
 
 TEST_F(PlannerNodeTest, ALowGainPathIsKeptWhenNoGlobalFrontierIsWorthMore) {
   // The rounds due, and the only global frontier, the one the lattice path
-  // itself leaves, is worth less than the threshold: it is not handed over
-  // for that, and the low-gain path is sent after all, not exploration
-  // complete.
+  // itself leaves (374), is worth less than the handoff minimum (50 voxels
+  // at unknown_voxel_gain 10): it is not handed over for that, and the
+  // low-gain path is sent after all, not exploration complete.
   auto node = makeNode("low_gain_kept");
   PlannerNodeTestPeer::observeFloor(*node, -1.5, 4.0, -1.5, 1.5);
   PlannerNodeTestPeer::acceptOdometry(*node, 0.0, 0.0, 1.0);

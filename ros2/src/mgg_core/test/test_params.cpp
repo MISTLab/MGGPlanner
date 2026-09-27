@@ -21,6 +21,16 @@ RobotParams makeSmb() {
   return r;
 }
 
+// Run 8 (review r0, I-1): the local low-gain threshold is 150 voxels; the
+// least a global frontier must be worth to take over a low-gain path stays
+// at 50, a parameter of its own, so raising the one does not reject more
+// global alternatives.
+TEST(PlanningParams, LowGainThresholdsAreSeparate) {
+  const mgg::PlanningParams p;
+  EXPECT_DOUBLE_EQ(p.low_gain_voxels, 150.0);
+  EXPECT_DOUBLE_EQ(p.low_gain_handoff_min_voxels, 50.0);
+}
+
 TEST(RobotParams, PlanningSizeFollowsTheBoundMode) {
   RobotParams r = makeSmb();
 

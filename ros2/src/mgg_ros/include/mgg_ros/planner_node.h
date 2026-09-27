@@ -209,7 +209,7 @@ class PlannerNode : public rclcpp::Node {
   /// repositioning is resumed. Fills best_path_; returns false with a reason
   /// when no route exists, or when the best frontier's discounted gain is
   /// under `min_gain` (a low-gain lattice path is handed over only for a
-  /// frontier worth more than it).
+  /// frontier worth low_gain_handoff_min_voxels).
   bool runGlobalPlanner(int target_id, std::string& reason,
                         double min_gain = 0.0);
   /// Dijkstra over the global graph from the robot to `goal`, linking both
