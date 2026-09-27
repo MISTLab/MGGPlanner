@@ -5,8 +5,14 @@
 
 #include <gtest/gtest.h>
 
+#include <array>
 #include <chrono>
 #include <cmath>
+#include <cstring>
+#include <filesystem>
+#include <fstream>
+#include <iomanip>
+#include <sstream>
 #include <cstdint>
 #include <future>
 #include <memory>
@@ -17,9 +23,12 @@
 #include <vector>
 
 #include <geometry_msgs/msg/transform_stamped.hpp>
+#include <nlohmann/json.hpp>
+#include <openssl/evp.h>
 #include <rclcpp/rclcpp.hpp>
 #include <tf2_msgs/msg/tf_message.hpp>
 
+#include "mgg_map_octomap/mola_map.h"
 #include "mgg_map_octomap/octomap_map.h"
 #include "mgg_ros/planner_node.h"
 #include "mgg_ros/fleet_conversions.h"
@@ -63,6 +72,172 @@ class SlowScanMap : public mgg::OctomapMap {
     std::this_thread::sleep_for(std::chrono::milliseconds(25));
     mgg::OctomapMap::getScanStatusIterative(pos, endpoints, gain, log, sensor);
   }
+};
+
+/// A MOLA planner product, as the mapping worker publishes it, of a level
+/// floor: an occupied 0.2 m voxel layer at z index -1 over [x0, x1) x [y0,
+/// y1) and free voxels above it, and 0.6 m round it, up to 0.8 m. The same layout as
+/// test_mola_map.cpp's Publication, reduced to one revision.
+class MolaFloorProduct {
+ public:
+  MolaFloorProduct(double x0, double x1, double y0, double y1) {
+    static int sequence = 0;
+    root_ = std::filesystem::temp_directory_path() /
+            ("mgg-planner-mola-" + std::to_string(::getpid()) + "-" +
+             std::to_string(sequence++));
+    std::filesystem::create_directories(root_ / "mola" / "components");
+    using json = nlohmann::json;
+    struct Voxel { std::int64_t x, y, z; };
+    std::vector<Voxel> occupied, free;
+    const auto index = [](double v) {
+      return static_cast<std::int64_t>(std::floor(v / 0.2 + 1e-9));
+    };
+    // Free space reaches 0.6 m beyond the floor on every side, so a body
+    // at the floor's edge is not in unknown space.
+    for (std::int64_t x = index(x0) - 3; x < index(x1) + 3; ++x) {
+      for (std::int64_t y = index(y0) - 3; y < index(y1) + 3; ++y) {
+        const bool floor = x >= index(x0) && x < index(x1) &&
+                           y >= index(y0) && y < index(y1);
+        if (floor) occupied.push_back({x, y, -1});
+        for (std::int64_t z = 0; z <= 3; ++z) free.push_back({x, y, z});
+      }
+    }
+    const std::string geometry(64, 'a');
+    const std::string snapshot_id(64, '1');
+    const std::uint64_t stamp = 1000;
+    const std::size_t points = occupied.size();
+    const json chunk{{"sha256", std::string(64, 'c')},
+                     {"size_bytes", 16 + 12 * points},
+                     {"point_count", points},
+                     {"encoding", "application/vnd.swarmdeck.xyz-f32.v1"}};
+    json submap{{"observed_at_ns", stamp}, {"chunks", json::array({chunk})}};
+    submap["sensor_origins"] = json::array({json::array({0.0, 0.0, 0.0})});
+    submap["ray_evidence"] = {{"return_semantics", "first_return"},
+                              {"deskew", "not_required"},
+                              {"origin_association", "single_capture"}};
+    json manifest{{"map_id", "onboard"},
+                  {"layer_id", "persistent_geometry"},
+                  {"frame_id", "component_test"},
+                  {"graph_revision", {{"component_id", "component:test"},
+                                      {"epoch", 1}, {"revision", 0}}},
+                  {"geometry_revision", geometry},
+                  {"submaps", json::array({submap})},
+                  {"chunks", json::array({chunk})},
+                  {"tombstones", json::array()}};
+    json canonical = manifest;
+    canonical["schema"] = "swarmdeck.autonomy.v1";
+    const json source{{"schema", "swarmdeck.autonomy.v1"},
+                      {"snapshot_id", snapshot_id},
+                      {"generated_at_ns", stamp},
+                      {"manifests", json::array({manifest})}};
+    const std::string source_bytes = source.dump();
+    const std::string source_digest = sha256(source_bytes);
+    const json metadata{
+        {"schema", "swarmdeck.mola_planner_grid.v2"},
+        {"graph_version", {{"component_id", "component:test"}, {"epoch", 1},
+                           {"revision", 0}, {"digest", std::string(64, 'd')}}},
+        {"identity", {{"geometry_revision", geometry},
+                      {"native_geometry_digest", std::string(64, 'e')},
+                      {"canonical_manifest_digest", sha256(canonical.dump())},
+                      {"source_snapshot_id", snapshot_id},
+                      {"source_sha256", source_digest},
+                      {"reference_frame", "component_test"}}},
+        {"source_stamp_ns", stamp},
+        {"resolution_m", 0.2},
+        {"ray_angular_resolution_rad", 0.08726646259971647},
+        {"ray_step_fraction", 0.75},
+        {"point_count", points},
+        {"source_point_count", points},
+        {"occupied_count", occupied.size()},
+        {"free_count", free.size()},
+        {"surface_count", occupied.size()},
+        {"retired_count", 0},
+        {"ray_steps", free.size()},
+        {"qualified_ray_keyframes", 1}};
+    const std::string metadata_bytes = metadata.dump();
+    std::string grid("SDMGRID1", 8);
+    append(grid, static_cast<std::uint32_t>(metadata_bytes.size()), 4);
+    grid += metadata_bytes;
+    for (const Voxel& v : occupied) {
+      append(grid, v.x, 8); append(grid, v.y, 8); append(grid, v.z, 8);
+    }
+    for (const Voxel& v : free) {
+      append(grid, v.x, 8); append(grid, v.y, 8); append(grid, v.z, 8);
+    }
+    for (const Voxel& v : occupied) {
+      append(grid, v.x, 8); append(grid, v.y, 8);
+      const double top = (v.z + 0.5) * 0.2;
+      std::uint64_t raw = 0;
+      std::memcpy(&raw, &top, sizeof(raw));
+      append(grid, raw, 8);
+    }
+    const json index_json{
+        {"version", 1},
+        {"source_snapshot_id", snapshot_id},
+        {"source_sha256", source_digest},
+        {"generated_at_ns", stamp},
+        {"artifacts",
+         json::array({{{"component_id", "component:test"}, {"epoch", 1},
+                       {"revision", 0}, {"geometry_revision", geometry},
+                       {"manifest_sha256", std::string(64, '9')},
+                       {"path", "components/native.mola"}, {"size_bytes", 1},
+                       {"sha256", std::string(64, 'f')},
+                       {"planner", {{"path", "components/native.sdpg"},
+                                    {"size_bytes", grid.size()},
+                                    {"sha256", sha256(grid)},
+                                    {"source_sha256", source_digest},
+                                    {"source_snapshot_id", snapshot_id}}}}})}};
+    write(root_ / "mola" / "components" / "native.sdpg", grid);
+    write(root_ / "mola" / "source.json", source_bytes);
+    write(root_ / "mola" / "index.json", index_json.dump());
+    request_ = {"component:test", 1, 0, geometry, stamp,
+                Eigen::Isometry3d::Identity()};
+  }
+  ~MolaFloorProduct() { std::filesystem::remove_all(root_); }
+
+  /// A MolaMap serving the product, once it has loaded it.
+  std::unique_ptr<mgg::MolaMap> serve() const {
+    mgg::MolaMapConfig config;
+    config.peer_root = root_.string();
+    config.snapshot_ttl_sec = 60.0;
+    auto map = std::make_unique<mgg::MolaMap>(config);
+    map->requestSnapshot(request_);
+    for (int i = 0; i < 400 && !map->getStatus(); ++i) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+    EXPECT_TRUE(map->getStatus()) << map->lastError();
+    return map;
+  }
+
+ private:
+  static std::string sha256(const std::string& bytes) {
+    std::array<unsigned char, EVP_MAX_MD_SIZE> output{};
+    unsigned int size = 0;
+    EVP_Digest(bytes.data(), bytes.size(), output.data(), &size, EVP_sha256(),
+               nullptr);
+    std::ostringstream text;
+    text << std::hex << std::setfill('0');
+    for (unsigned int i = 0; i < size; ++i) {
+      text << std::setw(2) << static_cast<unsigned int>(output[i]);
+    }
+    return text.str();
+  }
+  template <typename T>
+  static void append(std::string& bytes, T value, int size) {
+    std::uint64_t raw = 0;
+    std::memcpy(&raw, &value, sizeof(T));
+    for (int i = 0; i < size; ++i) {
+      bytes.push_back(static_cast<char>((raw >> (8 * i)) & 0xff));
+    }
+  }
+  static void write(const std::filesystem::path& path,
+                    const std::string& bytes) {
+    std::ofstream output(path, std::ios::binary | std::ios::trunc);
+    output.write(bytes.data(), static_cast<std::streamsize>(bytes.size()));
+  }
+
+  std::filesystem::path root_;
+  mgg::MolaSnapshotRequest request_;
 };
 
 class PlannerNodeTestPeer {
@@ -1514,6 +1689,122 @@ TEST_F(PlannerNodeTest, FromInsideANoGoZoneOnlyAnOutwardDepartureIsRouted) {
   auto inside = navigate(4.0);
   EXPECT_EQ(inside->status, mgg_msgs::srv::PlanObjective::Response::UNREACHABLE)
       << "path of " << inside->path.size() << " poses";
+}
+
+/// A robot in a 1.2 m corridor from x = -1 to 5 on the cloud backend, or
+/// on the mola_snapshot backend serving the same floor, with no-go zones
+/// of 1.0 m radius (1.1 m reach), wider than the lattice (y in [-1, 1]).
+std::shared_ptr<PlannerNode> corridorNode(const std::string& name, bool mola,
+                                          std::unique_ptr<MolaFloorProduct>& product) {
+  auto node = makeNode(name, "world",
+                       {rclcpp::Parameter("PlanningParams.no_go_radius_m", 1.0)});
+  if (mola) {
+    product = std::make_unique<MolaFloorProduct>(-1.0, 5.0, -0.6, 0.6);
+    PlannerNodeTestPeer::useMolaMap(*node, product->serve());
+    PlannerNodeTestPeer::serveMap(*node, "component:test", 1);
+    // The synthetic product's ground does not pass the observed-ground rule
+    // (min_observed_ground_fraction, tested on its own); the zones are what
+    // this scene is about.
+    PlannerNodeTestPeer::setMinObservedGround(*node, 0.0);
+  } else {
+    PlannerNodeTestPeer::observeFloor(*node, -1.0, 5.0, -0.6, 0.6);
+  }
+  return node;
+}
+
+double furthestX(const std::vector<geometry_msgs::msg::Pose>& path) {
+  double x = -1e9;
+  for (const auto& pose : path) x = std::max(x, pose.position.x);
+  return x;
+}
+
+/// The least distance of a pose of `path` from `centre`, in the plane.
+double nearestTo(const std::vector<geometry_msgs::msg::Pose>& path,
+                 const Eigen::Vector2d& centre) {
+  double d = 1e9;
+  for (const auto& pose : path) {
+    d = std::min(d, std::hypot(pose.position.x - centre.x(),
+                               pose.position.y - centre.y()));
+  }
+  return d;
+}
+
+TEST_F(PlannerNodeTest, LocalExplorationKeepsOutOfANoGoZoneOnEitherBackend) {
+  // Review r0, I-5: only the mola backend's map knew the zones; the cloud
+  // backend's lattice drove straight through them. The zone at x = 2.5
+  // closes the corridor: on either backend no pose of the path comes
+  // within its reach or gets past it, and without it the path goes on
+  // beyond.
+  for (const bool mola : {false, true}) {
+    SCOPED_TRACE(mola ? "mola_snapshot" : "cloud_octomap");
+    std::unique_ptr<MolaFloorProduct> product;
+    auto node = corridorNode(mola ? "no_go_explore_mola" : "no_go_explore_cloud",
+                             mola, product);
+    PlannerNodeTestPeer::acceptOdometry(*node, 0.0, 0.0, 1.0);
+    auto response = std::make_shared<mgg_msgs::srv::PlannerSrv::Response>();
+    PlannerNodeTestPeer::plan(*node, response);
+    ASSERT_EQ(response->status, mgg_msgs::srv::PlannerSrv::Response::FORWARD);
+    EXPECT_GT(furthestX(response->path), 2.0);
+
+    PlannerNodeTestPeer::receiveNoGoZones(*node, "world", {{2.5, 0.0}});
+    response = std::make_shared<mgg_msgs::srv::PlannerSrv::Response>();
+    PlannerNodeTestPeer::plan(*node, response);
+    EXPECT_LT(furthestX(response->path), 2.5)
+        << "path of " << response->path.size() << " poses";
+    EXPECT_GE(nearestTo(response->path, {2.5, 0.0}), 1.1 - 1e-6);
+  }
+}
+
+TEST_F(PlannerNodeTest, NavigateInTheLatticeKeepsOutOfANoGoZoneOnEitherBackend) {
+  // Review r0, I-5: a goal inside the lattice, beyond a zone closing the
+  // corridor, is refused on either backend; cleared, it is routed.
+  for (const bool mola : {false, true}) {
+    SCOPED_TRACE(mola ? "mola_snapshot" : "cloud_octomap");
+    std::unique_ptr<MolaFloorProduct> product;
+    auto node = corridorNode(mola ? "no_go_navigate_mola" : "no_go_navigate_cloud",
+                             mola, product);
+    PlannerNodeTestPeer::acceptOdometry(*node, 0.0, 0.0, 1.0);
+    auto request = std::make_shared<mgg_msgs::srv::PlanObjective::Request>();
+    request->objective = mgg_msgs::srv::PlanObjective::Request::NAVIGATE;
+    request->goal.position.x = 2.8;
+    request->goal.orientation.w = 1.0;
+    request->component_id = "component:test";
+    request->map_epoch = 1;
+    PlannerNodeTestPeer::receiveNoGoZones(*node, "world", {{1.5, 0.0}});
+    auto response = std::make_shared<mgg_msgs::srv::PlanObjective::Response>();
+    PlannerNodeTestPeer::objective(*node, request, response);
+    EXPECT_EQ(response->status,
+              mgg_msgs::srv::PlanObjective::Response::UNREACHABLE)
+        << "path to x " << furthestX(response->path);
+    PlannerNodeTestPeer::receiveNoGoZones(*node, "world", {});
+    response = std::make_shared<mgg_msgs::srv::PlanObjective::Response>();
+    PlannerNodeTestPeer::objective(*node, request, response);
+    EXPECT_EQ(response->status,
+              mgg_msgs::srv::PlanObjective::Response::SUCCEEDED)
+        << response->reason;
+  }
+}
+
+TEST_F(PlannerNodeTest, ExplorationFromInsideANoGoZoneOnlyDepartsOnEitherBackend) {
+  // Review r0, I-5 with I-3: the robot stands in the zone, west of its
+  // centre, facing east into it. Whatever is sent departs west and ends
+  // out of the zone; nothing goes east past where it stands.
+  for (const bool mola : {false, true}) {
+    SCOPED_TRACE(mola ? "mola_snapshot" : "cloud_octomap");
+    std::unique_ptr<MolaFloorProduct> product;
+    auto node = corridorNode(mola ? "no_go_depart_mola" : "no_go_depart_cloud",
+                             mola, product);
+    PlannerNodeTestPeer::acceptOdometry(*node, 1.8, 0.0, 1.0);
+    PlannerNodeTestPeer::receiveNoGoZones(*node, "world", {{2.3, 0.0}});
+    auto response = std::make_shared<mgg_msgs::srv::PlannerSrv::Response>();
+    PlannerNodeTestPeer::plan(*node, response);
+    EXPECT_LE(furthestX(response->path), 1.8 + 1e-3);
+    if (!response->path.empty()) {
+      EXPECT_GE(std::hypot(response->path.back().position.x - 2.3,
+                           response->path.back().position.y),
+                1.1 - 1e-6);
+    }
+  }
 }
 
 TEST_F(PlannerNodeTest, OverlappingNoGoZoneMessagesEndWithTheLastSet) {

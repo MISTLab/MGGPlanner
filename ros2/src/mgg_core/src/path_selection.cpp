@@ -103,7 +103,8 @@ PathSelectionResult selectBestPath(GraphManager& graph,
                                    const SharpTurnAllowedFn&
                                        sharp_turn_allowed,
                                    double goal_reach,
-                                   const SlopeEndRetreat& slope_end_retreat) {
+                                   const SlopeEndRetreat& slope_end_retreat,
+                                   const EndExcludedFn& end_excluded) {
   // Leaves share their paths' inner vertices; check each vertex once.
   std::unordered_map<int, bool> clear_by_id;
   const auto clear = [&](const Vertex* v) {
@@ -223,6 +224,7 @@ PathSelectionResult selectBestPath(GraphManager& graph,
       return true;
     };
     const auto excluded = [&](const Vertex* viewpoint) {
+      if (end_excluded && end_excluded(*viewpoint)) return true;
       return std::any_of(
           excluded_endpoints.begin(), excluded_endpoints.end(),
           [viewpoint, exclusion_radius](const Eigen::Vector3d& center) {

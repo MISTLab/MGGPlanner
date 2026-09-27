@@ -567,6 +567,17 @@ mgg::ExpandContext PlannerNode::makeContext() {
   ctx.preserve_hanging_root_start_height = hanging_root_edge_length_max_ > 0.0;
   ctx.root_footprint_exempt = true;
   ctx.root_is_robot = true;
+  // No-go zones close lattice edges on every backend, the robot's own
+  // departure from one it stands in excepted (review r0, I-5).
+  if (!no_go_.empty()) {
+    ctx.projected_edge_admissible =
+        [this](const std::vector<Eigen::Vector3d>& edge) {
+          for (std::size_t i = 1; i < edge.size(); ++i) {
+            if (noGoBlocksSegment(edge[i - 1], edge[i])) return false;
+          }
+          return true;
+        };
+  }
   return ctx;
 }
 
@@ -579,6 +590,10 @@ mgg::ExpandContext PlannerNode::makeGlobalContext() {
   // Vertex zero of the roadmap is home, not the robot.
   ctx.root_footprint_exempt = false;
   ctx.root_is_robot = false;
+  // The roadmap keeps edges through a zone, which its searches leave out
+  // while the zone stands (setEdgeBlocked): one refused here would be lost
+  // for good.
+  ctx.projected_edge_admissible = nullptr;
   return ctx;
 }
 
@@ -1423,6 +1438,15 @@ void PlannerNode::refreshNoGoZones() {
   const Eigen::Vector3d box = robot_params_.getPlanningSize();
   no_go_.set(no_go_zones_, planning_params_.no_go_radius_m +
                                0.5 * std::max(box.x(), box.y()));
+}
+
+bool PlannerNode::noGoAdmissible(const std::vector<mgg::StateVec>& path) {
+  refreshNoGoZones();
+  if (no_go_.empty() || path.empty()) return true;
+  std::vector<Eigen::Vector3d> points;
+  points.reserve(path.size());
+  for (const mgg::StateVec& state : path) points.push_back(state.head<3>());
+  return no_go_.pathAdmissible(points);
 }
 
 bool PlannerNode::noGoBlocksEdge(const mgg::Vertex& a,
@@ -2314,7 +2338,8 @@ std::string PlannerNode::buildLocalGraph() {
                                    turn_check.slopeAt(v.state.head<3>()));
       },
       turns_admissible, sharp_turn_allowed, reach_distance_,
-      slope_end_retreat);
+      slope_end_retreat,
+      [this](const mgg::Vertex& v) { return no_go_.inside(v.state.head<3>()); });
   for (const mgg::Vertex* v : sel.best_path) {
     if (v != nullptr) best_path_.push_back(v->state);
   }
@@ -2839,6 +2864,12 @@ bool PlannerNode::routeOverLocalLattice(const mgg::StateVec& goal,
   turns_ok = applyRouteTurnRule(*local_graph_, /*slope_from_map=*/false, {},
                                 route, "local lattice route");
   for (const mgg::Vertex* v : route) path.push_back(v->state);
+  if (!noGoAdmissible(path)) {
+    path.clear();
+    turns_ok = nullptr;
+    reason = "the route through the local lattice enters a no-go zone";
+    return false;
+  }
   return true;
 }
 
@@ -3070,6 +3101,7 @@ void PlannerNode::onPlanRequest(
     std::shared_ptr<mgg_msgs::srv::PlannerSrv::Response> response) {
   const std::lock_guard<std::recursive_mutex> lock(planner_mutex_);
   lattice_path_.clear();
+  refreshNoGoZones();
   withdrawUnplacedNeighbours();
   response->planning_bound_mode = request->bound_mode;
   if (!have_odometry_ || !map_->getStatus()) {
@@ -3308,6 +3340,11 @@ void PlannerNode::onPlanRequest(
   }
   robot_params_.bound_mode = previous;
 
+  if (!noGoAdmissible(best_path_)) {
+    // The last net: whatever produced it, nothing is sent into a zone.
+    best_path_.clear();
+    summary += "; the path enters a no-go zone: no path";
+  }
   recordSentPath();
   response->status = !best_path_.empty()
                          ? mgg_msgs::srv::PlannerSrv::Response::FORWARD
@@ -3381,6 +3418,7 @@ void PlannerNode::onObjectiveRequest(
   const std::lock_guard<std::recursive_mutex> lock(planner_mutex_);
   // An objective supersedes exploration's last path.
   turn_back_hysteresis_.reset();
+  refreshNoGoZones();
   // Every answer is logged with the objective, where the robot is and the
   // goal it asked for: a refusal alone does not say which objective it
   // answered or where it was going (run 5, 2026-09-25).
@@ -3504,6 +3542,11 @@ void PlannerNode::onObjectiveRequest(
     return;
   }
   shortcutAndResample(route, turns_ok);
+  if (!noGoAdmissible(route)) {
+    response->status = Service::Response::UNREACHABLE;
+    response->reason = "the route enters a no-go zone";
+    return;
+  }
   response->status = Service::Response::SUCCEEDED;
   for (const mgg::StateVec& s : route) response->path.push_back(toPoseMsg(s));
   char note[160];

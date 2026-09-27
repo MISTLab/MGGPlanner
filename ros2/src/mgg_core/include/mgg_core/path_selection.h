@@ -105,6 +105,9 @@ inline bool slopeExemptsTurnSpace(double slope) {
 
 /// Whether an exploration path may end at a vertex, e.g. viewpointClear.
 using ViewpointClearFn = std::function<bool(const Vertex&)>;
+/// Whether no path may end at a vertex at all, as none may in a
+/// reservation: e.g. one inside a no-go zone.
+using EndExcludedFn = std::function<bool(const Vertex&)>;
 
 /// How selectBestPath gives a path end on a slope, admitted by viewpointClear
 /// without its turn space observed, a way back (review r0, P1; controller
@@ -231,7 +234,8 @@ class TurnBackHysteresis {
   bool last_turned_back_ = false;
 };
 
-/// Scores every root-to-leaf path and returns the best.
+/// Scores every root-to-leaf path and returns the best. A path may not end
+/// where `end_excluded` says, treated as ending in a reservation.
 ///
 /// `exploring_direction` is the direction paths are penalised for leaving,
 /// by path_direction_penalty: the planner node passes the robot's heading,
@@ -288,7 +292,9 @@ PathSelectionResult selectBestPath(GraphManager& graph,
                                        sharp_turn_allowed = nullptr,
                                    double goal_reach = 0.0,
                                    const SlopeEndRetreat& slope_end_retreat =
-                                       {});
+                                       {},
+                                   const EndExcludedFn& end_excluded =
+                                       nullptr);
 
 }  // namespace mgg
 

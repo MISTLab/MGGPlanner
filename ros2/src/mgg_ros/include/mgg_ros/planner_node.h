@@ -165,6 +165,10 @@ class PlannerNode : public rclcpp::Node {
   /// Sets no_go_ from no_go_zones_, its reach the zone radius plus half
   /// the robot's planning box.
   void refreshNoGoZones();
+  /// Whether a path, driven from its first pose, keeps out of the no-go
+  /// zones (mgg::NoGoZones::pathAdmissible): the last check on every path
+  /// and route sent, on every backend.
+  bool noGoAdmissible(const std::vector<mgg::StateVec>& path);
   /// Whether a no-go zone closes a global graph edge
   /// (mgg::NoGoZones::blocksEdge): only an outward departure of the robot
   /// from a zone it stands in stays open.
