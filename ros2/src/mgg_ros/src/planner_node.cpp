@@ -601,7 +601,17 @@ void PlannerNode::loadParameters() {
   if (!loadRobotParams(p, "RobotParams", robot_params_)) {
     RCLCPP_ERROR(get_logger(), "RobotParams failed to load");
   }
-  if (!loadPlanningParams(p, "PlanningParams", planning_params_)) {
+  const bool planning_loaded =
+      loadPlanningParams(p, "PlanningParams", planning_params_);
+  // Every bid is costed in time at v_max (drone scout Task 17): a planner
+  // without a speed would bid what its peers refuse. It does not start.
+  if (!std::isfinite(planning_params_.v_max) ||
+      !(planning_params_.v_max > 0.0)) {
+    throw std::invalid_argument(
+        "PlanningParams.v_max must be a positive, finite speed (m/s); got " +
+        std::to_string(planning_params_.v_max));
+  }
+  if (!planning_loaded) {
     RCLCPP_ERROR(get_logger(), "PlanningParams failed to load");
   }
   if (!loadGridGraphParams(p, "BoundedSpaceParams/GridGraphLocal",

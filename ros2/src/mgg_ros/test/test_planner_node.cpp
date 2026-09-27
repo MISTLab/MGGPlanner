@@ -13,6 +13,7 @@
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
+#include <limits>
 #include <sstream>
 #include <cstdint>
 #include <future>
@@ -4727,6 +4728,24 @@ TEST_F(PlannerNodeTest, AClusterBehindTheRobotWithinReachStaysInTheTour) {
   EXPECT_NE(PlannerNodeTestPeer::refreshTour(*node), mgg::kNoCluster);
   PlannerNodeTestPeer::setFlightReach(*node, 9.0);
   EXPECT_EQ(PlannerNodeTestPeer::refreshTour(*node), mgg::kNoCluster);
+}
+
+TEST_F(PlannerNodeTest, APlannerWithoutAPositiveSpeedDoesNotStart) {
+  // Review r1, P1: every bid is costed at v_max. A node that started with
+  // none would bid what its peers refuse, and the loader's early return
+  // left the planning parameters after it unloaded.
+  for (const double v_max : {0.0, -1.0, std::nan(""),
+                             std::numeric_limits<double>::infinity()}) {
+    SCOPED_TRACE(v_max);
+    EXPECT_THROW(makeNode("bad_speed", "world",
+                          {rclcpp::Parameter("PlanningParams.v_max", v_max)}),
+                 std::invalid_argument);
+  }
+  auto node = makeNode("good_speed", "world",
+                       {rclcpp::Parameter("PlanningParams.v_max", 1.5)});
+  PlannerNodeTestPeer::observeFloor(*node, -1.5, 4.0, -1.5, 1.5);
+  PlannerNodeTestPeer::acceptOdometry(*node, 0.0, 0.0, 1.0);
+  EXPECT_EQ(PlannerNodeTestPeer::ownTourBidMsg(*node).speed_mps, 1.5);
 }
 
 }  // namespace mgg_ros
