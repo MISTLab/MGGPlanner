@@ -31,6 +31,7 @@ rosidl_generate_interfaces(${PROJECT_NAME}
   "msg/ExecutionPathMode.msg"
   "msg/Graph.msg"
   "msg/MappingSnapshot.msg"
+  "msg/PlannerConfigState.msg"
   "msg/PlannerStatus.msg"
   "msg/PlanningBound.msg"
   "msg/PlanningMode.msg"

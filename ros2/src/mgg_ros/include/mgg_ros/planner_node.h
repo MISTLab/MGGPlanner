@@ -49,6 +49,7 @@
 
 #include <mgg_msgs/msg/graph.hpp>
 #include <mgg_msgs/msg/mapping_snapshot.hpp>
+#include <mgg_msgs/msg/planner_config_state.hpp>
 #include <mgg_msgs/srv/plan_objective.hpp>
 #include <mgg_msgs/srv/planner_set_exploration_target.hpp>
 #include <mgg_msgs/srv/planner_set_exploration_region.hpp>
@@ -231,6 +232,9 @@ class PlannerNode : public rclcpp::Node {
   void publishOwnGraph();
   void publishPath();
   void publishMarkers();
+  /// Snapshot the applied configuration and publish it with planner_mutex_
+  /// held by the caller. No-op setters retain the last change's version/time.
+  void publishPlannerConfigState();
 
   /// Builds the local grid graph around the current state, scores it and
   /// selects the best path into best_path_. Returns a summary for the log.
@@ -791,6 +795,9 @@ class PlannerNode : public rclcpp::Node {
   rclcpp::Publisher<mgg_msgs::msg::Graph>::SharedPtr graph_pub_;
   rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr
       marker_pub_;
+  rclcpp::Publisher<mgg_msgs::msg::PlannerConfigState>::SharedPtr
+      planner_config_state_pub_;
+  mgg_msgs::msg::PlannerConfigState planner_config_state_;
   rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr path_pub_;
   rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr tour_pub_;
   rclcpp::Publisher<mgg_msgs::msg::TourBid>::SharedPtr tour_bid_pub_;

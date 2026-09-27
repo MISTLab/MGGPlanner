@@ -140,6 +140,11 @@ PlannerNode::PlannerNode(const rclcpp::NodeOptions& options)
     }
   });
 
+  std::random_device random;
+  planner_config_state_.incarnation =
+      std::uniform_int_distribution<std::uint64_t>(
+          1, std::numeric_limits<std::uint64_t>::max())(random);
+
   loadParameters();
 
   // The map: an octree built from point clouds, or the MOLA product a
@@ -412,13 +417,6 @@ PlannerNode::PlannerNode(const rclcpp::NodeOptions& options)
           onTourAward(m);
         },
         sub_opts);
-    release_claims_srv_ = create_service<mgg_msgs::srv::ReleaseClaims>(
-        "release_claims",
-        [this](const std::shared_ptr<mgg_msgs::srv::ReleaseClaims::Request> req,
-               std::shared_ptr<mgg_msgs::srv::ReleaseClaims::Response> res) {
-          onReleaseClaims(req, res);
-        },
-        rclcpp::ServicesQoS(), callback_group_);
     fleet_timer_ = create_timer(
         std::chrono::duration<double>(kFleetTickPeriodS),
         [this]() {
@@ -432,14 +430,6 @@ PlannerNode::PlannerNode(const rclcpp::NodeOptions& options)
         },
         callback_group_);
   }
-
-  build_srv_ = create_service<std_srvs::srv::Trigger>(
-      "build_local_graph",
-      [this](const std::shared_ptr<std_srvs::srv::Trigger::Request> req,
-             std::shared_ptr<std_srvs::srv::Trigger::Response> res) {
-        onBuildRequest(req, res);
-      },
-      rclcpp::ServicesQoS(), callback_group_);
 
   global_vertex_spacing_ =
       declareOrGet<double>(this, "global_vertex_spacing", 1.0);
@@ -545,6 +535,32 @@ PlannerNode::PlannerNode(const rclcpp::NodeOptions& options)
                 rebuild_off.c_str());
   }
 
+  const double publish_period =
+      declareOrGet<double>(this, "graph_publish_period_sec", 2.0);
+  planner_config_state_pub_ = create_publisher<mgg_msgs::msg::PlannerConfigState>(
+      "planner_config_state", rclcpp::QoS(1).reliable().transient_local());
+  {
+    const std::lock_guard<std::recursive_mutex> lock(planner_mutex_);
+    publishPlannerConfigState();
+  }
+
+  // Advertise planner services only after the initial configuration is latched.
+  if (fleet_) {
+    release_claims_srv_ = create_service<mgg_msgs::srv::ReleaseClaims>(
+        "release_claims",
+        [this](const std::shared_ptr<mgg_msgs::srv::ReleaseClaims::Request> req,
+               std::shared_ptr<mgg_msgs::srv::ReleaseClaims::Response> res) {
+          onReleaseClaims(req, res);
+        },
+        rclcpp::ServicesQoS(), callback_group_);
+  }
+  build_srv_ = create_service<std_srvs::srv::Trigger>(
+      "build_local_graph",
+      [this](const std::shared_ptr<std_srvs::srv::Trigger::Request> req,
+             std::shared_ptr<std_srvs::srv::Trigger::Response> res) {
+        onBuildRequest(req, res);
+      },
+      rclcpp::ServicesQoS(), callback_group_);
   plan_srv_ = create_service<mgg_msgs::srv::PlannerSrv>(
       "mggplanner",
       [this](const std::shared_ptr<mgg_msgs::srv::PlannerSrv::Request> req,
@@ -589,8 +605,6 @@ PlannerNode::PlannerNode(const rclcpp::NodeOptions& options)
       },
       rclcpp::ServicesQoS(), callback_group_);
 
-  const double publish_period =
-      declareOrGet<double>(this, "graph_publish_period_sec", 2.0);
   // Node::create_timer drives off get_clock(), the node's RCL_ROS_TIME clock.
   // That is correct in both deployments: on a real robot use_sim_time is false
   // and ROS time follows the system clock, while in simulation it follows
@@ -3807,6 +3821,39 @@ void PlannerNode::recordSentPath() {
   lattice_path_.clear();
 }
 
+void PlannerNode::publishPlannerConfigState() {
+  mgg_msgs::msg::PlannerConfigState state;
+  state.incarnation = planner_config_state_.incarnation;
+  state.generation = planner_config_state_.generation;
+  state.stamp = planner_config_state_.stamp;
+  state.region_active = exploration_region_.has_value();
+  if (exploration_region_) {
+    const auto& region = *exploration_region_;
+    state.region_low.x = region.min_val.x();
+    state.region_low.y = region.min_val.y();
+    state.region_low.z = region.min_val.z();
+    state.region_high.x = region.max_val.x();
+    state.region_high.y = region.max_val.y();
+    state.region_high.z = region.max_val.z();
+  }
+  state.target_active = exploration_target_.has_value();
+  if (exploration_target_) {
+    state.target.x = exploration_target_->x();
+    state.target.y = exploration_target_->y();
+    state.target.z = exploration_target_->z();
+  }
+  state.fleet_enabled = static_cast<bool>(fleet_);
+  state.leaving_fleet = fleet_ && fleet_->leaving();
+  // Metadata is copied unchanged above, so only applied fields can differ.
+  // Generation zero is the unpublished initial state, even with fleet off.
+  if (state.generation == 0 || state != planner_config_state_) {
+    ++state.generation;
+    state.stamp = now();
+  }
+  planner_config_state_ = state;
+  planner_config_state_pub_->publish(state);
+}
+
 void PlannerNode::onExplorationTargetRequest(
     const std::shared_ptr<mgg_msgs::srv::PlannerSetExplorationTarget::Request>
         request,
@@ -3820,6 +3867,7 @@ void PlannerNode::onExplorationTargetRequest(
       RCLCPP_INFO(get_logger(), "exploration target cleared");
     }
     exploration_target_.reset();
+    publishPlannerConfigState();
     response->success = true;
     return;
   }
@@ -3833,6 +3881,7 @@ void PlannerNode::onExplorationTargetRequest(
   exploration_target_ = target;
   RCLCPP_INFO(get_logger(), "exploring toward (%.2f, %.2f, %.2f)", target.x(),
               target.y(), target.z());
+  publishPlannerConfigState();
   response->success = true;
 }
 
@@ -3853,6 +3902,7 @@ void PlannerNode::onLeaveFleet(
     response->message = "rejoined the fleet";
   }
   ++tour_assignment_version_;
+  publishPlannerConfigState();
   response->success = true;
 }
 
@@ -3875,6 +3925,7 @@ void PlannerNode::onExplorationRegionRequest(
     }
     exploration_region_.reset();
     ++tour_assignment_version_;
+    publishPlannerConfigState();
     response->success = true;
     response->message = "exploration region cleared";
     return;
@@ -3898,6 +3949,7 @@ void PlannerNode::onExplorationRegionRequest(
               min.x(), min.y(), min.z(), max.x(), max.y(), max.z());
   // The tour's candidates change: solve again.
   ++tour_assignment_version_;
+  publishPlannerConfigState();
   response->success = true;
   response->message = "exploring inside the region only";
 }
