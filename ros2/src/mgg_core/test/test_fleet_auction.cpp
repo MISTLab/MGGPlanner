@@ -35,6 +35,7 @@ double euclid(const Eigen::Vector3d& a, const Eigen::Vector3d& b) {
 /// A bid from `robot` at (x, 0) listing `clusters` at straight-line costs.
 TourBidData bidAt(int robot, double x, const std::vector<FleetCluster>& clusters) {
   TourBidData bid;
+  bid.speed_mps = 1.0;
   bid.robot_id = robot;
   bid.auctioneer_id = robot;
   bid.pose = mgg::StateVec(x, 0.0, 0.0, 0.0);
@@ -384,6 +385,7 @@ mgg::ClusterPool twoClusterPool() {
 
 TourBidData droneBid() {
   TourBidData bid;
+  bid.speed_mps = 1.0;
   bid.robot_id = 4;
   bid.pose = mgg::StateVec(0.0, 0.0, 0.0, 0.0);
   bid.clusters = {cluster(1, 4, 8.0)};
@@ -405,10 +407,14 @@ TEST(FleetAuction, BidderCostsAreTimeAtTheBiddersSpeed) {
   EXPECT_DOUBLE_EQ(drone.from_pose[0], 2.0);   // 8 m at 4 m/s
   EXPECT_DOUBLE_EQ(drone.from_pose[1], 5.0);   // an estimated 20 m
   EXPECT_DOUBLE_EQ(drone.between[0][1], 3.0);  // 12 m
-  bid.speed_mps = 0.0;  // unknown: metres, as before
-  EXPECT_DOUBLE_EQ(mgg::bidderCosts(bid, {0}, twoClusterPool(), kStraight)
-                       .from_pose[0],
-                   8.0);
+  // Without a speed (never a well-formed bid) there is no time to compare:
+  // the bidder bids on nothing, rather than in metres (review r0, P1).
+  bid.speed_mps = 0.0;
+  bid.costs_from_pose = {0.0};  // standing at it: 0 / 0 is no cost
+  const AuctionBidder unknown =
+      mgg::bidderCosts(bid, {0}, twoClusterPool(), kStraight);
+  EXPECT_EQ(unknown.from_pose[0], mgg::kUnreachableCost);
+  EXPECT_EQ(unknown.from_pose[1], mgg::kUnreachableCost);
 }
 
 TEST(FleetAuction, BidderCostsSkipClustersBeyondReach) {

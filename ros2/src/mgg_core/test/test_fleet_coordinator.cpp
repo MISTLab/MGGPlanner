@@ -40,6 +40,14 @@ double euclid(const Eigen::Vector3d& a, const Eigen::Vector3d& b) {
   return (a - b).norm();
 }
 
+/// The own bid of a robot that knows no cluster, at 1 m/s: its costs are
+/// its distances.
+TourBidData noClusters() {
+  TourBidData bid;
+  bid.speed_mps = 1.0;
+  return bid;
+}
+
 std::vector<ClusterId> idsOf(const std::vector<FleetCluster>& clusters) {
   std::vector<ClusterId> ids;
   for (const FleetCluster& c : clusters) ids.push_back(c.id);
@@ -79,6 +87,7 @@ struct SimRobot {
 
   TourBidData ownBid() const {
     TourBidData bid;
+    bid.speed_mps = 1.0;
     bid.robot_id = id;
     bid.auctioneer_id = id;  // tick fills in the current election
     bid.pose = mgg::StateVec(position.x(), position.y(), 0.0, 0.0);
@@ -546,6 +555,7 @@ TEST(FleetCoordinator, AfterAClockRollbackASilentRobotsClaimAgesFromTheReset) {
     return a;
   };
   TourBidData bid;
+  bid.speed_mps = 1.0;
   bid.robot_id = 3;
   bid.auctioneer_id = 3;
   coordinator.onBid(bid, 10000.0);
@@ -559,7 +569,7 @@ TEST(FleetCoordinator, AfterAClockRollbackASilentRobotsClaimAgesFromTheReset) {
   const double reset = 10.0;
   for (double now = reset; now <= reset + params.claim_ttl_s; now += 2.0) {
     coordinator.onAward(award(auction_id++, now, now - reset), now);
-    coordinator.tick(now, nullptr, nullptr, nullptr);
+    coordinator.tick(now, noClusters, nullptr, nullptr);
     EXPECT_EQ(holds(coordinator.group(now), 3),
               now - reset <= params.peer_timeout_s)
         << "at " << now;
@@ -569,7 +579,7 @@ TEST(FleetCoordinator, AfterAClockRollbackASilentRobotsClaimAgesFromTheReset) {
   }
   const double expired = reset + params.claim_ttl_s + 2.0;
   coordinator.onAward(award(auction_id++, expired, expired - reset), expired);
-  coordinator.tick(expired, nullptr, nullptr, nullptr);
+  coordinator.tick(expired, noClusters, nullptr, nullptr);
   EXPECT_TRUE(coordinator.claimedByOthers(expired).empty());
   EXPECT_EQ(coordinator.group(expired), (std::vector<int>{1, 2}));
 }
@@ -650,6 +660,7 @@ TEST(FleetCoordinator, OwnBidsStayWithinTheBidClusterLimit) {
   }
   const auto own_bid = [&explored] {
     TourBidData bid;
+    bid.speed_mps = 1.0;
     bid.robot_id = 2;
     bid.auctioneer_id = 1;
     bid.explored = explored;
@@ -706,7 +717,7 @@ TEST(FleetCoordinator, AnAwardsUnnamedClustersAreIgnored) {
   EXPECT_EQ(idsOf(coordinator.exploredElsewhere()),
             std::vector<ClusterId>{41});
   const mgg::FleetTickOutput out =
-      coordinator.tick(0.0, nullptr, nullptr, nullptr);
+      coordinator.tick(0.0, noClusters, nullptr, nullptr);
   ASSERT_TRUE(out.bid.has_value());
   EXPECT_TRUE(out.bid->wellFormed());
   EXPECT_EQ(out.bid->bundle, std::vector<ClusterId>{21});
@@ -742,23 +753,24 @@ TEST(FleetCoordinator, ACallReusingAnAuctionIdWithANewStampIsAnswered) {
   FleetCoordinator coordinator(2, FleetParams{}, 0.2);
   TourAwardData call = makeCall(1, 7, 1.0);
   coordinator.onAward(call, 1.0);
-  mgg::FleetTickOutput out = coordinator.tick(1.0, nullptr, nullptr, nullptr);
+  mgg::FleetTickOutput out = coordinator.tick(1.0, noClusters, nullptr, nullptr);
   ASSERT_TRUE(out.bid.has_value());
   EXPECT_EQ(out.bid->auction_id, 7u);
 
   call.stamp_s = 2.0;
   coordinator.onAward(call, 2.0);
-  out = coordinator.tick(2.0, nullptr, nullptr, nullptr);
+  out = coordinator.tick(2.0, noClusters, nullptr, nullptr);
   ASSERT_TRUE(out.bid.has_value());
   EXPECT_EQ(out.bid->auction_id, 7u);
   // The same round delivered twice is answered once.
   coordinator.onAward(call, 2.5);
-  EXPECT_FALSE(coordinator.tick(2.5, nullptr, nullptr, nullptr).bid);
+  EXPECT_FALSE(coordinator.tick(2.5, noClusters, nullptr, nullptr).bid);
 }
 
 /// A well-formed bid from `robot_id` naming nothing: a peer heard.
 TourBidData emptyBid(int robot_id) {
   TourBidData bid;
+  bid.speed_mps = 1.0;
   bid.robot_id = robot_id;
   bid.auctioneer_id = robot_id;
   return bid;
@@ -770,11 +782,11 @@ TEST(FleetCoordinator, ARequestIsAnsweredByALaterAwardWhenTheFirstIsLost) {
   FleetCoordinator coordinator(2, FleetParams{}, 0.2);
   coordinator.requestAuction();
   coordinator.onAward(makeCall(1, 100, 0.0), 0.0);
-  ASSERT_TRUE(coordinator.tick(0.0, nullptr, nullptr, nullptr).bid);
+  ASSERT_TRUE(coordinator.tick(0.0, noClusters, nullptr, nullptr).bid);
   // Round 100's award is lost.
   coordinator.onAward(makeCall(1, 101, 2.0), 2.0);
   const mgg::FleetTickOutput out =
-      coordinator.tick(2.0, nullptr, nullptr, nullptr);
+      coordinator.tick(2.0, noClusters, nullptr, nullptr);
   ASSERT_TRUE(out.bid.has_value());
   EXPECT_TRUE(out.bid->request_auction);
   EXPECT_TRUE(coordinator.awaitingAuction());
@@ -795,10 +807,10 @@ TEST(FleetCoordinator, ARequestFollowsTheAuctioneerWhenItChanges) {
   coordinator.onBid(emptyBid(3), 0.0);
   coordinator.requestAuction();
   coordinator.onAward(makeCall(1, 100, 0.0), 0.0);
-  ASSERT_TRUE(coordinator.tick(0.0, nullptr, nullptr, nullptr).bid);
+  ASSERT_TRUE(coordinator.tick(0.0, noClusters, nullptr, nullptr).bid);
   for (double now = 0.1; now < 12.0; now += 0.1) {
     coordinator.onBid(emptyBid(3), now);  // robot 1 is not heard again
-    coordinator.tick(now, nullptr, nullptr, nullptr);
+    coordinator.tick(now, noClusters, nullptr, nullptr);
     if (now < params.peer_timeout_s) {
       EXPECT_TRUE(coordinator.awaitingAuction()) << "at " << now;
     }
@@ -832,14 +844,14 @@ TEST(FleetCoordinator, ABidReceivedAfterTheDeadlineIsNotCollected) {
     FleetCoordinator coordinator(1, params, 0.2);
     coordinator.onBid(emptyBid(2), 0.0);
     const mgg::FleetTickOutput call =
-        coordinator.tick(0.0, nullptr, nullptr, nullptr);
+        coordinator.tick(0.0, noClusters, nullptr, nullptr);
     EXPECT_TRUE(call.award && call.award->call);
     if (!call.award) return false;
     coordinator.onBid(
         bidFrom(2, 20.0, {cluster(21, 2, 18.0)}, call.award->auction_id),
         received_s);
     const mgg::FleetTickOutput out = coordinator.tick(
-        std::max(received_s, params.bid_deadline_s) + 0.1, nullptr, nullptr,
+        std::max(received_s, params.bid_deadline_s) + 0.1, noClusters, nullptr,
         nullptr);
     EXPECT_TRUE(out.award && !out.award->call);
     if (!out.award) return false;
@@ -1267,15 +1279,15 @@ TEST(FleetCoordinator, AReplayedCallIsNotAnsweredAgain) {
   FleetCoordinator coordinator(2, FleetParams{}, 0.2);
   const TourAwardData a = makeCall(1, 7, 1.0);
   coordinator.onAward(a, 1.0);
-  mgg::FleetTickOutput out = coordinator.tick(1.0, nullptr, nullptr, nullptr);
+  mgg::FleetTickOutput out = coordinator.tick(1.0, noClusters, nullptr, nullptr);
   ASSERT_TRUE(out.bid.has_value());
   EXPECT_EQ(out.bid->auction_id, 7u);
   coordinator.onAward(makeCall(1, 8, 1.5), 1.5);
-  out = coordinator.tick(1.5, nullptr, nullptr, nullptr);
+  out = coordinator.tick(1.5, noClusters, nullptr, nullptr);
   ASSERT_TRUE(out.bid.has_value());
   EXPECT_EQ(out.bid->auction_id, 8u);
   coordinator.onAward(a, 1.8);
-  EXPECT_FALSE(coordinator.tick(1.8, nullptr, nullptr, nullptr).bid);
+  EXPECT_FALSE(coordinator.tick(1.8, noClusters, nullptr, nullptr).bid);
 }
 
 // The tour solves again when the claims it respects change: a bid that
@@ -1351,7 +1363,7 @@ TEST(FleetCoordinator, ADelayedBidDoesNotUndoAnAuctionsTakeOver) {
   for (double now = 0.0; now < 12.0 && !released; now += 0.5) {
     coordinator.onBid(emptyBid(3), now);  // keeps robot 1 in a group
     const mgg::FleetTickOutput out =
-        coordinator.tick(now, nullptr, euclid, nullptr);
+        coordinator.tick(now, noClusters, euclid, nullptr);
     if (out.award && !out.award->call) {
       const auto& ids = out.award->released_robot_ids;
       released = std::find(ids.begin(), ids.end(), 2) != ids.end();
@@ -1393,28 +1405,28 @@ TEST(FleetCoordinator, AnOmittedBidderKeepsRequestingUntilNamedInAnAward) {
   FleetCoordinator leader(1, FleetParams{}, 0.2), follower(2, FleetParams{}, 0.2);
   leader.onBid(emptyBid(2), 0.0);
   follower.onBid(emptyBid(1), 0.0);
-  leader.tick(0.0, nullptr, nullptr, nullptr);  // call lost
+  leader.tick(0.0, noClusters, nullptr, nullptr);  // call lost
   follower.requestAuction();
-  auto reply = follower.tick(0.1, nullptr, nullptr, nullptr);
+  auto reply = follower.tick(0.1, noClusters, nullptr, nullptr);
   ASSERT_TRUE(reply.bid);
   leader.onBid(*reply.bid, 0.1);  // not an answer to the current call
-  auto out = leader.tick(1.1, nullptr, nullptr, nullptr);
+  auto out = leader.tick(1.1, noClusters, nullptr, nullptr);
   ASSERT_TRUE(out.award);
   ASSERT_EQ(out.award->bundleOf(2), nullptr);
   follower.onAward(*out.award, 1.1);
   EXPECT_FALSE(follower.requestAnswered());
   EXPECT_TRUE(follower.awaitingAuction());
-  reply = follower.tick(3.2, nullptr, nullptr, nullptr);
+  reply = follower.tick(3.2, noClusters, nullptr, nullptr);
   ASSERT_TRUE(reply.bid);
   EXPECT_TRUE(reply.bid->request_auction);
   leader.onBid(*reply.bid, 3.2);
-  out = leader.tick(3.2, nullptr, nullptr, nullptr);
+  out = leader.tick(3.2, noClusters, nullptr, nullptr);
   ASSERT_TRUE(out.award && out.award->call);
   follower.onAward(*out.award, 3.2);
-  reply = follower.tick(3.3, nullptr, nullptr, nullptr);
+  reply = follower.tick(3.3, noClusters, nullptr, nullptr);
   ASSERT_TRUE(reply.bid);
   leader.onBid(*reply.bid, 3.3);
-  out = leader.tick(4.3, nullptr, nullptr, nullptr);
+  out = leader.tick(4.3, noClusters, nullptr, nullptr);
   ASSERT_TRUE(out.award && !out.award->call);
   ASSERT_NE(out.award->bundleOf(1), nullptr);
   ASSERT_NE(out.award->bundleOf(2), nullptr);
@@ -1491,20 +1503,20 @@ TEST(FleetCoordinator, ADelayedAwardOfARoundBeforeTheRequestDoesNotAnswerIt) {
   FleetCoordinator coordinator(2, FleetParams{}, 0.2);
   coordinator.onAward(makeCall(1, 7, 10.0), 10.0);
   const mgg::FleetTickOutput before =
-      coordinator.tick(10.0, nullptr, nullptr, nullptr);
+      coordinator.tick(10.0, noClusters, nullptr, nullptr);
   ASSERT_TRUE(before.bid);
   ASSERT_EQ(before.bid->auction_id, 7u);
   ASSERT_FALSE(before.bid->request_auction);
   // Round 7's award, stamped 11, is delayed. The robot then asks.
   coordinator.requestAuction();
   const mgg::FleetTickOutput request =
-      coordinator.tick(10.5, nullptr, nullptr, nullptr);
+      coordinator.tick(10.5, noClusters, nullptr, nullptr);
   ASSERT_TRUE(request.bid);
   ASSERT_TRUE(request.bid->request_auction);
   // The auctioneer restarted and calls auction 7 again; the robot answers.
   coordinator.onAward(makeCall(1, 7, 12.0), 12.0);
   const mgg::FleetTickOutput answer =
-      coordinator.tick(12.0, nullptr, nullptr, nullptr);
+      coordinator.tick(12.0, noClusters, nullptr, nullptr);
   ASSERT_TRUE(answer.bid);
   ASSERT_EQ(answer.bid->auction_id, 7u);
   coordinator.onAward(
@@ -1584,12 +1596,12 @@ TEST(FleetCoordinator, AfterAClockRollbackARequestIsSentAgain) {
   coordinator.onAward(makeCall(1, 100, 100.0), 100.0);
   coordinator.requestAuction();
   const mgg::FleetTickOutput first =
-      coordinator.tick(100.0, nullptr, nullptr, nullptr);
+      coordinator.tick(100.0, noClusters, nullptr, nullptr);
   ASSERT_TRUE(first.bid);
   ASSERT_TRUE(first.bid->request_auction);
   // The clock goes back: the request goes out again at once.
   const mgg::FleetTickOutput again =
-      coordinator.tick(5.0, nullptr, nullptr, nullptr);
+      coordinator.tick(5.0, noClusters, nullptr, nullptr);
   ASSERT_TRUE(again.bid);
   EXPECT_TRUE(again.bid->request_auction);
   EXPECT_GT(again.bid->seq, first.bid->seq);
@@ -1616,7 +1628,7 @@ TEST(FleetCoordinator, ARestartedRequesterIgnoresAnAwardOfItsPreviousLifetime) {
   restarted.requestAuction();
   restarted.onAward(makeCall(1, 8, 12.0), 12.0);
   const mgg::FleetTickOutput answer =
-      restarted.tick(12.0, nullptr, nullptr, nullptr);
+      restarted.tick(12.0, noClusters, nullptr, nullptr);
   ASSERT_TRUE(answer.bid);
   ASSERT_TRUE(answer.bid->request_auction);
   EXPECT_GT(answer.bid->seq, 42u);
@@ -1641,7 +1653,7 @@ TEST(FleetCoordinator, BidSeqsStartFromTheWallClock) {
           .count());
   FleetCoordinator coordinator(2, FleetParams{}, 0.2);
   const mgg::FleetTickOutput out =
-      coordinator.tick(0.0, nullptr, nullptr, nullptr);
+      coordinator.tick(0.0, noClusters, nullptr, nullptr);
   ASSERT_TRUE(out.bid);
   EXPECT_GT(out.bid->seq, before);
 }
@@ -1653,7 +1665,7 @@ TEST(FleetCoordinator, ARequesterRestartedWithALaterSeedIgnoresItsOldAward) {
   {
     FleetCoordinator previous(2, FleetParams{}, 0.2, /*seq_seed=*/41);
     previous.onAward(makeCall(1, 7, 10.0), 10.0);
-    old_bid = previous.tick(10.0, nullptr, nullptr, nullptr);
+    old_bid = previous.tick(10.0, noClusters, nullptr, nullptr);
     ASSERT_TRUE(old_bid.bid);
     ASSERT_EQ(old_bid.bid->seq, 42u);
   }
@@ -1661,7 +1673,7 @@ TEST(FleetCoordinator, ARequesterRestartedWithALaterSeedIgnoresItsOldAward) {
   restarted.requestAuction();
   restarted.onAward(makeCall(1, 8, 12.0), 12.0);
   const mgg::FleetTickOutput answer =
-      restarted.tick(12.0, nullptr, nullptr, nullptr);
+      restarted.tick(12.0, noClusters, nullptr, nullptr);
   ASSERT_TRUE(answer.bid);
   EXPECT_EQ(answer.bid->seq, 1001u);
   restarted.onAward(

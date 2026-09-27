@@ -60,7 +60,8 @@ struct TourBidData {
   std::vector<ClusterId> explored;
   /// The bidder's bundle is done and it asks for an auction (§3.2, §3.5).
   bool request_auction = false;
-  /// The bidder's cruise speed, m/s; 0 when unknown (costs stay metres).
+  /// The bidder's cruise speed, m/s: the auction compares its costs in
+  /// time. Positive and finite in a well-formed bid.
   double speed_mps = 0.0;
   /// Metres of flight the bidder has left for exploring and returning home;
   /// infinite without a battery limit (drone scout design §4.3).
@@ -73,7 +74,8 @@ struct TourBidData {
   }
   /// At most kMaxBidClusters clusters, bundle entries and explored entries;
   /// cost arrays sized to the clusters; a finite pose and finite cluster
-  /// positions; costs may be +inf, never NaN or negative. The IDs in
+  /// positions; costs may be +inf, never NaN or negative; a positive,
+  /// finite speed. The IDs in
   /// clusters, bundle and explored must not be kNoCluster; current_target
   /// may be (no target). IDs are not checked against each other.
   bool wellFormed() const;

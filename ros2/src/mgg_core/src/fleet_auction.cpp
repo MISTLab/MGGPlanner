@@ -187,16 +187,20 @@ AuctionBidder bidderCosts(const TourBidData& bid,
     }
   }
   // Costs become time at the bidder's own speed, so a fast scout wins the
-  // far clusters a slow robot would take long to reach.
-  if (bid.speed_mps > 0.0) {
-    for (std::size_t p = 0; p < n; ++p) {
-      if (std::isfinite(bidder.from_pose[p])) {
-        bidder.from_pose[p] /= bid.speed_mps;
-      }
-      for (std::size_t q = 0; q < n; ++q) {
-        if (std::isfinite(bidder.between[p][q])) {
-          bidder.between[p][q] /= bid.speed_mps;
-        }
+  // far clusters a slow robot would take long to reach. Every bid carries
+  // one (TourBidData::wellFormed; the node bids at v_max); one without has
+  // no time to compare and bids on nothing.
+  if (!(std::isfinite(bid.speed_mps) && bid.speed_mps > 0.0)) {
+    bidder.from_pose.assign(n, kUnreachableCost);
+    return bidder;
+  }
+  for (std::size_t p = 0; p < n; ++p) {
+    if (std::isfinite(bidder.from_pose[p])) {
+      bidder.from_pose[p] /= bid.speed_mps;
+    }
+    for (std::size_t q = 0; q < n; ++q) {
+      if (std::isfinite(bidder.between[p][q])) {
+        bidder.between[p][q] /= bid.speed_mps;
       }
     }
   }

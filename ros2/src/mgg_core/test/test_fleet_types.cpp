@@ -24,6 +24,7 @@ FleetCluster cluster(mgg::ClusterId id, double x) {
 
 TourBidData twoClusterBid() {
   TourBidData bid;
+  bid.speed_mps = 1.0;
   bid.robot_id = 1;
   bid.auctioneer_id = 1;
   bid.pose = mgg::StateVec(0.0, 0.0, 0.0, 0.0);
@@ -65,6 +66,7 @@ TEST(FleetTypes, WellFormedRejectsInconsistentOrInvalidBids) {
   EXPECT_TRUE(b.wellFormed());
   // A robot with nothing to report still bids.
   TourBidData empty;
+  empty.speed_mps = 1.0;
   empty.auctioneer_id = empty.robot_id;
   EXPECT_TRUE(empty.wellFormed());
 }
@@ -86,6 +88,7 @@ TEST(FleetTypes, WellFormedRejectsUnnamedBundleAndExploredEntries) {
 TEST(FleetTypes, WellFormedCapsEveryListAtTheBidClusterLimit) {
   const auto bidWith = [](std::size_t n) {
     TourBidData bid;
+    bid.speed_mps = 1.0;
     bid.auctioneer_id = bid.robot_id;
     for (std::size_t i = 0; i < n; ++i) {
       bid.clusters.push_back(cluster(i + 1, static_cast<double>(i)));
@@ -97,6 +100,7 @@ TEST(FleetTypes, WellFormedCapsEveryListAtTheBidClusterLimit) {
   EXPECT_TRUE(bidWith(mgg::kMaxBidClusters).wellFormed());
   EXPECT_FALSE(bidWith(mgg::kMaxBidClusters + 1).wellFormed());
   TourBidData b;
+  b.speed_mps = 1.0;
   b.auctioneer_id = b.robot_id;
   b.bundle.assign(mgg::kMaxBidClusters, 11);
   b.explored.assign(mgg::kMaxBidClusters, 12);
@@ -129,11 +133,16 @@ TEST(FleetTypes, AnAwardFindsBundlesAndClustersById) {
 
 TEST(FleetTypes, ADronesSpeedReachAndHomeMustBeValid) {
   mgg::TourBidData bid;
-  EXPECT_TRUE(bid.wellFormed());
+  // Every bid is costed in time (review r0, P1): a bid without a speed has
+  // no costs to compare.
+  EXPECT_FALSE(bid.wellFormed());
   EXPECT_TRUE(std::isinf(bid.reach_m));
   bid.speed_mps = -1.0;
   EXPECT_FALSE(bid.wellFormed());
+  bid.speed_mps = std::numeric_limits<double>::infinity();
+  EXPECT_FALSE(bid.wellFormed());
   bid.speed_mps = 4.0;
+  EXPECT_TRUE(bid.wellFormed());
   bid.reach_m = std::nan("");
   EXPECT_FALSE(bid.wellFormed());
   bid.reach_m = 120.0;

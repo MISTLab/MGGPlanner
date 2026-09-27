@@ -70,7 +70,10 @@ struct AuctionBidder {
 
 /// The bid's costs over the pool: its own where it lists the cluster (the
 /// least of its entries merged into one), otherwise `estimate` on the
-/// auctioneer's roadmap (kUnreachableCost without one).
+/// auctioneer's roadmap (kUnreachableCost without one). Clusters the bidder
+/// could not reach and return home from within reach_m are unreachable;
+/// the rest are times, at the bid's speed_mps. A bid without a positive
+/// speed bids on nothing.
 AuctionBidder bidderCosts(const TourBidData& bid,
                           const std::vector<int>& bid_to_pool,
                           const ClusterPool& pool,

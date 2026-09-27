@@ -170,6 +170,21 @@ TEST_F(ParamFixture, LoadsTourAndFleetParams) {
 
 // An unconverted ROS 1 config reaches ROS 2 with rad()/deg() still as strings.
 // That must be reported, not silently read as zero.
+TEST(ParamLoader, APlanningSpeedThatIsNotPositiveIsRefused) {
+  // Bids are costed at v_max (review r0, P1): a robot without a speed
+  // would bid no time at all.
+  for (const double v_max : {0.0, -1.0}) {
+    rclcpp::NodeOptions opts;
+    opts.automatically_declare_parameters_from_overrides(true);
+    opts.parameter_overrides({{"PlanningParams.v_max", v_max}});
+    auto node = std::make_shared<rclcpp::Node>("param_speed_test", opts);
+    ParamLoader p(node.get());
+    mgg::PlanningParams params;
+    EXPECT_FALSE(mgg_ros::loadPlanningParams(p, "PlanningParams", params))
+        << v_max;
+  }
+}
+
 TEST_F(ParamFixture, UnevaluatedAngleExpressionIsRejected) {
   ParamLoader p(node_.get());
   double v = -1.0;

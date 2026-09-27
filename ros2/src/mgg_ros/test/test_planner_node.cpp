@@ -994,6 +994,7 @@ class PlannerNodeTestPeer {
   static void claim(PlannerNode& node, int robot_id, const mgg::FleetCluster& cluster,
                     double heard_s) {
     mgg::TourBidData bid;
+    bid.speed_mps = 1.0;
     bid.robot_id = robot_id;
     bid.auctioneer_id = robot_id;
     bid.stamp_s = heard_s;
@@ -1033,6 +1034,7 @@ class PlannerNodeTestPeer {
   static void hearPeer(PlannerNode& node, int robot_id) {
     const std::lock_guard<std::recursive_mutex> lock(node.planner_mutex_);
     mgg::TourBidData bid;
+    bid.speed_mps = 1.0;
     bid.robot_id = robot_id;
     bid.auctioneer_id = robot_id;
     node.fleet_->onBid(bid, node.now().seconds());
@@ -4068,10 +4070,16 @@ TEST_F(PlannerNodeTest, AMissedCallAwardDoesNotCompleteAnUnconsideredRobot) {
   TwoPlanners fleet("missed_call");
   PlannerNodeTestPeer::receiveTransform(*fleet.b, "robot_1/odom", "robot_0/odom", -5.0, 0.0);
   mgg::FleetCoordinator leader(1, mgg::FleetParams{}, 0.2);
+  // The leader knows no cluster; its bids carry a speed, as every bid does.
+  const mgg::OwnBidFn leader_bid = [] {
+    mgg::TourBidData bid;
+    bid.speed_mps = 1.0;
+    return bid;
+  };
   const double t = fleet.b->now().seconds();
   leader.onBid(fromTourBidMsg(PlannerNodeTestPeer::ownTourBidMsg(*fleet.b),
                              Eigen::Isometry3d::Identity()), t);
-  auto out = leader.tick(t, nullptr, nullptr, nullptr);
+  auto out = leader.tick(t, leader_bid, nullptr, nullptr);
   ASSERT_TRUE(out.bid && out.award && out.award->call);
   PlannerNodeTestPeer::receiveTourBid(*fleet.b, toTourBidMsg(*out.bid, "robot_0/odom"));
   // The call is lost. This idle robot requests after collection started.
@@ -4084,7 +4092,7 @@ TEST_F(PlannerNodeTest, AMissedCallAwardDoesNotCompleteAnUnconsideredRobot) {
   ASSERT_EQ(reply.bid->auction_id, 0u);
   ASSERT_TRUE(reply.bid->request_auction);
   leader.onBid(*reply.bid, t + 0.1);
-  out = leader.tick(t + 1.1, nullptr, nullptr, nullptr);
+  out = leader.tick(t + 1.1, leader_bid, nullptr, nullptr);
   ASSERT_TRUE(out.award && !out.award->call);
   ASSERT_EQ(out.award->bundleOf(2), nullptr);
   PlannerNodeTestPeer::receiveTourAward(*fleet.b, toTourAwardMsg(*out.award, "robot_0/odom"));
@@ -4095,13 +4103,13 @@ TEST_F(PlannerNodeTest, AMissedCallAwardDoesNotCompleteAnUnconsideredRobot) {
   ASSERT_TRUE(reply.bid);
   EXPECT_TRUE(reply.bid->request_auction);
   leader.onBid(*reply.bid, t + 3.2);
-  out = leader.tick(t + 3.2, nullptr, nullptr, nullptr);
+  out = leader.tick(t + 3.2, leader_bid, nullptr, nullptr);
   ASSERT_TRUE(out.award && out.award->call);
   PlannerNodeTestPeer::receiveTourAward(*fleet.b, toTourAwardMsg(*out.award, "robot_0/odom"));
   reply = PlannerNodeTestPeer::fleetStep(*fleet.b, t + 3.3);
   ASSERT_TRUE(reply.bid);
   leader.onBid(*reply.bid, t + 3.3);
-  out = leader.tick(t + 4.3, nullptr, nullptr, nullptr);
+  out = leader.tick(t + 4.3, leader_bid, nullptr, nullptr);
   ASSERT_TRUE(out.award && !out.award->call);
   ASSERT_NE(out.award->bundleOf(1), nullptr);
   ASSERT_NE(out.award->bundleOf(2), nullptr);

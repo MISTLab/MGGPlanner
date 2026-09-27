@@ -26,6 +26,7 @@ FleetCluster cluster(mgg::ClusterId id, int owner, double x, double y) {
 
 TourBidData sampleBid() {
   TourBidData bid;
+  bid.speed_mps = 1.0;
   bid.robot_id = 2;
   bid.seq = 17;
   bid.stamp_s = 123.25;
