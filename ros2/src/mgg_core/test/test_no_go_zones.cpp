@@ -7,6 +7,7 @@
 
 #include <gtest/gtest.h>
 
+#include "mgg_core/graph_manager.h"
 #include "mgg_core/no_go_zones.h"
 
 namespace {
@@ -78,6 +79,61 @@ TEST(NoGoZones, AnUndirectedEdgeIsOpenOnlyAsAnOutwardDepartureOfTheRobot) {
   EXPECT_TRUE(zones.blocksEdge({0.3, 0, 0}, {3, 0, 0}, robot_in));
   EXPECT_TRUE(zones.blocksEdge({0.6, 0, 0}, {-3, 0, 0}, robot_in));
   EXPECT_TRUE(zones.blocksEdge({0.8, -1, 0}, {0.8, 1, 0}, robot_in));
+}
+
+// Review r1, R1-1: the search filter (blocksEdge) opens departure edges
+// either way, so Dijkstra took S-A-B-T, which leaves the zone at A and
+// re-enters it at B; the final check refused it and the admissible
+// S-A-C-T was never tried. The zone-respecting search expands directed
+// states, departing outward only and never re-entering, and finds S-A-C-T.
+TEST(NoGoZones, TheZoneRespectingSearchFindsTheRouteThatDoesNotReEnter) {
+  mgg::GraphManager graph;
+  const auto add = [&graph](int id, double x, double y) {
+    auto* v = new mgg::Vertex(id, mgg::StateVec(x, y, 0.0, 0.0));
+    graph.addVertex(v);
+    return v;
+  };
+  mgg::Vertex* s = add(0, 0.5, 0.0);
+  mgg::Vertex* a = add(1, 2.0, 0.0);
+  mgg::Vertex* b = add(2, 0.5, 0.5);
+  mgg::Vertex* t = add(3, 0.0, 2.0);
+  mgg::Vertex* c = add(4, 2.0, 2.0);
+  const auto link = [&graph](mgg::Vertex* u, mgg::Vertex* v) {
+    graph.addEdge(u, v, (u->state - v->state).head<3>().norm());
+  };
+  link(s, a);
+  link(a, b);
+  link(b, t);
+  link(a, c);
+  link(c, t);
+  const NoGoZones zones = zoneAtOrigin();
+  const Eigen::Vector3d robot = s->state.head<3>();
+  graph.setEdgeBlocked([&zones, &robot](const mgg::Vertex& u, const mgg::Vertex& v) {
+    return zones.blocksEdge(u.state.head<3>(), v.state.head<3>(), robot);
+  });
+  // Dijkstra over the open edges: S-A-B-T, which re-enters.
+  mgg::ShortestPathsReport rep;
+  ASSERT_TRUE(graph.findShortestPaths(0, rep));
+  std::vector<int> dijkstra;
+  graph.getShortestPath(3, rep, true, dijkstra);
+  EXPECT_EQ(dijkstra, (std::vector<int>{0, 1, 2, 3}));
+  std::vector<Eigen::Vector3d> points;
+  for (int id : dijkstra) points.push_back(graph.getVertex(id)->state.head<3>());
+  EXPECT_FALSE(zones.pathAdmissible(points));
+  // The zone-respecting search: S-A-C-T.
+  const std::vector<mgg::Vertex*> route =
+      mgg::zoneRespectingRoute(graph, 0, 3, robot, zones);
+  ASSERT_EQ(route.size(), 4u);
+  EXPECT_EQ(route[0], s);
+  EXPECT_EQ(route[1], a);
+  EXPECT_EQ(route[2], c);
+  EXPECT_EQ(route[3], t);
+  points.clear();
+  for (const mgg::Vertex* v : route) points.push_back(v->state.head<3>());
+  EXPECT_TRUE(zones.pathAdmissible(points));
+  // With A-C gone, nothing is admissible: no route.
+  graph.removeEdge(a, c);
+  EXPECT_TRUE(mgg::zoneRespectingRoute(graph, 0, 3, robot, zones).empty());
 }
 
 }  // namespace

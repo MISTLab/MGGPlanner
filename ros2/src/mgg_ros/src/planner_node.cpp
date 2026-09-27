@@ -2352,7 +2352,17 @@ std::string PlannerNode::buildLocalGraph() {
       },
       turns_admissible, sharp_turn_allowed, reach_distance_,
       slope_end_retreat,
-      [this](const mgg::Vertex& v) { return no_go_.inside(v.state.head<3>()); });
+      [this](const mgg::Vertex& v) { return no_go_.inside(v.state.head<3>()); },
+      // A path the final check would refuse is left out, so another is
+      // chosen rather than none (review r1, R1-1).
+      no_go_.empty()
+          ? mgg::PathTurnsFn()
+          : mgg::PathTurnsFn([this](const std::vector<mgg::Vertex*>& path) {
+              std::vector<Eigen::Vector3d> points;
+              points.reserve(path.size());
+              for (const mgg::Vertex* v : path) points.push_back(v->state.head<3>());
+              return no_go_.pathAdmissible(points);
+            }));
   for (const mgg::Vertex* v : sel.best_path) {
     if (v != nullptr) best_path_.push_back(v->state);
   }
@@ -2734,9 +2744,32 @@ bool PlannerNode::routeOverGlobalGraph(const mgg::StateVec goal,
     global_graph_->getShortestPath(goal_vertex->id, rep, true, route);
   }
   if (departure.query_local) path.push_back(current);
+  // The robot departs from where it stands, or from its link vertex.
+  const Eigen::Vector3d route_start =
+      departure.query_local ? current.head<3>() : link_vertex->state.head<3>();
+  refreshNoGoZones();
+  const auto zones_admit = [this, &path](const std::vector<mgg::Vertex*>& r) {
+    std::vector<Eigen::Vector3d> points;
+    for (const mgg::StateVec& s : path) points.push_back(s.head<3>());
+    for (const mgg::Vertex* v : r) points.push_back(v->state.head<3>());
+    return no_go_.pathAdmissible(points);
+  };
+  // Dijkstra's edges are open either way, so its route may leave a zone
+  // the robot stands in and come back: the route that departs outward only
+  // and never re-enters is searched for instead (review r1, R1-1).
+  if (!no_go_.empty() && !route.empty() && !zones_admit(route)) {
+    route = mgg::zoneRespectingRoute(*global_graph_, link_vertex->id,
+                                     goal_vertex->id, route_start, no_go_);
+  }
   if (!route.empty()) {
+    const std::vector<mgg::Vertex*> before_turns = route;
     turns_ok = applyRouteTurnRule(*global_graph_, /*slope_from_map=*/true,
                                   path, route, "global route");
+    // A turn-compliant detour must keep out of the zones too; the route it
+    // replaced does.
+    if (!no_go_.empty() && !zones_admit(route) && zones_admit(before_turns)) {
+      route = before_turns;
+    }
   }
   for (const mgg::Vertex* v : route) path.push_back(v->state);
   if (path.size() < 2) {
@@ -2745,7 +2778,6 @@ bool PlannerNode::routeOverGlobalGraph(const mgg::StateVec goal,
   }
   // A route left open by the searches may still turn back into a zone the
   // robot is leaving, or end in one (review r0, I-3).
-  refreshNoGoZones();
   std::vector<Eigen::Vector3d> points;
   points.reserve(path.size());
   for (const mgg::StateVec& state : path) points.push_back(state.head<3>());

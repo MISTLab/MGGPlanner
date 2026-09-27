@@ -235,7 +235,9 @@ class TurnBackHysteresis {
 };
 
 /// Scores every root-to-leaf path and returns the best. A path may not end
-/// where `end_excluded` says, treated as ending in a reservation.
+/// where `end_excluded` says, treated as ending in a reservation, and no
+/// path, however cut back, is chosen that `path_admissible` refuses (one
+/// entering a no-go zone): another is, rather than none (review r1, R1-1).
 ///
 /// `exploring_direction` is the direction paths are penalised for leaving,
 /// by path_direction_penalty: the planner node passes the robot's heading,
@@ -294,6 +296,8 @@ PathSelectionResult selectBestPath(GraphManager& graph,
                                    const SlopeEndRetreat& slope_end_retreat =
                                        {},
                                    const EndExcludedFn& end_excluded =
+                                       nullptr,
+                                   const PathTurnsFn& path_admissible =
                                        nullptr);
 
 }  // namespace mgg

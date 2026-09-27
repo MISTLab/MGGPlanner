@@ -1824,8 +1824,8 @@ TEST_F(PlannerNodeTest, NavigateInTheLatticeKeepsOutOfANoGoZoneOnEitherBackend) 
 
 TEST_F(PlannerNodeTest, ExplorationFromInsideANoGoZoneOnlyDepartsOnEitherBackend) {
   // Review r0, I-5 with I-3: the robot stands in the zone, west of its
-  // centre, facing east into it. Whatever is sent departs west and ends
-  // out of the zone; nothing goes east past where it stands.
+  // centre, facing east into it. It is sent a departure west that ends out
+  // of the zone; nothing goes east past where it stands.
   for (const bool mola : {false, true}) {
     SCOPED_TRACE(mola ? "mola_snapshot" : "cloud_octomap");
     std::unique_ptr<MolaFloorProduct> product;
@@ -1835,12 +1835,13 @@ TEST_F(PlannerNodeTest, ExplorationFromInsideANoGoZoneOnlyDepartsOnEitherBackend
     PlannerNodeTestPeer::receiveNoGoZones(*node, "world", {{2.3, 0.0}});
     auto response = std::make_shared<mgg_msgs::srv::PlannerSrv::Response>();
     PlannerNodeTestPeer::plan(*node, response);
+    // Review r1, R1-1: a departure is sent, not an empty path.
+    ASSERT_EQ(response->status, mgg_msgs::srv::PlannerSrv::Response::FORWARD);
+    ASSERT_GE(response->path.size(), 2u);
     EXPECT_LE(furthestX(response->path), 1.8 + 1e-3);
-    if (!response->path.empty()) {
-      EXPECT_GE(std::hypot(response->path.back().position.x - 2.3,
-                           response->path.back().position.y),
-                1.1 - 1e-6);
-    }
+    EXPECT_GE(std::hypot(response->path.back().position.x - 2.3,
+                         response->path.back().position.y),
+              1.1 - 1e-6);
   }
 }
 

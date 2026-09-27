@@ -1,5 +1,6 @@
 // Tests for path scoring, the step that turns per-vertex gain into a decision.
 
+#include <algorithm>
 #include <cmath>
 #include <gtest/gtest.h>
 
@@ -238,6 +239,26 @@ TEST(PathSelection, AfterTurningBackTheRobotDoesNotTurnStraightBackAgain) {
   // Going on, the bound applies again.
   EXPECT_DOUBLE_EQ(hysteresis.selectionParams(p).path_direction_min_factor,
                    p.path_direction_min_factor);
+}
+
+// Review r1, R1-1: a lattice path the final check would refuse (one that
+// turns back into a no-go zone) was chosen, dropped, and the robot got no
+// path at all. selectBestPath's path_admissible leaves such paths out, so
+// another is chosen.
+TEST(PathSelection, AnInadmissiblePathIsLeftOutAndAnotherChosen) {
+  Fork f;
+  for (Vertex* v : f.x_branch) v->vol_gain.gain = 100.0;
+  for (Vertex* v : f.y_branch) v->vol_gain.gain = 10.0;
+  EdgeInclinations flat;
+  const mgg::PathTurnsFn not_through_3 = [](const std::vector<Vertex*>& path) {
+    return std::none_of(path.begin(), path.end(),
+                        [](const Vertex* v) { return v->id == 3; });
+  };
+  const auto r = mgg::selectBestPath(f.graph, makePlanning(), RobotParams(),
+                                     flat, 0.2, 0.0, {}, 0.0, nullptr, nullptr,
+                                     nullptr, 0.0, {}, nullptr, not_through_3);
+  ASSERT_FALSE(r.best_path.empty());
+  for (const Vertex* v : r.best_path) EXPECT_NE(v->id, 3);
 }
 
 TEST(PathSelection, FrontierPresenceIsReported) {
