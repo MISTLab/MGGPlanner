@@ -160,6 +160,11 @@ class MapInterface {
 
   /// Separate dynamic margins from static boxes for an oriented sweep.
   /// Backends without dynamic obstacles retain their ordinary box query.
+  /// A candidate place is not a departure: no dynamic-margin exemption.
+  virtual bool dynamicBoxBlocked(const Eigen::Vector3d&,
+                                 const Eigen::Vector3d&) const {
+    return false;
+  }
   virtual bool dynamicSweepBlocked(const Eigen::Vector3d&,
                                    const Eigen::Vector3d&, double) const {
     return false;

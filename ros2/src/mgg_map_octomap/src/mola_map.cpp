@@ -1216,6 +1216,11 @@ bool MolaMap::discSetBlocksBox(
   return false;
 }
 
+bool MolaMap::dynamicBoxBlocked(const Eigen::Vector3d& center,
+                                 const Eigen::Vector3d& size) const {
+  return discsBlockBox(center, size);
+}
+
 bool MolaMap::dynamicSweepBlocked(const Eigen::Vector3d& start,
                                    const Eigen::Vector3d& end,
                                    double half_width) const {

@@ -478,6 +478,40 @@ TEST(MolaMap, NoGoDiscsStayUntilReplacedAndCoexistWithPeerBodies) {
   EXPECT_EQ(map->getPathStatus(here, there, body, true), VoxelStatus::kFree);
 }
 
+TEST(MolaMap, LatticeCellsInsidePeerMarginsRemainOccupied) {
+  Publication publication;
+  const Voxel endpoint{10, 0, 2};
+  const auto request = publication.publish(0, {endpoint},
+      freeBlockWithout(endpoint), true, Eigen::Isometry3d::Identity());
+  MolaMap map(config(publication));
+  map.requestSnapshot(request);
+  ASSERT_TRUE(waitFor([&]() { return map.getStatus(); }));
+  map.setTransientDiscs({Eigen::Vector2d(0.5, 0.1)}, 0.4, 60.0);
+  mgg::RobotParams robot;
+  robot.type = mgg::RobotType::kGroundRobot;
+  robot.size = Eigen::Vector3d::Constant(0.1);
+  mgg::PlanningParams planning;
+  planning.num_loops_max = 100;
+  mgg::GroundProjection ground(map, planning);
+  mgg::ExpandContext ctx;
+  ctx.map = &map; ctx.robot = &robot; ctx.planning = &planning;
+  ctx.ground = &ground; ctx.robot_box_size = robot.getPlanningSize();
+  ctx.allow_unknown_lattice_body = true;
+  const mgg::StateVec root(-0.1, 0.1, 0.1, 0);
+  mgg::GraphManager graph;
+  graph.addVertex(new mgg::Vertex(0, root));
+  mgg::GridGraphParams grid;
+  grid.min_val = Eigen::Vector3d::Zero();
+  grid.max_val = Eigen::Vector3d(0.6, 0, 0);
+  grid.resolution = Eigen::Vector3d::Constant(0.6);
+  // Root is clear. The other cell and every cross-offset are inside the
+  // peer margin: none is a free place, even though a stationary sweep is
+  // allowed to depart an already occupied margin.
+  const auto result = mgg::buildGridGraph(graph, root, grid, ctx, 0);
+  EXPECT_EQ(result.free_cells, 1);
+  EXPECT_EQ(result.vertices_added, 0);
+}
+
 TEST(MolaMap, ZeroSizePathVisitsEveryVoxelTheSegmentCrossesAndHonoursDiscs) {
   // The robot's own-pose link is checked along its centre line: a zero-size
   // sweep. It must still meet every voxel the segment crosses, here

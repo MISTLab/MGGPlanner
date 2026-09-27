@@ -175,7 +175,8 @@ GridGraphResult buildGridGraph(GraphManager& graph, const StateVec& state,
     const Eigen::Vector3d center = candidate + ctx.robot->center_offset;
     VoxelStatus status = ctx.map->getBoxStatus(
         center, ctx.robot_box_size, !ctx.allow_unknown_lattice_body);
-    if (ground_robot && status == VoxelStatus::kOccupied) {
+    if (ground_robot && status == VoxelStatus::kOccupied &&
+        !ctx.map->dynamicBoxBlocked(center, ctx.robot_box_size)) {
       status = orientedBoxPathStatus(*ctx.map, center, center, body,
                                      !ctx.allow_unknown_lattice_body, nullptr);
     }

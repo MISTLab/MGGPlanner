@@ -178,6 +178,8 @@ class MolaMap : public MapInterface {
       const Eigen::Vector3d& view_point,
       const Eigen::Vector3d& voxel_to_test, bool stop_at_unknown_voxel,
       Eigen::Vector3d& end_voxel) const override;
+  bool dynamicBoxBlocked(const Eigen::Vector3d& center,
+                         const Eigen::Vector3d& size) const override;
   bool dynamicSweepBlocked(const Eigen::Vector3d& start,
                            const Eigen::Vector3d& end,
                            double half_width) const override;
