@@ -305,11 +305,11 @@ class PlannerNode : public rclcpp::Node {
   /// (frontiers_dropped_in_rebuild_). With `link_what_failed`, the rebuilt
   /// graph replaces the old one only when it links what the old one could
   /// not (the robot's pose, an exploration path), which it may add to it;
-  /// the function returns the vertex that links it, or null. Nor does it
-  /// replace an old graph whose home reaches its other vertices when it
-  /// would cut home off from that vertex (or, without one, from every
-  /// other vertex) or split places the old graph connects to home
-  /// (rebuildLosesHome; roadmap_rebuilds_refused_). Otherwise the old graph
+  /// the function returns the vertex that links it, or null. For an aerial
+  /// robot, nor does it replace an old graph whose home reaches its other
+  /// vertices when it would cut home off from that vertex (or, without
+  /// one, from every other vertex) or split places the old graph connects
+  /// to home (rebuildLosesHome; roadmap_rebuilds_refused_). Otherwise the old graph
   /// is kept. `why`, for the log, says what triggered it. At most once per
   /// roadmap_rebuild_min_interval_s_ for each trigger, and not again on the
   /// same trajectory revision and map. Returns true when the graph was

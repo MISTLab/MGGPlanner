@@ -4429,61 +4429,87 @@ TEST_F(PlannerNodeTest, ARegionsLatticeDoesNotDemoteAnOutsideFrontierItPasses) {
   }
 }
 
+/// Odometry at (x, y, z), facing +x, moving along x at `speed`.
+nav_msgs::msg::Odometry::SharedPtr odometryAt(double x, double y, double z,
+                                              int stamp, double speed = 0.0) {
+  auto msg = std::make_shared<nav_msgs::msg::Odometry>();
+  msg->header.stamp.sec = stamp;
+  msg->pose.pose.position.x = x;
+  msg->pose.pose.position.y = y;
+  msg->pose.pose.position.z = z;
+  msg->pose.pose.orientation.w = 1.0;
+  msg->twist.twist.linear.x = speed;
+  return msg;
+}
+
 /// A robot at home whose graph runs from home to (4, 0), with keyframes
 /// along the same track, and a wall across the track at x = `wall_x` seen
-/// after the graph was built (none when NaN).
+/// after the graph was built (none when NaN). An aerial robot flies it at
+/// 0.4 m, in the observed air under the wall's top. The graph ends at
+/// `graph_end` along x.
 std::shared_ptr<PlannerNode> connectedGraphAndAWallAcrossTheTrack(
-    const std::string& name, double wall_x) {
+    const std::string& name, double wall_x, bool aerial,
+    double graph_end = 4.0) {
   auto node = makeNode(name);
+  const double z = aerial ? 0.4 : 0.075;
+  if (aerial) PlannerNodeTestPeer::setAerialRobot(*node);
   PlannerNodeTestPeer::observeFloor(*node, -1.5, 6.0, -1.5, 1.5);
-  PlannerNodeTestPeer::acceptOdometry(*node, 0.0, 0.0, 1.0);
-  PlannerNodeTestPeer::addGlobalChainToFrontier(
-      *node, {{0.5, 0.0}, {1.0, 0.0}, {1.5, 0.0}, {2.0, 0.0}, {2.5, 0.0},
-              {3.0, 0.0}, {3.5, 0.0}, {4.0, 0.0}});
+  PlannerNodeTestPeer::acceptOdometry(*node, odometryAt(0.0, 0.0, z, 1));
+  std::vector<Eigen::Vector2d> chain;
+  for (double x = 0.5; x <= graph_end + 1e-9; x += 0.5) chain.emplace_back(x, 0.0);
+  PlannerNodeTestPeer::addGlobalChainToFrontier(*node, chain);
   if (!std::isnan(wall_x)) {
     PlannerNodeTestPeer::observeWallAlongY(*node, -1.5, 1.5, wall_x);
   }
   PlannerNodeTestPeer::serveMap(*node, "component:test", 0);
   auto source = std::make_unique<TrajectoryInMemory>();
   source->trajectory = keyframesAlongX(0.0, 4.0);
+  for (Eigen::Isometry3d& pose : source->trajectory.poses) {
+    pose.translation().z() = z;
+  }
   PlannerNodeTestPeer::setKeyframeSource(*node, std::move(source));
   return node;
 }
 
-TEST_F(PlannerNodeTest, ARebuildThatWouldCutOffHomeOrSplitTheGraphIsRefused) {
+TEST_F(PlannerNodeTest, ADronesRebuildThatWouldCutOffHomeOrSplitItsGraphIsRefused) {
   // Drone smoke test (drone scout Task 17, C): a keyframe rebuild replaced
   // a graph in which home was reachable with one of three components, home
   // alone in one, and Return Home failed for good. Rebuilt here, a wall
   // across the track refuses the edges there: at x = 0.25 home is cut off,
-  // at x = 2.25 the track is split. The old graph, connected, is kept.
-  for (const double wall_x : {0.25, 2.25}) {
-    SCOPED_TRACE(wall_x);
-    auto node = connectedGraphAndAWallAcrossTheTrack(
-        "rebuild_refused_" + std::to_string(int(wall_x * 100)), wall_x);
-    const int vertices = PlannerNodeTestPeer::globalVertices(*node);
-    EXPECT_FALSE(PlannerNodeTestPeer::rebuildRoadmap(
-        *node, PlannerNode::RoadmapRebuildTrigger::kPoseUnlinkable));
-    EXPECT_EQ(PlannerNodeTestPeer::roadmapRebuilds(*node), 0);
-    EXPECT_EQ(PlannerNodeTestPeer::roadmapRebuildsRefused(*node), 1);
-    EXPECT_EQ(PlannerNodeTestPeer::globalVertices(*node), vertices);
+  // at x = 2.25 the track is split. The old graph, connected, is kept. A
+  // ground robot's rebuild is the correction of a graph the map no longer
+  // supports (review r0, P1) and replaces it as before.
+  for (const bool aerial : {true, false}) {
+    for (const double wall_x : {0.25, 2.25}) {
+      SCOPED_TRACE(std::string(aerial ? "aerial" : "ground") + " wall " +
+                   std::to_string(wall_x));
+      auto node = connectedGraphAndAWallAcrossTheTrack(
+          std::string(aerial ? "drone" : "ground") + "_rebuild_wall_" +
+              std::to_string(int(wall_x * 100)),
+          wall_x, aerial);
+      EXPECT_EQ(PlannerNodeTestPeer::rebuildRoadmap(
+                    *node, PlannerNode::RoadmapRebuildTrigger::kPathUnlinkable),
+                !aerial);
+      EXPECT_EQ(PlannerNodeTestPeer::roadmapRebuilds(*node), aerial ? 0 : 1);
+      EXPECT_EQ(PlannerNodeTestPeer::roadmapRebuildsRefused(*node),
+                aerial ? 1 : 0);
+    }
   }
-  // The robot driven round a wall off its graph, as in
-  // APoseTheGraphCannotReachRebuildsItAndRoutesHome, but with a second wall
-  // across its track at x = 3: the rebuilt graph links its pose where home
+  // An exploration path the drone's graph cannot link, from (4, 0), with a
+  // second wall at x = 3: the rebuilt graph links the path where home
   // cannot be reached from.
-  auto cut_off = robotBehindAWall("rebuild_links_pose_away_from_home",
-                                  kRoundTheWall);
-  PlannerNodeTestPeer::observeWallAlongY(*cut_off, -1.5, 1.5, 3.0);
-  EXPECT_NE(returnHome(*cut_off, 0.0, 0.0)->status,
-            mgg_msgs::srv::PlanObjective::Response::SUCCEEDED);
+  auto cut_off = connectedGraphAndAWallAcrossTheTrack(
+      "drone_rebuild_links_path_away_from_home", 3.0, true, 1.0);
+  PlannerNodeTestPeer::addExplorationPath(
+      *cut_off, {mgg::StateVec(4.0, 0.0, 0.4, 0.0),
+                 mgg::StateVec(5.5, 0.0, 0.4, 0.0)});
   EXPECT_EQ(PlannerNodeTestPeer::roadmapRebuilds(*cut_off), 0);
   EXPECT_EQ(PlannerNodeTestPeer::roadmapRebuildsRefused(*cut_off), 1);
-  // With the track clear, the same rebuild replaces the graph as before.
-  auto clear = connectedGraphAndAWallAcrossTheTrack("rebuild_clear_track",
-                                                    std::nan(""));
+  // With the track clear, the drone's rebuild replaces the graph as before.
+  auto clear = connectedGraphAndAWallAcrossTheTrack("drone_rebuild_clear",
+                                                    std::nan(""), true);
   EXPECT_TRUE(PlannerNodeTestPeer::rebuildRoadmap(
-      *clear, PlannerNode::RoadmapRebuildTrigger::kPoseUnlinkable));
-  EXPECT_EQ(PlannerNodeTestPeer::roadmapRebuilds(*clear), 1);
+      *clear, PlannerNode::RoadmapRebuildTrigger::kPathUnlinkable));
   EXPECT_EQ(PlannerNodeTestPeer::roadmapRebuildsRefused(*clear), 0);
 }
 
@@ -4536,19 +4562,6 @@ TEST_F(PlannerNodeTest, ARegionsLatticeUpdatesAnInsideFrontierByItsWholeView) {
     EXPECT_EQ(PlannerNodeTestPeer::isGlobalFrontier(*node, frontier),
               !explored);
   }
-}
-
-/// Odometry at (x, y, z), facing +x, moving along x at `speed`.
-nav_msgs::msg::Odometry::SharedPtr odometryAt(double x, double y, double z,
-                                              int stamp, double speed = 0.0) {
-  auto msg = std::make_shared<nav_msgs::msg::Odometry>();
-  msg->header.stamp.sec = stamp;
-  msg->pose.pose.position.x = x;
-  msg->pose.pose.position.y = y;
-  msg->pose.pose.position.z = z;
-  msg->pose.pose.orientation.w = 1.0;
-  msg->twist.twist.linear.x = speed;
-  return msg;
 }
 
 /// A drone's planner with aerial_home_height_m `anchor`, over an observed

@@ -2033,11 +2033,16 @@ bool PlannerNode::rebuildGlobalGraphFromKeyframes(
       return false;
     }
   }
-  const std::string loses_home = rebuildLosesHome(
-      *global_graph_, *rebuilt, linked,
-      static_cast<int>(planning_params_.robot_id),
-      std::min(roadmap_rebuild_params_.link_radius,
-               planning_params_.edge_length_max));
+  // Only for an aerial robot: a ground robot's rebuild corrects a graph
+  // whose connections the map may no longer support (a wall seen since),
+  // and replaces it as before (review r0, P1).
+  const std::string loses_home =
+      robot_params_.type == mgg::RobotType::kAerialRobot
+          ? rebuildLosesHome(*global_graph_, *rebuilt, linked,
+                             static_cast<int>(planning_params_.robot_id),
+                             std::min(roadmap_rebuild_params_.link_radius,
+                                      planning_params_.edge_length_max))
+          : std::string();
   if (!loses_home.empty()) {
     ++roadmap_rebuilds_refused_;
     RCLCPP_WARN(get_logger(),
