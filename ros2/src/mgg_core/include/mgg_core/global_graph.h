@@ -403,6 +403,7 @@ struct GlobalFrontierReport {
   /// demoted, and how many are reachable from the source and not excluded.
   int frontiers = 0;
   int demoted = 0;
+  int rechecked = 0;
   int feasible = 0;
   /// Frontiers the time budget left unchecked: counted in `frontiers`, as
   /// they stand, but not ranked. With any, the search was cut short, and a

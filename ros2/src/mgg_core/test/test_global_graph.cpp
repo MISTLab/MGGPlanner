@@ -6,6 +6,8 @@
 // cycle or a live timer.
 
 #include <cmath>
+#include <chrono>
+#include <thread>
 #include <functional>
 #include <map>
 #include <utility>
@@ -1035,6 +1037,33 @@ TEST(SearchGlobalFrontier, OtherRobotsFrontierIsTakenOnlyWhenNothingElseIs) {
 // neighbour transforms expired meanwhile. With a time budget the re-check
 // takes the most promising reachable frontier first and stops once the
 // budget is spent, after one frontier at least.
+TEST(SearchGlobalFrontier, DijkstraAndPeerScoringDoNotSpendTheRecheckBudget) {
+  FrontierGraph graph;
+  for (auto& entry : graph.fixture.global.vertices_map_)
+    entry.second->vol_gain.gain = 1.0;
+  graph.theirs_->vol_gain.gain = 1e12;  // peer ranked first
+  bool delayed = false;
+  graph.fixture.global.setEdgeBlocked([&](const Vertex&, const Vertex&) {
+    if (!delayed) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(50));
+      delayed = true;
+    }
+    return false;
+  });
+  int own_rechecks = 0;
+  const auto report = mgg::searchGlobalFrontier(
+      graph.fixture.global, 0, 0, [&](Vertex& v) {
+        if (v.robot_id != 0) {
+          std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        } else {
+          ++own_rechecks;
+        }
+        graph.recompute()(v);
+      }, {}, 0.0, nullptr, 0.02);
+  EXPECT_GT(own_rechecks, 0);
+  EXPECT_FALSE(report.cut_short());
+}
+
 TEST(SearchGlobalFrontier, ATimeBudgetRechecksTheMostPromisingFrontierFirst) {
   FrontierGraph graph;
   // Gains as an earlier search left them.

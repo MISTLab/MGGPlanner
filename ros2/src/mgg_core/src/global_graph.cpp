@@ -1005,7 +1005,7 @@ GlobalFrontierReport searchGlobalFrontier(
     const std::vector<Eigen::Vector3d>& excluded, double exclusion_radius,
     const Eigen::Vector3d* target, double time_budget_s) {
   GlobalFrontierReport report;
-  const auto started = std::chrono::steady_clock::now();
+
 
   std::vector<Vertex*> global_frontiers;
   for (auto& entry : graph.vertices_map_) {
@@ -1083,17 +1083,24 @@ GlobalFrontierReport searchGlobalFrontier(
                      return a.promise > b.promise;
                    });
 
+  // Only this robot's map re-checks spend the budget. Graph search and
+  // peer scoring must not consume it before any local evidence is checked.
+  double recheck_seconds = 0.0;
   // Re-check (rrg.cpp:5612 to 5625) and rank (rrg.cpp:5766 to 5818).
   for (std::size_t i = 0; i < order.size(); ++i) {
-    if (i > 0 && std::chrono::duration<double>(
-                     std::chrono::steady_clock::now() - started)
-                         .count() >= time_budget_s) {
+    if (i > 0 && recheck_seconds >= time_budget_s) {
       report.unchecked = static_cast<int>(order.size() - i);
       report.frontiers += report.unchecked;
       break;
     }
     Vertex* frontier = order[i].frontier;
+    const auto started = std::chrono::steady_clock::now();
     if (recompute_gain) recompute_gain(*frontier);
+    ++report.rechecked;
+    if (frontier->robot_id == robot_id) {
+      recheck_seconds += std::chrono::duration<double>(
+          std::chrono::steady_clock::now() - started).count();
+    }
     if (!frontier->vol_gain.is_frontier) {
       frontier->type = VertexType::kUnvisited;
       ++report.demoted;

@@ -3078,8 +3078,8 @@ bool PlannerNode::runGlobalPlanner(int target_id, std::string& reason,
       char why[224];
       std::snprintf(why, sizeof(why),
                     "%d global frontier(s), none reachable with gain (%d "
-                    "re-checked out%s)",
-                    report.frontiers, report.demoted,
+                    "re-checked, %d demoted%s)",
+                    report.frontiers, report.rechecked, report.demoted,
                     report.cut_short()
                         ? (", " + std::to_string(report.unchecked) +
                            " left unchecked by the time budget")
