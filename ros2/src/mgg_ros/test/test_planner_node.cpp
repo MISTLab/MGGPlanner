@@ -260,10 +260,10 @@ class PlannerNodeTestPeer {
     node.ground_ = std::make_unique<mgg::GroundProjection>(
         *node.map_, node.planning_params_);
   }
-  static void resetFrontierGain(PlannerNode& node, int id) {
-    auto* v = node.global_graph_->getVertex(id);
-    v->type = mgg::VertexType::kFrontier;
-    v->vol_gain.gain = 0.0;
+  static void setReportedUnknown(PlannerNode& node, int id, int count) {
+    auto& gain = node.global_graph_->getVertex(id)->vol_gain;
+    gain.num_unknown_voxels = count;
+    gain.is_frontier = true;
   }
   static void setTourAside(PlannerNode& node, mgg::ClusterId id) {
     node.setTourClusterAside(id);
@@ -3892,6 +3892,7 @@ TEST_F(PlannerNodeTest, APeerImportedFrontierWithUnknownVolumeFormsATourCluster)
   ASSERT_NE(frontier, graph.vertices.end());
   ASSERT_NEAR(frontier->pose.position.x, 4.0, 1e-6);
   frontier->is_frontier = true;
+  frontier->num_unknown_voxels = 1000;
   PlannerNodeTestPeer::receiveTransform(*fleet.a, "robot_0/odom",
                                         "robot_1/odom", 5.0, 0.0);
   PlannerNodeTestPeer::setTour(*fleet.a, true, 1.0);
@@ -3904,6 +3905,36 @@ TEST_F(PlannerNodeTest, APeerImportedFrontierWithUnknownVolumeFormsATourCluster)
     EXPECT_GT(bid.clusters.front().gain, 1.0);
     EXPECT_NE(PlannerNodeTestPeer::refreshTour(*fleet.a), mgg::kNoCluster);
   }
+}
+
+TEST_F(PlannerNodeTest, APeerClusterUsesItsOwnersUpdatedVoxelCountsAndFlag) {
+  TwoPlanners fleet("owner_gain");
+  PlannerNodeTestPeer::gainFromUnknownVoxelsOnly(*fleet.a);
+  PlannerNodeTestPeer::setTour(*fleet.a, true, 1.0);
+  auto graph = PlannerNodeTestPeer::ownGraph(*fleet.b);
+  auto frontier = std::max_element(graph.vertices.begin(), graph.vertices.end(),
+      [](const auto& a, const auto& b) { return a.pose.position.x < b.pose.position.x; });
+  ASSERT_NE(frontier, graph.vertices.end());
+  frontier->is_frontier = true;
+  frontier->num_unknown_voxels = 1000;
+  PlannerNodeTestPeer::receiveTransform(*fleet.a, "robot_0/odom", "robot_1/odom", 5, 0);
+  PlannerNodeTestPeer::receiveGraph(*fleet.a, graph);
+  ASSERT_EQ(PlannerNodeTestPeer::frontierClusters(*fleet.a).size(), 1u);
+  // The owner explored it, while the receiver still sees unknown space.
+  frontier->num_unknown_voxels = 0;
+  frontier->num_free_voxels = 1000;
+  PlannerNodeTestPeer::receiveGraph(*fleet.a, graph);
+  EXPECT_TRUE(PlannerNodeTestPeer::frontierClusters(*fleet.a).empty());
+  EXPECT_EQ(PlannerNodeTestPeer::refreshTour(*fleet.a), mgg::kNoCluster);
+  frontier->num_unknown_voxels = 1000;
+  frontier->is_frontier = false;
+  PlannerNodeTestPeer::receiveGraph(*fleet.a, graph);
+  EXPECT_TRUE(PlannerNodeTestPeer::frontierClusters(*fleet.a).empty());
+  frontier->is_frontier = true;
+  PlannerNodeTestPeer::receiveGraph(*fleet.a, graph);
+  const auto clusters = PlannerNodeTestPeer::frontierClusters(*fleet.a);
+  ASSERT_EQ(clusters.size(), 1u);
+  EXPECT_DOUBLE_EQ(clusters.front().gain, 10000.0);
 }
 
 TEST_F(PlannerNodeTest, AwardsRequireARecentInRangeBidFromTheirAuctioneer) {
@@ -3933,7 +3964,7 @@ TEST_F(PlannerNodeTest, AwardsRequireARecentInRangeBidFromTheirAuctioneer) {
   EXPECT_TRUE(PlannerNodeTestPeer::fleetHasAward(*fleet.b));
 }
 
-TEST_F(PlannerNodeTest, ImportedFrontierScoringExcludesSnapshotPublication) {
+TEST_F(PlannerNodeTest, ImportedFrontierScoringNeedsNoLocalMapScan) {
   auto node = makeNode("frontier_map_lease");
   PlannerNodeTestPeer::observeFloor(*node, -1.0, 4.0, -1.0, 1.0);
   PlannerNodeTestPeer::acceptOdometry(*node, 0.0, 0.0, 1.0);
@@ -3943,11 +3974,7 @@ TEST_F(PlannerNodeTest, ImportedFrontierScoringExcludesSnapshotPublication) {
   auto* probe = map.get();
   PlannerNodeTestPeer::useMolaMap(*node, std::move(map));
   PlannerNodeTestPeer::frontierClusters(*node);
-  ASSERT_TRUE(probe->writer.valid());
-  EXPECT_TRUE(probe->publication_blocked);
-  EXPECT_EQ(probe->writer.wait_for(std::chrono::seconds(1)),
-            std::future_status::ready);
-  probe->writer.get();
+  EXPECT_FALSE(probe->writer.valid());
 }
 
 TEST_F(PlannerNodeTest, PeerFrontierRescoringDoesNotLapseATourSetAside) {
@@ -3972,7 +3999,7 @@ TEST_F(PlannerNodeTest, PeerFrontierRescoringDoesNotLapseATourSetAside) {
   for (int broadcast = 0; broadcast < 3; ++broadcast) {
     PlannerNodeTestPeer::receiveGraph(*fleet.a, graph);
     const auto clusters = PlannerNodeTestPeer::frontierClusters(*fleet.a);
-    ASSERT_EQ(clusters.size(), 1u);  // peer frontier was explored here
+    ASSERT_EQ(clusters.size(), 1u);  // owner reports zero unknown gain
     EXPECT_EQ(PlannerNodeTestPeer::refreshTour(*fleet.a), mgg::kNoCluster);
     EXPECT_EQ(PlannerNodeTestPeer::graphRevision(*fleet.a), revision);
   }
@@ -3991,33 +4018,21 @@ TEST_F(PlannerNodeTest, PeerFrontierRescoringDoesNotLapseATourSetAside) {
   EXPECT_EQ(PlannerNodeTestPeer::refreshTour(*fleet.a), target);
 }
 
-TEST_F(PlannerNodeTest, ImportedFrontierScoringContinuesAfterItsTimeBudget) {
-  auto node = makeNode("score_budget");
-  PlannerNodeTestPeer::observeFloor(*node, -1.0, 4.0, -1.0, 1.0);
-  PlannerNodeTestPeer::acceptOdometry(*node, 0.0, 0.0, 1.0);
-  PlannerNodeTestPeer::setTour(*node, true, 0.0);  // zero must not admit unscored peers
+TEST_F(PlannerNodeTest, ImportedFrontierCountsNeedNoScanningBudget) {
+  auto node = makeNode("owner_counts_no_budget");
+  PlannerNodeTestPeer::observeFloor(*node, -1, 4, -1, 1);
+  PlannerNodeTestPeer::acceptOdometry(*node, 0, 0, 1);
+  PlannerNodeTestPeer::setTour(*node, true, 0.0);
   for (double x : {3.0, 8.0, 13.0}) {
-    int id = PlannerNodeTestPeer::addGlobalChainToFrontier(*node, {{x, 0.0}});
+    const int id = PlannerNodeTestPeer::addGlobalChainToFrontier(*node, {{x, 0}});
     PlannerNodeTestPeer::setFrontierOwner(*node, id, 2);
+    PlannerNodeTestPeer::setReportedUnknown(*node, id, 1000);
   }
   auto map = std::make_unique<SlowScanMap>();
   auto* slow = map.get();
   PlannerNodeTestPeer::useCloudMap(*node, std::move(map));
-  auto clusters = PlannerNodeTestPeer::frontierClusters(*node);
-  ASSERT_EQ(slow->scanned_x.size(), 1u);  // one scan may exceed the budget
-  ASSERT_EQ(clusters.size(), 1u);
-  EXPECT_GT(clusters.front().gain, 0.0);
-  // A fresh zero-gain report for the first vertex cannot starve later ones.
-  PlannerNodeTestPeer::resetFrontierGain(*node, clusters.front().representative_vertex_id);
-  PlannerNodeTestPeer::frontierClusters(*node);
-  PlannerNodeTestPeer::frontierClusters(*node);
-  ASSERT_EQ(slow->scanned_x.size(), 3u);
-  EXPECT_NE(slow->scanned_x[0], slow->scanned_x[1]);
-  EXPECT_NE(slow->scanned_x[0], slow->scanned_x[2]);
-  EXPECT_NE(slow->scanned_x[1], slow->scanned_x[2]);
-  clusters = PlannerNodeTestPeer::frontierClusters(*node);
-  EXPECT_EQ(clusters.size(), 3u);
-  EXPECT_EQ(slow->scanned_x.size(), 4u);
+  EXPECT_EQ(PlannerNodeTestPeer::frontierClusters(*node).size(), 3u);
+  EXPECT_TRUE(slow->scanned_x.empty());
 }
 
 TEST_F(PlannerNodeTest, AMissedCallAwardDoesNotCompleteAnUnconsideredRobot) {

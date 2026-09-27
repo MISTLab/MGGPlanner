@@ -651,9 +651,6 @@ class PlannerNode : public rclcpp::Node {
   std::uint64_t tour_assignment_version_ = 0;
   /// The last tour's costing and solving time, for the plan summary.
   double tour_solve_ms_ = 0.0;
-  /// Bounded, round-robin initial scoring of imported frontiers.
-  int peer_frontier_score_after_id_ = -1;
-  static constexpr double kPeerFrontierScoreBudgetS = 0.02;
   /// Fleet frontier assignment (tour-exploration design §3); null when
   /// fleet.enabled is false.
   std::unique_ptr<mgg::FleetCoordinator> fleet_;

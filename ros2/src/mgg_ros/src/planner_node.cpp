@@ -636,47 +636,21 @@ void PlannerNode::noteGlobalGraphEdges() {
 }
 
 std::vector<mgg::FrontierCluster> PlannerNode::globalFrontierClusters() {
-  auto map_read = mapReadLease();
-  // Graph messages have no scalar gain. Score an imported frontier before
-  // min_cluster_gain can discard it, even beyond the local re-check radius.
-  // Keep positive scores: re-checking every distant peer frontier every
-  // cycle is expensive and remains its owner's job (addFrontiers).
-  using Clock = std::chrono::steady_clock;
-  const auto started = Clock::now();
-  std::vector<int> pending;
-  for (const auto& [id, vertex] : global_graph_->vertices_map_) {
-    if (vertex != nullptr && vertex->type == mgg::VertexType::kFrontier &&
-        vertex->robot_id != static_cast<int>(planning_params_.robot_id) &&
-        global_graph_->inService(*vertex) && !(vertex->vol_gain.gain > 0.0)) {
-      pending.push_back(id);
-    }
-  }
-  std::sort(pending.begin(), pending.end());
-  const auto next = std::upper_bound(pending.begin(), pending.end(),
-                                    peer_frontier_score_after_id_);
-  const std::size_t start = static_cast<std::size_t>(next - pending.begin());
-  std::unordered_set<int> unscored(pending.begin(), pending.end());
+  // Counts and the frontier flag are the owner's latest map evidence.
+  // Never replace them with this robot's unknown view of a peer's space.
   const auto score = globalFrontierGain();
-  for (std::size_t i = 0; i < pending.size(); ++i) {
-    const int id = pending[(start + i) % pending.size()];
-    mgg::Vertex* vertex = global_graph_->getVertex(id);
-    score(*vertex);
-    unscored.erase(id);
-    peer_frontier_score_after_id_ = id;
-    if (!vertex->vol_gain.is_frontier) {
-      vertex->type = mgg::VertexType::kUnvisited;
+  for (const auto& [id, vertex] : global_graph_->vertices_map_) {
+    if (vertex && vertex->robot_id != static_cast<int>(planning_params_.robot_id)) {
+      score(*vertex);
     }
-    // Gain/type changes alter the cluster set, not graph topology.
-    // Finish one scan even when it exceeds the budget, then resume by ID
-    // on the next call (iterators/pointers cannot survive a graph merge).
-    if (std::chrono::duration<double>(Clock::now() - started).count() >=
-        kPeerFrontierScoreBudgetS) break;
   }
-  global_space_.setCenter(current_state_, /*use_extension=*/true);
   std::vector<mgg::FrontierCluster> clusters = mgg::extractFrontierClusters(
       *global_graph_, fleet_params_.cluster_merge_radius_m,
       tour_params_.min_cluster_gain, tour_params_.cluster_id_cell_m,
-      [&unscored](const mgg::Vertex& v) { return unscored.count(v.id) == 0; });
+      [this](const mgg::Vertex& v) {
+        return v.robot_id == static_cast<int>(planning_params_.robot_id) ||
+               (v.vol_gain.is_frontier && v.vol_gain.gain > 0.0);
+      });
   cluster_ids_.stabilize(clusters, fleet_params_.cluster_merge_radius_m);
   return clusters;
 }
@@ -1215,6 +1189,15 @@ std::vector<Eigen::Vector3d> PlannerNode::selectionExclusions() {
 
 mgg::RecomputeGainFn PlannerNode::globalFrontierGain() {
   return [this](mgg::Vertex& vertex) {
+    if (vertex.robot_id != static_cast<int>(planning_params_.robot_id)) {
+      auto& gain = vertex.vol_gain;
+      gain.gain = gain.is_frontier
+          ? std::max(0, gain.num_unknown_voxels) * planning_params_.unknown_voxel_gain +
+            std::max(0, gain.num_free_voxels) * planning_params_.free_voxel_gain +
+            std::max(0, gain.num_occupied_voxels) * planning_params_.occupied_voxel_gain
+          : 0.0;
+      return;
+    }
     // Upstream scored global frontiers against the world-fixed global bound
     // (computeVolumetricGainRayModelNoBound, rrg.cpp:3767). This port centres
     // its gain volume on the robot every cycle, so a frontier a street away
