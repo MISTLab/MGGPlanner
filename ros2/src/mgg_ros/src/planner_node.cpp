@@ -67,8 +67,9 @@ constexpr const char* kFlightStateLanded = "landed";
 
 /// The in-service vertices of `graph` a route from home reaches: Dijkstra
 /// over its edges, those a no-go zone blocks left out and other robots'
-/// vertices passed through, as routeOverGlobalGraph searches. Home itself
-/// is always in it when the graph has one.
+/// vertices passed through, as routeOverGlobalGraph searches (the caller
+/// opens the edges peer bodies close). Home itself is always in it when the
+/// graph has one.
 std::unordered_set<int> reachedFromHome(mgg::GraphManager& graph) {
   std::unordered_set<int> reached;
   if (graph.vertices_map_.count(kHomeVertexId) == 0) return reached;
@@ -2219,8 +2220,18 @@ bool PlannerNode::rebuildGlobalGraphFromKeyframes(
   rebuilt->setRobotId(static_cast<int>(planning_params_.robot_id));
   mgg::RoadmapRebuildParams params = roadmap_rebuild_params_;
   params.vertex_spacing = global_vertex_spacing_;
+  // The keyframes are where the robot drove. A peer parked on them now
+  // closes those edges for a search (globalEdgeBlocked, installed below),
+  // not for the life of the rebuilt graph: its edges are checked against
+  // the map with no peer bodies. Static occupancy and every body, step and
+  // grade check still apply.
+  std::optional<mgg::MolaMap::TransientDiscPin> no_peers;
+  if (mola_map_ != nullptr) {
+    no_peers.emplace(*mola_map_, std::vector<Eigen::Vector2d>{}, 0.0);
+  }
   const mgg::RoadmapRebuildReport report = mgg::rebuildRoadmapFromTrajectory(
       *rebuilt, keyframes, makeGlobalContext(), params);
+  no_peers.reset();
   if (!report.home_supported) {
     RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 30000,
                          "global graph not rebuilt (%s): no mapped ground "
@@ -2250,14 +2261,21 @@ bool PlannerNode::rebuildGlobalGraphFromKeyframes(
   });
   // Only for an aerial robot: a ground robot's rebuild corrects a graph
   // whose connections the map may no longer support (a wall seen since),
-  // and replaces it as before (review r0, P1).
-  const std::string loses_home =
-      robot_params_.type == mgg::RobotType::kAerialRobot
-          ? rebuildLosesHome(*global_graph_, *rebuilt, linked,
-                             static_cast<int>(planning_params_.robot_id),
-                             std::min(roadmap_rebuild_params_.link_radius,
-                                      planning_params_.edge_length_max))
-          : std::string();
+  // and replaces it as before (review r0, P1). Both graphs are judged with
+  // no-go edges out and edges a peer body closes open: a parked peer closes
+  // them for a while, so it neither vetoes a rebuild nor hides the places
+  // beyond it from the check.
+  std::string loses_home;
+  if (robot_params_.type == mgg::RobotType::kAerialRobot) {
+    const bool open = peer_edges_open_;
+    peer_edges_open_ = true;
+    loses_home = rebuildLosesHome(
+        *global_graph_, *rebuilt, linked,
+        static_cast<int>(planning_params_.robot_id),
+        std::min(roadmap_rebuild_params_.link_radius,
+                 planning_params_.edge_length_max));
+    peer_edges_open_ = open;
+  }
   if (!loses_home.empty()) {
     ++roadmap_rebuilds_refused_;
     RCLCPP_WARN(get_logger(),

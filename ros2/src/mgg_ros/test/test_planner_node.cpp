@@ -1028,6 +1028,34 @@ class PlannerNodeTestPeer {
     }
     return -1;
   }
+  /// Whether a search of the global graph, as routes search it (no-go and
+  /// peer-blocked edges closed), reaches the vertex nearest `to` from the
+  /// vertex nearest `from`.
+  static bool globalGraphRoutes(PlannerNode& node, const Eigen::Vector2d& from,
+                                const Eigen::Vector2d& to) {
+    const std::lock_guard<std::recursive_mutex> lock(node.planner_mutex_);
+    const auto nearest = [&node](const Eigen::Vector2d& p) {
+      int best = -1;
+      double best_d = std::numeric_limits<double>::infinity();
+      for (const auto& [id, vertex] : node.global_graph_->vertices_map_) {
+        if (vertex == nullptr) continue;
+        const double d = (vertex->state.head<2>() - p).norm();
+        if (d < best_d) {
+          best_d = d;
+          best = id;
+        }
+      }
+      return best;
+    };
+    const int a = nearest(from);
+    const int b = nearest(to);
+    mgg::ShortestPathsReport rep;
+    if (a < 0 || b < 0 || !node.global_graph_->findShortestPaths(a, rep) ||
+        !rep.status) {
+      return false;
+    }
+    return std::isfinite(mgg::reachedDistance(rep, b));
+  }
   /// Removes the global edge between `a` and `b`, a new revision.
   static void removeGlobalEdge(PlannerNode& node, int a, int b) {
     const std::lock_guard<std::recursive_mutex> lock(node.planner_mutex_);
@@ -6504,6 +6532,72 @@ TEST_F(PlannerNodeTest, ADronesRebuildJudgesHomeByTheRoutesItsGraphHas) {
   EXPECT_TRUE(PlannerNodeTestPeer::rebuildRoadmap(
       *blocked, PlannerNode::RoadmapRebuildTrigger::kPathUnlinkable));
   EXPECT_EQ(PlannerNodeTestPeer::roadmapRebuildsRefused(*blocked), 0);
+}
+
+TEST_F(PlannerNodeTest, APeerParkedOnTheKeyframesClosesTheRebuiltEdgesOnlyWhileItStays) {
+  // A keyframe rebuild while a peer is parked on the robot's track: the
+  // run-10 peer bodies close a roadmap edge for a search, never for the
+  // graph's life. The rebuild checks the driven edges against the map
+  // without peer bodies, so the edge past the peer is in the rebuilt graph,
+  // closed to routes while the peer stays and open once it leaves.
+  std::unique_ptr<MolaFloorProduct> product;
+  auto node =
+      peerFloorNode("ground_rebuild_parked_peer", -1.5, 6.0, -1.5, 1.5, product);
+  PlannerNodeTestPeer::acceptOdometryFacing(*node, 0.0, 0.0, 0.0, 1.0);
+  PlannerNodeTestPeer::serveMap(*node, "component:test", 0);
+  auto source = std::make_unique<TrajectoryInMemory>();
+  source->trajectory = keyframesAlongX(0.0, 4.0);
+  PlannerNodeTestPeer::setKeyframeSource(*node, std::move(source));
+  PlannerNodeTestPeer::setPeerBodyTtl(*node, 600.0);
+  PlannerNodeTestPeer::receivePeerBodies(*node, {{2.0, 0.0}});
+  ASSERT_TRUE(PlannerNodeTestPeer::rebuildRoadmap(*node));
+  ASSERT_TRUE(PlannerNodeTestPeer::hasGlobalVertexNear(*node, 4.0, 0.0, 0.3));
+  const int edges = PlannerNodeTestPeer::globalEdges(*node);
+  EXPECT_FALSE(PlannerNodeTestPeer::globalGraphRoutes(*node, {0.0, 0.0},
+                                                      {4.0, 0.0}));
+  PlannerNodeTestPeer::receivePeerBodies(*node, {});
+  EXPECT_TRUE(PlannerNodeTestPeer::globalGraphRoutes(*node, {0.0, 0.0},
+                                                     {4.0, 0.0}));
+  EXPECT_EQ(PlannerNodeTestPeer::globalEdges(*node), edges);
+}
+
+TEST_F(PlannerNodeTest, ADronesRebuildIsNotVetoedByAParkedPeer) {
+  // Drone scout Task 17's rebuild veto with the run-10 peer bodies: home's
+  // routes are judged with the edges a peer closes open. Here the drone's
+  // graph reaches 1.5 m out; an exploration path at 3.5 to 4.5 m links to
+  // nothing, so the graph is rebuilt from the keyframes and the path linked
+  // to that. A peer is parked at 2.5 m on the track. Judged with the peer
+  // closing its edges, home would not reach where the path links, and the
+  // rebuild would be refused for a peer that moves on.
+  std::unique_ptr<MolaFloorProduct> product;
+  auto node =
+      peerFloorNode("drone_rebuild_parked_peer", -1.5, 6.0, -1.5, 1.5, product);
+  PlannerNodeTestPeer::setAerialRobot(*node);
+  PlannerNodeTestPeer::acceptOdometry(*node, odometryAt(0.0, 0.0, 0.4, 1));
+  PlannerNodeTestPeer::addGlobalChainToFrontier(
+      *node, {{0.5, 0.0}, {1.0, 0.0}, {1.5, 0.0}});
+  PlannerNodeTestPeer::serveMap(*node, "component:test", 0);
+  auto source = std::make_unique<TrajectoryInMemory>();
+  source->trajectory = keyframesAlongX(0.0, 4.0);
+  for (Eigen::Isometry3d& pose : source->trajectory.poses) {
+    pose.translation().z() = 0.4;
+  }
+  PlannerNodeTestPeer::setKeyframeSource(*node, std::move(source));
+  PlannerNodeTestPeer::setPeerBodyTtl(*node, 600.0);
+  PlannerNodeTestPeer::receivePeerBodies(*node, {{2.5, 0.0}});
+  PlannerNodeTestPeer::addExplorationPath(
+      *node, {mgg::StateVec(3.5, 0.0, 0.4, 0.0),
+              mgg::StateVec(4.0, 0.0, 0.4, 0.0),
+              mgg::StateVec(4.5, 0.0, 0.4, 0.0)});
+  EXPECT_EQ(PlannerNodeTestPeer::roadmapRebuildsRefused(*node), 0);
+  ASSERT_EQ(PlannerNodeTestPeer::roadmapRebuilds(*node), 1);
+  EXPECT_TRUE(PlannerNodeTestPeer::hasGlobalVertexNear(*node, 4.5, 0.0, 0.1));
+  // Closed while the peer stays, open once it leaves.
+  EXPECT_FALSE(PlannerNodeTestPeer::globalGraphRoutes(*node, {0.0, 0.0},
+                                                      {4.5, 0.0}));
+  PlannerNodeTestPeer::receivePeerBodies(*node, {});
+  EXPECT_TRUE(PlannerNodeTestPeer::globalGraphRoutes(*node, {0.0, 0.0},
+                                                     {4.5, 0.0}));
 }
 
 TEST_F(PlannerNodeTest, AClusterBehindTheRobotWithinReachStaysInTheTour) {
