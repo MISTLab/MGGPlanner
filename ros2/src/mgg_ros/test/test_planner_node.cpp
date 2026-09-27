@@ -5128,6 +5128,66 @@ TEST_F(PlannerNodeTest, GreedyRepositioningSkipsTheNearbyFrontierForTheNextReach
   EXPECT_FALSE(PlannerNodeTestPeer::completionWithheld(*node).empty());
 }
 
+TEST_F(PlannerNodeTest, ANearFrontierHoldsBackCompletionOnlyInsideTheRegion) {
+  // Run 11's reach skip with the drone's exploration region. A frontier
+  // 0.25 m from the robot is within PCI's goal tolerance: the greedy search
+  // skips it, and while it is inside the operator's region the search is
+  // retried rather than complete, without routing to the reachable
+  // frontier outside the region. Outside the region it is left alone as
+  // any other outside frontier is: the region's exploration may complete.
+  for (const bool near_inside : {true, false}) {
+    SCOPED_TRACE(near_inside ? "near frontier inside the region"
+                             : "near frontier outside the region");
+    auto node = makeNode(near_inside ? "region_reach_near_inside"
+                                     : "region_reach_near_outside");
+    PlannerNodeTestPeer::observeFloor(*node, -3.0, 4.0, -1.5, 1.5);
+    PlannerNodeTestPeer::acceptOdometry(*node, 0.0, 0.0, 1.0);
+    const int near = PlannerNodeTestPeer::addGlobalChainToFrontier(
+        *node, {{-0.25, 0.0}}, M_PI);
+    const int far = PlannerNodeTestPeer::addGlobalChainToFrontier(
+        *node, {{-0.5, 0.0}, {-1.0, 0.0}, {-1.5, 0.0}}, M_PI);
+    for (int id : {near, far}) {
+      PlannerNodeTestPeer::setFrontierOwner(*node, id, 2);
+    }
+    PlannerNodeTestPeer::setReportedUnknown(*node, near, 100000);
+    PlannerNodeTestPeer::setReportedUnknown(*node, far, 1000);
+    PlannerNodeTestPeer::setTour(*node, false, 0.0);
+    const Eigen::Vector3d low = near_inside ? Eigen::Vector3d(-0.4, -1.0, -2.0)
+                                            : Eigen::Vector3d(-2.0, -1.0, -2.0);
+    const Eigen::Vector3d high = near_inside ? Eigen::Vector3d(0.4, 1.0, 2.0)
+                                             : Eigen::Vector3d(-1.0, 1.0, 2.0);
+    ASSERT_TRUE(
+        PlannerNodeTestPeer::setExplorationRegion(*node, true, low, high)
+            ->success);
+    std::string reason;
+    if (near_inside) {
+      EXPECT_FALSE(PlannerNodeTestPeer::runGlobalPlanner(*node, reason));
+      EXPECT_TRUE(PlannerNodeTestPeer::bestPath(*node).empty());
+      EXPECT_FALSE(PlannerNodeTestPeer::repositioningOngoing(*node));
+      EXPECT_NE(reason.find("1 frontier(s) within the controller goal "
+                            "tolerance"),
+                std::string::npos)
+          << reason;
+      EXPECT_FALSE(PlannerNodeTestPeer::completionWithheld(*node).empty());
+      EXPECT_TRUE(PlannerNodeTestPeer::isGlobalFrontier(*node, far));
+      continue;
+    }
+    // The far frontier, inside, is taken; once it is explored nothing in
+    // the region is left, and the near one outside holds nothing back.
+    ASSERT_TRUE(PlannerNodeTestPeer::runGlobalPlanner(*node, reason)) << reason;
+    EXPECT_EQ(PlannerNodeTestPeer::repositioningTarget(*node), far);
+    PlannerNodeTestPeer::setGlobalVertexType(*node, far,
+                                             mgg::VertexType::kUnvisited);
+    EXPECT_FALSE(PlannerNodeTestPeer::runGlobalPlanner(*node, reason));
+    EXPECT_EQ(reason.find("within the controller goal tolerance"),
+              std::string::npos)
+        << reason;
+    EXPECT_TRUE(PlannerNodeTestPeer::completionWithheld(*node).empty())
+        << PlannerNodeTestPeer::completionWithheld(*node);
+    EXPECT_TRUE(PlannerNodeTestPeer::isGlobalFrontier(*node, near));
+  }
+}
+
 TEST_F(PlannerNodeTest, AnEdgeAloneThatConnectsAClusterReachesTheTour) {
   // Review r0, I-4: the frontier at (6, 0) is cut off from the robot by a
   // missing edge between (4, 0) and (5, 0), so the tour has no reachable

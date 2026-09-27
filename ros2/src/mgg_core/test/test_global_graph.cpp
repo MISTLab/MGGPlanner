@@ -1077,6 +1077,39 @@ TEST(SearchGlobalFrontier, SkipsFrontiersWithinPlanarReachOfTheRobotNotItsGraphL
   EXPECT_EQ(report.within_reach, 0);
 }
 
+TEST(SearchGlobalFrontier, OnlyFrontiersTheRegionAdmitsCountAsWithinReach) {
+  // The drone's exploration region with run 11's reach skip: a frontier
+  // within the robot's planar reach is skipped and counted (so the search
+  // is no answer, not exploration complete) only when the region admits
+  // it; one outside the region is neither taken nor counted.
+  const Eigen::Vector3d robot(5.25, 0.0, 0.0);
+  const std::vector<Eigen::Vector3d> reserved{Eigen::Vector3d(5.0, 5.0, 0.0)};
+  {
+    SCOPED_TRACE("the near frontier inside the region, the far one outside");
+    FrontierGraph graph;
+    const auto report = mgg::searchGlobalFrontier(
+        graph.fixture.global, 0, 0, graph.recompute(), reserved, 1.0, nullptr,
+        std::numeric_limits<double>::infinity(), &robot, 0.25,
+        [&graph](const Vertex& vertex) { return &vertex == graph.near_; });
+    EXPECT_EQ(report.best_frontier, nullptr);
+    EXPECT_EQ(report.within_reach, 1);
+    EXPECT_EQ(report.demoted, 0);
+    EXPECT_EQ(graph.near_->type, VertexType::kFrontier);
+    EXPECT_EQ(graph.far_->type, VertexType::kFrontier);
+  }
+  {
+    SCOPED_TRACE("the near frontier outside the region, the far one inside");
+    FrontierGraph graph;
+    const auto report = mgg::searchGlobalFrontier(
+        graph.fixture.global, 0, 0, graph.recompute(), reserved, 1.0, nullptr,
+        std::numeric_limits<double>::infinity(), &robot, 0.25,
+        [&graph](const Vertex& vertex) { return &vertex == graph.far_; });
+    EXPECT_EQ(report.best_frontier, graph.far_);
+    EXPECT_EQ(report.within_reach, 0);
+    EXPECT_EQ(graph.near_->type, VertexType::kFrontier);
+  }
+}
+
 TEST(SearchGlobalFrontier, AnExplorationTargetPullsTowardTheNearerFrontier) {
   FrontierGraph graph;
   // Without a target the far frontier wins (the test above). Toward a goal
