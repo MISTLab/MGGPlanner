@@ -114,6 +114,132 @@ TEST(PathSelection, DirectionPenaltyPrefersTheCurrentHeading) {
   EXPECT_EQ(r_north.best_path_id, 6);
 }
 
+/// Root at the origin with a +x branch and a -x branch, three vertices each.
+struct Line {
+  Line() {
+    auto* root = new Vertex(0, StateVec(0, 0, 0, 0));
+    graph.addVertex(root);
+    Vertex* prev = root;
+    for (int i = 1; i <= 3; ++i) {           // +x branch, ids 1..3
+      auto* v = new Vertex(i, StateVec(i * 1.0, 0.0, 0.0, 0.0));
+      graph.addVertex(v); graph.addEdge(v, prev, 1.0); prev = v;
+      ahead.push_back(v);
+    }
+    prev = root;
+    for (int i = 4; i <= 6; ++i) {           // -x branch, ids 4..6
+      auto* v = new Vertex(i, StateVec(-(i - 3) * 1.0, 0.0, 0.0, 0.0));
+      graph.addVertex(v); graph.addEdge(v, prev, 1.0); prev = v;
+      behind.push_back(v);
+    }
+  }
+  GraphManager graph;
+  std::vector<Vertex*> ahead, behind;
+};
+
+// Run 8, robot_3 at its 00:36 restart facing west: the unexplored east had
+// 2.5 to 8.8 times the gain of the explored west, but exp(-deviation)
+// multiplied the reverse path by 0.007 and the robot drove 30 m back into
+// the hangar. The factor is bounded below by path_direction_min_factor.
+TEST(PathSelection, DirectionPenaltyNeverDiscountsBelowTheMinimumFactor) {
+  PlanningParams p = makePlanning();
+  p.path_direction_penalty = 1.0;
+  EdgeInclinations flat;
+
+  // 8.8 times the gain behind: the path back wins.
+  Line l;
+  for (Vertex* v : l.ahead) v->vol_gain.gain = 100.0;
+  for (Vertex* v : l.behind) v->vol_gain.gain = 880.0;
+  const auto back = mgg::selectBestPath(l.graph, p, RobotParams(), flat, 0.2, 0.0);
+  EXPECT_EQ(back.best_path_id, 6);
+  EXPECT_NEAR(back.best_gain, 3 * 880.0 * p.path_direction_min_factor, 1e-6);
+
+  // One and a half times the gain behind: not enough, the robot goes on
+  // forward.
+  Line m;
+  for (Vertex* v : m.ahead) v->vol_gain.gain = 100.0;
+  for (Vertex* v : m.behind) v->vol_gain.gain = 150.0;
+  const auto on = mgg::selectBestPath(m.graph, p, RobotParams(), flat, 0.2, 0.0);
+  EXPECT_EQ(on.best_path_id, 3);
+
+  // A minimum factor of 0 is the unbounded upstream penalty.
+  p.path_direction_min_factor = 0.0;
+  Line n;
+  for (Vertex* v : n.ahead) v->vol_gain.gain = 100.0;
+  for (Vertex* v : n.behind) v->vol_gain.gain = 880.0;
+  const auto unbounded = mgg::selectBestPath(n.graph, p, RobotParams(), flat, 0.2, 0.0);
+  EXPECT_EQ(unbounded.best_path_id, 3);
+}
+
+TEST(PathSelection, APathEndingBehindTurnsBackAndOneAheadOrAsideDoesNot) {
+  PlanningParams p = makePlanning();
+  p.path_direction_penalty = 1.0;
+  const auto line = [](double angle) {
+    std::vector<Eigen::Vector3d> path;
+    for (int i = 0; i <= 10; ++i) {
+      path.emplace_back(0.3 * i * std::cos(angle), 0.3 * i * std::sin(angle),
+                        0.0);
+    }
+    return path;
+  };
+  EXPECT_FALSE(mgg::pathTurnsBack(line(0.0), 0.0, p));
+  EXPECT_FALSE(mgg::pathTurnsBack(line(M_PI / 4.0), 0.0, p));
+  EXPECT_FALSE(mgg::pathTurnsBack(line(-M_PI / 2.0 + 0.01), 0.0, p));
+  EXPECT_TRUE(mgg::pathTurnsBack(line(3.0 * M_PI / 4.0), 0.0, p));
+  EXPECT_TRUE(mgg::pathTurnsBack(line(M_PI), 0.0, p));
+  EXPECT_NEAR(mgg::pathDirectionFactor(line(M_PI), 0.0, p, true),
+              p.path_direction_min_factor, 1e-12);
+  EXPECT_LT(mgg::pathDirectionFactor(line(M_PI), 0.0, p, false), 0.05);
+  // Without a bound nothing is said to turn back.
+  p.path_direction_min_factor = 0.0;
+  EXPECT_FALSE(mgg::pathTurnsBack(line(M_PI), 0.0, p));
+}
+
+// The ping-pong the hysteresis stops (run-8 replays: on an unchanging map a
+// robot went back and forth between two viewpoints 2.8 m apart). The robot
+// faces +x with 8.8 times the gain behind it and turns back. At the end of
+// that path, facing -x, the side it came from still has 2.5 times the gain
+// of the side ahead: with the bound alone it would turn back again; right
+// after turning back it goes on.
+TEST(PathSelection, AfterTurningBackTheRobotDoesNotTurnStraightBackAgain) {
+  PlanningParams p = makePlanning();
+  p.path_direction_penalty = 1.0;
+  EdgeInclinations flat;
+  mgg::TurnBackHysteresis hysteresis;
+  const auto points = [](const std::vector<Vertex*>& path) {
+    std::vector<Eigen::Vector3d> out;
+    for (const Vertex* v : path) out.push_back(v->state.head<3>());
+    return out;
+  };
+
+  Line first;
+  for (Vertex* v : first.ahead) v->vol_gain.gain = 100.0;
+  for (Vertex* v : first.behind) v->vol_gain.gain = 880.0;
+  auto r = mgg::selectBestPath(first.graph, hysteresis.selectionParams(p),
+                               RobotParams(), flat, 0.2, 0.0);
+  ASSERT_EQ(r.best_path_id, 6);
+  hysteresis.record(points(r.best_path), 0.0, p);
+  EXPECT_TRUE(hysteresis.lastTurnedBack());
+
+  // Facing -x now: the -x branch is ahead (100), the +x branch behind (250).
+  Line second;
+  for (Vertex* v : second.ahead) v->vol_gain.gain = 250.0;
+  for (Vertex* v : second.behind) v->vol_gain.gain = 100.0;
+  const auto bound_only =
+      mgg::selectBestPath(second.graph, p, RobotParams(), flat, 0.2, M_PI);
+  EXPECT_EQ(bound_only.best_path_id, 3);  // back again, without hysteresis
+  Line third;
+  for (Vertex* v : third.ahead) v->vol_gain.gain = 250.0;
+  for (Vertex* v : third.behind) v->vol_gain.gain = 100.0;
+  r = mgg::selectBestPath(third.graph, hysteresis.selectionParams(p),
+                          RobotParams(), flat, 0.2, M_PI);
+  EXPECT_EQ(r.best_path_id, 6);  // goes on
+  hysteresis.record(points(r.best_path), M_PI, p);
+  EXPECT_FALSE(hysteresis.lastTurnedBack());
+  // Going on, the bound applies again.
+  EXPECT_DOUBLE_EQ(hysteresis.selectionParams(p).path_direction_min_factor,
+                   p.path_direction_min_factor);
+}
+
 TEST(PathSelection, FrontierPresenceIsReported) {
   Fork f;
   for (Vertex* v : f.x_branch) v->vol_gain.gain = 10.0;

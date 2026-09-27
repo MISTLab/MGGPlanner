@@ -225,6 +225,18 @@ struct PlanningParams {
   /// robots in run 6 turned back into an explored hangar. At 1.0 corridor
   /// runs go on forward on the run-6 probe cases; 1.5 chose the same ends.
   double path_direction_penalty = 1.0;
+  /// The least that factor may be, 0 to 1: at 1.0 an unbounded exp(-dev)
+  /// multiplied a path back the way the robot faced by 0.007, and in run 8
+  /// robot_3, restarted facing west, left an unexplored east for the
+  /// explored west. At 0.42 a path behind needs 2.4 times the gain. The
+  /// margins are thin both ways: on the replayed restart the east scored
+  /// 2.5 times the west (it wins from 0.41), and on the open symmetric floor
+  /// of PlannerNodeTest.ExplorationGoesTheWayTheRobotFaces (run 6) a
+  /// diagonal corner behind scores 2.2 times the path ahead (the robot
+  /// turns to it from 0.45). A backstop: the tour's target and the low-gain
+  /// handoff are what move a robot off an explored side. 0 is upstream's
+  /// unbounded penalty. Not an upstream parameter.
+  double path_direction_min_factor = 0.42;
   double hanging_vertex_penalty = 0.0;
   bool leafs_only_for_volumetric_gain = false;
   bool cluster_vertices_for_gain = false;

@@ -55,6 +55,40 @@ bool pullBackToClearViewpoint(
   return true;
 }
 
+double pathDirectionFactor(const std::vector<Eigen::Vector3d>& path,
+                           double exploring_direction,
+                           const PlanningParams& planning, bool bounded) {
+  const double deviation = computeDistanceBetweenTrajectoryAndDirection(
+      path, exploring_direction, 0.2, true);
+  const double factor = std::exp(-planning.path_direction_penalty * deviation);
+  return bounded ? std::max(planning.path_direction_min_factor, factor)
+                 : factor;
+}
+
+bool pathTurnsBack(const std::vector<Eigen::Vector3d>& path,
+                   double exploring_direction,
+                   const PlanningParams& planning) {
+  if (path.size() < 2 || !(planning.path_direction_min_factor > 0.0)) {
+    return false;
+  }
+  const Eigen::Vector2d heading(std::cos(exploring_direction),
+                                std::sin(exploring_direction));
+  return (path.back() - path.front()).head<2>().dot(heading) < 0.0;
+}
+
+PlanningParams TurnBackHysteresis::selectionParams(
+    const PlanningParams& planning) const {
+  PlanningParams params = planning;
+  if (last_turned_back_) params.path_direction_min_factor = 0.0;
+  return params;
+}
+
+void TurnBackHysteresis::record(const std::vector<Eigen::Vector3d>& path,
+                                double exploring_direction,
+                                const PlanningParams& planning) {
+  last_turned_back_ = pathTurnsBack(path, exploring_direction, planning);
+}
+
 PathSelectionResult selectBestPath(GraphManager& graph,
                                    const PlanningParams& planning,
                                    const RobotParams& robot,
@@ -184,9 +218,8 @@ PathSelectionResult selectBestPath(GraphManager& graph,
       std::vector<Eigen::Vector3d> path_points;
       path_points.reserve(path.size());
       for (const Vertex* v : path) path_points.push_back(v->state.head(3));
-      const double deviation = computeDistanceBetweenTrajectoryAndDirection(
-          path_points, exploring_direction, 0.2, true);
-      gain = path_gain * std::exp(-planning.path_direction_penalty * deviation);
+      gain = path_gain * pathDirectionFactor(path_points, exploring_direction,
+                                             planning, /*bounded=*/true);
       return true;
     };
     const auto excluded = [&](const Vertex* viewpoint) {

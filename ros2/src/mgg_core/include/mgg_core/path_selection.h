@@ -194,6 +194,40 @@ bool pathGoesNowhere(const PathSelectionResult& selection,
 /// 18973 edges, 37946 directed.
 constexpr int kMaxDetourSearchStates = 100000;
 
+/// The factor path_direction_penalty puts on a path's score for leaving
+/// `exploring_direction`: exp(-path_direction_penalty * deviation), and
+/// with `bounded` never below path_direction_min_factor, as selectBestPath
+/// applies it.
+double pathDirectionFactor(const std::vector<Eigen::Vector3d>& path,
+                           double exploring_direction,
+                           const PlanningParams& planning, bool bounded);
+
+/// Whether a chosen path turns back: it ends more than 90 degrees from
+/// `exploring_direction`, as seen from its start, with the penalty bounded
+/// (path_direction_min_factor above 0).
+bool pathTurnsBack(const std::vector<Eigen::Vector3d>& path,
+                   double exploring_direction, const PlanningParams& planning);
+
+/// Light hysteresis on turning back. With path_direction_min_factor a path
+/// back needs only a few times the gain of one ahead, and on the run-8
+/// replays a robot on an unchanging map went back and forth between two
+/// viewpoints 2.8 m apart, each turning back for the other. The selection
+/// right after a path that turned back uses the unbounded penalty, so the
+/// robot does not turn straight back again for a similar gain.
+class TurnBackHysteresis {
+ public:
+  /// `planning` as the next selection should use it.
+  PlanningParams selectionParams(const PlanningParams& planning) const;
+  /// Records the path chosen (empty for none) and the direction it was
+  /// scored against.
+  void record(const std::vector<Eigen::Vector3d>& path,
+              double exploring_direction, const PlanningParams& planning);
+  bool lastTurnedBack() const { return last_turned_back_; }
+
+ private:
+  bool last_turned_back_ = false;
+};
+
 /// Scores every root-to-leaf path and returns the best.
 ///
 /// `exploring_direction` is the direction paths are penalised for leaving,

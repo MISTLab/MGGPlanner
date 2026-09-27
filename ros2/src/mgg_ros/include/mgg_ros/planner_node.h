@@ -493,6 +493,11 @@ class PlannerNode : public rclcpp::Node {
   /// rrg.cpp:2098 to 2120: rounds without a frontier among the local
   /// leaves; at the configured count the global planner runs.
   int low_gain_rounds_ = 0;
+  /// Whether the last lattice path chosen turned back: the next selection
+  /// then bounds no direction penalty.
+  mgg::TurnBackHysteresis turn_back_hysteresis_;
+  /// Lattice paths chosen that turned back, since the node started.
+  int paths_turning_back_ = 0;
   /// Exploration paths and global routes sent to end where no pose had
   /// viewpoint clearance (mgg::viewpointClear), since the node started.
   int unclear_viewpoints_selected_ = 0;

@@ -272,6 +272,7 @@ bool loadPlanningParams(const ParamLoader& p, const std::string& ns,
   p.get(ns + "/unknown_voxel_gain", out.unknown_voxel_gain);
   p.get(ns + "/path_length_penalty", out.path_length_penalty);
   p.get(ns + "/path_direction_penalty", out.path_direction_penalty);
+  p.get(ns + "/path_direction_min_factor", out.path_direction_min_factor);
   p.get(ns + "/hanging_vertex_penalty", out.hanging_vertex_penalty);
   p.get(ns + "/leafs_only_for_volumetric_gain",
         out.leafs_only_for_volumetric_gain);

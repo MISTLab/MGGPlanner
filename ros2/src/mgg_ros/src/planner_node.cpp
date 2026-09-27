@@ -2117,8 +2117,13 @@ std::string PlannerNode::buildLocalGraph() {
                              standing_on);
     };
   }
+  // Right after a plan that turned back, the direction penalty is not
+  // bounded: the robot does not turn straight back again for a similar
+  // gain (mgg::pathTurnsBack).
+  const mgg::PlanningParams selection_params =
+      turn_back_hysteresis_.selectionParams(planning_params_);
   const mgg::PathSelectionResult sel = mgg::selectBestPath(
-      *local_graph_, planning_params_, robot_params_, edge_inclinations_,
+      *local_graph_, selection_params, robot_params_, edge_inclinations_,
       map_->getResolution(), selection_direction, selectionExclusions(),
       reservation_exclusion_radius_m_,
       [this, &turn_check](const mgg::Vertex& v) {
@@ -2132,6 +2137,15 @@ std::string PlannerNode::buildLocalGraph() {
       slope_end_retreat);
   for (const mgg::Vertex* v : sel.best_path) {
     if (v != nullptr) best_path_.push_back(v->state);
+  }
+  {
+    std::vector<Eigen::Vector3d> points;
+    for (const mgg::StateVec& state : best_path_) {
+      points.push_back(state.head<3>());
+    }
+    turn_back_hysteresis_.record(points, selection_direction,
+                                 planning_params_);
+    if (turn_back_hysteresis_.lastTurnedBack()) ++paths_turning_back_;
   }
   if (sel.sharp_turn_detour) {
     RCLCPP_INFO(get_logger(),
