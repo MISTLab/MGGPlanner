@@ -2441,7 +2441,16 @@ std::string PlannerNode::buildLocalGraph() {
   // room; the next cycle plans from there. With no way out it gets no path,
   // and its adapter's own recovery runs.
   std::string boxed_in;
-  const bool is_boxed_in = (sel.sharp_turn_fallback || goes_nowhere) &&
+  const bool is_boxed_in = !boxed_in_without_departure_now_ &&
+                           (sel.sharp_turn_fallback || goes_nowhere ||
+                            (sel.best_path.empty() &&
+                             sel.slope_ends_without_way_back > 0 &&
+                             std::any_of(local_graph_->vertices_map_.begin(),
+                                         local_graph_->vertices_map_.end(),
+                                         [](const auto& entry) {
+                                           return entry.second &&
+                                               entry.second->vol_gain.gain > 0;
+                                         }))) &&
                            turns_admissible &&
                            !mgg::roomToTurn(*map_, robot_params_, planning_params_,
                                             root_state, standing_on);
@@ -3139,7 +3148,7 @@ bool PlannerNode::runGlobalPlanner(int target_id, std::string& reason,
   // a way back as a lattice path's does (review r1, R1-3): the route is cut
   // back to its last end with one, or not taken.
   if (robot_params_.type == mgg::RobotType::kGroundRobot &&
-      best_path_.size() >= 2) {
+      !last_route_starts_with_turn_without_room_ && best_path_.size() >= 2) {
     const std::optional<mgg::StandingStart> standing = standingStart();
     const double radius =
         std::max(robot_params_.size.x(), robot_params_.size.y());
@@ -3162,9 +3171,11 @@ bool PlannerNode::runGlobalPlanner(int target_id, std::string& reason,
       for (std::size_t j = 0; j < best_path_.size() && !near_slope; ++j) {
         near_slope = sloped[j] && std::abs(along[j] - along[i]) <= radius;
       }
-      return near_slope && !mgg::turnSpaceObserved(*map_, robot_params_,
+      return !mgg::viewpointClear(*map_, robot_params_, planning_params_,
+                                  best_path_[i]) ||
+             (near_slope && !mgg::turnSpaceObserved(*map_, robot_params_,
                                                    planning_params_,
-                                                   best_path_[i]);
+                                                   best_path_[i]));
     };
     if (!mgg::cutBackToWayBack(
             best_path_, on_slope,
@@ -3172,29 +3183,21 @@ bool PlannerNode::runGlobalPlanner(int target_id, std::string& reason,
               return mgg::roomToTurn(*map_, robot_params_, planning_params_,
                                      best_path_[i],
                                      standing ? &*standing : nullptr);
-            })) {
+            }, planning_params_.departure_reverse_allowed)) {
       best_path_.clear();
       global_frontier_not_routed_ = true;
-      reason = "the route ends on a slope with no way back";
+      reason = "the route ends on a slope or in a narrow passage with no way back";
       return false;
     }
   }
-  // The frontier is a lattice leaf of an earlier cycle, which may stand
-  // against a wall: the route ends where the robot has room (viewpointClear)
-  // when any pose along it has, and at the frontier as before otherwise.
-  if (best_path_.size() >= 2 &&
-      !mgg::pullBackToClearViewpoint(
-          best_path_, [this](const mgg::StateVec& pose) {
-            return mgg::viewpointClear(*map_, robot_params_, planning_params_,
-                                       pose);
-          })) {
-    ++unclear_viewpoints_selected_;
-    RCLCPP_WARN(get_logger(),
-                "global route ends without viewpoint clearance at (%.2f, "
-                "%.2f, %.2f): no pose along it is clear (%d unclear "
-                "viewpoints so far)",
-                best_path_.back().x(), best_path_.back().y(),
-                best_path_.back().z(), unclear_viewpoints_selected_);
+  // Ground ends have already passed the single slope/narrow way-back
+  // predicate; pulling them back for clearance again would discard valid
+  // targets inside passages. Aerial routes retain the clearance cutback.
+  if (robot_params_.type != mgg::RobotType::kGroundRobot &&
+      best_path_.size() >= 2) {
+    mgg::pullBackToClearViewpoint(best_path_, [this](const mgg::StateVec& pose) {
+      return mgg::viewpointClear(*map_, robot_params_, planning_params_, pose);
+    });
   }
   best_path_from_global_graph_ = true;
   // rrg.cpp:5838 to 5843: this frontier is the target until it is reached.

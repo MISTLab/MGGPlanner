@@ -444,6 +444,32 @@ TEST(PathGoesNowhere, APulledBackPathLeadingToGainIsStillSent) {
   EXPECT_FALSE(mgg::pathGoesNowhere(refused, root->state.head<3>(), 0.3));
 }
 
+TEST(PathSelection, ANarrowTargetWithAWayBackBeatsAClearPrefix) {
+  GraphManager graph;
+  for (int i = 0; i < 4; ++i) {
+    auto* v = new Vertex(i, StateVec(i * 0.5, 0, 0, 0));
+    v->vol_gain.gain = i == 3 ? 100 : 0;
+    graph.addVertex(v);
+    if (i) graph.addEdge(v, graph.getVertex(i - 1), 0.5);
+  }
+  mgg::SlopeEndRetreat retreat;
+  retreat.admitted_on_slope = [](const Vertex&) { return false; };
+  retreat.room_to_turn = [](const Vertex& v) { return v.id <= 1; };
+  PlanningParams planning = makePlanning();
+  planning.departure_reverse_allowed = true;
+  const auto select = [&]() {
+    return mgg::selectBestPath(graph, planning, RobotParams(),
+        EdgeInclinations(), 0.2, 0, {}, 0,
+        [](const Vertex& v) { return v.id <= 1; }, {}, {}, 0, retreat);
+  };
+  EXPECT_EQ(select().best_path_id, 3);
+  planning.departure_reverse_allowed = false;
+  EXPECT_EQ(select().best_path_id, 1);
+  planning.departure_reverse_allowed = true;
+  retreat.room_to_turn = [](const Vertex&) { return false; };
+  EXPECT_EQ(select().best_path_id, 1);  // never the narrow end without a way back
+}
+
 TEST(PathSelection, AFallbackCutBackForItsWayBackNeverEndsInAReservation) {
   // Review r2 (P1): no end is clear, so the path is chosen as without the
   // check, but its leaf ends on a slope with no way back and it is cut
@@ -456,22 +482,22 @@ TEST(PathSelection, AFallbackCutBackForItsWayBackNeverEndsInAReservation) {
   inner->vol_gain.gain = 50.0;
   graph.addVertex(inner);
   graph.addEdge(inner, root, 1.0);
-  auto* leaf = new Vertex(2, StateVec(2.0, 0.0, 0.0, 0.0));
+  auto* leaf = new Vertex(2, StateVec(2.5, 0.0, 0.0, 0.0));
   graph.addVertex(leaf);
-  graph.addEdge(leaf, inner, 1.0);
+  graph.addEdge(leaf, inner, 1.5);
   EdgeInclinations flat;
   const mgg::ViewpointClearFn nowhere_clear = [](const Vertex&) {
     return false;
   };
   mgg::SlopeEndRetreat retreat;
   retreat.admitted_on_slope = [](const Vertex& v) { return v.id == 2; };
-  retreat.room_to_turn = [](const Vertex&) { return false; };
+  retreat.room_to_turn = [](const Vertex& v) { return v.id == 0; };
   // Unreserved, the cut path ends at the inner vertex, unclear.
   const auto free = mgg::selectBestPath(
       graph, makePlanning(), RobotParams(), flat, 0.2, 0.0, {}, 0.0,
       nowhere_clear, nullptr, nullptr, 0.0, retreat);
   ASSERT_EQ(free.best_path_id, 1);
-  EXPECT_TRUE(free.unclear_viewpoint);
+  EXPECT_FALSE(free.unclear_viewpoint);
   EXPECT_DOUBLE_EQ(free.best_gain, 50.0);
   // Reserved, there is no path.
   const auto reserved = mgg::selectBestPath(

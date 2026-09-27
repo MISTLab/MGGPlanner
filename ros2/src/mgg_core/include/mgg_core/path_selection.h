@@ -117,6 +117,9 @@ using EndExcludedFn = std::function<bool(const Vertex&)>;
 /// out to there straight, as a boxed-in robot departs, and goes down a ramp
 /// in steps of at most kDepartureMaxM, the lidar of each observing the turn
 /// space the next needs. Both are needed, or no end needs a way back.
+// Also applies to an end that fails viewpoint clearance (a narrow passage).
+// The same predicate governs clear selection, cutbacks, detours and fallback;
+// neither kind of end is admitted without reverse permission and a way back.
 struct SlopeEndRetreat {
   /// Whether viewpoint_clear admits the vertex only because it stands on a
   /// slope (slopeExemptsTurnSpace, and not turnSpaceObserved).
@@ -135,7 +138,8 @@ struct SlopeEndRetreat {
 /// no pose after the first has one.
 bool cutBackToWayBack(std::vector<StateVec>& route,
                       const std::function<bool(std::size_t)>& on_slope,
-                      const std::function<bool(std::size_t)>& room_to_turn);
+                      const std::function<bool(std::size_t)>& room_to_turn,
+                      bool reverse_allowed = true);
 
 /// Ends `route` at its last pose that passes `clear`, dropping the poses
 /// after it; the first pose, where the robot stands, is never asked. Returns

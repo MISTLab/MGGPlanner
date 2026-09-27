@@ -91,7 +91,8 @@ void TurnBackHysteresis::record(const std::vector<Eigen::Vector3d>& path,
 
 bool cutBackToWayBack(std::vector<StateVec>& route,
                       const std::function<bool(std::size_t)>& on_slope,
-                      const std::function<bool(std::size_t)>& room_to_turn) {
+                      const std::function<bool(std::size_t)>& room_to_turn,
+                      bool reverse_allowed) {
   if (route.size() < 2) return false;
   std::vector<double> along(route.size(), 0.0);
   for (std::size_t i = 1; i < route.size(); ++i) {
@@ -105,7 +106,7 @@ bool cutBackToWayBack(std::vector<StateVec>& route,
   };
   for (std::size_t end = route.size() - 1; end > 0; --end) {
     bool way_back = !on_slope(end);
-    for (std::size_t i = end; !way_back && i-- > 0;) {
+    for (std::size_t i = end; reverse_allowed && !way_back && i-- > 0;) {
       if (along[end] - along[i] > kDepartureMaxM + 1e-9) break;
       way_back = room_at(i);
     }
@@ -158,11 +159,12 @@ PathSelectionResult selectBestPath(GraphManager& graph,
   const auto way_back = [&](const std::vector<Vertex*>& path,
                             const std::vector<double>& along,
                             std::size_t end, int* refused) {
-    if (!retreat_checked ||
-        !cached(on_slope_by_id, path[end],
-                slope_end_retreat.admitted_on_slope)) {
-      return true;
-    }
+    if (!retreat_checked) return true;
+    const bool needs_retreat =
+        (viewpoint_clear && !clear(path[end])) ||
+        cached(on_slope_by_id, path[end], slope_end_retreat.admitted_on_slope);
+    if (!needs_retreat) return true;
+    if (!planning.departure_reverse_allowed) return false;
     for (std::size_t i = end; i-- > 0;) {
       if (along[end] - along[i] > kDepartureMaxM + 1e-9) break;
       if (cached(room_by_id, path[i], slope_end_retreat.room_to_turn)) {
@@ -382,7 +384,7 @@ PathSelectionResult selectBestPath(GraphManager& graph,
       // The robot stops where the path ends; the root is where it stands.
       std::size_t end = candidate.path.size() - 1;
       while (end > 0 &&
-             !(clear(candidate.path[end]) &&
+             !((clear(candidate.path[end]) || retreat_checked) &&
                way_back(candidate.path, candidate.along, end,
                         &result.slope_ends_without_way_back))) {
         --end;
