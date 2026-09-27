@@ -25,6 +25,7 @@
 #include <chrono>
 #include <cstdint>
 #include <functional>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -38,6 +39,9 @@
 #include <nav_msgs/msg/path.hpp>
 #include <sensor_msgs/msg/point_cloud2.hpp>
 #include <rclcpp/rclcpp.hpp>
+#include <std_msgs/msg/float64.hpp>
+#include <std_msgs/msg/string.hpp>
+#include <std_srvs/srv/set_bool.hpp>
 #include <std_srvs/srv/trigger.hpp>
 #include <tf2_msgs/msg/tf_message.hpp>
 #include <tf2_ros/buffer.h>
@@ -46,8 +50,10 @@
 
 #include <mgg_msgs/msg/graph.hpp>
 #include <mgg_msgs/msg/mapping_snapshot.hpp>
+#include <mgg_msgs/msg/planner_config_state.hpp>
 #include <mgg_msgs/srv/plan_objective.hpp>
 #include <mgg_msgs/srv/planner_set_exploration_target.hpp>
+#include <mgg_msgs/srv/planner_set_exploration_region.hpp>
 #include <mgg_msgs/srv/planner_srv.hpp>
 #include <mgg_msgs/msg/tour_award.hpp>
 #include <mgg_msgs/msg/tour_bid.hpp>
@@ -92,7 +98,7 @@ class PlannerNode : public rclcpp::Node {
 
   /// PlannerSrv status values beyond the FORWARD path. Negative so they
   /// cannot collide with the upstream constants.
-  static constexpr int kStatusNotReady = -1;      // no odometry or no map
+  static constexpr int kStatusNotReady = -1;      // waiting for inputs
   static constexpr int kStatusNoPath = -2;        // this cycle found none
   static constexpr int kStatusComplete = -3;      // nothing left to explore
 
@@ -239,11 +245,34 @@ class PlannerNode : public rclcpp::Node {
           request,
       std::shared_ptr<mgg_msgs::srv::PlannerSetExplorationTarget::Response>
           response);
+  /// "Explore here" (drone scout §3.5): gain and tour only inside a box.
+  void onExplorationRegionRequest(
+      const std::shared_ptr<mgg_msgs::srv::PlannerSetExplorationRegion::Request>
+          request,
+      std::shared_ptr<mgg_msgs::srv::PlannerSetExplorationRegion::Response>
+          response);
+  /// Leave the auction on landing (true), rejoin after take-off (false),
+  /// drone scout design §4.4.
+  void onLeaveFleet(
+      const std::shared_ptr<std_srvs::srv::SetBool::Request> request,
+      std::shared_ptr<std_srvs::srv::SetBool::Response> response);
+  /// Metres of flight left for exploring and coming home (drone scout
+  /// §4.3), from the drone's adapter; +inf until one arrives.
+  void onFlightReach(const std_msgs::msg::Float64::SharedPtr msg);
+  /// A drone's flight state from SwarmDeck's adapter (its supervisor's
+  /// state: "landed", "flying", ...), kept as latest_flight_state_.
+  void onFlightState(const std_msgs::msg::String::SharedPtr msg);
+  /// `clusters` without those outside the exploration region, if one is set.
+  std::vector<mgg::FrontierCluster> insideExplorationRegion(
+      std::vector<mgg::FrontierCluster> clusters) const;
   /// This robot's global graph as broadcast on neighbour_graph_out.
   mgg_msgs::msg::Graph ownGraphMessage();
   void publishOwnGraph();
   void publishPath();
   void publishMarkers();
+  /// Snapshot the applied configuration and publish it with planner_mutex_
+  /// held by the caller. No-op setters retain the last change's version/time.
+  void publishPlannerConfigState();
 
   /// Builds the local grid graph around the current state, scores it and
   /// selects the best path into best_path_. Returns a summary for the log.
@@ -310,8 +339,9 @@ class PlannerNode : public rclcpp::Node {
   /// neighbour; every kMinLength it is recorded and event E1 marks the
   /// roadmap around it visited.
   void ingestOdometryIntoGlobalGraph();
-  /// The root of the global graph is home: the first odometry, dropped onto
-  /// the terrain once the map shows ground under it.
+  /// The root is home: the current odometry at seeding, dropped onto the
+  /// terrain once mapped. An aerial anchor waits for flight_state or its
+  /// timeout; only "landed" lifts it (home_seeded_landed_).
   void seedGlobalGraph();
   /// Replaces the global graph with one rebuilt from the robot's keyframe
   /// trajectory (mgg::rebuildRoadmapFromTrajectory), vertex 0 at its home
@@ -319,16 +349,21 @@ class PlannerNode : public rclcpp::Node {
   /// mapped ground. The old graph's frontiers are not carried over: the
   /// rebuilt graph's come from exploration, and merged neighbours' with
   /// their next broadcast; how many of its own it dropped is kept
-  /// (frontiers_dropped_in_rebuild_). With `links_what_failed`, the rebuilt graph
-  /// replaces the old one only when it links what the old one could
+  /// (frontiers_dropped_in_rebuild_). With `link_what_failed`, the rebuilt
+  /// graph replaces the old one only when it links what the old one could
   /// not (the robot's pose, an exploration path), which it may add to it;
-  /// otherwise the old graph is kept. `why`, for the log, says what
-  /// triggered it. At most once per roadmap_rebuild_min_interval_s_ for
-  /// each trigger, and not again on the same trajectory revision and map.
-  /// Returns true when the graph was replaced.
+  /// the function returns the vertex that links it, or null. For an aerial
+  /// robot, nor does it replace an old graph whose home reaches its other
+  /// vertices when it would cut home off from that vertex (or, without
+  /// one, from every other vertex) or split places the old graph connects
+  /// to home (rebuildLosesHome; roadmap_rebuilds_refused_). Otherwise the old graph
+  /// is kept. `why`, for the log, says what triggered it. At most once per
+  /// roadmap_rebuild_min_interval_s_ for each trigger, and not again on the
+  /// same trajectory revision and map. Returns true when the graph was
+  /// replaced.
   bool rebuildGlobalGraphFromKeyframes(
       RoadmapRebuildTrigger trigger, const char* why,
-      const std::function<bool(mgg::GraphManager&)>& links_what_failed =
+      const std::function<mgg::Vertex*(mgg::GraphManager&)>& link_what_failed =
           nullptr);
   /// Whether an own in-service vertex of the global graph lies within
   /// edge_length_max of `state`: the graph reaches there, and a link
@@ -419,6 +454,9 @@ class PlannerNode : public rclcpp::Node {
   /// §2.3: solves the tour again when due and returns its current target,
   /// or nothing when it has none. `note` is for the plan summary.
   std::optional<mgg::FrontierCluster> refreshTour(std::string& note);
+  /// Graph distance from each cluster's representative to home (vertex 0).
+  std::vector<double> homeDistances(
+      const std::vector<mgg::FrontierCluster>& clusters);
   /// Whether a repositioning to global vertex `vertex_id` still heads for
   /// the tour's target (always, when the tour is off or has no target). A
   /// resumed route skips refreshTour, so the target is checked against the
@@ -604,6 +642,10 @@ class PlannerNode : public rclcpp::Node {
   std::string last_roadmap_rebuild_inputs_[kRoadmapRebuildTriggers];
   /// Global graphs rebuilt from the trajectory since the node started.
   int roadmap_rebuilds_ = 0;
+  /// Rebuilt graphs refused because they would have cut home off from what
+  /// the rebuild was for, or split places the current graph connects to
+  /// home (rebuildLosesHome; aerial robots only).
+  int roadmap_rebuilds_refused_ = 0;
   /// This robot's in-service frontiers the last rebuild that dropped any
   /// replaced, until the next failed global search, which is then no path
   /// rather than exploration complete (review r0, I-2).
@@ -717,6 +759,19 @@ class PlannerNode : public rclcpp::Node {
   /// See the parameter's comment in the constructor.
   bool allow_unknown_lattice_body_ = false;
   double hanging_root_edge_length_max_ = 0.0;
+  /// How far over its pad a drone's home is, metres: the height it takes
+  /// off to, where its flight links (drone scout Task 17, fix round 1).
+  /// Zero: home is where the first odometry is.
+  double aerial_home_height_m_ = 0.0;
+  /// With an aerial anchor, wait at most this many node-time seconds after
+  /// first odometry for flight_state. While pending, no planner work runs.
+  double aerial_home_state_wait_s_ = 5.0;
+  std::optional<rclcpp::Time> home_state_wait_started_;
+  rclcpp::TimerBase::SharedPtr home_state_wait_timer_;
+  /// Home was seeded while flight_state was "landed" (a drone on its pad,
+  /// with aerial_home_height_m_ set), so it is that high over the pose. The
+  /// keyframe rebuild lifts its first keyframe on this decision alone.
+  bool home_seeded_landed_ = false;
   /// The last cycle's frontier paths join the global graph before that
   /// graph is rebuilt (rrg.cpp:121 Rrg::reset).
   bool add_frontiers_to_global_graph_ = false;
@@ -733,8 +788,10 @@ class PlannerNode : public rclcpp::Node {
   /// The clusters the last refreshTour offered the tour.
   std::vector<mgg::FrontierCluster> tour_clusters_;
   /// Changes when the clusters this robot may visit change for a reason
-  /// other than the graph (the fleet's assignment); the tour solves again.
+  /// other than the graph (fleet assignment or exploration region).
   std::uint64_t tour_assignment_version_ = 0;
+  /// Last fleet version incorporated above; never overwrite local changes.
+  std::uint64_t tour_fleet_assignment_version_ = 0;
   /// The last tour's costing and solving time, for the plan summary.
   double tour_solve_ms_ = 0.0;
   /// Fleet frontier assignment (tour-exploration design §3); null when
@@ -822,6 +879,9 @@ class PlannerNode : public rclcpp::Node {
   rclcpp::Publisher<mgg_msgs::msg::Graph>::SharedPtr graph_pub_;
   rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr
       marker_pub_;
+  rclcpp::Publisher<mgg_msgs::msg::PlannerConfigState>::SharedPtr
+      planner_config_state_pub_;
+  mgg_msgs::msg::PlannerConfigState planner_config_state_;
   rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr path_pub_;
   rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr tour_pub_;
   rclcpp::Publisher<mgg_msgs::msg::TourBid>::SharedPtr tour_bid_pub_;
@@ -838,6 +898,15 @@ class PlannerNode : public rclcpp::Node {
   rclcpp::Service<mgg_msgs::srv::PlanObjective>::SharedPtr objective_srv_;
   rclcpp::Service<mgg_msgs::srv::PlannerSetExplorationTarget>::SharedPtr
       exploration_target_srv_;
+  rclcpp::Service<mgg_msgs::srv::PlannerSetExplorationRegion>::SharedPtr
+      exploration_region_srv_;
+  rclcpp::Service<std_srvs::srv::SetBool>::SharedPtr leave_fleet_srv_;
+  std::optional<mgg::BoundedSpaceParams> exploration_region_;
+  rclcpp::Subscription<std_msgs::msg::Float64>::SharedPtr flight_reach_sub_;
+  double flight_reach_m_ = std::numeric_limits<double>::infinity();
+  rclcpp::Subscription<std_msgs::msg::String>::SharedPtr flight_state_sub_;
+  /// The latest flight_state received; none until one arrives.
+  std::optional<std::string> latest_flight_state_;
   rclcpp::TimerBase::SharedPtr graph_timer_;
   /// rrg.h:367 global_graph_update_timer_.
   rclcpp::TimerBase::SharedPtr global_graph_update_timer_;
@@ -852,6 +921,8 @@ class PlannerNode : public rclcpp::Node {
   rclcpp::CallbackGroup::SharedPtr no_go_zones_group_;
   /// peer_bodies alone, for the same reason (review r1, R3).
   rclcpp::CallbackGroup::SharedPtr peer_bodies_group_;
+  /// flight_state alone, for the same reason.
+  rclcpp::CallbackGroup::SharedPtr flight_state_group_;
 };
 
 }  // namespace mgg_ros

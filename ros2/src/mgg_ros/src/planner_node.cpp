@@ -59,6 +59,74 @@ constexpr double kPeerGenerationCellM = 0.05;
 /// keyframes all lie within this of its home keyframe, has not left its
 /// start (PlannerNode::standingStart).
 constexpr double kStandingStartMoveM = 0.5;
+/// seedGlobalGraph creates the global graph's root, home, as vertex 0.
+constexpr int kHomeVertexId = 0;
+/// The flight_state SwarmDeck's adapter publishes for a drone on the ground
+/// (PlannerNode::home_seeded_landed_).
+constexpr const char* kFlightStateLanded = "landed";
+
+/// The in-service vertices of `graph` a route from home reaches: Dijkstra
+/// over its edges, those a no-go zone blocks left out and other robots'
+/// vertices passed through, as routeOverGlobalGraph searches. Home itself
+/// is always in it when the graph has one.
+std::unordered_set<int> reachedFromHome(mgg::GraphManager& graph) {
+  std::unordered_set<int> reached;
+  if (graph.vertices_map_.count(kHomeVertexId) == 0) return reached;
+  reached.insert(kHomeVertexId);
+  mgg::ShortestPathsReport report;
+  if (graph.getNumVertices() < 2 ||
+      !graph.findShortestPaths(kHomeVertexId, report) || !report.status) {
+    return reached;
+  }
+  for (const auto& entry : graph.vertices_map_) {
+    if (entry.second != nullptr && graph.inService(*entry.second) &&
+        std::isfinite(mgg::reachedDistance(report, entry.first))) {
+      reached.insert(entry.first);
+    }
+  }
+  return reached;
+}
+
+/// Why a keyframe rebuild must not replace `current` with `rebuilt`, or
+/// empty when it may. In the drone smoke test (drone scout Task 17, C) a
+/// rebuild swapped a graph whose home Return Home reached for one of three
+/// parts with home alone in one, and Return Home failed from then on. So
+/// when a route from home reaches another of this robot's vertices in
+/// `current` (reachedFromHome), a route from home in `rebuilt` must reach
+/// `linked` (what the rebuild was for; without it, any other vertex), and
+/// every such place: the rebuilt vertex nearest it, within
+/// `match_radius`, where there is one.
+std::string rebuildLosesHome(mgg::GraphManager& current,
+                             mgg::GraphManager& rebuilt,
+                             const mgg::Vertex* linked, int robot_id,
+                             double match_radius) {
+  std::vector<const mgg::Vertex*> places;
+  for (const int id : reachedFromHome(current)) {
+    const mgg::Vertex* vertex = current.vertices_map_.at(id);
+    if (id != kHomeVertexId && vertex->robot_id == robot_id) {
+      places.push_back(vertex);
+    }
+  }
+  if (places.empty()) return "";
+  const std::unordered_set<int> reached = reachedFromHome(rebuilt);
+  if (reached.empty()) return "has no home";
+  if (linked != nullptr) {
+    if (reached.count(linked->id) == 0) {
+      return "would not reach home from where it links";
+    }
+  } else if (reached.size() < 2) {
+    return "would cut home off";
+  }
+  for (const mgg::Vertex* place : places) {
+    mgg::StateVec state = place->state;
+    mgg::Vertex* nearest = nullptr;
+    if (rebuilt.getNearestVertexInRange(&state, match_radius, &nearest) &&
+        nearest != nullptr && reached.count(nearest->id) == 0) {
+      return "would cut off places the current graph connects to home";
+    }
+  }
+  return "";
+}
 
 double secondsSince(const std::chrono::steady_clock::time_point& then) {
   return std::chrono::duration<double>(std::chrono::steady_clock::now() - then)
@@ -84,6 +152,12 @@ PlannerNode::PlannerNode(const rclcpp::NodeOptions& options)
         break;
     }
   });
+
+  planner_config_state_.incarnation = static_cast<std::uint64_t>(
+      std::chrono::duration_cast<std::chrono::nanoseconds>(
+          std::chrono::system_clock::now().time_since_epoch()).count());
+  RCLCPP_INFO(get_logger(), "planner configuration incarnation: %llu (wall-clock ns)",
+              static_cast<unsigned long long>(planner_config_state_.incarnation));
 
   loadParameters();
 
@@ -307,6 +381,28 @@ PlannerNode::PlannerNode(const rclcpp::NodeOptions& options)
         onNoGoZones(m);
       },
       no_go_opts);
+  // Latched: SwarmDeck's adapter publishes the drone's flight state on each
+  // change; a planner started later gets the current one. Each state
+  // replaces the last, so, as no_go_zones, they are handled one at a time,
+  // in the order taken, in a group of their own: in the reentrant group an
+  // older "landed" could take the planner mutex after a newer "flying" and
+  // lift the home of a drone in the air (Task 17 review r2, P1).
+  flight_state_group_ =
+      create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
+  rclcpp::SubscriptionOptions flight_state_opts;
+  flight_state_opts.callback_group = flight_state_group_;
+  flight_state_sub_ = create_subscription<std_msgs::msg::String>(
+      "flight_state", rclcpp::QoS(1).transient_local(),
+      [this](const std_msgs::msg::String::SharedPtr msg) {
+        onFlightState(msg);
+      },
+      flight_state_opts);
+  flight_reach_sub_ = create_subscription<std_msgs::msg::Float64>(
+      "flight_reach_m", rclcpp::QoS(10),
+      [this](const std_msgs::msg::Float64::SharedPtr msg) {
+        onFlightReach(msg);
+      },
+      sub_opts);
 
   graph_pub_ = create_publisher<mgg_msgs::msg::Graph>("neighbour_graph_out",
                                                       rclcpp::QoS(10));
@@ -344,13 +440,6 @@ PlannerNode::PlannerNode(const rclcpp::NodeOptions& options)
           onTourAward(m);
         },
         sub_opts);
-    release_claims_srv_ = create_service<mgg_msgs::srv::ReleaseClaims>(
-        "release_claims",
-        [this](const std::shared_ptr<mgg_msgs::srv::ReleaseClaims::Request> req,
-               std::shared_ptr<mgg_msgs::srv::ReleaseClaims::Response> res) {
-          onReleaseClaims(req, res);
-        },
-        rclcpp::ServicesQoS(), callback_group_);
     fleet_timer_ = create_timer(
         std::chrono::duration<double>(kFleetTickPeriodS),
         [this]() {
@@ -364,14 +453,6 @@ PlannerNode::PlannerNode(const rclcpp::NodeOptions& options)
         },
         callback_group_);
   }
-
-  build_srv_ = create_service<std_srvs::srv::Trigger>(
-      "build_local_graph",
-      [this](const std::shared_ptr<std_srvs::srv::Trigger::Request> req,
-             std::shared_ptr<std_srvs::srv::Trigger::Response> res) {
-        onBuildRequest(req, res);
-      },
-      rclcpp::ServicesQoS(), callback_group_);
 
   global_vertex_spacing_ =
       declareOrGet<double>(this, "global_vertex_spacing", 1.0);
@@ -407,6 +488,20 @@ PlannerNode::PlannerNode(const rclcpp::NodeOptions& options)
   hanging_root_edge_length_max_ = std::max(
       0.0, declareOrGet<double>(this, "hanging_root_edge_length_max",
                                 hanging_root_edge_length_max_));
+  // A drone's pad is on the floor, where its box meets the ground and no
+  // edge joins it: its home is this far over the pad, at its take-off
+  // height, when SwarmDeck reports it landed on flight_state as home is
+  // seeded (seedGlobalGraph, rebuildGlobalGraphFromKeyframes).
+  aerial_home_height_m_ = std::max(
+      0.0, declareOrGet<double>(this, "aerial_home_height_m",
+                                aerial_home_height_m_));
+  aerial_home_state_wait_s_ = declareOrGet<double>(
+      this, "aerial_home_state_wait_s", aerial_home_state_wait_s_);
+  if (!std::isfinite(aerial_home_state_wait_s_) ||
+      aerial_home_state_wait_s_ < 0.0) {
+    throw std::invalid_argument(
+        "aerial_home_state_wait_s must be finite and non-negative");
+  }
   // The global graph lives only in memory: a restarted planner, or a robot
   // driven far off its graph, is left with a graph that cannot reach where
   // the robot is or home (run 5, 2026-09-25). It is rebuilt from the
@@ -469,6 +564,32 @@ PlannerNode::PlannerNode(const rclcpp::NodeOptions& options)
                 rebuild_off.c_str());
   }
 
+  const double publish_period =
+      declareOrGet<double>(this, "graph_publish_period_sec", 2.0);
+  planner_config_state_pub_ = create_publisher<mgg_msgs::msg::PlannerConfigState>(
+      "planner_config_state", rclcpp::QoS(1).reliable().transient_local());
+  {
+    const std::lock_guard<std::recursive_mutex> lock(planner_mutex_);
+    publishPlannerConfigState();
+  }
+
+  // Advertise planner services only after the initial configuration is latched.
+  if (fleet_) {
+    release_claims_srv_ = create_service<mgg_msgs::srv::ReleaseClaims>(
+        "release_claims",
+        [this](const std::shared_ptr<mgg_msgs::srv::ReleaseClaims::Request> req,
+               std::shared_ptr<mgg_msgs::srv::ReleaseClaims::Response> res) {
+          onReleaseClaims(req, res);
+        },
+        rclcpp::ServicesQoS(), callback_group_);
+  }
+  build_srv_ = create_service<std_srvs::srv::Trigger>(
+      "build_local_graph",
+      [this](const std::shared_ptr<std_srvs::srv::Trigger::Request> req,
+             std::shared_ptr<std_srvs::srv::Trigger::Response> res) {
+        onBuildRequest(req, res);
+      },
+      rclcpp::ServicesQoS(), callback_group_);
   plan_srv_ = create_service<mgg_msgs::srv::PlannerSrv>(
       "mggplanner",
       [this](const std::shared_ptr<mgg_msgs::srv::PlannerSrv::Request> req,
@@ -494,8 +615,25 @@ PlannerNode::PlannerNode(const rclcpp::NodeOptions& options)
                      res) { onExplorationTargetRequest(req, res); },
           rclcpp::ServicesQoS(), callback_group_);
 
-  const double publish_period =
-      declareOrGet<double>(this, "graph_publish_period_sec", 2.0);
+  exploration_region_srv_ =
+      create_service<mgg_msgs::srv::PlannerSetExplorationRegion>(
+          "set_exploration_region",
+          [this](const std::shared_ptr<
+                     mgg_msgs::srv::PlannerSetExplorationRegion::Request>
+                     req,
+                 std::shared_ptr<
+                     mgg_msgs::srv::PlannerSetExplorationRegion::Response>
+                     res) { onExplorationRegionRequest(req, res); },
+          rclcpp::ServicesQoS(), callback_group_);
+
+  leave_fleet_srv_ = create_service<std_srvs::srv::SetBool>(
+      "leave_fleet",
+      [this](const std::shared_ptr<std_srvs::srv::SetBool::Request> req,
+             std::shared_ptr<std_srvs::srv::SetBool::Response> res) {
+        onLeaveFleet(req, res);
+      },
+      rclcpp::ServicesQoS(), callback_group_);
+
   // Node::create_timer drives off get_clock(), the node's RCL_ROS_TIME clock.
   // That is correct in both deployments: on a real robot use_sim_time is false
   // and ROS time follows the system clock, while in simulation it follows
@@ -537,7 +675,17 @@ void PlannerNode::loadParameters() {
   if (!loadRobotParams(p, "RobotParams", robot_params_)) {
     RCLCPP_ERROR(get_logger(), "RobotParams failed to load");
   }
-  if (!loadPlanningParams(p, "PlanningParams", planning_params_)) {
+  const bool planning_loaded =
+      loadPlanningParams(p, "PlanningParams", planning_params_);
+  // Every bid is costed in time at v_max (drone scout Task 17): a planner
+  // without a speed would bid what its peers refuse. It does not start.
+  if (!std::isfinite(planning_params_.v_max) ||
+      !(planning_params_.v_max > 0.0)) {
+    throw std::invalid_argument(
+        "PlanningParams.v_max must be a positive, finite speed (m/s); got " +
+        std::to_string(planning_params_.v_max));
+  }
+  if (!planning_loaded) {
     RCLCPP_ERROR(get_logger(), "PlanningParams failed to load");
   }
   if (!loadGridGraphParams(p, "BoundedSpaceParams/GridGraphLocal",
@@ -705,7 +853,7 @@ std::vector<mgg::FrontierCluster> PlannerNode::tourCandidates(
       clusters.erase(std::remove_if(clusters.begin(), clusters.end(), others),
                      clusters.end());
     }
-    return clusters;
+    return insideExplorationRegion(std::move(clusters));
   }
   // Tour-exploration design §3.5: never a cluster another robot holds or a
   // peer explored; in a group with an award, the awarded bundle and the
@@ -737,8 +885,11 @@ std::vector<mgg::FrontierCluster> PlannerNode::tourCandidates(
                                            near(cluster, awarded));
                      }),
       clusters.end());
-  tour_assignment_version_ = fleet_->assignmentVersion();
-  return clusters;
+  if (tour_fleet_assignment_version_ != fleet_->assignmentVersion()) {
+    tour_fleet_assignment_version_ = fleet_->assignmentVersion();
+    ++tour_assignment_version_;
+  }
+  return insideExplorationRegion(std::move(clusters));
 }
 
 std::optional<mgg::FrontierCluster> PlannerNode::refreshTour(
@@ -808,10 +959,11 @@ std::optional<mgg::FrontierCluster> PlannerNode::refreshTour(
     }
     noteGlobalGraphEdges();
     const auto started = std::chrono::steady_clock::now();
-    const mgg::TourCostMatrix costs = mgg::computeTourCosts(
+    mgg::TourCostMatrix costs = mgg::computeTourCosts(
         *global_graph_, graph_revision_, tour_distances_, link->id,
         current_state_[3], clusters, tour_params_.heading_weight,
         peer_generation_);
+    mgg::capTourCostsByReach(costs, homeDistances(clusters), flight_reach_m_);
     tour_planner_->solve(clusters, costs, graph_revision_,
                          tour_assignment_version_, now_s, peer_generation_);
     tour_solve_ms_ = std::chrono::duration<double, std::milli>(
@@ -904,6 +1056,18 @@ void PlannerNode::onTourBid(mgg_msgs::msg::TourBid::ConstSharedPtr msg) {
     return;
   }
   const mgg::TourBidData bid = fromTourBidMsg(*msg, t_ours_theirs);
+  // An exit carries a pose for the same simulated radio range as a bid,
+  // but no tour or speed. It must not count as a normal bid receipt.
+  if (bid.leaving) {
+    if (bid.robot_id < 0 || bid.seq == 0 || !bid.pose.allFinite()) return;
+    if (communication_range_ > 0.0 &&
+        (bid.pose.head<3>() - current_state_.head<3>()).norm() >
+            communication_range_) {
+      return;
+    }
+    fleet_->onBid(bid, now().seconds());
+    return;
+  }
   if (!bid.wellFormed()) {
     RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 5000,
                          "ignoring a malformed bid from robot %d",
@@ -982,7 +1146,7 @@ void PlannerNode::onReleaseClaims(
 void PlannerNode::fleetTick(double now_s) {
   if (!fleet_) return;
   const std::lock_guard<std::recursive_mutex> lock(planner_mutex_);
-  if (!have_odometry_) return;
+  if (!have_odometry_ || home_state_wait_started_) return;
   auto map_read = mapReadLease();
   // Bids and auctions cost routes with one peer set, as a request does.
   std::optional<mgg::MolaMap::TransientDiscPin> peer_pin;
@@ -1008,6 +1172,19 @@ void PlannerNode::fleetTick(double now_s) {
               out.award->released_robot_ids.size());
 }
 
+std::vector<double> PlannerNode::homeDistances(
+    const std::vector<mgg::FrontierCluster>& clusters) {
+  std::vector<double> distances(clusters.size(), mgg::kUnreachableCost);
+  const mgg::ShortestPathsReport* report =
+      tour_distances_.from(*global_graph_, graph_revision_, kHomeVertexId);
+  if (report == nullptr) return distances;
+  for (std::size_t i = 0; i < clusters.size(); ++i) {
+    distances[i] =
+        mgg::reachedDistance(*report, clusters[i].representative_vertex_id);
+  }
+  return distances;
+}
+
 mgg::TourBidData PlannerNode::ownTourBid() {
   mgg::TourBidData bid;
   bid.robot_id = static_cast<int>(planning_params_.robot_id);
@@ -1015,6 +1192,11 @@ mgg::TourBidData PlannerNode::ownTourBid() {
   bid.pose = current_state_;
   bid.current_target = tour_planner_->target();
   bid.claim_stamp_s = tour_planner_->targetSince();
+  bid.speed_mps = planning_params_.v_max;
+  bid.reach_m = flight_reach_m_;
+  if (const mgg::Vertex* home = findGlobalVertex(kHomeVertexId)) {
+    bid.home = home->state.head<3>();
+  }
   // §3.3 pool construction: the awarded clusters this robot's roadmap
   // shows explored.
   for (const mgg::FleetCluster& cluster : fleet_->lastAwardClusters()) {
@@ -1038,6 +1220,7 @@ mgg::TourBidData PlannerNode::ownTourBid() {
                                   tour_distances_, link->id,
                                   current_state_[3], clusters,
                                   /*heading_weight=*/0.0, peer_generation_);
+    mgg::capTourCostsByReach(costs, homeDistances(clusters), flight_reach_m_);
   } else {
     costs.from_robot.assign(clusters.size(), mgg::kUnreachableCost);
     costs.between.assign(clusters.size(),
@@ -1096,6 +1279,7 @@ std::vector<Eigen::Vector3d> PlannerNode::fleetExclusions() {
 }
 
 bool PlannerNode::settleIdleRobot(std::string& summary, bool& complete) {
+  if (fleet_ && fleet_->leaving()) return false;
   const double now_s = now().seconds();
   if (fleet_->inGroup(now_s)) {
     if (fleet_->requestAnswered()) {
@@ -1325,6 +1509,7 @@ void PlannerNode::onOdometry(nav_msgs::msg::Odometry::ConstSharedPtr msg) {
   auto map_read = mapReadLease();
   refreshMapRevision();
   seedGlobalGraph();
+  if (home_state_wait_started_) return;
   // On start, or after the graph was lost, it holds only its seed.
   if (ownGlobalVertices() <= 1) {
     rebuildGlobalGraphFromKeyframes(RoadmapRebuildTrigger::kSeedOnly,
@@ -1738,6 +1923,7 @@ mgg::ReceiverPlatform PlannerNode::receiverPlatform() const {
 
 mgg::MergeResult PlannerNode::mergeNeighbourRoadmap(
     const mgg::GraphExchange& incoming) {
+  if (home_state_wait_started_) return {};
   const mgg::ExpandContext ctx = makeContext();
   // The merge asks whether the robot could actually drive between two graphs
   // before joining them; that judgement needs the map, so it is injected.
@@ -1849,10 +2035,52 @@ void PlannerNode::onNeighbourGraph(mgg_msgs::msg::Graph::ConstSharedPtr msg) {
 void PlannerNode::seedGlobalGraph() {
   if (!have_odometry_) return;
   if (global_graph_->getNumVertices() == 0) {
+    if (robot_params_.type == mgg::RobotType::kAerialRobot &&
+        aerial_home_height_m_ > 0.0 && !latest_flight_state_) {
+      const auto now_time = now();
+      if (!home_state_wait_started_ ||
+          home_state_wait_started_->nanoseconds() == 0) {
+        home_state_wait_started_ = now_time;
+        // Before the first /clock, zero is not a deadline anchor. Either
+        // odometry or the timer can first see valid time: re-arm the timer
+        // from that non-zero anchor, rather than let its old expiry win.
+        if (now_time.nanoseconds() != 0 && home_state_wait_timer_) {
+          home_state_wait_timer_->reset();
+        }
+      }
+      if ((now_time - *home_state_wait_started_).seconds() <
+          aerial_home_state_wait_s_) {
+        if (!home_state_wait_timer_ || home_state_wait_timer_->is_canceled()) {
+          home_state_wait_timer_ = create_timer(
+              std::chrono::duration<double>(aerial_home_state_wait_s_),
+              [this]() {
+                const std::lock_guard<std::recursive_mutex> lock(planner_mutex_);
+                auto map_read = mapReadLease();
+                seedGlobalGraph();
+              }, callback_group_);
+        }
+        return;
+      }
+      RCLCPP_WARN(get_logger(),
+                  "timed out waiting for %s after %.2f s; seeding home at "
+                  "the pose, unlifted",
+                  flight_state_sub_->get_topic_name(), aerial_home_state_wait_s_);
+    }
+    home_state_wait_started_.reset();
+    if (home_state_wait_timer_) home_state_wait_timer_->cancel();
     // A lone root is a landmark, not a traversability claim: capture it from
-    // the first odometry, before anything moves the robot away from home.
+    // the current odometry (after the bounded flight_state wait, if needed).
     // Until the map shows ground under it no edge attaches to it.
+    // A drone SwarmDeck reports landed stands on its pad, where its box
+    // meets the floor and no edge joins it: home is aerial_home_height_m
+    // over it, where it takes off to. Without that report (timed out, or a
+    // planner restarted in flight) home is where the drone is.
+    home_seeded_landed_ =
+        robot_params_.type == mgg::RobotType::kAerialRobot &&
+        aerial_home_height_m_ > 0.0 &&
+        latest_flight_state_ == std::string(kFlightStateLanded);
     mgg::StateVec root_state = current_state_;
+    if (home_seeded_landed_) root_state[2] += aerial_home_height_m_;
     global_root_supported_ = projectToDrivingHeight(root_state);
     if (!global_root_supported_) {
       root_state = physicalAnchorAtDrivingHeight(current_state_);
@@ -1866,9 +2094,12 @@ void PlannerNode::seedGlobalGraph() {
     last_state_marker_global_ = current_state_;
     ++graph_revision_;
     RCLCPP_INFO(get_logger(),
-                "global graph seeded at (%.2f, %.2f, %.2f)%s", root_state[0],
+                "global graph seeded at (%.2f, %.2f, %.2f)%s%s", root_state[0],
                 root_state[1], root_state[2],
-                global_root_supported_ ? "" : " (awaiting mapped support)");
+                global_root_supported_ ? "" : " (awaiting mapped support)",
+                home_seeded_landed_
+                    ? " (landed: aerial_home_height_m over the pad)"
+                    : "");
     return;
   }
   if (global_root_supported_ || !map_->getStatus()) return;
@@ -1914,8 +2145,9 @@ bool PlannerNode::globalGraphReaches(const mgg::StateVec& state) const {
 
 bool PlannerNode::rebuildGlobalGraphFromKeyframes(
     RoadmapRebuildTrigger trigger, const char* why,
-    const std::function<bool(mgg::GraphManager&)>& links_what_failed) {
-  if (keyframe_source_ == nullptr || !have_mapping_snapshot_ ||
+    const std::function<mgg::Vertex*(mgg::GraphManager&)>& link_what_failed) {
+  if (home_state_wait_started_ || keyframe_source_ == nullptr ||
+      !have_mapping_snapshot_ ||
       !map_->getStatus()) {
     return false;
   }
@@ -1975,6 +2207,12 @@ bool PlannerNode::rebuildGlobalGraphFromKeyframes(
     entry.pitch = std::atan2(-r(2, 0), std::hypot(r(2, 1), r(2, 2)));
     keyframes.push_back(entry);
   }
+  // The first keyframe is where the drone started. It is lifted as the
+  // seed was, and only when the seed was: home seeded landed was its pad.
+  // A planner started in flight cannot tell where its keyframes began.
+  if (home_seeded_landed_ && !keyframes.empty()) {
+    keyframes.front().pose[2] += aerial_home_height_m_;
+  }
 
   auto rebuilt = std::make_shared<mgg::GraphManager>();
   rebuilt->setRobotId(static_cast<int>(planning_params_.robot_id));
@@ -1990,12 +2228,44 @@ bool PlannerNode::rebuildGlobalGraphFromKeyframes(
                          keyframes.front().pose.y(), keyframes.front().pose.z());
     return false;
   }
-  if (links_what_failed && !links_what_failed(*rebuilt)) {
+  mgg::Vertex* linked = nullptr;
+  if (link_what_failed) {
+    linked = link_what_failed(*rebuilt);
+    if (linked == nullptr) {
+      RCLCPP_WARN(get_logger(),
+                  "global graph kept (%s): the graph rebuilt from %d "
+                  "keyframes does not link it either (%d vertices, %d "
+                  "components)",
+                  why, report.keyframes, rebuilt->getNumVertices(),
+                  report.components);
+      return false;
+    }
+  }
+  // Routes over the rebuilt graph leave out what they leave out over the
+  // current one: no-go edges and, for the search only, edges a peer body
+  // blocks (globalEdgeBlocked).
+  rebuilt->setEdgeBlocked([this](const mgg::Vertex& a, const mgg::Vertex& b) {
+    return globalEdgeBlocked(a, b);
+  });
+  // Only for an aerial robot: a ground robot's rebuild corrects a graph
+  // whose connections the map may no longer support (a wall seen since),
+  // and replaces it as before (review r0, P1).
+  const std::string loses_home =
+      robot_params_.type == mgg::RobotType::kAerialRobot
+          ? rebuildLosesHome(*global_graph_, *rebuilt, linked,
+                             static_cast<int>(planning_params_.robot_id),
+                             std::min(roadmap_rebuild_params_.link_radius,
+                                      planning_params_.edge_length_max))
+          : std::string();
+  if (!loses_home.empty()) {
+    ++roadmap_rebuilds_refused_;
     RCLCPP_WARN(get_logger(),
                 "global graph kept (%s): the graph rebuilt from %d keyframes "
-                "does not link it either (%d vertices, %d components)",
-                why, report.keyframes, rebuilt->getNumVertices(),
-                report.components);
+                "%s (%d vertices, %d components, home's %d vertices); %d "
+                "rebuild(s) refused so far",
+                why, report.keyframes, loses_home.c_str(),
+                rebuilt->getNumVertices(), report.components,
+                report.home_component_vertices, roadmap_rebuilds_refused_);
     return false;
   }
   // The old graph's own frontiers go with it (none is carried over); the
@@ -2020,10 +2290,6 @@ bool PlannerNode::rebuildGlobalGraphFromKeyframes(
     }
   }
   global_graph_ = rebuilt;
-  global_graph_->setEdgeBlocked(
-      [this](const mgg::Vertex& a, const mgg::Vertex& b) {
-        return globalEdgeBlocked(a, b);
-      });
   global_root_supported_ = true;
   global_exploration_ongoing_ = false;
   current_global_vertex_id_ = -1;
@@ -2109,7 +2375,7 @@ void PlannerNode::expandGlobalGraphTimerCallback() {
   const std::lock_guard<std::recursive_mutex> lock(planner_mutex_);
   auto map_read = mapReadLease();
   refreshMapRevision();
-  if (planner_trigger_count_ == 0) return;
+  if (planner_trigger_count_ == 0 || home_state_wait_started_) return;
   if (!have_odometry_ || !map_->getStatus()) return;
   // The pass samples against one peer set, the one its skip key records.
   std::optional<mgg::MolaMap::TransientDiscPin> peer_pin;
@@ -2167,6 +2433,37 @@ void PlannerNode::addRefPathToGraph(const std::vector<mgg::StateVec>& path) {
     lattice.push_back(vertex);
   }
   const mgg::ExpandContext ctx = makeGlobalContext();
+  // The lattice's gain outside an exploration region counts nothing there
+  // (buildLocalGraph): carried across, it would demote the roadmap's own
+  // frontiers outside the region for good. Those vertices enter as poses.
+  mgg::UsableVertexFn carries_gain;
+  // Those inside it counted only what they see inside it, which may leave a
+  // frontier at the boundary without gain (review r0, P1): they carry the
+  // gain of all they see instead, scored as a frontier re-check scores it,
+  // so an update that finds them explored still demotes them.
+  std::vector<std::unique_ptr<mgg::Vertex>> unrestricted;
+  if (exploration_region_) {
+    carries_gain = [region = *exploration_region_](const mgg::Vertex& vertex) {
+      return region.isInsideSpace(vertex.state.head<3>());
+    };
+    const mgg::RecomputeGainFn whole_view = globalFrontierGain();
+    for (mgg::Vertex*& vertex : lattice) {
+      if (!carries_gain(*vertex)) continue;
+      auto rescored = std::make_unique<mgg::Vertex>(*vertex);
+      // Scored on this robot's map: globalFrontierGain scores another
+      // robot's vertex from its owner's reported counts instead.
+      rescored->robot_id = static_cast<int>(planning_params_.robot_id);
+      whole_view(*rescored);
+      if (rescored->vol_gain.is_frontier) {
+        rescored->type = mgg::VertexType::kFrontier;
+      } else if (rescored->type == mgg::VertexType::kFrontier) {
+        rescored->type = mgg::VertexType::kUnvisited;
+      }
+      vertex = rescored.get();
+      unrestricted.push_back(std::move(rescored));
+    }
+    global_space_.setCenter(current_state_, /*use_extension=*/true);
+  }
   std::vector<mgg::Vertex*> added_vertices;
   const auto add = [&]() {
     return lattice.empty()
@@ -2175,7 +2472,7 @@ void PlannerNode::addRefPathToGraph(const std::vector<mgg::StateVec>& path) {
                                         &added_vertices)
                : mgg::addRefPathToGraph(*global_graph_, lattice, ctx,
                                         global_vertex_spacing_,
-                                        &added_vertices);
+                                        &added_vertices, carries_gain);
   };
   int before = global_graph_->getNumVertices();
   bool added = add();
@@ -2192,15 +2489,18 @@ void PlannerNode::addRefPathToGraph(const std::vector<mgg::StateVec>& path) {
     const bool rebuilt = rebuildGlobalGraphFromKeyframes(
         RoadmapRebuildTrigger::kPathUnlinkable,
         "an exploration path could not be linked",
-        [&](mgg::GraphManager& graph) {
+        [&](mgg::GraphManager& graph) -> mgg::Vertex* {
           rebuilt_before = graph.getNumVertices();
-          return lattice.empty()
-                     ? mgg::addRefPathToGraph(graph, path, ctx,
-                                              global_vertex_spacing_,
-                                              &rebuilt_added)
-                     : mgg::addRefPathToGraph(graph, lattice, ctx,
-                                              global_vertex_spacing_,
-                                              &rebuilt_added);
+          const bool joined =
+              lattice.empty()
+                  ? mgg::addRefPathToGraph(graph, path, ctx,
+                                           global_vertex_spacing_,
+                                           &rebuilt_added)
+                  : mgg::addRefPathToGraph(graph, lattice, ctx,
+                                           global_vertex_spacing_,
+                                           &rebuilt_added, carries_gain);
+          return joined && !rebuilt_added.empty() ? rebuilt_added.front()
+                                                  : nullptr;
         });
     if (rebuilt) {
       before = rebuilt_before;
@@ -2375,6 +2675,7 @@ std::string PlannerNode::buildLocalGraph() {
   local_gain_remains_now_ = false;
   low_gain_path_now_ = false;
   if (!have_odometry_) return "no odometry received yet";
+  if (home_state_wait_started_) return "waiting for flight_state";
   if (!map_->getStatus()) {
     if (mola_map_ != nullptr) {
       const std::string detail = mola_map_->lastError();
@@ -2440,6 +2741,9 @@ std::string PlannerNode::buildLocalGraph() {
   const auto t_grid = Clock::now();
   // Global space is defined in world frame and must remain static at world origin.
   mgg::GainContext gain_ctx = makeGainContext();
+  // An operator region limits new exploration, not persistent frontier
+  // re-checks: a temporary exclusion must never be broadcast as explored.
+  gain_ctx.gain_region = exploration_region_ ? &*exploration_region_ : nullptr;
   const int evaluated = mgg::computeExplorationGain(
       *local_graph_, gain_ctx, planning_params_.leafs_only_for_volumetric_gain,
       planning_params_.cluster_vertices_for_gain);
@@ -2845,14 +3149,19 @@ bool PlannerNode::routeOverGlobalGraph(const mgg::StateVec goal,
       mgg::linkDeparture(*global_graph_, current, ctx, kLinkRadius);
   // Only when no vertex of the graph is within an edge of the robot: a
   // robot wedged beside a healthy graph (its box refused) keeps it. The
-  // rebuilt graph replaces it only if the robot's pose links to it.
-  if (departure.vertex == nullptr && !globalGraphReaches(current) &&
+  // rebuilt graph replaces it only if the robot's pose links to it. Not
+  // for an aerial robot, which relinks as it flies (odometry, exploration
+  // paths): its keyframes start on the pad, whose floor its box sits in,
+  // and a rebuild cut the drone's home off (drone scout Task 17, C).
+  if (departure.vertex == nullptr &&
+      robot_params_.type == mgg::RobotType::kGroundRobot &&
+      !globalGraphReaches(current) &&
       rebuildGlobalGraphFromKeyframes(
           RoadmapRebuildTrigger::kPoseUnlinkable,
           "the current pose cannot be linked",
           [&current, &ctx](mgg::GraphManager& graph) {
             return mgg::linkDeparture(graph, current, ctx, kLinkRadius)
-                       .vertex != nullptr;
+                .vertex;
           })) {
     departure = mgg::linkDeparture(*global_graph_, current, ctx, kLinkRadius);
   }
@@ -3280,12 +3589,17 @@ bool PlannerNode::runGlobalPlanner(int target_id, std::string& reason,
     reason = "the global graph holds no frontier to reposition to";
     return false;
   }
+  const auto inside_region = [this](const mgg::Vertex& vertex) {
+    return !exploration_region_ ||
+           exploration_region_->isInsideSpace(vertex.state.head<3>());
+  };
   mgg::Vertex* target = nullptr;
   if (target_id >= 0) {
     // Resuming the repositioning that was under way (rrg.cpp:5556).
     target = findGlobalVertex(target_id);
-    if (target == nullptr || target->type != mgg::VertexType::kFrontier) {
-      target = nullptr;  // it was reached or demoted meanwhile: choose anew
+    if (target == nullptr || target->type != mgg::VertexType::kFrontier ||
+        !inside_region(*target)) {
+      target = nullptr;  // reached, demoted or excluded: choose anew
     }
   }
   if (target == nullptr) {
@@ -3319,7 +3633,7 @@ bool PlannerNode::runGlobalPlanner(int target_id, std::string& reason,
         static_cast<int>(planning_params_.robot_id), globalFrontierGain(),
         excluded, exclusion_radius,
         exploration_target_.has_value() ? &*exploration_target_ : nullptr,
-        planning_params_.global_search_time_budget_s);
+        planning_params_.global_search_time_budget_s, inside_region);
     global_space_.setCenter(current_state_, /*use_extension=*/true);
     // Cut short, the search is no answer whether or not it found a
     // frontier: the one it found may yet fail to route (review r0, I-6).
@@ -3509,6 +3823,12 @@ void PlannerNode::onPlanRequest(
   peer_blocked_edges_.clear();
   withdrawUnplacedNeighbours();
   response->planning_bound_mode = request->bound_mode;
+  if (home_state_wait_started_) {
+    response->status = kStatusNotReady;
+    RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 5000,
+                         "plan request refused: waiting for flight_state");
+    return;
+  }
   if (!have_odometry_ || !map_->getStatus()) {
     response->status = kStatusNotReady;
     RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 5000,
@@ -3819,6 +4139,14 @@ void PlannerNode::onPlanRequest(
   publishPath();
   publishMarkers();
   RCLCPP_INFO(get_logger(), "plan request: %s", summary.c_str());
+  // A computed answer (including no-path/complete), not an early NOT_READY
+  // refusal, establishes which configuration this exploration cycle used.
+  // Publish before returning the service response, still under planner_mutex_.
+  if (planner_config_state_.last_plan_generation !=
+      planner_config_state_.generation) {
+    planner_config_state_.last_plan_generation = planner_config_state_.generation;
+    publishPlannerConfigState();
+  }
 }
 
 void PlannerNode::recordSentPath() {
@@ -3845,6 +4173,40 @@ void PlannerNode::recordSentPath() {
   lattice_path_.clear();
 }
 
+void PlannerNode::publishPlannerConfigState() {
+  mgg_msgs::msg::PlannerConfigState state;
+  state.incarnation = planner_config_state_.incarnation;
+  state.generation = planner_config_state_.generation;
+  state.stamp = planner_config_state_.stamp;
+  state.last_plan_generation = planner_config_state_.last_plan_generation;
+  state.region_active = exploration_region_.has_value();
+  if (exploration_region_) {
+    const auto& region = *exploration_region_;
+    state.region_low.x = region.min_val.x();
+    state.region_low.y = region.min_val.y();
+    state.region_low.z = region.min_val.z();
+    state.region_high.x = region.max_val.x();
+    state.region_high.y = region.max_val.y();
+    state.region_high.z = region.max_val.z();
+  }
+  state.target_active = exploration_target_.has_value();
+  if (exploration_target_) {
+    state.target.x = exploration_target_->x();
+    state.target.y = exploration_target_->y();
+    state.target.z = exploration_target_->z();
+  }
+  state.fleet_enabled = static_cast<bool>(fleet_);
+  state.leaving_fleet = fleet_ && fleet_->leaving();
+  // Metadata is copied unchanged above, so only applied fields can differ.
+  // Generation zero is the unpublished initial state, even with fleet off.
+  if (state.generation == 0 || state != planner_config_state_) {
+    ++state.generation;
+    state.stamp = now();
+  }
+  planner_config_state_ = state;
+  planner_config_state_pub_->publish(state);
+}
+
 void PlannerNode::onExplorationTargetRequest(
     const std::shared_ptr<mgg_msgs::srv::PlannerSetExplorationTarget::Request>
         request,
@@ -3858,6 +4220,7 @@ void PlannerNode::onExplorationTargetRequest(
       RCLCPP_INFO(get_logger(), "exploration target cleared");
     }
     exploration_target_.reset();
+    publishPlannerConfigState();
     response->success = true;
     return;
   }
@@ -3871,7 +4234,110 @@ void PlannerNode::onExplorationTargetRequest(
   exploration_target_ = target;
   RCLCPP_INFO(get_logger(), "exploring toward (%.2f, %.2f, %.2f)", target.x(),
               target.y(), target.z());
+  publishPlannerConfigState();
   response->success = true;
+}
+
+void PlannerNode::onLeaveFleet(
+    const std::shared_ptr<std_srvs::srv::SetBool::Request> request,
+    std::shared_ptr<std_srvs::srv::SetBool::Response> response) {
+  const std::lock_guard<std::recursive_mutex> lock(planner_mutex_);
+  if (!fleet_) {
+    response->success = false;
+    response->message = "fleet assignment is off";
+    return;
+  }
+  if (request->data) {
+    fleet_->leave(now().seconds());
+    response->message = "left the fleet; claims released";
+  } else {
+    fleet_->rejoin();
+    response->message = "rejoined the fleet";
+  }
+  ++tour_assignment_version_;
+  publishPlannerConfigState();
+  response->success = true;
+}
+
+void PlannerNode::onExplorationRegionRequest(
+    const std::shared_ptr<mgg_msgs::srv::PlannerSetExplorationRegion::Request>
+        request,
+    std::shared_ptr<mgg_msgs::srv::PlannerSetExplorationRegion::Response>
+        response) {
+  const std::lock_guard<std::recursive_mutex> lock(planner_mutex_);
+  if (!request->active) {
+    if (exploration_region_) {
+      const auto& min = exploration_region_->min_val;
+      const auto& max = exploration_region_->max_val;
+      RCLCPP_INFO(get_logger(),
+                  "exploration region cleared: min (%.2f, %.2f, %.2f), "
+                  "max (%.2f, %.2f, %.2f)",
+                  min.x(), min.y(), min.z(), max.x(), max.y(), max.z());
+    } else {
+      RCLCPP_INFO(get_logger(), "exploration region cleared (none was active)");
+    }
+    exploration_region_.reset();
+    ++tour_assignment_version_;
+    publishPlannerConfigState();
+    response->success = true;
+    response->message = "exploration region cleared";
+    return;
+  }
+  const Eigen::Vector3d min(request->min.x, request->min.y, request->min.z);
+  const Eigen::Vector3d max(request->max.x, request->max.y, request->max.z);
+  if (!min.allFinite() || !max.allFinite() ||
+      !(min.array() < max.array()).all()) {
+    response->success = false;
+    response->message = "exploration region must be finite with min < max";
+    return;
+  }
+  mgg::BoundedSpaceParams region;
+  region.type = mgg::BoundedSpaceType::kCuboid;
+  region.setBound(min, max);
+  region.setCenter(Eigen::Vector3d(0, 0, 0), /*use_extension=*/false);
+  exploration_region_ = region;
+  RCLCPP_INFO(get_logger(),
+              "exploration region set: min (%.2f, %.2f, %.2f), "
+              "max (%.2f, %.2f, %.2f)",
+              min.x(), min.y(), min.z(), max.x(), max.y(), max.z());
+  // The tour's candidates change: solve again.
+  ++tour_assignment_version_;
+  publishPlannerConfigState();
+  response->success = true;
+  response->message = "exploring inside the region only";
+}
+
+void PlannerNode::onFlightReach(const std_msgs::msg::Float64::SharedPtr msg) {
+  if (std::isnan(msg->data) || msg->data < 0.0) return;
+  const std::lock_guard<std::recursive_mutex> lock(planner_mutex_);
+  if (msg->data != flight_reach_m_) ++tour_assignment_version_;
+  flight_reach_m_ = msg->data;
+}
+
+void PlannerNode::onFlightState(const std_msgs::msg::String::SharedPtr msg) {
+  const std::lock_guard<std::recursive_mutex> lock(planner_mutex_);
+  if (home_state_wait_started_) {
+    auto map_read = mapReadLease();
+    // A late state must not lift home if the deadline passed before the
+    // timer callback could acquire the planner mutex.
+    seedGlobalGraph();
+    latest_flight_state_ = msg->data;
+    seedGlobalGraph();
+  } else {
+    latest_flight_state_ = msg->data;
+  }
+}
+
+std::vector<mgg::FrontierCluster> PlannerNode::insideExplorationRegion(
+    std::vector<mgg::FrontierCluster> clusters) const {
+  if (!exploration_region_) return clusters;
+  clusters.erase(std::remove_if(clusters.begin(), clusters.end(),
+                                [this](const mgg::FrontierCluster& cluster) {
+                                  return !exploration_region_->isInsideSpace(
+                                      cluster.position);
+                                }),
+                 clusters.end());
+  return clusters;
 }
 
 void PlannerNode::onObjectiveRequest(
@@ -3935,6 +4401,11 @@ void PlannerNode::onObjectiveRequest(
       response->reason = "the requested map is not the one in service";
       return;
     }
+  }
+  if (home_state_wait_started_) {
+    response->status = Service::Response::BLOCKED;
+    response->reason = "waiting for flight_state";
+    return;
   }
   if (!have_odometry_ || !map_->getStatus()) {
     response->status = Service::Response::BLOCKED;

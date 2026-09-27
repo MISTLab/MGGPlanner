@@ -21,6 +21,10 @@ bool inNoGainZone(const GainContext& ctx, const Eigen::Vector3d& voxel) {
   return false;
 }
 
+bool outsideGainRegion(const GainContext& ctx, const Eigen::Vector3d& voxel) {
+  return ctx.gain_region != nullptr && !ctx.gain_region->isInsideSpace(voxel);
+}
+
 /// Where the ground under a vertex's surroundings has been mapped. The
 /// support of a column is the first occupied voxel below the vertex's
 /// height, as the planner's ground projection would find it, searched down
@@ -169,6 +173,7 @@ void computeVolumetricGain(
       // outside any zone declared uninteresting.
       if (!ctx.global_space->isInsideSpace(voxel)) continue;
       if (inNoGainZone(ctx, voxel)) continue;
+      if (outsideGainRegion(ctx, voxel)) continue;
 
       if (ground_robot) {
         if (origin.z() - voxel.z() > max_h_below) continue;

@@ -14,6 +14,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <functional>
+#include <limits>
 #include <vector>
 
 #include <Eigen/Dense>
@@ -59,13 +60,26 @@ struct TourBidData {
   std::vector<ClusterId> explored;
   /// The bidder's bundle is done and it asks for an auction (§3.2, §3.5).
   bool request_auction = false;
+  /// The bidder's cruise speed, m/s: the auction compares its costs in
+  /// time. Positive and finite in a well-formed bid.
+  double speed_mps = 0.0;
+  /// Metres of flight the bidder has left for exploring and returning home;
+  /// infinite without a battery limit (drone scout design §4.3).
+  double reach_m = std::numeric_limits<double>::infinity();
+  /// Where the bidder must return to within its reach, this robot's frame.
+  Eigen::Vector3d home = Eigen::Vector3d::Zero();
+
+  /// Deliberate exit (drone scout design §4.4). Only identity, sequence,
+  /// stamp and pose are used; no tour or speed is needed.
+  bool leaving = false;
 
   double costBetween(std::size_t i, std::size_t j) const {
     return costs_between[i * clusters.size() + j];
   }
   /// At most kMaxBidClusters clusters, bundle entries and explored entries;
   /// cost arrays sized to the clusters; a finite pose and finite cluster
-  /// positions; costs may be +inf, never NaN or negative. The IDs in
+  /// positions; costs may be +inf, never NaN or negative; a positive,
+  /// finite speed. The IDs in
   /// clusters, bundle and explored must not be kNoCluster; current_target
   /// may be (no target). IDs are not checked against each other.
   bool wellFormed() const;

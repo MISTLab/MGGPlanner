@@ -73,11 +73,15 @@ inline constexpr double kViewpointArrivalSlack = 0.05;
 /// PlanningParams::min_observed_ground_fraction set, a ground robot's end
 /// also needs turnSpaceObserved): in run 5 (2026-09-25) path
 /// ends allowed 0.49 m from a wall left Bunkers, whose corners reach
-/// 0.64 m, boxed in. For an aerial robot it is its inscribed radius (half
-/// the smaller of RobotParams::size x and y) plus the margin. The lattice's
-/// body check is a box aligned with the map and only size_extension larger
-/// than the robot, so a vertex it admits can still end a path with the
-/// robot's flank or corner against a wall: routes on the SubT finals ended
+/// 0.64 m, boxed in. For an aerial robot it is its circumscribed radius
+/// (half the diagonal of RobotParams::size x and y) plus
+/// PlanningParams::aerial_viewpoint_clearance_margin, and never less than
+/// that radius: with the inscribed radius and 0.1 m, the drone smoke test's
+/// first goal ended 0.7 m from a wall the drone struck on the way (drone
+/// scout Task 15). The lattice's body check is a box aligned with the map
+/// and only size_extension larger than the robot, so a vertex it admits
+/// can still end a path with the robot's flank or corner against a wall:
+/// routes on the SubT finals ended
 /// 0.08 and 0.11 m from a lethal cell of the controller's costmap
 /// (2026-09-23). Unknown space passes, as it does for the lattice's body
 /// check, and so does a query the map cannot answer.

@@ -36,6 +36,7 @@
 #include <optional>
 #include <set>
 #include <vector>
+#include <utility>
 
 #include "mgg_core/fleet_auction.h"
 #include "mgg_core/fleet_claims.h"
@@ -82,6 +83,15 @@ class FleetCoordinator {
   /// it reports explored are kept for this robot's next auction (at most
   /// kMaxExploredElsewhere, the oldest go); one the last award named makes
   /// an auction due.
+  /// An exit needs robot_id >= 0, seq > 0 and a finite pose, not a tour.
+  /// It releases membership and claims immediately. Around exits, bids
+  /// are ordered by (sender stamp, seq): only a strictly newer normal bid
+  /// rejoins, including a restarted sender with a lower seq and later stamp.
+  /// An exit older than the latest normal bid is ignored. Between normal
+  /// bids the existing timestamp-based claim policy is unchanged.
+  /// While a peer is away, its calls/awards and claims in others' awards
+  /// cannot restore it. On clock rollback, future order stamps are clamped
+  /// to the local receipt time; seq is kept to break ties on the new clock.
   void onBid(const TourBidData& bid, double now_s);
   /// A peer's call or award, in this robot's frame. A malformed one (a
   /// non-finite position, a non-finite or negative silence, a bundle ID no
@@ -96,7 +106,9 @@ class FleetCoordinator {
   /// One step. Returns this robot's bid when an auction was called, every
   /// fleet.auction_interval_s, and at once when it requests an auction; as
   /// auctioneer, a call when one is due and the award once the bid deadline
-  /// has passed (applied here too). `own_bid` is called only for a bid.
+  /// has passed (applied here too). `own_bid` is called only for a bid; it
+  /// is required: without it the step sends and does nothing, and says so
+  /// once.
   FleetTickOutput tick(double now_s, const OwnBidFn& own_bid,
                        const CostEstimateFn& estimate,
                        const ExploredFn& explored);
@@ -121,6 +133,14 @@ class FleetCoordinator {
   /// longest is released so this robot may take its clusters over. Returns
   /// that robot's ID, or -1 when no silent robot holds one.
   int takeOverOldestClaim(double now_s);
+
+  /// Drop the local award and stop bidding/auctioneering until rejoin().
+  /// Announce the exit on the next tick and every auction interval, using
+  /// the own-bid provider's current pose for the radio-range check.
+  void leave(double now_s);
+  /// Resume bidding at the next tick, without waiting an auction interval.
+  void rejoin();
+  bool leaving() const { return leaving_; }
 
   /// This robot and every robot heard within fleet.peer_timeout_s, sorted.
   /// A robot last heard after `now_s` (the clock was reset) counts as just
@@ -171,7 +191,8 @@ class FleetCoordinator {
   /// the next bid, award or call waits at most one interval or deadline. The
   /// rounds applied and answered are forgotten, as their stamps are of the
   /// old clock, a pending request is sent again, and a claim's source stamp
-  /// in the future becomes `now_s`. Called first by every member that takes
+  /// in the future becomes `now_s`, as do leave/normal bid order stamps
+  /// (their seqs are kept). Called first by every member that takes
   /// the time.
   void rebaseFutureTimes(double now_s);
   /// `robot_id` was heard at the local receipt time `now_s`.
@@ -205,6 +226,9 @@ class FleetCoordinator {
 
   std::map<int, double> last_heard_s_;
   std::map<int, TourBidData> last_bids_;
+  using BidOrder = std::pair<double, std::uint64_t>;
+  std::map<int, BidOrder> last_normal_bid_;
+  std::map<int, BidOrder> away_;
   // The auctioneer each robot's latest bid, call or award names.
   std::map<int, int> follows_;
   // Per robot, the stamp of the claim's latest state: the bid or award it
@@ -220,6 +244,8 @@ class FleetCoordinator {
   std::vector<FleetCluster> award_clusters_;
   std::vector<FleetCluster> explored_elsewhere_;
   bool has_award_ = false;
+  /// A tick without an own-bid provider was reported.
+  bool missing_own_bid_logged_ = false;
   std::uint64_t assignment_version_ = 0;
   std::size_t last_unassigned_ = 0;
 
@@ -260,6 +286,8 @@ class FleetCoordinator {
   std::vector<ClusterId> reported_explored_;
   bool explored_reported_ = false;
   std::vector<int> pending_releases_;
+  bool leaving_ = false;
+  bool leave_announced_ = false;
 };
 
 }  // namespace mgg

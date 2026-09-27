@@ -353,7 +353,8 @@ bool addRefPathToGraph(GraphManager& graph, const std::vector<StateVec>& path,
 bool addRefPathToGraph(GraphManager& graph,
                        const std::vector<Vertex*>& path,
                        const ExpandContext& ctx, double vertex_spacing,
-                       std::vector<Vertex*>* path_vertices) {
+                       std::vector<Vertex*>* path_vertices,
+                       const UsableVertexFn& carries_gain) {
   std::vector<RefPose> poses;
   poses.reserve(path.size());
   for (std::size_t i = 0; i < path.size(); ++i) {
@@ -361,7 +362,8 @@ bool addRefPathToGraph(GraphManager& graph,
     // Don't add the part of the path after the first hanging vertex
     // (rrg.cpp:4868).
     if (i > 0 && path[i]->is_hanging) break;
-    poses.push_back({path[i]->state, path[i]});
+    const bool carried = !carries_gain || carries_gain(*path[i]);
+    poses.push_back({path[i]->state, carried ? path[i] : nullptr});
   }
   return addRefPath(graph, poses, ctx, vertex_spacing, path_vertices);
 }
@@ -1003,14 +1005,15 @@ GlobalFrontierReport searchGlobalFrontier(
     GraphManager& graph, int source_id, int robot_id,
     const RecomputeGainFn& recompute_gain,
     const std::vector<Eigen::Vector3d>& excluded, double exclusion_radius,
-    const Eigen::Vector3d* target, double time_budget_s) {
+    const Eigen::Vector3d* target, double time_budget_s,
+    const UsableVertexFn& eligible) {
   GlobalFrontierReport report;
 
   std::vector<Vertex*> global_frontiers;
   for (auto& entry : graph.vertices_map_) {
     Vertex* vertex = entry.second;
     if (vertex == nullptr || vertex->type != VertexType::kFrontier ||
-        !graph.inService(*vertex)) {
+        !graph.inService(*vertex) || (eligible && !eligible(*vertex))) {
       continue;
     }
     global_frontiers.push_back(vertex);

@@ -26,6 +26,7 @@ class ParamFixture : public ::testing::Test {
         {"PlanningParams.global_frame_id", std::string("R1/world")},
         {"PlanningParams.type", std::string("kAdaptiveExploration")},
         {"PlanningParams.viewpoint_clearance_margin", 0.15},
+        {"PlanningParams.aerial_viewpoint_clearance_margin", 0.8},
         {"PlanningParams.max_cross_slope", 0.1745},
         {"PlanningParams.max_footprint_tilt", 0.3491},
         {"PlanningParams.max_footprint_step", 0.12},
@@ -100,6 +101,7 @@ TEST_F(ParamFixture, LoadsPlanningParams) {
   EXPECT_EQ(params.global_frame_id, "R1/world");
   EXPECT_EQ(params.type, mgg::PlanningModeType::kAdaptiveExploration);
   EXPECT_DOUBLE_EQ(params.viewpoint_clearance_margin, 0.15);
+  EXPECT_DOUBLE_EQ(params.aerial_viewpoint_clearance_margin, 0.8);
   EXPECT_DOUBLE_EQ(params.max_cross_slope, 0.1745);
   EXPECT_DOUBLE_EQ(params.max_footprint_tilt, 0.3491);
   EXPECT_DOUBLE_EQ(params.max_footprint_step, 0.12);
@@ -168,6 +170,21 @@ TEST_F(ParamFixture, LoadsTourAndFleetParams) {
 
 // An unconverted ROS 1 config reaches ROS 2 with rad()/deg() still as strings.
 // That must be reported, not silently read as zero.
+TEST(ParamLoader, APlanningSpeedThatIsNotPositiveIsRefused) {
+  // Bids are costed at v_max (review r0, P1): a robot without a speed
+  // would bid no time at all.
+  for (const double v_max : {0.0, -1.0}) {
+    rclcpp::NodeOptions opts;
+    opts.automatically_declare_parameters_from_overrides(true);
+    opts.parameter_overrides({{"PlanningParams.v_max", v_max}});
+    auto node = std::make_shared<rclcpp::Node>("param_speed_test", opts);
+    ParamLoader p(node.get());
+    mgg::PlanningParams params;
+    EXPECT_FALSE(mgg_ros::loadPlanningParams(p, "PlanningParams", params))
+        << v_max;
+  }
+}
+
 TEST_F(ParamFixture, UnevaluatedAngleExpressionIsRejected) {
   ParamLoader p(node_.get());
   double v = -1.0;

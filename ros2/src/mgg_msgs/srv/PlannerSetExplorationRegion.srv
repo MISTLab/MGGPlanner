@@ -1,0 +1,9 @@
+# Explore only inside a box (drone scout design §3.5, "Explore here"): voxels
+# outside it give no gain and frontier clusters outside it are not toured.
+# In the planner's world frame. active = false clears it.
+bool active
+geometry_msgs/Point min
+geometry_msgs/Point max
+---
+bool success
+string message
