@@ -78,16 +78,84 @@ GridGraphResult buildGridGraph(GraphManager& graph, const StateVec& state,
   LatticeColumnGround column_ground(ctx.planning->max_step_height);
   if (ground_robot) column_ground.add(i0, j0, state.z());
 
+  // A cell whose ground was found, more than a step above or below the
+  // robot's, but whose edge to its nearest vertex was refused: on another
+  // level, reached only by going outward first, its way in may not exist
+  // yet. Offered again once the sweep is done. Cells on the robot's own
+  // level are not, which keeps the lattice as it was where there is one.
+  struct Retry {
+    Eigen::Vector3d cell;
+    int i, j;
+  };
+  std::vector<Retry> retries;
+
+  // Offers one cell to expandGraph; false when a size or loop cap stops the
+  // sweep.
+  const auto offer = [&](const Eigen::Vector3d& cell, int i, int j,
+                         bool first_pass, bool& added) {
+    added = false;
+    if (loop_count++ > ctx.planning->num_loops_max ||
+        num_vertices >= ctx.planning->num_vertices_max ||
+        num_edges >= ctx.planning->num_edges_max) {
+      result.hit_limit = true;
+      return false;
+    }
+    // The ground this cell would be dropped onto, as expandGraph drops it:
+    // a vertex at its column already on that ground makes it the same place
+    // again.
+    bool other_level = false;
+    if (ground_robot) {
+      Eigen::Vector3d sample = cell;
+      VoxelStatus ground_status;
+      const double ground_height =
+          ctx.ground->projectSample(sample, ground_status);
+      const double driving_z =
+          cell.z() - (ground_height - ctx.planning->max_ground_height);
+      if (ground_status == VoxelStatus::kOccupied &&
+          column_ground.holds(i, j, driving_z)) {
+        if (first_pass) ++result.merged_duplicates;
+        return true;
+      }
+      other_level = ground_status == VoxelStatus::kOccupied &&
+                    std::abs(driving_z - state.z()) >
+                        ctx.planning->max_step_height;
+    }
+
+    Vertex candidate(vertex_id++, StateVec(cell.x(), cell.y(), cell.z(), heading));
+    candidate.robot_id = ctx.robot_id;
+    ExpandGraphReport rep;
+    expandGraph(graph, candidate, rep, ctx);
+    if (first_pass) {
+      ++result.rejected[static_cast<int>(rep.status)];
+      if (rep.no_ground) ++result.no_ground;
+      if (rep.projected_endpoint_status == VoxelStatus::kOccupied) {
+        ++result.projected_endpoint_occupied;
+      } else if (rep.projected_endpoint_status == VoxelStatus::kUnknown) {
+        ++result.projected_endpoint_unknown;
+      }
+      for (int e = 0; e < 8; ++e) result.edge_status[e] += rep.edge_status[e];
+    }
+    if (rep.status == ExpandGraphStatus::kSuccess) {
+      added = true;
+      num_vertices += rep.num_vertices_added;
+      num_edges += rep.num_edges_added;
+      result.vertices_added += rep.num_vertices_added;
+      result.edges_added += rep.num_edges_added;
+      // A vertex clipped short of its cell stands elsewhere.
+      if (ground_robot && rep.vertex_added != nullptr &&
+          (rep.vertex_added->state.head<2>() - cell.head<2>()).norm() < 1e-6) {
+        column_ground.add(i, j, rep.vertex_added->state.z());
+      }
+    } else if (first_pass && other_level && !rep.no_ground &&
+               rep.status == ExpandGraphStatus::kErrorCollisionEdge) {
+      retries.push_back({cell, i, j});
+    }
+    return true;
+  };
+
   for (const auto& [unused_distance, i, j] : columns) {
     (void)unused_distance;
     for (int k = 0; k < num_nodes[2]; ++k) {
-      if (loop_count++ > ctx.planning->num_loops_max ||
-          num_vertices >= ctx.planning->num_vertices_max ||
-          num_edges >= ctx.planning->num_edges_max) {
-        result.hit_limit = true;
-        return result;
-      }
-
       double x_val = min_val.x() + i * grid.resolution.x();
       double y_val = min_val.y() + j * grid.resolution.y();
       const double z_val = min_val.z() + k * grid.resolution.z();
@@ -109,47 +177,29 @@ GridGraphResult buildGridGraph(GraphManager& graph, const StateVec& state,
         continue;
       }
       ++result.free_cells;
-      // The ground this cell would be dropped onto, as expandGraph drops
-      // it: a vertex at its column already on that ground makes it the same
-      // place again.
-      if (ground_robot) {
-        Eigen::Vector3d sample = cell;
-        VoxelStatus ground_status;
-        const double ground_height =
-            ctx.ground->projectSample(sample, ground_status);
-        if (ground_status == VoxelStatus::kOccupied &&
-            column_ground.holds(
-                i, j,
-                cell.z() - (ground_height - ctx.planning->max_ground_height))) {
-          ++result.merged_duplicates;
-          continue;
-        }
-      }
+      bool added = false;
+      if (!offer(cell, i, j, /*first_pass=*/true, added)) return result;
+    }
+  }
 
-      Vertex candidate(vertex_id++, StateVec(x_val, y_val, z_world, heading));
-      candidate.robot_id = ctx.robot_id;
-      ExpandGraphReport rep;
-      expandGraph(graph, candidate, rep, ctx);
-      ++result.rejected[static_cast<int>(rep.status)];
-      if (rep.no_ground) ++result.no_ground;
-      if (rep.projected_endpoint_status == VoxelStatus::kOccupied) {
-        ++result.projected_endpoint_occupied;
-      } else if (rep.projected_endpoint_status == VoxelStatus::kUnknown) {
-        ++result.projected_endpoint_unknown;
+  // Retry passes, nearest first again, while the last one joined a vertex.
+  for (int pass = 0; pass < kGridGraphRetryPasses && !retries.empty(); ++pass) {
+    std::vector<Retry> left;
+    int joined = 0;
+    for (const Retry& retry : retries) {
+      bool added = false;
+      if (!offer(retry.cell, retry.i, retry.j, /*first_pass=*/false, added)) {
+        return result;
       }
-      for (int e = 0; e < 8; ++e) result.edge_status[e] += rep.edge_status[e];
-      if (rep.status == ExpandGraphStatus::kSuccess) {
-        num_vertices += rep.num_vertices_added;
-        num_edges += rep.num_edges_added;
-        result.vertices_added += rep.num_vertices_added;
-        result.edges_added += rep.num_edges_added;
-        // A vertex clipped short of its cell stands elsewhere.
-        if (ground_robot && rep.vertex_added != nullptr &&
-            (rep.vertex_added->state.head<2>() - cell.head<2>()).norm() < 1e-6) {
-          column_ground.add(i, j, rep.vertex_added->state.z());
-        }
+      if (added) {
+        ++joined;
+      } else {
+        left.push_back(retry);
       }
     }
+    result.retried_joined += joined;
+    retries.swap(left);
+    if (joined == 0) break;
   }
   return result;
 }

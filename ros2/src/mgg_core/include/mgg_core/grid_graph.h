@@ -61,6 +61,12 @@ struct GridGraphResult {
   /// a step of a vertex already at the same lattice column
   /// (LatticeColumnGround): the same place reached from another z level.
   int merged_duplicates = 0;
+  /// Cells on another level than the robot's (ground more than a step
+  /// above or below) refused an edge in the sweep and joined on a retry
+  /// pass once vertices beyond them had been added: ground reached only by
+  /// going outward first (a deck over the floor, reached up a ramp further
+  /// out).
+  int retried_joined = 0;
   /// Why the candidates that were offered got turned away, indexed by
   /// ExpandGraphStatus. A sweep that finds plenty of free cells and produces
   /// no vertices is otherwise indistinguishable from one that found nothing,
@@ -99,13 +105,19 @@ class LatticeColumnGround {
   std::unordered_map<std::int64_t, std::vector<double>> heights_;
 };
 
+/// Retry passes over the cells the sweep refused an edge (GridGraphResult::
+/// retried_joined); each stops the retries when it joins nothing.
+inline constexpr int kGridGraphRetryPasses = 3;
+
 /// Sweeps the lattice around `state` and grows `graph` through it.
 ///
 /// `heading` rotates the lattice about z so it follows the robot rather than
 /// the world axes. Columns are swept outward from the robot, nearest first,
-/// so a size or loop cap leaves out the farthest cells. For a ground robot,
-/// a cell whose ground a vertex at its column already stands on
-/// (LatticeColumnGround) is not offered again.
+/// so a size or loop cap leaves out the farthest cells; cells on another
+/// level than the robot's refused an edge are offered again after the
+/// sweep (kGridGraphRetryPasses). For a
+/// ground robot, a cell whose ground a vertex at its column already stands
+/// on (LatticeColumnGround) is not offered again.
 GridGraphResult buildGridGraph(GraphManager& graph, const StateVec& state,
                                const GridGraphParams& grid,
                                const ExpandContext& ctx, double heading);

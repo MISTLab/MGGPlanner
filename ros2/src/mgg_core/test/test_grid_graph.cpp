@@ -2,6 +2,8 @@
 // The ROS 1 version had none: it ran only inside a full planning cycle.
 
 #include <cmath>
+#include <functional>
+#include <map>
 #include <memory>
 #include <set>
 #include <utility>
@@ -672,6 +674,150 @@ TEST(GridGraph, HomeOnALedgeIsNotEnteredWithItsFrontOverTheDrop) {
                 1);
     }
   }
+}
+
+/// Ground at several levels: each 0.2 m column holds the tops of the solids
+/// in it, each solid 0.2 m thick, and every other cell is free. A vertical
+/// ray stops on the first top below where it starts.
+class StackedFloors : public OpenSpace {
+ public:
+  void add(double x0, double x1, double y0, double y1,
+           const std::function<double(double, double)>& top) {
+    for (auto x = key(x0); x < key(x1); ++x) {
+      for (auto y = key(y0); y < key(y1); ++y) {
+        tops_[{x, y}].push_back(top((x + 0.5) * 0.2, (y + 0.5) * 0.2));
+      }
+    }
+  }
+  bool getAxisAlignedXYCellCenter(const Eigen::Vector2d& p,
+                                  Eigen::Vector2d& center) const override {
+    center = Eigen::Vector2d(key(p.x()) + 0.5, key(p.y()) + 0.5) * 0.2;
+    return true;
+  }
+  VoxelStatus getVoxelStatus(const Eigen::Vector3d& p) const override {
+    for (const double top : column(p)) {
+      if (p.z() <= top && p.z() >= top - 0.2) return VoxelStatus::kOccupied;
+    }
+    return VoxelStatus::kFree;
+  }
+  VoxelStatus getRayStatus(const Eigen::Vector3d& a, const Eigen::Vector3d& b,
+                           bool, Eigen::Vector3d& end_voxel) const override {
+    end_voxel = b;
+    double best = -1e9;
+    for (const double top : column(a)) {
+      if (top <= a.z() + 1e-9 && top >= b.z() && top > best) best = top;
+    }
+    if (best < -1e8) return VoxelStatus::kFree;
+    end_voxel = Eigen::Vector3d((key(a.x()) + 0.5) * 0.2,
+                                (key(a.y()) + 0.5) * 0.2, best);
+    return VoxelStatus::kOccupied;
+  }
+  VoxelStatus getBoxStatus(const Eigen::Vector3d& c, const Eigen::Vector3d& size,
+                           bool) const override {
+    const Eigen::Vector3d lo = c - 0.5 * size, hi = c + 0.5 * size;
+    for (auto x = key(lo.x()); x <= key(hi.x()); ++x) {
+      for (auto y = key(lo.y()); y <= key(hi.y()); ++y) {
+        const auto it = tops_.find({x, y});
+        if (it == tops_.end()) continue;
+        for (const double top : it->second) {
+          if (top >= lo.z() && top - 0.2 <= hi.z()) return VoxelStatus::kOccupied;
+        }
+      }
+    }
+    return VoxelStatus::kFree;
+  }
+  VoxelStatus getPathStatus(const Eigen::Vector3d& a, const Eigen::Vector3d& b,
+                            const Eigen::Vector3d& size, bool s) const override {
+    const double steps = std::max(1.0, std::ceil((b - a).norm() / 0.2));
+    const Eigen::Vector3d step = (b - a) / steps;
+    for (int i = 0; i < static_cast<int>(steps); ++i) {
+      if (getBoxStatus(a + (i + 0.5) * step, size + step.cwiseAbs(), s) !=
+          VoxelStatus::kFree) {
+        return VoxelStatus::kOccupied;
+      }
+    }
+    return VoxelStatus::kFree;
+  }
+
+ private:
+  static std::int64_t key(double v) {
+    return static_cast<std::int64_t>(std::floor(v / 0.2));
+  }
+  std::vector<double> column(const Eigen::Vector3d& p) const {
+    const auto it = tops_.find({key(p.x()), key(p.y())});
+    return it == tops_.end() ? std::vector<double>{} : it->second;
+  }
+  std::map<std::pair<std::int64_t, std::int64_t>, std::vector<double>> tops_;
+};
+
+// Review r0 (mgg-run8), multi-level connectivity: a deck 1.2 m over the
+// robot's floor, near it, is reached only by driving outward first: along
+// the floor to a ramp 4.6 m out, up it, back along an upper walkway and
+// onto the deck. The lattice sweeps outward, so the deck's columns come
+// before the ramp that leads to them; the lattice must still join the
+// deck, and keep the floor under it as a level of its own.
+TEST(GridGraph, ADeckOverTheFloorReachedOnlyByGoingOutwardFirstIsJoined) {
+  StackedFloors map;
+  const auto flat = [](double level) {
+    return [level](double, double) { return level; };
+  };
+  map.add(-1.0, 6.0, -0.6, 0.6, flat(0.0));             // floor
+  map.add(4.6, 6.0, 0.6, 3.0, [](double, double y) {    // ramp, 26.6 deg
+    return 0.5 * (y - 0.6);
+  });
+  map.add(0.4, 6.0, 3.0, 3.8, flat(1.2));               // upper walkway
+  map.add(0.4, 2.0, 0.6, 3.0, flat(1.2));               // bridge
+  map.add(0.4, 2.0, -0.6, 0.6, flat(1.2));              // deck over the floor
+  RobotParams robot;
+  robot.type = RobotType::kGroundRobot;
+  robot.size = Eigen::Vector3d(0.4, 0.4, 0.3);
+  PlanningParams planning;
+  planning.max_ground_height = 0.3;
+  planning.max_step_height = 0.15;
+  planning.max_inclination = 0.52;
+  planning.edge_length_min = 0.05;
+  planning.edge_length_max = 0.8;
+  planning.edge_overshoot = 0.0;
+  planning.nearest_range = 0.6;
+  planning.nearest_range_min = 0.05;
+  planning.nearest_range_max = 1.0;
+  planning.nearest_range_z = 0.3;
+  planning.num_vertices_max = 5000;
+  planning.num_edges_max = 50000;
+  planning.num_loops_max = 100000;
+  planning.min_observed_ground_fraction = 0.0;
+  const mgg::GroundProjection ground(map, planning);
+  ExpandContext ctx;
+  ctx.map = &map;
+  ctx.planning = &planning;
+  ctx.robot = &robot;
+  ctx.ground = &ground;
+  ctx.robot_box_size = robot.getPlanningSize();
+  ctx.root_is_robot = true;
+  GraphManager graph;
+  const StateVec root(0.1, 0.1, 0.3, 0.0);
+  graph.addVertex(new Vertex(0, root));
+  GridGraphParams g;
+  g.min_val = Eigen::Vector3d(-0.8, -0.8, -0.2);
+  g.max_val = Eigen::Vector3d(6.0, 4.0, 1.4);
+  g.resolution = Eigen::Vector3d(0.4, 0.4, 0.2);
+  const auto r = buildGridGraph(graph, root, g, ctx, 0.0);
+  ASSERT_EQ(r.status, GridGraphStatus::kOk);
+  mgg::ShortestPathsReport rep;
+  ASSERT_TRUE(graph.findShortestPaths(0, rep));
+  int deck = 0, floor_under_deck = 0, walkway = 0;
+  for (const auto& [id, v] : graph.vertices_map_) {
+    const bool reached = id == 0 || rep.parent_id_map.at(id) != id;
+    if (!reached) continue;
+    const bool over_floor = v->state.x() > 0.5 && v->state.x() < 1.9 &&
+                            std::abs(v->state.y()) < 0.5;
+    if (over_floor && v->state.z() > 1.3) ++deck;
+    if (over_floor && v->state.z() < 0.5) ++floor_under_deck;
+    if (v->state.y() > 3.0 && v->state.z() > 1.3) ++walkway;
+  }
+  EXPECT_GT(walkway, 0);
+  EXPECT_GT(floor_under_deck, 0);
+  EXPECT_GT(deck, 0);
 }
 
 }  // namespace
