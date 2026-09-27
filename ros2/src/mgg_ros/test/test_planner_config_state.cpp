@@ -24,8 +24,37 @@ using Region = mgg_msgs::srv::PlannerSetExplorationRegion;
 using Target = mgg_msgs::srv::PlannerSetExplorationTarget;
 using Leave = std_srvs::srv::SetBool;
 
+// Isolate the ROS contract from an on-disk mapping product: readiness alone
+// is supplied; the real MOLA geometry queries still report unknown space.
+class ReadyUnknownMap : public mgg::MolaMap {
+ public:
+  ReadyUnknownMap()
+      : mgg::MolaMap(mgg::MolaMapConfig{"/nonexistent/config_plan"}) {}
+  bool getStatus() const override { return true; }
+};
+
 class PlannerNodeTestPeer {
  public:
+  static void enablePlanning(PlannerNode& node) {
+    const std::lock_guard<std::recursive_mutex> lock(node.planner_mutex_);
+    auto map = std::make_unique<ReadyUnknownMap>();
+    node.mola_map_ = map.get();
+    node.map_ = std::move(map);
+    node.ground_ = std::make_unique<mgg::GroundProjection>(
+        *node.map_, node.planning_params_);
+    node.robot_params_.type = mgg::RobotType::kAerialRobot;
+    node.grid_params_.min_val = Eigen::Vector3d::Constant(-1);
+    node.grid_params_.max_val = Eigen::Vector3d::Constant(1);
+    node.grid_params_.resolution = Eigen::Vector3d::Ones();
+    node.have_odometry_ = true;
+    node.last_odometry_received_ = std::chrono::steady_clock::now();
+  }
+
+  static int computedPlans(PlannerNode& node) {
+    const std::lock_guard<std::recursive_mutex> lock(node.planner_mutex_);
+    return node.planner_trigger_count_;
+  }
+
   // Read the fields the planner actually uses, not its publication cache.
   static ConfigState applied(PlannerNode& node) {
     const std::lock_guard<std::recursive_mutex> lock(node.planner_mutex_);
@@ -203,6 +232,7 @@ TEST_F(PlannerConfigStateTest, LateSubscriberReceivesInitialState) {
   const auto& state = observer.states.back();
   EXPECT_NE(state.incarnation, 0u);
   EXPECT_EQ(state.generation, 1u);
+  EXPECT_EQ(state.last_plan_generation, 0u);
   ConfigState expected;
   expected.fleet_enabled = true;
   expectFields(state, expected);
@@ -304,7 +334,9 @@ TEST_F(PlannerConfigStateTest, LeaveRejoinAndTheirNoOpsReflectTheCoordinator) {
     EXPECT_TRUE(state.fleet_enabled);
     EXPECT_EQ(state.leaving_fleet, leaving[i]);
     expectFields(state, PlannerNodeTestPeer::applied(*planner));
-    if (i % 2 == 1) EXPECT_EQ(state, before);
+    if (i % 2 == 1) {
+      EXPECT_EQ(state, before);
+    }
   }
 }
 
@@ -340,9 +372,17 @@ TEST_F(PlannerConfigStateTest, InvalidSettersDoNotAdvanceOrPublishState) {
   expectFields(observer.states.back(), PlannerNodeTestPeer::applied(*planner));
 }
 
-TEST_F(PlannerConfigStateTest, TwoPlannersHaveDistinctNonzeroIncarnations) {
+TEST_F(PlannerConfigStateTest, SequentialPlannersHaveIncreasingWallClockIncarnations) {
+  const auto epoch_ns = [] {
+    return static_cast<std::uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::system_clock::now().time_since_epoch()).count());
+  };
+  const auto before_first = epoch_ns();
   auto first = makeNode("config_first");
+  const auto after_first = epoch_ns();
   auto second = makeNode("config_second");
+  const auto after_second = epoch_ns();
   Observer first_observer(first);
   Observer second_observer(second);
   ASSERT_TRUE(first_observer.waitFor([&] { return !first_observer.states.empty(); }));
@@ -351,7 +391,86 @@ TEST_F(PlannerConfigStateTest, TwoPlannersHaveDistinctNonzeroIncarnations) {
   const auto b = second_observer.states.back().incarnation;
   EXPECT_NE(a, 0u);
   EXPECT_NE(b, 0u);
-  EXPECT_NE(a, b);
+  EXPECT_GT(b, a);
+  EXPECT_GE(a, before_first);
+  EXPECT_LE(a, after_first);
+  EXPECT_GE(b, after_first);
+  EXPECT_LE(b, after_second);
+}
+
+TEST_F(PlannerConfigStateTest, ComputedPlanPublishesItsGenerationBeforeResponseDispatch) {
+  auto planner = makeNode("config_plan");
+  Observer observer(planner);
+  ASSERT_TRUE(observer.waitFor([&] { return !observer.states.empty(); }));
+  EXPECT_EQ(observer.states.back().last_plan_generation, 0u);
+  PlannerNodeTestPeer::enablePlanning(*planner);
+
+  // Keep client response dispatch on a separate executor. Dispatch the planner
+  // and state subscriber first, then the client: DDS does not promise ordering
+  // between the state topic and service replies on different endpoints.
+  auto client_node = std::make_shared<rclcpp::Node>("config_plan_client");
+  auto client = client_node->create_client<mgg_msgs::srv::PlannerSrv>(
+      "/config_plan/mgg/mggplanner");
+  rclcpp::executors::SingleThreadedExecutor responses;
+  responses.add_node(client_node);
+  ASSERT_TRUE(client->wait_for_service(3s));
+  auto plan = [&] {
+    const auto before = observer.states.back();
+    auto future = client->async_send_request(
+        std::make_shared<mgg_msgs::srv::PlannerSrv::Request>());
+    ASSERT_TRUE(observer.waitFor([&] {
+      return observer.states.back().last_plan_generation == before.generation;
+    }));
+    EXPECT_EQ(responses.spin_until_future_complete(future, 3s),
+              rclcpp::FutureReturnCode::SUCCESS);
+    ASSERT_EQ(future.get()->status, PlannerNode::kStatusNoPath);
+    const auto& state = observer.states.back();
+    EXPECT_EQ(state.last_plan_generation, before.generation);
+    EXPECT_EQ(state.generation, before.generation);
+    EXPECT_EQ(state.incarnation, before.incarnation);
+    EXPECT_EQ(state.stamp, before.stamp);
+    expectFields(state, before);
+  };
+  plan();
+  ASSERT_EQ(PlannerNodeTestPeer::computedPlans(*planner), 1);
+  const auto after_first_plan = observer.states.back();
+  const auto count = observer.states.size();
+  // Same configuration, another real exploration answer: no state publication.
+  auto unchanged = observer.call<mgg_msgs::srv::PlannerSrv>(
+      "/config_plan/mgg/mggplanner", mgg_msgs::srv::PlannerSrv::Request());
+  EXPECT_EQ(unchanged->status, PlannerNode::kStatusNoPath);
+  EXPECT_EQ(PlannerNodeTestPeer::computedPlans(*planner), 2);
+  EXPECT_FALSE(observer.waitFor([&] { return observer.states.size() > count; }, 100ms));
+
+  // A setter preserves the preceding plan's watermark, and only the next
+  // computed plan advances it to the new configuration generation.
+  Target::Request target;
+  target.active = true;
+  target.target.x = 5;
+  ASSERT_TRUE(observer.call<Target>(
+      "/config_plan/mgg/set_exploration_target", target)->success);
+  ASSERT_TRUE(observer.waitFor([&] { return observer.states.size() > count; }));
+  EXPECT_EQ(observer.states.back().generation, 2u);
+  EXPECT_EQ(observer.states.back().last_plan_generation, 1u);
+  EXPECT_EQ(after_first_plan.last_plan_generation, 1u);
+  plan();
+  EXPECT_EQ(PlannerNodeTestPeer::computedPlans(*planner), 3);
+  EXPECT_EQ(observer.states.back().last_plan_generation, 2u);
+}
+
+TEST_F(PlannerConfigStateTest, NotReadyRefusalDoesNotClaimAPlanUsedTheConfiguration) {
+  auto planner = makeNode("config_plan_not_ready");
+  Observer observer(planner);
+  ASSERT_TRUE(observer.waitFor([&] { return !observer.states.empty(); }));
+  const auto before = observer.states.back();
+  auto response = observer.call<mgg_msgs::srv::PlannerSrv>(
+      "/config_plan_not_ready/mgg/mggplanner",
+      mgg_msgs::srv::PlannerSrv::Request());
+  EXPECT_EQ(response->status, PlannerNode::kStatusNotReady);
+  EXPECT_EQ(PlannerNodeTestPeer::computedPlans(*planner), 0);
+  EXPECT_FALSE(observer.waitFor([&] { return observer.states.size() > 1; }, 100ms));
+  EXPECT_EQ(observer.states.back(), before);
+  EXPECT_EQ(observer.states.back().last_plan_generation, 0u);
 }
 
 TEST_F(PlannerConfigStateTest, SetterCannotPublishBeforeAcquiringPlannerMutex) {

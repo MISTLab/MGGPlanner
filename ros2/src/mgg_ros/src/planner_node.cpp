@@ -140,10 +140,11 @@ PlannerNode::PlannerNode(const rclcpp::NodeOptions& options)
     }
   });
 
-  std::random_device random;
-  planner_config_state_.incarnation =
-      std::uniform_int_distribution<std::uint64_t>(
-          1, std::numeric_limits<std::uint64_t>::max())(random);
+  planner_config_state_.incarnation = static_cast<std::uint64_t>(
+      std::chrono::duration_cast<std::chrono::nanoseconds>(
+          std::chrono::system_clock::now().time_since_epoch()).count());
+  RCLCPP_INFO(get_logger(), "planner configuration incarnation: %llu (wall-clock ns)",
+              static_cast<unsigned long long>(planner_config_state_.incarnation));
 
   loadParameters();
 
@@ -3795,6 +3796,14 @@ void PlannerNode::onPlanRequest(
   publishPath();
   publishMarkers();
   RCLCPP_INFO(get_logger(), "plan request: %s", summary.c_str());
+  // A computed answer (including no-path/complete), not an early NOT_READY
+  // refusal, establishes which configuration this exploration cycle used.
+  // Publish before returning the service response, still under planner_mutex_.
+  if (planner_config_state_.last_plan_generation !=
+      planner_config_state_.generation) {
+    planner_config_state_.last_plan_generation = planner_config_state_.generation;
+    publishPlannerConfigState();
+  }
 }
 
 void PlannerNode::recordSentPath() {
@@ -3826,6 +3835,7 @@ void PlannerNode::publishPlannerConfigState() {
   state.incarnation = planner_config_state_.incarnation;
   state.generation = planner_config_state_.generation;
   state.stamp = planner_config_state_.stamp;
+  state.last_plan_generation = planner_config_state_.last_plan_generation;
   state.region_active = exploration_region_.has_value();
   if (exploration_region_) {
     const auto& region = *exploration_region_;
