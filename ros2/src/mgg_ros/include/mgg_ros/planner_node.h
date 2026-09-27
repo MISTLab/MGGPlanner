@@ -190,6 +190,16 @@ class PlannerNode : public rclcpp::Node {
   /// peer_edges_open_.
   bool peerBlocksSegment(const Eigen::Vector3d& from,
                          const Eigen::Vector3d& to) const;
+  /// Pins the peer bodies in force now in `pin`, on this thread, for the
+  /// rest of a plan or objective request (mgg::MolaMap::TransientDiscPin):
+  /// every map query, roadmap search and route check of the request sees
+  /// this one set, and onPeerBodies, serialised with planning, publishes
+  /// the next only after it. Left empty without the mola_snapshot backend.
+  void pinPeerBodies(std::optional<mgg::MolaMap::TransientDiscPin>& pin);
+  /// Whether `path`, driven from its first pose, keeps clear of the peer
+  /// bodies (peerBlocksSegment): the last check on every path and route
+  /// sent, as noGoAdmissible is for the zones.
+  bool peerAdmissible(const std::vector<mgg::StateVec>& path) const;
   /// The global graph's edge test (GraphManager::setEdgeBlocked): a no-go
   /// zone or a peer body closes the edge from `a` to `b` for this search,
   /// and the roadmap keeps it. Records each edge a peer closes in

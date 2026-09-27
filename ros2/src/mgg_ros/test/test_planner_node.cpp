@@ -196,11 +196,14 @@ class MolaFloorProduct {
   ~MolaFloorProduct() { std::filesystem::remove_all(root_); }
 
   /// A MolaMap serving the product, once it has loaded it.
-  std::unique_ptr<mgg::MolaMap> serve() const {
+  /// A `Map`, a MolaMap or one derived from it, serving the product once
+  /// it has loaded it.
+  template <class Map = mgg::MolaMap>
+  std::unique_ptr<Map> serve() const {
     mgg::MolaMapConfig config;
     config.peer_root = root_.string();
     config.snapshot_ttl_sec = 60.0;
-    auto map = std::make_unique<mgg::MolaMap>(config);
+    auto map = std::make_unique<Map>(config);
     map->requestSnapshot(request_);
     for (int i = 0; i < 400 && !map->getStatus(); ++i) {
       std::this_thread::sleep_for(std::chrono::milliseconds(5));
@@ -2136,6 +2139,106 @@ TEST_F(PlannerNodeTest, NavigateAndReturnHomeBehindAParkedPeerAreBlockedUntilItL
       peerObjective(*node, Service::Request::NAVIGATE, 20.0, 20.0);
   EXPECT_EQ(off_map->status, Service::Response::UNREACHABLE)
       << off_map->reason;
+}
+
+namespace {
+
+/// Review r0, I5: peer bodies published from another thread while a plan
+/// request is under way. Once armed, the first voxel, ground ray or box
+/// the request asks of the map publishes a peer through the node's peer_bodies
+/// callback on another thread, waits for it to run as far as it can, and
+/// records whether the map, read by a third thread, holds the new peer
+/// yet.
+class PeerUpdateProbeMap : public mgg::MolaMap {
+ public:
+  using mgg::MolaMap::MolaMap;
+  PlannerNode* node = nullptr;
+  bool armed = false;
+  Eigen::Vector2d peer = Eigen::Vector2d::Zero();
+  std::future<void> writer;
+  std::optional<bool> published_during_request;
+  mgg::VoxelStatus getVoxelStatus(
+      const Eigen::Vector3d& position) const override {
+    publishOnce();
+    return mgg::MolaMap::getVoxelStatus(position);
+  }
+  mgg::VoxelStatus getBoxStatus(const Eigen::Vector3d& center,
+                                const Eigen::Vector3d& size,
+                                bool stop_at_unknown_voxel) const override {
+    publishOnce();
+    return mgg::MolaMap::getBoxStatus(center, size, stop_at_unknown_voxel);
+  }
+  mgg::VoxelStatus getGroundRayStatus(
+      const Eigen::Vector3d& view_point, const Eigen::Vector3d& voxel_to_test,
+      bool stop_at_unknown_voxel, Eigen::Vector3d& end_voxel) const override {
+    publishOnce();
+    return mgg::MolaMap::getGroundRayStatus(view_point, voxel_to_test,
+                                            stop_at_unknown_voxel, end_voxel);
+  }
+  mgg::VoxelStatus getStaticBoxStatus(const Eigen::Vector3d& center,
+                                      const Eigen::Vector3d& size,
+                                      bool stop_at_unknown) const override {
+    publishOnce();
+    return mgg::MolaMap::getStaticBoxStatus(center, size, stop_at_unknown);
+  }
+
+ private:
+  void publishOnce() const {
+    auto* self = const_cast<PeerUpdateProbeMap*>(this);
+    if (!self->armed) return;
+    self->armed = false;
+    self->writer = std::async(std::launch::async, [self]() {
+      PlannerNodeTestPeer::receivePeerBodies(*self->node, {self->peer});
+    });
+    self->writer.wait_for(std::chrono::milliseconds(100));
+    self->published_during_request =
+        std::async(std::launch::async, [self]() {
+          return !self->activeTransientDiscs().centres.empty();
+        }).get();
+  }
+};
+
+}  // namespace
+
+TEST_F(PlannerNodeTest, APeerUpdateDuringARequestWaitsForItAndTheRequestSeesOneSet) {
+  // Review r0, I5: the straight 6 m route of AStraightRouteThroughAPeerIs-
+  // Refused is resumed while a peer is published parking on it. The
+  // publication waits for the request, which plans with the peers as they
+  // were when it started from its first search to its last check: the
+  // route is sent whole. The next request sees the peer and refuses it.
+  auto node = makeNode("peer_update_mid_request");
+  MolaFloorProduct product(-7.5, 1.5, -1.5, 1.5);
+  auto served = product.serve<PeerUpdateProbeMap>();
+  PeerUpdateProbeMap* probe = served.get();
+  probe->node = node.get();
+  PlannerNodeTestPeer::useMolaMap(*node, std::move(served));
+  PlannerNodeTestPeer::serveMap(*node, "component:test", 1);
+  PlannerNodeTestPeer::setMinObservedGround(*node, 0.0);
+  PlannerNodeTestPeer::acceptOdometryFacing(*node, 0.0, 0.0, M_PI, 1.0);
+  const int frontier =
+      PlannerNodeTestPeer::addGlobalChainToFrontier(*node, {{-6.0, 0.0}}, M_PI);
+  PlannerNodeTestPeer::setTour(*node, false, 0.0);
+  const auto resume = [&]() {
+    PlannerNodeTestPeer::repositionTowards(*node, frontier);
+    auto response = std::make_shared<mgg_msgs::srv::PlannerSrv::Response>();
+    PlannerNodeTestPeer::plan(*node, response);
+    return response;
+  };
+
+  probe->peer = Eigen::Vector2d(-3.0, 0.0);
+  probe->armed = true;
+  auto response = resume();
+  ASSERT_TRUE(probe->writer.valid());
+  probe->writer.get();
+  ASSERT_TRUE(probe->published_during_request.has_value());
+  EXPECT_FALSE(*probe->published_during_request);
+  EXPECT_EQ(response->status, mgg_msgs::srv::PlannerSrv::Response::FORWARD);
+  EXPECT_TRUE(PlannerNodeTestPeer::bestPathFromGlobalGraph(*node));
+  EXPECT_NEAR(response->path.back().position.x, -6.0, 0.1);
+
+  response = resume();
+  EXPECT_FALSE(PlannerNodeTestPeer::bestPathFromGlobalGraph(*node));
+  EXPECT_GE(nearestTo(response->path, probe->peer), kPeerReachM - 0.01);
 }
 
 TEST_F(PlannerNodeTest, ATourTargetBehindAParkedPeerIsSetAsideBriefly) {

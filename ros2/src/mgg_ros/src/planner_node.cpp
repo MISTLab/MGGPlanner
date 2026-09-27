@@ -1438,11 +1438,14 @@ void PlannerNode::onPeerBodies(
       centres.emplace_back(pose.position.x, pose.position.y);
     }
   }
+  // Published between requests, never during one: a plan or objective
+  // request plans with one peer set throughout (pinPeerBodies), and the
+  // revision below changes with it (review r0, I5).
+  const std::lock_guard<std::recursive_mutex> lock(planner_mutex_);
   mola_map_->setTransientDiscs(centres, peer_body_radius_m_, peer_body_ttl_s_);
   // The global graph's searches close the edges a peer body blocks
   // (globalEdgeBlocked): a body appearing, leaving or moving more than its
   // radius changes the route costs the tour caches by revision.
-  const std::lock_guard<std::recursive_mutex> lock(planner_mutex_);
   bool moved = centres.size() != peer_body_centres_.size();
   for (std::size_t i = 0; !moved && i < centres.size(); ++i) {
     moved = (centres[i] - peer_body_centres_[i]).norm() > peer_body_radius_m_;
@@ -1518,6 +1521,22 @@ bool PlannerNode::peerBlocksSegment(const Eigen::Vector3d& from,
   return mola_map_->transientDiscsBlockSweep(
       from + robot_params_.center_offset, to + robot_params_.center_offset,
       0.5 * std::max(box.x(), box.y()));
+}
+
+void PlannerNode::pinPeerBodies(
+    std::optional<mgg::MolaMap::TransientDiscPin>& pin) {
+  if (mola_map_ == nullptr) return;
+  mgg::MolaMap::TransientDiscSet peers = mola_map_->activeTransientDiscs();
+  pin.emplace(*mola_map_, std::move(peers.centres), peers.radius_m);
+}
+
+bool PlannerNode::peerAdmissible(const std::vector<mgg::StateVec>& path) const {
+  for (std::size_t i = 1; i < path.size(); ++i) {
+    if (peerBlocksSegment(path[i - 1].head<3>(), path[i].head<3>())) {
+      return false;
+    }
+  }
+  return true;
 }
 
 bool PlannerNode::globalEdgeBlocked(const mgg::Vertex& a,
@@ -3404,6 +3423,9 @@ void PlannerNode::onPlanRequest(
     const std::shared_ptr<mgg_msgs::srv::PlannerSrv::Request> request,
     std::shared_ptr<mgg_msgs::srv::PlannerSrv::Response> response) {
   const std::lock_guard<std::recursive_mutex> lock(planner_mutex_);
+  // One peer set for the whole request (review r0, I5).
+  std::optional<mgg::MolaMap::TransientDiscPin> peer_pin;
+  pinPeerBodies(peer_pin);
   lattice_path_.clear();
   peer_blocked_edges_.clear();
   withdrawUnplacedNeighbours();
@@ -3695,6 +3717,12 @@ void PlannerNode::onPlanRequest(
     best_path_.clear();
     summary += "; the path enters a no-go zone: no path";
   }
+  if (!peerAdmissible(best_path_)) {
+    // And nothing is sent through a peer body of the set this request
+    // planned with.
+    best_path_.clear();
+    summary += "; the path meets a peer body: no path";
+  }
   if (!peer_blocked_edges_.empty()) {
     summary += "; " + std::to_string(peer_blocked_edges_.size()) +
                " global graph edge(s) blocked by peers";
@@ -3772,6 +3800,9 @@ void PlannerNode::onObjectiveRequest(
     std::shared_ptr<mgg_msgs::srv::PlanObjective::Response> response) {
   using Service = mgg_msgs::srv::PlanObjective;
   const std::lock_guard<std::recursive_mutex> lock(planner_mutex_);
+  // One peer set for the whole request (review r0, I5).
+  std::optional<mgg::MolaMap::TransientDiscPin> peer_pin;
+  pinPeerBodies(peer_pin);
   // An objective supersedes exploration's last path.
   turn_back_hysteresis_.reset();
   refreshNoGoZones();
@@ -3926,6 +3957,11 @@ void PlannerNode::onObjectiveRequest(
   if (!noGoAdmissible(route)) {
     response->status = Service::Response::UNREACHABLE;
     response->reason = "the route enters a no-go zone";
+    return;
+  }
+  if (!peerAdmissible(route)) {
+    response->status = Service::Response::BLOCKED;
+    response->reason = "blocked by a peer: the route meets a peer body";
     return;
   }
   response->status = Service::Response::SUCCEEDED;
