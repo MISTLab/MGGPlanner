@@ -271,12 +271,20 @@ PlannerNode::PlannerNode(const rclcpp::NodeOptions& options)
       sub_opts);
   // Latched: SwarmDeck republishes the whole set on each change and owns
   // the zones' lifetime; a planner started later still gets the last set.
+  // Each message replaces the set, so they are handled one at a time, in
+  // the order taken, in a group of their own: in the reentrant group an
+  // older message could take the planner mutex after a newer one and put
+  // an obsolete set back (review r0, I-4).
+  no_go_zones_group_ =
+      create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
+  rclcpp::SubscriptionOptions no_go_opts;
+  no_go_opts.callback_group = no_go_zones_group_;
   no_go_zones_sub_ = create_subscription<geometry_msgs::msg::PoseArray>(
       "no_go_zones", rclcpp::QoS(1).transient_local(),
       [this](geometry_msgs::msg::PoseArray::ConstSharedPtr m) {
         onNoGoZones(m);
       },
-      sub_opts);
+      no_go_opts);
 
   graph_pub_ = create_publisher<mgg_msgs::msg::Graph>("neighbour_graph_out",
                                                       rclcpp::QoS(10));

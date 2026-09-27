@@ -747,6 +747,9 @@ class PlannerNode : public rclcpp::Node {
   /// Reentrant, so the planning service and the subscriptions can run
   /// concurrently under a MultiThreadedExecutor. See the note in main().
   rclcpp::CallbackGroup::SharedPtr callback_group_;
+  /// no_go_zones alone: its messages replace one another, so they are
+  /// handled one at a time.
+  rclcpp::CallbackGroup::SharedPtr no_go_zones_group_;
 };
 
 }  // namespace mgg_ros

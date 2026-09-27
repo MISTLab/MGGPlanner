@@ -246,6 +246,15 @@ class PlannerNodeTestPeer {
     vertex->robot_id = robot_id;
     node.global_graph_->addNeighbourVertex(vertex, 1000000);
   }
+  /// The no-go zones in force, planning frame.
+  static std::vector<Eigen::Vector2d> noGoZones(PlannerNode& node) {
+    const std::lock_guard<std::recursive_mutex> lock(node.planner_mutex_);
+    return node.no_go_zones_;
+  }
+  static rclcpp::CallbackGroupType noGoZonesCallbackGroupType(
+      PlannerNode& node) {
+    return node.no_go_zones_group_->type();
+  }
   /// No-go zones at `points`, as SwarmDeck publishes them.
   static void receiveNoGoZones(PlannerNode& node, const std::string& frame,
                                const std::vector<Eigen::Vector2d>& points) {
@@ -1466,6 +1475,66 @@ TEST_F(PlannerNodeTest, ANoGoZoneTurnsTheGlobalRouteAwayOrLeavesNone) {
   ASSERT_EQ(response->status, mgg_msgs::srv::PlanObjective::Response::SUCCEEDED)
       << response->reason;
   EXPECT_NEAR(pathLength(response->path), 4.0, 0.60);
+}
+
+TEST_F(PlannerNodeTest, OverlappingNoGoZoneMessagesEndWithTheLastSet) {
+  // Review r0, I-4: the subscription was in the node's reentrant group, and
+  // under the multithreaded executor an older replacement could take the
+  // planner mutex after a newer one and put an obsolete set back, or clear
+  // a new hazard. It has a mutually exclusive group of its own, so the
+  // messages are handled one at a time, in the order taken. Published
+  // back to back, alternating sets and clears end with the last message.
+  auto node = makeNode("no_go_order", "world");
+  EXPECT_EQ(PlannerNodeTestPeer::noGoZonesCallbackGroupType(*node),
+            rclcpp::CallbackGroupType::MutuallyExclusive);
+  auto publisher_node = std::make_shared<rclcpp::Node>("no_go_publisher");
+  rclcpp::executors::MultiThreadedExecutor executor(
+      rclcpp::ExecutorOptions(), 4);
+  executor.add_node(node);
+  std::thread spinner([&executor]() { executor.spin(); });
+  auto zones_publisher =
+      publisher_node->create_publisher<geometry_msgs::msg::PoseArray>(
+          "no_go_zones", rclcpp::QoS(1).transient_local().reliable());
+  for (int round = 0; round < 20; ++round) {
+    for (int i = 0; i < 50; ++i) {
+      geometry_msgs::msg::PoseArray msg;
+      msg.header.frame_id = "world";
+      if (i % 2 == 0) {
+        geometry_msgs::msg::Pose pose;
+        pose.position.x = round * 100 + i;
+        pose.orientation.w = 1.0;
+        msg.poses.push_back(pose);
+      }
+      zones_publisher->publish(msg);
+    }
+    // The last message of the round sets one zone.
+    geometry_msgs::msg::PoseArray last;
+    last.header.frame_id = "world";
+    geometry_msgs::msg::Pose pose;
+    pose.position.x = -1.0 - round;
+    pose.orientation.w = 1.0;
+    last.poses.push_back(pose);
+    zones_publisher->publish(last);
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    bool settled = false;
+    while (std::chrono::steady_clock::now() < deadline) {
+      const auto zones = PlannerNodeTestPeer::noGoZones(*node);
+      if (zones.size() == 1 && zones.front().x() == -1.0 - round) {
+        settled = true;
+        break;
+      }
+      std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+    EXPECT_TRUE(settled) << "round " << round;
+    // Nothing older arrives after it.
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    const auto zones = PlannerNodeTestPeer::noGoZones(*node);
+    ASSERT_EQ(zones.size(), 1u) << "round " << round;
+    EXPECT_EQ(zones.front().x(), -1.0 - round);
+  }
+  executor.cancel();
+  spinner.join();
 }
 
 TEST_F(PlannerNodeTest, ARobotStandingInANoGoZoneIsRoutedOutOfIt) {
