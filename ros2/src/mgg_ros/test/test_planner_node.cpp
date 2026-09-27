@@ -3630,6 +3630,73 @@ TEST_F(PlannerNodeTest, TheTourHeadsForItsTargetWithoutWaitingForLowGainRounds) 
   }
 }
 
+TEST_F(PlannerNodeTest, AnUndrivableRouteToTheTourTargetKeepsTheLocalPathAndSetsTheTargetAside) {
+  // Run 10b, robot_0 at 467.8 s: a lattice path with gain runs ahead, the
+  // tour's target lies behind the robot outside the lattice, the route to
+  // it starts with a turn the robot has no room for, and no straight
+  // departure leads out. The tour sent nothing, 69 times, until the trial
+  // ended. Here the robot faces +x in a corridor too narrow to turn in,
+  // walls from x = -2.5 to 2.5: no departure within 2 m either way, while
+  // the lattice reaches the open floor beyond the corridor, unmapped past
+  // x = 4. The target is a frontier 2 m behind, the only one worth a tour
+  // cluster: the frontiers the lattice path leaves in the roadmap have
+  // less gain than the least a cluster takes.
+  auto node = boxedIn("tour_undrivable_route", -2.5, 2.5);
+  PlannerNodeTestPeer::setLowGainVoxels(*node, 0.0);  // non-low gain case
+  PlannerNodeTestPeer::setGlobalFrontierReach(*node, 1.0);
+  PlannerNodeTestPeer::acceptOdometry(*node, 0.0, 0.0, 1.0);
+  const int behind = PlannerNodeTestPeer::addGlobalChainToFrontier(
+      *node, {{-0.5, 0.0}, {-1.0, 0.0}, {-1.5, 0.0}, {-2.0, 0.0}}, M_PI);
+  PlannerNodeTestPeer::setVertexGain(*node, behind, 1e6);
+  PlannerNodeTestPeer::setTour(*node, true, 1e5);
+  const mgg::StateVec start =
+      PlannerNodeTestPeer::drivingState(*node, 0.0, 0.0, 0.0);
+  ASSERT_FALSE(PlannerNodeTestPeer::roomToTurn(*node, start));
+  std::vector<mgg::StateVec> departure;
+  bool reverse = false;
+  ASSERT_FALSE(PlannerNodeTestPeer::straightDeparture(*node, start, departure,
+                                                      reverse));
+
+  auto response = std::make_shared<mgg_msgs::srv::PlannerSrv::Response>();
+  PlannerNodeTestPeer::plan(*node, response);
+  EXPECT_EQ(PlannerNodeTestPeer::routeSharpTurnFallbacks(*node), 1);
+  ASSERT_EQ(response->status, mgg_msgs::srv::PlannerSrv::Response::FORWARD);
+  ASSERT_GE(response->path.size(), 2u);
+  EXPECT_FALSE(PlannerNodeTestPeer::bestPathFromGlobalGraph(*node));
+  EXPECT_GT(response->path.back().position.x, 2.5);
+  for (const geometry_msgs::msg::Pose& pose : response->path) {
+    EXPECT_GE(pose.position.x, -1e-6);
+  }
+  // The target is set aside as a target no route reaches would be.
+  EXPECT_EQ(PlannerNodeTestPeer::tourRoutesFailed(*node), 1);
+  EXPECT_EQ(PlannerNodeTestPeer::tourTarget(*node), mgg::kNoCluster);
+  PlannerNodeTestPeer::refreshTour(*node);
+  EXPECT_FALSE(PlannerNodeTestPeer::tourTargetPosition(*node).x() < -1.5);
+}
+
+TEST_F(PlannerNodeTest, AnUndrivableTourRouteWithNoLocalPathLeavesTheChoiceToTheGreedyPlanner) {
+  // exploredDeadEnd with no reversing: the lattice has no path, and the
+  // route to the tour's only target, behind, starts with a turn the robot
+  // has no room for, with no departure. The target is set aside and the
+  // choice falls to what the robot does without the tour: here the greedy
+  // global planner, whose own route is judged, and withheld, in turn.
+  int frontier = -1;
+  auto node = exploredDeadEnd("tour_undrivable_no_local", frontier);
+  PlannerNodeTestPeer::setDepartureReverseAllowed(*node, false);
+  PlannerNodeTestPeer::setTour(*node, true, 0.0);
+  PlannerNodeTestPeer::lowGainRoundsDueAtOnce(*node);
+
+  auto response = std::make_shared<mgg_msgs::srv::PlannerSrv::Response>();
+  PlannerNodeTestPeer::plan(*node, response);
+  EXPECT_EQ(response->status, PlannerNode::kStatusNoPath);
+  EXPECT_TRUE(response->path.empty());
+  EXPECT_EQ(PlannerNodeTestPeer::tourRoutesFailed(*node), 1);
+  EXPECT_EQ(PlannerNodeTestPeer::tourTarget(*node), mgg::kNoCluster);
+  // The tour's route, then the greedy planner's to the same frontier.
+  EXPECT_EQ(PlannerNodeTestPeer::routeSharpTurnFallbacks(*node), 2);
+  EXPECT_EQ(PlannerNodeTestPeer::boxedInWithoutDeparture(*node), 2);
+}
+
 TEST_F(PlannerNodeTest, LocalExplorationTowardTheTourTargetIsKept) {
   // Floor mapped to x = 4 and unknown beyond: the lattice has gain ahead,
   // and so does the tour: a global frontier 3.5 m ahead, and the frontier

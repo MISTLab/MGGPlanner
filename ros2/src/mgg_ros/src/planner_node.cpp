@@ -3426,15 +3426,35 @@ void PlannerNode::onPlanRequest(
           summary += "; the robot stands on the tour's target: reached";
         } else if (runGlobalPlanner(tour_target->representative_vertex_id,
                                     reason)) {
-          tour_decided = true;
           low_gain_rounds_ = 0;
-          if (depart_instead_of_turning_route(departure)) {
+          if (!depart_instead_of_turning_route(departure)) {
+            tour_decided = true;
+            summary += "; routing to the tour's target over the global graph";
+          } else if (!best_path_.empty()) {
+            tour_decided = true;
             summary +=
                 "; the route to the tour's target starts with a turn the "
                 "robot has no room for" +
                 departure;
           } else {
-            summary += "; routing to the tour's target over the global graph";
+            // Run 10b, robot_0: a route that starts with a turn the robot
+            // has no room for, and no departure out, is no route at all.
+            // The tour fails as it does when no route exists: the target is
+            // set aside and the local path already checked is kept. Without
+            // one, the choices without the tour follow; they judge their
+            // own routes' first turns, not this one's.
+            ++tour_routes_failed_;
+            setTourClusterAside(tour_target->id);
+            boxed_in_without_departure_now_ = false;
+            summary +=
+                "; the route to the tour's target starts with a turn the "
+                "robot has no room for and it has no straight departure: "
+                "the target is set aside";
+            if (!local_path.empty()) {
+              best_path_ = local_path;
+              best_path_from_global_graph_ = false;
+              summary += ", the local path kept";
+            }
           }
         } else {
           // No route after all: the next solve chooses again, and this
