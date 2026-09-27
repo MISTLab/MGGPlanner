@@ -310,6 +310,11 @@ class PlannerNodeTestPeer {
     return found == node.tour_set_aside_.end() ? std::nan("")
                                                : found->second.at_s;
   }
+  /// Advance an aside past its retry deadline without sleeping.
+  static void expireTourAside(PlannerNode& node, mgg::ClusterId id) {
+    auto& aside = node.tour_set_aside_.at(id);
+    aside.at_s = node.now().seconds() - aside.retry_s - 1.0;
+  }
   static void setTourRetry(PlannerNode& node, double seconds) {
     const std::lock_guard<std::recursive_mutex> lock(node.planner_mutex_);
     node.tour_params_.route_retry_s = seconds;
@@ -4677,6 +4682,107 @@ TEST_F(PlannerNodeTest, ANearHighGainTourTargetKeepsTheMovingLocalPathAndStaysAs
     EXPECT_DOUBLE_EQ(PlannerNodeTestPeer::tourAsideAt(*node, target), aside_at);
     EXPECT_NE(PlannerNodeTestPeer::refreshTour(*node), target);
   }
+}
+
+namespace {
+
+std::shared_ptr<PlannerNode> atTargetTour(const std::string& name, int& frontier) {
+  auto node = makeNode(name);
+  PlannerNodeTestPeer::setLowGainVoxels(*node, 0.0);
+  PlannerNodeTestPeer::observeFloor(*node, -3.0, 5.0, -1.5, 1.5);
+  PlannerNodeTestPeer::acceptOdometry(*node, 0.0, 0.0, 1.0);
+  frontier = PlannerNodeTestPeer::addGlobalChainToFrontier(
+      *node, {{-0.25, 0.0}}, M_PI);
+  // The owner's high gain survives local rescoring; the floor behind the
+  // frontier remains unknown to the local sensor too.
+  PlannerNodeTestPeer::setSensorRange(*node, 4.0);
+  PlannerNodeTestPeer::setFrontierOwner(*node, frontier, 2);
+  PlannerNodeTestPeer::setReportedUnknown(*node, frontier, 100000);
+  PlannerNodeTestPeer::setTour(*node, true, 1e5);
+  PlannerNodeTestPeer::setTourRetry(*node, 30.0);
+  PlannerNodeTestPeer::solveTourOnEveryChange(*node);
+  return node;
+}
+
+}  // namespace
+
+TEST_F(PlannerNodeTest, AnAtTargetTourAsideSurvivesMovement) {
+  int frontier;
+  auto node = atTargetTour("at_target_move", frontier);
+  const auto target = PlannerNodeTestPeer::refreshTour(*node);
+  ASSERT_NE(target, mgg::kNoCluster);
+  auto response = std::make_shared<mgg_msgs::srv::PlannerSrv::Response>();
+  PlannerNodeTestPeer::plan(*node, response);
+  ASSERT_FALSE(response->path.empty());
+  ASSERT_DOUBLE_EQ(PlannerNodeTestPeer::tourAsideRetry(*node, target), 30.0);
+  const double aside_at = PlannerNodeTestPeer::tourAsideAt(*node, target);
+  PlannerNodeTestPeer::acceptOdometry(*node, 2.1, 0.0, 2.0);
+  // Odometry marks the nearby roadmap visited; the owner still reports
+  // this frontier, just as a fresh peer graph would.
+  PlannerNodeTestPeer::markGlobalFrontier(*node, frontier);
+  EXPECT_NE(PlannerNodeTestPeer::refreshTour(*node), target);
+  EXPECT_DOUBLE_EQ(PlannerNodeTestPeer::tourAsideAt(*node, target), aside_at);
+  PlannerNodeTestPeer::setReportedUnknown(*node, frontier, 200000);
+  EXPECT_EQ(PlannerNodeTestPeer::refreshTour(*node), target);
+}
+
+TEST_F(PlannerNodeTest, AProgressingTourDecisionResetsAtTargetBackoff) {
+  int frontier;
+  auto node = atTargetTour("at_target_progress", frontier);
+  const auto target = PlannerNodeTestPeer::refreshTour(*node);
+  ASSERT_NE(target, mgg::kNoCluster);
+  auto response = std::make_shared<mgg_msgs::srv::PlannerSrv::Response>();
+  PlannerNodeTestPeer::plan(*node, response);
+  ASSERT_DOUBLE_EQ(PlannerNodeTestPeer::tourAsideRetry(*node, target), 30.0);
+  PlannerNodeTestPeer::expireTourAside(*node, target);
+  PlannerNodeTestPeer::acceptOdometry(*node, 2.1, 0.0, 2.0);
+  PlannerNodeTestPeer::markGlobalFrontier(*node, frontier);
+  ASSERT_EQ(PlannerNodeTestPeer::refreshTour(*node), target);
+  response = std::make_shared<mgg_msgs::srv::PlannerSrv::Response>();
+  PlannerNodeTestPeer::plan(*node, response);
+  ASSERT_EQ(PlannerNodeTestPeer::tourTarget(*node), target);
+  ASSERT_FALSE(response->path.empty());
+  EXPECT_GT(std::hypot(response->path.back().position.x - 2.1,
+                        response->path.back().position.y), 0.3);
+  // Back at the same still-unexplored frontier, the next failure starts
+  // again at the base retry, rather than carrying its earlier backoff.
+  PlannerNodeTestPeer::acceptOdometry(*node, 0.0, 0.0, 3.0);
+  PlannerNodeTestPeer::markGlobalFrontier(*node, frontier);
+  response = std::make_shared<mgg_msgs::srv::PlannerSrv::Response>();
+  PlannerNodeTestPeer::plan(*node, response);
+  EXPECT_DOUBLE_EQ(PlannerNodeTestPeer::tourAsideRetry(*node, target), 30.0);
+}
+
+TEST_F(PlannerNodeTest, RepeatedAtTargetFailuresBackOffUntilNewGainOrClusterRemoval) {
+  int frontier;
+  auto node = atTargetTour("at_target_backoff", frontier);
+  const auto target = PlannerNodeTestPeer::refreshTour(*node);
+  ASSERT_NE(target, mgg::kNoCluster);
+  const auto fail = [&]() {
+    auto response = std::make_shared<mgg_msgs::srv::PlannerSrv::Response>();
+    PlannerNodeTestPeer::plan(*node, response);
+    EXPECT_FALSE(response->path.empty());
+    EXPECT_NE(PlannerNodeTestPeer::tourTarget(*node), target);
+  };
+  for (const double retry : {30.0, 60.0, 120.0, 120.0}) {
+    fail();
+    ASSERT_DOUBLE_EQ(PlannerNodeTestPeer::tourAsideRetry(*node, target), retry);
+    PlannerNodeTestPeer::expireTourAside(*node, target);
+    ASSERT_EQ(PlannerNodeTestPeer::refreshTour(*node), target);
+  }
+  // New evidence resets the failure sequence, even after the aside lapsed.
+  PlannerNodeTestPeer::setReportedUnknown(*node, frontier, 200000);
+  ASSERT_EQ(PlannerNodeTestPeer::refreshTour(*node), target);
+  fail();
+  EXPECT_DOUBLE_EQ(PlannerNodeTestPeer::tourAsideRetry(*node, target), 30.0);
+  PlannerNodeTestPeer::expireTourAside(*node, target);
+  // A removed cluster must not leave an unbounded failure-history entry.
+  PlannerNodeTestPeer::setGlobalVertexType(*node, frontier, mgg::VertexType::kUnvisited);
+  EXPECT_NE(PlannerNodeTestPeer::refreshTour(*node), target);
+  PlannerNodeTestPeer::markGlobalFrontier(*node, frontier);
+  ASSERT_EQ(PlannerNodeTestPeer::refreshTour(*node), target);
+  fail();
+  EXPECT_DOUBLE_EQ(PlannerNodeTestPeer::tourAsideRetry(*node, target), 30.0);
 }
 
 TEST_F(PlannerNodeTest, LocalTourDecisionsNeedProgressBeyondTheConfiguredPciTolerance) {

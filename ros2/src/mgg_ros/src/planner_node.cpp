@@ -40,7 +40,8 @@ constexpr double kLinkRadius = 1.5;
 // and it gets its own vertex with checked edges.
 constexpr double kGoalLinkRadius = 0.1;
 /// A cluster set aside from the tour (setTourClusterAside) returns once the
-/// robot is this far from where it was set aside.
+/// robot is this far from where it was set aside, unless it failed while
+/// already at the target: moving away must not invite an immediate return.
 constexpr double kTourSetAsideMoveM = 2.0;
 /// It returns too once its gain has risen by more than this fraction of
 /// its scored gain when set aside, and by more than tour.min_cluster_gain:
@@ -649,9 +650,17 @@ mgg::Vertex* PlannerNode::linkRobotToGlobalGraph() {
 }
 
 void PlannerNode::setTourClusterAside(const mgg::FrontierCluster& cluster,
-                                      double retry_s) {
+                                      double retry_s, bool at_target) {
+  if (at_target) {
+    auto& failure = tour_at_target_failures_[cluster.id];
+    failure.retry_multiplier =
+        std::min(4, std::max(1, 2 * failure.retry_multiplier));
+    failure.gain = cluster.gain;
+    retry_s *= failure.retry_multiplier;
+  }
   tour_set_aside_[cluster.id] = TourSetAside{
-      current_state_.head<3>(), cluster.gain, now().seconds(), retry_s};
+      current_state_.head<3>(), cluster.gain, now().seconds(), retry_s,
+      at_target};
   tour_planner_->releaseTarget();
 }
 
@@ -745,20 +754,36 @@ std::optional<mgg::FrontierCluster> PlannerNode::refreshTour(
     std::string& note) {
   note.clear();
   if (!tour_params_.enabled || global_graph_->getNumVertices() <= 1) {
+    if (global_graph_->getNumVertices() <= 1) tour_at_target_failures_.clear();
     tour_clusters_.clear();
     return std::nullopt;
   }
   noteGlobalGraphEdges();
   refreshPeerGeneration();
-  std::vector<mgg::FrontierCluster> clusters =
-      tourCandidates(globalFrontierClusters());
+  std::vector<mgg::FrontierCluster> clusters = globalFrontierClusters();
+  // Keep backoff only for existing clusters, including ones temporarily
+  // reserved by peers. New evidence resets even an already-lapsed aside.
+  for (auto it = tour_at_target_failures_.begin();
+       it != tour_at_target_failures_.end();) {
+    const auto cluster = std::find_if(
+        clusters.begin(), clusters.end(),
+        [&](const mgg::FrontierCluster& c) { return c.id == it->first; });
+    const double gain = it->second.gain;
+    const bool gain_rose = cluster != clusters.end() && gain > 0.0 &&
+        cluster->gain - gain >
+            std::max(kTourSetAsideGainRise * gain, tour_params_.min_cluster_gain);
+    it = cluster == clusters.end() || gain_rose
+             ? tour_at_target_failures_.erase(it) : std::next(it);
+  }
+  clusters = tourCandidates(std::move(clusters));
   const double now_s = now().seconds();
   // Clusters set aside stay out until something that could change the
   // outcome has: the robot's position, new evidence at the cluster (its
   // gain rising markedly), or the retry deadline (a clock that went
   // backwards counts as passed). Not any new graph revision: the roadmap
   // grows every cycle, and a cluster released at 103.5 s was offered and
-  // released again at 106.2 s (run 10b, robot_1).
+  // released again at 106.2 s (run 10b, robot_1). At-target failures ignore
+  // movement: it is not evidence that the frontier can now be observed.
   for (auto it = tour_set_aside_.begin(); it != tour_set_aside_.end();) {
     const TourSetAside& aside = it->second;
     const mgg::ClusterId id = it->first;
@@ -773,8 +798,9 @@ std::optional<mgg::FrontierCluster> PlannerNode::refreshTour(
             std::max(kTourSetAsideGainRise * aside.gain,
                      tour_params_.min_cluster_gain);
     const bool lapsed =
-        (current_state_.head<3>() - aside.position).norm() >
-            kTourSetAsideMoveM ||
+        (!aside.at_target &&
+         (current_state_.head<3>() - aside.position).norm() >
+             kTourSetAsideMoveM) ||
         gain_rose || now_s < aside.at_s || now_s - aside.at_s >= aside.retry_s;
     it = lapsed ? tour_set_aside_.erase(it) : std::next(it);
   }
@@ -3277,6 +3303,7 @@ bool PlannerNode::runGlobalPlanner(int target_id, std::string& reason,
   best_path_from_global_graph_ = false;
   global_search_cut_short_ = false;
   global_frontier_not_routed_ = false;
+  global_route_at_target_ = false;
   last_route_blocked_by_peer_ = false;
   if (global_graph_->getNumVertices() <= 1) {
     // rrg.cpp:5582.
@@ -3490,6 +3517,9 @@ bool PlannerNode::runGlobalPlanner(int target_id, std::string& reason,
           reach_distance_) {
     best_path_.clear();
     global_frontier_not_routed_ = true;
+    global_route_at_target_ =
+        (target_state.head<2>() - current_state_.head<2>()).norm() <=
+            reach_distance_;
     global_exploration_ongoing_ = false;
     current_global_vertex_id_ = -1;
     reason = "the global route makes no progress beyond the controller goal "
@@ -3709,7 +3739,8 @@ void PlannerNode::onPlanRequest(
               *tour_target,
               last_route_blocked_by_peer_
                   ? std::min(kPeerBlockedAsideS, tour_params_.route_retry_s)
-                  : tour_params_.route_retry_s);
+                  : tour_params_.route_retry_s,
+              global_route_at_target_);
           summary += "; no route to the tour's target, set aside: " + reason;
         }
       }
@@ -3717,6 +3748,7 @@ void PlannerNode::onPlanRequest(
     // A tour that decided nothing has no target this cycle: its target was
     // set aside, and the fleet and the greedy planner choose without it
     // (review r0, I1).
+    if (tour_decided) tour_at_target_failures_.erase(tour_target->id);
     if (!tour_decided) tour_target.reset();
     // A low-gain lattice path, once the low-gain rounds are due and the
     // tour has not decided, is set aside for the fleet and the global
