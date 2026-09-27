@@ -486,6 +486,25 @@ class PlannerNodeTestPeer {
   static int lowGainRounds(PlannerNode& node) {
     return node.low_gain_rounds_;
   }
+  /// Whether the next lattice selection is to be scored without the
+  /// direction penalty's bound (mgg::TurnBackHysteresis).
+  static bool lastTurnedBack(PlannerNode& node) {
+    const std::lock_guard<std::recursive_mutex> lock(node.planner_mutex_);
+    return node.turn_back_hysteresis_.lastTurnedBack();
+  }
+  /// The exploration target service, as SwarmDeck calls it.
+  static void requestExplorationTarget(PlannerNode& node, bool active,
+                                       const Eigen::Vector3d& target) {
+    auto request = std::make_shared<
+        mgg_msgs::srv::PlannerSetExplorationTarget::Request>();
+    request->active = active;
+    request->target.x = target.x();
+    request->target.y = target.y();
+    request->target.z = target.z();
+    auto response = std::make_shared<
+        mgg_msgs::srv::PlannerSetExplorationTarget::Response>();
+    node.onExplorationTargetRequest(request, response);
+  }
   static int lowGainHandoffs(PlannerNode& node) {
     return node.low_gain_handoffs_;
   }
@@ -1032,6 +1051,67 @@ TEST_F(PlannerNodeTest, ExplorationGoesTheWayTheRobotFaces) {
   PlannerNodeTestPeer::setExplorationTarget(*node,
                                             Eigen::Vector3d(-10.0, 0.0, 0.0));
   EXPECT_LT(plan_facing(0.0).x(), -1.0);
+}
+
+TEST_F(PlannerNodeTest, TheTurnBackHysteresisFollowsThePathActuallySent) {
+  // Review r0, M-1: the hysteresis recorded the lattice candidate before it
+  // could be dropped as going nowhere or handed over to a global route. The
+  // robot faces +x with an exploration target far to the west: the best
+  // lattice path goes east, back from the target's bearing.
+  const auto scene = [](const std::string& name) {
+    auto node = makeNode(name);
+    PlannerNodeTestPeer::observeFloor(*node, -1.5, 4.0, -1.5, 1.5);
+    PlannerNodeTestPeer::acceptOdometry(*node, 0.0, 0.0, 1.0);
+    PlannerNodeTestPeer::requestExplorationTarget(*node, true, {-10.0, 0.0, 0.0});
+    return node;
+  };
+  const auto plan = [](PlannerNode& node) {
+    auto response = std::make_shared<mgg_msgs::srv::PlannerSrv::Response>();
+    PlannerNodeTestPeer::plan(node, response);
+    return response;
+  };
+  {
+    SCOPED_TRACE("sent");
+    auto node = scene("hysteresis_sent");
+    const auto response = plan(*node);
+    ASSERT_EQ(response->status, mgg_msgs::srv::PlannerSrv::Response::FORWARD);
+    ASSERT_GT(response->path.back().position.x, 0.5);
+    EXPECT_TRUE(PlannerNodeTestPeer::lastTurnedBack(*node));
+    // A new target, or an objective, supersedes it.
+    PlannerNodeTestPeer::requestExplorationTarget(*node, true, {10.0, 0.0, 0.0});
+    EXPECT_FALSE(PlannerNodeTestPeer::lastTurnedBack(*node));
+    plan(*node);
+    PlannerNodeTestPeer::requestExplorationTarget(*node, true, {-10.0, 0.0, 0.0});
+    plan(*node);
+    ASSERT_TRUE(PlannerNodeTestPeer::lastTurnedBack(*node));
+    auto request = std::make_shared<mgg_msgs::srv::PlanObjective::Request>();
+    request->objective = mgg_msgs::srv::PlanObjective::Request::NAVIGATE;
+    request->goal.position.x = 1.0;
+    request->goal.orientation.w = 1.0;
+    auto objective = std::make_shared<mgg_msgs::srv::PlanObjective::Response>();
+    PlannerNodeTestPeer::objective(*node, request, objective);
+    EXPECT_FALSE(PlannerNodeTestPeer::lastTurnedBack(*node));
+  }
+  {
+    SCOPED_TRACE("dropped as going nowhere");
+    auto node = scene("hysteresis_nowhere");
+    PlannerNodeTestPeer::setReachDistance(*node, 10.0);
+    const auto response = plan(*node);
+    EXPECT_TRUE(response->path.empty());
+    EXPECT_FALSE(PlannerNodeTestPeer::lastTurnedBack(*node));
+  }
+  {
+    SCOPED_TRACE("handed over to a global route");
+    auto node = scene("hysteresis_handover");
+    PlannerNodeTestPeer::addGlobalChainToFrontier(
+        *node, {{-0.5, 0.0}, {-1.0, 0.0}, {-1.5, 0.0}}, M_PI);
+    PlannerNodeTestPeer::consultGlobalPlannerAtOnce(*node);
+    PlannerNodeTestPeer::setLowGainVoxels(*node, 1e9);
+    const auto response = plan(*node);
+    ASSERT_EQ(response->status, mgg_msgs::srv::PlannerSrv::Response::FORWARD);
+    ASSERT_TRUE(PlannerNodeTestPeer::bestPathFromGlobalGraph(*node));
+    EXPECT_FALSE(PlannerNodeTestPeer::lastTurnedBack(*node));
+  }
 }
 
 TEST_F(PlannerNodeTest, APathEndingWithinTheGoalToleranceIsNoPath) {

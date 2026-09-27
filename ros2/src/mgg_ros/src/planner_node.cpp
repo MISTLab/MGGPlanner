@@ -2317,15 +2317,7 @@ std::string PlannerNode::buildLocalGraph() {
   for (const mgg::Vertex* v : sel.best_path) {
     if (v != nullptr) best_path_.push_back(v->state);
   }
-  {
-    std::vector<Eigen::Vector3d> points;
-    for (const mgg::StateVec& state : best_path_) {
-      points.push_back(state.head<3>());
-    }
-    turn_back_hysteresis_.record(points, selection_direction,
-                                 planning_params_);
-    if (turn_back_hysteresis_.lastTurnedBack()) ++paths_turning_back_;
-  }
+  lattice_selection_direction_ = selection_direction;
   if (sel.sharp_turn_detour) {
     RCLCPP_INFO(get_logger(),
                 "exploration path to (%.2f, %.2f, %.2f) goes the long way "
@@ -2500,6 +2492,10 @@ std::string PlannerNode::buildLocalGraph() {
   } else if (low_gain_rounds_ > 0) {
     --low_gain_rounds_;
   }
+  // The lattice path as it will be sent, unless something replaces it
+  // (recordSentPath).
+  lattice_path_ = is_boxed_in || goes_nowhere ? std::vector<mgg::StateVec>{}
+                                               : best_path_;
   return std::string(buf);
 }
 
@@ -3060,6 +3056,7 @@ void PlannerNode::onPlanRequest(
     const std::shared_ptr<mgg_msgs::srv::PlannerSrv::Request> request,
     std::shared_ptr<mgg_msgs::srv::PlannerSrv::Response> response) {
   const std::lock_guard<std::recursive_mutex> lock(planner_mutex_);
+  lattice_path_.clear();
   withdrawUnplacedNeighbours();
   response->planning_bound_mode = request->bound_mode;
   if (!have_odometry_ || !map_->getStatus()) {
@@ -3298,6 +3295,7 @@ void PlannerNode::onPlanRequest(
   }
   robot_params_.bound_mode = previous;
 
+  recordSentPath();
   response->status = !best_path_.empty()
                          ? mgg_msgs::srv::PlannerSrv::Response::FORWARD
                      : complete ? kStatusComplete
@@ -3310,12 +3308,38 @@ void PlannerNode::onPlanRequest(
   RCLCPP_INFO(get_logger(), "plan request: %s", summary.c_str());
 }
 
+void PlannerNode::recordSentPath() {
+  // The hysteresis follows the path actually sent: the lattice path when
+  // it is what goes out, else nothing (review r0, M-1).
+  const bool lattice_sent =
+      !best_path_.empty() && !best_path_from_global_graph_ &&
+      best_path_.size() == lattice_path_.size() &&
+      std::equal(best_path_.begin(), best_path_.end(), lattice_path_.begin(),
+                 [](const mgg::StateVec& a, const mgg::StateVec& b) {
+                   return a == b;
+                 });
+  if (!lattice_sent) {
+    turn_back_hysteresis_.reset();
+  } else {
+    std::vector<Eigen::Vector3d> points;
+    for (const mgg::StateVec& state : best_path_) {
+      points.push_back(state.head<3>());
+    }
+    turn_back_hysteresis_.record(points, lattice_selection_direction_,
+                                 planning_params_);
+    if (turn_back_hysteresis_.lastTurnedBack()) ++paths_turning_back_;
+  }
+  lattice_path_.clear();
+}
+
 void PlannerNode::onExplorationTargetRequest(
     const std::shared_ptr<mgg_msgs::srv::PlannerSetExplorationTarget::Request>
         request,
     std::shared_ptr<mgg_msgs::srv::PlannerSetExplorationTarget::Response>
         response) {
   const std::lock_guard<std::recursive_mutex> lock(planner_mutex_);
+  // The direction paths are scored against changes with the target.
+  turn_back_hysteresis_.reset();
   if (!request->active) {
     if (exploration_target_.has_value()) {
       RCLCPP_INFO(get_logger(), "exploration target cleared");
@@ -3342,6 +3366,8 @@ void PlannerNode::onObjectiveRequest(
     std::shared_ptr<mgg_msgs::srv::PlanObjective::Response> response) {
   using Service = mgg_msgs::srv::PlanObjective;
   const std::lock_guard<std::recursive_mutex> lock(planner_mutex_);
+  // An objective supersedes exploration's last path.
+  turn_back_hysteresis_.reset();
   // Every answer is logged with the objective, where the robot is and the
   // goal it asked for: a refusal alone does not say which objective it
   // answered or where it was going (run 5, 2026-09-25).

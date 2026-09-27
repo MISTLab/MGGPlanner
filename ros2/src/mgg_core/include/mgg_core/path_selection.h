@@ -218,11 +218,14 @@ class TurnBackHysteresis {
  public:
   /// `planning` as the next selection should use it.
   PlanningParams selectionParams(const PlanningParams& planning) const;
-  /// Records the path chosen (empty for none) and the direction it was
-  /// scored against.
+  /// Records the lattice path sent (empty for none) and the direction it
+  /// was scored against.
   void record(const std::vector<Eigen::Vector3d>& path,
               double exploring_direction, const PlanningParams& planning);
   bool lastTurnedBack() const { return last_turned_back_; }
+  /// Forgets the last path: another mode superseded it (a global route, an
+  /// objective, a new target), or none was sent.
+  void reset() { last_turned_back_ = false; }
 
  private:
   bool last_turned_back_ = false;

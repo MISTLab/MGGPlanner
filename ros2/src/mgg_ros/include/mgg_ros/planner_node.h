@@ -130,6 +130,8 @@ class PlannerNode : public rclcpp::Node {
   /// roadmap of theirs was merged again, and robot_1 declared exploration
   /// complete with none of their frontiers.
   void readmitQuarantinedNeighbours();
+  /// Updates the turn-back hysteresis from the path a plan request sends.
+  void recordSentPath();
   /// Why exploration may not be declared complete although no frontier is
   /// left to go to, or empty: a quarantined neighbour roadmap, whose
   /// frontiers are out of every search until its transform returns, a
@@ -547,9 +549,14 @@ class PlannerNode : public rclcpp::Node {
   /// leaves, or whose best path scores under low_gain_voxels; at the
   /// configured count the global planner runs.
   int low_gain_rounds_ = 0;
-  /// Whether the last lattice path chosen turned back: the next selection
-  /// then bounds no direction penalty.
+  /// Whether the last lattice path sent turned back: the next selection
+  /// then bounds no direction penalty. Reset when the plan sent something
+  /// else, and on a new exploration target or an objective.
   mgg::TurnBackHysteresis turn_back_hysteresis_;
+  /// This plan's lattice path as buildLocalGraph leaves it to be sent, and
+  /// the direction it was scored against (recordSentPath).
+  std::vector<mgg::StateVec> lattice_path_;
+  double lattice_selection_direction_ = 0.0;
   /// Lattice paths chosen that turned back, since the node started.
   int paths_turning_back_ = 0;
   /// This cycle's lattice path scores under low_gain_voxels
