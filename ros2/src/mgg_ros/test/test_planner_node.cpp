@@ -522,6 +522,13 @@ class PlannerNodeTestPeer {
   static void setHangingRootReach(PlannerNode& node, double reach) {
     node.hanging_root_edge_length_max_ = reach;
   }
+  /// One local plan, as a plan request runs it: its log summary.
+  static std::string buildLocalGraph(PlannerNode& node) {
+    return node.buildLocalGraph();
+  }
+  static int keyframeReadErrorsLogged(PlannerNode& node) {
+    return node.keyframe_read_errors_logged_;
+  }
   static void plan(PlannerNode& node,
                    std::shared_ptr<mgg_msgs::srv::PlannerSrv::Response> response) {
     node.onPlanRequest(std::make_shared<mgg_msgs::srv::PlannerSrv::Request>(),
@@ -3175,6 +3182,53 @@ TEST_F(PlannerNodeTest, AStandingStartInItsLidarsBlindDiskIsNotBoxedIn) {
   EXPECT_TRUE(response->path.empty())
       << "path of " << response->path.size() << " poses";
   EXPECT_EQ(PlannerNodeTestPeer::boxedInWithoutDeparture(*moved), 1);
+}
+
+TEST_F(PlannerNodeTest, KeyframesItCannotReadAreAnErrorAndLeaveNoStandingStart) {
+  // Runs 9 and 10: the planner looked for its keyframes where the bridge
+  // never writes them. Every robot stood blind at its start without a
+  // standing start and was boxed in, and the only trace was a warning every
+  // 30 s that the global graph was not rebuilt. An unreadable keyframe
+  // source is an ERROR, logged at once and then at most once a minute, and
+  // each plan says the standing start is inactive and where it looked.
+  const std::filesystem::path peer =
+      std::filesystem::temp_directory_path() / "mgg_keyframes_unreadable";
+  std::filesystem::remove_all(peer);
+  std::filesystem::create_directories(peer);
+  const std::string file = (peer / "graph_solution.json").string();
+  auto node = makeNode("keyframes_unreadable");
+  PlannerNodeTestPeer::observeRaisedRing(*node, 0.6, 3.5, 0.0);
+  PlannerNodeTestPeer::setHangingRootReach(*node, 1.2);
+  PlannerNodeTestPeer::serveMap(*node, "component:test", 0);
+  PlannerNodeTestPeer::setKeyframeSource(
+      *node, std::make_unique<GraphSolutionFile>(file, "robot_1", 1 << 20));
+  PlannerNodeTestPeer::acceptOdometry(*node, 0.0, 0.0, 1.0);
+
+  const std::string inactive =
+      "standing start: inactive (no keyframes at " + file + ")";
+  std::string summary = PlannerNodeTestPeer::buildLocalGraph(*node);
+  EXPECT_NE(summary.find(inactive), std::string::npos) << summary;
+  EXPECT_EQ(PlannerNodeTestPeer::keyframeReadErrorsLogged(*node), 1);
+  summary = PlannerNodeTestPeer::buildLocalGraph(*node);
+  EXPECT_NE(summary.find(inactive), std::string::npos) << summary;
+  EXPECT_EQ(PlannerNodeTestPeer::keyframeReadErrorsLogged(*node), 1);
+
+  // Once the bridge writes it, the robot stands at its start, and the plan
+  // says nothing about it.
+  std::ofstream(file)
+      << R"({"schema": "swarmdeck.pose-snapshot.v1", "solution": {
+        "revision": {"component_id": "component:test", "epoch": 0,
+                     "revision": 1},
+        "poses": [{"keyframe_id": {"robot_id": "robot_1",
+                                   "session_id": "s", "seq": 0},
+                   "T_component_keyframe": [[1, 0, 0, 0], [0, 1, 0, 0],
+                                            [0, 0, 1, 0.075],
+                                            [0, 0, 0, 1]]}]}})";
+  summary = PlannerNodeTestPeer::buildLocalGraph(*node);
+  EXPECT_EQ(summary.find("standing start"), std::string::npos) << summary;
+  EXPECT_TRUE(PlannerNodeTestPeer::standingStart(*node).has_value());
+  EXPECT_EQ(PlannerNodeTestPeer::keyframeReadErrorsLogged(*node), 1);
+  std::filesystem::remove_all(peer);
 }
 
 TEST_F(PlannerNodeTest, APlannerRestartedBesideAnUnobservedDropIsNotAtItsStart) {

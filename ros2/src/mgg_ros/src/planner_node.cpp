@@ -1140,7 +1140,30 @@ mgg::StateVec PlannerNode::physicalAnchorAtDrivingHeight(
   return anchor;
 }
 
+bool PlannerNode::readOwnKeyframes(KeyframeTrajectory& trajectory,
+                                   std::string& error) {
+  if (keyframe_source_->read(trajectory, error)) {
+    keyframe_read_error_logged_at_.reset();
+    return true;
+  }
+  const auto now = std::chrono::steady_clock::now();
+  if (!keyframe_read_error_logged_at_ ||
+      std::chrono::duration<double>(now - *keyframe_read_error_logged_at_)
+              .count() >= kKeyframeReadErrorPeriodS) {
+    keyframe_read_error_logged_at_ = now;
+    ++keyframe_read_errors_logged_;
+    RCLCPP_ERROR(get_logger(),
+                 "cannot read this robot's keyframes from %s: %s; without "
+                 "them it has no standing start and no roadmap rebuild "
+                 "(%d such errors logged)",
+                 keyframe_source_->location().c_str(), error.c_str(),
+                 keyframe_read_errors_logged_);
+  }
+  return false;
+}
+
 std::optional<mgg::StandingStart> PlannerNode::standingStart() {
+  standing_start_unread_keyframes_.clear();
   if (robot_params_.type != mgg::RobotType::kGroundRobot ||
       !standing_start_xy_ || !(hanging_root_edge_length_max_ > 0.0) ||
       keyframe_source_ == nullptr || !have_mapping_snapshot_) {
@@ -1148,7 +1171,11 @@ std::optional<mgg::StandingStart> PlannerNode::standingStart() {
   }
   KeyframeTrajectory trajectory;
   std::string error;
-  if (!keyframe_source_->read(trajectory, error) || trajectory.poses.empty() ||
+  if (!readOwnKeyframes(trajectory, error)) {
+    standing_start_unread_keyframes_ = keyframe_source_->location();
+    return std::nullopt;
+  }
+  if (trajectory.poses.empty() ||
       trajectory.component_id != mapping_snapshot_.component_id ||
       trajectory.epoch != mapping_snapshot_.epoch) {
     return std::nullopt;
@@ -1773,7 +1800,7 @@ bool PlannerNode::rebuildGlobalGraphFromKeyframes(
   last_roadmap_rebuild_attempt_[slot] = now;
   KeyframeTrajectory trajectory;
   std::string error;
-  if (!keyframe_source_->read(trajectory, error)) {
+  if (!readOwnKeyframes(trajectory, error)) {
     RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 30000,
                          "global graph not rebuilt (%s): %s", why,
                          error.c_str());
@@ -2247,6 +2274,13 @@ std::string PlannerNode::buildLocalGraph() {
   ++planner_trigger_count_;
   const std::optional<mgg::StandingStart> standing = standingStart();
   const mgg::StandingStart* standing_on = standing ? &*standing : nullptr;
+  // A robot that may stand blind at its start, and cannot tell, is told
+  // of in every plan (runs 9 and 10).
+  const std::string standing_inactive =
+      standing_start_unread_keyframes_.empty()
+          ? std::string()
+          : "; standing start: inactive (no keyframes at " +
+                standing_start_unread_keyframes_ + ")";
 
   // The lattice checks each vertex's footprint from every edge that meets
   // it. Its ground lookups are shared for this plan only: the map is held
@@ -2562,7 +2596,7 @@ std::string PlannerNode::buildLocalGraph() {
   // (recordSentPath).
   lattice_path_ = is_boxed_in || goes_nowhere ? std::vector<mgg::StateVec>{}
                                                : best_path_;
-  return std::string(buf);
+  return std::string(buf) + standing_inactive;
 }
 
 std::string PlannerNode::departBoxedIn(const mgg::StateVec& root_state,

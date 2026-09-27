@@ -326,6 +326,11 @@ class PlannerNode : public rclcpp::Node {
   /// read, and without a hanging_root_edge_length_max. Once the trajectory
   /// shows the robot left, it never stands at its start again.
   std::optional<mgg::StandingStart> standingStart();
+  /// keyframe_source_->read. A failure is an ERROR, logged at once and then
+  /// at most every kKeyframeReadErrorPeriodS until a read succeeds: without
+  /// its keyframes a robot has neither a standing start nor a roadmap
+  /// rebuild (runs 9 and 10).
+  bool readOwnKeyframes(KeyframeTrajectory& trajectory, std::string& error);
   /// T_navigation_component of the map in service (mapping_snapshot_).
   Eigen::Isometry3d navigationFromComponent() const;
   /// Dijkstra through a fresh local lattice from the robot to a goal inside
@@ -534,6 +539,16 @@ class PlannerNode : public rclcpp::Node {
   /// null when there is none (a map backend without one, or rebuilding
   /// turned off).
   std::unique_ptr<KeyframeTrajectorySource> keyframe_source_;
+  /// ERRORs logged since the node started because keyframe_source_ could
+  /// not be read (readOwnKeyframes), and when the last was, while reads
+  /// keep failing.
+  static constexpr double kKeyframeReadErrorPeriodS = 60.0;
+  int keyframe_read_errors_logged_ = 0;
+  std::optional<std::chrono::steady_clock::time_point>
+      keyframe_read_error_logged_at_;
+  /// Where standingStart() last looked for keyframes it could not read,
+  /// while the robot may still stand at its start; empty otherwise.
+  std::string standing_start_unread_keyframes_;
   mgg::RoadmapRebuildParams roadmap_rebuild_params_;
   double roadmap_rebuild_min_interval_s_ = 10.0;
   /// Per trigger: whether and when it last tried, and the trajectory

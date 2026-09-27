@@ -37,6 +37,8 @@ class KeyframeTrajectorySource {
   /// The latest trajectory; false, with `error` saying why, when there is
   /// none to read.
   virtual bool read(KeyframeTrajectory& trajectory, std::string& error) = 0;
+  /// Where it reads from, for the log; empty when it has no such place.
+  virtual std::string location() const { return {}; }
 };
 
 /// The graph solution file of SwarmDeck's C-SLAM bridge (graph_solution.json
@@ -61,6 +63,7 @@ class GraphSolutionFile : public KeyframeTrajectorySource {
   GraphSolutionFile(std::string path, std::string robot_id,
                     std::size_t max_bytes);
   bool read(KeyframeTrajectory& trajectory, std::string& error) override;
+  std::string location() const override { return path_; }
 
   const std::string& path() const { return path_; }
   const std::string& robotId() const { return robot_id_; }
