@@ -141,8 +141,7 @@ VoxelStatus orientedBoxPathStatus(const MapInterface& map,
       if (status == VoxelStatus::kUnknown) unknown = true;
     }
   }
-  return unknown ? VoxelStatus::kUnknown
-                                          : VoxelStatus::kFree;
+  return unknown ? VoxelStatus::kUnknown : VoxelStatus::kFree;
 }
 
 bool findDeparture(const MapInterface& map, const GroundProjection& ground,

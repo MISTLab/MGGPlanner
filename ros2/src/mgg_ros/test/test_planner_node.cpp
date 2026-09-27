@@ -4277,4 +4277,3 @@ TEST_F(PlannerNodeTest, ANearTourTargetDoesNotStarveTheLowGainHandoff) {
 }
 
 }  // namespace mgg_ros
-

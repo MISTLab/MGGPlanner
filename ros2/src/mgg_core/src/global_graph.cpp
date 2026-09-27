@@ -1006,7 +1006,6 @@ GlobalFrontierReport searchGlobalFrontier(
     const Eigen::Vector3d* target, double time_budget_s) {
   GlobalFrontierReport report;
 
-
   std::vector<Vertex*> global_frontiers;
   for (auto& entry : graph.vertices_map_) {
     Vertex* vertex = entry.second;
