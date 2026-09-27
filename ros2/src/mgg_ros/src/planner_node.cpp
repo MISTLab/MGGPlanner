@@ -42,6 +42,11 @@ constexpr double kGoalLinkRadius = 0.1;
 /// A cluster set aside from the tour (setTourClusterAside) returns once the
 /// robot is this far from where it was set aside.
 constexpr double kTourSetAsideMoveM = 2.0;
+/// A tour cluster only peer bodies kept the robot from is set aside this
+/// long at most: a peer moves on, and one parked must not keep the robot
+/// off the cluster for good (run 10b, robot_1 and robot_3 routed through
+/// parked robot_2).
+constexpr double kPeerBlockedAsideS = 5.0;
 /// A robot that has moved less than this from its first odometry, and whose
 /// keyframes all lie within this of its home keyframe, has not left its
 /// start (PlannerNode::standingStart).
@@ -155,7 +160,7 @@ PlannerNode::PlannerNode(const rclcpp::NodeOptions& options)
   global_graph_ = std::make_shared<mgg::GraphManager>();
   global_graph_->setEdgeBlocked(
       [this](const mgg::Vertex& a, const mgg::Vertex& b) {
-        return noGoBlocksEdge(a, b);
+        return globalEdgeBlocked(a, b);
       });
   local_graph_->setRobotId(static_cast<int>(planning_params_.robot_id));
   global_graph_->setRobotId(static_cast<int>(planning_params_.robot_id));
@@ -626,11 +631,11 @@ mgg::Vertex* PlannerNode::linkRobotToGlobalGraph() {
   return link;
 }
 
-void PlannerNode::setTourClusterAside(mgg::ClusterId id) {
+void PlannerNode::setTourClusterAside(mgg::ClusterId id, double retry_s) {
   // The revision it is set aside at includes any edge change so far.
   noteGlobalGraphEdges();
-  tour_set_aside_[id] =
-      TourSetAside{current_state_.head<3>(), graph_revision_, now().seconds()};
+  tour_set_aside_[id] = TourSetAside{current_state_.head<3>(), graph_revision_,
+                                     now().seconds(), retry_s};
   tour_planner_->releaseTarget();
 }
 
@@ -740,7 +745,7 @@ std::optional<mgg::FrontierCluster> PlannerNode::refreshTour(
         (current_state_.head<3>() - aside.position).norm() >
             kTourSetAsideMoveM ||
         graph_revision_ != aside.graph_revision || now_s < aside.at_s ||
-        now_s - aside.at_s >= tour_params_.route_retry_s;
+        now_s - aside.at_s >= aside.retry_s;
     it = lapsed ? tour_set_aside_.erase(it) : std::next(it);
   }
   clusters.erase(std::remove_if(clusters.begin(), clusters.end(),
@@ -1417,8 +1422,19 @@ void PlannerNode::onPeerBodies(
       centres.emplace_back(pose.position.x, pose.position.y);
     }
   }
-  mola_map_->setTransientDiscs(std::move(centres), peer_body_radius_m_,
-                               peer_body_ttl_s_);
+  mola_map_->setTransientDiscs(centres, peer_body_radius_m_, peer_body_ttl_s_);
+  // The global graph's searches close the edges a peer body blocks
+  // (globalEdgeBlocked): a body appearing, leaving or moving more than its
+  // radius changes the route costs the tour caches by revision.
+  const std::lock_guard<std::recursive_mutex> lock(planner_mutex_);
+  bool moved = centres.size() != peer_body_centres_.size();
+  for (std::size_t i = 0; !moved && i < centres.size(); ++i) {
+    moved = (centres[i] - peer_body_centres_[i]).norm() > peer_body_radius_m_;
+  }
+  if (moved) {
+    peer_body_centres_ = std::move(centres);
+    ++graph_revision_;
+  }
 }
 
 void PlannerNode::onNoGoZones(
@@ -1475,6 +1491,28 @@ bool PlannerNode::noGoBlocksSegment(const Eigen::Vector3d& from,
                                     const Eigen::Vector3d& to) const {
   return !no_go_.empty() &&
          no_go_.blocksEdge(from, to, current_state_.head<3>());
+}
+
+bool PlannerNode::peerBlocksSegment(const Eigen::Vector3d& from,
+                                    const Eigen::Vector3d& to) const {
+  if (mola_map_ == nullptr || peer_edges_open_) return false;
+  // Where a roadmap edge is checked (global_graph.cpp edgeStatus): the
+  // body's centre, half its planning box across.
+  const Eigen::Vector3d box = robot_params_.getPlanningSize();
+  return mola_map_->transientDiscsBlockSweep(
+      from + robot_params_.center_offset, to + robot_params_.center_offset,
+      0.5 * std::max(box.x(), box.y()));
+}
+
+bool PlannerNode::globalEdgeBlocked(const mgg::Vertex& a,
+                                    const mgg::Vertex& b) {
+  if (noGoBlocksEdge(a, b)) return true;
+  // Run 10b: roadmap edges laid before a peer parked on them routed
+  // robot_1 and robot_3 through robot_2. Closed for the search only, as a
+  // no-go zone's are: the peer moves on, and the roadmap keeps the edge.
+  if (!peerBlocksSegment(a.state.head<3>(), b.state.head<3>())) return false;
+  peer_blocked_edges_.insert(std::minmax(a.id, b.id));
+  return true;
 }
 
 void PlannerNode::onNeighbourTransforms(
@@ -1892,7 +1930,7 @@ bool PlannerNode::rebuildGlobalGraphFromKeyframes(
   global_graph_ = rebuilt;
   global_graph_->setEdgeBlocked(
       [this](const mgg::Vertex& a, const mgg::Vertex& b) {
-        return noGoBlocksEdge(a, b);
+        return globalEdgeBlocked(a, b);
       });
   global_root_supported_ = true;
   global_exploration_ongoing_ = false;
@@ -2686,6 +2724,7 @@ bool PlannerNode::routeOverGlobalGraph(const mgg::StateVec goal,
   path.clear();
   turns_ok = nullptr;
   last_route_starts_with_turn_without_room_ = false;
+  last_route_blocked_by_peer_ = false;
   if (global_graph_->getNumVertices() == 0) {
     reason = "the global graph is empty";
     return false;
@@ -2813,6 +2852,18 @@ bool PlannerNode::routeOverGlobalGraph(const mgg::StateVec goal,
   }
   if (!reaches(*goal_vertex)) {
     reason = "no route over the global graph reaches the goal";
+    // Whether only peer bodies close the way: the same search with them
+    // left out reaches the goal. Then the route is to be tried again.
+    if (mola_map_ != nullptr) {
+      peer_edges_open_ = true;
+      search();
+      peer_edges_open_ = false;
+      if (reaches(*goal_vertex)) {
+        last_route_blocked_by_peer_ = true;
+        reason = "every route over the global graph to the goal is blocked "
+                 "by a peer";
+      }
+    }
     return false;
   }
   std::vector<mgg::Vertex*> route;
@@ -2883,6 +2934,18 @@ bool PlannerNode::routeOverGlobalGraph(const mgg::StateVec goal,
     turns_ok = nullptr;
     reason = "the route enters a no-go zone";
     return false;
+  }
+  // The searches leave out the edges a peer body closes; the route as it
+  // is sent, the robot's lead-in onto the roadmap and any route kept for
+  // its turns included, is checked whole.
+  for (std::size_t i = 1; i < points.size(); ++i) {
+    if (peerBlocksSegment(points[i - 1], points[i])) {
+      path.clear();
+      turns_ok = nullptr;
+      last_route_blocked_by_peer_ = true;
+      reason = "the route is blocked by a peer";
+      return false;
+    }
   }
   return true;
 }
@@ -3102,6 +3165,7 @@ bool PlannerNode::runGlobalPlanner(int target_id, std::string& reason,
   best_path_from_global_graph_ = false;
   global_search_cut_short_ = false;
   global_frontier_not_routed_ = false;
+  last_route_blocked_by_peer_ = false;
   if (global_graph_->getNumVertices() <= 1) {
     // rrg.cpp:5582.
     reason = "the global graph holds no frontier to reposition to";
@@ -3164,6 +3228,37 @@ bool PlannerNode::runGlobalPlanner(int target_id, std::string& reason,
                               .c_str()
                         : "");
       reason = why;
+      // Frontiers only peer bodies keep the robot from are still to be
+      // explored: the search is retried, not exploration complete.
+      if (mola_map_ != nullptr && !report.cut_short()) {
+        mgg::ShortestPathsReport open;
+        peer_edges_open_ = true;
+        global_graph_->findShortestPaths(link_vertex->id, open);
+        peer_edges_open_ = false;
+        for (const auto& [id, vertex] : global_graph_->vertices_map_) {
+          if (vertex == nullptr || vertex->type != mgg::VertexType::kFrontier ||
+              !global_graph_->inService(*vertex) ||
+              vertex->vol_gain.gain <= 0.0) {
+            continue;
+          }
+          const auto parent = open.parent_id_map.find(id);
+          if (!open.status || parent == open.parent_id_map.end() ||
+              parent->second == id) {
+            continue;
+          }
+          const bool is_excluded = std::any_of(
+              excluded.begin(), excluded.end(),
+              [&](const Eigen::Vector3d& point) {
+                return (vertex->state.head<3>() - point).norm() <=
+                       exclusion_radius;
+              });
+          if (is_excluded) continue;
+          global_frontier_not_routed_ = true;
+          last_route_blocked_by_peer_ = true;
+          reason += "; the frontiers left are blocked by a peer";
+          break;
+        }
+      }
       return false;
     }
     if (report.best_gain < min_gain) {
@@ -3294,6 +3389,7 @@ void PlannerNode::onPlanRequest(
     std::shared_ptr<mgg_msgs::srv::PlannerSrv::Response> response) {
   const std::lock_guard<std::recursive_mutex> lock(planner_mutex_);
   lattice_path_.clear();
+  peer_blocked_edges_.clear();
   withdrawUnplacedNeighbours();
   response->planning_bound_mode = request->bound_mode;
   if (!have_odometry_ || !map_->getStatus()) {
@@ -3370,7 +3466,10 @@ void PlannerNode::onPlanRequest(
     std::string departure;
     if (!runGlobalPlanner(current_global_vertex_id_, reason)) {
       global_exploration_ongoing_ = false;
-      summary = "global repositioning abandoned: " + reason;
+      // Kept in the summary of the local plan made instead: a route a peer
+      // blocks is retried, not missing.
+      resumed = "; global repositioning abandoned: " + reason;
+      summary = resumed.substr(2);
     } else if (depart_instead_of_turning_route(departure)) {
       withheld_without_departure = best_path_.empty();
       resumed =
@@ -3400,7 +3499,7 @@ void PlannerNode::onPlanRequest(
     if (tour_target && low_gain_path_now_ &&
         (tour_target->position - current_state_.head<3>()).norm() <=
             global_frontier_reach_m_) {
-      setTourClusterAside(tour_target->id);
+      setTourClusterAside(tour_target->id, tour_params_.route_retry_s);
       tour_target.reset();
       summary += "; nearby tour target reached with low local gain";
     }
@@ -3422,7 +3521,7 @@ void PlannerNode::onPlanRequest(
           // The robot stands on the target's representative: reached, and
           // local exploration has nothing here. The tour costs it zero and
           // a route cannot leave from it, so it is set aside, not routed to.
-          setTourClusterAside(tour_target->id);
+          setTourClusterAside(tour_target->id, tour_params_.route_retry_s);
           summary += "; the robot stands on the tour's target: reached";
         } else if (runGlobalPlanner(tour_target->representative_vertex_id,
                                     reason)) {
@@ -3444,7 +3543,7 @@ void PlannerNode::onPlanRequest(
             // one, the choices without the tour follow; they judge their
             // own routes' first turns, not this one's.
             ++tour_routes_failed_;
-            setTourClusterAside(tour_target->id);
+            setTourClusterAside(tour_target->id, tour_params_.route_retry_s);
             boxed_in_without_departure_now_ = false;
             summary +=
                 "; the route to the tour's target starts with a turn the "
@@ -3461,8 +3560,14 @@ void PlannerNode::onPlanRequest(
           // cycle keeps what local exploration found.
           best_path_ = local_path;
           best_path_from_global_graph_ = false;
+          // Blocked only by peer bodies, the target is set aside briefly:
+          // the peer may move on.
           ++tour_routes_failed_;
-          setTourClusterAside(tour_target->id);
+          setTourClusterAside(
+              tour_target->id,
+              last_route_blocked_by_peer_
+                  ? std::min(kPeerBlockedAsideS, tour_params_.route_retry_s)
+                  : tour_params_.route_retry_s);
           summary += "; no route to the tour's target, set aside: " + reason;
         }
       }
@@ -3566,6 +3671,10 @@ void PlannerNode::onPlanRequest(
     // runs with the request's bound mode still applied.
     best_path_.clear();
     summary += "; the path enters a no-go zone: no path";
+  }
+  if (!peer_blocked_edges_.empty()) {
+    summary += "; " + std::to_string(peer_blocked_edges_.size()) +
+               " global graph edge(s) blocked by peers";
   }
   robot_params_.bound_mode = previous;
   refreshNoGoZones();

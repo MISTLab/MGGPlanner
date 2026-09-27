@@ -275,7 +275,44 @@ class PlannerNodeTestPeer {
     gain.is_frontier = true;
   }
   static void setTourAside(PlannerNode& node, mgg::ClusterId id) {
-    node.setTourClusterAside(id);
+    node.setTourClusterAside(id, node.tour_params_.route_retry_s);
+  }
+  /// Peer bodies at `points`, planning frame, as SwarmDeck publishes them.
+  static void receivePeerBodies(PlannerNode& node,
+                                const std::vector<Eigen::Vector2d>& points) {
+    auto msg = std::make_shared<geometry_msgs::msg::PoseArray>();
+    msg->header.frame_id = node.world_frame_;
+    for (const Eigen::Vector2d& p : points) {
+      geometry_msgs::msg::Pose pose;
+      pose.position.x = p.x();
+      pose.position.y = p.y();
+      pose.orientation.w = 1.0;
+      msg->poses.push_back(pose);
+    }
+    node.onPeerBodies(msg);
+  }
+  /// Global graph edges peer bodies closed in the last plan request.
+  static std::size_t peerBlockedEdges(PlannerNode& node) {
+    const std::lock_guard<std::recursive_mutex> lock(node.planner_mutex_);
+    return node.peer_blocked_edges_.size();
+  }
+  /// How long the tour's cluster `id` is set aside for; -1 when it is not.
+  static double tourAsideRetry(PlannerNode& node, mgg::ClusterId id) {
+    const std::lock_guard<std::recursive_mutex> lock(node.planner_mutex_);
+    const auto found = node.tour_set_aside_.find(id);
+    return found == node.tour_set_aside_.end() ? -1.0 : found->second.retry_s;
+  }
+  /// Odometry at (x, y) facing `yaw`.
+  static void acceptOdometryFacing(PlannerNode& node, double x, double y,
+                                   double yaw, double stamp_s) {
+    auto msg = std::make_shared<nav_msgs::msg::Odometry>();
+    msg->header.stamp.sec = static_cast<std::int32_t>(stamp_s);
+    msg->pose.pose.position.x = x;
+    msg->pose.pose.position.y = y;
+    msg->pose.pose.position.z = 0.075;
+    msg->pose.pose.orientation.z = std::sin(yaw / 2.0);
+    msg->pose.pose.orientation.w = std::cos(yaw / 2.0);
+    node.onOdometry(msg);
   }
   static void setFrontierOwner(PlannerNode& node, int id, int owner) {
     node.global_graph_->getVertex(id)->robot_id = owner;
@@ -1804,6 +1841,222 @@ double nearestTo(const std::vector<geometry_msgs::msg::Pose>& path,
                                pose.position.y - centre.y()));
   }
   return d;
+}
+
+/// A robot on the mola_snapshot backend serving a level floor over
+/// [x0, x1] x [y0, y1], the backend that holds peer bodies.
+std::shared_ptr<PlannerNode> peerFloorNode(
+    const std::string& name, double x0, double x1, double y0, double y1,
+    std::unique_ptr<MolaFloorProduct>& product) {
+  auto node = makeNode(name);
+  product = std::make_unique<MolaFloorProduct>(x0, x1, y0, y1);
+  PlannerNodeTestPeer::useMolaMap(*node, product->serve());
+  PlannerNodeTestPeer::serveMap(*node, "component:test", 1);
+  // As corridorNode: the synthetic product's ground does not pass the
+  // observed-ground rule, tested on its own.
+  PlannerNodeTestPeer::setMinObservedGround(*node, 0.0);
+  return node;
+}
+
+/// A peer body's reach for the test robot: peer_body_radius_m (0.6) and
+/// half its 0.2 m planning box.
+constexpr double kPeerReachM = 0.7;
+
+TEST_F(PlannerNodeTest, TheRun10bEntranceRoutesThroughAParkedPeerAreRefused) {
+  // Run 10b at 240 s (diag-run10b replay/peerpath.txt): robot_2 stood
+  // parked in the hangar entrance at (-10.56, -0.29) after its controller
+  // gave up. robot_1, at (-11.96, 0.40) facing south, and robot_3, at
+  // (-11.40, -0.47) facing east, both kept a global route through it,
+  // robot_1's also 0.20 m from robot_3; robot_1 resumed its twice. Each
+  // roadmap here follows the saved route from where the robot stood, the
+  // entrance its only way out. Without peer bodies the resumed route is
+  // that route; with the other two robots' bodies it is refused, the edges
+  // they close are counted, and the robot explores locally rather than
+  // being told exploration is complete.
+  struct Scene {
+    const char* name;
+    Eigen::Vector2d robot;
+    double yaw;
+    std::vector<Eigen::Vector2d> route;
+    std::vector<Eigen::Vector2d> peers;
+  };
+  const Eigen::Vector2d robot_2(-10.56, -0.29);
+  const std::vector<Scene> scenes{
+      {"robot_1", {-11.96, 0.40}, -1.50,
+       {{-12.00, -0.06}, {-11.44, -0.28}, {-10.74, -0.29}, {-10.00, -0.31},
+        {-9.30, -0.33}, {-8.55, -0.37}, {-7.80, -0.41}, {-7.05, -0.45},
+        {-6.30, -0.49}},
+       {robot_2, {-11.40, -0.47}}},
+      {"robot_3", {-11.40, -0.47}, 0.07,
+       {{-11.01, -0.29}, {-10.50, -0.30}, {-9.75, -0.31}, {-9.00, -0.32},
+        {-8.25, -0.33}},
+       {robot_2, {-11.96, 0.40}}},
+  };
+  for (const Scene& scene : scenes) {
+    SCOPED_TRACE(scene.name);
+    std::unique_ptr<MolaFloorProduct> product;
+    auto node = peerFloorNode(std::string("run10b_entrance_") + scene.name,
+                              -14.0, -4.0, -2.5, 2.5, product);
+    PlannerNodeTestPeer::acceptOdometryFacing(*node, scene.robot.x(),
+                                              scene.robot.y(), scene.yaw, 1.0);
+    const int frontier =
+        PlannerNodeTestPeer::addGlobalChainToFrontier(*node, scene.route);
+    PlannerNodeTestPeer::setTour(*node, false, 0.0);
+    const auto resume = [&]() {
+      PlannerNodeTestPeer::repositionTowards(*node, frontier);
+      auto response = std::make_shared<mgg_msgs::srv::PlannerSrv::Response>();
+      PlannerNodeTestPeer::plan(*node, response);
+      return response;
+    };
+
+    auto response = resume();
+    ASSERT_EQ(response->status, mgg_msgs::srv::PlannerSrv::Response::FORWARD);
+    ASSERT_TRUE(PlannerNodeTestPeer::bestPathFromGlobalGraph(*node));
+    EXPECT_LT(nearestTo(response->path, robot_2), kPeerReachM - 0.1);
+
+    PlannerNodeTestPeer::receivePeerBodies(*node, scene.peers);
+    response = resume();
+    EXPECT_FALSE(PlannerNodeTestPeer::bestPathFromGlobalGraph(*node));
+    EXPECT_FALSE(PlannerNodeTestPeer::repositioningOngoing(*node));
+    EXPECT_GT(PlannerNodeTestPeer::peerBlockedEdges(*node), 0u);
+    EXPECT_NE(response->status, PlannerNode::kStatusComplete);
+    for (const Eigen::Vector2d& peer : scene.peers) {
+      EXPECT_GE(nearestTo(response->path, peer), kPeerReachM - 0.01);
+    }
+  }
+}
+
+namespace {
+
+/// peerFloorNode with the robot at the origin facing west, and a roadmap
+/// west along y = 0 to a frontier at (-8, 0), with a detour round
+/// (-4, 0) by y = 2 from (-2, 0) to (-6, 0). Returns the frontier's id.
+std::shared_ptr<PlannerNode> peerLoopNode(
+    const std::string& name, std::unique_ptr<MolaFloorProduct>& product,
+    int& frontier) {
+  auto node = peerFloorNode(name, -9.0, 1.5, -1.5, 3.5, product);
+  PlannerNodeTestPeer::acceptOdometryFacing(*node, 0.0, 0.0, M_PI, 1.0);
+  frontier = PlannerNodeTestPeer::addGlobalChainToFrontier(
+      *node, {{-1.0, 0.0}, {-2.0, 0.0}, {-3.0, 0.0}, {-4.0, 0.0},
+              {-5.0, 0.0}, {-6.0, 0.0}, {-7.0, 0.0}, {-8.0, 0.0}},
+      M_PI);
+  int previous = PlannerNodeTestPeer::globalVertexAt(*node, -2.0, 0.0);
+  for (const Eigen::Vector2d& p :
+       std::vector<Eigen::Vector2d>{{-2.0, 1.0}, {-2.0, 2.0}, {-3.0, 2.0},
+                                    {-4.0, 2.0}, {-5.0, 2.0}, {-6.0, 2.0},
+                                    {-6.0, 1.0}}) {
+    const int next =
+        PlannerNodeTestPeer::addIsolatedGlobalVertex(*node, p.x(), p.y());
+    PlannerNodeTestPeer::addGlobalEdgeOnly(*node, previous, next);
+    previous = next;
+  }
+  PlannerNodeTestPeer::addGlobalEdgeOnly(
+      *node, previous, PlannerNodeTestPeer::globalVertexAt(*node, -6.0, 0.0));
+  PlannerNodeTestPeer::setTour(*node, false, 0.0);
+  return node;
+}
+
+}  // namespace
+
+TEST_F(PlannerNodeTest, AResumedRouteThroughANewlyParkedPeerIsReRoutedUntilItLeaves) {
+  // peerLoopNode: the repositioning to (-8, 0) goes straight along y = 0.
+  // A peer then parks at (-4, 0): the resumed route goes round it by the
+  // detour, and the roadmap keeps every edge. The peer leaves: the
+  // resumed route is straight again.
+  std::unique_ptr<MolaFloorProduct> product;
+  int frontier = -1;
+  auto node = peerLoopNode("peer_resume_reroute", product, frontier);
+  const int edges = PlannerNodeTestPeer::globalEdges(*node);
+  const auto resume = [&]() {
+    PlannerNodeTestPeer::repositionTowards(*node, frontier);
+    auto response = std::make_shared<mgg_msgs::srv::PlannerSrv::Response>();
+    PlannerNodeTestPeer::plan(*node, response);
+    return response;
+  };
+  const Eigen::Vector2d parked(-4.0, 0.0);
+
+  auto response = resume();
+  ASSERT_EQ(response->status, mgg_msgs::srv::PlannerSrv::Response::FORWARD);
+  ASSERT_TRUE(PlannerNodeTestPeer::bestPathFromGlobalGraph(*node));
+  EXPECT_NEAR(pathLength(response->path), 8.0, 0.5);
+  EXPECT_LT(nearestTo(response->path, parked), 0.1);
+
+  PlannerNodeTestPeer::receivePeerBodies(*node, {parked});
+  response = resume();
+  ASSERT_EQ(response->status, mgg_msgs::srv::PlannerSrv::Response::FORWARD);
+  ASSERT_TRUE(PlannerNodeTestPeer::bestPathFromGlobalGraph(*node));
+  EXPECT_EQ(PlannerNodeTestPeer::repositioningTarget(*node), frontier);
+  EXPECT_GT(pathLength(response->path), 8.8);
+  EXPECT_GE(nearestTo(response->path, parked), kPeerReachM - 0.01);
+  EXPECT_NEAR(response->path.back().position.x, -8.0, 0.1);
+  EXPECT_GT(PlannerNodeTestPeer::peerBlockedEdges(*node), 0u);
+  EXPECT_EQ(PlannerNodeTestPeer::globalEdges(*node), edges);
+
+  PlannerNodeTestPeer::receivePeerBodies(*node, {{0.5, 3.0}});
+  response = resume();
+  ASSERT_EQ(response->status, mgg_msgs::srv::PlannerSrv::Response::FORWARD);
+  ASSERT_TRUE(PlannerNodeTestPeer::bestPathFromGlobalGraph(*node));
+  EXPECT_NEAR(pathLength(response->path), 8.0, 0.5);
+  EXPECT_EQ(PlannerNodeTestPeer::peerBlockedEdges(*node), 0u);
+}
+
+TEST_F(PlannerNodeTest, AStraightRouteThroughAPeerIsRefused) {
+  // One straight roadmap edge, 6 m west from where the robot stands facing
+  // west: no turn anywhere on the route. A peer parks halfway along it.
+  // The resumed route is refused, not sent through the peer, and the
+  // robot is not told exploration is complete.
+  std::unique_ptr<MolaFloorProduct> product;
+  auto node = peerFloorNode("peer_straight", -7.5, 1.5, -1.5, 1.5, product);
+  PlannerNodeTestPeer::acceptOdometryFacing(*node, 0.0, 0.0, M_PI, 1.0);
+  const int frontier =
+      PlannerNodeTestPeer::addGlobalChainToFrontier(*node, {{-6.0, 0.0}}, M_PI);
+  PlannerNodeTestPeer::setTour(*node, false, 0.0);
+  const auto resume = [&]() {
+    PlannerNodeTestPeer::repositionTowards(*node, frontier);
+    auto response = std::make_shared<mgg_msgs::srv::PlannerSrv::Response>();
+    PlannerNodeTestPeer::plan(*node, response);
+    return response;
+  };
+  auto response = resume();
+  ASSERT_EQ(response->status, mgg_msgs::srv::PlannerSrv::Response::FORWARD);
+  ASSERT_TRUE(PlannerNodeTestPeer::bestPathFromGlobalGraph(*node));
+
+  const Eigen::Vector2d parked(-3.0, 0.0);
+  PlannerNodeTestPeer::receivePeerBodies(*node, {parked});
+  response = resume();
+  EXPECT_FALSE(PlannerNodeTestPeer::bestPathFromGlobalGraph(*node));
+  EXPECT_FALSE(PlannerNodeTestPeer::repositioningOngoing(*node));
+  EXPECT_EQ(PlannerNodeTestPeer::peerBlockedEdges(*node), 1u);
+  EXPECT_NE(response->status, PlannerNode::kStatusComplete);
+  EXPECT_GE(nearestTo(response->path, parked), kPeerReachM - 0.01);
+}
+
+TEST_F(PlannerNodeTest, ATourTargetBehindAParkedPeerIsSetAsideBriefly) {
+  // The robot faces east with a lattice path ahead; the tour's target is a
+  // frontier 6 m behind, taken before a peer parked on the only roadmap
+  // way there. The route is refused as blocked by a peer: the target is
+  // set aside for kPeerBlockedAsideS, not tour.route_retry_s, and the
+  // local path is sent.
+  std::unique_ptr<MolaFloorProduct> product;
+  auto node = peerFloorNode("peer_tour_aside", -7.5, 3.5, -1.5, 1.5, product);
+  PlannerNodeTestPeer::setLowGainVoxels(*node, 0.0);  // non-low gain case
+  PlannerNodeTestPeer::acceptOdometry(*node, 0.0, 0.0, 1.0);
+  PlannerNodeTestPeer::addGlobalChainToFrontier(
+      *node, {{-1.0, 0.0}, {-2.0, 0.0}, {-3.0, 0.0}, {-4.0, 0.0},
+              {-5.0, 0.0}, {-6.0, 0.0}},
+      M_PI);
+  PlannerNodeTestPeer::setTour(*node, true, 0.0);
+  const mgg::ClusterId target = PlannerNodeTestPeer::refreshTour(*node);
+  ASSERT_NE(target, mgg::kNoCluster);
+
+  PlannerNodeTestPeer::receivePeerBodies(*node, {{-3.0, 0.0}});
+  auto response = std::make_shared<mgg_msgs::srv::PlannerSrv::Response>();
+  PlannerNodeTestPeer::plan(*node, response);
+  EXPECT_EQ(PlannerNodeTestPeer::tourRoutesFailed(*node), 1);
+  EXPECT_DOUBLE_EQ(PlannerNodeTestPeer::tourAsideRetry(*node, target), 5.0);
+  ASSERT_EQ(response->status, mgg_msgs::srv::PlannerSrv::Response::FORWARD);
+  EXPECT_FALSE(PlannerNodeTestPeer::bestPathFromGlobalGraph(*node));
+  EXPECT_GT(response->path.back().position.x, 0.0);
 }
 
 TEST_F(PlannerNodeTest, LocalExplorationKeepsOutOfANoGoZoneOnEitherBackend) {

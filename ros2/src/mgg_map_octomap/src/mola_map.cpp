@@ -1158,6 +1158,13 @@ bool MolaMap::discsBlockSweep(const Eigen::Vector3d& start,
                             half_width);
 }
 
+bool MolaMap::transientDiscsBlockSweep(const Eigen::Vector3d& start,
+                                       const Eigen::Vector3d& end,
+                                       const double half_width) const {
+  return discSetBlocksSweep(std::atomic_load(&transient_discs_), start, end,
+                            half_width);
+}
+
 bool MolaMap::discSetBlocksSweep(
     const std::shared_ptr<const TransientDiscs>& discs,
     const Eigen::Vector3d& start, const Eigen::Vector3d& end,

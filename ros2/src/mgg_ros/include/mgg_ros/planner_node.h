@@ -182,6 +182,19 @@ class PlannerNode : public rclcpp::Node {
   /// The same for a straight segment, such as a shortcut.
   bool noGoBlocksSegment(const Eigen::Vector3d& from,
                          const Eigen::Vector3d& to) const;
+  /// Whether a peer body closes the straight segment from `from` to `to`,
+  /// driven that way: the sweep the lattice's edges take
+  /// (mgg::MolaMap::transientDiscsBlockSweep, the outward departure from a
+  /// peer's reach left open) of the robot's planning box. Never, without
+  /// the mola_snapshot backend (no peer bodies), or while
+  /// peer_edges_open_.
+  bool peerBlocksSegment(const Eigen::Vector3d& from,
+                         const Eigen::Vector3d& to) const;
+  /// The global graph's edge test (GraphManager::setEdgeBlocked): a no-go
+  /// zone or a peer body closes the edge from `a` to `b` for this search,
+  /// and the roadmap keeps it. Records each edge a peer closes in
+  /// peer_blocked_edges_.
+  bool globalEdgeBlocked(const mgg::Vertex& a, const mgg::Vertex& b);
   void onBuildRequest(
       const std::shared_ptr<std_srvs::srv::Trigger::Request> request,
       std::shared_ptr<std_srvs::srv::Trigger::Response> response);
@@ -360,10 +373,11 @@ class PlannerNode : public rclcpp::Node {
   void noteGlobalGraphEdges();
   /// Leaves the tour's cluster `id` out of its solves, and releases it as
   /// the target, until the robot moves more than kTourSetAsideMoveM from
-  /// here, the graph revision changes or tour.route_retry_s passes: the
-  /// robot could not be routed to it, or stands on its representative (the
-  /// route's source, which the tour costs zero and no route leaves).
-  void setTourClusterAside(mgg::ClusterId id);
+  /// here, the graph revision changes or `retry_s` passes: the robot could
+  /// not be routed to it (tour.route_retry_s; less when only peer bodies
+  /// were in the way), or stands on its representative (the route's
+  /// source, which the tour costs zero and no route leaves).
+  void setTourClusterAside(mgg::ClusterId id, double retry_s);
   /// Every frontier cluster of the global graph, other robots' included,
   /// under its stable name (tour-exploration design §2.1).
   std::vector<mgg::FrontierCluster> globalFrontierClusters();
@@ -631,6 +645,21 @@ class PlannerNode : public rclcpp::Node {
   /// not, and its first turn, from the robot's heading, is sharp where the
   /// robot has no room to turn (applyRouteTurnRule): a turn it cannot make.
   bool last_route_starts_with_turn_without_room_ = false;
+  /// The last route to a goal failed only because peer bodies closed every
+  /// way there (routeOverGlobalGraph), or the last global frontier search
+  /// found frontiers only behind them (runGlobalPlanner): a retryable
+  /// outcome, not a missing route.
+  bool last_route_blocked_by_peer_ = false;
+  /// Global graph edges a peer body closed in the searches of this plan
+  /// request (globalEdgeBlocked), as (lower id, higher id).
+  std::set<std::pair<int, int>> peer_blocked_edges_;
+  /// Peer bodies are left out of peerBlocksSegment: set only to ask whether
+  /// a failed search would have succeeded without them.
+  bool peer_edges_open_ = false;
+  /// The peer bodies' centres the global graph's revision last took in
+  /// (onPeerBodies): a body appearing, leaving or moving farther than its
+  /// radius changes which edges are closed.
+  std::vector<Eigen::Vector2d> peer_body_centres_;
   /// Exploration paths sent unshortcut because the shortcut, once resampled,
   /// turned where the lattice path did not, since the node started.
   int shortcut_turn_reverts_ = 0;
@@ -682,11 +711,12 @@ class PlannerNode : public rclcpp::Node {
   /// (noteGlobalGraphEdges).
   int tour_graph_edges_ = -1;
   /// Clusters setTourClusterAside left out of the tour: where the robot
-  /// stood, the graph revision and the time then.
+  /// stood, the graph revision and the time then, and for how long.
   struct TourSetAside {
     Eigen::Vector3d position = Eigen::Vector3d::Zero();
     std::uint64_t graph_revision = 0;
     double at_s = 0.0;
+    double retry_s = 0.0;
   };
   std::unordered_map<mgg::ClusterId, TourSetAside> tour_set_aside_;
   /// Tour targets the robot could not be routed to.

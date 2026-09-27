@@ -166,6 +166,12 @@ class MolaMap : public MapInterface {
   /// call replaces the set, and an empty one clears it; the publisher owns
   /// their lifetime.
   void setNoGoDiscs(std::vector<Eigen::Vector2d> centres, double radius_m);
+  /// dynamicSweepBlocked for the discs of setTransientDiscs alone, the
+  /// peer bodies: the same sweep test and outward departure from a disc's
+  /// reach, without the no-go discs, which a caller checks on its own terms.
+  bool transientDiscsBlockSweep(const Eigen::Vector3d& start,
+                                const Eigen::Vector3d& end,
+                                double half_width) const;
   VoxelStatus getVoxelStatus(const Eigen::Vector3d& position) const override;
   VoxelStatus getRayStatus(const Eigen::Vector3d& view_point,
                            const Eigen::Vector3d& voxel_to_test,
