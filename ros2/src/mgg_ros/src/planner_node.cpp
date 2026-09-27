@@ -2610,8 +2610,9 @@ bool PlannerNode::straightDeparture(const mgg::StateVec& start,
   if (no_go_.inside(start.head<3>())) {
     // A bounded straight recovery, not a turn on the slope. Only a fully
     // outward path ending outside every zone can replace the empty choice.
-    return mgg::findDeparture(*map_, ground, robot_params_, planning_params_,
-        start, departure, [this, &ground](const auto& path) {
+    int endpoints_without_room = 0;
+    const bool found = mgg::findDeparture(*map_, ground, robot_params_, planning_params_,
+        start, departure, [this, &ground, &endpoints_without_room](const auto& path) {
           std::vector<Eigen::Vector3d> points;
           for (const auto& pose : path) points.push_back(pose.template head<3>());
           if (!no_go_.pathAdmissible(points)) return false;
@@ -2619,11 +2620,19 @@ bool PlannerNode::straightDeparture(const mgg::StateVec& start,
           const double slope = mgg::groundSlope(ground, end.template head<3>(),
               std::max(robot_params_.size.x(), robot_params_.size.y()),
               local_graph_.get());
-          return (slope > mgg::kLevelGroundSlopeRad &&
-                  slope < mgg::kUnknownSlopeRad) ||
-                 mgg::roomToTurn(*map_, robot_params_, planning_params_, end,
-                                 ground.standingStart());
+          if ((slope > mgg::kLevelGroundSlopeRad &&
+               slope < mgg::kUnknownSlopeRad) ||
+              mgg::roomToTurn(*map_, robot_params_, planning_params_, end,
+                              ground.standingStart())) return true;
+          ++endpoints_without_room;
+          return false;
         }, 3.0, /*straight_only=*/true);
+    if (endpoints_without_room > 0) {
+      RCLCPP_INFO(get_logger(),
+                  "zone escape: %d outside-zone endpoints refused for lack of "
+                  "turning room", endpoints_without_room);
+    }
+    return found;
   }
   return mgg::findDeparture(*map_, ground, robot_params_, planning_params_,
                             start, departure);

@@ -1925,7 +1925,12 @@ TEST_F(PlannerNodeTest, ALevelZoneEscapeStillNeedsRoomToTurn) {
   PlannerNodeTestPeer::acceptOdometry(*node, 1.8, 0, 1);
   PlannerNodeTestPeer::receiveNoGoZones(*node, "world", {{2.3, 0}});
   auto response = std::make_shared<mgg_msgs::srv::PlannerSrv::Response>();
+  testing::internal::CaptureStderr();
   PlannerNodeTestPeer::plan(*node, response);
+  const auto log = testing::internal::GetCapturedStderr();
+  EXPECT_EQ(PlannerNodeTestPeer::boxedInWithoutDeparture(*node), 1);
+  EXPECT_NE(log.find("outside-zone endpoints refused for lack of turning room"),
+            std::string::npos) << log;
   EXPECT_TRUE(response->path.empty());
   EXPECT_EQ(response->status, PlannerNode::kStatusNoPath);
 }
