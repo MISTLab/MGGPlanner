@@ -1175,14 +1175,18 @@ void PlannerNode::fleetTick(double now_s) {
 
 std::vector<double> PlannerNode::homeDistances(
     const std::vector<mgg::FrontierCluster>& clusters) {
+  // The way back, from each representative to home: a peer body's margin
+  // may be left but not entered, so the way out from home can be open where
+  // the way back is not. computeTourCosts has solved from each
+  // representative under this key already.
   std::vector<double> distances(clusters.size(), mgg::kUnreachableCost);
-  const mgg::ShortestPathsReport* report =
-      tour_distances_.from(*global_graph_, graph_revision_, kHomeVertexId,
-                           peer_generation_);
-  if (report == nullptr) return distances;
   for (std::size_t i = 0; i < clusters.size(); ++i) {
-    distances[i] =
-        mgg::reachedDistance(*report, clusters[i].representative_vertex_id);
+    const mgg::ShortestPathsReport* report = tour_distances_.from(
+        *global_graph_, graph_revision_, clusters[i].representative_vertex_id,
+        peer_generation_);
+    if (report != nullptr) {
+      distances[i] = mgg::reachedDistance(*report, kHomeVertexId);
+    }
   }
   return distances;
 }

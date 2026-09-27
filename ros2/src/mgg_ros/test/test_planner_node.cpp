@@ -6013,6 +6013,61 @@ TEST_F(PlannerNodeTest, AParkedPeerOnTheWayHomeCapsADronesReachUntilItLeaves) {
   EXPECT_EQ(PlannerNodeTestPeer::graphRevision(*node), revision);
 }
 
+TEST_F(PlannerNodeTest, APeerBesideHomeCapsADronesReachOnTheWayBackOnly) {
+  // Review r0 (mgg-integrate), P1: a peer body's margin may be left but not
+  // entered, so the way out from home and the way back to it differ. A peer
+  // parked 0.5 m from home has home inside its margin: a route from home to
+  // the frontier leaves the margin and is open, the route back enters it
+  // and is closed. Reach is the flight out and back, so the frontier the
+  // drone could reach but not return from leaves its tour and its bid, and
+  // returns once the peer leaves.
+  std::unique_ptr<MolaFloorProduct> product;
+  auto node = peerFloorNode("drone_reach_peer_beside_home", -7.5, 1.5, -1.5,
+                            1.5, product);
+  PlannerNodeTestPeer::acceptOdometryFacing(*node, 0.0, 0.0, M_PI, 1.0);
+  PlannerNodeTestPeer::setAerialRobot(*node);
+  const int frontier = PlannerNodeTestPeer::addGlobalChainToFrontier(
+      *node, {{-1.0, 0.0}, {-2.0, 0.0}, {-3.0, 0.0}, {-4.0, 0.0}, {-5.0, 0.0},
+              {-6.0, 0.0}},
+      M_PI);
+  PlannerNodeTestPeer::acceptOdometryFacing(*node, -4.0, 0.0, M_PI, 2.0);
+  PlannerNodeTestPeer::markGlobalFrontier(*node, frontier);
+  PlannerNodeTestPeer::setGlobalFrontierReach(*node, 1.0);
+  PlannerNodeTestPeer::setTour(*node, true, 0.0);
+  PlannerNodeTestPeer::solveTourOnEveryChange(*node);
+  PlannerNodeTestPeer::setFlightReach(*node, 20.0);
+  const auto finite_costs = [&node]() {
+    const mgg_msgs::msg::TourBid bid =
+        PlannerNodeTestPeer::ownTourBidMsg(*node);
+    return std::count_if(bid.costs_from_pose.begin(),
+                         bid.costs_from_pose.end(),
+                         [](double cost) { return std::isfinite(cost); });
+  };
+  const mgg::ClusterId target = PlannerNodeTestPeer::refreshTour(*node);
+  ASSERT_NE(target, mgg::kNoCluster);
+  EXPECT_GT(finite_costs(), 0);
+  const std::uint64_t revision = PlannerNodeTestPeer::graphRevision(*node);
+
+  PlannerNodeTestPeer::setPeerBodyTtl(*node, 600.0);
+  PlannerNodeTestPeer::receivePeerBodies(*node, {{0.5, 0.0}});
+  EXPECT_TRUE(PlannerNodeTestPeer::globalGraphRoutes(*node, {0.0, 0.0},
+                                                     {-6.0, 0.0}));
+  EXPECT_FALSE(PlannerNodeTestPeer::globalGraphRoutes(*node, {-6.0, 0.0},
+                                                      {0.0, 0.0}));
+  // The drone reaches the frontier: only the way back is closed.
+  EXPECT_TRUE(PlannerNodeTestPeer::globalGraphRoutes(*node, {-4.0, 0.0},
+                                                     {-6.0, 0.0}));
+  EXPECT_EQ(PlannerNodeTestPeer::refreshTour(*node), mgg::kNoCluster);
+  EXPECT_EQ(finite_costs(), 0);
+
+  PlannerNodeTestPeer::receivePeerBodies(*node, {});
+  EXPECT_TRUE(PlannerNodeTestPeer::globalGraphRoutes(*node, {-6.0, 0.0},
+                                                     {0.0, 0.0}));
+  EXPECT_EQ(PlannerNodeTestPeer::refreshTour(*node), target);
+  EXPECT_GT(finite_costs(), 0);
+  EXPECT_EQ(PlannerNodeTestPeer::graphRevision(*node), revision);
+}
+
 TEST_F(PlannerNodeTest, ARegionsLatticeDoesNotDemoteAnOutsideFrontierItPasses) {
   // Task 16 review r1, m1: a path chosen on a lattice computed inside the
   // region runs through this robot's frontier outside it. Joining the
