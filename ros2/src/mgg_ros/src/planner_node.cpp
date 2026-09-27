@@ -556,7 +556,6 @@ mgg::GainContext PlannerNode::makeGainContext() {
   ctx.robot = &robot_params_;
   ctx.global_space = &global_space_;
   ctx.no_gain_zones = no_gain_zones_.empty() ? nullptr : &no_gain_zones_;
-  ctx.gain_region = exploration_region_ ? &*exploration_region_ : nullptr;
   ctx.sensors = &sensors_;
   return ctx;
 }
@@ -2278,6 +2277,9 @@ std::string PlannerNode::buildLocalGraph() {
   const auto t_grid = Clock::now();
   // Global space is defined in world frame and must remain static at world origin.
   mgg::GainContext gain_ctx = makeGainContext();
+  // An operator region limits new exploration, not persistent frontier
+  // re-checks: a temporary exclusion must never be broadcast as explored.
+  gain_ctx.gain_region = exploration_region_ ? &*exploration_region_ : nullptr;
   const int evaluated = mgg::computeExplorationGain(
       *local_graph_, gain_ctx, planning_params_.leafs_only_for_volumetric_gain,
       planning_params_.cluster_vertices_for_gain);
@@ -3044,12 +3046,17 @@ bool PlannerNode::runGlobalPlanner(int target_id, std::string& reason,
     reason = "the global graph holds no frontier to reposition to";
     return false;
   }
+  const auto inside_region = [this](const mgg::Vertex& vertex) {
+    return !exploration_region_ ||
+           exploration_region_->isInsideSpace(vertex.state.head<3>());
+  };
   mgg::Vertex* target = nullptr;
   if (target_id >= 0) {
     // Resuming the repositioning that was under way (rrg.cpp:5556).
     target = findGlobalVertex(target_id);
-    if (target == nullptr || target->type != mgg::VertexType::kFrontier) {
-      target = nullptr;  // it was reached or demoted meanwhile: choose anew
+    if (target == nullptr || target->type != mgg::VertexType::kFrontier ||
+        !inside_region(*target)) {
+      target = nullptr;  // reached, demoted or excluded: choose anew
     }
   }
   if (target == nullptr) {
@@ -3083,7 +3090,7 @@ bool PlannerNode::runGlobalPlanner(int target_id, std::string& reason,
         static_cast<int>(planning_params_.robot_id), globalFrontierGain(),
         excluded, exclusion_radius,
         exploration_target_.has_value() ? &*exploration_target_ : nullptr,
-        planning_params_.global_search_time_budget_s);
+        planning_params_.global_search_time_budget_s, inside_region);
     global_space_.setCenter(current_state_, /*use_extension=*/true);
     // Cut short, the search is no answer whether or not it found a
     // frontier: the one it found may yet fail to route (review r0, I-6).
@@ -3557,6 +3564,16 @@ void PlannerNode::onExplorationRegionRequest(
         response) {
   const std::lock_guard<std::recursive_mutex> lock(planner_mutex_);
   if (!request->active) {
+    if (exploration_region_) {
+      const auto& min = exploration_region_->min_val;
+      const auto& max = exploration_region_->max_val;
+      RCLCPP_INFO(get_logger(),
+                  "exploration region cleared: min (%.2f, %.2f, %.2f), "
+                  "max (%.2f, %.2f, %.2f)",
+                  min.x(), min.y(), min.z(), max.x(), max.y(), max.z());
+    } else {
+      RCLCPP_INFO(get_logger(), "exploration region cleared (none was active)");
+    }
     exploration_region_.reset();
     ++tour_assignment_version_;
     response->success = true;
@@ -3576,6 +3593,10 @@ void PlannerNode::onExplorationRegionRequest(
   region.setBound(min, max);
   region.setCenter(Eigen::Vector3d(0, 0, 0), /*use_extension=*/false);
   exploration_region_ = region;
+  RCLCPP_INFO(get_logger(),
+              "exploration region set: min (%.2f, %.2f, %.2f), "
+              "max (%.2f, %.2f, %.2f)",
+              min.x(), min.y(), min.z(), max.x(), max.y(), max.z());
   // The tour's candidates change: solve again.
   ++tour_assignment_version_;
   response->success = true;

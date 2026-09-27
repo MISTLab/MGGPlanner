@@ -995,6 +995,23 @@ TEST(SearchGlobalFrontier, PicksTheReachableFrontierWithTheBestDiscountedGain) {
   EXPECT_NEAR(report.best_distance, 10.0, 1e-9);
 }
 
+TEST(SearchGlobalFrontier, ARegionPredicateFiltersSelectionWithoutDemotingFrontiers) {
+  FrontierGraph graph;
+  const mgg::GlobalFrontierReport report = mgg::searchGlobalFrontier(
+      graph.fixture.global, 0, 0, graph.recompute(), {}, 0.0, nullptr,
+      std::numeric_limits<double>::infinity(),
+      [](const Vertex& vertex) { return vertex.state.x() >= 9.0; });
+  ASSERT_EQ(report.best_frontier, graph.far_);
+  EXPECT_EQ(report.feasible, 1);
+  EXPECT_EQ(report.demoted, 0);
+  EXPECT_EQ(graph.near_->type, VertexType::kFrontier);
+  EXPECT_EQ(graph.seen_->type, VertexType::kFrontier);
+  // Clearing the filter makes the other candidates eligible again.
+  const auto cleared = mgg::searchGlobalFrontier(
+      graph.fixture.global, 0, 0, graph.recompute());
+  EXPECT_EQ(cleared.best_frontier, graph.excluded_);
+}
+
 TEST(SearchGlobalFrontier, AnExplorationTargetPullsTowardTheNearerFrontier) {
   FrontierGraph graph;
   // Without a target the far frontier wins (the test above). Toward a goal

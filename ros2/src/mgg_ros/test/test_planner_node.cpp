@@ -462,10 +462,24 @@ class PlannerNodeTestPeer {
     const std::lock_guard<std::recursive_mutex> lock(node.planner_mutex_);
     node.global_graph_->releaseNeighbourGraph(robot_id);
   }
-  /// runGlobalPlanner to the best frontier, outside a plan request.
-  static bool runGlobalPlanner(PlannerNode& node, std::string& reason) {
+  /// runGlobalPlanner outside a plan request, optionally resuming a target.
+  static bool runGlobalPlanner(PlannerNode& node, std::string& reason,
+                               int target_id = -1) {
     const std::lock_guard<std::recursive_mutex> lock(node.planner_mutex_);
-    return node.runGlobalPlanner(-1, reason);
+    return node.runGlobalPlanner(target_id, reason);
+  }
+  static bool isGlobalFrontier(PlannerNode& node, int id) {
+    const std::lock_guard<std::recursive_mutex> lock(node.planner_mutex_);
+    return node.global_graph_->getVertex(id)->type == mgg::VertexType::kFrontier;
+  }
+  static int buildLocalUnknownGain(PlannerNode& node) {
+    const std::lock_guard<std::recursive_mutex> lock(node.planner_mutex_);
+    node.buildLocalGraph();
+    int unknown = 0;
+    for (const auto& [id, vertex] : node.local_graph_->vertices_map_) {
+      if (vertex) unknown += vertex->vol_gain.num_unknown_voxels;
+    }
+    return unknown;
   }
   static std::string completionWithheld(PlannerNode& node) {
     const std::lock_guard<std::recursive_mutex> lock(node.planner_mutex_);
@@ -4208,6 +4222,102 @@ TEST_F(PlannerNodeTest, RegionChangesInvalidateToursWithAndWithoutFleet) {
                     Eigen::Vector3d::Zero())->success);
     EXPECT_TRUE(PlannerNodeTestPeer::emptyTourNeedsSolve(*node));
   }
+}
+
+TEST_F(PlannerNodeTest, RegionPlansPreserveOutsideFrontiersAndTheirBroadcast) {
+  auto node = makeNode("region_preserves_frontiers", "world",
+                       {rclcpp::Parameter("tour.min_cluster_gain", 0.0)});
+  PlannerNodeTestPeer::observeFloor(*node, -3.55, 4.55, -1.55, 1.55);
+  PlannerNodeTestPeer::acceptOdometry(*node, 0.0, 0.0, 1.0);
+  PlannerNodeTestPeer::gainFromUnknownVoxelsOnly(*node);
+  const int outside = PlannerNodeTestPeer::addGlobalChainToFrontier(
+      *node, {{-0.5, 0.0}, {-1.0, 0.0}, {-2.0, 0.0}}, M_PI);
+  const auto plan = [&]() {
+    auto response = std::make_shared<mgg_msgs::srv::PlannerSrv::Response>();
+    PlannerNodeTestPeer::plan(*node, response);
+  };
+  // The second plan re-checks persistent frontiers before replacing the
+  // previous local graph, as each subsequent exploration cycle does.
+  plan();
+  plan();
+  ASSERT_TRUE(PlannerNodeTestPeer::isGlobalFrontier(*node, outside));
+  const auto broadcastFrontier = [&]() {
+    const auto graph = PlannerNodeTestPeer::ownGraph(*node);
+    for (const auto& vertex : graph.vertices) {
+      if (vertex.id == outside) return vertex.is_frontier;
+    }
+    return false;
+  };
+  ASSERT_TRUE(broadcastFrontier());
+  const auto hasOutsideCandidate = [&]() {
+    const auto candidates = PlannerNodeTestPeer::tourCandidates(
+        *node, PlannerNodeTestPeer::frontierClusters(*node));
+    for (const auto& cluster : candidates) {
+      for (int id : cluster.member_vertex_ids) {
+        if (id == outside) return true;
+      }
+    }
+    return false;
+  };
+  ASSERT_TRUE(hasOutsideCandidate());
+  ASSERT_TRUE(PlannerNodeTestPeer::setExplorationRegion(
+                  *node, true, {100, 100, 100}, {110, 110, 110})->success);
+  plan();
+  EXPECT_TRUE(PlannerNodeTestPeer::isGlobalFrontier(*node, outside));
+  EXPECT_TRUE(broadcastFrontier()) << "must not broadcast an operator exclusion as explored";
+  EXPECT_TRUE(PlannerNodeTestPeer::tourCandidates(
+                  *node, PlannerNodeTestPeer::frontierClusters(*node)).empty());
+
+  ASSERT_TRUE(PlannerNodeTestPeer::setExplorationRegion(
+                  *node, false, Eigen::Vector3d::Zero(),
+                  Eigen::Vector3d::Zero())->success);
+  EXPECT_TRUE(hasOutsideCandidate());
+}
+
+TEST_F(PlannerNodeTest, RegionLimitsLocalGainAndARefusedRequestPreservesIt) {
+  auto node = makeNode("region_local_gain");
+  PlannerNodeTestPeer::observeFloor(*node, -1.55, 4.55, -1.55, 1.55);
+  PlannerNodeTestPeer::acceptOdometry(*node, 0.0, 0.0, 1.0);
+  ASSERT_GT(PlannerNodeTestPeer::buildLocalUnknownGain(*node), 0);
+  ASSERT_TRUE(PlannerNodeTestPeer::setExplorationRegion(
+                  *node, true, {100, 100, 100}, {110, 110, 110})->success);
+  EXPECT_EQ(PlannerNodeTestPeer::buildLocalUnknownGain(*node), 0);
+  EXPECT_FALSE(PlannerNodeTestPeer::setExplorationRegion(
+                   *node, true, {0, 0, 0}, {0, 1, 1})->success);
+  EXPECT_EQ(PlannerNodeTestPeer::buildLocalUnknownGain(*node), 0);
+  mgg::FrontierCluster inside, outside;
+  inside.id = 1;
+  inside.position = {105, 105, 105};
+  outside.id = 2;
+  outside.position = {2, 0, 0};
+  const auto kept = PlannerNodeTestPeer::insideExplorationRegion(
+      *node, {inside, outside});
+  ASSERT_EQ(kept.size(), 1u);
+  EXPECT_EQ(kept.front().id, inside.id);
+  ASSERT_TRUE(PlannerNodeTestPeer::setExplorationRegion(
+                  *node, false, Eigen::Vector3d::Zero(),
+                  Eigen::Vector3d::Zero())->success);
+  EXPECT_GT(PlannerNodeTestPeer::buildLocalUnknownGain(*node), 0);
+}
+
+TEST_F(PlannerNodeTest, RegionRejectsGreedyAndResumedOutsideFrontiersWithoutDemotion) {
+  auto node = makeNode("region_greedy_filter");
+  PlannerNodeTestPeer::observeFloor(*node, -3.55, 4.55, -1.55, 1.55);
+  PlannerNodeTestPeer::acceptOdometry(*node, 0.0, 0.0, 1.0);
+  const int outside = PlannerNodeTestPeer::addGlobalChainToFrontier(
+      *node, {{-0.5, 0.0}, {-1.0, 0.0}, {-2.0, 0.0}}, M_PI);
+  std::string reason;
+  ASSERT_TRUE(PlannerNodeTestPeer::runGlobalPlanner(*node, reason)) << reason;
+  ASSERT_TRUE(PlannerNodeTestPeer::setExplorationRegion(
+                  *node, true, {100, 100, 100}, {110, 110, 110})->success);
+  // The resumed path must not bypass the candidate predicate.
+  EXPECT_FALSE(PlannerNodeTestPeer::runGlobalPlanner(*node, reason, outside));
+  EXPECT_FALSE(PlannerNodeTestPeer::runGlobalPlanner(*node, reason));
+  EXPECT_TRUE(PlannerNodeTestPeer::isGlobalFrontier(*node, outside));
+  ASSERT_TRUE(PlannerNodeTestPeer::setExplorationRegion(
+                  *node, false, Eigen::Vector3d::Zero(),
+                  Eigen::Vector3d::Zero())->success);
+  EXPECT_TRUE(PlannerNodeTestPeer::runGlobalPlanner(*node, reason)) << reason;
 }
 
 }  // namespace mgg_ros

@@ -431,12 +431,15 @@ struct GlobalFrontierReport {
 /// scored counts as the best), then the rest; the re-check stops once
 /// `time_budget_s` is spent (after at least one frontier), and the report
 /// counts what it left unchecked (GlobalFrontierReport::unchecked).
+/// `eligible`, when set, excludes frontiers before re-checking or ranking;
+/// an operator's temporary region must not demote persistent frontiers.
 GlobalFrontierReport searchGlobalFrontier(
     GraphManager& graph, int source_id, int robot_id,
     const RecomputeGainFn& recompute_gain,
     const std::vector<Eigen::Vector3d>& excluded = {},
     double exclusion_radius = 0.0, const Eigen::Vector3d* target = nullptr,
-    double time_budget_s = std::numeric_limits<double>::infinity());
+    double time_budget_s = std::numeric_limits<double>::infinity(),
+    const UsableVertexFn& eligible = {});
 
 }  // namespace mgg
 

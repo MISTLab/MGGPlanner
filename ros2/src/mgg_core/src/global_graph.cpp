@@ -1003,7 +1003,8 @@ GlobalFrontierReport searchGlobalFrontier(
     GraphManager& graph, int source_id, int robot_id,
     const RecomputeGainFn& recompute_gain,
     const std::vector<Eigen::Vector3d>& excluded, double exclusion_radius,
-    const Eigen::Vector3d* target, double time_budget_s) {
+    const Eigen::Vector3d* target, double time_budget_s,
+    const UsableVertexFn& eligible) {
   GlobalFrontierReport report;
   const auto started = std::chrono::steady_clock::now();
 
@@ -1011,7 +1012,7 @@ GlobalFrontierReport searchGlobalFrontier(
   for (auto& entry : graph.vertices_map_) {
     Vertex* vertex = entry.second;
     if (vertex == nullptr || vertex->type != VertexType::kFrontier ||
-        !graph.inService(*vertex)) {
+        !graph.inService(*vertex) || (eligible && !eligible(*vertex))) {
       continue;
     }
     global_frontiers.push_back(vertex);
