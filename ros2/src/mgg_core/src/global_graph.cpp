@@ -1003,7 +1003,8 @@ GlobalFrontierReport searchGlobalFrontier(
     GraphManager& graph, int source_id, int robot_id,
     const RecomputeGainFn& recompute_gain,
     const std::vector<Eigen::Vector3d>& excluded, double exclusion_radius,
-    const Eigen::Vector3d* target, double time_budget_s) {
+    const Eigen::Vector3d* target, double time_budget_s,
+    const Eigen::Vector3d* robot_position, double reach_distance) {
   GlobalFrontierReport report;
 
   std::vector<Vertex*> global_frontiers;
@@ -1064,16 +1065,21 @@ GlobalFrontierReport searchGlobalFrontier(
     Vertex* frontier;
     double distance;
     bool ranked;
+    bool within_reach;
     double promise;
   };
   std::vector<Candidate> order;
   order.reserve(global_frontiers.size());
   for (Vertex* frontier : global_frontiers) {
     const double distance = distance_to(frontier);
-    const bool ranked = std::isfinite(distance) && !is_excluded(frontier);
+    const bool eligible = std::isfinite(distance) && !is_excluded(frontier);
+    const bool within_reach = eligible && robot_position != nullptr &&
+        (frontier->state.head<2>() - robot_position->head<2>()).norm() <=
+            reach_distance;
+    const bool ranked = eligible && !within_reach;
     const double stored =
         frontier->vol_gain.gain > 0.0 ? frontier->vol_gain.gain : best_stored;
-    order.push_back({frontier, distance, ranked,
+    order.push_back({frontier, distance, ranked, within_reach,
                      ranked ? discounted(frontier, stored, distance) : 0.0});
   }
   std::stable_sort(order.begin(), order.end(),
@@ -1106,6 +1112,9 @@ GlobalFrontierReport searchGlobalFrontier(
       continue;
     }
     ++report.frontiers;
+    if (order[i].within_reach && frontier->vol_gain.gain > 0.0) {
+      ++report.within_reach;
+    }
     if (!order[i].ranked) continue;
     ++report.feasible;
     const double exp_gain =

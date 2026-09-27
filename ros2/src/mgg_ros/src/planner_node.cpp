@@ -3344,12 +3344,14 @@ bool PlannerNode::runGlobalPlanner(int target_id, std::string& reason,
         fleet_ ? std::max(reservation_exclusion_radius_m_,
                           fleet_params_.cluster_merge_radius_m)
                : reservation_exclusion_radius_m_;
+    const Eigen::Vector3d robot_position = current_state_.head<3>();
     const mgg::GlobalFrontierReport report = mgg::searchGlobalFrontier(
         *global_graph_, link_vertex->id,
         static_cast<int>(planning_params_.robot_id), globalFrontierGain(),
         excluded, exclusion_radius,
         exploration_target_.has_value() ? &*exploration_target_ : nullptr,
-        planning_params_.global_search_time_budget_s);
+        planning_params_.global_search_time_budget_s, &robot_position,
+        reach_distance_);
     global_space_.setCenter(current_state_, /*use_extension=*/true);
     // Cut short, the search is no answer whether or not it found a
     // frontier: the one it found may yet fail to route (review r0, I-6).
@@ -3367,6 +3369,15 @@ bool PlannerNode::runGlobalPlanner(int target_id, std::string& reason,
                               .c_str()
                         : "");
       reason = why;
+      if (report.within_reach > 0) {
+        // Still holding gain, but PCI would consider their goals reached:
+        // these frontiers were skipped, not explored. Retry, not complete.
+        global_frontier_not_routed_ = true;
+        global_exploration_ongoing_ = false;
+        current_global_vertex_id_ = -1;
+        reason += "; " + std::to_string(report.within_reach) +
+                  " frontier(s) within the controller goal tolerance";
+      }
       // Frontiers only peer bodies keep the robot from are still to be
       // explored: the search is retried, not exploration complete. Only
       // with peers in force, and within the search budget: cut short, the

@@ -997,6 +997,28 @@ TEST(SearchGlobalFrontier, PicksTheReachableFrontierWithTheBestDiscountedGain) {
   EXPECT_NEAR(report.best_distance, 10.0, 1e-9);
 }
 
+TEST(SearchGlobalFrontier, SkipsFrontiersWithinPlanarReachOfTheRobotNotItsGraphLink) {
+  FrontierGraph graph;
+  graph.gains_[graph.near_->id] = 1e9;
+  // Source vertex is at (0,0), but the robot is 0.25 m from near_. Height
+  // must not affect PCI's planar tolerance, including its exact boundary.
+  const Eigen::Vector3d robot(5.25, 0.0, 10.0);
+  auto report = mgg::searchGlobalFrontier(
+      graph.fixture.global, 0, 0, graph.recompute(),
+      {Eigen::Vector3d(5.0, 5.0, 0.0)}, 1.0, nullptr,
+      std::numeric_limits<double>::infinity(), &robot, 0.25);
+  EXPECT_EQ(report.best_frontier, graph.far_);
+  EXPECT_EQ(report.within_reach, 1);
+  EXPECT_EQ(graph.near_->type, VertexType::kFrontier);
+  EXPECT_GT(graph.near_->vol_gain.gain, 0.0);
+  report = mgg::searchGlobalFrontier(
+      graph.fixture.global, 0, 0, graph.recompute(),
+      {Eigen::Vector3d(5.0, 5.0, 0.0)}, 1.0, nullptr,
+      std::numeric_limits<double>::infinity(), &robot, 0.24);
+  EXPECT_EQ(report.best_frontier, graph.near_);
+  EXPECT_EQ(report.within_reach, 0);
+}
+
 TEST(SearchGlobalFrontier, AnExplorationTargetPullsTowardTheNearerFrontier) {
   FrontierGraph graph;
   // Without a target the far frontier wins (the test above). Toward a goal

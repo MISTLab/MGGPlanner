@@ -606,6 +606,10 @@ class PlannerNodeTestPeer {
     const std::lock_guard<std::recursive_mutex> lock(node.planner_mutex_);
     return node.runGlobalPlanner(-1, reason);
   }
+  static std::vector<mgg::StateVec> bestPath(PlannerNode& node) {
+    const std::lock_guard<std::recursive_mutex> lock(node.planner_mutex_);
+    return node.best_path_;
+  }
   static std::string completionWithheld(PlannerNode& node) {
     const std::lock_guard<std::recursive_mutex> lock(node.planner_mutex_);
     return node.completionWithheld();
@@ -3307,28 +3311,30 @@ TEST_F(PlannerNodeTest, AGlobalSearchCutShortIsNotExplorationComplete) {
 }
 
 TEST_F(PlannerNodeTest, AFrontierFoundButNotRoutedToLeavesTheSearchInconclusive) {
-  // Review r0, I-6: the robot stands on the best frontier of the global
-  // graph, so the route to it fails ("already at the goal"), and another
-  // frontier 1 m away is left unchecked by a zero time budget, or checked
-  // with time to spare. Either way the search found a frontier it could not
-  // route to: its failure is no answer, and exploration is not complete.
+  // Review r0, I-6: the best frontier cannot be routed to, and another
+  // frontier is left unchecked by a zero time budget, or checked with time
+  // to spare. Either way its failure is no answer, not exploration complete.
+  // A root frontier is now skipped before ranking. Instead, put an isolated
+  // vertex at the preferred frontier's position first: the search reaches
+  // the frontier, but routing to its position finds that isolated vertex.
   for (const double budget : {0.0, 10.0}) {
     SCOPED_TRACE(budget);
     auto node = makeNode("found_not_routed_" + std::to_string(int(budget)));
     PlannerNodeTestPeer::observeFloor(*node, -1.5, 0.5, -0.5, 0.5);
     PlannerNodeTestPeer::acceptOdometry(*node, 0.0, 0.0, 1.0);
-    // The other frontier, deeper in the mapped floor, sees less unknown
-    // space than the one the robot stands on; its last gain is lower too,
-    // so the budget leaves it for later.
+    PlannerNodeTestPeer::addIsolatedGlobalVertex(*node, -1.25, 0.0);
+    const int preferred = PlannerNodeTestPeer::addGlobalChainToFrontier(
+        *node, {{-0.5, 0.0}, {-1.0, 0.0}, {-1.25, 0.0}}, M_PI);
+    // Facing into the mapped floor, the other frontier sees less unknown.
     const int other =
         PlannerNodeTestPeer::addGlobalChainToFrontier(*node, {{-1.0, 0.0}});
-    PlannerNodeTestPeer::markGlobalFrontier(*node, 0);
-    PlannerNodeTestPeer::setVertexGain(*node, 0, 1e6);
+    PlannerNodeTestPeer::setVertexGain(*node, preferred, 1e6);
     PlannerNodeTestPeer::setVertexGain(*node, other, 1.0);
     PlannerNodeTestPeer::setGlobalSearchBudget(*node, budget);
     std::string reason;
     EXPECT_FALSE(PlannerNodeTestPeer::runGlobalPlanner(*node, reason));
-    EXPECT_NE(reason.find("already at the goal"), std::string::npos) << reason;
+    EXPECT_NE(reason.find("no route over the global graph"), std::string::npos)
+        << reason;
     EXPECT_FALSE(PlannerNodeTestPeer::completionWithheld(*node).empty());
   }
 }
@@ -4818,6 +4824,36 @@ TEST_F(PlannerNodeTest, GlobalRepositioningRejectsAnEndInsideTheConfiguredPciTol
     PlannerNodeTestPeer::setReachDistance(*node, reach - 0.05);
     EXPECT_TRUE(PlannerNodeTestPeer::runGlobalPlanner(*node, reason)) << reason;
   }
+}
+
+TEST_F(PlannerNodeTest, GreedyRepositioningSkipsTheNearbyFrontierForTheNextReachableOne) {
+  auto node = makeNode("greedy_skip_near");
+  PlannerNodeTestPeer::observeFloor(*node, -3.0, 4.0, -1.5, 1.5);
+  PlannerNodeTestPeer::acceptOdometry(*node, 0.0, 0.0, 1.0);
+  const int near = PlannerNodeTestPeer::addGlobalChainToFrontier(
+      *node, {{-0.25, 0.0}}, M_PI);
+  const int far = PlannerNodeTestPeer::addGlobalChainToFrontier(
+      *node, {{-0.5, 0.0}, {-1.0, 0.0}, {-1.5, 0.0}}, M_PI);
+  // Owner-reported gain makes the near frontier the greedy favourite,
+  // independently of the local sensor's view of the two endpoints.
+  for (int id : {near, far}) PlannerNodeTestPeer::setFrontierOwner(*node, id, 2);
+  PlannerNodeTestPeer::setReportedUnknown(*node, near, 100000);
+  PlannerNodeTestPeer::setReportedUnknown(*node, far, 1000);
+  PlannerNodeTestPeer::setTour(*node, false, 0.0);
+  std::string reason;
+  ASSERT_TRUE(PlannerNodeTestPeer::runGlobalPlanner(*node, reason)) << reason;
+  EXPECT_EQ(PlannerNodeTestPeer::repositioningTarget(*node), far);
+  EXPECT_TRUE(PlannerNodeTestPeer::bestPathFromGlobalGraph(*node));
+  const auto path = PlannerNodeTestPeer::bestPath(*node);
+  ASSERT_FALSE(path.empty());
+  EXPECT_NEAR(path.back().x(), -1.5, 1e-6);
+  // The near frontier is still unexplored, but must not be sent alone or
+  // mistaken for exploration complete once the other frontier is gone.
+  PlannerNodeTestPeer::setGlobalVertexType(*node, far, mgg::VertexType::kUnvisited);
+  EXPECT_FALSE(PlannerNodeTestPeer::runGlobalPlanner(*node, reason));
+  EXPECT_TRUE(PlannerNodeTestPeer::bestPath(*node).empty());
+  EXPECT_FALSE(PlannerNodeTestPeer::repositioningOngoing(*node));
+  EXPECT_FALSE(PlannerNodeTestPeer::completionWithheld(*node).empty());
 }
 
 TEST_F(PlannerNodeTest, AnEdgeAloneThatConnectsAClusterReachesTheTour) {
