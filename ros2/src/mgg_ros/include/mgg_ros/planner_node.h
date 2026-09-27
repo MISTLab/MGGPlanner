@@ -131,8 +131,9 @@ class PlannerNode : public rclcpp::Node {
   void readmitQuarantinedNeighbours();
   /// Why exploration may not be declared complete although no frontier is
   /// left to go to, or empty: a quarantined neighbour roadmap, whose
-  /// frontiers are out of every search until its transform returns, or a
-  /// global search cut short by its time budget.
+  /// frontiers are out of every search until its transform returns, a
+  /// global search cut short by its time budget, or one that found a
+  /// frontier it could not route to.
   std::string completionWithheld() const;
   /// This robot's platform as a neighbour's roadmap is re-read for it.
   mgg::ReceiverPlatform receiverPlatform() const;
@@ -433,8 +434,12 @@ class PlannerNode : public rclcpp::Node {
   /// neighbour, to re-admit it from when its transform returns.
   std::unordered_map<int, mgg::GraphExchange> neighbour_roadmaps_;
   /// The last global frontier search was cut short by
-  /// global_search_time_budget_s with nothing found (runGlobalPlanner).
+  /// global_search_time_budget_s (runGlobalPlanner), found a frontier or
+  /// not.
   bool global_search_cut_short_ = false;
+  /// The last global search found a frontier, or resumed one, and routing
+  /// to it failed (runGlobalPlanner).
+  bool global_frontier_not_routed_ = false;
   mgg::RandomSampler random_sampler_;
   mgg::RobotStateHistory robot_state_hist_;
 

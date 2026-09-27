@@ -1499,6 +1499,9 @@ std::string PlannerNode::completionWithheld() const {
   if (global_search_cut_short_) {
     return "the global search was cut short by its time budget";
   }
+  if (global_frontier_not_routed_) {
+    return "the global search found a frontier it could not route to";
+  }
   return "";
 }
 
@@ -2873,6 +2876,7 @@ bool PlannerNode::runGlobalPlanner(int target_id, std::string& reason,
   best_path_.clear();
   best_path_from_global_graph_ = false;
   global_search_cut_short_ = false;
+  global_frontier_not_routed_ = false;
   if (global_graph_->getNumVertices() <= 1) {
     // rrg.cpp:5582.
     reason = "the global graph holds no frontier to reposition to";
@@ -2919,8 +2923,9 @@ bool PlannerNode::runGlobalPlanner(int target_id, std::string& reason,
         exploration_target_.has_value() ? &*exploration_target_ : nullptr,
         planning_params_.global_search_time_budget_s);
     global_space_.setCenter(current_state_, /*use_extension=*/true);
-    global_search_cut_short_ =
-        report.best_frontier == nullptr && report.cut_short();
+    // Cut short, the search is no answer whether or not it found a
+    // frontier: the one it found may yet fail to route (review r0, I-6).
+    global_search_cut_short_ = report.cut_short();
     if (report.best_frontier == nullptr) {
       // rrg.cpp:5628 and 5759: no frontier, or none the graph can reach.
       char why[224];
@@ -2966,6 +2971,11 @@ bool PlannerNode::runGlobalPlanner(int target_id, std::string& reason,
   mgg::PathOkFn turns_ok;
   const bool routed = routeOverGlobalGraph(target_state, 1e-3, best_path_,
                                            turns_ok, reason);
+  // A frontier found but not routed to is still a frontier: the search's
+  // failure is no answer, not "none left".
+  if (!routed || roadmap_rebuilds_ != rebuilds_before) {
+    global_frontier_not_routed_ = true;
+  }
   if (roadmap_rebuilds_ != rebuilds_before) {
     best_path_.clear();
     global_exploration_ongoing_ = false;

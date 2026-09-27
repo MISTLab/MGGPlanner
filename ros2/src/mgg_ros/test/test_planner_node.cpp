@@ -277,6 +277,15 @@ class PlannerNodeTestPeer {
     const std::lock_guard<std::recursive_mutex> lock(node.planner_mutex_);
     node.global_graph_->releaseNeighbourGraph(robot_id);
   }
+  /// runGlobalPlanner to the best frontier, outside a plan request.
+  static bool runGlobalPlanner(PlannerNode& node, std::string& reason) {
+    const std::lock_guard<std::recursive_mutex> lock(node.planner_mutex_);
+    return node.runGlobalPlanner(-1, reason);
+  }
+  static std::string completionWithheld(PlannerNode& node) {
+    const std::lock_guard<std::recursive_mutex> lock(node.planner_mutex_);
+    return node.completionWithheld();
+  }
   static void setGlobalSearchBudget(PlannerNode& node, double seconds) {
     node.planning_params_.global_search_time_budget_s = seconds;
   }
@@ -615,6 +624,11 @@ class PlannerNodeTestPeer {
     node.global_graph_->addVertex(v);
     ++node.graph_revision_;
     return v->id;
+  }
+  /// A global vertex's last scored gain.
+  static void setVertexGain(PlannerNode& node, int id, double gain) {
+    const std::lock_guard<std::recursive_mutex> lock(node.planner_mutex_);
+    node.findGlobalVertex(id)->vol_gain.gain = gain;
   }
   static void markGlobalFrontier(PlannerNode& node, int id) {
     const std::lock_guard<std::recursive_mutex> lock(node.planner_mutex_);
@@ -1749,6 +1763,33 @@ TEST_F(PlannerNodeTest, AGlobalSearchCutShortIsNotExplorationComplete) {
   EXPECT_EQ(plan(), PlannerNode::kStatusNoPath);
   PlannerNodeTestPeer::setGlobalSearchBudget(*node, 10.0);
   EXPECT_EQ(plan(), PlannerNode::kStatusComplete);
+}
+
+TEST_F(PlannerNodeTest, AFrontierFoundButNotRoutedToLeavesTheSearchInconclusive) {
+  // Review r0, I-6: the robot stands on the best frontier of the global
+  // graph, so the route to it fails ("already at the goal"), and another
+  // frontier 1 m away is left unchecked by a zero time budget, or checked
+  // with time to spare. Either way the search found a frontier it could not
+  // route to: its failure is no answer, and exploration is not complete.
+  for (const double budget : {0.0, 10.0}) {
+    SCOPED_TRACE(budget);
+    auto node = makeNode("found_not_routed_" + std::to_string(int(budget)));
+    PlannerNodeTestPeer::observeFloor(*node, -1.5, 0.5, -0.5, 0.5);
+    PlannerNodeTestPeer::acceptOdometry(*node, 0.0, 0.0, 1.0);
+    // The other frontier, deeper in the mapped floor, sees less unknown
+    // space than the one the robot stands on; its last gain is lower too,
+    // so the budget leaves it for later.
+    const int other =
+        PlannerNodeTestPeer::addGlobalChainToFrontier(*node, {{-1.0, 0.0}});
+    PlannerNodeTestPeer::markGlobalFrontier(*node, 0);
+    PlannerNodeTestPeer::setVertexGain(*node, 0, 1e6);
+    PlannerNodeTestPeer::setVertexGain(*node, other, 1.0);
+    PlannerNodeTestPeer::setGlobalSearchBudget(*node, budget);
+    std::string reason;
+    EXPECT_FALSE(PlannerNodeTestPeer::runGlobalPlanner(*node, reason));
+    EXPECT_NE(reason.find("already at the goal"), std::string::npos) << reason;
+    EXPECT_FALSE(PlannerNodeTestPeer::completionWithheld(*node).empty());
+  }
 }
 
 TEST_F(PlannerNodeTest, NeighbourRoadmapDoesNotReachThroughAKnownWall) {
