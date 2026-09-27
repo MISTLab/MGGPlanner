@@ -60,6 +60,7 @@
 #include "mgg_core/graph_manager.h"
 #include "mgg_core/graph_merge.h"
 #include "mgg_core/grid_graph.h"
+#include "mgg_core/no_go_zones.h"
 #include "mgg_core/path_selection.h"
 #include "mgg_core/ground_projection.h"
 #include "mgg_core/params.h"
@@ -161,9 +162,12 @@ class PlannerNode : public rclcpp::Node {
   /// leaving one it starts in excepted), and on every backend the global
   /// graph's searches leave out the edges through it (noGoBlocksEdge).
   void onNoGoZones(geometry_msgs::msg::PoseArray::ConstSharedPtr msg);
-  /// Whether a global graph edge passes through a no-go zone, the robot's
-  /// body width included. A zone the robot stands in does not block, so
-  /// that it can be routed out of it.
+  /// Sets no_go_ from no_go_zones_, its reach the zone radius plus half
+  /// the robot's planning box.
+  void refreshNoGoZones();
+  /// Whether a no-go zone closes a global graph edge
+  /// (mgg::NoGoZones::blocksEdge): only an outward departure of the robot
+  /// from a zone it stands in stays open.
   bool noGoBlocksEdge(const mgg::Vertex& a, const mgg::Vertex& b) const;
   /// The same for a straight segment, such as a shortcut.
   bool noGoBlocksSegment(const Eigen::Vector3d& from,
@@ -719,6 +723,8 @@ class PlannerNode : public rclcpp::Node {
       no_go_zones_sub_;
   /// The no-go zones' centres, planning frame (onNoGoZones).
   std::vector<Eigen::Vector2d> no_go_zones_;
+  /// The same zones with their reach, as every check applies them.
+  mgg::NoGoZones no_go_;
   rclcpp::Publisher<mgg_msgs::msg::Graph>::SharedPtr graph_pub_;
   rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr
       marker_pub_;

@@ -1410,11 +1410,19 @@ void PlannerNode::onNoGoZones(
   }
   if (centres != no_go_zones_) {
     no_go_zones_ = std::move(centres);
+    refreshNoGoZones();
     // Route costs change with the edges the searches leave out.
     ++graph_revision_;
     RCLCPP_INFO(get_logger(), "%zu no-go zone(s) of %.2f m radius",
                 no_go_zones_.size(), planning_params_.no_go_radius_m);
   }
+}
+
+void PlannerNode::refreshNoGoZones() {
+  // A centre line kept out of the reach keeps the body out of the disc.
+  const Eigen::Vector3d box = robot_params_.getPlanningSize();
+  no_go_.set(no_go_zones_, planning_params_.no_go_radius_m +
+                               0.5 * std::max(box.x(), box.y()));
 }
 
 bool PlannerNode::noGoBlocksEdge(const mgg::Vertex& a,
@@ -1424,23 +1432,8 @@ bool PlannerNode::noGoBlocksEdge(const mgg::Vertex& a,
 
 bool PlannerNode::noGoBlocksSegment(const Eigen::Vector3d& from,
                                     const Eigen::Vector3d& to) const {
-  if (no_go_zones_.empty()) return false;
-  const Eigen::Vector3d box = robot_params_.getPlanningSize();
-  const double reach =
-      planning_params_.no_go_radius_m + 0.5 * std::max(box.x(), box.y());
-  const Eigen::Vector2d robot = current_state_.head<2>();
-  const Eigen::Vector2d p = from.head<2>();
-  const Eigen::Vector2d d = to.head<2>() - p;
-  const double length_squared = d.squaredNorm();
-  for (const Eigen::Vector2d& centre : no_go_zones_) {
-    if ((centre - robot).norm() < reach) continue;  // the robot stands in it
-    const double t =
-        length_squared > 1e-12
-            ? std::clamp((centre - p).dot(d) / length_squared, 0.0, 1.0)
-            : 0.0;
-    if ((centre - (p + t * d)).norm() < reach) return true;
-  }
-  return false;
+  return !no_go_.empty() &&
+         no_go_.blocksEdge(from, to, current_state_.head<3>());
 }
 
 void PlannerNode::onNeighbourTransforms(
@@ -2710,6 +2703,18 @@ bool PlannerNode::routeOverGlobalGraph(const mgg::StateVec goal,
   for (const mgg::Vertex* v : route) path.push_back(v->state);
   if (path.size() < 2) {
     reason = "no route over the global graph reaches the goal";
+    return false;
+  }
+  // A route left open by the searches may still turn back into a zone the
+  // robot is leaving, or end in one (review r0, I-3).
+  refreshNoGoZones();
+  std::vector<Eigen::Vector3d> points;
+  points.reserve(path.size());
+  for (const mgg::StateVec& state : path) points.push_back(state.head<3>());
+  if (!no_go_.pathAdmissible(points)) {
+    path.clear();
+    turns_ok = nullptr;
+    reason = "the route enters a no-go zone";
     return false;
   }
   return true;

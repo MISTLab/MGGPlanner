@@ -44,6 +44,7 @@ add_library(${PROJECT_NAME}
   src/trajectory.cpp
   src/path_selection.cpp
   src/path_turns.cpp
+  src/no_go_zones.cpp
   src/departure.cpp
   src/global_graph.cpp
   src/frontier_clusters.cpp
@@ -102,6 +103,8 @@ if(BUILD_TESTING)
   target_link_libraries(test_trajectory ${PROJECT_NAME})
   ament_add_gtest(test_path_selection test/test_path_selection.cpp)
   target_link_libraries(test_path_selection ${PROJECT_NAME})
+  ament_add_gtest(test_no_go_zones test/test_no_go_zones.cpp)
+  target_link_libraries(test_no_go_zones ${PROJECT_NAME})
   ament_add_gtest(test_path_turns test/test_path_turns.cpp)
   target_link_libraries(test_path_turns ${PROJECT_NAME})
   ament_add_gtest(test_departure test/test_departure.cpp)

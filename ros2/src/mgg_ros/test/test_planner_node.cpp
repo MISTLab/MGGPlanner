@@ -1477,6 +1477,45 @@ TEST_F(PlannerNodeTest, ANoGoZoneTurnsTheGlobalRouteAwayOrLeavesNone) {
   EXPECT_NEAR(pathLength(response->path), 4.0, 0.60);
 }
 
+TEST_F(PlannerNodeTest, FromInsideANoGoZoneOnlyAnOutwardDepartureIsRouted) {
+  // Review r0, I-3: standing in a zone disabled it for the whole route. The
+  // robot stands in a zone near its east edge, on a straight track. A goal
+  // to the west, through the zone's centre, is refused; one to the east,
+  // straight out, is routed; and with the robot outside, a goal inside the
+  // zone is refused.
+  auto node = makeNode("no_go_inside", "world",
+                       {rclcpp::Parameter("PlanningParams.no_go_radius_m", 0.5)});
+  PlannerNodeTestPeer::observeFloor(*node, -1.5, 8.0, -1.5, 1.5);
+  double stamp = 1.0;
+  for (double x = 0.0; x <= 7.0 + 1e-9; x += 0.5) {
+    PlannerNodeTestPeer::acceptOdometry(*node, x, 0.0, stamp);
+    stamp += 1.0;
+  }
+  // Zone at (4, 0), reach 0.6; the robot at 4.4.
+  PlannerNodeTestPeer::acceptOdometry(*node, 4.4, 0.0, stamp++);
+  PlannerNodeTestPeer::receiveNoGoZones(*node, "world", {{4.0, 0.0}});
+  const auto navigate = [&node](double x) {
+    auto request = std::make_shared<mgg_msgs::srv::PlanObjective::Request>();
+    request->objective = mgg_msgs::srv::PlanObjective::Request::NAVIGATE;
+    request->goal.position.x = x;
+    request->goal.orientation.w = 1.0;
+    auto response = std::make_shared<mgg_msgs::srv::PlanObjective::Response>();
+    PlannerNodeTestPeer::objective(*node, request, response);
+    return response;
+  };
+  auto west = navigate(0.0);
+  EXPECT_EQ(west->status, mgg_msgs::srv::PlanObjective::Response::UNREACHABLE)
+      << "path of " << west->path.size() << " poses";
+  auto east = navigate(7.0 + 1e-3);
+  EXPECT_EQ(east->status, mgg_msgs::srv::PlanObjective::Response::SUCCEEDED)
+      << east->reason;
+  // Outside, at the far west: the zone's centre is no goal.
+  PlannerNodeTestPeer::acceptOdometry(*node, 0.0, 0.0, stamp++);
+  auto inside = navigate(4.0);
+  EXPECT_EQ(inside->status, mgg_msgs::srv::PlanObjective::Response::UNREACHABLE)
+      << "path of " << inside->path.size() << " poses";
+}
+
 TEST_F(PlannerNodeTest, OverlappingNoGoZoneMessagesEndWithTheLastSet) {
   // Review r0, I-4: the subscription was in the node's reentrant group, and
   // under the multithreaded executor an older replacement could take the
