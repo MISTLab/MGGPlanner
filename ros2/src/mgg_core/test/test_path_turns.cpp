@@ -412,9 +412,41 @@ TEST(ViewpointClear, AGroundRobotsPathEndsOnlyWhereItCanTurn) {
   EXPECT_FALSE(mgg::viewpointClear(wall, bunker, planning, at_055));
   EXPECT_TRUE(mgg::viewpointClear(wall, bunker, planning, at_067));
   planning.viewpoint_clearance_margin = 0.0;
-  // An aerial robot keeps its inscribed radius: 0.389 m.
-  bunker.type = mgg::RobotType::kAerialRobot;
-  EXPECT_TRUE(mgg::viewpointClear(wall, bunker, planning, at_055));
+  // The aerial margin is not a ground robot's.
+  planning.aerial_viewpoint_clearance_margin = 5.0;
+  EXPECT_TRUE(mgg::viewpointClear(wall, bunker, planning, at_070));
+}
+
+TEST(ViewpointClear, ADronesPathEndsItsRadiusAndTheAerialMarginFromWalls) {
+  // Drone smoke test (drone scout Task 15): path ends kept only the
+  // inscribed radius plus 0.1 m clear, and the drone arrived 0.7 m from the
+  // wall. A drone needs its circumscribed radius, 0.354 m for the 0.5 m
+  // square, plus aerial_viewpoint_clearance_margin (0.65 m): ends at least
+  // 1.0 m from an occupied cell. A wall's face at y = 0.6.
+  const Walls wall([](double, double y) { return y > 0.65; });
+  RobotParams drone;
+  drone.type = mgg::RobotType::kAerialRobot;
+  drone.size = Eigen::Vector3d(0.5, 0.5, 0.25);
+  mgg::PlanningParams planning;
+  const StateVec at_070(0.1, -0.1, 0.5, 0.0);
+  const StateVec at_095(0.1, -0.35, 0.5, 0.0);
+  const StateVec at_105(0.1, -0.45, 0.5, 0.0);
+  EXPECT_FALSE(mgg::viewpointClear(wall, drone, planning, at_070));
+  EXPECT_FALSE(mgg::viewpointClear(wall, drone, planning, at_095));
+  EXPECT_TRUE(mgg::viewpointClear(wall, drone, planning, at_105));
+  // The ground robots' margin does not apply to it.
+  planning.viewpoint_clearance_margin = 1.0;
+  EXPECT_TRUE(mgg::viewpointClear(wall, drone, planning, at_105));
+  // The aerial margin is configurable: 0.25 m admits 0.7 m.
+  planning.aerial_viewpoint_clearance_margin = 0.25;
+  EXPECT_TRUE(mgg::viewpointClear(wall, drone, planning, at_070));
+  // A negative one never takes the drone's own radius in: 0.40 m from the
+  // wall is clear, 0.30 m is not.
+  planning.aerial_viewpoint_clearance_margin = -1.0;
+  EXPECT_TRUE(mgg::viewpointClear(wall, drone, planning,
+                                  StateVec(0.1, 0.2, 0.5, 0.0)));
+  EXPECT_FALSE(mgg::viewpointClear(wall, drone, planning,
+                                   StateVec(0.1, 0.3, 0.5, 0.0)));
 }
 
 /// Open space over ground at `height`(x, y), where it has a value; the

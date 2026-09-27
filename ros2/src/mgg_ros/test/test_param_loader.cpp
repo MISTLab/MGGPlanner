@@ -26,6 +26,7 @@ class ParamFixture : public ::testing::Test {
         {"PlanningParams.global_frame_id", std::string("R1/world")},
         {"PlanningParams.type", std::string("kAdaptiveExploration")},
         {"PlanningParams.viewpoint_clearance_margin", 0.15},
+        {"PlanningParams.aerial_viewpoint_clearance_margin", 0.8},
         {"PlanningParams.max_cross_slope", 0.1745},
         {"PlanningParams.max_footprint_tilt", 0.3491},
         {"PlanningParams.max_footprint_step", 0.12},
@@ -100,6 +101,7 @@ TEST_F(ParamFixture, LoadsPlanningParams) {
   EXPECT_EQ(params.global_frame_id, "R1/world");
   EXPECT_EQ(params.type, mgg::PlanningModeType::kAdaptiveExploration);
   EXPECT_DOUBLE_EQ(params.viewpoint_clearance_margin, 0.15);
+  EXPECT_DOUBLE_EQ(params.aerial_viewpoint_clearance_margin, 0.8);
   EXPECT_DOUBLE_EQ(params.max_cross_slope, 0.1745);
   EXPECT_DOUBLE_EQ(params.max_footprint_tilt, 0.3491);
   EXPECT_DOUBLE_EQ(params.max_footprint_step, 0.12);

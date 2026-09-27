@@ -659,13 +659,14 @@ TEST(MolaMap, ExplorationInACorridorNarrowerThanTheClearanceStillHasAPath) {
   ASSERT_TRUE(waitFor([&]() { return provider.getStatus(); }))
       << provider.lastError();
 
-  // Inscribed radius 0.25 m plus 0.1 m margin: wider than the corridor's
-  // 0.3 m half-width, so no vertex along it has viewpoint clearance.
+  // Circumscribed radius 0.354 m, with no aerial margin: wider than the
+  // corridor's 0.3 m half-width, so no vertex along it has viewpoint
+  // clearance.
   mgg::RobotParams robot;
   robot.type = mgg::RobotType::kAerialRobot;
   robot.size = Eigen::Vector3d(0.5, 0.5, 0.2);
   mgg::PlanningParams planning;
-  planning.viewpoint_clearance_margin = 0.1;
+  planning.aerial_viewpoint_clearance_margin = 0.0;
   planning.edge_length_min = 0.05;
   planning.edge_length_max = 1.0;
   planning.edge_overshoot = 0.0;
