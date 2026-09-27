@@ -6537,6 +6537,62 @@ TEST_F(PlannerNodeTest, ADronesRebuiltHomeIsLiftedAsItsSeedWas) {
   }
 }
 
+TEST_F(PlannerNodeTest, ADronesRebuildReadsTheGraphSolutionItIsGivenAndLiftsItsPad) {
+  // Run 10's explicit keyframe source with the drone's home anchor. As
+  // SwarmDeck deploys it, map.mola.peer_root is the robot's planning
+  // product, <peer>/planning, and roadmap_rebuild.graph_solution and
+  // roadmap_rebuild.robot_id name the file the bridge writes and the robot.
+  // A drone reported landed seeds home aerial_home_height_m over its pad;
+  // the rebuild its seed starts reads the given file, and lifts the first
+  // keyframe, on the pad, to the same home.
+  const std::filesystem::path peer =
+      std::filesystem::temp_directory_path() /
+      ("mgg_drone_graph_solution_" + std::to_string(::getpid())) / "robot_1";
+  std::filesystem::remove_all(peer.parent_path());
+  std::filesystem::create_directories(peer / "planning");
+  const std::string file = (peer / "graph_solution.json").string();
+  {
+    std::ostringstream poses;
+    for (int i = 0; i <= 8; ++i) {
+      if (i > 0) poses << ", ";
+      poses << R"({"keyframe_id": {"robot_id": "robot_1", "session_id": "s", )"
+            << R"("seq": )" << i << R"(}, "T_component_keyframe": )"
+            << "[[1, 0, 0, " << 0.5 * i << "], [0, 1, 0, 0], [0, 0, 1, "
+            << (i == 0 ? 0.075 : 0.4) << "], [0, 0, 0, 1]]}";
+    }
+    std::ofstream(file)
+        << R"({"schema": "swarmdeck.pose-snapshot.v1", "solution": {)"
+        << R"("revision": {"component_id": "component:test", "epoch": 1, )"
+        << R"("revision": 1}, "poses": [)" << poses.str() << "]}}";
+  }
+  rclcpp::NodeOptions options;
+  options.arguments({"--ros-args", "-r", "__node:=drone_given_graph_solution"});
+  options.parameter_overrides(
+      {rclcpp::Parameter("map.backend", "mola_snapshot"),
+       rclcpp::Parameter("map.mola.peer_root", (peer / "planning").string()),
+       rclcpp::Parameter("PlanningParams.global_frame_id", "world"),
+       rclcpp::Parameter("roadmap_rebuild.graph_solution", file),
+       rclcpp::Parameter("roadmap_rebuild.robot_id", "robot_1"),
+       rclcpp::Parameter("aerial_home_height_m", 1.0)});
+  options.automatically_declare_parameters_from_overrides(true);
+  auto node = std::make_shared<PlannerNode>(options);
+  PlannerNodeTestPeer::configureGroundRobot(*node);
+  PlannerNodeTestPeer::setAerialRobot(*node);
+  MolaFloorProduct product(-1.5, 6.0, -1.5, 1.5);
+  PlannerNodeTestPeer::useMolaMap(*node, product.serve());
+  PlannerNodeTestPeer::serveMap(*node, "component:test", 1);
+
+  PlannerNodeTestPeer::setFlightState(*node, "landed");
+  PlannerNodeTestPeer::acceptOdometry(*node, odometryAt(0.0, 0.0, 0.075, 1));
+  EXPECT_EQ(PlannerNodeTestPeer::keyframeReadErrorsLogged(*node), 0);
+  ASSERT_EQ(PlannerNodeTestPeer::roadmapRebuilds(*node), 1);
+  const mgg::StateVec home = PlannerNodeTestPeer::globalVertexState(*node, 0);
+  EXPECT_NEAR(home.x(), 0.0, 1e-9);
+  EXPECT_NEAR(home.z(), 1.075, 1e-9);
+  EXPECT_TRUE(PlannerNodeTestPeer::hasGlobalVertexNear(*node, 4.0, 0.0, 0.3));
+  std::filesystem::remove_all(peer.parent_path());
+}
+
 TEST_F(PlannerNodeTest, ADronesRebuildJudgesHomeByTheRoutesItsGraphHas) {
   // Review r0, P1: whether home reaches a place is what a route over the
   // graph finds. Through a peer's vertex it does, though no edge of this
