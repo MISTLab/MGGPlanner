@@ -153,7 +153,7 @@ PathSelectionResult selectBestPath(GraphManager& graph,
     if (found != by_id.end()) return found->second;
     return by_id[v->id] = ask(*v);
   };
-  // Whether path[end] may end the path: an end admitted only on a slope
+  // Whether path[end] may end the path: a narrow or slope-exempt end
   // needs room to turn within kDepartureMaxM back along it. A refusal
   // counts in `refused`, when given.
   const auto way_back = [&](const std::vector<Vertex*>& path,
@@ -282,7 +282,7 @@ PathSelectionResult selectBestPath(GraphManager& graph,
     // leaf had to satisfy, checked where the path now ends (review r2).
     //   * The end lies in no reservation; cut back from a reserved leaf, the
     //     path must carry gain of its own, outside the reservation.
-    //   * With slope_end_retreat, an end admitted only on a slope has a way
+    //   * With slope_end_retreat, a narrow or slope-exempt end has a way
     //     back (way_back).
     //   * The path up to there is not too steep and turns only where it
     //     may.
@@ -318,23 +318,18 @@ PathSelectionResult selectBestPath(GraphManager& graph,
       return Ending::kAdmissible;
     };
 
-    // Clearance is a preference that always wins while it can be had: the best
-    // path ending with room for the robot, pulled back to its last clear vertex
-    // where needed, is chosen whenever there is one, even when the prefix it
-    // was pulled back to carries no gain of its own (with leaf-only gain it
-    // seldom does); between equal clear candidates, the one whose full path is
-    // worth more wins. Only when no path ends clear, e.g. in a passage narrower
-    // than the robot plus twice the margin, is the best path chosen as without
-    // the check, so exploration goes on wherever it went on before. With no
-    // gain anywhere there is still no path.
+    // Prefer a clear end or an admitted narrow end with a bounded reverse
+    // way back. Cut back to the last admissible end when needed, including
+    // a gainless prefix that leads to the leaf's gain. Without the retreat
+    // check, clearance remains a preference and an unclear fallback may win.
+    // With it, no room anywhere means no path: the caller may try a boxed-in
+    // departure, but selection never waives the way-back safety requirement.
     //
     // Some whole path, to a leaf outside every reservation, may be driven
     // and has gain: without one, no path is chosen, clear or not.
     bool gain_reachable = false;
-    // The fallback, chosen when no path ends clear: the best path as it is,
-    // or, where its end is admitted only on a slope with no way back, cut
-    // back to its last end with one (review r1, P1). Ranked by its own
-    // gain, then by the gain its whole path leads to.
+    // The fallback obeys the same end predicate, including narrow/slope
+    // way-back checks. Rank by its gain, then the whole path's gain.
     std::vector<Vertex*> fallback_path;
     double fallback_gain = 0.0;
     double fallback_leads_to = 0.0;

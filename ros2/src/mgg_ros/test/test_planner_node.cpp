@@ -998,6 +998,12 @@ class PlannerNodeTestPeer {
     node.global_exploration_ongoing_ = true;
     node.current_global_vertex_id_ = target_id;
   }
+  static std::vector<mgg::StateVec> localStates(PlannerNode& node) {
+    std::vector<mgg::StateVec> states;
+    for (const auto& entry : node.local_graph_->vertices_map_)
+      states.push_back(entry.second->state);
+    return states;
+  }
   static int boxedInWithoutDeparture(PlannerNode& node) {
     return node.boxed_in_without_departure_;
   }
@@ -2705,6 +2711,27 @@ TEST_F(PlannerNodeTest, ABoxedInRobotDepartsStraightAheadWhenThereIsRoom) {
       EXPECT_DOUBLE_EQ(pose[3], yaw);
     }
   }
+}
+
+TEST_F(PlannerNodeTest, NoRoomAnywhereInTheLatticeTriggersABoxedInDeparture) {
+  auto node = boxedIn("narrow_no_fallback", -0.4, 2.5);
+  PlannerNodeTestPeer::setLattice(*node, {0, 0}, {1.5, 0});
+  PlannerNodeTestPeer::setLatticeResolution(*node, 0.5);
+  PlannerNodeTestPeer::acceptOdometry(*node, 0, 0, 1);
+  auto response = std::make_shared<mgg_msgs::srv::PlannerSrv::Response>();
+  PlannerNodeTestPeer::plan(*node, response);
+  const auto states = PlannerNodeTestPeer::localStates(*node);
+  ASSERT_GE(states.size(), 2u);
+  for (const auto& state : states)
+    EXPECT_FALSE(PlannerNodeTestPeer::roomToTurnObserved(*node, state));
+  // No legal lattice end, even though there is gain ahead. The boxed-in
+  // recovery reverses to room outside the lattice, rather than selecting
+  // the former narrow-end fallback with no way back.
+  EXPECT_EQ(PlannerNodeTestPeer::boxedInDepartures(*node), 1);
+  ASSERT_GE(response->path.size(), 2u);
+  EXPECT_LT(response->path.back().position.x, -0.4);
+  for (const auto& pose : response->path)
+    EXPECT_NEAR(pose.position.y, 0.0, 1e-6);
 }
 
 TEST_F(PlannerNodeTest, ABoxedInRobotReversesOutWhenOnlyBehindHasRoom) {

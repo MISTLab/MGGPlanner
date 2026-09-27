@@ -470,11 +470,24 @@ TEST(PathSelection, ANarrowTargetWithAWayBackBeatsAClearPrefix) {
   EXPECT_EQ(select().best_path_id, 1);  // never the narrow end without a way back
 }
 
+TEST(PathSelection, NoRoomAnywhereMeansNoNarrowFallbackPath) {
+  Fork f;
+  f.x_branch.back()->vol_gain.gain = 100.0;
+  mgg::SlopeEndRetreat retreat;
+  retreat.admitted_on_slope = [](const Vertex&) { return false; };
+  retreat.room_to_turn = [](const Vertex&) { return false; };
+  const auto result = mgg::selectBestPath(
+      f.graph, makePlanning(), RobotParams(), EdgeInclinations(), 0.2, 0,
+      {}, 0, [](const Vertex&) { return false; }, {}, {}, 0, retreat);
+  EXPECT_TRUE(result.best_path.empty());
+  EXPECT_EQ(result.best_path_id, -1);
+  EXPECT_GT(result.slope_ends_without_way_back, 0);
+}
+
 TEST(PathSelection, AFallbackCutBackForItsWayBackNeverEndsInAReservation) {
-  // Review r2 (P1): no end is clear, so the path is chosen as without the
-  // check, but its leaf ends on a slope with no way back and it is cut
-  // back to the inner vertex, which holds the gain. That vertex lies in a
-  // peer's reservation: the cut path may not end there either.
+  // No end is clear. The leaf has no bounded way back, but the inner
+  // vertex can reverse to turning space at the root and holds the gain.
+  // If reserved, that cut-back end must still be refused.
   GraphManager graph;
   auto* root = new Vertex(0, StateVec(0, 0, 0, 0));
   graph.addVertex(root);
@@ -492,7 +505,7 @@ TEST(PathSelection, AFallbackCutBackForItsWayBackNeverEndsInAReservation) {
   mgg::SlopeEndRetreat retreat;
   retreat.admitted_on_slope = [](const Vertex& v) { return v.id == 2; };
   retreat.room_to_turn = [](const Vertex& v) { return v.id == 0; };
-  // Unreserved, the cut path ends at the inner vertex, unclear.
+  // Unreserved, the cut path ends at the inner vertex with a way back.
   const auto free = mgg::selectBestPath(
       graph, makePlanning(), RobotParams(), flat, 0.2, 0.0, {}, 0.0,
       nowhere_clear, nullptr, nullptr, 0.0, retreat);
