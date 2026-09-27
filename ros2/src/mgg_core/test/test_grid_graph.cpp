@@ -509,6 +509,37 @@ TEST(GridGraph, LatticeColumnGroundMergesWithinAStepAndKeepsOtherLevels) {
   EXPECT_TRUE(columns.holds(2, 3, 0.5));
 }
 
+/// Occupied everywhere, counting its box probes.
+class OccupiedEverywhere : public OpenSpace {
+ public:
+  OccupiedEverywhere() : OpenSpace(-1e9) {}
+  VoxelStatus getBoxStatus(const Eigen::Vector3d& c, const Eigen::Vector3d& s,
+                           bool stop) const override {
+    ++probes;
+    return OpenSpace::getBoxStatus(c, s, stop);
+  }
+  mutable int probes = 0;
+};
+
+// Review r1, R1-4: the retry refactoring charged the loop budget only for
+// cells whose body box was free, so a lattice wholly occupied or unknown
+// probed every cell and never reported hit_limit. Every swept cell is
+// charged before it is probed again.
+TEST(GridGraph, TheLoopCapBoundsAnOccupiedLattice) {
+  Fixture f;
+  OccupiedEverywhere occupied;
+  f.ctx.map = &occupied;
+  f.planning.num_loops_max = 10;
+  GridGraphParams g;
+  g.min_val = Eigen::Vector3d(-2.0, -2.0, 0.0);
+  g.max_val = Eigen::Vector3d(2.0, 2.0, 0.0);
+  g.resolution = Eigen::Vector3d(0.5, 0.5, 0.5);  // 81 cells
+  const auto r = buildGridGraph(f.graph, StateVec(0, 0, 0, 0), g, f.ctx, 0.0);
+  EXPECT_TRUE(r.hit_limit);
+  EXPECT_EQ(r.free_cells, 0);
+  EXPECT_LE(occupied.probes, 11);
+}
+
 TEST(GridGraph, LatticeFollowsTheRobotPosition) {
   Fixture f;
   const auto r = buildGridGraph(f.graph, StateVec(50.0, 50.0, 0.0, 0.0),

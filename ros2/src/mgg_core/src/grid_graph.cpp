@@ -89,17 +89,23 @@ GridGraphResult buildGridGraph(GraphManager& graph, const StateVec& state,
   };
   std::vector<Retry> retries;
 
-  // Offers one cell to expandGraph; false when a size or loop cap stops the
-  // sweep.
-  const auto offer = [&](const Eigen::Vector3d& cell, int i, int j,
-                         bool first_pass, bool& added) {
-    added = false;
+  // Charges one cell to the loop budget, as upstream charged every swept
+  // cell before probing it, occupied or not; false, with hit_limit, when a
+  // size or loop cap stops the sweep (review r1, R1-4).
+  const auto charge = [&]() {
     if (loop_count++ > ctx.planning->num_loops_max ||
         num_vertices >= ctx.planning->num_vertices_max ||
         num_edges >= ctx.planning->num_edges_max) {
       result.hit_limit = true;
       return false;
     }
+    return true;
+  };
+
+  // Offers one cell, already charged, to expandGraph.
+  const auto offer = [&](const Eigen::Vector3d& cell, int i, int j,
+                         bool first_pass, bool& added) {
+    added = false;
     // The ground this cell would be dropped onto, as expandGraph drops it:
     // a vertex at its column already on that ground makes it the same place
     // again.
@@ -114,7 +120,7 @@ GridGraphResult buildGridGraph(GraphManager& graph, const StateVec& state,
       if (ground_status == VoxelStatus::kOccupied &&
           column_ground.holds(i, j, driving_z)) {
         if (first_pass) ++result.merged_duplicates;
-        return true;
+        return;
       }
       other_level = ground_status == VoxelStatus::kOccupied &&
                     std::abs(driving_z - state.z()) >
@@ -150,12 +156,12 @@ GridGraphResult buildGridGraph(GraphManager& graph, const StateVec& state,
                rep.status == ExpandGraphStatus::kErrorCollisionEdge) {
       retries.push_back({cell, i, j});
     }
-    return true;
   };
 
   for (const auto& [unused_distance, i, j] : columns) {
     (void)unused_distance;
     for (int k = 0; k < num_nodes[2]; ++k) {
+      if (!charge()) return result;
       double x_val = min_val.x() + i * grid.resolution.x();
       double y_val = min_val.y() + j * grid.resolution.y();
       const double z_val = min_val.z() + k * grid.resolution.z();
@@ -178,7 +184,7 @@ GridGraphResult buildGridGraph(GraphManager& graph, const StateVec& state,
       }
       ++result.free_cells;
       bool added = false;
-      if (!offer(cell, i, j, /*first_pass=*/true, added)) return result;
+      offer(cell, i, j, /*first_pass=*/true, added);
     }
   }
 
@@ -187,10 +193,10 @@ GridGraphResult buildGridGraph(GraphManager& graph, const StateVec& state,
     std::vector<Retry> left;
     int joined = 0;
     for (const Retry& retry : retries) {
+      // Retries are charged to the same budget.
+      if (!charge()) return result;
       bool added = false;
-      if (!offer(retry.cell, retry.i, retry.j, /*first_pass=*/false, added)) {
-        return result;
-      }
+      offer(retry.cell, retry.i, retry.j, /*first_pass=*/false, added);
       if (added) {
         ++joined;
       } else {
