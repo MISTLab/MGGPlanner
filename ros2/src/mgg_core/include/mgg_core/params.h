@@ -295,6 +295,10 @@ struct PlanningParams {
   bool auto_homing_enable = false;
   bool homing_backward = false;
   double time_budget_limit = std::numeric_limits<double>::max();
+  /// Radius of each no-go zone the planner node receives on no_go_zones,
+  /// metres: a disc about each position, blocking the local lattice, path
+  /// ends and global routes. Not an upstream parameter.
+  double no_go_radius_m = 1.5;
   /// How long the global planner may spend re-checking frontiers for one
   /// repositioning, seconds (searchGlobalFrontier). In run 8 robot_1's
   /// search held its node for 6 to 16 s, past its 5 s neighbour transform

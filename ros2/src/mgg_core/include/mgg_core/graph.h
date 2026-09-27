@@ -8,10 +8,12 @@
 #ifndef MGG_CORE_GRAPH_H_
 #define MGG_CORE_GRAPH_H_
 
+#include <functional>
 #include <unordered_map>
 
 #include <boost/graph/adjacency_list.hpp>
 #include <boost/graph/dijkstra_shortest_paths.hpp>
+#include <boost/graph/filtered_graph.hpp>
 #include <boost/graph/graph_traits.hpp>
 #include <Eigen/Dense>
 //#include <boost/graph/undirected_graph.hpp>
@@ -71,6 +73,11 @@ class Graph {
   bool edgeExists(int u_id, int v_id);
 
   bool findDijkstraShortestPaths(int src_id, ShortestPathsReport& rep);
+  /// Whether the edge between two vertex ids is closed to every search
+  /// (findDijkstraShortestPaths), though it stays in the graph.
+  using EdgeBlockedFn = std::function<bool(int, int)>;
+  /// Closes edges to the searches; an empty function opens them all.
+  void setEdgeBlocked(EdgeBlockedFn blocked) { edge_blocked_ = std::move(blocked); }
 
   int getVertexID(VertexDescriptor v);
   int getNumVertices();
@@ -94,6 +101,7 @@ class Graph {
   std::vector<VertexDescriptor> vertices_;
   int num_vertices_;
   int robot_id_;
+  EdgeBlockedFn edge_blocked_;
 
   bool findDijkstraShortestPaths(VertexDescriptor& source,
                                  std::vector<VertexDescriptor>& shortest_paths,

@@ -418,6 +418,56 @@ TEST(MolaMap, TransientDiscsAreOccupiedUntilTheyExpire) {
 }
 
 
+TEST(MolaMap, NoGoDiscsStayUntilReplacedAndCoexistWithPeerBodies) {
+  // Run 8: a Scout tipped over debris its 0.2 m map showed as a low plateau,
+  // three times in 4 s, each time sent back over it. SwarmDeck marks where
+  // the tilt guard tripped; the planner must not drive there. Those discs
+  // do not expire in the map, and neither disc set replaces the other.
+  Publication publication;
+  const Voxel endpoint{10, 0, 2};
+  const auto request = publication.publish(0, {endpoint},
+                                           freeBlockWithout(endpoint), true,
+                                           Eigen::Isometry3d::Identity());
+  MolaMap provider(config(publication));
+  mgg::MapInterface* map = &provider;
+  provider.requestSnapshot(request);
+  ASSERT_TRUE(waitFor([&]() { return map->getStatus(); })) << provider.lastError();
+
+  const Eigen::Vector3d here(0.1, 0.1, 0.1);
+  const Eigen::Vector3d there(0.5, 0.1, 0.1);
+  const Eigen::Vector3d body(0.1, 0.1, 0.1);
+  // A segment well away from the no-go disc, for the peer body.
+  const Eigen::Vector3d west(-0.5, 0.1, 0.1);
+  const Eigen::Vector3d far_west(-1.3, 0.1, 0.1);
+  ASSERT_EQ(map->getPathStatus(here, there, body, true), VoxelStatus::kFree);
+  ASSERT_EQ(map->getPathStatus(west, far_west, body, true), VoxelStatus::kFree);
+
+  provider.setNoGoDiscs({Eigen::Vector2d(0.3, 0.35)}, 0.25);
+  EXPECT_EQ(map->getPathStatus(here, there, body, true), VoxelStatus::kOccupied);
+  EXPECT_EQ(map->getBoxStatus(Eigen::Vector3d(0.3, 0.2, 0.1), body, true),
+            VoxelStatus::kOccupied);
+  // A robot standing in one may leave it, as it may leave a peer's reach.
+  EXPECT_EQ(map->getPathStatus(Eigen::Vector3d(0.3, 0.2, 0.1),
+                               Eigen::Vector3d(0.3, -0.4, 0.1), body, true),
+            VoxelStatus::kFree);
+
+  // A peer body elsewhere, with a short TTL: both sets hold at once.
+  provider.setTransientDiscs({Eigen::Vector2d(-0.9, 0.1)}, 0.1, 0.05);
+  EXPECT_EQ(map->getPathStatus(west, far_west, body, true),
+            VoxelStatus::kOccupied);
+  EXPECT_EQ(map->getPathStatus(here, there, body, true), VoxelStatus::kOccupied);
+  std::this_thread::sleep_for(std::chrono::milliseconds(120));
+  // The peer body expired; the no-go disc did not.
+  EXPECT_EQ(map->getPathStatus(west, far_west, body, true), VoxelStatus::kFree);
+  EXPECT_EQ(map->getPathStatus(here, there, body, true), VoxelStatus::kOccupied);
+  // Peer bodies do not clear it either.
+  provider.setTransientDiscs({}, 0.25, 60.0);
+  EXPECT_EQ(map->getPathStatus(here, there, body, true), VoxelStatus::kOccupied);
+  // An empty set clears it.
+  provider.setNoGoDiscs({}, 0.25);
+  EXPECT_EQ(map->getPathStatus(here, there, body, true), VoxelStatus::kFree);
+}
+
 TEST(MolaMap, ZeroSizePathVisitsEveryVoxelTheSegmentCrossesAndHonoursDiscs) {
   // The robot's own-pose link is checked along its centre line: a zero-size
   // sweep. It must still meet every voxel the segment crosses, here

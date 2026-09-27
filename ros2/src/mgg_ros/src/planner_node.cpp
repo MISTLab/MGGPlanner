@@ -129,6 +129,10 @@ PlannerNode::PlannerNode(const rclcpp::NodeOptions& options)
   geofence_ = std::make_unique<mgg::GeofenceManager>();
   local_graph_ = std::make_shared<mgg::GraphManager>();
   global_graph_ = std::make_shared<mgg::GraphManager>();
+  global_graph_->setEdgeBlocked(
+      [this](const mgg::Vertex& a, const mgg::Vertex& b) {
+        return noGoBlocksEdge(a, b);
+      });
   local_graph_->setRobotId(static_cast<int>(planning_params_.robot_id));
   global_graph_->setRobotId(static_cast<int>(planning_params_.robot_id));
   // The global graph expansion (rrg.cpp:80 to 82) samples in the local box
@@ -239,6 +243,14 @@ PlannerNode::PlannerNode(const rclcpp::NodeOptions& options)
       "peer_bodies", rclcpp::QoS(10),
       [this](geometry_msgs::msg::PoseArray::ConstSharedPtr m) {
         onPeerBodies(m);
+      },
+      sub_opts);
+  // Latched: SwarmDeck republishes the whole set on each change and owns
+  // the zones' lifetime; a planner started later still gets the last set.
+  no_go_zones_sub_ = create_subscription<geometry_msgs::msg::PoseArray>(
+      "no_go_zones", rclcpp::QoS(1).transient_local(),
+      [this](geometry_msgs::msg::PoseArray::ConstSharedPtr m) {
+        onNoGoZones(m);
       },
       sub_opts);
 
@@ -1345,6 +1357,60 @@ void PlannerNode::onPeerBodies(
                                peer_body_ttl_s_);
 }
 
+void PlannerNode::onNoGoZones(
+    geometry_msgs::msg::PoseArray::ConstSharedPtr msg) {
+  if (msg->header.frame_id != world_frame_) {
+    RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 5000,
+                         "ignoring no-go zones in frame '%s'",
+                         msg->header.frame_id.c_str());
+    return;
+  }
+  std::vector<Eigen::Vector2d> centres;
+  centres.reserve(msg->poses.size());
+  for (const auto& pose : msg->poses) {
+    if (std::isfinite(pose.position.x) && std::isfinite(pose.position.y)) {
+      centres.emplace_back(pose.position.x, pose.position.y);
+    }
+  }
+  const std::lock_guard<std::recursive_mutex> lock(planner_mutex_);
+  if (mola_map_ != nullptr) {
+    mola_map_->setNoGoDiscs(centres, planning_params_.no_go_radius_m);
+  }
+  if (centres != no_go_zones_) {
+    no_go_zones_ = std::move(centres);
+    // Route costs change with the edges the searches leave out.
+    ++graph_revision_;
+    RCLCPP_INFO(get_logger(), "%zu no-go zone(s) of %.2f m radius",
+                no_go_zones_.size(), planning_params_.no_go_radius_m);
+  }
+}
+
+bool PlannerNode::noGoBlocksEdge(const mgg::Vertex& a,
+                                 const mgg::Vertex& b) const {
+  return noGoBlocksSegment(a.state.head<3>(), b.state.head<3>());
+}
+
+bool PlannerNode::noGoBlocksSegment(const Eigen::Vector3d& from,
+                                    const Eigen::Vector3d& to) const {
+  if (no_go_zones_.empty()) return false;
+  const Eigen::Vector3d box = robot_params_.getPlanningSize();
+  const double reach =
+      planning_params_.no_go_radius_m + 0.5 * std::max(box.x(), box.y());
+  const Eigen::Vector2d robot = current_state_.head<2>();
+  const Eigen::Vector2d p = from.head<2>();
+  const Eigen::Vector2d d = to.head<2>() - p;
+  const double length_squared = d.squaredNorm();
+  for (const Eigen::Vector2d& centre : no_go_zones_) {
+    if ((centre - robot).norm() < reach) continue;  // the robot stands in it
+    const double t =
+        length_squared > 1e-12
+            ? std::clamp((centre - p).dot(d) / length_squared, 0.0, 1.0)
+            : 0.0;
+    if ((centre - (p + t * d)).norm() < reach) return true;
+  }
+  return false;
+}
+
 void PlannerNode::onNeighbourTransforms(
     tf2_msgs::msg::TFMessage::ConstSharedPtr msg) {
   const std::lock_guard<std::recursive_mutex> lock(planner_mutex_);
@@ -1729,6 +1795,10 @@ bool PlannerNode::rebuildGlobalGraphFromKeyframes(
   }
   if (dropped > 0) frontiers_dropped_in_rebuild_ = dropped;
   global_graph_ = rebuilt;
+  global_graph_->setEdgeBlocked(
+      [this](const mgg::Vertex& a, const mgg::Vertex& b) {
+        return noGoBlocksEdge(a, b);
+      });
   global_root_supported_ = true;
   global_exploration_ongoing_ = false;
   current_global_vertex_id_ = -1;
@@ -1976,7 +2046,9 @@ void PlannerNode::shortcutAndResample(std::vector<mgg::StateVec>& path,
     // explored map is mostly unknown, so every candidate line qualifies and
     // the path collapses to a straight run through whatever has not been
     // seen yet. A ground robot's segment also follows the terrain (steps,
-    // inclination) as every graph edge does.
+    // inclination) as every graph edge does. Nor may it cross a no-go zone
+    // the route went round.
+    if (noGoBlocksSegment(from, to)) return false;
     if (robot_params_.type == mgg::RobotType::kGroundRobot) {
       std::vector<Eigen::Vector3d> projected;
       // Driven from `from` to `to`: the shortcut is the path itself.

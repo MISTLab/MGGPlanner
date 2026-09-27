@@ -143,6 +143,12 @@ class MolaMap : public MapInterface {
   /// cost per query is one distance test per disc.
   void setTransientDiscs(std::vector<Eigen::Vector2d> centres, double radius_m,
                          double ttl_s);
+  /// Places the robot must not drive into, such as where it tripped its
+  /// tilt guard: discs as setTransientDiscs makes them, kept apart from
+  /// them (neither call replaces the other's), and without expiry: each
+  /// call replaces the set, and an empty one clears it; the publisher owns
+  /// their lifetime.
+  void setNoGoDiscs(std::vector<Eigen::Vector2d> centres, double radius_m);
   VoxelStatus getVoxelStatus(const Eigen::Vector3d& position) const override;
   VoxelStatus getRayStatus(const Eigen::Vector3d& view_point,
                            const Eigen::Vector3d& voxel_to_test,
@@ -243,8 +249,16 @@ class MolaMap : public MapInterface {
     std::chrono::steady_clock::time_point expires;
   };
   std::shared_ptr<const TransientDiscs> transient_discs_;
+  std::shared_ptr<const TransientDiscs> no_go_discs_;
   bool discsBlockBox(const Eigen::Vector3d& center,
                      const Eigen::Vector3d& size) const;
+  static bool discSetBlocksBox(
+      const std::shared_ptr<const TransientDiscs>& discs,
+      const Eigen::Vector3d& center, const Eigen::Vector3d& size);
+  static bool discSetBlocksSweep(
+      const std::shared_ptr<const TransientDiscs>& discs,
+      const Eigen::Vector3d& start, const Eigen::Vector3d& end,
+      double half_width);
   bool discsBlockSweep(const Eigen::Vector3d& start, const Eigen::Vector3d& end,
                        double half_width) const;
   mutable std::mutex error_mutex_;

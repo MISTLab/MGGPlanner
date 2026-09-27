@@ -1124,10 +1124,33 @@ void MolaMap::setTransientDiscs(std::vector<Eigen::Vector2d> centres,
                     std::shared_ptr<const TransientDiscs>(std::move(discs)));
 }
 
+void MolaMap::setNoGoDiscs(std::vector<Eigen::Vector2d> centres,
+                           const double radius_m) {
+  auto discs = std::make_shared<TransientDiscs>();
+  if (std::isfinite(radius_m) && radius_m > 0.0) {
+    for (const Eigen::Vector2d& centre : centres) {
+      if (centre.allFinite()) discs->centres.push_back(centre);
+    }
+    discs->radius_m = radius_m;
+    discs->expires = Clock::time_point::max();
+  }
+  std::atomic_store(&no_go_discs_,
+                    std::shared_ptr<const TransientDiscs>(std::move(discs)));
+}
+
 bool MolaMap::discsBlockSweep(const Eigen::Vector3d& start,
                               const Eigen::Vector3d& end,
                               const double half_width) const {
-  const auto discs = std::atomic_load(&transient_discs_);
+  return discSetBlocksSweep(std::atomic_load(&transient_discs_), start, end,
+                            half_width) ||
+         discSetBlocksSweep(std::atomic_load(&no_go_discs_), start, end,
+                            half_width);
+}
+
+bool MolaMap::discSetBlocksSweep(
+    const std::shared_ptr<const TransientDiscs>& discs,
+    const Eigen::Vector3d& start, const Eigen::Vector3d& end,
+    const double half_width) {
   if (discs == nullptr || discs->centres.empty() ||
       Clock::now() > discs->expires) {
     return false;
@@ -1161,9 +1184,15 @@ bool MolaMap::discsBlockSweep(const Eigen::Vector3d& start,
 
 bool MolaMap::discsBlockBox(const Eigen::Vector3d& center,
                             const Eigen::Vector3d& size) const {
+  return discSetBlocksBox(std::atomic_load(&transient_discs_), center, size) ||
+         discSetBlocksBox(std::atomic_load(&no_go_discs_), center, size);
+}
+
+bool MolaMap::discSetBlocksBox(
+    const std::shared_ptr<const TransientDiscs>& discs,
+    const Eigen::Vector3d& center, const Eigen::Vector3d& size) {
   // A box is a place, not a departure: inside a neighbour's reach it is
   // occupied, whichever way a sweep through it might be allowed to leave.
-  const auto discs = std::atomic_load(&transient_discs_);
   if (discs == nullptr || discs->centres.empty() ||
       Clock::now() > discs->expires) {
     return false;

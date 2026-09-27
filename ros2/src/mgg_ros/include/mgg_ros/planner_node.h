@@ -148,6 +148,22 @@ class PlannerNode : public rclcpp::Node {
   void onCoordinationExclusions(
       geometry_msgs::msg::PoseArray::ConstSharedPtr msg);
   void onPeerBodies(geometry_msgs::msg::PoseArray::ConstSharedPtr msg);
+  /// Places the robot must not drive into (no_go_zones: SwarmDeck marks
+  /// where a robot tripped its tilt guard), in the planning frame. Each
+  /// message replaces the set; an empty one clears it. Each position is a
+  /// disc of PlanningParams::no_go_radius_m, of unbounded height, kept
+  /// apart from the peer bodies: with the mola_snapshot backend the map
+  /// reports it occupied to the lattice, path ends and every sweep (a sweep
+  /// leaving one it starts in excepted), and on every backend the global
+  /// graph's searches leave out the edges through it (noGoBlocksEdge).
+  void onNoGoZones(geometry_msgs::msg::PoseArray::ConstSharedPtr msg);
+  /// Whether a global graph edge passes through a no-go zone, the robot's
+  /// body width included. A zone the robot stands in does not block, so
+  /// that it can be routed out of it.
+  bool noGoBlocksEdge(const mgg::Vertex& a, const mgg::Vertex& b) const;
+  /// The same for a straight segment, such as a shortcut.
+  bool noGoBlocksSegment(const Eigen::Vector3d& from,
+                         const Eigen::Vector3d& to) const;
   void onBuildRequest(
       const std::shared_ptr<std_srvs::srv::Trigger::Request> request,
       std::shared_ptr<std_srvs::srv::Trigger::Response> response);
@@ -680,6 +696,10 @@ class PlannerNode : public rclcpp::Node {
       coordination_exclusions_sub_;
   rclcpp::Subscription<geometry_msgs::msg::PoseArray>::SharedPtr
       peer_bodies_sub_;
+  rclcpp::Subscription<geometry_msgs::msg::PoseArray>::SharedPtr
+      no_go_zones_sub_;
+  /// The no-go zones' centres, planning frame (onNoGoZones).
+  std::vector<Eigen::Vector2d> no_go_zones_;
   rclcpp::Publisher<mgg_msgs::msg::Graph>::SharedPtr graph_pub_;
   rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr
       marker_pub_;

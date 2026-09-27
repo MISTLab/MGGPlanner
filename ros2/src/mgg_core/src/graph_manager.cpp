@@ -37,6 +37,7 @@ void GraphManager::reset() {
 
   // Reset graph.
   graph_.reset(new Graph());
+  installEdgeBlocked();
 
   // Free the vertices this manager owns.
   //
@@ -269,6 +270,25 @@ bool GraphManager::updatePoseIdToNearestVertices(const StateVec* state,
     if (kd_res_next(neighbors) <= 0) break;
   }
   return true;
+}
+
+void GraphManager::setEdgeBlocked(EdgeBlockedFn blocked) {
+  edge_blocked_ = std::move(blocked);
+  installEdgeBlocked();
+}
+
+void GraphManager::installEdgeBlocked() {
+  if (!edge_blocked_) {
+    graph_->setEdgeBlocked(nullptr);
+    return;
+  }
+  graph_->setEdgeBlocked([this](int u, int v) {
+    const auto a = vertices_map_.find(u);
+    const auto b = vertices_map_.find(v);
+    return a != vertices_map_.end() && b != vertices_map_.end() &&
+           a->second != nullptr && b->second != nullptr &&
+           edge_blocked_(*a->second, *b->second);
+  });
 }
 
 bool GraphManager::findShortestPaths(ShortestPathsReport& rep) {

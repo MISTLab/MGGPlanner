@@ -36,6 +36,7 @@ class ParamFixture : public ::testing::Test {
         {"PlanningParams.path_direction_min_factor", 0.5},
         {"PlanningParams.low_gain_voxels", 25.0},
         {"PlanningParams.global_search_time_budget_s", 0.5},
+        {"PlanningParams.no_go_radius_m", 2.0},
         {"RobotParams.type", std::string("kGroundRobot")},
         {"RobotParams.size", std::vector<double>{0.8, 0.8, 0.2}},
         {"RobotParams.bound_mode", std::string("kExtendedBound")},
@@ -108,6 +109,7 @@ TEST_F(ParamFixture, LoadsPlanningParams) {
   EXPECT_DOUBLE_EQ(params.path_direction_min_factor, 0.5);
   EXPECT_DOUBLE_EQ(params.low_gain_voxels, 25.0);
   EXPECT_DOUBLE_EQ(params.global_search_time_budget_s, 0.5);
+  EXPECT_DOUBLE_EQ(params.no_go_radius_m, 2.0);
   // Absent from the overrides, so the struct default survives.
   EXPECT_DOUBLE_EQ(params.v_max, 0.2);
 }

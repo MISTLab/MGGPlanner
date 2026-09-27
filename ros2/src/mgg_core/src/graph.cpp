@@ -108,15 +108,31 @@ bool Graph::findDijkstraShortestPaths(
   shortest_paths.resize(num_vertices_);
   shortest_distances.resize(num_vertices_);
 
-  auto v_index = boost::get(boost::vertex_index, graph_);
-  auto weight = boost::get(boost::edge_weight, graph_);
-  boost::dijkstra_shortest_paths(
-      graph_, source,
+  const auto parameters =
       boost::predecessor_map(
           boost::make_iterator_property_map(shortest_paths.begin(),
                                             get(boost::vertex_index, graph_)))
           .distance_map(boost::make_iterator_property_map(
-              shortest_distances.begin(), get(boost::vertex_index, graph_))));
+              shortest_distances.begin(), get(boost::vertex_index, graph_)))
+          .weight_map(get(boost::edge_weight, graph_))
+          .vertex_index_map(get(boost::vertex_index, graph_));
+  if (!edge_blocked_) {
+    boost::dijkstra_shortest_paths(graph_, source, parameters);
+    return true;
+  }
+  // Blocked edges are left out of this search only.
+  struct Open {
+    const GraphType* graph = nullptr;
+    const EdgeBlockedFn* blocked = nullptr;
+    bool operator()(const EdgeDescriptor& e) const {
+      const auto index = boost::get(boost::vertex_index, *graph);
+      return !(*blocked)(boost::get(index, boost::source(e, *graph)),
+                         boost::get(index, boost::target(e, *graph)));
+    }
+  };
+  const boost::filtered_graph<GraphType, Open> open(graph_,
+                                                    Open{&graph_, &edge_blocked_});
+  boost::dijkstra_shortest_paths(open, source, parameters);
   return true;
 }
 

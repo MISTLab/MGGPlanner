@@ -19,6 +19,7 @@
 #ifndef MGG_CORE_GRAPH_MANAGER_H_
 #define MGG_CORE_GRAPH_MANAGER_H_
 
+#include <functional>
 #include <map>
 #include <memory>
 #include <string>
@@ -122,6 +123,11 @@ class GraphManager {
 
   bool findShortestPaths(ShortestPathsReport& rep);
   bool findShortestPaths(int source_id, ShortestPathsReport& rep);
+  /// Whether the edge between two vertices is closed to every search
+  /// (findShortestPaths), though it stays in the graph: an edge through a
+  /// no-go zone. An empty function opens them all.
+  using EdgeBlockedFn = std::function<bool(const Vertex&, const Vertex&)>;
+  void setEdgeBlocked(EdgeBlockedFn blocked);
 
   void getShortestPath(int target_id, const ShortestPathsReport& rep,
                        bool source_to_target_order, std::vector<int>& path);
@@ -166,6 +172,9 @@ class GraphManager {
   std::unordered_map<int, NeighbourPlacement> neighbour_placements_;
 
  private:
+  /// Puts edge_blocked_ on graph_, which reset() replaces.
+  void installEdgeBlocked();
+  EdgeBlockedFn edge_blocked_;
   /// Nearest-neighbour index over the vertices.
   kdtree* kd_tree_ = nullptr;
   int subgraph_ind_ = -1;

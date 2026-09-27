@@ -276,6 +276,7 @@ bool loadPlanningParams(const ParamLoader& p, const std::string& ns,
   p.get(ns + "/hanging_vertex_penalty", out.hanging_vertex_penalty);
   p.get(ns + "/low_gain_voxels", out.low_gain_voxels);
   p.get(ns + "/global_search_time_budget_s", out.global_search_time_budget_s);
+  p.get(ns + "/no_go_radius_m", out.no_go_radius_m);
   p.get(ns + "/leafs_only_for_volumetric_gain",
         out.leafs_only_for_volumetric_gain);
   p.get(ns + "/cluster_vertices_for_gain", out.cluster_vertices_for_gain);

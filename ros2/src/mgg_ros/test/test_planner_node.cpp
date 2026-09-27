@@ -246,6 +246,20 @@ class PlannerNodeTestPeer {
     vertex->robot_id = robot_id;
     node.global_graph_->addNeighbourVertex(vertex, 1000000);
   }
+  /// No-go zones at `points`, as SwarmDeck publishes them.
+  static void receiveNoGoZones(PlannerNode& node, const std::string& frame,
+                               const std::vector<Eigen::Vector2d>& points) {
+    auto msg = std::make_shared<geometry_msgs::msg::PoseArray>();
+    msg->header.frame_id = frame;
+    for (const Eigen::Vector2d& p : points) {
+      geometry_msgs::msg::Pose pose;
+      pose.position.x = p.x();
+      pose.position.y = p.y();
+      pose.orientation.w = 1.0;
+      msg->poses.push_back(pose);
+    }
+    node.onNoGoZones(msg);
+  }
   static void setCommunicationRange(PlannerNode& node, double range) {
     const std::lock_guard<std::recursive_mutex> lock(node.planner_mutex_);
     node.communication_range_ = range;
@@ -1253,6 +1267,99 @@ TEST_F(PlannerNodeTest, NavigateRoutesToAGoalOnTheRoadmap) {
   EXPECT_EQ(response->status,
             mgg_msgs::srv::PlanObjective::Response::UNREACHABLE);
   EXPECT_TRUE(response->path.empty());
+}
+
+TEST_F(PlannerNodeTest, ANoGoZoneTurnsTheGlobalRouteAwayOrLeavesNone) {
+  // SwarmDeck marks where a robot tripped its tilt guard (run 8: a Scout
+  // was sent back over the same debris three times in 4 s). The robot
+  // drove a loop: out along y = 0, back along y = 1. A zone on the outward
+  // track sends the route to its far end round the loop; zones on both
+  // leave no route; an empty set restores the direct one. A set in another
+  // frame is ignored.
+  auto node = makeNode("no_go_route", "world",
+                       {rclcpp::Parameter("PlanningParams.no_go_radius_m", 0.3)});
+  PlannerNodeTestPeer::observeFloor(*node, -1.5, 6.0, -1.5, 2.5);
+  double stamp = 1.0;
+  const auto drive = [&](double x, double y) {
+    PlannerNodeTestPeer::acceptOdometry(*node, x, y, stamp);
+    stamp += 1.0;
+  };
+  for (double x = 0.0; x <= 4.0 + 1e-9; x += 0.5) drive(x, 0.0);
+  drive(4.0, 0.5);
+  for (double x = 4.0; x >= -1e-9; x -= 0.5) drive(x, 1.0);
+  drive(0.0, 0.5);
+  drive(0.0, 0.0);
+
+  auto request = std::make_shared<mgg_msgs::srv::PlanObjective::Request>();
+  request->objective = mgg_msgs::srv::PlanObjective::Request::NAVIGATE;
+  request->goal.position.x = 4.0;
+  request->goal.orientation.w = 1.0;
+  const auto navigate = [&]() {
+    auto response = std::make_shared<mgg_msgs::srv::PlanObjective::Response>();
+    PlannerNodeTestPeer::objective(*node, request, response);
+    return response;
+  };
+  const auto nearest = [](const auto& path, const Eigen::Vector2d& zone) {
+    double d = 1e9;
+    for (const auto& pose : path) {
+      d = std::min(d, std::hypot(pose.position.x - zone.x(),
+                                 pose.position.y - zone.y()));
+    }
+    return d;
+  };
+  auto response = navigate();
+  ASSERT_EQ(response->status, mgg_msgs::srv::PlanObjective::Response::SUCCEEDED)
+      << response->reason;
+  EXPECT_NEAR(pathLength(response->path), 4.0, 0.60);
+
+  const Eigen::Vector2d outward(2.5, 0.0);
+  PlannerNodeTestPeer::receiveNoGoZones(*node, "world", {outward});
+  response = navigate();
+  ASSERT_EQ(response->status, mgg_msgs::srv::PlanObjective::Response::SUCCEEDED)
+      << response->reason;
+  EXPECT_GT(pathLength(response->path), 4.4);
+  EXPECT_GT(nearest(response->path, outward), 0.4);
+
+  PlannerNodeTestPeer::receiveNoGoZones(*node, "world",
+                                        {outward, Eigen::Vector2d(2.5, 1.0)});
+  response = navigate();
+  EXPECT_EQ(response->status,
+            mgg_msgs::srv::PlanObjective::Response::UNREACHABLE);
+  EXPECT_TRUE(response->path.empty());
+
+  // Another frame's set changes nothing.
+  PlannerNodeTestPeer::receiveNoGoZones(*node, "elsewhere", {});
+  EXPECT_EQ(navigate()->status,
+            mgg_msgs::srv::PlanObjective::Response::UNREACHABLE);
+
+  PlannerNodeTestPeer::receiveNoGoZones(*node, "world", {});
+  response = navigate();
+  ASSERT_EQ(response->status, mgg_msgs::srv::PlanObjective::Response::SUCCEEDED)
+      << response->reason;
+  EXPECT_NEAR(pathLength(response->path), 4.0, 0.60);
+}
+
+TEST_F(PlannerNodeTest, ARobotStandingInANoGoZoneIsRoutedOutOfIt) {
+  // The zone is where the robot tripped, so it stands in it when the zone
+  // arrives: its global routes may leave it.
+  auto node = makeNode("no_go_leave", "world",
+                       {rclcpp::Parameter("PlanningParams.no_go_radius_m", 0.3)});
+  PlannerNodeTestPeer::observeFloor(*node, -1.5, 6.0, -1.5, 1.5);
+  double stamp = 1.0;
+  for (double x = 0.0; x <= 4.0 + 1e-9; x += 0.5) {
+    PlannerNodeTestPeer::acceptOdometry(*node, x, 0.0, stamp);
+    stamp += 1.0;
+  }
+  PlannerNodeTestPeer::receiveNoGoZones(*node, "world", {{4.0, 0.0}});
+  auto request = std::make_shared<mgg_msgs::srv::PlanObjective::Request>();
+  request->objective = mgg_msgs::srv::PlanObjective::Request::NAVIGATE;
+  request->goal.position.x = 0.0;
+  request->goal.orientation.w = 1.0;
+  auto response = std::make_shared<mgg_msgs::srv::PlanObjective::Response>();
+  PlannerNodeTestPeer::objective(*node, request, response);
+  ASSERT_EQ(response->status, mgg_msgs::srv::PlanObjective::Response::SUCCEEDED)
+      << response->reason;
+  EXPECT_NEAR(response->path.back().position.x, 0.0, 0.30);
 }
 
 TEST_F(PlannerNodeTest, NavigateInsideTheLatticeNeedsNoRoadmap) {

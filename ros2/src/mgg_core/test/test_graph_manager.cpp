@@ -1,6 +1,8 @@
 // Tests for the vertex store: kd-tree lookup, shortest paths over the graph,
 // and the per-robot vertex maps the multi-robot merge relies on.
 
+#include <algorithm>
+#include <cmath>
 #include <memory>
 #include <vector>
 
@@ -142,6 +144,46 @@ TEST(GraphManager, UpdateVertexTypeInRangeMarksVisited) {
   c.gm.updateVertexTypeInRange(at_start, 1.5);
   // Vertices 0 and 1 are within 1.5 m and should now be visited.
   EXPECT_EQ(c.gm.getVertex(0)->type, VertexType::kVisited);
+}
+
+// No-go zones (run 8): an edge through one stays in the graph but is closed
+// to every search, which then detours, or finds nothing; opening the edges
+// restores the shortest route.
+TEST(GraphManager, BlockedEdgesAreLeftOutOfTheShortestPaths) {
+  GraphManager g;
+  std::vector<Vertex*> v;
+  for (const auto& xy : std::vector<std::pair<double, double>>{
+           {0, 0}, {1, 0}, {2, 0}, {1, 1}}) {
+    v.push_back(new Vertex(static_cast<int>(v.size()),
+                           StateVec(xy.first, xy.second, 0, 0)));
+    g.addVertex(v.back());
+  }
+  g.addEdge(v[0], v[1], 1.0);
+  g.addEdge(v[1], v[2], 1.0);
+  g.addEdge(v[0], v[3], std::sqrt(2.0));
+  g.addEdge(v[3], v[2], std::sqrt(2.0));
+  const auto route = [&g]() {
+    ShortestPathsReport rep;
+    EXPECT_TRUE(g.findShortestPaths(0, rep));
+    std::vector<int> path;
+    if (rep.parent_id_map.at(2) == 2) return path;  // unreached
+    g.getShortestPath(2, rep, true, path);
+    return path;
+  };
+  EXPECT_EQ(route(), (std::vector<int>{0, 1, 2}));
+  // A zone at (1.5, 0) closes the straight edge 1-2.
+  const Eigen::Vector2d zone(1.5, 0.0);
+  g.setEdgeBlocked([&zone](const Vertex& a, const Vertex& b) {
+    const Eigen::Vector2d p = a.state.head<2>(), d = b.state.head<2>() - p;
+    const double t = std::clamp((zone - p).dot(d) / d.squaredNorm(), 0.0, 1.0);
+    return (zone - (p + t * d)).norm() < 0.3;
+  });
+  EXPECT_EQ(route(), (std::vector<int>{0, 3, 2}));
+  EXPECT_EQ(g.getNumEdges(), 4);
+  g.setEdgeBlocked([](const Vertex&, const Vertex&) { return true; });
+  EXPECT_TRUE(route().empty());
+  g.setEdgeBlocked(nullptr);
+  EXPECT_EQ(route(), (std::vector<int>{0, 1, 2}));
 }
 
 }  // namespace
