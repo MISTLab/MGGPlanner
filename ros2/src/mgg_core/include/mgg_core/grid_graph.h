@@ -21,6 +21,10 @@
 
 #include <Eigen/Dense>
 
+#include <cstdint>
+#include <unordered_map>
+#include <vector>
+
 #include "mgg_core/graph_expansion.h"
 #include "mgg_core/graph_manager.h"
 #include "mgg_core/types.h"
@@ -46,12 +50,17 @@ enum class GridGraphStatus {
 
 struct GridGraphResult {
   GridGraphStatus status = GridGraphStatus::kOk;
-  /// Cells whose footprint was free, i.e. candidates offered to expandGraph.
+  /// Cells whose footprint was free: candidates offered to expandGraph, and
+  /// merged_duplicates.
   int free_cells = 0;
   int vertices_added = 0;
   int edges_added = 0;
   /// True when a size or loop cap stopped the sweep early.
   bool hit_limit = false;
+  /// Free cells not offered to expandGraph because their ground lies within
+  /// a step of a vertex already at the same lattice column
+  /// (LatticeColumnGround): the same place reached from another z level.
+  int merged_duplicates = 0;
   /// Why the candidates that were offered got turned away, indexed by
   /// ExpandGraphStatus. A sweep that finds plenty of free cells and produces
   /// no vertices is otherwise indistinguishable from one that found nothing,
@@ -68,10 +77,35 @@ struct GridGraphResult {
   int edge_status[8] = {0, 0, 0, 0, 0, 0, 0, 0};
 };
 
+/// The driving heights of the vertices a ground lattice holds at each of its
+/// columns. A lattice column has one cell per z level, and on one floor
+/// every level projects onto the same ground: run 8's lattices held 4.9
+/// vertices per position, so the vertex limit held a fifth of the area.
+/// Ground within `step` (max_step_height) of a held height is the same
+/// ground; farther apart it is another level, a floor under a walkway, and
+/// is held apart.
+class LatticeColumnGround {
+ public:
+  explicit LatticeColumnGround(double step) : step_(step) {}
+  /// Whether column (i, j) holds a vertex within the step of height `z`.
+  bool holds(int i, int j, double z) const;
+  void add(int i, int j, double z);
+
+ private:
+  static std::int64_t key(int i, int j) {
+    return (static_cast<std::int64_t>(i) << 32) ^ static_cast<std::uint32_t>(j);
+  }
+  double step_;
+  std::unordered_map<std::int64_t, std::vector<double>> heights_;
+};
+
 /// Sweeps the lattice around `state` and grows `graph` through it.
 ///
 /// `heading` rotates the lattice about z so it follows the robot rather than
-/// the world axes.
+/// the world axes. Columns are swept outward from the robot, nearest first,
+/// so a size or loop cap leaves out the farthest cells. For a ground robot,
+/// a cell whose ground a vertex at its column already stands on
+/// (LatticeColumnGround) is not offered again.
 GridGraphResult buildGridGraph(GraphManager& graph, const StateVec& state,
                                const GridGraphParams& grid,
                                const ExpandContext& ctx, double heading);

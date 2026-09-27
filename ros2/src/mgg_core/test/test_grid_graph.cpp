@@ -3,6 +3,7 @@
 
 #include <cmath>
 #include <memory>
+#include <set>
 #include <utility>
 #include <vector>
 
@@ -417,6 +418,93 @@ TEST(GridGraph, RespectsTheVertexLimit) {
   const auto r = buildGridGraph(f.graph, StateVec(0, 0, 0, 0), smallGrid(),
                                 f.ctx, 0.0);
   EXPECT_TRUE(r.hit_limit);
+}
+
+// Run 8: the lattice was swept from its rear row to its front, so the
+// 1500-vertex limit cut the rows ahead of the robot (robot_3 at a corridor
+// junction reached +2.8 m of the 6 m ahead). The sweep now grows outward
+// from the robot, and a limit drops the farthest cells.
+TEST(GridGraph, VertexLimitDropsTheFarthestCellsFirst) {
+  Fixture f;
+  f.planning.num_vertices_max = 9;
+  GridGraphParams g;
+  g.min_val = Eigen::Vector3d(-2.0, -2.0, 0.0);
+  g.max_val = Eigen::Vector3d(2.0, 2.0, 0.0);
+  g.resolution = Eigen::Vector3d(0.5, 0.5, 0.5);
+  const auto r = buildGridGraph(f.graph, StateVec(0, 0, 0, 0), g, f.ctx, 0.0);
+  EXPECT_TRUE(r.hit_limit);
+  ASSERT_EQ(f.graph.getNumVertices(), 9);
+  // The robot and the eight cells around it, none farther.
+  for (const auto& [id, v] : f.graph.vertices_map_) {
+    EXPECT_LE(v->state.head<2>().norm(), std::sqrt(0.5) + 1e-9) << id;
+  }
+}
+
+// Run 8: every lattice column's six z levels projected to the same ground,
+// and each was kept: 4.9 vertices per position, so the 1500-vertex limit
+// held about 300 positions of the 961 the lattice has.
+TEST(GridGraph, GroundLatticeKeepsOneVertexPerColumnOfOneFloor) {
+  std::map<std::pair<std::int64_t, std::int64_t>, double> tops;
+  for (std::int64_t x = -10; x < 10; ++x) {
+    for (std::int64_t y = -10; y < 10; ++y) tops[{x, y}] = 0.0;
+  }
+  const mgg_test::TerrainFixture map(0.2, tops);
+  RobotParams robot;
+  robot.type = RobotType::kGroundRobot;
+  robot.size = Eigen::Vector3d(0.4, 0.4, 0.4);
+  PlanningParams planning;
+  planning.max_ground_height = 0.5;
+  planning.max_step_height = 0.15;
+  planning.max_inclination = 0.6;
+  planning.edge_length_min = 0.05;
+  planning.edge_length_max = 2.0;
+  planning.edge_overshoot = 0.0;
+  planning.nearest_range = 0.6;
+  planning.nearest_range_min = 0.05;
+  planning.nearest_range_max = 1.0;
+  planning.nearest_range_z = 0.15;
+  const mgg::GroundProjection ground(map, planning);
+  ExpandContext ctx;
+  ctx.map = &map;
+  ctx.planning = &planning;
+  ctx.robot = &robot;
+  ctx.ground = &ground;
+  ctx.robot_box_size = robot.getPlanningSize();
+  ctx.root_is_robot = true;
+  GraphManager graph;
+  graph.addVertex(new Vertex(0, StateVec(0.1, 0.1, 0.5, 0.0)));
+  GridGraphParams g;
+  g.min_val = Eigen::Vector3d(-0.8, -0.8, -0.2);
+  g.max_val = Eigen::Vector3d(0.8, 0.8, 0.3);
+  g.resolution = Eigen::Vector3d(0.4, 0.4, 0.1);
+  const auto r = buildGridGraph(graph, StateVec(0.1, 0.1, 0.5, 0.0), g, ctx,
+                                0.0);
+  EXPECT_EQ(r.status, GridGraphStatus::kOk);
+  // All 25 columns, the robot's included, once each.
+  EXPECT_EQ(graph.getNumVertices(), 25);
+  EXPECT_GT(r.merged_duplicates, 0);
+  std::set<std::pair<long, long>> columns;
+  for (const auto& [id, v] : graph.vertices_map_) {
+    columns.insert({std::lround(v->state.x() * 10), std::lround(v->state.y() * 10)});
+  }
+  EXPECT_EQ(columns.size(), graph.getNumVertices());
+}
+
+// The merge is by ground height: within a step it is the same ground, more
+// than a step apart another level (a floor under a walkway), kept apart.
+TEST(GridGraph, LatticeColumnGroundMergesWithinAStepAndKeepsOtherLevels) {
+  mgg::LatticeColumnGround columns(0.15);
+  EXPECT_FALSE(columns.holds(2, 3, 0.5));
+  columns.add(2, 3, 0.5);
+  EXPECT_TRUE(columns.holds(2, 3, 0.5));
+  EXPECT_TRUE(columns.holds(2, 3, 0.64));
+  EXPECT_TRUE(columns.holds(2, 3, 0.36));
+  EXPECT_FALSE(columns.holds(2, 3, 0.66));
+  EXPECT_FALSE(columns.holds(2, 3, 2.5));
+  EXPECT_FALSE(columns.holds(3, 3, 0.5));
+  columns.add(2, 3, 2.5);
+  EXPECT_TRUE(columns.holds(2, 3, 2.5));
+  EXPECT_TRUE(columns.holds(2, 3, 0.5));
 }
 
 TEST(GridGraph, LatticeFollowsTheRobotPosition) {

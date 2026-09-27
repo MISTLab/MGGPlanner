@@ -409,6 +409,10 @@ class PlannerNodeTestPeer {
     node.grid_params_.min_val.head<2>() = lo;
     node.grid_params_.max_val.head<2>() = hi;
   }
+  /// The lattice's cell size in x and y.
+  static void setLatticeResolution(PlannerNode& node, double resolution) {
+    node.grid_params_.resolution.head<2>().setConstant(resolution);
+  }
   /// The test lidar sees all round, so no direction has more gain for the
   /// way a viewpoint faces.
   static void seeAllRound(PlannerNode& node) {
@@ -900,8 +904,13 @@ TEST_F(PlannerNodeTest, ASlopeWithNoRoomToTurnWithinReachGetsNoPathNotComplete) 
   // back along its path. The fallback for when no path ends clear sent the
   // best of them anyway; it must not. No path, retried, and not
   // exploration complete, not even with the global planner consulted.
+  // The lattice is fine enough, and short enough to stay on the slope, for
+  // every end's slope to be measured: grown outward from the robot, a 0.5 m
+  // lattice on this holed slope holds three vertices.
   auto node = makeNode("slope_no_way_back");
   PlannerNodeTestPeer::setRobotFootprint(*node, 0.6, 0.2);
+  PlannerNodeTestPeer::setLatticeResolution(*node, 0.25);
+  PlannerNodeTestPeer::setLattice(*node, {-1.0, -1.0}, {2.0, 1.0});
   PlannerNodeTestPeer::allowUnknownLatticeBody(*node);
   PlannerNodeTestPeer::observeSparseSlope(*node, -1.5, 4.0, -1.5, 1.5, 0.2);
   PlannerNodeTestPeer::acceptOdometry(*node, 0.0, 0.0, 1.0);
@@ -1995,12 +2004,16 @@ TEST_F(PlannerNodeTest, AStandingStartInItsLidarsBlindDiskIsNotBoxedIn) {
   // boxed in with no departure. Here the floor is observed from 0.6 m out,
   // and a wall 0.8 m ahead of the robot, which faces +y. Standing at its
   // start, as its keyframes show, it has room to turn and gets a path, on
-  // this side of the wall.
+  // this side of the wall. Side walls 0.4 m either side close the lattice's
+  // diagonals: from the robot they are 45-degree turns, which the turn rule
+  // allows anywhere.
   const auto scene = [](const std::string& name,
                         const KeyframeTrajectory& keyframes) {
     auto node = makeNode(name);
     PlannerNodeTestPeer::observeRaisedRing(*node, 0.6, 3.5, 0.0);
     PlannerNodeTestPeer::observeWall(*node, -1.0, 1.0, 0.8);
+    PlannerNodeTestPeer::observeWallAlongY(*node, 0.2, 0.8, 0.4);
+    PlannerNodeTestPeer::observeWallAlongY(*node, 0.2, 0.8, -0.4);
     PlannerNodeTestPeer::setHangingRootReach(*node, 1.2);
     PlannerNodeTestPeer::serveMap(*node, "component:test", 0);
     auto source = std::make_unique<TrajectoryInMemory>();

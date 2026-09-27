@@ -2286,10 +2286,13 @@ std::string PlannerNode::buildLocalGraph() {
       boxed_in.c_str(), selection_direction, timing);
 
   // rrg.cpp:2098 to 2120: rounds without a frontier among the leaves count
-  // towards the global planner; a round with one counts back.
+  // towards the global planner; a round with one counts back. A round with
+  // frontiers but no path to send counts as one without: the lattice sees
+  // gain it cannot reach, which is local gain left, not a finished
+  // exploration, and not a reason never to reposition either.
   if (local_graph_->getNumVertices() <= 1) {
     // Nothing was scored; this round says nothing about the frontier.
-  } else if (frontiers == 0 || goes_nowhere) {
+  } else if (frontiers == 0 || goes_nowhere || best_path_.empty()) {
     ++low_gain_rounds_;
     local_gain_remains_now_ =
         frontiers > 0 || (goes_nowhere && sel.best_full_gain > 0.0);
