@@ -466,6 +466,17 @@ PlannerNode::PlannerNode(const rclcpp::NodeOptions& options)
                      res) { onExplorationTargetRequest(req, res); },
           rclcpp::ServicesQoS(), callback_group_);
 
+  exploration_region_srv_ =
+      create_service<mgg_msgs::srv::PlannerSetExplorationRegion>(
+          "set_exploration_region",
+          [this](const std::shared_ptr<
+                     mgg_msgs::srv::PlannerSetExplorationRegion::Request>
+                     req,
+                 std::shared_ptr<
+                     mgg_msgs::srv::PlannerSetExplorationRegion::Response>
+                     res) { onExplorationRegionRequest(req, res); },
+          rclcpp::ServicesQoS(), callback_group_);
+
   const double publish_period =
       declareOrGet<double>(this, "graph_publish_period_sec", 2.0);
   // Node::create_timer drives off get_clock(), the node's RCL_ROS_TIME clock.
@@ -545,6 +556,7 @@ mgg::GainContext PlannerNode::makeGainContext() {
   ctx.robot = &robot_params_;
   ctx.global_space = &global_space_;
   ctx.no_gain_zones = no_gain_zones_.empty() ? nullptr : &no_gain_zones_;
+  ctx.gain_region = exploration_region_ ? &*exploration_region_ : nullptr;
   ctx.sensors = &sensors_;
   return ctx;
 }
@@ -704,7 +716,7 @@ std::vector<mgg::FrontierCluster> PlannerNode::tourCandidates(
       clusters.erase(std::remove_if(clusters.begin(), clusters.end(), others),
                      clusters.end());
     }
-    return clusters;
+    return insideExplorationRegion(std::move(clusters));
   }
   // Tour-exploration design §3.5: never a cluster another robot holds or a
   // peer explored; in a group with an award, the awarded bundle and the
@@ -736,8 +748,11 @@ std::vector<mgg::FrontierCluster> PlannerNode::tourCandidates(
                                            near(cluster, awarded));
                      }),
       clusters.end());
-  tour_assignment_version_ = fleet_->assignmentVersion();
-  return clusters;
+  if (tour_fleet_assignment_version_ != fleet_->assignmentVersion()) {
+    tour_fleet_assignment_version_ = fleet_->assignmentVersion();
+    ++tour_assignment_version_;
+  }
+  return insideExplorationRegion(std::move(clusters));
 }
 
 std::optional<mgg::FrontierCluster> PlannerNode::refreshTour(
@@ -3533,6 +3548,50 @@ void PlannerNode::onExplorationTargetRequest(
   RCLCPP_INFO(get_logger(), "exploring toward (%.2f, %.2f, %.2f)", target.x(),
               target.y(), target.z());
   response->success = true;
+}
+
+void PlannerNode::onExplorationRegionRequest(
+    const std::shared_ptr<mgg_msgs::srv::PlannerSetExplorationRegion::Request>
+        request,
+    std::shared_ptr<mgg_msgs::srv::PlannerSetExplorationRegion::Response>
+        response) {
+  const std::lock_guard<std::recursive_mutex> lock(planner_mutex_);
+  if (!request->active) {
+    exploration_region_.reset();
+    ++tour_assignment_version_;
+    response->success = true;
+    response->message = "exploration region cleared";
+    return;
+  }
+  const Eigen::Vector3d min(request->min.x, request->min.y, request->min.z);
+  const Eigen::Vector3d max(request->max.x, request->max.y, request->max.z);
+  if (!min.allFinite() || !max.allFinite() ||
+      !(min.array() < max.array()).all()) {
+    response->success = false;
+    response->message = "exploration region must be finite with min < max";
+    return;
+  }
+  mgg::BoundedSpaceParams region;
+  region.type = mgg::BoundedSpaceType::kCuboid;
+  region.setBound(min, max);
+  region.setCenter(Eigen::Vector3d(0, 0, 0), /*use_extension=*/false);
+  exploration_region_ = region;
+  // The tour's candidates change: solve again.
+  ++tour_assignment_version_;
+  response->success = true;
+  response->message = "exploring inside the region only";
+}
+
+std::vector<mgg::FrontierCluster> PlannerNode::insideExplorationRegion(
+    std::vector<mgg::FrontierCluster> clusters) const {
+  if (!exploration_region_) return clusters;
+  clusters.erase(std::remove_if(clusters.begin(), clusters.end(),
+                                [this](const mgg::FrontierCluster& cluster) {
+                                  return !exploration_region_->isInsideSpace(
+                                      cluster.position);
+                                }),
+                 clusters.end());
+  return clusters;
 }
 
 void PlannerNode::onObjectiveRequest(

@@ -31,6 +31,7 @@
 #include "mgg_map_octomap/mola_map.h"
 #include "mgg_map_octomap/octomap_map.h"
 #include "mgg_ros/planner_node.h"
+#include "mgg_msgs/srv/planner_set_exploration_region.hpp"
 #include "mgg_ros/fleet_conversions.h"
 
 namespace mgg_ros {
@@ -661,6 +662,48 @@ class PlannerNodeTestPeer {
     mgg::SensorParams& sensor = node.sensors_["test_lidar"];
     sensor.fov.x() = 2.0 * M_PI;
     sensor.update();
+  }
+  static std::shared_ptr<mgg_msgs::srv::PlannerSetExplorationRegion::Response>
+  setExplorationRegion(PlannerNode& node, bool active,
+                       const Eigen::Vector3d& min, const Eigen::Vector3d& max) {
+    auto request =
+        std::make_shared<mgg_msgs::srv::PlannerSetExplorationRegion::Request>();
+    request->active = active;
+    request->min.x = min.x();
+    request->min.y = min.y();
+    request->min.z = min.z();
+    request->max.x = max.x();
+    request->max.y = max.y();
+    request->max.z = max.z();
+    auto response =
+        std::make_shared<mgg_msgs::srv::PlannerSetExplorationRegion::Response>();
+    node.onExplorationRegionRequest(request, response);
+    return response;
+  }
+  static std::vector<mgg::FrontierCluster> insideExplorationRegion(
+      PlannerNode& node, std::vector<mgg::FrontierCluster> clusters) {
+    const std::lock_guard<std::recursive_mutex> lock(node.planner_mutex_);
+    return node.insideExplorationRegion(std::move(clusters));
+  }
+  static std::vector<mgg::FrontierCluster> tourCandidates(
+      PlannerNode& node, std::vector<mgg::FrontierCluster> clusters) {
+    const std::lock_guard<std::recursive_mutex> lock(node.planner_mutex_);
+    return node.tourCandidates(std::move(clusters));
+  }
+  // Cache an empty tour: candidate IDs and graph revision stay unchanged,
+  // so only an assignment/region change can require another solve.
+  static void solveEmptyTour(PlannerNode& node) {
+    const std::lock_guard<std::recursive_mutex> lock(node.planner_mutex_);
+    const auto clusters = node.tourCandidates({});
+    node.tour_planner_->solve(clusters, mgg::TourCostMatrix{},
+                              node.graph_revision_,
+                              node.tour_assignment_version_, 0.0);
+  }
+  static bool emptyTourNeedsSolve(PlannerNode& node) {
+    const std::lock_guard<std::recursive_mutex> lock(node.planner_mutex_);
+    const auto clusters = node.tourCandidates({});
+    return node.tour_planner_->needsSolve(clusters, node.graph_revision_,
+                                         node.tour_assignment_version_, 100.0);
   }
   static void setExplorationTarget(PlannerNode& node,
                                    const Eigen::Vector3d& target) {
@@ -4095,6 +4138,76 @@ TEST_F(PlannerNodeTest, ASoloReleaseReportsThatItAppliedLocally) {
   EXPECT_TRUE(PlannerNodeTestPeer::fleetExclusions(*node).empty());
   EXPECT_NE(response->message.find("locally"), std::string::npos);
   EXPECT_NE(response->message.find("nothing forwarded"), std::string::npos);
+}
+
+TEST_F(PlannerNodeTest, AnExplorationRegionKeepsTheTourInsideIt) {
+  for (bool fleet_enabled : {false, true}) {
+    SCOPED_TRACE(fleet_enabled);
+    auto node = makeNode("exploration_region", "world",
+                         {rclcpp::Parameter("fleet.enabled", fleet_enabled)});
+    mgg::FrontierCluster pit;
+    pit.id = 11;
+    pit.position = Eigen::Vector3d(2.0, 0.0, -6.0);
+    mgg::FrontierCluster corridor;
+    corridor.id = 12;
+    corridor.position = Eigen::Vector3d(20.0, 0.0, 1.0);
+    const std::vector<mgg::FrontierCluster> both{pit, corridor};
+
+    EXPECT_EQ(PlannerNodeTestPeer::insideExplorationRegion(*node, both).size(), 2u);
+    auto response = PlannerNodeTestPeer::setExplorationRegion(
+        *node, true, Eigen::Vector3d(-1, -3, -10), Eigen::Vector3d(5, 3, 0));
+    ASSERT_TRUE(response->success) << response->message;
+    const auto inside = PlannerNodeTestPeer::insideExplorationRegion(*node, both);
+    ASSERT_EQ(inside.size(), 1u);
+    EXPECT_EQ(inside[0].id, 11u);
+    const auto candidates = PlannerNodeTestPeer::tourCandidates(*node, both);
+    ASSERT_EQ(candidates.size(), 1u);
+    EXPECT_EQ(candidates[0].id, 11u);
+
+    response = PlannerNodeTestPeer::setExplorationRegion(
+        *node, false, Eigen::Vector3d::Zero(), Eigen::Vector3d::Zero());
+    ASSERT_TRUE(response->success);
+    EXPECT_EQ(PlannerNodeTestPeer::insideExplorationRegion(*node, both).size(), 2u);
+    EXPECT_EQ(PlannerNodeTestPeer::tourCandidates(*node, both).size(), 2u);
+  }
+}
+
+TEST_F(PlannerNodeTest, AnEmptyOrNonFiniteRegionIsRefused) {
+  auto node = makeNode("exploration_region_bad");
+  EXPECT_FALSE(PlannerNodeTestPeer::setExplorationRegion(
+                   *node, true, Eigen::Vector3d(1, 1, 1), Eigen::Vector3d(0, 2, 2))
+                   ->success);
+  EXPECT_FALSE(PlannerNodeTestPeer::setExplorationRegion(
+                   *node, true, Eigen::Vector3d(0, 0, 0),
+                   Eigen::Vector3d(std::nan(""), 1, 1))
+                   ->success);
+  EXPECT_FALSE(PlannerNodeTestPeer::setExplorationRegion(
+                   *node, true, Eigen::Vector3d(0, 0, 0), Eigen::Vector3d(0, 1, 1))
+                   ->success);
+}
+
+TEST_F(PlannerNodeTest, RegionChangesInvalidateToursWithAndWithoutFleet) {
+  for (bool fleet_enabled : {false, true}) {
+    SCOPED_TRACE(fleet_enabled);
+    auto node = makeNode("region_tour_invalidation", "world",
+                         {rclcpp::Parameter("fleet.enabled", fleet_enabled)});
+    PlannerNodeTestPeer::solveEmptyTour(*node);
+    ASSERT_FALSE(PlannerNodeTestPeer::emptyTourNeedsSolve(*node));
+    ASSERT_TRUE(PlannerNodeTestPeer::setExplorationRegion(
+                    *node, true, Eigen::Vector3d(-1, -3, -10),
+                    Eigen::Vector3d(5, 3, 0))->success);
+    EXPECT_TRUE(PlannerNodeTestPeer::emptyTourNeedsSolve(*node));
+    PlannerNodeTestPeer::solveEmptyTour(*node);
+    ASSERT_FALSE(PlannerNodeTestPeer::emptyTourNeedsSolve(*node));
+    EXPECT_FALSE(PlannerNodeTestPeer::setExplorationRegion(
+                     *node, true, Eigen::Vector3d::Zero(),
+                     Eigen::Vector3d::Zero())->success);
+    EXPECT_FALSE(PlannerNodeTestPeer::emptyTourNeedsSolve(*node));
+    ASSERT_TRUE(PlannerNodeTestPeer::setExplorationRegion(
+                    *node, false, Eigen::Vector3d::Zero(),
+                    Eigen::Vector3d::Zero())->success);
+    EXPECT_TRUE(PlannerNodeTestPeer::emptyTourNeedsSolve(*node));
+  }
 }
 
 }  // namespace mgg_ros

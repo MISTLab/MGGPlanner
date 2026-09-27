@@ -201,6 +201,31 @@ TEST(Gain, NoGainZonesSuppressTheirContents) {
   EXPECT_LT(with.gain, without.gain);
 }
 
+TEST(Gain, AGainRegionIgnoresEverythingOutsideIt) {
+  Fixture f;
+  VolumetricGain without;
+  computeVolumetricGain(StateVec(4.0, 0, 0, 0), without, f.ctx);
+  ASSERT_GT(without.num_unknown_voxels, 0);
+
+  BoundedSpaceParams far_away;
+  far_away.type = BoundedSpaceType::kCuboid;
+  far_away.setBound(Eigen::Vector3d(100, 100, 100), Eigen::Vector3d(110, 110, 110));
+  far_away.setCenter(Eigen::Vector3d(0, 0, 0), false);
+  f.ctx.gain_region = &far_away;
+  VolumetricGain outside;
+  computeVolumetricGain(StateVec(4.0, 0, 0, 0), outside, f.ctx);
+  EXPECT_EQ(outside.num_unknown_voxels, 0);
+
+  BoundedSpaceParams everywhere;
+  everywhere.type = BoundedSpaceType::kCuboid;
+  everywhere.setBound(Eigen::Vector3d(-50, -50, -50), Eigen::Vector3d(50, 50, 50));
+  everywhere.setCenter(Eigen::Vector3d(0, 0, 0), false);
+  f.ctx.gain_region = &everywhere;
+  VolumetricGain inside;
+  computeVolumetricGain(StateVec(4.0, 0, 0, 0), inside, f.ctx);
+  EXPECT_EQ(inside.num_unknown_voxels, without.num_unknown_voxels);
+}
+
 TEST(Gain, FrontierIsFlaggedWhenEnoughUnknownIsVisible) {
   Fixture f;
   VolumetricGain g;

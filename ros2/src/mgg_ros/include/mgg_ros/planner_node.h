@@ -47,6 +47,7 @@
 #include <mgg_msgs/msg/mapping_snapshot.hpp>
 #include <mgg_msgs/srv/plan_objective.hpp>
 #include <mgg_msgs/srv/planner_set_exploration_target.hpp>
+#include <mgg_msgs/srv/planner_set_exploration_region.hpp>
 #include <mgg_msgs/srv/planner_srv.hpp>
 #include <mgg_msgs/msg/tour_award.hpp>
 #include <mgg_msgs/msg/tour_bid.hpp>
@@ -201,6 +202,15 @@ class PlannerNode : public rclcpp::Node {
           request,
       std::shared_ptr<mgg_msgs::srv::PlannerSetExplorationTarget::Response>
           response);
+  /// "Explore here" (drone scout §3.5): gain and tour only inside a box.
+  void onExplorationRegionRequest(
+      const std::shared_ptr<mgg_msgs::srv::PlannerSetExplorationRegion::Request>
+          request,
+      std::shared_ptr<mgg_msgs::srv::PlannerSetExplorationRegion::Response>
+          response);
+  /// `clusters` without those outside the exploration region, if one is set.
+  std::vector<mgg::FrontierCluster> insideExplorationRegion(
+      std::vector<mgg::FrontierCluster> clusters) const;
   /// This robot's global graph as broadcast on neighbour_graph_out.
   mgg_msgs::msg::Graph ownGraphMessage();
   void publishOwnGraph();
@@ -647,8 +657,10 @@ class PlannerNode : public rclcpp::Node {
   /// The clusters the last refreshTour offered the tour.
   std::vector<mgg::FrontierCluster> tour_clusters_;
   /// Changes when the clusters this robot may visit change for a reason
-  /// other than the graph (the fleet's assignment); the tour solves again.
+  /// other than the graph (fleet assignment or exploration region).
   std::uint64_t tour_assignment_version_ = 0;
+  /// Last fleet version incorporated above; never overwrite local changes.
+  std::uint64_t tour_fleet_assignment_version_ = 0;
   /// The last tour's costing and solving time, for the plan summary.
   double tour_solve_ms_ = 0.0;
   /// Bounded, round-robin initial scoring of imported frontiers.
@@ -754,6 +766,9 @@ class PlannerNode : public rclcpp::Node {
   rclcpp::Service<mgg_msgs::srv::PlanObjective>::SharedPtr objective_srv_;
   rclcpp::Service<mgg_msgs::srv::PlannerSetExplorationTarget>::SharedPtr
       exploration_target_srv_;
+  rclcpp::Service<mgg_msgs::srv::PlannerSetExplorationRegion>::SharedPtr
+      exploration_region_srv_;
+  std::optional<mgg::BoundedSpaceParams> exploration_region_;
   rclcpp::TimerBase::SharedPtr graph_timer_;
   /// rrg.h:367 global_graph_update_timer_.
   rclcpp::TimerBase::SharedPtr global_graph_update_timer_;
