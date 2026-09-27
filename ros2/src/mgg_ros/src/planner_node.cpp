@@ -3146,7 +3146,6 @@ void PlannerNode::onPlanRequest(
     std::shared_ptr<mgg_msgs::srv::PlannerSrv::Response> response) {
   const std::lock_guard<std::recursive_mutex> lock(planner_mutex_);
   lattice_path_.clear();
-  refreshNoGoZones();
   withdrawUnplacedNeighbours();
   response->planning_bound_mode = request->bound_mode;
   if (!have_odometry_ || !map_->getStatus()) {
@@ -3169,6 +3168,10 @@ void PlannerNode::onPlanRequest(
   const mgg::BoundModeType previous = robot_params_.bound_mode;
   robot_params_.bound_mode =
       static_cast<mgg::BoundModeType>(request->bound_mode);
+  // The zones' reach is half the planning box out, the box this request
+  // plans with, for the lattice, the routes and the final check alike
+  // (review r1, R1-2).
+  refreshNoGoZones();
   // Every cycle plans afresh; the previous path was the previous answer.
   best_path_.clear();
   best_path_from_global_graph_ = false;
@@ -3383,13 +3386,14 @@ void PlannerNode::onPlanRequest(
       }
     }
   }
-  robot_params_.bound_mode = previous;
-
   if (!noGoAdmissible(best_path_)) {
-    // The last net: whatever produced it, nothing is sent into a zone.
+    // The last net: whatever produced it, nothing is sent into a zone. It
+    // runs with the request's bound mode still applied.
     best_path_.clear();
     summary += "; the path enters a no-go zone: no path";
   }
+  robot_params_.bound_mode = previous;
+  refreshNoGoZones();
   recordSentPath();
   response->status = !best_path_.empty()
                          ? mgg_msgs::srv::PlannerSrv::Response::FORWARD

@@ -518,6 +518,21 @@ class PlannerNodeTestPeer {
     node.onPlanRequest(std::make_shared<mgg_msgs::srv::PlannerSrv::Request>(),
                        response);
   }
+  /// A plan request pinning `mode` for its cycle.
+  static void planWithBoundMode(
+      PlannerNode& node, mgg::BoundModeType mode,
+      std::shared_ptr<mgg_msgs::srv::PlannerSrv::Response> response) {
+    auto request = std::make_shared<mgg_msgs::srv::PlannerSrv::Request>();
+    request->bound_mode = static_cast<std::uint8_t>(mode);
+    node.onPlanRequest(request, response);
+  }
+  /// The robot's configured bound mode and its size extension.
+  static void setBound(PlannerNode& node, mgg::BoundModeType mode,
+                       double extension) {
+    const std::lock_guard<std::recursive_mutex> lock(node.planner_mutex_);
+    node.robot_params_.bound_mode = mode;
+    node.robot_params_.size_extension = Eigen::Vector3d(extension, extension, 0.0);
+  }
   /// A floor rising along +x at `grade` (rise over run) over [xmin, xmax] x
   /// [ymin, ymax], observed by vertical rays at the centre of every 0.1 m
   /// voxel but one in nine, (x, y) index 1 modulo 3 both ways. The
@@ -1842,6 +1857,48 @@ TEST_F(PlannerNodeTest, ExplorationFromInsideANoGoZoneOnlyDepartsOnEitherBackend
     EXPECT_GE(std::hypot(response->path.back().position.x - 2.3,
                          response->path.back().position.y),
               1.1 - 1e-6);
+  }
+}
+
+TEST_F(PlannerNodeTest, TheNoGoReachFollowsTheRequestsBoundMode) {
+  // Review r1, R1-2: the zones' reach (radius plus half the planning box)
+  // was taken before the request's bound mode was applied, and the final
+  // check ran after the configured mode was restored, so the lattice and
+  // the check used the configured footprint, not the requested one. The
+  // robot is 0.2 m with a 0.6 m extension; a zone of 0.3 m radius stands
+  // 0.6 m beside the corridor's centre line, at (2, 0.6).
+  const Eigen::Vector2d zone(2.0, 0.6);
+  {
+    SCOPED_TRACE("configured exact, requested extended: the reach grows");
+    auto node = makeNode("no_go_bound_grow", "world",
+                         {rclcpp::Parameter("PlanningParams.no_go_radius_m", 0.3)});
+    PlannerNodeTestPeer::observeFloor(*node, -1.0, 5.0, -0.6, 0.6);
+    PlannerNodeTestPeer::setBound(*node, mgg::BoundModeType::kExactBound, 0.6);
+    PlannerNodeTestPeer::acceptOdometry(*node, 0.0, 0.0, 1.0);
+    PlannerNodeTestPeer::receiveNoGoZones(*node, "world", {zone});
+    auto response = std::make_shared<mgg_msgs::srv::PlannerSrv::Response>();
+    PlannerNodeTestPeer::planWithBoundMode(
+        *node, mgg::BoundModeType::kExtendedBound, response);
+    // Reach 0.3 + 0.4: the centre line near x = 2 is closed.
+    EXPECT_GE(nearestTo(response->path, zone), 0.7 - 1e-6)
+        << "path to x " << furthestX(response->path);
+  }
+  {
+    SCOPED_TRACE("configured extended, requested exact: the reach shrinks");
+    auto node = makeNode("no_go_bound_shrink", "world",
+                         {rclcpp::Parameter("PlanningParams.no_go_radius_m", 0.3)});
+    // A corridor one lattice row wide: the way past is the centre line.
+    PlannerNodeTestPeer::observeFloor(*node, -1.0, 5.0, -0.3, 0.3);
+    PlannerNodeTestPeer::setBound(*node, mgg::BoundModeType::kExtendedBound, 0.6);
+    PlannerNodeTestPeer::acceptOdometry(*node, 0.0, 0.0, 1.0);
+    PlannerNodeTestPeer::receiveNoGoZones(*node, "world", {zone});
+    auto response = std::make_shared<mgg_msgs::srv::PlannerSrv::Response>();
+    PlannerNodeTestPeer::planWithBoundMode(
+        *node, mgg::BoundModeType::kExactBound, response);
+    // Reach 0.3 + 0.1: the centre line stays open past the zone.
+    ASSERT_EQ(response->status, mgg_msgs::srv::PlannerSrv::Response::FORWARD);
+    EXPECT_GT(furthestX(response->path), 2.5);
+    EXPECT_GE(nearestTo(response->path, zone), 0.4 - 1e-6);
   }
 }
 
