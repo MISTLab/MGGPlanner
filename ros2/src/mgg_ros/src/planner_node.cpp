@@ -3541,12 +3541,15 @@ void PlannerNode::onPlanRequest(
           summary += "; the robot stands on the tour's target: reached";
         } else if (runGlobalPlanner(tour_target->representative_vertex_id,
                                     reason)) {
-          low_gain_rounds_ = 0;
+          // The low-gain rounds restart only once the tour sends something
+          // the robot can drive (review r0, I1).
           if (!depart_instead_of_turning_route(departure)) {
             tour_decided = true;
+            low_gain_rounds_ = 0;
             summary += "; routing to the tour's target over the global graph";
           } else if (!best_path_.empty()) {
             tour_decided = true;
+            low_gain_rounds_ = 0;
             summary +=
                 "; the route to the tour's target starts with a turn the "
                 "robot has no room for" +
@@ -3588,6 +3591,10 @@ void PlannerNode::onPlanRequest(
         }
       }
     }
+    // A tour that decided nothing has no target this cycle: its target was
+    // set aside, and the fleet and the greedy planner choose without it
+    // (review r0, I1).
+    if (!tour_decided) tour_target.reset();
     // A low-gain lattice path, once the low-gain rounds are due and the
     // tour has not decided, is set aside for the fleet and the global
     // planner below, as no path would be; it is sent only when neither

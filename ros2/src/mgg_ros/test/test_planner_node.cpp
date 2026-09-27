@@ -793,6 +793,13 @@ class PlannerNodeTestPeer {
   static void setLowGainHandoffMinVoxels(PlannerNode& node, double voxels) {
     node.planning_params_.low_gain_handoff_min_voxels = voxels;
   }
+  /// The global planner is consulted after `rounds` low-gain rounds, and
+  /// `so_far` have passed: due already when `so_far` >= `rounds`. A
+  /// positive `rounds`, as production clamps it.
+  static void lowGainRoundsDue(PlannerNode& node, int rounds, int so_far) {
+    node.auto_global_planner_low_gain_rounds_ = rounds;
+    node.low_gain_rounds_ = so_far;
+  }
   /// The low-gain rounds are due at once; the tour is left as it is.
   static void lowGainRoundsDueAtOnce(PlannerNode& node) {
     node.auto_global_planner_low_gain_rounds_ = 0;
@@ -3963,11 +3970,13 @@ TEST_F(PlannerNodeTest, AnUndrivableTourRouteWithNoLocalPathLeavesTheChoiceToThe
   // has no room for, with no departure. The target is set aside and the
   // choice falls to what the robot does without the tour: here the greedy
   // global planner, whose own route is judged, and withheld, in turn.
+  // Review r0, I1: with a threshold production allows (at least one) and
+  // the rounds already due, the failed tour must not reset them.
   int frontier = -1;
   auto node = exploredDeadEnd("tour_undrivable_no_local", frontier);
   PlannerNodeTestPeer::setDepartureReverseAllowed(*node, false);
   PlannerNodeTestPeer::setTour(*node, true, 0.0);
-  PlannerNodeTestPeer::lowGainRoundsDueAtOnce(*node);
+  PlannerNodeTestPeer::lowGainRoundsDue(*node, 3, 3);
 
   auto response = std::make_shared<mgg_msgs::srv::PlannerSrv::Response>();
   PlannerNodeTestPeer::plan(*node, response);
@@ -3978,6 +3987,30 @@ TEST_F(PlannerNodeTest, AnUndrivableTourRouteWithNoLocalPathLeavesTheChoiceToThe
   // The tour's route, then the greedy planner's to the same frontier.
   EXPECT_EQ(PlannerNodeTestPeer::routeSharpTurnFallbacks(*node), 2);
   EXPECT_EQ(PlannerNodeTestPeer::boxedInWithoutDeparture(*node), 2);
+}
+
+TEST_F(PlannerNodeTest, AnUndrivableTourRouteWithNoLocalPathLetsTheFleetSettle) {
+  // Review r0, I1: as above, with a silent robot's claim far off. The tour
+  // failed, so its target is no target this cycle: the idle robot settles
+  // with the fleet, taking the silent robot's claim over, before the greedy
+  // planner is consulted.
+  int frontier = -1;
+  auto node = exploredDeadEnd("tour_undrivable_fleet", frontier);
+  PlannerNodeTestPeer::setDepartureReverseAllowed(*node, false);
+  PlannerNodeTestPeer::setTour(*node, true, 0.0);
+  PlannerNodeTestPeer::lowGainRoundsDue(*node, 3, 3);
+  const double now = node->now().seconds();
+  PlannerNodeTestPeer::claim(*node, 2, {21, 2, {20.0, 0.0, 0.0}, 1000.0},
+                             now - 30.0);
+  ASSERT_EQ(PlannerNodeTestPeer::fleetExclusions(*node).size(), 1u);
+
+  auto response = std::make_shared<mgg_msgs::srv::PlannerSrv::Response>();
+  PlannerNodeTestPeer::plan(*node, response);
+  EXPECT_EQ(response->status, PlannerNode::kStatusNoPath);
+  EXPECT_EQ(PlannerNodeTestPeer::tourRoutesFailed(*node), 1);
+  EXPECT_TRUE(PlannerNodeTestPeer::fleetExclusions(*node).empty());
+  // The fleet decided: no greedy route after the tour's.
+  EXPECT_EQ(PlannerNodeTestPeer::routeSharpTurnFallbacks(*node), 1);
 }
 
 TEST_F(PlannerNodeTest, LocalExplorationTowardTheTourTargetIsKept) {
