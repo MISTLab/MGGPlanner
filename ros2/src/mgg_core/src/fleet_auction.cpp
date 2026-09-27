@@ -257,7 +257,10 @@ AuctionResult runSequentialAuction(const std::vector<AuctionBidder>& input,
     double best_bid = kUnreachableCost;
     for (const AuctionBidder* b : bidders) {
       for (std::size_t c = 0; c < n; ++c) {
-        if (taken[c]) continue;
+        // A cluster the bidder cannot reach from its pose (or, with limited
+        // reach, not reach and return from: bidderCosts) is not its
+        // candidate, however cheap the leg from one it already won.
+        if (taken[c] || !std::isfinite(b->from_pose[c])) continue;
         const Insertion insertion = cheapestInsertion(
             order[b->robot_id], static_cast<int>(c), b->from_pose, b->between,
             keeps_first[b->robot_id]);

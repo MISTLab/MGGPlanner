@@ -421,4 +421,21 @@ TEST(FleetAuction, BidderCostsSkipClustersBeyondReach) {
   EXPECT_EQ(drone.from_pose[1], mgg::kUnreachableCost);  // 20 + 20 > 30
 }
 
+TEST(FleetAuction, AClusterBeyondReachIsNotWonThroughAnotherCluster) {
+  // Review r0, P1: capping leaves the 20 m cluster 12 m from the 8 m one;
+  // once the drone won the near cluster, appending the far one cost a
+  // finite 12 m, and it won that too. A cluster the bidder cannot reach
+  // and return from is not a candidate at all.
+  TourBidData bid = droneBid();
+  bid.reach_m = 30.0;
+  bid.home = Eigen::Vector3d::Zero();
+  const AuctionBidder drone =
+      mgg::bidderCosts(bid, {0}, twoClusterPool(), kStraight);
+  ASSERT_TRUE(std::isfinite(drone.between[0][1]));
+  const AuctionResult result =
+      mgg::runSequentialAuction({drone}, {false, false}, 0.2, 0.3);
+  EXPECT_EQ(result.bundles.at(4), std::vector<int>{0});
+  EXPECT_EQ(result.unassigned, std::vector<int>{1});
+}
+
 }  // namespace

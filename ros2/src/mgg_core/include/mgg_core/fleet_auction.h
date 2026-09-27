@@ -84,7 +84,8 @@ struct AuctionResult {
   std::vector<int> unassigned;
 };
 
-/// §3.4 steps 1 and 2 over the pool clusters not `fixed`.
+/// §3.4 steps 1 and 2 over the pool clusters not `fixed`. A bidder bids
+/// only on clusters its from_pose cost is finite for.
 AuctionResult runSequentialAuction(const std::vector<AuctionBidder>& bidders,
                                    const std::vector<bool>& fixed,
                                    double commit_margin,
