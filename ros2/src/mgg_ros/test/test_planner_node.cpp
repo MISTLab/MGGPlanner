@@ -3848,6 +3848,33 @@ TEST_F(PlannerNodeTest, TheDroneLeavesAndRejoinsTheFleetOnRequest) {
   EXPECT_FALSE(rejoined.bid->leaving);
 }
 
+TEST_F(PlannerNodeTest, ALeavingIdleRobotFallsBackInsteadOfWaitingForAnAuction) {
+  auto node = makeNode("leaving_idle_fallback");
+  PlannerNodeTestPeer::observeFloor(*node, -1.5, 4.0, -1.5, 1.5);
+  PlannerNodeTestPeer::acceptOdometry(*node, 0.0, 0.0, 1.0);
+  PlannerNodeTestPeer::addGlobalChainToFrontier(
+      *node, {{-0.5, 0.0}, {-1.0, 0.0}, {-1.5, 0.0}}, M_PI);
+  // No tour target, but the greedy fallback can still reach the frontier.
+  PlannerNodeTestPeer::setTour(*node, true, 1e9);
+  PlannerNodeTestPeer::lowGainRoundsDueAtOnce(*node);
+  PlannerNodeTestPeer::setLowGainVoxels(*node, 80.0);
+  ASSERT_TRUE(PlannerNodeTestPeer::leaveFleet(*node, true)->success);
+  PlannerNodeTestPeer::hearPeer(*node, 2);
+  ASSERT_EQ(PlannerNodeTestPeer::fleetGroup(*node), (std::vector<int>{1, 2}));
+  bool complete = false;
+  std::string note;
+  EXPECT_FALSE(PlannerNodeTestPeer::settleIdle(*node, note, complete));
+  EXPECT_FALSE(complete);
+  EXPECT_TRUE(note.empty());
+
+  auto response = std::make_shared<mgg_msgs::srv::PlannerSrv::Response>();
+  PlannerNodeTestPeer::plan(*node, response);
+  ASSERT_EQ(response->status, mgg_msgs::srv::PlannerSrv::Response::FORWARD);
+  ASSERT_GE(response->path.size(), 2u);
+  EXPECT_TRUE(PlannerNodeTestPeer::bestPathFromGlobalGraph(*node));
+  EXPECT_EQ(PlannerNodeTestPeer::lowGainHandoffs(*node), 1);
+}
+
 TEST_F(PlannerNodeTest, LeaveFleetIsRefusedWhenFleetAssignmentIsOff) {
   auto node = makeNode("leave_fleet_off", "world",
                         {rclcpp::Parameter("fleet.enabled", false)});

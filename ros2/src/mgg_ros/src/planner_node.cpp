@@ -1234,6 +1234,7 @@ std::vector<Eigen::Vector3d> PlannerNode::fleetExclusions() {
 }
 
 bool PlannerNode::settleIdleRobot(std::string& summary, bool& complete) {
+  if (fleet_ && fleet_->leaving()) return false;
   const double now_s = now().seconds();
   if (fleet_->inGroup(now_s)) {
     if (fleet_->requestAnswered()) {
