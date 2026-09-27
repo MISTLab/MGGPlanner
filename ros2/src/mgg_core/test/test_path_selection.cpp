@@ -261,6 +261,35 @@ TEST(PathSelection, AnInadmissiblePathIsLeftOutAndAnotherChosen) {
   for (const Vertex* v : r.best_path) EXPECT_NE(v->id, 3);
 }
 
+// Review r1, R1-3: an automatic global repositioning's end, on a slope
+// where the robot cannot turn, needs a way back as a lattice path's does:
+// room to turn within kDepartureMaxM back along the route. The route is cut
+// back to its last end with one, or refused.
+TEST(PathSelection, ARouteIsCutBackToItsLastEndWithAWayBack) {
+  std::vector<mgg::StateVec> route;
+  for (int i = 0; i <= 10; ++i) route.emplace_back(0.5 * i, 0.0, 0.0, 0.0);
+  // On the slope from x = 1.5; room to turn up to x = 0.5.
+  const auto on_slope = [&route](std::size_t i) { return route[i].x() >= 1.5; };
+  const auto room = [&route](std::size_t i) { return route[i].x() <= 0.5; };
+  std::vector<mgg::StateVec> cut = route;
+  ASSERT_TRUE(mgg::cutBackToWayBack(cut, on_slope, room));
+  // The last end within 2 m of x = 0.5 is x = 2.5.
+  EXPECT_NEAR(cut.back().x(), 2.5, 1e-9);
+  // No room anywhere: an end on the slope has no way back; the last end
+  // off it (x = 1.0) is kept.
+  cut = route;
+  ASSERT_TRUE(mgg::cutBackToWayBack(cut, on_slope,
+                                    [](std::size_t) { return false; }));
+  EXPECT_NEAR(cut.back().x(), 1.0, 1e-9);
+  // Every pose after the first on the slope, and no room: refused, and the
+  // route left as it was.
+  cut = route;
+  EXPECT_FALSE(mgg::cutBackToWayBack(
+      cut, [&route](std::size_t i) { return route[i].x() > 0.1; },
+      [](std::size_t) { return false; }));
+  EXPECT_EQ(cut.size(), route.size());
+}
+
 TEST(PathSelection, FrontierPresenceIsReported) {
   Fork f;
   for (Vertex* v : f.x_branch) v->vol_gain.gain = 10.0;

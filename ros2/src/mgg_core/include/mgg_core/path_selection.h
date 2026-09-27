@@ -126,6 +126,17 @@ struct SlopeEndRetreat {
   std::function<bool(const Vertex&)> room_to_turn;
 };
 
+/// Ends `route` (the robot's pose first) at its last pose with a way back,
+/// dropping the poses after it: a pose that is not `on_slope` has one, and
+/// one that is has one when a pose within kDepartureMaxM of route length
+/// back from it (the first included) has `room_to_turn` (SlopeEndRetreat's
+/// rule, for a route of poses: review r1, R1-3). Both are asked by the
+/// pose's index in `route`. Returns false, leaving `route` untouched, when
+/// no pose after the first has one.
+bool cutBackToWayBack(std::vector<StateVec>& route,
+                      const std::function<bool(std::size_t)>& on_slope,
+                      const std::function<bool(std::size_t)>& room_to_turn);
+
 /// Ends `route` at its last pose that passes `clear`, dropping the poses
 /// after it; the first pose, where the robot stands, is never asked. Returns
 /// false, leaving `route` untouched, when no pose after the first passes.

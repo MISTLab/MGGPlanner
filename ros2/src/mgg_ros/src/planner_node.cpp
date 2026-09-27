@@ -3104,6 +3104,50 @@ bool PlannerNode::runGlobalPlanner(int target_id, std::string& reason,
   }
   if (!routed) return false;
   shortcutAndResample(best_path_, turns_ok);
+  // A repositioning's end on a slope, where the robot may not turn, needs
+  // a way back as a lattice path's does (review r1, R1-3): the route is cut
+  // back to its last end with one, or not taken.
+  if (robot_params_.type == mgg::RobotType::kGroundRobot &&
+      best_path_.size() >= 2) {
+    const std::optional<mgg::StandingStart> standing = standingStart();
+    const double radius =
+        std::max(robot_params_.size.x(), robot_params_.size.y());
+    // The map's slope at each pose, from nine ground points round it, is
+    // noisy where the ground is patchy: a pose is taken as on the slope
+    // when the map puts any pose within a robot's length along the route
+    // on one.
+    std::vector<double> along(best_path_.size(), 0.0);
+    std::vector<bool> sloped(best_path_.size(), false);
+    for (std::size_t i = 0; i < best_path_.size(); ++i) {
+      if (i > 0) {
+        along[i] = along[i - 1] + (best_path_[i].head<3>() -
+                                   best_path_[i - 1].head<3>()).norm();
+      }
+      sloped[i] = mgg::slopeExemptsTurnSpace(
+          mgg::groundSlope(*ground_, best_path_[i].head<3>(), radius));
+    }
+    const auto on_slope = [&](std::size_t i) {
+      bool near_slope = false;
+      for (std::size_t j = 0; j < best_path_.size() && !near_slope; ++j) {
+        near_slope = sloped[j] && std::abs(along[j] - along[i]) <= radius;
+      }
+      return near_slope && !mgg::turnSpaceObserved(*map_, robot_params_,
+                                                   planning_params_,
+                                                   best_path_[i]);
+    };
+    if (!mgg::cutBackToWayBack(
+            best_path_, on_slope,
+            [this, &standing](std::size_t i) {
+              return mgg::roomToTurn(*map_, robot_params_, planning_params_,
+                                     best_path_[i],
+                                     standing ? &*standing : nullptr);
+            })) {
+      best_path_.clear();
+      global_frontier_not_routed_ = true;
+      reason = "the route ends on a slope with no way back";
+      return false;
+    }
+  }
   // The frontier is a lattice leaf of an earlier cycle, which may stand
   // against a wall: the route ends where the robot has room (viewpointClear)
   // when any pose along it has, and at the frontier as before otherwise.

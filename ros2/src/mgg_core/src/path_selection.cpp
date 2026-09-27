@@ -89,6 +89,34 @@ void TurnBackHysteresis::record(const std::vector<Eigen::Vector3d>& path,
   last_turned_back_ = pathTurnsBack(path, exploring_direction, planning);
 }
 
+bool cutBackToWayBack(std::vector<StateVec>& route,
+                      const std::function<bool(std::size_t)>& on_slope,
+                      const std::function<bool(std::size_t)>& room_to_turn) {
+  if (route.size() < 2) return false;
+  std::vector<double> along(route.size(), 0.0);
+  for (std::size_t i = 1; i < route.size(); ++i) {
+    along[i] = along[i - 1] +
+               (route[i].head<3>() - route[i - 1].head<3>()).norm();
+  }
+  std::vector<signed char> room(route.size(), -1);
+  const auto room_at = [&](std::size_t i) {
+    if (room[i] < 0) room[i] = room_to_turn(i) ? 1 : 0;
+    return room[i] == 1;
+  };
+  for (std::size_t end = route.size() - 1; end > 0; --end) {
+    bool way_back = !on_slope(end);
+    for (std::size_t i = end; !way_back && i-- > 0;) {
+      if (along[end] - along[i] > kDepartureMaxM + 1e-9) break;
+      way_back = room_at(i);
+    }
+    if (way_back) {
+      route.resize(end + 1);
+      return true;
+    }
+  }
+  return false;
+}
+
 PathSelectionResult selectBestPath(GraphManager& graph,
                                    const PlanningParams& planning,
                                    const RobotParams& robot,

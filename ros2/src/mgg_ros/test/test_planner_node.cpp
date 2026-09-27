@@ -1186,11 +1186,10 @@ TEST_F(PlannerNodeTest, ASlopeWithNoRoomToTurnOnTheDefaultLatticeGetsNoPathNotCo
   // on the slope: it needed its turn space observed to be clear, and the
   // fallback for when no path ends clear sent it with no way back. Where
   // the lattice cannot measure the slope the map does (groundSlope), and an
-  // end the map puts on the slope needs a way back too. No lattice path,
-  // retried. With the global planner consulted it is not exploration
-  // complete; unlike on the old lattice, where every path turned sharply
-  // and the robot was boxed in, the global planner may now route to a
-  // frontier the lattice left (global routes have no way-back rule).
+  // end the map puts on the slope needs a way back too. No path, retried,
+  // and not exploration complete, not even with the global planner
+  // consulted: an automatic repositioning's end needs a way back as a
+  // lattice path's does (review r1, R1-3).
   auto node = makeNode("slope_no_way_back_default");
   PlannerNodeTestPeer::setRobotFootprint(*node, 0.6, 0.2);
   PlannerNodeTestPeer::allowUnknownLatticeBody(*node);
@@ -1209,10 +1208,11 @@ TEST_F(PlannerNodeTest, ASlopeWithNoRoomToTurnOnTheDefaultLatticeGetsNoPathNotCo
   PlannerNodeTestPeer::consultGlobalPlannerAtOnce(*node);
   response = std::make_shared<mgg_msgs::srv::PlannerSrv::Response>();
   PlannerNodeTestPeer::plan(*node, response);
-  EXPECT_NE(response->status, PlannerNode::kStatusComplete);
-  if (!response->path.empty()) {
-    EXPECT_TRUE(PlannerNodeTestPeer::bestPathFromGlobalGraph(*node));
-  }
+  EXPECT_TRUE(response->path.empty())
+      << "path of " << response->path.size() << " poses to ("
+      << response->path.back().position.x << ", "
+      << response->path.back().position.y << ")";
+  EXPECT_EQ(response->status, PlannerNode::kStatusNoPath);
 }
 
 TEST_F(PlannerNodeTest, ASlopeWithNoRoomToTurnWithinReachGetsNoPathNotComplete) {
