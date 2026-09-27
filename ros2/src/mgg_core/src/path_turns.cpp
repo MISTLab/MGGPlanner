@@ -1,5 +1,7 @@
 #include "mgg_core/path_turns.h"
 
+#include <Eigen/Eigenvalues>
+
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
@@ -122,8 +124,41 @@ double groundSlope(const GroundProjection& ground,
   }
   double slope = planeSlope(points);
   if (lattice != nullptr) {
-    const Vertex probe(-1, StateVec(position.x(), position.y(), position.z(), 0));
-    slope = std::min(slope, terrainSlope(*lattice, probe, radius));
+    StateVec probe(position.x(), position.y(), position.z(), 0);
+    std::vector<Vertex*> nearby;
+    std::vector<Eigen::Vector3d> samples;
+    lattice->getNearestVertices(&probe, radius, &nearby);
+    Eigen::Vector2d mean = Eigen::Vector2d::Zero();
+    for (const auto* v : nearby) {
+      if (v == nullptr || v->is_hanging) continue;
+      samples.push_back(v->state.head<3>() - position);
+      mean += samples.back().head<2>();
+    }
+    // A sparse or thin strip can alias a real ramp as level. Only a
+    // neighbourhood spanning the fit radius in BOTH horizontal principal
+    // axes, with at least six measurements, may reduce the map slope.
+    if (samples.size() >= 6) {
+      mean /= samples.size();
+      Eigen::Matrix2d covariance = Eigen::Matrix2d::Zero();
+      for (const auto& sample : samples) {
+        const Eigen::Vector2d p = sample.head<2>() - mean;
+        covariance += p * p.transpose();
+      }
+      const Eigen::SelfAdjointEigenSolver<Eigen::Matrix2d> axes(covariance);
+      if (axes.info() == Eigen::Success) {
+        Eigen::Vector2d low = Eigen::Vector2d::Constant(INFINITY);
+        Eigen::Vector2d high = Eigen::Vector2d::Constant(-INFINITY);
+        for (const auto& sample : samples) {
+          const Eigen::Vector2d p = axes.eigenvectors().transpose() *
+                                    (sample.head<2>() - mean);
+          low = low.cwiseMin(p);
+          high = high.cwiseMax(p);
+        }
+        if ((high - low).minCoeff() + 1e-9 >= radius) {
+          slope = std::min(slope, planeSlope(samples));
+        }
+      }
+    }
   }
   return slope;
 }

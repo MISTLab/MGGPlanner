@@ -460,16 +460,41 @@ TEST(PathTurns, LevelImuOverridesANoisyMapAtTheRouteStartOnly) {
   EXPECT_NEAR(check.slopeAt({0, 0, 0}), 20 * kDeg, 1e-9);
 }
 
-TEST(GroundSlope, UsesTheLowerMeasuredLatticeSlopeBesideAWall) {
-  const Ground tilted([](double x, double) { return 0.2 * x; });
+TEST(GroundSlope, WellSpannedLatticeCanLowerAWallBiasedMapSlope) {
+  const Ground wall([](double x, double) { return x > 0.4 ? 0.14 : 0.0; });
   const mgg::PlanningParams planning;
-  const mgg::GroundProjection ground(tilted, planning);
+  const mgg::GroundProjection ground(wall, planning);
   GraphManager lattice;
   for (int x = -1; x <= 1; ++x)
     for (int y = -1; y <= 1; ++y)
       lattice.addVertex(new Vertex(lattice.generateVertexID(),
-                                  StateVec(x * 0.3, y * 0.3, 0.5, 0)));
+                                  StateVec(x * 0.5, y * 0.5, 0.5, 0)));
+  ASSERT_GT(mgg::groundSlope(ground, {0, 0, 0.5}, 0.8), kDeg);
   EXPECT_NEAR(mgg::groundSlope(ground, {0, 0, 0.5}, 0.8, &lattice), 0, 1e-9);
+}
+
+TEST(GroundSlope, SparseOrNarrowLatticeCannotFlattenARealRamp) {
+  const Ground ramp([](double x, double) { return x * std::tan(16 * kDeg); });
+  const mgg::PlanningParams planning;
+  const mgg::GroundProjection ground(ramp, planning);
+  for (int scene = 0; scene < 3; ++scene) {
+    SCOPED_TRACE(scene);
+    GraphManager lattice;
+    for (int x = -1; x <= 1; ++x) {
+      for (int y = -1; y <= 1; ++y) {
+        if (scene == 0 && x != 0 && y != 0) continue;  // Only five vertices.
+        const Eigen::Vector2d at = scene == 0 ? Eigen::Vector2d(0.6*x, 0.6*y)
+            : scene == 1 ? Eigen::Vector2d(0.3*x, 0.3*y)
+                         : Eigen::Vector2d(0.5*x, 0.5*x + 0.04*y);
+        // Aliased flat measurements must not override the real map ramp:
+        // too few vertices, insufficient span, or a rotated narrow strip.
+        lattice.addVertex(new Vertex(lattice.generateVertexID(),
+                                     StateVec(at.x(), at.y(), 0.5, 0)));
+      }
+    }
+    EXPECT_NEAR(mgg::groundSlope(ground, {0, 0, 0.5}, 0.8, &lattice),
+                16 * kDeg, 1e-6);
+  }
 }
 
 TEST(GroundSlope, FitsTheMappedGroundAndFailsClosedWithoutIt) {
