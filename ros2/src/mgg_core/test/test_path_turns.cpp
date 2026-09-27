@@ -842,4 +842,48 @@ TEST(PathTurnCheck, ArrivalTurningWhereItMayNotLeavesTheSearchLooking) {
   EXPECT_EQ(sel.best_path, (std::vector<Vertex*>{r, b, c, f}));
 }
 
+// Review r0, I-2: the turn-compliant search walked edge_map_ and ignored
+// the edges a graph closes to its searches (a no-go zone,
+// GraphManager::setEdgeBlocked). The shortest route R-A-F turns sharply at
+// A, where it may not; the long way R-B-C-F crosses a zone on B-C. With the
+// zone there is no route; without it, the long way.
+TEST(PathTurns, TheTurnCompliantSearchLeavesOutBlockedEdges) {
+  GraphManager graph;
+  const auto add = [&graph](int id, double x, double y) {
+    auto* v = new Vertex(id, StateVec(x, y, 0.5, 0.0));
+    graph.addVertex(v);
+    return v;
+  };
+  Vertex* r = add(0, -2.0, 0.0);
+  Vertex* a = add(1, 0.0, 0.0);
+  Vertex* f = add(2, 0.0, 0.4);
+  Vertex* b = add(3, -2.0, 2.0);
+  Vertex* c = add(4, 0.0, 2.0);
+  const auto link = [&graph](Vertex* u, Vertex* v) {
+    graph.addEdge(u, v, (u->state - v->state).head<3>().norm());
+  };
+  link(r, a);
+  link(a, f);
+  link(r, b);
+  link(b, c);
+  link(c, f);
+  const mgg::SharpTurnAllowedFn not_at_a = [a](const Vertex& v) {
+    return v.id != a->id;
+  };
+  const Eigen::Vector2d zone(-1.0, 2.0);
+  graph.setEdgeBlocked([&zone](const Vertex& u, const Vertex& v) {
+    const Eigen::Vector2d p = u.state.head<2>(), d = v.state.head<2>() - p;
+    const double t = std::clamp((zone - p).dot(d) / d.squaredNorm(), 0.0, 1.0);
+    return (zone - (p + t * d)).norm() < 0.5;
+  });
+  const auto blocked =
+      mgg::findTurnCompliantRoutes(graph, 0.0, 0.8, {f->id}, not_at_a, 100);
+  EXPECT_EQ(blocked.to.count(f->id), 0u);
+  graph.setEdgeBlocked(nullptr);
+  const auto open =
+      mgg::findTurnCompliantRoutes(graph, 0.0, 0.8, {f->id}, not_at_a, 100);
+  ASSERT_EQ(open.to.count(f->id), 1u);
+  EXPECT_EQ(open.to.at(f->id).path, (std::vector<Vertex*>{r, b, c, f}));
+}
+
 }  // namespace

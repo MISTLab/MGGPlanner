@@ -148,8 +148,10 @@ struct TurnCompliantRoutes {
 /// route, and at the start from `start_heading`. A turn less than `window`
 /// before a destination is measured towards it when the route arrives, and
 /// an arrival that turns where it may not is refused while the search goes
-/// on for another. The caller still checks a route with PathTurnCheck before
-/// using it. At most `max_states` states are expanded.
+/// on for another. Edges the graph closes to its searches
+/// (GraphManager::setEdgeBlocked) are not taken. The caller still checks a
+/// route with PathTurnCheck before using it. At most `max_states` states
+/// are expanded.
 TurnCompliantRoutes findTurnCompliantRoutes(
     GraphManager& graph, double start_heading, double window,
     const std::vector<int>& destinations,

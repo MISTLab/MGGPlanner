@@ -128,6 +128,11 @@ class GraphManager {
   /// no-go zone. An empty function opens them all.
   using EdgeBlockedFn = std::function<bool(const Vertex&, const Vertex&)>;
   void setEdgeBlocked(EdgeBlockedFn blocked);
+  /// Whether setEdgeBlocked closes the edge between `a` and `b`: for
+  /// searches that walk edge_map_ themselves (findTurnCompliantRoutes).
+  bool edgeBlocked(const Vertex& a, const Vertex& b) const {
+    return edge_blocked_ && edge_blocked_(a, b);
+  }
 
   void getShortestPath(int target_id, const ShortestPathsReport& rep,
                        bool source_to_target_order, std::vector<int>& path);

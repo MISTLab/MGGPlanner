@@ -231,6 +231,9 @@ TurnCompliantRoutes findTurnCompliantRoutes(
       if (w == s.from) continue;
       const Vertex* next = vertex(w);
       if (next == nullptr) continue;
+      // An edge the graph closes to its searches (a no-go zone) is closed
+      // to this one too (review r0, I-2).
+      if (graph.edgeBlocked(*u, *next)) continue;
       // A route passes each vertex once: it is sent as a path, and walked
       // back through parents.
       if (std::find(route.begin(), route.end(), next) != route.end()) {
