@@ -203,6 +203,17 @@ class PathTurnCheck {
   /// first check.
   void setRobotTilt(const Eigen::Vector3d& position, double tilt);
 
+  /// Where the graph cannot measure the slope (kUnknownSlopeRad), and the
+  /// robot's tilt does not stand for it, the slope is `unmeasured` there,
+  /// e.g. the map's groundSlope. The outward lattice holds one vertex per
+  /// position, and round some ends too few to fit the ground: such an end
+  /// read as unmeasured rather than on a slope, and the fallback for no end
+  /// clear sent it with no way back (the original sparse-slope scene).
+  /// Call before the first check.
+  void setUnmeasuredSlope(SlopeFn unmeasured) {
+    unmeasured_ = std::move(unmeasured);
+  }
+
   /// Candidate paths refused for a sharp turn on a slope, and for one
   /// without room to turn.
   int refused_on_slope = 0;
@@ -220,6 +231,7 @@ class PathTurnCheck {
   double window_ = 0.0;
   TurnRoomFn room_to_turn_;
   SlopeFn slope_;
+  SlopeFn unmeasured_;
   std::map<PositionKey, double> slope_at_;
   std::optional<std::pair<PositionKey, double>> robot_tilt_;
   std::map<PositionKey, bool> room_at_;

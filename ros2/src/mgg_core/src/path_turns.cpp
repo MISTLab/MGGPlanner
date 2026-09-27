@@ -384,6 +384,8 @@ double PathTurnCheck::slopeAt(const Eigen::Vector3d& position) {
   if (slope >= kUnknownSlopeRad && robot_tilt_ && robot_tilt_->first == key &&
       robot_tilt_->second < kLevelGroundSlopeRad) {
     slope = robot_tilt_->second;
+  } else if (slope >= kUnknownSlopeRad && unmeasured_) {
+    slope = unmeasured_(position);
   }
   return slope_at_[key] = slope;
 }

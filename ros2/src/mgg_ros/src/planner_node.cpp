@@ -2298,6 +2298,12 @@ std::string PlannerNode::buildLocalGraph() {
                                standing_on);
       });
   turn_check.setRobotTilt(root_state.head<3>(), current_tilt_);
+  // Where the lattice is too sparse to fit the ground, the map measures it.
+  turn_check.setUnmeasuredSlope([this](const Eigen::Vector3d& position) {
+    return mgg::groundSlope(
+        *ground_, position,
+        std::max(robot_params_.size.x(), robot_params_.size.y()));
+  });
   mgg::PathTurnsFn turns_admissible;
   mgg::SharpTurnAllowedFn sharp_turn_allowed;
   // A path end on a slope, which needs no observed turn space, needs room
@@ -2308,10 +2314,17 @@ std::string PlannerNode::buildLocalGraph() {
     sharp_turn_allowed = [&turn_check](const mgg::Vertex& v) {
       return turn_check.sharpTurnAllowedAt(v.state.head<3>());
     };
+    // An end on a slope by the lattice's measure or by the map's needs a
+    // way back: the lattice's plane fit can read a slope as level where its
+    // neighbourhood is sparse (the original sparse-slope scene), and such
+    // an end, unclear, was sent by the fallback with none.
     slope_end_retreat.admitted_on_slope = [this, &turn_check](
                                               const mgg::Vertex& v) {
-      return mgg::slopeExemptsTurnSpace(
-                 turn_check.slopeAt(v.state.head<3>())) &&
+      return (mgg::slopeExemptsTurnSpace(
+                  turn_check.slopeAt(v.state.head<3>())) ||
+              mgg::slopeExemptsTurnSpace(mgg::groundSlope(
+                  *ground_, v.state.head<3>(),
+                  std::max(robot_params_.size.x(), robot_params_.size.y())))) &&
              !mgg::turnSpaceObserved(*map_, robot_params_, planning_params_,
                                      v.state);
     };

@@ -886,4 +886,21 @@ TEST(PathTurns, TheTurnCompliantSearchLeavesOutBlockedEdges) {
   EXPECT_EQ(open.to.at(f->id).path, (std::vector<Vertex*>{r, b, c, f}));
 }
 
+// Review r0 (mgg-run8): the outward lattice holds one vertex per position,
+// and round some ends too few to fit the ground's slope. Where the graph
+// cannot measure it, the slope is taken from `unmeasured`, e.g. the map's
+// groundSlope; the robot's own tilt at its root still comes first.
+TEST(PathTurns, AnUnmeasuredSlopeIsTakenFromTheFallback) {
+  GraphManager sparse;
+  sparse.addVertex(new Vertex(0, StateVec(0, 0, 0, 0)));
+  sparse.addVertex(new Vertex(1, StateVec(0.4, 0, 0.1, 0)));
+  PathTurnCheck check(sparse, robot());
+  EXPECT_GE(check.slopeAt({0.4, 0, 0.1}), mgg::kUnknownSlopeRad);
+  PathTurnCheck with_map(sparse, robot());
+  with_map.setUnmeasuredSlope([](const Eigen::Vector3d&) { return 0.2; });
+  with_map.setRobotTilt({0.0, 0.0, 0.0}, 0.05);
+  EXPECT_DOUBLE_EQ(with_map.slopeAt({0.4, 0, 0.1}), 0.2);
+  EXPECT_DOUBLE_EQ(with_map.slopeAt({0.0, 0.0, 0.0}), 0.05);
+}
+
 }  // namespace

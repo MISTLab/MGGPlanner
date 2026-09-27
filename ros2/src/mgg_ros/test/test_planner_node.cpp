@@ -1163,6 +1163,43 @@ TEST_F(PlannerNodeTest, AMountedLidarStillFindsTheFrontierAhead) {
   }
 }
 
+TEST_F(PlannerNodeTest, ASlopeWithNoRoomToTurnOnTheDefaultLatticeGetsNoPathNotComplete) {
+  // Review r1 (P1), the original scene, kept alongside the finer one below
+  // (review r0 of mgg-run8): the default 0.5 m lattice to x = 3. Grown
+  // outward from the robot, it holds too few vertices round some ends to
+  // fit the ground's slope there, and such an end read as unmeasured, not
+  // on the slope: it needed its turn space observed to be clear, and the
+  // fallback for when no path ends clear sent it with no way back. Where
+  // the lattice cannot measure the slope the map does (groundSlope), and an
+  // end the map puts on the slope needs a way back too. No lattice path,
+  // retried. With the global planner consulted it is not exploration
+  // complete; unlike on the old lattice, where every path turned sharply
+  // and the robot was boxed in, the global planner may now route to a
+  // frontier the lattice left (global routes have no way-back rule).
+  auto node = makeNode("slope_no_way_back_default");
+  PlannerNodeTestPeer::setRobotFootprint(*node, 0.6, 0.2);
+  PlannerNodeTestPeer::allowUnknownLatticeBody(*node);
+  PlannerNodeTestPeer::observeSparseSlope(*node, -1.5, 4.0, -1.5, 1.5, 0.2);
+  PlannerNodeTestPeer::acceptOdometry(*node, 0.0, 0.0, 1.0);
+  const mgg::StateVec root =
+      PlannerNodeTestPeer::drivingState(*node, 0.0, 0.0, 0.0);
+  ASSERT_FALSE(PlannerNodeTestPeer::roomToTurnObserved(*node, root));
+  auto response = std::make_shared<mgg_msgs::srv::PlannerSrv::Response>();
+  PlannerNodeTestPeer::plan(*node, response);
+  EXPECT_TRUE(response->path.empty())
+      << "path of " << response->path.size() << " poses to ("
+      << response->path.back().position.x << ", "
+      << response->path.back().position.y << ")";
+  EXPECT_EQ(response->status, PlannerNode::kStatusNoPath);
+  PlannerNodeTestPeer::consultGlobalPlannerAtOnce(*node);
+  response = std::make_shared<mgg_msgs::srv::PlannerSrv::Response>();
+  PlannerNodeTestPeer::plan(*node, response);
+  EXPECT_NE(response->status, PlannerNode::kStatusComplete);
+  if (!response->path.empty()) {
+    EXPECT_TRUE(PlannerNodeTestPeer::bestPathFromGlobalGraph(*node));
+  }
+}
+
 TEST_F(PlannerNodeTest, ASlopeWithNoRoomToTurnWithinReachGetsNoPathNotComplete) {
   // Review r1 (P1): the robot stands on an 11 degree slope whose every
   // turning circle holds an unobserved column: no vertex has room to turn,
