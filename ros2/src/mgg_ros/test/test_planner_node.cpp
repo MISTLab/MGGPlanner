@@ -539,7 +539,8 @@ class PlannerNodeTestPeer {
   /// columns left out stay wholly unknown, so no turning circle is
   /// observed (turnSpaceObserved), while the ground between is bridged.
   static void observeSparseSlope(PlannerNode& node, double xmin, double xmax,
-                                 double ymin, double ymax, double grade) {
+                                 double ymin, double ymax, double grade,
+                                 bool sparse = true) {
     const std::lock_guard<std::recursive_mutex> lock(node.planner_mutex_);
     std::vector<Eigen::Vector3d> floor;
     const auto index = [](double v) {
@@ -547,7 +548,7 @@ class PlannerNodeTestPeer {
     };
     for (long ix = index(xmin); ix <= index(xmax); ++ix) {
       for (long iy = index(ymin); iy <= index(ymax); ++iy) {
-        if (((ix % 3) + 3) % 3 == 1 && ((iy % 3) + 3) % 3 == 1) continue;
+        if (sparse && ((ix % 3) + 3) % 3 == 1 && ((iy % 3) + 3) % 3 == 1) continue;
         const double x = (ix + 0.5) * 0.10;
         floor.emplace_back(x, (iy + 0.5) * 0.10, grade * x);
       }
@@ -1860,6 +1861,73 @@ TEST_F(PlannerNodeTest, ExplorationFromInsideANoGoZoneOnlyDepartsOnEitherBackend
                          response->path.back().position.y),
               1.1 - 1e-6);
   }
+}
+
+TEST_F(PlannerNodeTest, AnEmptyNoGoSelectionEscapesStraightEvenOnASlope) {
+  for (const bool sloped : {false, true}) {
+    auto node = makeNode(sloped ? "slope_zone_exit" : "level_zone_exit", "world",
+        {rclcpp::Parameter("PlanningParams.no_go_radius_m", 1.0)});
+    PlannerNodeTestPeer::setRobotFootprint(*node, 0.6, 0.2);
+    PlannerNodeTestPeer::observeSparseSlope(*node, -1.5, 5, -1.5, 1.5,
+                                           sloped ? 0.25 : 0.0, false);
+    if (sloped) {
+      PlannerNodeTestPeer::observeWall(*node, -1.5, 5, 0.25);
+      PlannerNodeTestPeer::observeWall(*node, -1.5, 5, -0.25);
+    }
+    PlannerNodeTestPeer::setLattice(*node, {-0.25, -0.25}, {0.25, 0.25});
+    PlannerNodeTestPeer::setLatticeResolution(*node, 0.25);
+    auto odom = std::make_shared<nav_msgs::msg::Odometry>();
+    odom->header.stamp.sec = 1;
+    odom->pose.pose.position.x = 1.8;
+    odom->pose.pose.position.z = 0.075 + (sloped ? 0.45 : 0.0);
+    odom->pose.pose.orientation.w = 1;
+    PlannerNodeTestPeer::acceptOdometry(*node, odom);
+    PlannerNodeTestPeer::receiveNoGoZones(*node, "world", {{2.3, 0}});
+    auto response = std::make_shared<mgg_msgs::srv::PlannerSrv::Response>();
+    PlannerNodeTestPeer::plan(*node, response);
+    ASSERT_EQ(response->status, mgg_msgs::srv::PlannerSrv::Response::FORWARD);
+    ASSERT_GE(response->path.size(), 2u);
+    EXPECT_LE(response->path.back().position.x, 1.0);
+    EXPECT_GE(response->path.back().position.x, -1.2);
+    const auto& p = response->path.back().position;
+    EXPECT_EQ(PlannerNodeTestPeer::roomToTurnObserved(
+                  *node, mgg::StateVec(p.x, p.y, p.z, 0)), !sloped);
+    for (const auto& pose : response->path) {
+      EXPECT_NEAR(pose.position.y, 0, 1e-6);
+      EXPECT_LE(pose.position.x, 1.8 + 1e-6);
+    }
+  }
+}
+
+TEST_F(PlannerNodeTest, ALevelZoneEscapeStillNeedsRoomToTurn) {
+  auto node = makeNode("level_zone_no_room", "world",
+      {rclcpp::Parameter("PlanningParams.no_go_radius_m", 1.0)});
+  PlannerNodeTestPeer::setRobotFootprint(*node, 0.6, 0.2);
+  PlannerNodeTestPeer::observeFloor(*node, -4, 5, -1.5, 1.5);
+  PlannerNodeTestPeer::observeWall(*node, -4, 5, 0.25);
+  PlannerNodeTestPeer::observeWall(*node, -4, 5, -0.25);
+  PlannerNodeTestPeer::setLattice(*node, {-0.25, -0.25}, {0.25, 0.25});
+  PlannerNodeTestPeer::acceptOdometry(*node, 1.8, 0, 1);
+  PlannerNodeTestPeer::receiveNoGoZones(*node, "world", {{2.3, 0}});
+  auto response = std::make_shared<mgg_msgs::srv::PlannerSrv::Response>();
+  PlannerNodeTestPeer::plan(*node, response);
+  EXPECT_TRUE(response->path.empty());
+  EXPECT_EQ(response->status, PlannerNode::kStatusNoPath);
+}
+
+TEST_F(PlannerNodeTest, AnEmptyNoGoSelectionWithNoEscapeIsRetryable) {
+  auto node = makeNode("zone_no_exit", "world",
+      {rclcpp::Parameter("PlanningParams.no_go_radius_m", 4.0)});
+  PlannerNodeTestPeer::observeFloor(*node, -5, 5, -2, 2);
+  PlannerNodeTestPeer::setLattice(*node, {-0.25, -0.25}, {0.25, 0.25});
+  PlannerNodeTestPeer::acceptOdometry(*node, 0, 0, 1);
+  PlannerNodeTestPeer::receiveNoGoZones(*node, "world", {{0.5, 0}});
+  PlannerNodeTestPeer::consultGlobalPlannerAtOnce(*node);
+  auto response = std::make_shared<mgg_msgs::srv::PlannerSrv::Response>();
+  PlannerNodeTestPeer::plan(*node, response);
+  EXPECT_TRUE(response->path.empty());
+  EXPECT_EQ(response->status, PlannerNode::kStatusNoPath);
+  EXPECT_EQ(PlannerNodeTestPeer::boxedInWithoutDeparture(*node), 1);
 }
 
 TEST_F(PlannerNodeTest, TheNoGoReachFollowsTheRequestsBoundMode) {

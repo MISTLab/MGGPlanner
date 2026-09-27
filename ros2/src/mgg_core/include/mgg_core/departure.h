@@ -12,6 +12,7 @@
 #define MGG_CORE_DEPARTURE_H_
 
 #include <vector>
+#include <functional>
 
 #include <Eigen/Dense>
 
@@ -110,7 +111,11 @@ struct Departure {
 /// with `departure.path` empty, when there is no way out.
 bool findDeparture(const MapInterface& map, const GroundProjection& ground,
                    const RobotParams& robot, const PlanningParams& planning,
-                   const StateVec& start, Departure& departure);
+                   const StateVec& start, Departure& departure,
+                   const std::function<bool(const std::vector<StateVec>&)>&
+                       end_admissible = {},
+                   double max_distance = kDepartureMaxM,
+                   bool straight_only = false);
 
 }  // namespace mgg
 

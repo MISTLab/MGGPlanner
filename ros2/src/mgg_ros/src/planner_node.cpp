@@ -2438,7 +2438,10 @@ std::string PlannerNode::buildLocalGraph() {
   // room; the next cycle plans from there. With no way out it gets no path,
   // and its adapter's own recovery runs.
   std::string boxed_in;
+  const bool zone_escape = best_path_.empty() &&
+                           no_go_.inside(root_state.head<3>());
   const bool is_boxed_in = !boxed_in_without_departure_now_ &&
+                          (zone_escape || (
                            (sel.sharp_turn_fallback || goes_nowhere ||
                             (sel.best_path.empty() &&
                              sel.slope_ends_without_way_back > 0 &&
@@ -2450,9 +2453,9 @@ std::string PlannerNode::buildLocalGraph() {
                                          }))) &&
                            turns_admissible &&
                            !mgg::roomToTurn(*map_, robot_params_, planning_params_,
-                                            root_state, standing_on);
+                                            root_state, standing_on)));
   if (is_boxed_in) {
-    boxed_in = departBoxedIn(root_state, goes_nowhere
+    boxed_in = departBoxedIn(root_state, zone_escape ? "no admissible end outside no-go zones" : goes_nowhere
                                              ? "its best path goes nowhere"
                                              : "no path turns only where it "
                                                "may");
@@ -2602,6 +2605,24 @@ bool PlannerNode::straightDeparture(const mgg::StateVec& start,
                                     mgg::Departure& departure) {
   mgg::GroundProjection ground(*map_, planning_params_);
   ground.setStandingStart(standingStart());
+  if (no_go_.inside(start.head<3>())) {
+    // A bounded straight recovery, not a turn on the slope. Only a fully
+    // outward path ending outside every zone can replace the empty choice.
+    return mgg::findDeparture(*map_, ground, robot_params_, planning_params_,
+        start, departure, [this, &ground](const auto& path) {
+          std::vector<Eigen::Vector3d> points;
+          for (const auto& pose : path) points.push_back(pose.template head<3>());
+          if (!no_go_.pathAdmissible(points)) return false;
+          const auto& end = path.back();
+          const double slope = mgg::groundSlope(ground, end.template head<3>(),
+              std::max(robot_params_.size.x(), robot_params_.size.y()),
+              local_graph_.get());
+          return (slope > mgg::kLevelGroundSlopeRad &&
+                  slope < mgg::kUnknownSlopeRad) ||
+                 mgg::roomToTurn(*map_, robot_params_, planning_params_, end,
+                                 ground.standingStart());
+        }, 3.0, /*straight_only=*/true);
+  }
   return mgg::findDeparture(*map_, ground, robot_params_, planning_params_,
                             start, departure);
 }

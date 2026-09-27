@@ -147,13 +147,18 @@ VoxelStatus orientedBoxPathStatus(const MapInterface& map,
 
 bool findDeparture(const MapInterface& map, const GroundProjection& ground,
                    const RobotParams& robot, const PlanningParams& planning,
-                   const StateVec& start, Departure& departure) {
+                   const StateVec& start, Departure& departure,
+                   const std::function<bool(const std::vector<StateVec>&)>&
+                       end_admissible,
+                   double max_distance, bool straight_only) {
   departure = Departure();
   const bool ground_robot = robot.type == RobotType::kGroundRobot;
   const double spacing = planning.path_interpolation_distance;
   const double step =
       spacing > 0.0 ? std::min(spacing, kDepartureMinM) : map.getResolution();
-  const int steps = static_cast<int>(std::ceil(kDepartureMaxM / step - 1e-9));
+  if (!std::isfinite(max_distance) || max_distance < kDepartureMinM ||
+      max_distance > 3.0 || !std::isfinite(step) || step <= 0) return false;
+  const int steps = static_cast<int>(std::ceil(max_distance / step - 1e-9));
   OrientedBox standing;
   standing.center = start.head<3>();
   standing.heading = start[3];
@@ -190,7 +195,7 @@ bool findDeparture(const MapInterface& map, const GroundProjection& ground,
       here[3] = heading;
       departure.path.assign(1, here);
       for (int i = 1; i <= steps; ++i) {
-        const double out = std::min(i * step, kDepartureMaxM);
+        const double out = std::min(i * step, max_distance);
         const Eigen::Vector2d xy = start.head<2>() + out * unit;
         StateVec to(xy.x(), xy.y(), departure.path.back().z(), heading);
         if (ground_robot && !toDrivingHeight(ground, planning, to)) break;
@@ -202,7 +207,9 @@ bool findDeparture(const MapInterface& map, const GroundProjection& ground,
         if (!step_free(departure.path.back(), to, i == 1)) break;
         departure.path.push_back(to);
         if (out >= kDepartureMinM - 1e-9 &&
-            roomToTurn(map, robot, planning, to, ground.standingStart())) {
+            (end_admissible ? end_admissible(departure.path)
+                            : roomToTurn(map, robot, planning, to,
+                                          ground.standingStart()))) {
           departure.reverse = backwards;
           return true;
         }
@@ -213,6 +220,7 @@ bool findDeparture(const MapInterface& map, const GroundProjection& ground,
   };
 
   if (straight(start[3])) return true;
+  if (straight_only) return false;
   // Turned in place first, nearest first; a way blocked at some turn stays
   // blocked beyond it. Each 5-degree pose is checked, not the arc between
   // them (review r0, M-1).
