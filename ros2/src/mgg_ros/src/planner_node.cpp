@@ -42,6 +42,10 @@ constexpr double kGoalLinkRadius = 0.1;
 /// A cluster set aside from the tour (setTourClusterAside) returns once the
 /// robot is this far from where it was set aside.
 constexpr double kTourSetAsideMoveM = 2.0;
+/// It returns too once its gain has risen by more than this fraction of
+/// its scored gain when set aside, and by more than tour.min_cluster_gain:
+/// new evidence about the cluster itself.
+constexpr double kTourSetAsideGainRise = 0.25;
 /// A tour cluster only peer bodies kept the robot from is set aside this
 /// long at most: a peer moves on, and one parked must not keep the robot
 /// off the cluster for good (run 10b, robot_1 and robot_3 routed through
@@ -631,11 +635,10 @@ mgg::Vertex* PlannerNode::linkRobotToGlobalGraph() {
   return link;
 }
 
-void PlannerNode::setTourClusterAside(mgg::ClusterId id, double retry_s) {
-  // The revision it is set aside at includes any edge change so far.
-  noteGlobalGraphEdges();
-  tour_set_aside_[id] = TourSetAside{current_state_.head<3>(), graph_revision_,
-                                     now().seconds(), retry_s};
+void PlannerNode::setTourClusterAside(const mgg::FrontierCluster& cluster,
+                                      double retry_s) {
+  tour_set_aside_[cluster.id] = TourSetAside{
+      current_state_.head<3>(), cluster.gain, now().seconds(), retry_s};
   tour_planner_->releaseTarget();
 }
 
@@ -737,15 +740,28 @@ std::optional<mgg::FrontierCluster> PlannerNode::refreshTour(
       tourCandidates(globalFrontierClusters());
   const double now_s = now().seconds();
   // Clusters set aside stay out until something that could change the
-  // outcome has: the robot's position, the graph, or the retry deadline
-  // (a clock that went backwards counts as passed).
+  // outcome has: the robot's position, new evidence at the cluster (its
+  // gain rising markedly), or the retry deadline (a clock that went
+  // backwards counts as passed). Not any new graph revision: the roadmap
+  // grows every cycle, and a cluster released at 103.5 s was offered and
+  // released again at 106.2 s (run 10b, robot_1).
   for (auto it = tour_set_aside_.begin(); it != tour_set_aside_.end();) {
     const TourSetAside& aside = it->second;
+    const mgg::ClusterId id = it->first;
+    const auto cluster = std::find_if(
+        clusters.begin(), clusters.end(),
+        [id](const mgg::FrontierCluster& c) { return c.id == id; });
+    // A gain of zero is one never scored (as searchGlobalFrontier reads
+    // it): its first score is no rise.
+    const bool gain_rose =
+        cluster != clusters.end() && aside.gain > 0.0 &&
+        cluster->gain - aside.gain >
+            std::max(kTourSetAsideGainRise * aside.gain,
+                     tour_params_.min_cluster_gain);
     const bool lapsed =
         (current_state_.head<3>() - aside.position).norm() >
             kTourSetAsideMoveM ||
-        graph_revision_ != aside.graph_revision || now_s < aside.at_s ||
-        now_s - aside.at_s >= aside.retry_s;
+        gain_rose || now_s < aside.at_s || now_s - aside.at_s >= aside.retry_s;
     it = lapsed ? tour_set_aside_.erase(it) : std::next(it);
   }
   clusters.erase(std::remove_if(clusters.begin(), clusters.end(),
@@ -3499,7 +3515,7 @@ void PlannerNode::onPlanRequest(
     if (tour_target && low_gain_path_now_ &&
         (tour_target->position - current_state_.head<3>()).norm() <=
             global_frontier_reach_m_) {
-      setTourClusterAside(tour_target->id, tour_params_.route_retry_s);
+      setTourClusterAside(*tour_target, tour_params_.route_retry_s);
       tour_target.reset();
       summary += "; nearby tour target reached with low local gain";
     }
@@ -3521,7 +3537,7 @@ void PlannerNode::onPlanRequest(
           // The robot stands on the target's representative: reached, and
           // local exploration has nothing here. The tour costs it zero and
           // a route cannot leave from it, so it is set aside, not routed to.
-          setTourClusterAside(tour_target->id, tour_params_.route_retry_s);
+          setTourClusterAside(*tour_target, tour_params_.route_retry_s);
           summary += "; the robot stands on the tour's target: reached";
         } else if (runGlobalPlanner(tour_target->representative_vertex_id,
                                     reason)) {
@@ -3543,7 +3559,7 @@ void PlannerNode::onPlanRequest(
             // one, the choices without the tour follow; they judge their
             // own routes' first turns, not this one's.
             ++tour_routes_failed_;
-            setTourClusterAside(tour_target->id, tour_params_.route_retry_s);
+            setTourClusterAside(*tour_target, tour_params_.route_retry_s);
             boxed_in_without_departure_now_ = false;
             summary +=
                 "; the route to the tour's target starts with a turn the "
@@ -3564,7 +3580,7 @@ void PlannerNode::onPlanRequest(
           // the peer may move on.
           ++tour_routes_failed_;
           setTourClusterAside(
-              tour_target->id,
+              *tour_target,
               last_route_blocked_by_peer_
                   ? std::min(kPeerBlockedAsideS, tour_params_.route_retry_s)
                   : tour_params_.route_retry_s);

@@ -274,8 +274,17 @@ class PlannerNodeTestPeer {
     gain.num_unknown_voxels = count;
     gain.is_frontier = true;
   }
+  /// Sets the tour's cluster `id`, as the last refreshTour offered it,
+  /// aside.
   static void setTourAside(PlannerNode& node, mgg::ClusterId id) {
-    node.setTourClusterAside(id, node.tour_params_.route_retry_s);
+    const std::lock_guard<std::recursive_mutex> lock(node.planner_mutex_);
+    for (const mgg::FrontierCluster& cluster : node.tour_clusters_) {
+      if (cluster.id == id) {
+        node.setTourClusterAside(cluster, node.tour_params_.route_retry_s);
+        return;
+      }
+    }
+    ADD_FAILURE() << "no tour cluster " << id;
   }
   /// Peer bodies at `points`, planning frame, as SwarmDeck publishes them.
   static void receivePeerBodies(PlannerNode& node,
@@ -290,6 +299,17 @@ class PlannerNodeTestPeer {
       msg->poses.push_back(pose);
     }
     node.onPeerBodies(msg);
+  }
+  /// When the tour's cluster `id` was set aside; NaN when it is not.
+  static double tourAsideAt(PlannerNode& node, mgg::ClusterId id) {
+    const std::lock_guard<std::recursive_mutex> lock(node.planner_mutex_);
+    const auto found = node.tour_set_aside_.find(id);
+    return found == node.tour_set_aside_.end() ? std::nan("")
+                                               : found->second.at_s;
+  }
+  static void setTourRetry(PlannerNode& node, double seconds) {
+    const std::lock_guard<std::recursive_mutex> lock(node.planner_mutex_);
+    node.tour_params_.route_retry_s = seconds;
   }
   /// Global graph edges peer bodies closed in the last plan request.
   static std::size_t peerBlockedEdges(PlannerNode& node) {
@@ -4473,7 +4493,9 @@ TEST_F(PlannerNodeTest, PeerFrontierRescoringDoesNotLapseATourSetAside) {
     EXPECT_EQ(PlannerNodeTestPeer::refreshTour(*fleet.a), mgg::kNoCluster);
     EXPECT_EQ(PlannerNodeTestPeer::graphRevision(*fleet.a), revision);
   }
-  // Unlike re-marking a frontier, a genuinely new edge changes topology.
+  // A genuinely new edge changes topology, a new graph revision, and is
+  // still no reason to offer the cluster again: an aside lapses with time,
+  // the robot's movement or new gain at the cluster (run 10b, robot_1).
   const auto ends = std::minmax_element(graph.vertices.begin(), graph.vertices.end(),
       [](const auto& a, const auto& b) { return a.pose.position.x < b.pose.position.x; });
   mgg_msgs::msg::Edge edge;
@@ -4485,7 +4507,7 @@ TEST_F(PlannerNodeTest, PeerFrontierRescoringDoesNotLapseATourSetAside) {
   PlannerNodeTestPeer::receiveGraph(*fleet.a, graph);
   EXPECT_EQ(PlannerNodeTestPeer::globalEdges(*fleet.a), edges + 1);
   EXPECT_GT(PlannerNodeTestPeer::graphRevision(*fleet.a), revision);
-  EXPECT_EQ(PlannerNodeTestPeer::refreshTour(*fleet.a), target);
+  EXPECT_EQ(PlannerNodeTestPeer::refreshTour(*fleet.a), mgg::kNoCluster);
 }
 
 TEST_F(PlannerNodeTest, ReceiverExplorationDemotesAPeerDespiteRepeatedUnknownReports) {
@@ -4678,6 +4700,89 @@ TEST_F(PlannerNodeTest, ASoloReleaseReportsThatItAppliedLocally) {
   EXPECT_TRUE(PlannerNodeTestPeer::fleetExclusions(*node).empty());
   EXPECT_NE(response->message.find("locally"), std::string::npos);
   EXPECT_NE(response->message.find("nothing forwarded"), std::string::npos);
+}
+
+TEST_F(PlannerNodeTest, TheRun10bLowGainReleaseIsNotReofferedAsTheRoadmapGrows) {
+  // Run 10b, robot_1: a nearby target with low local gain was released at
+  // 103.5 s and released again at 106.2 s. Its set-aside lapsed on the
+  // next graph revision, which ordinary roadmap growth makes every cycle.
+  // Here the nearby frontier is released with low local gain, the roadmap
+  // then grows beside the robot, which moves 0.5 m: the frontier is not
+  // offered again, and is not released again. Its gain may rise with the
+  // robot's move, by less than tour.min_cluster_gain: 400 at this scene's
+  // scale, where the frontier scores about 430 (deployed: 9000).
+  auto node = makeNode("low_gain_release_stays");
+  PlannerNodeTestPeer::observeFloor(*node, -1.5, 4.0, -1.5, 1.5);
+  PlannerNodeTestPeer::acceptOdometry(*node, 0.0, 0.0, 1.0);
+  const int frontier = PlannerNodeTestPeer::addGlobalChainToFrontier(
+      *node, {{0.5, 0.0}, {1.0, 0.0}, {1.5, 0.0}, {2.0, 0.0}, {2.5, 0.0},
+              {3.0, 0.0}, {3.5, 0.0}});
+  PlannerNodeTestPeer::setGlobalFrontierReach(*node, 5.0);
+  PlannerNodeTestPeer::setTour(*node, true, 400.0);
+  PlannerNodeTestPeer::solveTourOnEveryChange(*node);
+  PlannerNodeTestPeer::setLowGainVoxels(*node, 1e9);
+  PlannerNodeTestPeer::setVertexGain(*node, frontier, 450.0);
+  const mgg::ClusterId target = PlannerNodeTestPeer::refreshTour(*node);
+  ASSERT_NE(target, mgg::kNoCluster);
+  auto response = std::make_shared<mgg_msgs::srv::PlannerSrv::Response>();
+  PlannerNodeTestPeer::plan(*node, response);
+  const double released = PlannerNodeTestPeer::tourAsideAt(*node, target);
+  ASSERT_FALSE(std::isnan(released));
+
+  const std::uint64_t revision = PlannerNodeTestPeer::graphRevision(*node);
+  const int side = PlannerNodeTestPeer::addIsolatedGlobalVertex(*node, 0.0, 1.0);
+  PlannerNodeTestPeer::addGlobalEdgeOnly(*node, 0, side);
+  PlannerNodeTestPeer::acceptOdometry(*node, 0.5, 0.0, 2.0);
+  ASSERT_GT(PlannerNodeTestPeer::graphRevision(*node), revision);
+  std::this_thread::sleep_for(std::chrono::milliseconds(20));
+  response = std::make_shared<mgg_msgs::srv::PlannerSrv::Response>();
+  PlannerNodeTestPeer::plan(*node, response);
+  EXPECT_DOUBLE_EQ(PlannerNodeTestPeer::tourAsideAt(*node, target), released);
+  EXPECT_NE(PlannerNodeTestPeer::tourTarget(*node), target);
+}
+
+TEST_F(PlannerNodeTest, ASetAsideTourTargetReturnsOnTheRetryMovementOrNewGain) {
+  // The frontier 3.5 m ahead, with gain 1000, is set aside. A new edge
+  // alone does not bring it back. Its gain rising by less than a quarter,
+  // or by less than tour.min_cluster_gain (500), does not either; rising
+  // by both does. Set aside again, the robot moving more than 2 m brings
+  // it back; set aside again, the retry period passing does.
+  auto node = makeNode("set_aside_lapses");
+  PlannerNodeTestPeer::observeFloor(*node, -3.0, 6.0, -1.5, 1.5);
+  PlannerNodeTestPeer::acceptOdometry(*node, 0.0, 0.0, 1.0);
+  const int frontier = PlannerNodeTestPeer::addGlobalChainToFrontier(
+      *node, {{1.0, 0.0}, {2.0, 0.0}, {3.5, 0.0}});
+  PlannerNodeTestPeer::setVertexGain(*node, frontier, 1000.0);
+  PlannerNodeTestPeer::setTour(*node, true, 500.0);
+  PlannerNodeTestPeer::solveTourOnEveryChange(*node);
+  const mgg::ClusterId target = PlannerNodeTestPeer::refreshTour(*node);
+  ASSERT_NE(target, mgg::kNoCluster);
+
+  PlannerNodeTestPeer::setTourAside(*node, target);
+  const int side = PlannerNodeTestPeer::addIsolatedGlobalVertex(*node, 0.0, 1.0);
+  PlannerNodeTestPeer::addGlobalEdgeOnly(*node, 0, side);
+  EXPECT_EQ(PlannerNodeTestPeer::refreshTour(*node), mgg::kNoCluster);
+  PlannerNodeTestPeer::setVertexGain(*node, frontier, 1200.0);  // +20 %
+  EXPECT_EQ(PlannerNodeTestPeer::refreshTour(*node), mgg::kNoCluster);
+  PlannerNodeTestPeer::setVertexGain(*node, frontier, 1450.0);  // +45 %, +450
+  EXPECT_EQ(PlannerNodeTestPeer::refreshTour(*node), mgg::kNoCluster);
+  PlannerNodeTestPeer::setVertexGain(*node, frontier, 1600.0);  // +60 %, +600
+  EXPECT_EQ(PlannerNodeTestPeer::refreshTour(*node), target);
+
+  // Back, away from the frontier: driving toward it would mark the
+  // roadmap round it visited (kUpdateRadius).
+  PlannerNodeTestPeer::setTourAside(*node, target);
+  PlannerNodeTestPeer::acceptOdometry(*node, -1.5, 0.0, 2.0);
+  EXPECT_EQ(PlannerNodeTestPeer::refreshTour(*node), mgg::kNoCluster);
+  // 2.1 m from where it was set aside.
+  PlannerNodeTestPeer::acceptOdometry(*node, -2.1, 0.0, 3.0);
+  EXPECT_EQ(PlannerNodeTestPeer::refreshTour(*node), target);
+
+  PlannerNodeTestPeer::setTourRetry(*node, 0.2);
+  PlannerNodeTestPeer::setTourAside(*node, target);
+  EXPECT_EQ(PlannerNodeTestPeer::refreshTour(*node), mgg::kNoCluster);
+  std::this_thread::sleep_for(std::chrono::milliseconds(300));
+  EXPECT_EQ(PlannerNodeTestPeer::refreshTour(*node), target);
 }
 
 TEST_F(PlannerNodeTest, ANearTourTargetDoesNotStarveTheLowGainHandoff) {

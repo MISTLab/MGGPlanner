@@ -33,9 +33,9 @@ struct TourParams {
   /// Fraction of the remaining tour cost a new first cluster must save to
   /// replace the current target.
   double commit_margin = 0.2;
-  /// A cluster the robot could not be routed to is left out of the tour
-  /// for at most this long, seconds; sooner when the robot moves or the
-  /// graph changes.
+  /// A cluster the robot could not be routed to, or reached with little
+  /// local gain, is left out of the tour for at most this long, seconds;
+  /// sooner when the robot moves or the cluster's gain rises markedly.
   double route_retry_s = 30.0;
 };
 
