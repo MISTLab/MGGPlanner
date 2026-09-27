@@ -36,6 +36,7 @@
 #include "mgg_ros/planner_node.h"
 #include "mgg_msgs/srv/planner_set_exploration_region.hpp"
 #include "mgg_ros/fleet_conversions.h"
+#include "mgg_ros/conversions.h"
 
 namespace mgg_ros {
 
@@ -1038,6 +1039,29 @@ class PlannerNodeTestPeer {
   }
   static void fleetTick(PlannerNode& node, double now_s) {
     node.fleetTick(now_s);
+  }
+  static std::uint64_t expansionMapRevision(PlannerNode& node) {
+    return node.expansion_map_revision_;
+  }
+  static void expandForHomeWaitTest(PlannerNode& node) {
+    // Isolate the wait guard from the separate "no planning cycle yet" guard.
+    node.planner_trigger_count_ = 1;
+    node.expandGlobalGraphTimerCallback();
+  }
+  static int mergeIntoTwoVertexRoadmap(PlannerNode& node,
+                                      const mgg_msgs::msg::Graph& incoming) {
+    // The core also refuses an empty receiver graph. Supply a connectable
+    // fixture so removing the node's wait guard cannot hide behind that rule.
+    const auto saved_graph = node.global_graph_;
+    const auto saved_revision = node.graph_revision_;
+    node.global_graph_ = std::make_shared<mgg::GraphManager>();
+    node.global_graph_->setRobotId(1);
+    const int root = addGlobalVertex(node, 1, 0.0, 0.0, 0.4, {});
+    addGlobalVertex(node, 1, 0.5, 0.0, 0.4, {root});
+    const auto result = node.mergeNeighbourRoadmap(fromGraphMsg(incoming));
+    node.global_graph_ = saved_graph;
+    node.graph_revision_ = saved_revision;
+    return result.vertices_added;
   }
   static bool fleetHasAward(PlannerNode& node) {
     const std::lock_guard<std::recursive_mutex> lock(node.planner_mutex_);
@@ -4845,6 +4869,91 @@ TEST_F(PlannerNodeTest, ADroneSeedsUnliftedAndWarnsOnceWhenFlightStateTimesOut) 
       EXPECT_EQ(log.find("timed out waiting for", warning + 1), std::string::npos);
     }
   }
+}
+
+TEST_F(PlannerNodeTest, TheHomeStateWaitStartsWhenRosTimeFirstBecomesNonZero) {
+  // Before /clock, zero means no time reference yet. Exercise both odometry
+  // and the already-due timer as the first callback to see the non-zero time.
+  // T is not a multiple of the timer period: re-anchoring without re-arming
+  // would otherwise leave an early timer expiry before T + wait.
+  for (const bool odometry_first : {false, true}) {
+    for (const bool landed : {false, true}) {
+      SCOPED_TRACE(odometry_first ? "odometry first" : "timer first");
+      SCOPED_TRACE(landed ? "landed before deadline" : "timeout");
+      auto node = droneOverAFloor("drone_home_clock_start", 1.0);
+      setHomeWaitNodeTime(*node, 0.0);
+      rclcpp::executors::SingleThreadedExecutor executor;
+      executor.add_node(node);
+      testing::internal::CaptureStderr();
+      PlannerNodeTestPeer::acceptOdometry(*node, odometryAt(0, 0, 0.075, 1));
+      executor.spin_some();
+      EXPECT_EQ(PlannerNodeTestPeer::globalVertices(*node), 0);
+      setHomeWaitNodeTime(*node, 101.0);
+      if (odometry_first) {
+        PlannerNodeTestPeer::acceptOdometry(*node, odometryAt(0, 0, 0.075, 2));
+      }
+      executor.spin_some();
+      EXPECT_EQ(PlannerNodeTestPeer::globalVertices(*node), 0);
+      setHomeWaitNodeTime(*node, 105.99);
+      executor.spin_some();
+      EXPECT_EQ(PlannerNodeTestPeer::globalVertices(*node), 0);
+      if (landed) PlannerNodeTestPeer::setFlightState(*node, "landed");
+      setHomeWaitNodeTime(*node, 106.0);
+      executor.spin_some();
+      EXPECT_NEAR(PlannerNodeTestPeer::globalVertexState(*node, 0).z(),
+                  landed ? 1.075 : 0.075, 1e-9);
+      const std::string log = testing::internal::GetCapturedStderr();
+      const auto warning = log.find("timed out waiting for");
+      if (landed) {
+        EXPECT_EQ(warning, std::string::npos) << log;
+      } else {
+        EXPECT_NE(warning, std::string::npos) << log;
+        if (warning != std::string::npos) {
+          EXPECT_NE(log.rfind("WARN", warning), std::string::npos);
+          EXPECT_NE(log.substr(warning).find("/flight_state"), std::string::npos);
+          EXPECT_EQ(log.find("timed out waiting for", warning + 1),
+                    std::string::npos);
+        }
+      }
+    }
+  }
+}
+
+TEST_F(PlannerNodeTest, BackgroundWorkWaitsForFlightStateAndResumesAfterRelease) {
+  auto node = makeNode("drone_wait_background", "world",
+                      {rclcpp::Parameter("aerial_home_height_m", 1.0),
+                       rclcpp::Parameter("neighbour_offsets",
+                                         std::vector<double>{2, 0, 0, 0})});
+  PlannerNodeTestPeer::setAerialRobot(*node);
+  PlannerNodeTestPeer::observeFloor(*node, -1.5, 6.0, -1.5, 1.5);
+  PlannerNodeTestPeer::observeFreeBox(*node, {2.25, 0, 1.2}, {7.5, 3, 1.6});
+  auto peer = makeNode("home_wait_peer", "world",
+                      {rclcpp::Parameter("PlanningParams.robot_id", 2)});
+  PlannerNodeTestPeer::setAerialRobot(*peer);
+  const int root = PlannerNodeTestPeer::addGlobalVertex(*peer, 2, 1, 0, 0.4, {});
+  PlannerNodeTestPeer::addGlobalVertex(*peer, 2, 1.5, 0, 0.4, {root});
+  const auto incoming = PlannerNodeTestPeer::ownGraph(*peer);
+  setHomeWaitNodeTime(*node, 10.0);
+  PlannerNodeTestPeer::acceptOdometry(*node, odometryAt(0, 0, 0.4, 1));
+  PlannerNodeTestPeer::hearPeer(*node, 2);
+
+  PlannerNodeTestPeer::fleetTick(*node, 10.0);
+  PlannerNodeTestPeer::fleetTick(*node, 11.1);
+  EXPECT_FALSE(PlannerNodeTestPeer::fleetHasAward(*node));
+  PlannerNodeTestPeer::expandForHomeWaitTest(*node);
+  EXPECT_EQ(PlannerNodeTestPeer::expansionMapRevision(*node), 0u);
+  EXPECT_EQ(PlannerNodeTestPeer::mergeIntoTwoVertexRoadmap(*node, incoming), 0);
+  EXPECT_EQ(PlannerNodeTestPeer::globalVertices(*node), 0);
+
+  setHomeWaitNodeTime(*node, 12.0);
+  PlannerNodeTestPeer::setFlightState(*node, "flying");
+  PlannerNodeTestPeer::hearPeer(*node, 2);
+  PlannerNodeTestPeer::fleetTick(*node, 12.0);
+  PlannerNodeTestPeer::fleetTick(*node, 13.1);
+  EXPECT_TRUE(PlannerNodeTestPeer::fleetHasAward(*node));
+  PlannerNodeTestPeer::expandForHomeWaitTest(*node);
+  EXPECT_GT(PlannerNodeTestPeer::expansionMapRevision(*node), 0u);
+  EXPECT_GT(PlannerNodeTestPeer::mergeIntoTwoVertexRoadmap(*node, incoming), 0);
 }
 
 TEST_F(PlannerNodeTest, ALandedStateAfterTheDeadlineCannotBeatTheTimeoutCallback) {

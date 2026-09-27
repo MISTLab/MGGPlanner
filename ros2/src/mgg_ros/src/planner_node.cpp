@@ -1875,8 +1875,18 @@ void PlannerNode::seedGlobalGraph() {
   if (global_graph_->getNumVertices() == 0) {
     if (robot_params_.type == mgg::RobotType::kAerialRobot &&
         aerial_home_height_m_ > 0.0 && !latest_flight_state_) {
-      if (!home_state_wait_started_) home_state_wait_started_ = now();
-      if ((now() - *home_state_wait_started_).seconds() <
+      const auto now_time = now();
+      if (!home_state_wait_started_ ||
+          home_state_wait_started_->nanoseconds() == 0) {
+        home_state_wait_started_ = now_time;
+        // Before the first /clock, zero is not a deadline anchor. Either
+        // odometry or the timer can first see valid time: re-arm the timer
+        // from that non-zero anchor, rather than let its old expiry win.
+        if (now_time.nanoseconds() != 0 && home_state_wait_timer_) {
+          home_state_wait_timer_->reset();
+        }
+      }
+      if ((now_time - *home_state_wait_started_).seconds() <
           aerial_home_state_wait_s_) {
         if (!home_state_wait_timer_ || home_state_wait_timer_->is_canceled()) {
           home_state_wait_timer_ = create_timer(
