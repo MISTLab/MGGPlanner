@@ -1491,28 +1491,72 @@ TEST(FleetCoordinator, ALeavingDroneReannouncesWithItsPoseAndNoTour) {
 }
 
 TEST(FleetCoordinator, WhileLeavingNeitherCallsNorAwardsRestoreAnAward) {
-  for (const int id : {1, 2}) {
-    FleetCoordinator robot(id, FleetParams{}, 0.2);
-    TourBidData peer = noClusters();
-    peer.robot_id = 3 - id;
-    robot.onBid(peer, 0.0);
-    robot.tick(0.0, noClusters, euclid, nullptr);  // may start a collection
-    robot.requestAuction();
-    robot.leave(0.1);
-    robot.onAward(makeCall(1, 42, 0.2), 0.2);
-    robot.onAward(makeAward(1, 42, 0.3, {{id, {77}}},
-                            {cluster(77, 2, 5.0)}), 0.3);
-    for (const double now : {0.4, 2.0, 5.0}) {
-      const auto out = robot.tick(now, noClusters, euclid, nullptr);
-      EXPECT_FALSE(out.award);
-      if (out.bid) {
-        EXPECT_TRUE(out.bid->leaving);
-      }
-      EXPECT_FALSE(robot.hasAward());
-      EXPECT_TRUE(robot.bundle().empty());
-      EXPECT_FALSE(robot.awaitingAuction());
+  FleetCoordinator robot(2, FleetParams{}, 0.2);
+  TourBidData peer = noClusters();
+  peer.robot_id = 1;
+  robot.onBid(peer, 0.0);
+  robot.tick(0.0, noClusters, euclid, nullptr);
+  robot.requestAuction();
+  robot.leave(0.1);
+  robot.onAward(makeCall(1, 42, 0.2), 0.2);
+  robot.onAward(makeAward(1, 42, 0.3, {{2, {77}}},
+                          {cluster(77, 2, 5.0)}), 0.3);
+  for (const double now : {0.4, 2.0, 5.0}) {
+    const auto out = robot.tick(now, noClusters, euclid, nullptr);
+    EXPECT_FALSE(out.award);
+    if (out.bid) {
+      EXPECT_TRUE(out.bid->leaving);
     }
+    EXPECT_FALSE(robot.hasAward());
+    EXPECT_TRUE(robot.bundle().empty());
+    EXPECT_FALSE(robot.awaitingAuction());
   }
+}
+
+TEST(FleetCoordinator, RequestingAnAuctionWhileLeavingDoesNothing) {
+  FleetCoordinator robot(2, FleetParams{}, 0.2);
+  robot.leave(0.0);
+  robot.requestAuction();
+  EXPECT_FALSE(robot.awaitingAuction());
+  EXPECT_FALSE(robot.requestAnswered());
+  const auto out = robot.tick(0.1, noClusters, euclid, nullptr);
+  ASSERT_TRUE(out.bid);
+  EXPECT_TRUE(out.bid->leaving);
+  EXPECT_FALSE(out.bid->request_auction);
+  EXPECT_FALSE(out.award);
+}
+
+TEST(FleetCoordinator, ARejoinerAnswersTheNextCallAndIsNamedInItsAward) {
+  const FleetParams params;
+  SimRobot lead(1, 40.0, 0.0, params), drone(2, 0.0, 0.0, params);
+  drone.known = {cluster(77, 2, 5.0)};
+  Radio radio{{&lead, &drone}};
+  drone.coordinator->leave(0.0);
+  radio.step(0.0);
+  ASSERT_EQ(lead.coordinator->group(0.0), std::vector<int>{1});
+  drone.coordinator->rejoin();
+  double now = 0.1;
+  radio.runUntil(now, 6.0);
+
+  ASSERT_FALSE(radio.calls.empty());
+  const auto& call = radio.calls.front().second;
+  EXPECT_EQ(call.auctioneer_id, 1);
+  const auto answer = std::find_if(radio.bids.begin(), radio.bids.end(),
+      [&](const auto& sent) {
+        return sent.second.robot_id == 2 &&
+               sent.second.auction_id == call.auction_id;
+      });
+  EXPECT_NE(answer, radio.bids.end());
+  ASSERT_FALSE(radio.awards.empty());
+  const auto& award = radio.awards.front().second;
+  EXPECT_EQ(award.auction_id, call.auction_id);
+  const auto* bundle = award.bundleOf(2);
+  ASSERT_NE(bundle, nullptr);
+  EXPECT_EQ(bundle->clusters, (std::vector<ClusterId>{77}));
+  ASSERT_NE(answer, radio.bids.end());
+  EXPECT_EQ(bundle->bid_seq, answer->second.seq);
+  EXPECT_TRUE(drone.coordinator->hasAward());
+  EXPECT_EQ(idsOf(drone.coordinator->bundle()), (std::vector<ClusterId>{77}));
 }
 
 TEST(FleetCoordinator, LeavingBidsCannotAddClaimsOrMembershipAndNeedAnIdentity) {
