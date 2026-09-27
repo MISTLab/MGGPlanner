@@ -50,8 +50,8 @@ enum class GridGraphStatus {
 
 struct GridGraphResult {
   GridGraphStatus status = GridGraphStatus::kOk;
-  /// Cells whose footprint was free: candidates offered to expandGraph, and
-  /// merged_duplicates.
+  /// Nominal cells whose footprint was free: first-pass offers and
+  /// merged_duplicates. Retry/nudge attempts do not count again.
   int free_cells = 0;
   int vertices_added = 0;
   int edges_added = 0;
@@ -67,7 +67,7 @@ struct GridGraphResult {
   /// going outward first (a deck over the floor, reached up a ramp further
   /// out).
   int retried_joined = 0;
-  /// Why the candidates that were offered got turned away, indexed by
+  /// First-pass candidate verdicts (not retries/nudges), indexed by
   /// ExpandGraphStatus. A sweep that finds plenty of free cells and produces
   /// no vertices is otherwise indistinguishable from one that found nothing,
   /// and the two have completely different causes.
@@ -78,7 +78,7 @@ struct GridGraphResult {
   /// check, split by the two actionable failure classes.
   int projected_endpoint_occupied = 0;
   int projected_endpoint_unknown = 0;
-  /// Edge verdicts summed over every candidate, indexed by
+  /// Edge verdicts summed over first-pass candidates, indexed by
   /// ProjectedEdgeStatus.
   int edge_status[8] = {0, 0, 0, 0, 0, 0, 0, 0};
 };

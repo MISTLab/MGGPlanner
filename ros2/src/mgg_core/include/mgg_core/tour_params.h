@@ -20,7 +20,7 @@ struct TourParams {
   /// Clusters whose representative's gain is below this are dropped. Chosen
   /// on SubT exploration metrics (§5.1), provisional (single runs); the
   /// plan-time gate is deferred.
-  /// Equivalent to twenty unknown voxels at unknown_voxel_gain 60.
+  /// Equivalent to 150 unknown voxels at unknown_voxel_gain 60.
   double min_cluster_gain = 9000.0;
   /// Grid a representative's position is quantized on for its stable ID,
   /// metres.

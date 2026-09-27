@@ -1061,6 +1061,7 @@ TEST(SearchGlobalFrontier, DijkstraAndPeerScoringDoNotSpendTheRecheckBudget) {
         graph.recompute()(v);
       }, {}, 0.0, nullptr, 0.02);
   EXPECT_GT(own_rechecks, 0);
+  EXPECT_EQ(report.rechecked, own_rechecks);
   EXPECT_FALSE(report.cut_short());
 }
 

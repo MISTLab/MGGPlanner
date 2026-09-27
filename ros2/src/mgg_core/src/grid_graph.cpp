@@ -160,7 +160,8 @@ GridGraphResult buildGridGraph(GraphManager& graph, const StateVec& state,
     return rep.edge_status[static_cast<int>(ProjectedEdgeStatus::kOccupied)] > 0;
   };
 
-  const auto try_cell = [&](const Eigen::Vector3d& candidate, int i, int j, bool& added) {
+  const auto try_cell = [&](const Eigen::Vector3d& candidate, int i, int j,
+                            bool first_pass, bool& added) {
     OrientedBox body;
     body.heading = heading;
     StateVec query(candidate.x(), candidate.y(), candidate.z(), heading);
@@ -181,8 +182,8 @@ GridGraphResult buildGridGraph(GraphManager& graph, const StateVec& state,
                                      !ctx.allow_unknown_lattice_body, nullptr);
     }
     if (status != VoxelStatus::kFree) return status == VoxelStatus::kOccupied;
-    ++result.free_cells;
-    return offer(candidate, i, j, /*first_pass=*/true, added);
+    if (first_pass) ++result.free_cells;
+    return offer(candidate, i, j, first_pass, added);
   };
 
   std::vector<Retry> nudges;
@@ -205,7 +206,7 @@ GridGraphResult buildGridGraph(GraphManager& graph, const StateVec& state,
 
       const Eigen::Vector3d cell(x_val, y_val, z_world);
       bool added = false;
-      const bool refused = try_cell(cell, i, j, added);
+      const bool refused = try_cell(cell, i, j, /*first_pass=*/true, added);
       if (ground_robot && refused && !added) nudges.push_back({cell, i, j});
     }
   }
@@ -237,7 +238,7 @@ GridGraphResult buildGridGraph(GraphManager& graph, const StateVec& state,
       bool added = false;
       const Eigen::Vector3d shifted =
           retry.cell + offset * Eigen::Vector3d(-sin_h, cos_h, 0.0);
-      try_cell(shifted, retry.i, retry.j, added);
+      try_cell(shifted, retry.i, retry.j, /*first_pass=*/false, added);
       if (added) break;
     }
   }

@@ -2429,7 +2429,8 @@ std::string PlannerNode::buildLocalGraph() {
     path_shortcut_from_ = path_shortcut_corners_ = path_shortcut_to_ = 0;
   }
 
-  // Boxed in: no path turns only where it may, or none goes anywhere, and
+  // Boxed in: no path turns only where it may, goes anywhere, or has a
+  // bounded way back from a narrow/slope end, and
   // the robot has no room to turn where it stands, so the fallback path
   // starts with a turn it cannot make. In run 4 a Bunker sent one in a
   // pocket got no valid trajectory from DWB three times and exploration was
@@ -2454,10 +2455,12 @@ std::string PlannerNode::buildLocalGraph() {
                            !mgg::roomToTurn(*map_, robot_params_, planning_params_,
                                             root_state, standing_on)));
   if (is_boxed_in) {
-    boxed_in = departBoxedIn(root_state, zone_escape ? "no admissible end outside no-go zones" : goes_nowhere
-                                             ? "its best path goes nowhere"
-                                             : "no path turns only where it "
-                                               "may");
+    const char* reason = zone_escape ? "no admissible end outside no-go zones"
+        : goes_nowhere ? "its best path goes nowhere"
+        : sel.best_path.empty() && sel.slope_ends_without_way_back > 0
+            ? "no narrow or slope end has a way back"
+            : "no path turns only where it may";
+    boxed_in = departBoxedIn(root_state, reason);
     // Sent as it is: not a lattice path, and the roadmap keeps no edge the
     // robot drives backwards.
     path_shortcut_from_ = static_cast<int>(best_path_.size());
@@ -2509,7 +2512,7 @@ std::string PlannerNode::buildLocalGraph() {
       "grid graph: %d free cells, %d vertices, %d edges%s%s; %d viewpoints, "
       "%d frontiers; best path %zu poses (%d lattice -> %d corners -> %d "
       "resampled), gain %.1f%s; viewpoint clearance: %d paths pulled back, "
-      "%d without%s, %d slope ends without a way back; sharp turns: %d "
+      "%d without%s, %d narrow/slope ends without a way back; sharp turns: %d "
       "paths refused (%d on a slope, %d "
       "without room)%s%s%s%s; "
       "heading %.2f rad%s",
@@ -3104,7 +3107,7 @@ bool PlannerNode::runGlobalPlanner(int target_id, std::string& reason,
       char why[224];
       std::snprintf(why, sizeof(why),
                     "%d global frontier(s), none reachable with gain (%d "
-                    "re-checked, %d demoted%s)",
+                    "own re-checked, %d demoted%s)",
                     report.frontiers, report.rechecked, report.demoted,
                     report.cut_short()
                         ? (", " + std::to_string(report.unchecked) +

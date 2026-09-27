@@ -1096,8 +1096,8 @@ GlobalFrontierReport searchGlobalFrontier(
     Vertex* frontier = order[i].frontier;
     const auto started = std::chrono::steady_clock::now();
     if (recompute_gain) recompute_gain(*frontier);
-    ++report.rechecked;
-    if (frontier->robot_id == robot_id) {
+    if (recompute_gain && frontier->robot_id == robot_id) {
+      ++report.rechecked;
       recheck_seconds += std::chrono::duration<double>(
           std::chrono::steady_clock::now() - started).count();
     }

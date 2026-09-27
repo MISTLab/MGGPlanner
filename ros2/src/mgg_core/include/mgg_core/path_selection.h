@@ -169,12 +169,12 @@ struct PathSelectionResult {
   /// path to the last vertex that passes, and those with none past the root.
   int paths_pulled_back = 0;
   int paths_without_clear_viewpoint = 0;
-  /// Path ends viewpoint_clear admitted on a slope but refused for having
-  /// no room to turn within kDepartureMaxM back along the path
+  /// Narrow or slope-exempt path ends refused for having no room to turn
+  /// within kDepartureMaxM back along the path
   /// (SlopeEndRetreat), counted once per candidate end.
   int slope_ends_without_way_back = 0;
-  /// No admissible path ended clear, so the best path was chosen without
-  /// the clearance check.
+  /// No admissible path ended clear, so the best fallback was chosen.
+  /// It still obeys slope_end_retreat when that check is provided.
   bool unclear_viewpoint = false;
   /// Candidate paths, as they are or pulled back, that failed
   /// `turns_admissible`.
@@ -261,26 +261,16 @@ class TurnBackHysteresis {
 /// `exclusion_radius` of an `excluded_endpoints` point are skipped; a path
 /// pulled back is checked where it now ends.
 ///
-/// With `viewpoint_clear`, a path whose leaf fails it ends at the last vertex
-/// along it that passes, and is scored up to there. With
-/// `slope_end_retreat`, an end it admits only on a slope must also have a
-/// way back along the path (SlopeEndRetreat), and so must the end of a path
-/// chosen with no path ending clear: that path is cut back to its last end
-/// with one, or is not chosen. Wherever a path ends, its leaf or a vertex
-/// it was cut back to, that end is held to what the leaf was: outside every
-/// reservation, the way back, not too steep, turning only where it may.
-/// The best path ending
-/// clear wins; only when there is none is the best path chosen without the
-/// check, flagged unclear_viewpoint, so that clearance never stops
-/// exploration where it would have gone on. A clear end within
-/// `goal_reach` of the root, or on a path leading to no gain, goes nowhere
-/// (pathGoesNowhere) and does not count as clear: at the mouth of a
-/// passage too narrow to end a path in, the path into it is chosen
-/// unclear, not the robot's own place. A clear end carrying no gain of its
-/// own is chosen when its path leads to gain, even when that gain lies at
-/// an end with no way back. With no whole path to a leaf outside every
-/// reservation that may be driven and has gain, and no clear end with gain
-/// of its own, no path is chosen.
+/// With `viewpoint_clear`, prefer an end that passes, cutting back when
+/// needed. With `slope_end_retreat`, a narrow or slope-exempt end may also
+/// compete if it has a bounded reverse way back (SlopeEndRetreat). This
+/// applies to every candidate end, including cutbacks and fallback: no room
+/// anywhere means no path, not an unchecked narrow-end fallback.
+/// Wherever a path ends, it must lie outside reservations and its path must
+/// be admissible. A clear end within `goal_reach` of the root or leading to
+/// no gain goes nowhere and does not count as clear. A gainless clear prefix
+/// may win if it leads to gain at an admissible leaf. Without a whole
+/// admissible path to gain or a clear end with gain, no path is chosen.
 ///
 /// With `turns_admissible` (PathTurnCheck), a candidate that fails it is not
 /// admissible, and outranks clearance: a path that turns only where it may

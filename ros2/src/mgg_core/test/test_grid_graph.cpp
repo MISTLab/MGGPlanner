@@ -894,7 +894,12 @@ TEST(GridGraph, HeadingAlignedBodyAndCrossNudgeEnterANarrowNorthPassage) {
     grid.min_val = Eigen::Vector3d::Zero();
     grid.max_val = Eigen::Vector3d(2.8, 0, 0);
     grid.resolution = Eigen::Vector3d::Constant(0.4);
-    buildGridGraph(graph, root, grid, ctx, M_PI / 2);
+    const auto result = buildGridGraph(graph, root, grid, ctx, M_PI / 2);
+    // Diagnostics count the eight nominal cells, not the retry offers.
+    EXPECT_LE(result.free_cells, 8);
+    int offers = result.merged_duplicates;
+    for (int count : result.rejected) offers += count;
+    EXPECT_LE(offers, 8);
     double reach = 0;
     for (const auto& entry : graph.vertices_map_)
       reach = std::max(reach, entry.second->state.y());
