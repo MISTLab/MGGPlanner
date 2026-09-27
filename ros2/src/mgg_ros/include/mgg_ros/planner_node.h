@@ -96,7 +96,7 @@ class PlannerNode : public rclcpp::Node {
 
   /// PlannerSrv status values beyond the FORWARD path. Negative so they
   /// cannot collide with the upstream constants.
-  static constexpr int kStatusNotReady = -1;      // no odometry or no map
+  static constexpr int kStatusNotReady = -1;      // waiting for inputs
   static constexpr int kStatusNoPath = -2;        // this cycle found none
   static constexpr int kStatusComplete = -3;      // nothing left to explore
 
@@ -297,9 +297,9 @@ class PlannerNode : public rclcpp::Node {
   /// neighbour; every kMinLength it is recorded and event E1 marks the
   /// roadmap around it visited.
   void ingestOdometryIntoGlobalGraph();
-  /// The root of the global graph is home: the first odometry, dropped onto
-  /// the terrain once the map shows ground under it; for a drone reported
-  /// landed then, aerial_home_height_m_ over it (home_seeded_landed_).
+  /// The root is home: the current odometry at seeding, dropped onto the
+  /// terrain once mapped. An aerial anchor waits for flight_state or its
+  /// timeout; only "landed" lifts it (home_seeded_landed_).
   void seedGlobalGraph();
   /// Replaces the global graph with one rebuilt from the robot's keyframe
   /// trajectory (mgg::rebuildRoadmapFromTrajectory), vertex 0 at its home
@@ -673,6 +673,11 @@ class PlannerNode : public rclcpp::Node {
   /// off to, where its flight links (drone scout Task 17, fix round 1).
   /// Zero: home is where the first odometry is.
   double aerial_home_height_m_ = 0.0;
+  /// With an aerial anchor, wait at most this many node-time seconds after
+  /// first odometry for flight_state. While pending, no planner work runs.
+  double aerial_home_state_wait_s_ = 5.0;
+  std::optional<rclcpp::Time> home_state_wait_started_;
+  rclcpp::TimerBase::SharedPtr home_state_wait_timer_;
   /// Home was seeded while flight_state was "landed" (a drone on its pad,
   /// with aerial_home_height_m_ set), so it is that high over the pose. The
   /// keyframe rebuild lifts its first keyframe on this decision alone.

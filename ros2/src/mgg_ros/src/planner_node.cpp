@@ -482,6 +482,13 @@ PlannerNode::PlannerNode(const rclcpp::NodeOptions& options)
   aerial_home_height_m_ = std::max(
       0.0, declareOrGet<double>(this, "aerial_home_height_m",
                                 aerial_home_height_m_));
+  aerial_home_state_wait_s_ = declareOrGet<double>(
+      this, "aerial_home_state_wait_s", aerial_home_state_wait_s_);
+  if (!std::isfinite(aerial_home_state_wait_s_) ||
+      aerial_home_state_wait_s_ < 0.0) {
+    throw std::invalid_argument(
+        "aerial_home_state_wait_s must be finite and non-negative");
+  }
   // The global graph lives only in memory: a restarted planner, or a robot
   // driven far off its graph, is left with a graph that cannot reach where
   // the robot is or home (run 5, 2026-09-25). It is rebuilt from the
@@ -1107,7 +1114,7 @@ void PlannerNode::onReleaseClaims(
 void PlannerNode::fleetTick(double now_s) {
   if (!fleet_) return;
   const std::lock_guard<std::recursive_mutex> lock(planner_mutex_);
-  if (!have_odometry_) return;
+  if (!have_odometry_ || home_state_wait_started_) return;
   auto map_read = mapReadLease();
   const mgg::FleetTickOutput out =
       fleet_->tick(now_s, [this]() { return ownTourBid(); },
@@ -1427,6 +1434,7 @@ void PlannerNode::onOdometry(nav_msgs::msg::Odometry::ConstSharedPtr msg) {
   auto map_read = mapReadLease();
   refreshMapRevision();
   seedGlobalGraph();
+  if (home_state_wait_started_) return;
   // On start, or after the graph was lost, it holds only its seed.
   if (ownGlobalVertices() <= 1) {
     rebuildGlobalGraphFromKeyframes(RoadmapRebuildTrigger::kSeedOnly,
@@ -1753,6 +1761,7 @@ mgg::ReceiverPlatform PlannerNode::receiverPlatform() const {
 
 mgg::MergeResult PlannerNode::mergeNeighbourRoadmap(
     const mgg::GraphExchange& incoming) {
+  if (home_state_wait_started_) return {};
   const mgg::ExpandContext ctx = makeContext();
   // The merge asks whether the robot could actually drive between two graphs
   // before joining them; that judgement needs the map, so it is injected.
@@ -1864,12 +1873,35 @@ void PlannerNode::onNeighbourGraph(mgg_msgs::msg::Graph::ConstSharedPtr msg) {
 void PlannerNode::seedGlobalGraph() {
   if (!have_odometry_) return;
   if (global_graph_->getNumVertices() == 0) {
+    if (robot_params_.type == mgg::RobotType::kAerialRobot &&
+        aerial_home_height_m_ > 0.0 && !latest_flight_state_) {
+      if (!home_state_wait_started_) home_state_wait_started_ = now();
+      if ((now() - *home_state_wait_started_).seconds() <
+          aerial_home_state_wait_s_) {
+        if (!home_state_wait_timer_ || home_state_wait_timer_->is_canceled()) {
+          home_state_wait_timer_ = create_timer(
+              std::chrono::duration<double>(aerial_home_state_wait_s_),
+              [this]() {
+                const std::lock_guard<std::recursive_mutex> lock(planner_mutex_);
+                auto map_read = mapReadLease();
+                seedGlobalGraph();
+              }, callback_group_);
+        }
+        return;
+      }
+      RCLCPP_WARN(get_logger(),
+                  "timed out waiting for %s after %.2f s; seeding home at "
+                  "the pose, unlifted",
+                  flight_state_sub_->get_topic_name(), aerial_home_state_wait_s_);
+    }
+    home_state_wait_started_.reset();
+    if (home_state_wait_timer_) home_state_wait_timer_->cancel();
     // A lone root is a landmark, not a traversability claim: capture it from
-    // the first odometry, before anything moves the robot away from home.
+    // the current odometry (after the bounded flight_state wait, if needed).
     // Until the map shows ground under it no edge attaches to it.
     // A drone SwarmDeck reports landed stands on its pad, where its box
     // meets the floor and no edge joins it: home is aerial_home_height_m
-    // over it, where it takes off to. Without that report (none yet, or a
+    // over it, where it takes off to. Without that report (timed out, or a
     // planner restarted in flight) home is where the drone is.
     home_seeded_landed_ =
         robot_params_.type == mgg::RobotType::kAerialRobot &&
@@ -1942,7 +1974,8 @@ bool PlannerNode::globalGraphReaches(const mgg::StateVec& state) const {
 bool PlannerNode::rebuildGlobalGraphFromKeyframes(
     RoadmapRebuildTrigger trigger, const char* why,
     const std::function<mgg::Vertex*(mgg::GraphManager&)>& link_what_failed) {
-  if (keyframe_source_ == nullptr || !have_mapping_snapshot_ ||
+  if (home_state_wait_started_ || keyframe_source_ == nullptr ||
+      !have_mapping_snapshot_ ||
       !map_->getStatus()) {
     return false;
   }
@@ -2169,7 +2202,7 @@ void PlannerNode::expandGlobalGraphTimerCallback() {
   const std::lock_guard<std::recursive_mutex> lock(planner_mutex_);
   auto map_read = mapReadLease();
   refreshMapRevision();
-  if (planner_trigger_count_ == 0) return;
+  if (planner_trigger_count_ == 0 || home_state_wait_started_) return;
   if (!have_odometry_ || !map_->getStatus()) return;
   // The sampler draws around the unvisited clusters of the global graph and
   // tests against the map and the robot's trail. When none of those changed
@@ -2443,6 +2476,7 @@ std::string PlannerNode::buildLocalGraph() {
   local_gain_remains_now_ = false;
   low_gain_path_now_ = false;
   if (!have_odometry_) return "no odometry received yet";
+  if (home_state_wait_started_) return "waiting for flight_state";
   if (!map_->getStatus()) {
     if (mola_map_ != nullptr) {
       const std::string detail = mola_map_->lastError();
@@ -3474,6 +3508,12 @@ void PlannerNode::onPlanRequest(
   lattice_path_.clear();
   withdrawUnplacedNeighbours();
   response->planning_bound_mode = request->bound_mode;
+  if (home_state_wait_started_) {
+    response->status = kStatusNotReady;
+    RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 5000,
+                         "plan request refused: waiting for flight_state");
+    return;
+  }
   if (!have_odometry_ || !map_->getStatus()) {
     response->status = kStatusNotReady;
     RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 5000,
@@ -3861,7 +3901,16 @@ void PlannerNode::onFlightReach(const std_msgs::msg::Float64::SharedPtr msg) {
 
 void PlannerNode::onFlightState(const std_msgs::msg::String::SharedPtr msg) {
   const std::lock_guard<std::recursive_mutex> lock(planner_mutex_);
-  latest_flight_state_ = msg->data;
+  if (home_state_wait_started_) {
+    auto map_read = mapReadLease();
+    // A late state must not lift home if the deadline passed before the
+    // timer callback could acquire the planner mutex.
+    seedGlobalGraph();
+    latest_flight_state_ = msg->data;
+    seedGlobalGraph();
+  } else {
+    latest_flight_state_ = msg->data;
+  }
 }
 
 std::vector<mgg::FrontierCluster> PlannerNode::insideExplorationRegion(
@@ -3934,6 +3983,11 @@ void PlannerNode::onObjectiveRequest(
       response->reason = "the requested map is not the one in service";
       return;
     }
+  }
+  if (home_state_wait_started_) {
+    response->status = Service::Response::BLOCKED;
+    response->reason = "waiting for flight_state";
+    return;
   }
   if (!have_odometry_ || !map_->getStatus()) {
     response->status = Service::Response::BLOCKED;

@@ -4760,9 +4760,11 @@ TEST_F(PlannerNodeTest, ARegionsLatticeUpdatesAnInsideFrontierByItsWholeView) {
 /// floor with observed air up to 2 m (or over a map that has seen nothing).
 std::shared_ptr<PlannerNode> droneOverAFloor(const std::string& name,
                                              double anchor,
-                                             bool observed = true) {
+                                             bool observed = true,
+                                             double wait_s = 5.0) {
   auto node = makeNode(name, "world",
-                       {rclcpp::Parameter("aerial_home_height_m", anchor)});
+                       {rclcpp::Parameter("aerial_home_height_m", anchor),
+                        rclcpp::Parameter("aerial_home_state_wait_s", wait_s)});
   PlannerNodeTestPeer::setAerialRobot(*node);
   if (observed) {
     PlannerNodeTestPeer::observeFloor(*node, -1.5, 6.0, -1.5, 1.5);
@@ -4770,6 +4772,148 @@ std::shared_ptr<PlannerNode> droneOverAFloor(const std::string& name,
                                         {7.5, 3.0, 1.6});
   }
   return node;
+}
+
+// Drive node time without sleeping through the home-state deadline. The timer
+// still runs through the executor, so odometry-only startup exercises its wakeup.
+void setHomeWaitNodeTime(PlannerNode& node, double seconds) {
+  auto* clock = node.get_clock()->get_clock_handle();
+  ASSERT_EQ(rcl_enable_ros_time_override(clock), RCL_RET_OK);
+  ASSERT_EQ(rcl_set_ros_time_override(
+                clock, static_cast<rcl_time_point_value_t>(seconds * 1e9)),
+            RCL_RET_OK);
+}
+
+TEST_F(PlannerNodeTest, ADroneWaitsForFlightStateAfterOdometryBeforeSeedingHome) {
+  // Seeding on odometry alone loses the anchor; treating every received state
+  // as landed instead would incorrectly lift an airborne restart.
+  for (const auto& [state, home_z] :
+       std::vector<std::pair<std::string, double>>{{"landed", 1.4},
+                                                   {"flying", 0.4},
+                                                   {"", 0.4}}) {
+    SCOPED_TRACE(state);
+    auto node = droneOverAFloor("drone_wait_for_state", 1.0);
+    setHomeWaitNodeTime(*node, 10.0);
+    PlannerNodeTestPeer::acceptOdometry(*node, odometryAt(0, 0, 0.075, 1));
+    EXPECT_EQ(PlannerNodeTestPeer::globalVertices(*node), 0);
+    setHomeWaitNodeTime(*node, 14.0);
+    PlannerNodeTestPeer::acceptOdometry(*node, odometryAt(0, 0, 0.4, 2));
+    EXPECT_EQ(PlannerNodeTestPeer::globalVertices(*node), 0);
+    PlannerNodeTestPeer::setFlightState(*node, state);
+    EXPECT_NEAR(PlannerNodeTestPeer::globalVertexState(*node, 0).z(), home_z,
+                1e-9);
+  }
+}
+
+TEST_F(PlannerNodeTest, ADroneSeedsUnliftedAndWarnsOnceWhenFlightStateTimesOut) {
+  // The default is five node-time seconds from first odometry, not startup,
+  // last odometry, or wall time. Also exercise a configured shorter wait.
+  for (const double wait_s : {5.0, 1.25}) {
+    SCOPED_TRACE(wait_s);
+    std::vector<rclcpp::Parameter> params{
+        rclcpp::Parameter("aerial_home_height_m", 1.0)};
+    if (wait_s != 5.0) {
+      params.emplace_back("aerial_home_state_wait_s", wait_s);
+    }
+    auto node = makeNode("drone_state_timeout", "world", params);
+    PlannerNodeTestPeer::setAerialRobot(*node);
+    setHomeWaitNodeTime(*node, 100.0);
+    rclcpp::executors::SingleThreadedExecutor executor;
+    executor.add_node(node);
+    testing::internal::CaptureStderr();
+    PlannerNodeTestPeer::acceptOdometry(*node, odometryAt(0, 0, 0.075, 1));
+    EXPECT_EQ(PlannerNodeTestPeer::globalVertices(*node), 0);
+    setHomeWaitNodeTime(*node, 100.0 + wait_s - 0.01);
+    executor.spin_some();
+    EXPECT_EQ(PlannerNodeTestPeer::globalVertices(*node), 0);
+    setHomeWaitNodeTime(*node, 100.0 + wait_s);
+    executor.spin_some();
+    EXPECT_NEAR(PlannerNodeTestPeer::globalVertexState(*node, 0).z(), 0.075,
+                1e-9);
+    setHomeWaitNodeTime(*node, 110.0);
+    executor.spin_some();
+    PlannerNodeTestPeer::setFlightState(*node, "landed");
+    PlannerNodeTestPeer::acceptOdometry(*node, odometryAt(0, 0, 0.4, 2));
+    EXPECT_NEAR(PlannerNodeTestPeer::globalVertexState(*node, 0).z(), 0.075,
+                1e-9);
+    const std::string log = testing::internal::GetCapturedStderr();
+    const auto warning = log.find("timed out waiting for");
+    EXPECT_NE(warning, std::string::npos) << log;
+    if (warning != std::string::npos) {
+      EXPECT_NE(log.substr(warning).find("/flight_state"), std::string::npos);
+      EXPECT_NE(log.rfind("WARN", warning), std::string::npos);
+      EXPECT_EQ(log.find("timed out waiting for", warning + 1), std::string::npos);
+    }
+  }
+}
+
+TEST_F(PlannerNodeTest, ALandedStateAfterTheDeadlineCannotBeatTheTimeoutCallback) {
+  auto node = droneOverAFloor("drone_late_state_before_timer", 1.0);
+  setHomeWaitNodeTime(*node, 10.0);
+  PlannerNodeTestPeer::acceptOdometry(*node, odometryAt(0, 0, 0.4, 1));
+  setHomeWaitNodeTime(*node, 15.0);
+  // Deliberately do not spin the executor: the state handler wins the mutex,
+  // but arrived too late to lift home.
+  PlannerNodeTestPeer::setFlightState(*node, "landed");
+  EXPECT_NEAR(PlannerNodeTestPeer::globalVertexState(*node, 0).z(), 0.4, 1e-9);
+}
+
+TEST_F(PlannerNodeTest, TheHomeFlightStateWaitMustBeFiniteAndNonNegative) {
+  for (const double wait_s : {-1.0, std::nan(""),
+                              std::numeric_limits<double>::infinity()}) {
+    EXPECT_THROW(makeNode("invalid_home_state_wait", "world",
+                          {rclcpp::Parameter("aerial_home_state_wait_s", wait_s)}),
+                 std::invalid_argument);
+  }
+}
+
+TEST_F(PlannerNodeTest, RobotsWithoutAnAerialAnchorSeedWithoutFlightState) {
+  for (const bool aerial : {false, true}) {
+    SCOPED_TRACE(aerial);
+    auto node = makeNode("no_anchor_wait", "world",
+                        {rclcpp::Parameter("aerial_home_height_m",
+                                            aerial ? 0.0 : 1.0)});
+    if (aerial) PlannerNodeTestPeer::setAerialRobot(*node);
+    PlannerNodeTestPeer::acceptOdometry(*node, odometryAt(0, 0, 0.075, 1));
+    EXPECT_EQ(PlannerNodeTestPeer::globalVertices(*node), 1);
+    EXPECT_TRUE(PlannerNodeTestPeer::globalVertexState(*node, 0).allFinite());
+    if (aerial) {
+      EXPECT_NEAR(PlannerNodeTestPeer::globalVertexState(*node, 0).z(), 0.075,
+                  1e-9);
+    }
+  }
+}
+
+TEST_F(PlannerNodeTest, PlanRequestsDoNotPlanWhileWaitingForFlightState) {
+  auto node = droneOverAFloor("drone_wait_plan", 1.0);
+  PlannerNodeTestPeer::serveMap(*node, "component:test", 0);
+  auto source = std::make_unique<TrajectoryInMemory>();
+  source->trajectory = keyframesAlongX(0.0, 4.0);
+  PlannerNodeTestPeer::setKeyframeSource(*node, std::move(source));
+  setHomeWaitNodeTime(*node, 10.0);
+  PlannerNodeTestPeer::acceptOdometry(*node, odometryAt(0, 0, 0.4, 1));
+  auto plan = std::make_shared<mgg_msgs::srv::PlannerSrv::Response>();
+  testing::internal::CaptureStderr();
+  PlannerNodeTestPeer::plan(*node, plan);
+  const std::string log = testing::internal::GetCapturedStderr();
+  EXPECT_EQ(plan->status, PlannerNode::kStatusNotReady);
+  EXPECT_TRUE(plan->path.empty());
+  EXPECT_NE(log.find("waiting for flight_state"), std::string::npos) << log;
+  for (const auto objective : {mgg_msgs::srv::PlanObjective::Request::NAVIGATE,
+                               mgg_msgs::srv::PlanObjective::Request::RETURN_HOME}) {
+    auto request = std::make_shared<mgg_msgs::srv::PlanObjective::Request>();
+    request->objective = objective;
+    request->goal.position.x = 1.0;
+    request->goal.position.z = 0.4;
+    request->goal.orientation.w = 1.0;
+    auto route = std::make_shared<mgg_msgs::srv::PlanObjective::Response>();
+    PlannerNodeTestPeer::objective(*node, request, route);
+    EXPECT_EQ(route->status, mgg_msgs::srv::PlanObjective::Response::BLOCKED);
+    EXPECT_TRUE(route->path.empty());
+    EXPECT_EQ(route->reason, "waiting for flight_state");
+  }
+  EXPECT_EQ(PlannerNodeTestPeer::globalVertices(*node), 0);
+  EXPECT_EQ(PlannerNodeTestPeer::roadmapRebuilds(*node), 0);
 }
 
 TEST_F(PlannerNodeTest, ADronesPadStartAnchorsHomeWhereItFliesSoReachIsUsable) {
@@ -4814,7 +4958,8 @@ TEST_F(PlannerNodeTest, ADronesHomeIsLiftedOnlyWhenSwarmDeckSaysItIsLanded) {
   // over the floor, or standing where the map has seen nothing, gave no
   // evidence of the pad and had its home lifted into the air. Only the
   // flight state SwarmDeck publishes, landed when home is seeded, lifts
-  // it; without one, or with any other, home is where the drone is.
+  // it; after a zero-length wait without one, or with any other state,
+  // home is where the drone is.
   struct Case {
     const char* name;
     std::optional<std::string> state;
@@ -4833,14 +4978,14 @@ TEST_F(PlannerNodeTest, ADronesHomeIsLiftedOnlyWhenSwarmDeckSaysItIsLanded) {
   for (const Case& c : cases) {
     SCOPED_TRACE(c.name);
     auto node = droneOverAFloor(std::string("drone_home_") + c.name, 1.0,
-                                c.observed);
+                                c.observed, 0.0);
     if (c.state) PlannerNodeTestPeer::setFlightState(*node, *c.state);
     PlannerNodeTestPeer::acceptOdometry(*node, odometryAt(0.0, 0.0, c.z, 1));
     EXPECT_NEAR(PlannerNodeTestPeer::globalVertexState(*node, 0).z(),
                 c.z + (c.lifted ? 1.0 : 0.0), 1e-9);
   }
   // Landed reported after home was seeded lifts nothing afterwards.
-  auto late = droneOverAFloor("drone_home_landed_late", 1.0);
+  auto late = droneOverAFloor("drone_home_landed_late", 1.0, true, 0.0);
   PlannerNodeTestPeer::acceptOdometry(*late, odometryAt(0.0, 0.0, 0.075, 1));
   PlannerNodeTestPeer::setFlightState(*late, "landed");
   PlannerNodeTestPeer::acceptOdometry(*late, odometryAt(0.0, 0.0, 0.075, 2));
