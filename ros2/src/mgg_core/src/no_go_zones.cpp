@@ -44,40 +44,49 @@ bool NoGoZones::inside(const Eigen::Vector3d& p) const {
                      });
 }
 
-std::uint64_t NoGoZones::departing(const Eigen::Vector3d& p) const {
-  std::uint64_t mask = 0;
-  for (std::size_t z = 0; z < centres_.size() && z < 64; ++z) {
-    if ((p.head<2>() - centres_[z]).norm() < reach_) mask |= 1ull << z;
+NoGoZones::Departing NoGoZones::departing(const Eigen::Vector3d& p) const {
+  Departing zones;
+  for (std::size_t z = 0; z < centres_.size(); ++z) {
+    if ((p.head<2>() - centres_[z]).norm() < reach_) {
+      zones.push_back(static_cast<int>(z));
+    }
   }
-  return mask;
+  return zones;
 }
 
 bool NoGoZones::step(const Eigen::Vector3d& a3, const Eigen::Vector3d& b3,
-                     std::uint64_t& departing) const {
+                     Departing& departing) const {
   const Eigen::Vector2d a = a3.head<2>();
   const Eigen::Vector2d b = b3.head<2>();
-  std::uint64_t next = departing;
-  for (std::size_t z = 0; z < centres_.size(); ++z) {
-    const Eigen::Vector2d& c = centres_[z];
-    const bool leaving = z < 64 && (departing & (1ull << z)) != 0;
-    if (leaving) {
-      // Monotonic outward: the segment is nearest the centre at its start.
-      if (nearestFraction(a, b, c) > kEps &&
-          nearestDistance(a, b, c) < (a - c).norm() - kEps) {
-        return false;
-      }
-      if ((b - c).norm() >= reach_) next &= ~(1ull << z);
-      continue;
+  // The zones being departed, checked by their own rule, and those still
+  // departed at b.
+  Departing next;
+  next.reserve(departing.size());
+  for (const int z : departing) {
+    const Eigen::Vector2d& c = centres_[static_cast<std::size_t>(z)];
+    // Monotonic outward: the segment is nearest the centre at its start.
+    if (nearestFraction(a, b, c) > kEps &&
+        nearestDistance(a, b, c) < (a - c).norm() - kEps) {
+      return false;
     }
-    if (nearestDistance(a, b, c) < reach_) return false;
+    if ((b - c).norm() < reach_) next.push_back(z);
   }
-  departing = next;
+  // Every other zone is blocked.
+  auto leaving = departing.begin();
+  for (std::size_t z = 0; z < centres_.size(); ++z) {
+    while (leaving != departing.end() && *leaving < static_cast<int>(z)) {
+      ++leaving;
+    }
+    if (leaving != departing.end() && *leaving == static_cast<int>(z)) continue;
+    if (nearestDistance(a, b, centres_[z]) < reach_) return false;
+  }
+  departing.swap(next);
   return true;
 }
 
 bool NoGoZones::pathAdmissible(const std::vector<Eigen::Vector3d>& path) const {
   if (centres_.empty() || path.empty()) return true;
-  std::uint64_t leaving = departing(path.front());
+  Departing leaving = departing(path.front());
   for (std::size_t i = 1; i < path.size(); ++i) {
     if (!step(path[i - 1], path[i], leaving)) return false;
   }
@@ -120,19 +129,19 @@ std::vector<Vertex*> zoneRespectingRoute(GraphManager& graph, int source_id,
   if (source == nullptr || target == nullptr || zones.inside(target->state.head<3>())) {
     return {};
   }
-  std::uint64_t first = zones.departing(start);
+  NoGoZones::Departing first = zones.departing(start);
   if ((source->state.head<3>() - start).norm() > 1e-9 &&
       !zones.step(start, source->state.head<3>(), first)) {
     return {};
   }
   struct State {
     int at;
-    std::uint64_t leaving;
+    NoGoZones::Departing leaving;
     double cost;
     int parent;  // index into states, -1 at the source
   };
   std::vector<State> states{{source_id, first, 0.0, -1}};
-  std::map<std::pair<int, std::uint64_t>, std::size_t> index{
+  std::map<std::pair<int, NoGoZones::Departing>, std::size_t> index{
       {{source_id, first}, 0}};
   std::vector<bool> settled{false};
   using Entry = std::pair<double, std::size_t>;
@@ -143,7 +152,7 @@ std::vector<Vertex*> zoneRespectingRoute(GraphManager& graph, int source_id,
     open.pop();
     if (settled[si] || cost > states[si].cost) continue;
     settled[si] = true;
-    const State s = states[si];
+    const State s = states[si];  // a copy: states grows below
     if (s.at == target_id) {
       std::vector<Vertex*> route;
       for (int k = static_cast<int>(si); k >= 0; k = states[k].parent) {
@@ -161,7 +170,7 @@ std::vector<Vertex*> zoneRespectingRoute(GraphManager& graph, int source_id,
           !graph.graph_->edgeExists(s.at, w)) {
         continue;
       }
-      std::uint64_t leaving = s.leaving;
+      NoGoZones::Departing leaving = s.leaving;
       if (!zones.step(u->state.head<3>(), v->state.head<3>(), leaving)) {
         continue;
       }

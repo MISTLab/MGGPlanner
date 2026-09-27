@@ -6,7 +6,6 @@
 #ifndef MGG_CORE_NO_GO_ZONES_H_
 #define MGG_CORE_NO_GO_ZONES_H_
 
-#include <cstdint>
 #include <vector>
 
 #include <Eigen/Dense>
@@ -42,15 +41,21 @@ class NoGoZones {
   bool blocksEdge(const Eigen::Vector3d& a, const Eigen::Vector3d& b,
                   const Eigen::Vector3d& robot) const;
 
-  /// The zones `p` lies within reach of, as a bit per zone (the first 64
-  /// zones; a later one is never taken as departed from).
-  std::uint64_t departing(const Eigen::Vector3d& p) const;
+  /// The zones a path is still departing, by index in centres(), in
+  /// increasing order. Only zones holding the path's start are ever in it,
+  /// so it is short whatever the number of zones; every other zone is
+  /// simply blocked (review r2, R2-1: a 64-bit mask left the 65th zone and
+  /// beyond undepartable).
+  using Departing = std::vector<int>;
+  /// The zones `p` lies within reach of: a path starting at `p` departs
+  /// them.
+  Departing departing(const Eigen::Vector3d& p) const;
   /// One segment of a path driven from `a` to `b` under pathAdmissible's
   /// rule, with `departing` the zones the path is still leaving: false
   /// when the segment is refused, else `departing` becomes the zones it is
   /// still leaving at `b`.
   bool step(const Eigen::Vector3d& a, const Eigen::Vector3d& b,
-            std::uint64_t& departing) const;
+            Departing& departing) const;
 
  private:
   std::vector<Eigen::Vector2d> centres_;

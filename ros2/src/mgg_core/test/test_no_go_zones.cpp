@@ -3,6 +3,7 @@
 // disabled it for the whole route; only a monotonic outward departure is
 // allowed, and the zone is enforced after it.
 
+#include <algorithm>
 #include <vector>
 
 #include <gtest/gtest.h>
@@ -134,6 +135,75 @@ TEST(NoGoZones, TheZoneRespectingSearchFindsTheRouteThatDoesNotReEnter) {
   // With A-C gone, nothing is admissible: no route.
   graph.removeEdge(a, c);
   EXPECT_TRUE(mgg::zoneRespectingRoute(graph, 0, 3, robot, zones).empty());
+}
+
+// Review r2, R2-1: departures were tracked for the first 64 zones only, so
+// a start inside the 65th could not depart it, not even straight out.
+TEST(NoGoZones, ADepartureFromTheSixtyFifthZoneIsAdmissible) {
+  std::vector<Eigen::Vector2d> centres;
+  for (int i = 0; i < 64; ++i) centres.emplace_back(100.0 + 5.0 * i, 100.0);
+  centres.emplace_back(0.0, 0.0);
+  NoGoZones zones;
+  zones.set(centres, 1.0);
+  EXPECT_TRUE(zones.pathAdmissible(path({{0.5, 0}, {2, 0}})));
+  EXPECT_FALSE(zones.pathAdmissible(path({{0.5, 0}, {-2, 0}})));
+  // The search departs it too.
+  mgg::GraphManager graph;
+  graph.addVertex(new mgg::Vertex(0, mgg::StateVec(0.5, 0.0, 0.0, 0.0)));
+  graph.addVertex(new mgg::Vertex(1, mgg::StateVec(2.0, 0.0, 0.0, 0.0)));
+  graph.addEdge(graph.getVertex(0), graph.getVertex(1), 1.5);
+  EXPECT_EQ(mgg::zoneRespectingRoute(graph, 0, 1, {0.5, 0.0, 0.0}, zones).size(),
+            2u);
+}
+
+// Review r2, R2-1: what a path may do does not depend on the order the
+// zones were given in.
+TEST(NoGoZones, AdmissibilityDoesNotDependOnTheZonesOrder) {
+  std::vector<Eigen::Vector2d> centres;
+  for (int i = 0; i < 70; ++i) centres.emplace_back(10.0 + 3.0 * i, 3.0 * (i % 5));
+  centres.emplace_back(0.0, 0.0);
+  centres.emplace_back(0.6, 0.0);
+  const std::vector<std::vector<Eigen::Vector3d>> paths = {
+      path({{0.3, 0}, {0.3, 3}}),
+      path({{0.3, 0}, {-3, 0}}),
+      path({{0.3, 0}, {3, 0}}),
+      path({{0.3, 0}, {0.3, 3}, {3, 3}, {3, 0.5}, {1.4, 0.5}}),
+      path({{-5, 5}, {5, 5}}),
+      path({{-5, 0}, {5, 0}}),
+      path({{12, 3}, {12, 6}}),
+  };
+  std::vector<bool> expected;
+  NoGoZones zones;
+  zones.set(centres, 1.0);
+  for (const auto& p : paths) expected.push_back(zones.pathAdmissible(p));
+  for (int order = 0; order < 3; ++order) {
+    std::vector<Eigen::Vector2d> shuffled = centres;
+    if (order == 0) std::reverse(shuffled.begin(), shuffled.end());
+    if (order == 1) std::rotate(shuffled.begin(), shuffled.begin() + 35, shuffled.end());
+    if (order == 2) std::rotate(shuffled.begin(), shuffled.begin() + 71, shuffled.end());
+    NoGoZones other;
+    other.set(shuffled, 1.0);
+    for (std::size_t k = 0; k < paths.size(); ++k) {
+      EXPECT_EQ(other.pathAdmissible(paths[k]), expected[k])
+          << "order " << order << ", path " << k;
+    }
+  }
+}
+
+// Review r2, R2-1: a start inside two overlapping zones departs both,
+// moving away from each centre; moving toward either is refused, and so is
+// coming back into either once out.
+TEST(NoGoZones, AStartInsideTwoOverlappingZonesDepartsBoth) {
+  NoGoZones zones;
+  zones.set({Eigen::Vector2d(0.0, 0.0), Eigen::Vector2d(0.6, 0.0)}, 1.0);
+  EXPECT_TRUE(zones.pathAdmissible(path({{0.3, 0}, {0.3, 3}})));
+  // West: away from (0.6, 0), but across (0, 0)'s centre.
+  EXPECT_FALSE(zones.pathAdmissible(path({{0.3, 0}, {-3, 0}})));
+  // East: across (0.6, 0)'s centre.
+  EXPECT_FALSE(zones.pathAdmissible(path({{0.3, 0}, {3, 0}})));
+  EXPECT_FALSE(zones.pathAdmissible(
+      path({{0.3, 0}, {0.3, 3}, {3, 3}, {3, 0.5}, {1.4, 0.5}})));
+  EXPECT_TRUE(zones.pathAdmissible(path({{0.3, 0}, {0.3, 3}, {3, 3}, {3, 2}})));
 }
 
 }  // namespace
