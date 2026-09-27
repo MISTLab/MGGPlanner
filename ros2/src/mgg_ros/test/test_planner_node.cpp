@@ -3819,6 +3819,52 @@ TEST_F(PlannerNodeTest, APeersBidJoinsTheGroupOnlyWithATransformToIt) {
             (std::vector<int>{1, 2}));
 }
 
+TEST_F(PlannerNodeTest, ALeavingBidReleasesClaimsOnlyWithinRadioRange) {
+  for (const bool initially_in_range : {true, false}) {
+    SCOPED_TRACE(initially_in_range);
+    TwoPlanners fleet("fleet_leave_range");
+    PlannerNodeTestPeer::receiveTransform(*fleet.a, "robot_0/odom",
+                                          "robot_1/odom", 5.0, 0.0);
+    PlannerNodeTestPeer::setCommunicationRange(*fleet.a, 10.0);
+    mgg::TourBidData bid;
+    bid.robot_id = 2;
+    bid.seq = 1;
+    bid.stamp_s = fleet.a->now().seconds();
+    bid.speed_mps = 1.0;
+    bid.pose = mgg::StateVec(4, 0, 0, 0);  // transformed x = 9, within range
+    bid.clusters = {{77, 2, Eigen::Vector3d(5, 0, 0), 1000.0}};
+    bid.costs_from_pose = {1.0};
+    bid.costs_between = {0.0};
+    bid.bundle = {77};
+    PlannerNodeTestPeer::receiveTourBid(*fleet.a,
+                                        toTourBidMsg(bid, "robot_1/odom"));
+    ASSERT_EQ(PlannerNodeTestPeer::fleetExclusions(*fleet.a).size(), 1u);
+    ASSERT_EQ(PlannerNodeTestPeer::fleetGroup(*fleet.a),
+              (std::vector<int>{1, 2}));
+
+    mgg::TourBidData leaving;
+    leaving.robot_id = 2;
+    leaving.seq = 2;
+    leaving.stamp_s = bid.stamp_s;
+    leaving.leaving = true;
+    leaving.pose = mgg::StateVec(initially_in_range ? 4 : 6, 0, 0, 0);
+    PlannerNodeTestPeer::receiveTourBid(*fleet.a,
+        toTourBidMsg(leaving, "robot_1/odom"));
+    if (!initially_in_range) {
+      EXPECT_EQ(PlannerNodeTestPeer::fleetExclusions(*fleet.a).size(), 1u);
+      EXPECT_EQ(PlannerNodeTestPeer::fleetGroup(*fleet.a),
+                (std::vector<int>{1, 2}));
+      // A periodic exit is heard after returning into range.
+      leaving.seq = 3;
+      leaving.pose[0] = 4;
+      PlannerNodeTestPeer::receiveTourBid(*fleet.a,
+          toTourBidMsg(leaving, "robot_1/odom"));
+    }
+    EXPECT_TRUE(PlannerNodeTestPeer::fleetExclusions(*fleet.a).empty());
+    EXPECT_EQ(PlannerNodeTestPeer::fleetGroup(*fleet.a), std::vector<int>{1});
+  }
+}
+
 TEST_F(PlannerNodeTest, AMalformedBidIsIgnored) {
   // Review Focus 1: one cost more than the bid has clusters.
   TwoPlanners fleet("fleet_malformed");

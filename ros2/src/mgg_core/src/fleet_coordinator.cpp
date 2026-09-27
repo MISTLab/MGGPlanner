@@ -103,7 +103,31 @@ void FleetCoordinator::noteHeard(int robot_id, double now_s) {
 
 void FleetCoordinator::onBid(const TourBidData& bid, double now_s) {
   rebaseFutureTimes(now_s);
-  if (bid.robot_id == robot_id_ || !bid.wellFormed()) return;
+  if (bid.robot_id == robot_id_) return;
+  const BidOrder order{bid.stamp_s, bid.seq};
+  const auto away = away_.find(bid.robot_id);
+  if (bid.leaving) {
+    if (bid.robot_id < 0 || bid.seq == 0 || !bid.pose.allFinite()) return;
+    const auto normal = last_normal_bid_.find(bid.robot_id);
+    if (normal != last_normal_bid_.end() && order < normal->second) return;
+    if (away != away_.end() && order <= away->second) return;
+    away_[bid.robot_id] = order;
+    last_heard_s_.erase(bid.robot_id);
+    last_bids_.erase(bid.robot_id);
+    follows_.erase(bid.robot_id);
+    if (claims_.release(bid.robot_id)) ++assignment_version_;
+    if (collecting_) collecting_->bids.erase(bid.robot_id);
+    return;
+  }
+  if (!bid.wellFormed()) return;
+  if (away != away_.end()) {
+    if (order <= away->second) return;
+    away_.erase(away);
+  }
+  const auto normal = last_normal_bid_.find(bid.robot_id);
+  if (normal == last_normal_bid_.end() || order > normal->second) {
+    last_normal_bid_[bid.robot_id] = order;
+  }
   noteHeard(bid.robot_id, now_s);
   follows_[bid.robot_id] = bid.auctioneer_id;
   recordBidClaim(bid, now_s);
@@ -184,7 +208,8 @@ void FleetCoordinator::noteReportedExplored(
 
 void FleetCoordinator::onAward(const TourAwardData& award, double now_s) {
   rebaseFutureTimes(now_s);
-  if (award.auctioneer_id == robot_id_ || !award.wellFormed()) return;
+  if (leaving_ || away_.count(award.auctioneer_id) > 0 ||
+      award.auctioneer_id == robot_id_ || !award.wellFormed()) return;
   noteHeard(award.auctioneer_id, now_s);
   follows_[award.auctioneer_id] = award.auctioneer_id;
   // A robot that left the sender's group, or whose group just merged with a
@@ -208,6 +233,7 @@ void FleetCoordinator::onAward(const TourAwardData& award, double now_s) {
 }
 
 void FleetCoordinator::requestAuction() {
+  if (leaving_) return;
   requested_ = true;
   request_sent_ = false;
   answered_ = false;
@@ -233,6 +259,21 @@ FleetTickOutput FleetCoordinator::tick(double now_s, const OwnBidFn& own_bid,
   bool claims_changed = !claims_.expire(now_s, params_.claim_ttl_s).empty();
   if (explored && claims_.dropExplored(explored) > 0) claims_changed = true;
   if (claims_changed) ++assignment_version_;
+
+  if (leaving_) {
+    if (!leave_announced_ || now_s - last_bid_s_ >= params_.auction_interval_s) {
+      TourBidData bid;
+      bid.robot_id = robot_id_;
+      bid.seq = ++seq_;
+      bid.stamp_s = now_s;
+      bid.pose = own_bid().pose;
+      bid.leaving = true;
+      out.bid = std::move(bid);
+      last_bid_s_ = now_s;
+      leave_announced_ = true;
+    }
+    return out;
+  }
 
   const std::vector<int> members = group(now_s);
   const int elected = auctioneer(now_s);
@@ -514,6 +555,7 @@ void FleetCoordinator::applyAward(const TourAwardData& award, double now_s) {
     claim_stamp_s_[robot_id] = award.stamp_s;
   }
   for (const RobotBundle& bundle : award.bundles) {
+    if (away_.count(bundle.robot_id) > 0) continue;
     std::vector<FleetCluster> clusters;
     for (const ClusterId id : bundle.clusters) {
       if (id == kNoCluster) continue;
@@ -645,6 +687,24 @@ std::set<ClusterId> FleetCoordinator::poolSignature(
     for (const FleetCluster& c : bid->second.clusters) ids.insert(c.id);
   }
   return ids;
+}
+
+void FleetCoordinator::leave(double) {
+  leaving_ = true;
+  leave_announced_ = false;
+  bundle_.clear();
+  has_award_ = false;
+  requested_ = false;
+  collecting_.reset();
+  called_round_.reset();
+  ++assignment_version_;
+}
+
+void FleetCoordinator::rejoin() {
+  if (!leaving_) return;
+  leaving_ = false;
+  last_bid_s_ = kNever;
+  ++assignment_version_;
 }
 
 }  // namespace mgg

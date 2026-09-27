@@ -99,6 +99,7 @@ mgg::TourBidData fromTourBidMsg(const mgg_msgs::msg::TourBid& msg,
   bid.bundle.assign(msg.bundle.begin(), msg.bundle.end());
   bid.explored.assign(msg.explored.begin(), msg.explored.end());
   bid.request_auction = msg.request_auction;
+  bid.leaving = msg.leaving;
   bid.speed_mps = msg.speed_mps;
   bid.reach_m = msg.reach_m;
   bid.home = t_ours_theirs *
@@ -125,6 +126,7 @@ mgg_msgs::msg::TourBid toTourBidMsg(const mgg::TourBidData& bid,
   msg.bundle.assign(bid.bundle.begin(), bid.bundle.end());
   msg.explored.assign(bid.explored.begin(), bid.explored.end());
   msg.request_auction = bid.request_auction;
+  msg.leaving = bid.leaving;
   msg.speed_mps = bid.speed_mps;
   msg.reach_m = bid.reach_m;
   msg.home.x = bid.home.x();

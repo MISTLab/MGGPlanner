@@ -190,6 +190,7 @@ TEST(FleetConversions, UnrepresentableStampsBecomeZero) {
 
 TEST(FleetConversions, ADronesSpeedReachAndHomeTravelWithTheBid) {
   TourBidData bid = sampleBid();
+  bid.leaving = true;
   bid.speed_mps = 4.0;
   bid.reach_m = 250.0;
   bid.home = Eigen::Vector3d(1.0, 0.0, 0.0);
@@ -197,6 +198,7 @@ TEST(FleetConversions, ADronesSpeedReachAndHomeTravelWithTheBid) {
   t_ours_theirs.translation() = Eigen::Vector3d(5.0, 0.0, 0.0);
   const TourBidData out = mgg_ros::fromTourBidMsg(
       mgg_ros::toTourBidMsg(bid, "robot_4/odom"), t_ours_theirs);
+  EXPECT_TRUE(out.leaving);
   EXPECT_EQ(out.speed_mps, 4.0);
   EXPECT_EQ(out.reach_m, 250.0);
   EXPECT_TRUE(out.home.isApprox(Eigen::Vector3d(6.0, 0.0, 0.0)));

@@ -36,6 +36,7 @@
 #include <optional>
 #include <set>
 #include <vector>
+#include <utility>
 
 #include "mgg_core/fleet_auction.h"
 #include "mgg_core/fleet_claims.h"
@@ -82,6 +83,14 @@ class FleetCoordinator {
   /// it reports explored are kept for this robot's next auction (at most
   /// kMaxExploredElsewhere, the oldest go); one the last award named makes
   /// an auction due.
+  /// An exit needs robot_id >= 0, seq > 0 and a finite pose, not a tour.
+  /// It releases membership and claims immediately. Around exits, bids
+  /// are ordered by (sender stamp, seq): only a strictly newer normal bid
+  /// rejoins, including a restarted sender with a lower seq and later stamp.
+  /// An exit older than the latest normal bid is ignored. Between normal
+  /// bids the existing timestamp-based claim policy is unchanged.
+  /// While a peer is away, its calls/awards and claims in others' awards
+  /// cannot restore it. Ordering assumes the sender clock has not reset.
   void onBid(const TourBidData& bid, double now_s);
   /// A peer's call or award, in this robot's frame. A malformed one (a
   /// non-finite position, a non-finite or negative silence, a bundle ID no
@@ -123,6 +132,14 @@ class FleetCoordinator {
   /// longest is released so this robot may take its clusters over. Returns
   /// that robot's ID, or -1 when no silent robot holds one.
   int takeOverOldestClaim(double now_s);
+
+  /// Drop the local award and stop bidding/auctioneering until rejoin().
+  /// Announce the exit on the next tick and every auction interval, using
+  /// the own-bid provider's current pose for the radio-range check.
+  void leave(double now_s);
+  /// Resume bidding at the next tick, without waiting an auction interval.
+  void rejoin();
+  bool leaving() const { return leaving_; }
 
   /// This robot and every robot heard within fleet.peer_timeout_s, sorted.
   /// A robot last heard after `now_s` (the clock was reset) counts as just
@@ -207,6 +224,9 @@ class FleetCoordinator {
 
   std::map<int, double> last_heard_s_;
   std::map<int, TourBidData> last_bids_;
+  using BidOrder = std::pair<double, std::uint64_t>;
+  std::map<int, BidOrder> last_normal_bid_;
+  std::map<int, BidOrder> away_;
   // The auctioneer each robot's latest bid, call or award names.
   std::map<int, int> follows_;
   // Per robot, the stamp of the claim's latest state: the bid or award it
@@ -264,6 +284,8 @@ class FleetCoordinator {
   std::vector<ClusterId> reported_explored_;
   bool explored_reported_ = false;
   std::vector<int> pending_releases_;
+  bool leaving_ = false;
+  bool leave_announced_ = false;
 };
 
 }  // namespace mgg

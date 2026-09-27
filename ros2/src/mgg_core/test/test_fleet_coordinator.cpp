@@ -1428,6 +1428,180 @@ TEST(FleetCoordinator, WithoutAnOwnBidProviderNothingIsSent) {
   EXPECT_TRUE(out.bid->wellFormed());
 }
 
+TEST(FleetCoordinator, ALandingDroneLeavesAndItsClaimsAreReleasedAtOnce) {
+  const FleetParams params;
+  SimRobot lead(1, 40.0, 0.0, params), drone(2, 0.0, 0.0, params);
+  drone.known = {cluster(77, 2, 5.0)};
+  Radio radio{{&lead, &drone}};
+  double now = 0.0;
+  radio.runUntil(now, 6.0);
+  ASSERT_TRUE(drone.coordinator->hasAward());
+  ASSERT_EQ(idsOf(drone.coordinator->bundle()), (std::vector<ClusterId>{77}));
+  ASSERT_EQ(lead.coordinator->claimedByOthers(now).size(), 1u);
+
+  drone.coordinator->leave(now);
+  EXPECT_TRUE(drone.coordinator->leaving());
+  EXPECT_FALSE(drone.coordinator->hasAward());
+  EXPECT_TRUE(drone.coordinator->bundle().empty());
+  radio.step(now + 0.1);
+  EXPECT_EQ(lead.coordinator->group(now + 0.1), std::vector<int>{1});
+  EXPECT_TRUE(lead.coordinator->claimedByOthers(now + 0.1).empty());
+
+  drone.coordinator->rejoin();
+  radio.step(now + 0.2);
+  ASSERT_FALSE(radio.bids.empty());
+  EXPECT_EQ(radio.bids.back().first, now + 0.2);
+  EXPECT_FALSE(radio.bids.back().second.leaving);
+  EXPECT_EQ(lead.coordinator->group(now + 0.2), (std::vector<int>{1, 2}));
+}
+
+TEST(FleetCoordinator, ALeavingDroneReannouncesWithItsPoseAndNoTour) {
+  const FleetParams params;
+  SimRobot lead(1, 40.0, 0.0, params), drone(2, 5.0, 0.0, params);
+  drone.known = {cluster(77, 2, 6.0)};
+  Radio radio{{&lead, &drone}};
+  double now = 0.0;
+  radio.runUntil(now, 6.0);
+  ASSERT_EQ(lead.coordinator->claimedByOthers(now).size(), 1u);
+  drone.coordinator->leave(now);
+  const auto tick = [&](double t) {
+    return drone.coordinator->tick(t, [&] { return drone.ownBid(); },
+                                    euclid, nullptr);
+  };
+  const auto first = tick(now);
+  ASSERT_TRUE(first.bid);
+  EXPECT_TRUE(first.bid->leaving);
+  EXPECT_TRUE(first.bid->pose.isApprox(mgg::StateVec(5, 0, 0, 0)));
+  EXPECT_TRUE(first.bid->clusters.empty());
+  EXPECT_TRUE(first.bid->bundle.empty());
+  EXPECT_EQ(first.bid->current_target, mgg::kNoCluster);
+  EXPECT_FALSE(first.award);
+  EXPECT_FALSE(tick(now + 0.1).bid);
+  // The first announcement is lost. Claims must not wait for their TTL.
+  EXPECT_FALSE(lead.coordinator->claimedByOthers(now + 0.1).empty());
+  const auto repeat = tick(now + params.auction_interval_s);
+  ASSERT_TRUE(repeat.bid);
+  EXPECT_TRUE(repeat.bid->leaving);
+  EXPECT_GT(repeat.bid->seq, first.bid->seq);
+  lead.coordinator->onBid(*repeat.bid, now + params.auction_interval_s);
+  EXPECT_TRUE(lead.coordinator->claimedByOthers(now + params.auction_interval_s)
+                  .empty());
+  EXPECT_EQ(lead.coordinator->group(now + params.auction_interval_s),
+            std::vector<int>{1});
+}
+
+TEST(FleetCoordinator, WhileLeavingNeitherCallsNorAwardsRestoreAnAward) {
+  for (const int id : {1, 2}) {
+    FleetCoordinator robot(id, FleetParams{}, 0.2);
+    TourBidData peer = noClusters();
+    peer.robot_id = 3 - id;
+    robot.onBid(peer, 0.0);
+    robot.tick(0.0, noClusters, euclid, nullptr);  // may start a collection
+    robot.requestAuction();
+    robot.leave(0.1);
+    robot.onAward(makeCall(1, 42, 0.2), 0.2);
+    robot.onAward(makeAward(1, 42, 0.3, {{id, {77}}},
+                            {cluster(77, 2, 5.0)}), 0.3);
+    for (const double now : {0.4, 2.0, 5.0}) {
+      const auto out = robot.tick(now, noClusters, euclid, nullptr);
+      EXPECT_FALSE(out.award);
+      if (out.bid) {
+        EXPECT_TRUE(out.bid->leaving);
+      }
+      EXPECT_FALSE(robot.hasAward());
+      EXPECT_TRUE(robot.bundle().empty());
+      EXPECT_FALSE(robot.awaitingAuction());
+    }
+  }
+}
+
+TEST(FleetCoordinator, LeavingBidsCannotAddClaimsOrMembershipAndNeedAnIdentity) {
+  FleetCoordinator peer(1, FleetParams{}, 0.2);
+  TourBidData bid = noClusters();
+  bid.robot_id = 2;
+  bid.seq = 10;
+  bid.stamp_s = 1.0;
+  bid.clusters = {cluster(77, 2, 5.0)};
+  bid.costs_from_pose = {5.0};
+  bid.costs_between = {0.0};
+  bid.bundle = {77};
+  peer.onBid(bid, 1.0);
+  ASSERT_EQ(peer.claimedByOthers(1.0).size(), 1u);
+  bid.leaving = true;
+  bid.seq = 0;
+  peer.onBid(bid, 1.1);
+  EXPECT_EQ(peer.claimedByOthers(1.1).size(), 1u);
+  bid.seq = 11;
+  bid.pose[0] = std::numeric_limits<double>::quiet_NaN();
+  peer.onBid(bid, 1.2);
+  EXPECT_EQ(peer.claimedByOthers(1.2).size(), 1u);
+  bid.pose.setZero();
+  bid.robot_id = -1;
+  peer.onBid(bid, 1.3);
+  EXPECT_EQ(peer.group(1.3), (std::vector<int>{1, 2}));
+  bid.robot_id = 2;
+  bid.speed_mps = 0.0;  // exit carries no tour; even injected claims are ignored
+  peer.onBid(bid, 1.4);
+  EXPECT_TRUE(peer.claimedByOthers(1.4).empty());
+  EXPECT_EQ(peer.group(1.4), std::vector<int>{1});
+  bid.robot_id = 3;
+  peer.onBid(bid, 1.5);
+  EXPECT_TRUE(peer.claimedByOthers(1.5).empty());
+  EXPECT_EQ(peer.group(1.5), std::vector<int>{1});
+}
+
+TEST(FleetCoordinator, LeaveOrderingUsesStampThenSeqAndAllowsARestartToRejoin) {
+  FleetCoordinator peer(1, FleetParams{}, 0.2);
+  TourBidData normal = noClusters();
+  normal.robot_id = 2;
+  normal.seq = 100;
+  normal.stamp_s = 10.0;
+  peer.onBid(normal, 10.0);
+  TourBidData leaving;
+  leaving.robot_id = 2;
+  leaving.leaving = true;
+  leaving.seq = 99;
+  leaving.stamp_s = 9.0;
+  peer.onBid(leaving, 10.1);  // old exit cannot evict a newer normal bidder
+  EXPECT_EQ(peer.group(10.1), (std::vector<int>{1, 2}));
+  leaving.stamp_s = 10.0;
+  leaving.seq = 101;
+  peer.onBid(leaving, 10.2);
+  EXPECT_EQ(peer.group(10.2), std::vector<int>{1});
+  peer.onBid(normal, 10.3);  // same stamp, lower seq
+  EXPECT_EQ(peer.group(10.3), std::vector<int>{1});
+  normal.stamp_s = 9.0;
+  normal.seq = 999;
+  peer.onBid(normal, 10.4);  // earlier stamp, even a higher seq is stale
+  EXPECT_EQ(peer.group(10.4), std::vector<int>{1});
+  peer.onAward(makeCall(2, 1, 11.0), 11.0);
+  EXPECT_EQ(peer.group(11.0), std::vector<int>{1});
+  normal.stamp_s = 11.0;
+  normal.seq = 1;  // restarted sender
+  peer.onBid(normal, 11.1);
+  EXPECT_EQ(peer.group(11.1), (std::vector<int>{1, 2}));
+  peer.onBid(leaving, 11.2);
+  EXPECT_EQ(peer.group(11.2), (std::vector<int>{1, 2}));
+}
+
+TEST(FleetCoordinator, AnAwardCannotResurrectTheClaimOfAPeerKnownToHaveLeft) {
+  FleetCoordinator peer(3, FleetParams{}, 0.2);
+  const auto award = makeAward(1, 1, 1.0, {{2, {77}}},
+                               {cluster(77, 2, 5.0)});
+  peer.onAward(award, 1.0);
+  ASSERT_EQ(peer.claimedByOthers(1.0).size(), 1u);
+  TourBidData leaving;
+  leaving.robot_id = 2;
+  leaving.seq = 1;
+  leaving.stamp_s = 2.0;
+  leaving.leaving = true;
+  peer.onBid(leaving, 2.0);
+  auto delayed = award;
+  delayed.stamp_s = 3.0;
+  peer.onAward(delayed, 3.0);
+  EXPECT_TRUE(peer.claimedByOthers(3.0).empty());
+}
+
 }  // namespace
 
 TEST(FleetCoordinator, AnOmittedBidderKeepsRequestingUntilNamedInAnAward) {

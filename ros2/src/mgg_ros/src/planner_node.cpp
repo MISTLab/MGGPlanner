@@ -1009,6 +1009,18 @@ void PlannerNode::onTourBid(mgg_msgs::msg::TourBid::ConstSharedPtr msg) {
     return;
   }
   const mgg::TourBidData bid = fromTourBidMsg(*msg, t_ours_theirs);
+  // An exit carries a pose for the same simulated radio range as a bid,
+  // but no tour or speed. It must not count as a normal bid receipt.
+  if (bid.leaving) {
+    if (bid.robot_id < 0 || bid.seq == 0 || !bid.pose.allFinite()) return;
+    if (communication_range_ > 0.0 &&
+        (bid.pose.head<3>() - current_state_.head<3>()).norm() >
+            communication_range_) {
+      return;
+    }
+    fleet_->onBid(bid, now().seconds());
+    return;
+  }
   if (!bid.wellFormed()) {
     RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 5000,
                          "ignoring a malformed bid from robot %d",

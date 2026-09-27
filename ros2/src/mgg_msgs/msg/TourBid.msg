@@ -18,3 +18,4 @@ bool request_auction               # its bundle is done: it asks for an auction
 float64 speed_mps                  # cruise speed; 0: unknown (costs in metres)
 float64 reach_m                    # flight left to explore and return; .inf: no limit
 geometry_msgs/Point home           # where it must return to, in its planning frame
+bool leaving                       # deliberate exit: release my claims now

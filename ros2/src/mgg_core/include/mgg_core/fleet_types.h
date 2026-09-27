@@ -69,6 +69,10 @@ struct TourBidData {
   /// Where the bidder must return to within its reach, this robot's frame.
   Eigen::Vector3d home = Eigen::Vector3d::Zero();
 
+  /// Deliberate exit (drone scout design §4.4). Only identity, sequence,
+  /// stamp and pose are used; no tour or speed is needed.
+  bool leaving = false;
+
   double costBetween(std::size_t i, std::size_t j) const {
     return costs_between[i * clusters.size() + j];
   }
