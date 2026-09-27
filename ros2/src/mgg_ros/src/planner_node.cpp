@@ -574,6 +574,14 @@ PlannerNode::PlannerNode(const rclcpp::NodeOptions& options)
                      res) { onExplorationRegionRequest(req, res); },
           rclcpp::ServicesQoS(), callback_group_);
 
+  leave_fleet_srv_ = create_service<std_srvs::srv::SetBool>(
+      "leave_fleet",
+      [this](const std::shared_ptr<std_srvs::srv::SetBool::Request> req,
+             std::shared_ptr<std_srvs::srv::SetBool::Response> res) {
+        onLeaveFleet(req, res);
+      },
+      rclcpp::ServicesQoS(), callback_group_);
+
   const double publish_period =
       declareOrGet<double>(this, "graph_publish_period_sec", 2.0);
   // Node::create_timer drives off get_clock(), the node's RCL_ROS_TIME clock.
@@ -3774,6 +3782,26 @@ void PlannerNode::onExplorationTargetRequest(
   exploration_target_ = target;
   RCLCPP_INFO(get_logger(), "exploring toward (%.2f, %.2f, %.2f)", target.x(),
               target.y(), target.z());
+  response->success = true;
+}
+
+void PlannerNode::onLeaveFleet(
+    const std::shared_ptr<std_srvs::srv::SetBool::Request> request,
+    std::shared_ptr<std_srvs::srv::SetBool::Response> response) {
+  const std::lock_guard<std::recursive_mutex> lock(planner_mutex_);
+  if (!fleet_) {
+    response->success = false;
+    response->message = "fleet assignment is off";
+    return;
+  }
+  if (request->data) {
+    fleet_->leave(now().seconds());
+    response->message = "left the fleet; claims released";
+  } else {
+    fleet_->rejoin();
+    response->message = "rejoined the fleet";
+  }
+  ++tour_assignment_version_;
   response->success = true;
 }
 

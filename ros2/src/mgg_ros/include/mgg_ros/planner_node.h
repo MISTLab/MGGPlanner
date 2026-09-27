@@ -40,6 +40,7 @@
 #include <rclcpp/rclcpp.hpp>
 #include <std_msgs/msg/float64.hpp>
 #include <std_msgs/msg/string.hpp>
+#include <std_srvs/srv/set_bool.hpp>
 #include <std_srvs/srv/trigger.hpp>
 #include <tf2_msgs/msg/tf_message.hpp>
 #include <tf2_ros/buffer.h>
@@ -211,6 +212,11 @@ class PlannerNode : public rclcpp::Node {
           request,
       std::shared_ptr<mgg_msgs::srv::PlannerSetExplorationRegion::Response>
           response);
+  /// Leave the auction on landing (true), rejoin after take-off (false),
+  /// drone scout design §4.4.
+  void onLeaveFleet(
+      const std::shared_ptr<std_srvs::srv::SetBool::Request> request,
+      std::shared_ptr<std_srvs::srv::SetBool::Response> response);
   /// Metres of flight left for exploring and coming home (drone scout
   /// §4.3), from the drone's adapter; +inf until one arrives.
   void onFlightReach(const std_msgs::msg::Float64::SharedPtr msg);
@@ -798,6 +804,7 @@ class PlannerNode : public rclcpp::Node {
       exploration_target_srv_;
   rclcpp::Service<mgg_msgs::srv::PlannerSetExplorationRegion>::SharedPtr
       exploration_region_srv_;
+  rclcpp::Service<std_srvs::srv::SetBool>::SharedPtr leave_fleet_srv_;
   std::optional<mgg::BoundedSpaceParams> exploration_region_;
   rclcpp::Subscription<std_msgs::msg::Float64>::SharedPtr flight_reach_sub_;
   double flight_reach_m_ = std::numeric_limits<double>::infinity();

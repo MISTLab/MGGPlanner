@@ -28,6 +28,7 @@
 #include <nlohmann/json.hpp>
 #include <openssl/evp.h>
 #include <rclcpp/rclcpp.hpp>
+#include <std_srvs/srv/set_bool.hpp>
 #include <tf2_msgs/msg/tf_message.hpp>
 
 #include "mgg_map_octomap/mola_map.h"
@@ -982,6 +983,18 @@ class PlannerNodeTestPeer {
   static void receiveTourAward(PlannerNode& node,
                                const mgg_msgs::msg::TourAward& msg) {
     node.onTourAward(std::make_shared<mgg_msgs::msg::TourAward>(msg));
+  }
+  static std::shared_ptr<std_srvs::srv::SetBool::Response> leaveFleet(
+      PlannerNode& node, bool leave) {
+    auto request = std::make_shared<std_srvs::srv::SetBool::Request>();
+    request->data = leave;
+    auto response = std::make_shared<std_srvs::srv::SetBool::Response>();
+    node.onLeaveFleet(request, response);
+    return response;
+  }
+  static bool fleetLeaving(PlannerNode& node) {
+    const std::lock_guard<std::recursive_mutex> lock(node.planner_mutex_);
+    return node.fleet_ && node.fleet_->leaving();
   }
   static std::vector<int> fleetGroup(PlannerNode& node) {
     const std::lock_guard<std::recursive_mutex> lock(node.planner_mutex_);
@@ -3817,6 +3830,53 @@ TEST_F(PlannerNodeTest, APeersBidJoinsTheGroupOnlyWithATransformToIt) {
   PlannerNodeTestPeer::receiveTourBid(*fleet.a, bid);
   EXPECT_EQ(PlannerNodeTestPeer::fleetGroup(*fleet.a),
             (std::vector<int>{1, 2}));
+}
+
+TEST_F(PlannerNodeTest, TheDroneLeavesAndRejoinsTheFleetOnRequest) {
+  auto node = makeNode("leave_fleet");
+  auto response = PlannerNodeTestPeer::leaveFleet(*node, true);
+  ASSERT_TRUE(response->success) << response->message;
+  EXPECT_TRUE(PlannerNodeTestPeer::fleetLeaving(*node));
+  const auto leaving = PlannerNodeTestPeer::fleetStep(*node, 1.0);
+  ASSERT_TRUE(leaving.bid);
+  EXPECT_TRUE(leaving.bid->leaving);
+  response = PlannerNodeTestPeer::leaveFleet(*node, false);
+  ASSERT_TRUE(response->success) << response->message;
+  EXPECT_FALSE(PlannerNodeTestPeer::fleetLeaving(*node));
+  const auto rejoined = PlannerNodeTestPeer::fleetStep(*node, 1.1);
+  ASSERT_TRUE(rejoined.bid);
+  EXPECT_FALSE(rejoined.bid->leaving);
+}
+
+TEST_F(PlannerNodeTest, LeaveFleetIsRefusedWhenFleetAssignmentIsOff) {
+  auto node = makeNode("leave_fleet_off", "world",
+                        {rclcpp::Parameter("fleet.enabled", false)});
+  for (const bool leave : {true, false}) {
+    const auto response = PlannerNodeTestPeer::leaveFleet(*node, leave);
+    EXPECT_FALSE(response->success);
+    EXPECT_FALSE(response->message.empty());
+    EXPECT_FALSE(PlannerNodeTestPeer::fleetLeaving(*node));
+  }
+}
+
+TEST_F(PlannerNodeTest, LeaveFleetServiceAcceptsBothTransitions) {
+  auto node = makeNode("leave_fleet_service");
+  auto client_node = std::make_shared<rclcpp::Node>("leave_fleet_client");
+  auto client = client_node->create_client<std_srvs::srv::SetBool>("leave_fleet");
+  rclcpp::executors::SingleThreadedExecutor executor;
+  executor.add_node(node);
+  executor.add_node(client_node);
+  ASSERT_TRUE(client->wait_for_service(std::chrono::seconds(3)));
+  for (const bool leave : {true, false}) {
+    auto request = std::make_shared<std_srvs::srv::SetBool::Request>();
+    request->data = leave;
+    auto future = client->async_send_request(request);
+    ASSERT_EQ(executor.spin_until_future_complete(future, std::chrono::seconds(3)),
+              rclcpp::FutureReturnCode::SUCCESS);
+    const auto response = future.get();
+    ASSERT_TRUE(response->success) << response->message;
+    EXPECT_EQ(PlannerNodeTestPeer::fleetLeaving(*node), leave);
+  }
 }
 
 TEST_F(PlannerNodeTest, ALeavingBidReleasesClaimsOnlyWithinRadioRange) {
