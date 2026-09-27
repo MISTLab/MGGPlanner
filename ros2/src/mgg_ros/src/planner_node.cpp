@@ -1176,7 +1176,8 @@ std::vector<double> PlannerNode::homeDistances(
     const std::vector<mgg::FrontierCluster>& clusters) {
   std::vector<double> distances(clusters.size(), mgg::kUnreachableCost);
   const mgg::ShortestPathsReport* report =
-      tour_distances_.from(*global_graph_, graph_revision_, kHomeVertexId);
+      tour_distances_.from(*global_graph_, graph_revision_, kHomeVertexId,
+                           peer_generation_);
   if (report == nullptr) return distances;
   for (std::size_t i = 0; i < clusters.size(); ++i) {
     distances[i] =

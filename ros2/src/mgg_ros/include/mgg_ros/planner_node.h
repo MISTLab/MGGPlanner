@@ -454,7 +454,9 @@ class PlannerNode : public rclcpp::Node {
   /// §2.3: solves the tour again when due and returns its current target,
   /// or nothing when it has none. `note` is for the plan summary.
   std::optional<mgg::FrontierCluster> refreshTour(std::string& note);
-  /// Graph distance from each cluster's representative to home (vertex 0).
+  /// Graph distance from each cluster's representative to home (vertex 0),
+  /// from the tour's distance cache under the same key as the tour's costs:
+  /// graph revision and peer generation.
   std::vector<double> homeDistances(
       const std::vector<mgg::FrontierCluster>& clusters);
   /// Whether a repositioning to global vertex `vertex_id` still heads for

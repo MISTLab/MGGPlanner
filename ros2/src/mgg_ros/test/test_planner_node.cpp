@@ -1131,6 +1131,11 @@ class PlannerNodeTestPeer {
     bid.stamp_s = node.now().seconds();
     return toTourBidMsg(bid, node.world_frame_);
   }
+  /// Dijkstra runs of the tour's distance cache so far.
+  static std::size_t tourDistanceSolves(PlannerNode& node) {
+    const std::lock_guard<std::recursive_mutex> lock(node.planner_mutex_);
+    return node.tour_distances_.solves();
+  }
   static void setFlightReach(PlannerNode& node, double reach_m) {
     auto msg = std::make_shared<std_msgs::msg::Float64>();
     msg->data = reach_m;
@@ -5874,6 +5879,67 @@ TEST_F(PlannerNodeTest, AFlightReachLeavesOutClustersItCouldNotReturnFrom) {
   PlannerNodeTestPeer::setFlightReach(*node, 20.0);
   EXPECT_NE(PlannerNodeTestPeer::refreshTour(*node), mgg::kNoCluster);
   EXPECT_GT(finite_costs(), 0);
+}
+
+TEST_F(PlannerNodeTest, AParkedPeerOnTheWayHomeCapsADronesReachUntilItLeaves) {
+  // Integration of the drone's flight reach with the run-10 peer bodies: a
+  // cluster's way home is a roadmap route, and a peer parked on it closes
+  // it for the search, so a cluster the drone could reach but not return
+  // from leaves its tour and its bid. The cap follows the peer through the
+  // peer generation, on an unchanged roadmap, and the distances home share
+  // the tour's cache key: a bid made twice with nothing changed solves no
+  // route again.
+  std::unique_ptr<MolaFloorProduct> product;
+  auto node = peerFloorNode("drone_reach_parked_peer", -7.5, 1.5, -1.5, 1.5,
+                            product);
+  PlannerNodeTestPeer::acceptOdometryFacing(*node, 0.0, 0.0, M_PI, 1.0);
+  PlannerNodeTestPeer::setAerialRobot(*node);
+  const int frontier = PlannerNodeTestPeer::addGlobalChainToFrontier(
+      *node, {{-1.0, 0.0}, {-2.0, 0.0}, {-3.0, 0.0}, {-4.0, 0.0}, {-5.0, 0.0},
+              {-6.0, 0.0}},
+      M_PI);
+  // The drone has flown out to (-4, 0): 2 m from the frontier, 6 m from it
+  // back home. Flying there marks the roadmap round it visited; the
+  // frontier stays one, and is not reached from 2 m off.
+  PlannerNodeTestPeer::acceptOdometryFacing(*node, -4.0, 0.0, M_PI, 2.0);
+  PlannerNodeTestPeer::markGlobalFrontier(*node, frontier);
+  PlannerNodeTestPeer::setGlobalFrontierReach(*node, 1.0);
+  PlannerNodeTestPeer::setTour(*node, true, 0.0);
+  PlannerNodeTestPeer::solveTourOnEveryChange(*node);
+  PlannerNodeTestPeer::setFlightReach(*node, 20.0);
+  const auto finite_costs = [&node]() {
+    const mgg_msgs::msg::TourBid bid =
+        PlannerNodeTestPeer::ownTourBidMsg(*node);
+    return std::count_if(bid.costs_from_pose.begin(),
+                         bid.costs_from_pose.end(),
+                         [](double cost) { return std::isfinite(cost); });
+  };
+  const mgg::ClusterId target = PlannerNodeTestPeer::refreshTour(*node);
+  ASSERT_NE(target, mgg::kNoCluster);
+  EXPECT_GT(finite_costs(), 0);
+  const std::uint64_t revision = PlannerNodeTestPeer::graphRevision(*node);
+
+  // Parked between the frontier and home: out there it is 2 m away, but
+  // there is no way back.
+  PlannerNodeTestPeer::setPeerBodyTtl(*node, 600.0);
+  PlannerNodeTestPeer::receivePeerBodies(*node, {{-2.0, 0.0}});
+  EXPECT_EQ(PlannerNodeTestPeer::refreshTour(*node), mgg::kNoCluster);
+  EXPECT_EQ(finite_costs(), 0);
+  const std::size_t solves = PlannerNodeTestPeer::tourDistanceSolves(*node);
+  EXPECT_EQ(finite_costs(), 0);
+  EXPECT_EQ(PlannerNodeTestPeer::tourDistanceSolves(*node), solves);
+  // Without a reach the peer does not keep the drone from the frontier.
+  PlannerNodeTestPeer::setFlightReach(*node,
+                                      std::numeric_limits<double>::infinity());
+  EXPECT_EQ(PlannerNodeTestPeer::refreshTour(*node), target);
+  PlannerNodeTestPeer::setFlightReach(*node, 20.0);
+  EXPECT_EQ(PlannerNodeTestPeer::refreshTour(*node), mgg::kNoCluster);
+
+  // The peer leaves: the way home opens with the roadmap unchanged.
+  PlannerNodeTestPeer::receivePeerBodies(*node, {});
+  EXPECT_EQ(PlannerNodeTestPeer::refreshTour(*node), target);
+  EXPECT_GT(finite_costs(), 0);
+  EXPECT_EQ(PlannerNodeTestPeer::graphRevision(*node), revision);
 }
 
 TEST_F(PlannerNodeTest, ARegionsLatticeDoesNotDemoteAnOutsideFrontierItPasses) {
