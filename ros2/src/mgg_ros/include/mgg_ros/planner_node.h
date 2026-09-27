@@ -21,6 +21,7 @@
 #ifndef MGG_ROS_PLANNER_NODE_H_
 #define MGG_ROS_PLANNER_NODE_H_
 
+#include <array>
 #include <chrono>
 #include <cstdint>
 #include <functional>
@@ -182,6 +183,12 @@ class PlannerNode : public rclcpp::Node {
   /// The same for a straight segment, such as a shortcut.
   bool noGoBlocksSegment(const Eigen::Vector3d& from,
                          const Eigen::Vector3d& to) const;
+  /// Advances peer_generation_ when the peer bodies in force (a request's
+  /// pinned set, else those published and not expired) differ from those
+  /// it last saw, centres compared on a kPeerGenerationCellM grid: a peer
+  /// appearing, leaving, expiring or moving at all. Run when the tour's
+  /// costs are read, which are cached by it with the graph revision.
+  void refreshPeerGeneration();
   /// Whether a peer body closes the straight segment from `from` to `to`,
   /// driven that way: the sweep the lattice's edges take
   /// (mgg::MolaMap::transientDiscsBlockSweep, the outward departure from a
@@ -671,10 +678,12 @@ class PlannerNode : public rclcpp::Node {
   /// Peer bodies are left out of peerBlocksSegment: set only to ask whether
   /// a failed search would have succeeded without them.
   bool peer_edges_open_ = false;
-  /// The peer bodies' centres the global graph's revision last took in
-  /// (onPeerBodies): a body appearing, leaving or moving farther than its
-  /// radius changes which edges are closed.
-  std::vector<Eigen::Vector2d> peer_body_centres_;
+  /// Changes whenever the peer bodies in force change
+  /// (refreshPeerGeneration): the tour's route costs are cached by it and
+  /// the graph revision (review r0, I3). Its key: the centres, quantized
+  /// and sorted, then the radius.
+  std::uint64_t peer_generation_ = 0;
+  std::vector<std::array<long, 2>> peer_generation_key_;
   /// Exploration paths sent unshortcut because the shortcut, once resampled,
   /// turned where the lattice path did not, since the node started.
   int shortcut_turn_reverts_ = 0;

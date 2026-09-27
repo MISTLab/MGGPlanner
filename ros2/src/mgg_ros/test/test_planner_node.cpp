@@ -314,6 +314,11 @@ class PlannerNodeTestPeer {
     const std::lock_guard<std::recursive_mutex> lock(node.planner_mutex_);
     node.tour_params_.route_retry_s = seconds;
   }
+  /// How long a peer_bodies message stays in force.
+  static void setPeerBodyTtl(PlannerNode& node, double seconds) {
+    const std::lock_guard<std::recursive_mutex> lock(node.planner_mutex_);
+    node.peer_body_ttl_s_ = seconds;
+  }
   /// Global graph edges peer bodies closed in the last plan request.
   static std::size_t peerBlockedEdges(PlannerNode& node) {
     const std::lock_guard<std::recursive_mutex> lock(node.planner_mutex_);
@@ -2239,6 +2244,45 @@ TEST_F(PlannerNodeTest, APeerUpdateDuringARequestWaitsForItAndTheRequestSeesOneS
   response = resume();
   EXPECT_FALSE(PlannerNodeTestPeer::bestPathFromGlobalGraph(*node));
   EXPECT_GE(nearestTo(response->path, probe->peer), kPeerReachM - 0.01);
+}
+
+TEST_F(PlannerNodeTest, TourCostsFollowPeerExpiryAndSmallMovesOnAnUnchangedRoadmap) {
+  // Review r0, I3: the tour's cached route costs followed peers only
+  // through graph revisions bumped on a peer appearing, leaving or moving
+  // more than its radius. A peer whose message expired, or that moved a
+  // little across the edge's margin, left the costs as they were until the
+  // roadmap happened to change. Here the tour's only cluster lies at the
+  // end of a straight roadmap edge 6 m west, and nothing changes the
+  // roadmap: the target comes and goes with the peer alone.
+  std::unique_ptr<MolaFloorProduct> product;
+  auto node = peerFloorNode("peer_generation", -7.5, 1.5, -1.5, 1.5, product);
+  PlannerNodeTestPeer::acceptOdometryFacing(*node, 0.0, 0.0, M_PI, 1.0);
+  PlannerNodeTestPeer::addGlobalChainToFrontier(*node, {{-6.0, 0.0}}, M_PI);
+  PlannerNodeTestPeer::setTour(*node, true, 0.0);
+  PlannerNodeTestPeer::solveTourOnEveryChange(*node);
+  const mgg::ClusterId target = PlannerNodeTestPeer::refreshTour(*node);
+  ASSERT_NE(target, mgg::kNoCluster);
+
+  // Parked on the edge, its message kept 0.3 s: then it expires.
+  PlannerNodeTestPeer::setPeerBodyTtl(*node, 0.3);
+  PlannerNodeTestPeer::receivePeerBodies(*node, {{-3.0, 0.0}});
+  EXPECT_EQ(PlannerNodeTestPeer::refreshTour(*node), mgg::kNoCluster);
+  const std::uint64_t revision = PlannerNodeTestPeer::graphRevision(*node);
+  std::this_thread::sleep_for(std::chrono::milliseconds(400));
+  EXPECT_EQ(PlannerNodeTestPeer::refreshTour(*node), target);
+  EXPECT_EQ(PlannerNodeTestPeer::graphRevision(*node), revision);
+
+  // Beside the edge, 0.75 m off it, beyond its reach (0.7 m); then 0.1 m
+  // nearer, far less than its radius, and within it; then back.
+  PlannerNodeTestPeer::setPeerBodyTtl(*node, 60.0);
+  PlannerNodeTestPeer::receivePeerBodies(*node, {{-3.0, 0.75}});
+  EXPECT_EQ(PlannerNodeTestPeer::refreshTour(*node), target);
+  const std::uint64_t beside = PlannerNodeTestPeer::graphRevision(*node);
+  PlannerNodeTestPeer::receivePeerBodies(*node, {{-3.0, 0.65}});
+  EXPECT_EQ(PlannerNodeTestPeer::refreshTour(*node), mgg::kNoCluster);
+  PlannerNodeTestPeer::receivePeerBodies(*node, {{-3.0, 0.75}});
+  EXPECT_EQ(PlannerNodeTestPeer::refreshTour(*node), target);
+  EXPECT_EQ(PlannerNodeTestPeer::graphRevision(*node), beside);
 }
 
 TEST_F(PlannerNodeTest, ATourTargetBehindAParkedPeerIsSetAsideBriefly) {

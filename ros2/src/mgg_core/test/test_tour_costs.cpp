@@ -83,6 +83,21 @@ TEST(TourCosts, DistancesAreSolvedOncePerGraphRevision) {
   EXPECT_EQ(cache.solves(), 6u);
 }
 
+TEST(TourCosts, DistancesAreSolvedAgainForANewPeerGeneration) {
+  // Review r0, I3: peer bodies close edges without a new graph revision.
+  GraphManager graph;
+  Vertex* root = add(graph, 0.0, 0.0);
+  Vertex* a = add(graph, 5.0, 0.0, root, VertexType::kFrontier);
+  GraphDistanceCache cache;
+  const std::vector<FrontierCluster> clusters{clusterAt(a)};
+  mgg::computeTourCosts(graph, 1, cache, root->id, 0.0, clusters, 0.0, 7);
+  EXPECT_EQ(cache.solves(), 2u);
+  mgg::computeTourCosts(graph, 1, cache, root->id, 0.0, clusters, 0.0, 7);
+  EXPECT_EQ(cache.solves(), 2u);
+  mgg::computeTourCosts(graph, 1, cache, root->id, 0.0, clusters, 0.0, 8);
+  EXPECT_EQ(cache.solves(), 4u);
+}
+
 TEST(TourCosts, AnotherGraphAtTheSameRevisionIsSolvedAfresh) {
   // Two graphs with the same vertex IDs and revision: the cache must not
   // hand the second graph the first one's distances.

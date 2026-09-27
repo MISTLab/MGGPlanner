@@ -51,6 +51,10 @@ constexpr double kTourSetAsideGainRise = 0.25;
 /// off the cluster for good (run 10b, robot_1 and robot_3 routed through
 /// parked robot_2).
 constexpr double kPeerBlockedAsideS = 5.0;
+/// Peer bodies' centres are compared on a grid this fine, metres, for the
+/// peer generation (refreshPeerGeneration): a move of a peer across a
+/// roadmap edge's margin changes it, however small against its radius.
+constexpr double kPeerGenerationCellM = 0.05;
 /// A robot that has moved less than this from its first odometry, and whose
 /// keyframes all lie within this of its home keyframe, has not left its
 /// start (PlannerNode::standingStart).
@@ -736,6 +740,7 @@ std::optional<mgg::FrontierCluster> PlannerNode::refreshTour(
     return std::nullopt;
   }
   noteGlobalGraphEdges();
+  refreshPeerGeneration();
   std::vector<mgg::FrontierCluster> clusters =
       tourCandidates(globalFrontierClusters());
   const double now_s = now().seconds();
@@ -784,7 +789,8 @@ std::optional<mgg::FrontierCluster> PlannerNode::refreshTour(
     }
   }
   if (tour_planner_->needsSolve(clusters, graph_revision_,
-                                tour_assignment_version_, now_s)) {
+                                tour_assignment_version_, now_s,
+                                peer_generation_)) {
     mgg::Vertex* link = linkRobotToGlobalGraph();
     if (link == nullptr) {
       tour_clusters_.clear();
@@ -795,9 +801,10 @@ std::optional<mgg::FrontierCluster> PlannerNode::refreshTour(
     const auto started = std::chrono::steady_clock::now();
     const mgg::TourCostMatrix costs = mgg::computeTourCosts(
         *global_graph_, graph_revision_, tour_distances_, link->id,
-        current_state_[3], clusters, tour_params_.heading_weight);
+        current_state_[3], clusters, tour_params_.heading_weight,
+        peer_generation_);
     tour_planner_->solve(clusters, costs, graph_revision_,
-                         tour_assignment_version_, now_s);
+                         tour_assignment_version_, now_s, peer_generation_);
     tour_solve_ms_ = std::chrono::duration<double, std::milli>(
                          std::chrono::steady_clock::now() - started)
                          .count();
@@ -968,6 +975,10 @@ void PlannerNode::fleetTick(double now_s) {
   const std::lock_guard<std::recursive_mutex> lock(planner_mutex_);
   if (!have_odometry_) return;
   auto map_read = mapReadLease();
+  // Bids and auctions cost routes with one peer set, as a request does.
+  std::optional<mgg::MolaMap::TransientDiscPin> peer_pin;
+  pinPeerBodies(peer_pin);
+  refreshPeerGeneration();
   const mgg::FleetTickOutput out =
       fleet_->tick(now_s, [this]() { return ownTourBid(); },
                    roadmapCostEstimate(), exploredByRoadmap());
@@ -1012,11 +1023,12 @@ mgg::TourBidData PlannerNode::ownTourBid() {
   }
   if (clusters.empty()) return bid;
   mgg::TourCostMatrix costs;
+  refreshPeerGeneration();
   if (mgg::Vertex* link = linkRobotToGlobalGraph()) {
     costs = mgg::computeTourCosts(*global_graph_, graph_revision_,
                                   tour_distances_, link->id,
                                   current_state_[3], clusters,
-                                  /*heading_weight=*/0.0);
+                                  /*heading_weight=*/0.0, peer_generation_);
   } else {
     costs.from_robot.assign(clusters.size(), mgg::kUnreachableCost);
     costs.between.assign(clusters.size(),
@@ -1046,7 +1058,8 @@ mgg::CostEstimateFn PlannerNode::roadmapCostEstimate() {
       return mgg::kUnreachableCost;
     }
     const mgg::ShortestPathsReport* report =
-        tour_distances_.from(*global_graph_, graph_revision_, a->id);
+        tour_distances_.from(*global_graph_, graph_revision_, a->id,
+                             peer_generation_);
     if (report == nullptr) return mgg::kUnreachableCost;
     return mgg::reachedDistance(*report, b->id) +
            (from - a->state.head<3>()).norm() +
@@ -1439,21 +1452,33 @@ void PlannerNode::onPeerBodies(
     }
   }
   // Published between requests, never during one: a plan or objective
-  // request plans with one peer set throughout (pinPeerBodies), and the
-  // revision below changes with it (review r0, I5).
+  // request plans with one peer set throughout (pinPeerBodies), review r0,
+  // I5. The tour's route costs follow the set through the peer generation
+  // (refreshPeerGeneration), not the graph revision.
   const std::lock_guard<std::recursive_mutex> lock(planner_mutex_);
-  mola_map_->setTransientDiscs(centres, peer_body_radius_m_, peer_body_ttl_s_);
-  // The global graph's searches close the edges a peer body blocks
-  // (globalEdgeBlocked): a body appearing, leaving or moving more than its
-  // radius changes the route costs the tour caches by revision.
-  bool moved = centres.size() != peer_body_centres_.size();
-  for (std::size_t i = 0; !moved && i < centres.size(); ++i) {
-    moved = (centres[i] - peer_body_centres_[i]).norm() > peer_body_radius_m_;
+  mola_map_->setTransientDiscs(std::move(centres), peer_body_radius_m_,
+                               peer_body_ttl_s_);
+}
+
+void PlannerNode::refreshPeerGeneration() {
+  if (mola_map_ == nullptr) return;
+  // The set in force: a request's pinned one, or, outside a request, the
+  // one published and not expired.
+  const mgg::MolaMap::TransientDiscSet peers =
+      mola_map_->activeTransientDiscs();
+  std::vector<std::array<long, 2>> key;
+  key.reserve(peers.centres.size() + 1);
+  for (const Eigen::Vector2d& centre : peers.centres) {
+    key.push_back({std::lround(centre.x() / kPeerGenerationCellM),
+                   std::lround(centre.y() / kPeerGenerationCellM)});
   }
-  if (moved) {
-    peer_body_centres_ = std::move(centres);
-    ++graph_revision_;
+  std::sort(key.begin(), key.end());
+  if (!key.empty()) {
+    key.push_back({std::lround(peers.radius_m / kPeerGenerationCellM), 0});
   }
+  if (key == peer_generation_key_) return;
+  peer_generation_key_ = std::move(key);
+  ++peer_generation_;
 }
 
 void PlannerNode::onNoGoZones(

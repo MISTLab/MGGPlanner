@@ -8,12 +8,15 @@ namespace mgg {
 
 const ShortestPathsReport* GraphDistanceCache::from(GraphManager& graph,
                                                     std::uint64_t revision,
-                                                    int source_id) {
-  if (!valid_ || &graph != graph_ || revision != revision_) {
+                                                    int source_id,
+                                                    std::uint64_t peer_generation) {
+  if (!valid_ || &graph != graph_ || revision != revision_ ||
+      peer_generation != peer_generation_) {
     reports_.clear();
     failed_.clear();
     graph_ = &graph;
     revision_ = revision;
+    peer_generation_ = peer_generation;
     valid_ = true;
   }
   const auto found = reports_.find(source_id);
@@ -84,7 +87,8 @@ TourCostMatrix computeTourCosts(GraphManager& graph, std::uint64_t revision,
                                 GraphDistanceCache& cache,
                                 int source_vertex_id, double robot_yaw,
                                 const std::vector<FrontierCluster>& clusters,
-                                double heading_weight) {
+                                double heading_weight,
+                                std::uint64_t peer_generation) {
   const std::size_t n = clusters.size();
   TourCostMatrix costs;
   costs.from_robot.assign(n, kUnreachableCost);
@@ -92,7 +96,7 @@ TourCostMatrix computeTourCosts(GraphManager& graph, std::uint64_t revision,
   for (std::size_t i = 0; i < n; ++i) costs.between[i][i] = 0.0;
 
   const ShortestPathsReport* robot =
-      cache.from(graph, revision, source_vertex_id);
+      cache.from(graph, revision, source_vertex_id, peer_generation);
   if (robot != nullptr) {
     for (std::size_t i = 0; i < n; ++i) {
       const int target = clusters[i].representative_vertex_id;
@@ -105,7 +109,8 @@ TourCostMatrix computeTourCosts(GraphManager& graph, std::uint64_t revision,
   }
   for (std::size_t i = 0; i < n; ++i) {
     const ShortestPathsReport* from_cluster =
-        cache.from(graph, revision, clusters[i].representative_vertex_id);
+        cache.from(graph, revision, clusters[i].representative_vertex_id,
+                   peer_generation);
     if (from_cluster == nullptr) continue;
     for (std::size_t j = i + 1; j < n; ++j) {
       const double distance = reachedDistance(

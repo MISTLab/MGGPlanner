@@ -36,19 +36,22 @@ class TourPlanner {
 
   /// §2.3: at once before the first solve, when the target's cluster is
   /// gone, or after releaseTarget; otherwise when the graph revision, the
+  /// peer generation (the peer bodies closing roadmap edges), the
   /// assignment version or the set of cluster IDs changed, and at least
   /// tour.recompute_interval_s after the last solve. A `now_s` before the
   /// last solve (the clock went backwards, as a simulation reset under
   /// use_sim_time does) counts as the interval elapsed.
   bool needsSolve(const std::vector<FrontierCluster>& clusters,
                   std::uint64_t graph_revision,
-                  std::uint64_t assignment_version, double now_s) const;
+                  std::uint64_t assignment_version, double now_s,
+                  std::uint64_t peer_generation = 0) const;
   /// Solves the tour over `clusters` with `costs` (indexed alike) and applies
   /// the commitment rule.
   const TourPlan& solve(const std::vector<FrontierCluster>& clusters,
                         const TourCostMatrix& costs,
                         std::uint64_t graph_revision,
-                        std::uint64_t assignment_version, double now_s);
+                        std::uint64_t assignment_version, double now_s,
+                        std::uint64_t peer_generation = 0);
   /// The target was reached, or no route to it exists: the next solve
   /// chooses freely.
   void releaseTarget();
@@ -66,6 +69,7 @@ class TourPlanner {
   bool solved_ = false;
   bool released_ = false;
   std::uint64_t graph_revision_ = 0;
+  std::uint64_t peer_generation_ = 0;
   std::uint64_t assignment_version_ = 0;
   std::set<ClusterId> cluster_ids_;
   double solved_at_s_ = 0.0;
