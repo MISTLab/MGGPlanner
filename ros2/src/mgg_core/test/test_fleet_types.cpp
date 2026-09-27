@@ -127,4 +127,20 @@ TEST(FleetTypes, AnAwardFindsBundlesAndClustersById) {
   EXPECT_EQ(award.cluster(99), nullptr);
 }
 
+TEST(FleetTypes, ADronesSpeedReachAndHomeMustBeValid) {
+  mgg::TourBidData bid;
+  EXPECT_TRUE(bid.wellFormed());
+  EXPECT_TRUE(std::isinf(bid.reach_m));
+  bid.speed_mps = -1.0;
+  EXPECT_FALSE(bid.wellFormed());
+  bid.speed_mps = 4.0;
+  bid.reach_m = std::nan("");
+  EXPECT_FALSE(bid.wellFormed());
+  bid.reach_m = 120.0;
+  bid.home = Eigen::Vector3d(0.0, std::numeric_limits<double>::infinity(), 0.0);
+  EXPECT_FALSE(bid.wellFormed());
+  bid.home = Eigen::Vector3d::Zero();
+  EXPECT_TRUE(bid.wellFormed());
+}
+
 }  // namespace

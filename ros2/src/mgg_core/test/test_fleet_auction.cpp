@@ -375,4 +375,50 @@ TEST(SequentialAuction, FixedAndUnreachableClustersAreNotAwarded) {
   EXPECT_EQ(result.unassigned, std::vector<int>{2});
 }
 
+mgg::ClusterPool twoClusterPool() {
+  mgg::ClusterPool pool;
+  pool.clusters = {cluster(1, 4, 8.0), cluster(2, 1, 20.0)};
+  pool.member_ids = {{1}, {2}};
+  return pool;
+}
+
+TourBidData droneBid() {
+  TourBidData bid;
+  bid.robot_id = 4;
+  bid.pose = mgg::StateVec(0.0, 0.0, 0.0, 0.0);
+  bid.clusters = {cluster(1, 4, 8.0)};
+  bid.costs_from_pose = {8.0};
+  bid.costs_between = {0.0};
+  return bid;
+}
+
+const mgg::CostEstimateFn kStraight = [](const Eigen::Vector3d& a,
+                                         const Eigen::Vector3d& b) {
+  return (a - b).norm();
+};
+
+TEST(FleetAuction, BidderCostsAreTimeAtTheBiddersSpeed) {
+  TourBidData bid = droneBid();
+  bid.speed_mps = 4.0;
+  const AuctionBidder drone =
+      mgg::bidderCosts(bid, {0}, twoClusterPool(), kStraight);
+  EXPECT_DOUBLE_EQ(drone.from_pose[0], 2.0);   // 8 m at 4 m/s
+  EXPECT_DOUBLE_EQ(drone.from_pose[1], 5.0);   // an estimated 20 m
+  EXPECT_DOUBLE_EQ(drone.between[0][1], 3.0);  // 12 m
+  bid.speed_mps = 0.0;  // unknown: metres, as before
+  EXPECT_DOUBLE_EQ(mgg::bidderCosts(bid, {0}, twoClusterPool(), kStraight)
+                       .from_pose[0],
+                   8.0);
+}
+
+TEST(FleetAuction, BidderCostsSkipClustersBeyondReach) {
+  TourBidData bid = droneBid();
+  bid.reach_m = 30.0;
+  bid.home = Eigen::Vector3d::Zero();
+  const AuctionBidder drone =
+      mgg::bidderCosts(bid, {0}, twoClusterPool(), kStraight);
+  EXPECT_DOUBLE_EQ(drone.from_pose[0], 8.0);                  // 8 + 8 <= 30
+  EXPECT_EQ(drone.from_pose[1], mgg::kUnreachableCost);  // 20 + 20 > 30
+}
+
 }  // namespace

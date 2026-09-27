@@ -46,6 +46,8 @@ constexpr double kTourSetAsideMoveM = 2.0;
 /// keyframes all lie within this of its home keyframe, has not left its
 /// start (PlannerNode::standingStart).
 constexpr double kStandingStartMoveM = 0.5;
+/// seedGlobalGraph creates the global graph's root, home, as vertex 0.
+constexpr int kHomeVertexId = 0;
 
 double secondsSince(const std::chrono::steady_clock::time_point& then) {
   return std::chrono::duration<double>(std::chrono::steady_clock::now() - then)
@@ -285,6 +287,12 @@ PlannerNode::PlannerNode(const rclcpp::NodeOptions& options)
         onNoGoZones(m);
       },
       no_go_opts);
+  flight_reach_sub_ = create_subscription<std_msgs::msg::Float64>(
+      "flight_reach_m", rclcpp::QoS(10),
+      [this](const std_msgs::msg::Float64::SharedPtr msg) {
+        onFlightReach(msg);
+      },
+      sub_opts);
 
   graph_pub_ = create_publisher<mgg_msgs::msg::Graph>("neighbour_graph_out",
                                                       rclcpp::QoS(10));
@@ -806,9 +814,10 @@ std::optional<mgg::FrontierCluster> PlannerNode::refreshTour(
     }
     noteGlobalGraphEdges();
     const auto started = std::chrono::steady_clock::now();
-    const mgg::TourCostMatrix costs = mgg::computeTourCosts(
+    mgg::TourCostMatrix costs = mgg::computeTourCosts(
         *global_graph_, graph_revision_, tour_distances_, link->id,
         current_state_[3], clusters, tour_params_.heading_weight);
+    mgg::capTourCostsByReach(costs, homeDistances(clusters), flight_reach_m_);
     tour_planner_->solve(clusters, costs, graph_revision_,
                          tour_assignment_version_, now_s);
     tour_solve_ms_ = std::chrono::duration<double, std::milli>(
@@ -1001,6 +1010,19 @@ void PlannerNode::fleetTick(double now_s) {
               out.award->released_robot_ids.size());
 }
 
+std::vector<double> PlannerNode::homeDistances(
+    const std::vector<mgg::FrontierCluster>& clusters) {
+  std::vector<double> distances(clusters.size(), mgg::kUnreachableCost);
+  const mgg::ShortestPathsReport* report =
+      tour_distances_.from(*global_graph_, graph_revision_, kHomeVertexId);
+  if (report == nullptr) return distances;
+  for (std::size_t i = 0; i < clusters.size(); ++i) {
+    distances[i] =
+        mgg::reachedDistance(*report, clusters[i].representative_vertex_id);
+  }
+  return distances;
+}
+
 mgg::TourBidData PlannerNode::ownTourBid() {
   mgg::TourBidData bid;
   bid.robot_id = static_cast<int>(planning_params_.robot_id);
@@ -1008,6 +1030,11 @@ mgg::TourBidData PlannerNode::ownTourBid() {
   bid.pose = current_state_;
   bid.current_target = tour_planner_->target();
   bid.claim_stamp_s = tour_planner_->targetSince();
+  bid.speed_mps = planning_params_.v_max;
+  bid.reach_m = flight_reach_m_;
+  if (const mgg::Vertex* home = findGlobalVertex(kHomeVertexId)) {
+    bid.home = home->state.head<3>();
+  }
   // §3.3 pool construction: the awarded clusters this robot's roadmap
   // shows explored.
   for (const mgg::FleetCluster& cluster : fleet_->lastAwardClusters()) {
@@ -1030,6 +1057,7 @@ mgg::TourBidData PlannerNode::ownTourBid() {
                                   tour_distances_, link->id,
                                   current_state_[3], clusters,
                                   /*heading_weight=*/0.0);
+    mgg::capTourCostsByReach(costs, homeDistances(clusters), flight_reach_m_);
   } else {
     costs.from_robot.assign(clusters.size(), mgg::kUnreachableCost);
     costs.between.assign(clusters.size(),
@@ -3601,6 +3629,13 @@ void PlannerNode::onExplorationRegionRequest(
   ++tour_assignment_version_;
   response->success = true;
   response->message = "exploring inside the region only";
+}
+
+void PlannerNode::onFlightReach(const std_msgs::msg::Float64::SharedPtr msg) {
+  if (std::isnan(msg->data) || msg->data < 0.0) return;
+  const std::lock_guard<std::recursive_mutex> lock(planner_mutex_);
+  if (msg->data != flight_reach_m_) ++tour_assignment_version_;
+  flight_reach_m_ = msg->data;
 }
 
 std::vector<mgg::FrontierCluster> PlannerNode::insideExplorationRegion(

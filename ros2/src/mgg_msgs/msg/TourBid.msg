@@ -15,3 +15,6 @@ builtin_interfaces/Time claim_stamp  # when it took its current target
 uint64[] bundle                    # its current bundle
 uint64[] explored                  # awarded clusters its roadmap shows explored
 bool request_auction               # its bundle is done: it asks for an auction
+float64 speed_mps                  # cruise speed; 0: unknown (costs in metres)
+float64 reach_m                    # flight left to explore and return; .inf: no limit
+geometry_msgs/Point home           # where it must return to, in its planning frame

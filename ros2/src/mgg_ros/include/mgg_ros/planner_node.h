@@ -24,6 +24,7 @@
 #include <chrono>
 #include <cstdint>
 #include <functional>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -37,6 +38,7 @@
 #include <nav_msgs/msg/path.hpp>
 #include <sensor_msgs/msg/point_cloud2.hpp>
 #include <rclcpp/rclcpp.hpp>
+#include <std_msgs/msg/float64.hpp>
 #include <std_srvs/srv/trigger.hpp>
 #include <tf2_msgs/msg/tf_message.hpp>
 #include <tf2_ros/buffer.h>
@@ -208,6 +210,9 @@ class PlannerNode : public rclcpp::Node {
           request,
       std::shared_ptr<mgg_msgs::srv::PlannerSetExplorationRegion::Response>
           response);
+  /// Metres of flight left for exploring and coming home (drone scout
+  /// §4.3), from the drone's adapter; +inf until one arrives.
+  void onFlightReach(const std_msgs::msg::Float64::SharedPtr msg);
   /// `clusters` without those outside the exploration region, if one is set.
   std::vector<mgg::FrontierCluster> insideExplorationRegion(
       std::vector<mgg::FrontierCluster> clusters) const;
@@ -381,6 +386,9 @@ class PlannerNode : public rclcpp::Node {
   /// §2.3: solves the tour again when due and returns its current target,
   /// or nothing when it has none. `note` is for the plan summary.
   std::optional<mgg::FrontierCluster> refreshTour(std::string& note);
+  /// Graph distance from each cluster's representative to home (vertex 0).
+  std::vector<double> homeDistances(
+      const std::vector<mgg::FrontierCluster>& clusters);
   /// Whether a repositioning to global vertex `vertex_id` still heads for
   /// the tour's target (always, when the tour is off or has no target). A
   /// resumed route skips refreshTour, so the target is checked against the
@@ -769,6 +777,8 @@ class PlannerNode : public rclcpp::Node {
   rclcpp::Service<mgg_msgs::srv::PlannerSetExplorationRegion>::SharedPtr
       exploration_region_srv_;
   std::optional<mgg::BoundedSpaceParams> exploration_region_;
+  rclcpp::Subscription<std_msgs::msg::Float64>::SharedPtr flight_reach_sub_;
+  double flight_reach_m_ = std::numeric_limits<double>::infinity();
   rclcpp::TimerBase::SharedPtr graph_timer_;
   /// rrg.h:367 global_graph_update_timer_.
   rclcpp::TimerBase::SharedPtr global_graph_update_timer_;

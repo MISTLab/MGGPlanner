@@ -117,4 +117,16 @@ TourCostMatrix computeTourCosts(GraphManager& graph, std::uint64_t revision,
   return costs;
 }
 
+void capTourCostsByReach(TourCostMatrix& costs,
+                         const std::vector<double>& cluster_to_home,
+                         double reach_m) {
+  if (!std::isfinite(reach_m)) return;
+  for (std::size_t i = 0;
+       i < costs.from_robot.size() && i < cluster_to_home.size(); ++i) {
+    if (costs.from_robot[i] + cluster_to_home[i] > reach_m) {
+      costs.from_robot[i] = kUnreachableCost;
+    }
+  }
+}
+
 }  // namespace mgg

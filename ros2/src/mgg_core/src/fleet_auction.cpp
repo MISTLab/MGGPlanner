@@ -176,6 +176,30 @@ AuctionBidder bidderCosts(const TourBidData& bid,
   if (bid.current_target != kNoCluster) {
     bidder.current_target = pool.indexOf(bid.current_target);
   }
+  // A bidder that must keep flight to get home bids on nothing it could not
+  // reach and still return from (drone scout design §4.3).
+  if (std::isfinite(bid.reach_m)) {
+    for (std::size_t p = 0; p < n; ++p) {
+      const double back = estimated(pool.clusters[p].position, bid.home);
+      if (bidder.from_pose[p] + back > bid.reach_m) {
+        bidder.from_pose[p] = kUnreachableCost;
+      }
+    }
+  }
+  // Costs become time at the bidder's own speed, so a fast scout wins the
+  // far clusters a slow robot would take long to reach.
+  if (bid.speed_mps > 0.0) {
+    for (std::size_t p = 0; p < n; ++p) {
+      if (std::isfinite(bidder.from_pose[p])) {
+        bidder.from_pose[p] /= bid.speed_mps;
+      }
+      for (std::size_t q = 0; q < n; ++q) {
+        if (std::isfinite(bidder.between[p][q])) {
+          bidder.between[p][q] /= bid.speed_mps;
+        }
+      }
+    }
+  }
   return bidder;
 }
 

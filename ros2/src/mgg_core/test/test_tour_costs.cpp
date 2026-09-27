@@ -192,4 +192,20 @@ TEST(TourCosts, TheFirstLegHeadingLooksPastTheFirstVertex) {
                    0.0);
 }
 
+TEST(TourCosts, ReachCapsClustersTheRobotCouldNotReturnFrom) {
+  TourCostMatrix costs;
+  costs.from_robot = {5.0, 10.0, mgg::kUnreachableCost};
+  costs.between = {{0.0, 5.0, 1.0}, {5.0, 0.0, 1.0}, {1.0, 1.0, 0.0}};
+  mgg::capTourCostsByReach(costs, {5.0, 10.0, 1.0}, 16.0);
+  EXPECT_EQ(costs.from_robot[0], 5.0);  // 5 there + 5 back
+  EXPECT_EQ(costs.from_robot[1], mgg::kUnreachableCost);  // 10 + 10
+  EXPECT_EQ(costs.from_robot[2], mgg::kUnreachableCost);
+  TourCostMatrix unlimited;
+  unlimited.from_robot = {50.0};
+  unlimited.between = {{0.0}};
+  mgg::capTourCostsByReach(unlimited, {50.0},
+                           std::numeric_limits<double>::infinity());
+  EXPECT_EQ(unlimited.from_robot[0], 50.0);
+}
+
 }  // namespace

@@ -14,6 +14,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <functional>
+#include <limits>
 #include <vector>
 
 #include <Eigen/Dense>
@@ -59,6 +60,13 @@ struct TourBidData {
   std::vector<ClusterId> explored;
   /// The bidder's bundle is done and it asks for an auction (§3.2, §3.5).
   bool request_auction = false;
+  /// The bidder's cruise speed, m/s; 0 when unknown (costs stay metres).
+  double speed_mps = 0.0;
+  /// Metres of flight the bidder has left for exploring and returning home;
+  /// infinite without a battery limit (drone scout design §4.3).
+  double reach_m = std::numeric_limits<double>::infinity();
+  /// Where the bidder must return to within its reach, this robot's frame.
+  Eigen::Vector3d home = Eigen::Vector3d::Zero();
 
   double costBetween(std::size_t i, std::size_t j) const {
     return costs_between[i * clusters.size() + j];

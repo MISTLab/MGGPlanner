@@ -74,6 +74,14 @@ TourCostMatrix computeTourCosts(GraphManager& graph, std::uint64_t revision,
                                 const std::vector<FrontierCluster>& clusters,
                                 double heading_weight);
 
+/// A robot with limited flight left (a drone on battery, drone scout design
+/// §4.3) does not take clusters it could reach but not return from: those
+/// whose cost from the robot plus `cluster_to_home` exceeds `reach_m` become
+/// kUnreachableCost. An infinite reach changes nothing.
+void capTourCostsByReach(TourCostMatrix& costs,
+                         const std::vector<double>& cluster_to_home,
+                         double reach_m);
+
 }  // namespace mgg
 
 #endif  // MGG_CORE_TOUR_COSTS_H_

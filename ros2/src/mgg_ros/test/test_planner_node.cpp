@@ -5,6 +5,7 @@
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <array>
 #include <chrono>
 #include <cmath>
@@ -963,6 +964,15 @@ class PlannerNodeTestPeer {
     bid.robot_id = static_cast<int>(node.planning_params_.robot_id);
     bid.stamp_s = node.now().seconds();
     return toTourBidMsg(bid, node.world_frame_);
+  }
+  static void setFlightReach(PlannerNode& node, double reach_m) {
+    auto msg = std::make_shared<std_msgs::msg::Float64>();
+    msg->data = reach_m;
+    node.onFlightReach(msg);
+  }
+  static double flightReach(PlannerNode& node) {
+    const std::lock_guard<std::recursive_mutex> lock(node.planner_mutex_);
+    return node.flight_reach_m_;
   }
   static void receiveTourBid(PlannerNode& node,
                              const mgg_msgs::msg::TourBid& msg) {
@@ -4318,6 +4328,48 @@ TEST_F(PlannerNodeTest, RegionRejectsGreedyAndResumedOutsideFrontiersWithoutDemo
                   *node, false, Eigen::Vector3d::Zero(),
                   Eigen::Vector3d::Zero())->success);
   EXPECT_TRUE(PlannerNodeTestPeer::runGlobalPlanner(*node, reason)) << reason;
+}
+
+TEST_F(PlannerNodeTest, ABidCarriesTheRobotsSpeedReachAndHome) {
+  auto node = makeNode("drone_bid");
+  PlannerNodeTestPeer::observeFloor(*node, -1.5, 4.0, -1.5, 1.5);
+  PlannerNodeTestPeer::acceptOdometry(*node, 0.0, 0.0, 1.0);
+  EXPECT_TRUE(std::isinf(PlannerNodeTestPeer::flightReach(*node)));
+  PlannerNodeTestPeer::setFlightReach(*node, 180.0);
+  PlannerNodeTestPeer::setFlightReach(*node, std::nan(""));  // ignored
+  EXPECT_EQ(PlannerNodeTestPeer::flightReach(*node), 180.0);
+  const mgg_msgs::msg::TourBid bid = PlannerNodeTestPeer::ownTourBidMsg(*node);
+  EXPECT_EQ(bid.reach_m, 180.0);
+  EXPECT_GT(bid.speed_mps, 0.0);
+}
+
+TEST_F(PlannerNodeTest, AFlightReachLeavesOutClustersItCouldNotReturnFrom) {
+  // The frontier at (6, 0) is 6 m out and 6 m back home (vertex 0, where
+  // the robot stands): within a reach of 20 m, beyond one of 10 m.
+  auto node = makeNode("drone_reach_tour");
+  PlannerNodeTestPeer::observeFloor(*node, -1.5, 7.0, -1.5, 1.5);
+  PlannerNodeTestPeer::acceptOdometry(*node, 0.0, 0.0, 1.0);
+  PlannerNodeTestPeer::addGlobalChainToFrontier(
+      *node, {{1.0, 0.0}, {2.0, 0.0}, {3.0, 0.0}, {4.0, 0.0}, {5.0, 0.0},
+              {6.0, 0.0}});
+  PlannerNodeTestPeer::setTour(*node, true, 0.0);
+  PlannerNodeTestPeer::solveTourOnEveryChange(*node);
+  const auto finite_costs = [&node]() {
+    const mgg_msgs::msg::TourBid bid =
+        PlannerNodeTestPeer::ownTourBidMsg(*node);
+    return std::count_if(bid.costs_from_pose.begin(),
+                         bid.costs_from_pose.end(),
+                         [](double cost) { return std::isfinite(cost); });
+  };
+
+  EXPECT_NE(PlannerNodeTestPeer::refreshTour(*node), mgg::kNoCluster);
+  EXPECT_GT(finite_costs(), 0);
+  PlannerNodeTestPeer::setFlightReach(*node, 10.0);
+  EXPECT_EQ(PlannerNodeTestPeer::refreshTour(*node), mgg::kNoCluster);
+  EXPECT_EQ(finite_costs(), 0);
+  PlannerNodeTestPeer::setFlightReach(*node, 20.0);
+  EXPECT_NE(PlannerNodeTestPeer::refreshTour(*node), mgg::kNoCluster);
+  EXPECT_GT(finite_costs(), 0);
 }
 
 }  // namespace mgg_ros
