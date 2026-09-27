@@ -13,7 +13,7 @@ TEST(TourParams, DefaultsAreTheDesignTable) {
   const mgg::TourParams p;
   EXPECT_TRUE(p.enabled);
   // Chosen on SubT exploration metrics (§5.1); plan-time gate deferred.
-  EXPECT_DOUBLE_EQ(p.min_cluster_gain, 1200.0);
+  EXPECT_DOUBLE_EQ(p.min_cluster_gain, 9000.0);
   EXPECT_DOUBLE_EQ(p.heading_weight, 2.0);
   EXPECT_DOUBLE_EQ(p.cluster_id_cell_m, 1.0);
   EXPECT_DOUBLE_EQ(p.recompute_interval_s, 1.0);

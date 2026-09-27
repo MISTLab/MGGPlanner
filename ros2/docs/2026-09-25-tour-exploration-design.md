@@ -183,7 +183,7 @@ on, and keeps leases for operator goals and Return Home.
 | Parameter | Default | Meaning |
 |---|---|---|
 | `tour.enabled` | true | Use the tour instead of low-gain-triggered greedy repositioning |
-| `tour.min_cluster_gain` | 1200 | Drop clusters below this gain |
+| `tour.min_cluster_gain` | 9000 | Drop clusters below this gain |
 | `tour.cluster_id_cell_m` | 1.0 | Quantization for stable cluster IDs |
 | `tour.heading_weight` | 2.0 | Cost per radian of first-leg heading change |
 | `tour.recompute_interval_s` | 1.0 | Minimum interval between tour solves |
@@ -197,6 +197,14 @@ on, and keeps leases for operator goals and Return Home.
 | `fleet.claim_ttl_s` | 1800 | Claim lifetime of a silent peer (SwarmDeck SubT sim: 600) |
 
 ### 5.1 Tuning record
+
+**Run-10 controller ruling:** `tour.min_cluster_gain=9000` supersedes the
+provisional 1200 below: 150 unknown voxels × 60 gain/voxel, matching the local
+low-gain floor. Run 9's 20-voxel leftovers kept nearby tour targets deciding
+and suppressed handoffs. A target within `global_frontier_reach_m` now counts
+as reached when the lattice path is low-gain; distant tour targets still decide.
+The historical tuning results below are retained, not current defaults.
+
 
 **Chosen on exploration metrics; plan-time gate deferred, not passed.**
 Measured on 2026-09-27 in SwarmDeck's SubT finals simulation, four robots,

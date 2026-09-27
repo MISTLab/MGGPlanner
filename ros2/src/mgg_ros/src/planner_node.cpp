@@ -3324,6 +3324,13 @@ void PlannerNode::onPlanRequest(
       tour_target = refreshTour(tour_note);
       summary += tour_note;
     }
+    if (tour_target && low_gain_path_now_ &&
+        (tour_target->position - current_state_.head<3>()).norm() <=
+            global_frontier_reach_m_) {
+      setTourClusterAside(tour_target->id);
+      tour_target.reset();
+      summary += "; nearby tour target reached with low local gain";
+    }
     bool tour_decided = false;
     if (tour_target.has_value() && !departed &&
         !boxed_in_without_departure_now_ && !withheld_without_departure) {

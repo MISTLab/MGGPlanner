@@ -21,7 +21,7 @@ struct TourParams {
   /// on SubT exploration metrics (§5.1), provisional (single runs); the
   /// plan-time gate is deferred.
   /// Equivalent to twenty unknown voxels at unknown_voxel_gain 60.
-  double min_cluster_gain = 1200.0;
+  double min_cluster_gain = 9000.0;
   /// Grid a representative's position is quantized on for its stable ID,
   /// metres.
   double cluster_id_cell_m = 1.0;

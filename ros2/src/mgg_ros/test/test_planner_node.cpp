@@ -708,6 +708,9 @@ class PlannerNodeTestPeer {
     return node.low_gain_handoffs_;
   }
   /// A path scoring under `voxels` unknown voxels is a low-gain round.
+  static void setGlobalFrontierReach(PlannerNode& node, double reach) {
+    node.global_frontier_reach_m_ = reach;
+  }
   static void setLowGainVoxels(PlannerNode& node, double voxels) {
     node.planning_params_.low_gain_voxels = voxels;
   }
@@ -1456,16 +1459,15 @@ TEST_F(PlannerNodeTest, TheHandoffTakesAGlobalFrontierByItsOwnMinimumGain) {
 }
 
 TEST_F(PlannerNodeTest, ALowGainPathTowardTheTourTargetIsLeftToTheTour) {
-  // Tour-exploration design §2.4: the tour's target decides when the robot
-  // leaves local exploration. A low-gain lattice path toward the target is
-  // kept, however many low-gain rounds are due; the greedy global planner
-  // does not overrule the tour.
+  // A distant target still decides; a reached target with little local
+  // gain must release the same path to the low-gain handoff.
   auto node = makeNode("low_gain_tour");
   PlannerNodeTestPeer::observeFloor(*node, -1.5, 4.0, -1.5, 1.5);
   PlannerNodeTestPeer::acceptOdometry(*node, 0.0, 0.0, 1.0);
   PlannerNodeTestPeer::addGlobalChainToFrontier(
       *node, {{0.5, 0.0}, {1.0, 0.0}, {1.5, 0.0}, {2.0, 0.0}, {2.5, 0.0},
               {3.0, 0.0}, {3.5, 0.0}});
+  PlannerNodeTestPeer::setGlobalFrontierReach(*node, 0.5);
   PlannerNodeTestPeer::setTour(*node, true, 0.0);
   PlannerNodeTestPeer::lowGainRoundsDueAtOnce(*node);
   PlannerNodeTestPeer::setLowGainVoxels(*node, 1e9);
@@ -3472,6 +3474,7 @@ TEST_F(PlannerNodeTest, LocalExplorationTowardTheTourTargetIsKept) {
   // explores locally toward its target rather than taking the global
   // route.
   auto node = makeNode("tour_local_toward");
+  PlannerNodeTestPeer::setLowGainVoxels(*node, 0.0);  // non-low gain case
   PlannerNodeTestPeer::observeFloor(*node, -1.5, 4.0, -1.5, 1.5);
   PlannerNodeTestPeer::acceptOdometry(*node, 0.0, 0.0, 1.0);
   PlannerNodeTestPeer::addGlobalChainToFrontier(
@@ -3633,6 +3636,7 @@ TEST_F(PlannerNodeTest, AReachedTourTargetThatIsStillAFrontierIsReleasedOnce) {
   // every cycle would solve every cycle and restamp the target's claim
   // (targetSince) each time.
   auto node = makeNode("tour_reached_once");
+  PlannerNodeTestPeer::setLowGainVoxels(*node, 0.0);  // non-low gain case
   PlannerNodeTestPeer::observeFloor(*node, -1.5, 4.0, -1.5, 1.5);
   PlannerNodeTestPeer::acceptOdometry(*node, 0.0, 0.0, 1.0);
   PlannerNodeTestPeer::addGlobalChainToFrontier(
@@ -4100,4 +4104,28 @@ TEST_F(PlannerNodeTest, ASoloReleaseReportsThatItAppliedLocally) {
   EXPECT_NE(response->message.find("nothing forwarded"), std::string::npos);
 }
 
+TEST_F(PlannerNodeTest, ANearTourTargetDoesNotStarveTheLowGainHandoff) {
+  // A distant target still decides; a reached target with little local
+  // gain must release the same path to the low-gain handoff.
+  auto node = makeNode("near_low_gain_tour");
+  PlannerNodeTestPeer::observeFloor(*node, -1.5, 4.0, -1.5, 1.5);
+  PlannerNodeTestPeer::acceptOdometry(*node, 0.0, 0.0, 1.0);
+  PlannerNodeTestPeer::addGlobalChainToFrontier(
+      *node, {{0.5, 0.0}, {1.0, 0.0}, {1.5, 0.0}, {2.0, 0.0}, {2.5, 0.0},
+              {3.0, 0.0}, {3.5, 0.0}});
+  PlannerNodeTestPeer::setGlobalFrontierReach(*node, 5.0);
+  PlannerNodeTestPeer::setTour(*node, true, 0.0);
+  PlannerNodeTestPeer::lowGainRoundsDueAtOnce(*node);
+  PlannerNodeTestPeer::setLowGainVoxels(*node, 1e9);
+  auto response = std::make_shared<mgg_msgs::srv::PlannerSrv::Response>();
+  PlannerNodeTestPeer::plan(*node, response);
+  ASSERT_EQ(response->status, mgg_msgs::srv::PlannerSrv::Response::FORWARD);
+  ASSERT_GE(response->path.size(), 2u);
+  EXPECT_TRUE(PlannerNodeTestPeer::bestPathFromGlobalGraph(*node));
+  EXPECT_EQ(PlannerNodeTestPeer::tourTarget(*node), mgg::kNoCluster);
+  EXPECT_EQ(PlannerNodeTestPeer::lowGainHandoffs(*node), 1);
+  EXPECT_GT(response->path.back().position.x, 0.0);
+}
+
 }  // namespace mgg_ros
+
