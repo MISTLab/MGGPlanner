@@ -405,12 +405,15 @@ struct GlobalFrontierReport {
   double best_gain = 0.0;
   double best_distance = 0.0;
   /// Frontiers still standing after the re-check, how many the re-check
-  /// demoted, and how many are reachable from the source and not excluded.
+  /// demoted, and how many are reachable, unexcluded and outside reach.
   int frontiers = 0;
   int demoted = 0;
   /// This robot's gain re-checks (the work charged to the time budget).
   int rechecked = 0;
   int feasible = 0;
+  /// Reachable, unexcluded frontiers still holding positive gain but too
+  /// close to the robot for a repositioning. They are not explored.
+  int within_reach = 0;
   /// Frontiers the time budget left unchecked: counted in `frontiers`, as
   /// they stand, but not ranked. With any, the search was cut short, and a
   /// frontier it did not rank may be the best: no frontier found is then
@@ -427,6 +430,8 @@ struct GlobalFrontierReport {
 /// times kGlobalOtherRobotPenalty for another robot's frontier
 /// (rrg.cpp:5800 to 5808). Frontiers within `exclusion_radius` of an
 /// `excluded` point (a peer's reservation or a refused target) are skipped.
+/// With `robot_position`, frontiers within planar `reach_distance` of it
+/// are also skipped and counted separately; source_id may link elsewhere.
 /// With a `target` (exploring toward a goal with no known route), each
 /// frontier is also discounted by exp(-kGlobalTargetPenalty * its
 /// straight-line distance to the target).
@@ -440,12 +445,15 @@ struct GlobalFrontierReport {
 /// counts what it left unchecked (GlobalFrontierReport::unchecked).
 /// `eligible`, when set, excludes frontiers before re-checking or ranking;
 /// an operator's temporary region must not demote persistent frontiers.
+/// A frontier it excludes is not counted within reach either: the search
+/// could not take it anyway.
 GlobalFrontierReport searchGlobalFrontier(
     GraphManager& graph, int source_id, int robot_id,
     const RecomputeGainFn& recompute_gain,
     const std::vector<Eigen::Vector3d>& excluded = {},
     double exclusion_radius = 0.0, const Eigen::Vector3d* target = nullptr,
     double time_budget_s = std::numeric_limits<double>::infinity(),
+    const Eigen::Vector3d* robot_position = nullptr, double reach_distance = 0.0,
     const UsableVertexFn& eligible = {});
 
 }  // namespace mgg

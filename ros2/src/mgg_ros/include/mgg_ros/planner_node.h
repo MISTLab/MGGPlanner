@@ -440,8 +440,10 @@ class PlannerNode : public rclcpp::Node {
   /// bodies were in the way), reached it with little local gain, or stands
   /// on its representative (the route's source, which the tour costs zero
   /// and no route leaves).
+  /// At-target failures do not lapse on movement; consecutive failures
+  /// double the retry up to 4x, until new gain or a progressing decision.
   void setTourClusterAside(const mgg::FrontierCluster& cluster,
-                           double retry_s);
+                           double retry_s, bool at_target = false);
   /// Every frontier cluster of the global graph, other robots' included,
   /// under its stable name (tour-exploration design §2.1).
   std::vector<mgg::FrontierCluster> globalFrontierClusters();
@@ -552,6 +554,9 @@ class PlannerNode : public rclcpp::Node {
   /// The last global search found a frontier, or resumed one, and routing
   /// to it failed (runGlobalPlanner).
   bool global_frontier_not_routed_ = false;
+  /// The last global route failed its final progress check while the
+  /// robot was already within reach_distance of the requested frontier.
+  bool global_route_at_target_ = false;
   mgg::RandomSampler random_sampler_;
   mgg::RobotStateHistory robot_state_hist_;
 
@@ -818,8 +823,16 @@ class PlannerNode : public rclcpp::Node {
     double gain = 0.0;
     double at_s = 0.0;
     double retry_s = 0.0;
+    bool at_target = false;
   };
   std::unordered_map<mgg::ClusterId, TourSetAside> tour_set_aside_;
+  struct TourAtTargetFailure {
+    double gain = 0.0;
+    int retry_multiplier = 0;
+  };
+  /// Retained across retry expiry, pruned when a cluster disappears, gains
+  /// new evidence, or gets a successful progressing tour decision.
+  std::unordered_map<mgg::ClusterId, TourAtTargetFailure> tour_at_target_failures_;
   /// Tour targets the robot could not be routed to.
   int tour_routes_failed_ = 0;
 
