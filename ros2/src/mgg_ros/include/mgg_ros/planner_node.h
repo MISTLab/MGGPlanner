@@ -337,7 +337,7 @@ class PlannerNode : public rclcpp::Node {
   /// This robot's own vertices in the global graph.
   std::size_t ownGlobalVertices() const;
   /// rrg.cpp:2535 expandGlobalGraphTimerCallback, idle while its inputs
-  /// (graph, map, robot position) are unchanged.
+  /// (graph, map, peer bodies, robot position) are unchanged.
   void expandGlobalGraphTimerCallback();
 
   /// A ground robot's state at driving height above mapped ground. False
@@ -613,6 +613,9 @@ class PlannerNode : public rclcpp::Node {
   /// sampler: its other inputs are the graph and map revisions.
   static constexpr double kOdometryStillM = 1e-3;
   std::uint64_t expansion_graph_revision_ = 0;
+  /// The peer generation (refreshPeerGeneration) the last pass sampled
+  /// against.
+  std::uint64_t expansion_peer_generation_ = 0;
   std::uint64_t expansion_map_revision_ = 0;
   mgg::StateVec expansion_state_ = mgg::StateVec::Zero();
   /// rrg.cpp:2548: nothing to grow before the first plan.

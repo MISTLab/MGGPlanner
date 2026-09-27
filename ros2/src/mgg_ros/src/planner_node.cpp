@@ -2102,19 +2102,27 @@ void PlannerNode::expandGlobalGraphTimerCallback() {
   refreshMapRevision();
   if (planner_trigger_count_ == 0) return;
   if (!have_odometry_ || !map_->getStatus()) return;
+  // The pass samples against one peer set, the one its skip key records.
+  std::optional<mgg::MolaMap::TransientDiscPin> peer_pin;
+  pinPeerBodies(peer_pin);
+  refreshPeerGeneration();
   // The sampler draws around the unvisited clusters of the global graph and
-  // tests against the map and the robot's trail. When none of those changed
-  // since a pass that added nothing, another pass spends its whole budget
-  // (rrg.cpp:2608) rediscovering that nothing is admissible: a parked robot
-  // would burn kGlobalGraphUpdateTimeBudget every period indefinitely.
+  // tests against the map, the peer bodies and the robot's trail. When none
+  // of those changed since a pass that added nothing, another pass spends
+  // its whole budget (rrg.cpp:2608) rediscovering that nothing is
+  // admissible: a parked robot would burn kGlobalGraphUpdateTimeBudget
+  // every period indefinitely. A peer leaving opens space to sample
+  // without changing the graph (review r1, R2).
   if (graph_revision_ == expansion_graph_revision_ &&
       map_revision_ == expansion_map_revision_ &&
+      peer_generation_ == expansion_peer_generation_ &&
       (current_state_.head<3>() - expansion_state_.head<3>()).norm() <
           kOdometryStillM) {
     return;
   }
   expansion_graph_revision_ = graph_revision_;
   expansion_map_revision_ = map_revision_;
+  expansion_peer_generation_ = peer_generation_;
   expansion_state_ = current_state_;
 
   const mgg::GlobalGraphExpansionReport report = mgg::expandGlobalGraph(

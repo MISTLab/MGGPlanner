@@ -314,6 +314,38 @@ class PlannerNodeTestPeer {
     const std::lock_guard<std::recursive_mutex> lock(node.planner_mutex_);
     node.tour_params_.route_retry_s = seconds;
   }
+  /// One background expansion of the global graph, as its timer runs it,
+  /// after a first plan; the vertices it added.
+  static int expandGlobalGraph(PlannerNode& node) {
+    const int before = globalVertices(node);
+    node.planner_trigger_count_ = std::max(node.planner_trigger_count_, 1);
+    node.expandGlobalGraphTimerCallback();
+    return globalVertices(node) - before;
+  }
+  /// The expansion's sampler draws offsets in [lo, hi] from a centroid.
+  static void setExpansionSamplerBound(PlannerNode& node,
+                                       const Eigen::Vector3d& lo,
+                                       const Eigen::Vector3d& hi) {
+    const std::lock_guard<std::recursive_mutex> lock(node.planner_mutex_);
+    node.random_sampler_.setBound(lo, hi);
+  }
+  static void setGlobalVertexType(PlannerNode& node, int id,
+                                  mgg::VertexType type) {
+    const std::lock_guard<std::recursive_mutex> lock(node.planner_mutex_);
+    node.findGlobalVertex(id)->type = type;
+  }
+  /// Global frontier vertices east of `x`.
+  static int globalFrontiersBeyond(PlannerNode& node, double x) {
+    const std::lock_guard<std::recursive_mutex> lock(node.planner_mutex_);
+    int frontiers = 0;
+    for (const auto& [id, vertex] : node.global_graph_->vertices_map_) {
+      if (vertex != nullptr && vertex->type == mgg::VertexType::kFrontier &&
+          vertex->state.x() > x) {
+        ++frontiers;
+      }
+    }
+    return frontiers;
+  }
   /// Peer diagnoses run since the node started.
   static int peerDiagnoses(PlannerNode& node) {
     const std::lock_guard<std::recursive_mutex> lock(node.planner_mutex_);
@@ -2407,6 +2439,46 @@ TEST_F(PlannerNodeTest, NoPeerDiagnosisRunsWithoutPeersInForce) {
   EXPECT_EQ(response->status, Service::Response::UNREACHABLE)
       << response->reason;
   EXPECT_GT(PlannerNodeTestPeer::peerDiagnoses(*node), 0);
+}
+
+TEST_F(PlannerNodeTest, APeerLeavingLetsTheBackgroundExpansionRunAgain) {
+  // Review r1, R2: the background expansion skips a pass while the graph,
+  // the map and the robot's pose are as they were at a pass that added
+  // nothing. Peer bodies no longer change the graph revision, yet the
+  // expansion's samples are refused where a peer stands. Here the roadmap
+  // runs east along a corridor from the robot to its one unvisited vertex
+  // at (8, 0), and the expansion samples 5.1 to 5.9 m east of it, where a
+  // peer is parked: nothing is added. The peer leaves, nothing else
+  // changes, and the next pass adds a frontier past (8, 0).
+  std::unique_ptr<MolaFloorProduct> product;
+  auto node = peerFloorNode("peer_expansion_retry", -1.0, 14.0, -0.6, 0.6,
+                            product);
+  PlannerNodeTestPeer::acceptOdometry(*node, 0.0, 0.0, 1.0);
+  const int far_end = PlannerNodeTestPeer::addGlobalChainToFrontier(
+      *node, {{1.0, 0.0}, {2.0, 0.0}, {3.0, 0.0}, {4.0, 0.0}, {5.0, 0.0},
+              {6.0, 0.0}, {7.0, 0.0}, {8.0, 0.0}});
+  for (double x = 0.0; x <= 7.0 + 1e-9; x += 1.0) {
+    const int id = PlannerNodeTestPeer::globalVertexAt(*node, x, 0.0);
+    ASSERT_GE(id, 0);
+    PlannerNodeTestPeer::setGlobalVertexType(*node, id,
+                                             mgg::VertexType::kVisited);
+  }
+  PlannerNodeTestPeer::setGlobalVertexType(*node, far_end,
+                                           mgg::VertexType::kUnvisited);
+  PlannerNodeTestPeer::setExpansionSamplerBound(
+      *node, {5.1, -0.4, 0.0}, {5.9, 0.4, 0.0});
+  PlannerNodeTestPeer::receivePeerBodies(*node, {{13.5, 0.0}});
+
+  EXPECT_EQ(PlannerNodeTestPeer::expandGlobalGraph(*node), 0);
+  EXPECT_EQ(PlannerNodeTestPeer::expandGlobalGraph(*node), 0);
+  const std::uint64_t revision = PlannerNodeTestPeer::graphRevision(*node);
+  const int edges = PlannerNodeTestPeer::globalEdges(*node);
+
+  PlannerNodeTestPeer::receivePeerBodies(*node, {});
+  EXPECT_EQ(PlannerNodeTestPeer::graphRevision(*node), revision);
+  EXPECT_EQ(PlannerNodeTestPeer::globalEdges(*node), edges);
+  EXPECT_GT(PlannerNodeTestPeer::expandGlobalGraph(*node), 0);
+  EXPECT_GT(PlannerNodeTestPeer::globalFrontiersBeyond(*node, 8.1), 0);
 }
 
 TEST_F(PlannerNodeTest, ATourTargetBehindAParkedPeerIsSetAsideBriefly) {
