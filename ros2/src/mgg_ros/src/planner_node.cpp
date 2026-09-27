@@ -2766,12 +2766,31 @@ bool PlannerNode::routeOverGlobalGraph(const mgg::StateVec goal,
     turns_ok = applyRouteTurnRule(*global_graph_, /*slope_from_map=*/true,
                                   path, route, "global route");
     // A turn-compliant detour must keep out of the zones too; the route it
-    // replaced does.
+    // replaced does. That route turns where it may not, as a fallback does,
+    // and its first turn is judged below like a fallback's.
     if (!no_go_.empty() && !zones_admit(route) && zones_admit(before_turns)) {
       route = before_turns;
+      ++route_sharp_turn_fallbacks_;
+      RCLCPP_WARN(get_logger(),
+                  "global route to (%.2f, %.2f, %.2f): the only route turning "
+                  "where it may enters a no-go zone; the zone-safe route, "
+                  "which does not turn only where it may, is kept (%d such "
+                  "routes so far)",
+                  route.back()->state.x(), route.back()->state.y(),
+                  route.back()->state.z(), route_sharp_turn_fallbacks_);
     }
   }
   for (const mgg::Vertex* v : route) path.push_back(v->state);
+  // Whether the route kept starts with a turn the robot has no room for,
+  // judged on that route, whichever branch kept it (review r2, R2-2): the
+  // boxed-in guard (depart_instead_of_turning_route) reads it.
+  {
+    std::vector<Eigen::Vector3d> kept;
+    kept.reserve(path.size());
+    for (const mgg::StateVec& state : path) kept.push_back(state.head<3>());
+    last_route_starts_with_turn_without_room_ =
+        routeStartsWithTurnWithoutRoom(kept);
+  }
   if (path.size() < 2) {
     reason = "no route over the global graph reaches the goal";
     return false;
@@ -2918,6 +2937,24 @@ bool PlannerNode::routeOverLocalLattice(const mgg::StateVec& goal,
   return true;
 }
 
+bool PlannerNode::routeStartsWithTurnWithoutRoom(
+    const std::vector<Eigen::Vector3d>& points) {
+  if (robot_params_.type != mgg::RobotType::kGroundRobot || points.size() < 2) {
+    return false;
+  }
+  const double start_heading = current_state_[3];
+  // Over the robot's length, as PathTurnCheck measures turns.
+  const std::vector<double> turns = mgg::pathTurns(
+      points, start_heading,
+      std::max(robot_params_.size.x(), robot_params_.size.y()));
+  const std::optional<mgg::StandingStart> standing = standingStart();
+  return !turns.empty() && turns.front() > mgg::kSharpTurnRad + 1e-9 &&
+         !mgg::roomToTurn(*map_, robot_params_, planning_params_,
+                          mgg::StateVec(points.front().x(), points.front().y(),
+                                        points.front().z(), start_heading),
+                          standing ? &*standing : nullptr);
+}
+
 mgg::PathOkFn PlannerNode::applyRouteTurnRule(
     mgg::GraphManager& graph, bool slope_from_map,
     const std::vector<mgg::StateVec>& lead_in,
@@ -2964,14 +3001,8 @@ mgg::PathOkFn PlannerNode::applyRouteTurnRule(
     ++route_sharp_turn_fallbacks_;
     std::vector<Eigen::Vector3d> points = lead_in_points;
     for (const mgg::Vertex* v : route) points.push_back(v->state.head<3>());
-    const std::vector<double> turns =
-        mgg::pathTurns(points, start_heading, check->window());
     last_route_starts_with_turn_without_room_ =
-        !turns.empty() && turns.front() > mgg::kSharpTurnRad + 1e-9 &&
-        !mgg::roomToTurn(*map_, robot_params_, planning_params_,
-                         mgg::StateVec(points.front().x(), points.front().y(),
-                                       points.front().z(), start_heading),
-                         standing ? &*standing : nullptr);
+        routeStartsWithTurnWithoutRoom(points);
     RCLCPP_WARN(get_logger(),
                 "%s to (%.2f, %.2f, %.2f) turns sharply on a slope or "
                 "without room to turn: no route turns only where it may; "

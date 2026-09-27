@@ -133,6 +133,12 @@ class PlannerNode : public rclcpp::Node {
   void readmitQuarantinedNeighbours();
   /// Updates the turn-back hysteresis from the path a plan request sends.
   void recordSentPath();
+  /// Whether a route, the robot's pose first, starts with a sharp turn
+  /// (kSharpTurnRad, measured over the robot's length from its heading)
+  /// where the robot has no room to turn: the route a boxed-in robot is
+  /// not sent.
+  bool routeStartsWithTurnWithoutRoom(
+      const std::vector<Eigen::Vector3d>& points);
   /// Why exploration may not be declared complete although no frontier is
   /// left to go to, or empty: a quarantined neighbour roadmap, whose
   /// frontiers are out of every search until its transform returns, a

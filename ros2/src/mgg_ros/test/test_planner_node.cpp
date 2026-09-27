@@ -1902,6 +1902,66 @@ TEST_F(PlannerNodeTest, TheNoGoReachFollowsTheRequestsBoundMode) {
   }
 }
 
+TEST_F(PlannerNodeTest, ARestoredZoneSafeRouteThatTurnsWithoutRoomIsNotSent) {
+  // Review r2, R2-2, the reviewer's graph at twice its scale (roadmap links
+  // reach 0.55 m here): a zone of 2 m reach (1.7 m radius, 0.3 m
+  // half-length) at the origin; the robot at S = (1, 0) faces north, with a
+  // post 0.29 m south-west of it: no room to turn there, room everywhere
+  // else. The roadmap holds S-A-C-T, zone-safe but turning 90 degrees at S,
+  // and S-U-B-T, which starts north but re-enters the zone at B. A wall
+  // across S-C and A-T leaves the route no shortcut. The zone-safe route is
+  // found, the turn rule replaces it with S-U-B-T, and that is put back for
+  // re-entering the zone. The flag that makes a route starting with a turn
+  // the robot has no room for into a straight departure was left unset,
+  // and S-A-C-T was sent. It must be a straight departure or no path.
+  auto node = makeNode("no_go_restored_turn", "world",
+                       {rclcpp::Parameter("PlanningParams.no_go_radius_m", 1.7)});
+  PlannerNodeTestPeer::setRobotFootprint(*node, 0.6, 0.2);
+  PlannerNodeTestPeer::observeFloor(*node, -1.5, 5.0, -1.5, 4.5);
+  PlannerNodeTestPeer::observeWall(*node, 0.85, 0.85, -0.25);
+  PlannerNodeTestPeer::observeWallAlongY(*node, 1.3, 2.7, 2.5);
+  // Only the lattice's own cells, all inside the zone: no path may end
+  // there, so the global planner is consulted.
+  PlannerNodeTestPeer::setLatticeResolution(*node, 0.25);
+  PlannerNodeTestPeer::setLattice(*node, {-0.25, -0.25}, {0.25, 0.25});
+  auto odometry = std::make_shared<nav_msgs::msg::Odometry>();
+  odometry->header.stamp.sec = 1;
+  odometry->pose.pose.position.x = 1.0;
+  odometry->pose.pose.position.z = 0.075;
+  odometry->pose.pose.orientation.z = std::sin(M_PI / 4.0);
+  odometry->pose.pose.orientation.w = std::cos(M_PI / 4.0);
+  PlannerNodeTestPeer::acceptOdometry(*node, odometry);
+  const int a = PlannerNodeTestPeer::addIsolatedGlobalVertex(*node, 4.0, 0.0);
+  const int c = PlannerNodeTestPeer::addIsolatedGlobalVertex(*node, 4.0, 4.0);
+  const int t = PlannerNodeTestPeer::addIsolatedGlobalVertex(*node, 0.0, 4.0);
+  const int u = PlannerNodeTestPeer::addIsolatedGlobalVertex(*node, 1.0, 4.0);
+  const int b = PlannerNodeTestPeer::addIsolatedGlobalVertex(*node, 1.0, 1.0);
+  PlannerNodeTestPeer::addGlobalEdgeOnly(*node, 0, a);
+  PlannerNodeTestPeer::addGlobalEdgeOnly(*node, a, c);
+  PlannerNodeTestPeer::addGlobalEdgeOnly(*node, c, t);
+  PlannerNodeTestPeer::addGlobalEdgeOnly(*node, 0, u);
+  PlannerNodeTestPeer::addGlobalEdgeOnly(*node, u, b);
+  PlannerNodeTestPeer::addGlobalEdgeOnly(*node, b, t);
+  PlannerNodeTestPeer::markGlobalFrontier(*node, t);
+  PlannerNodeTestPeer::receiveNoGoZones(*node, "world", {{0.0, 0.0}});
+  PlannerNodeTestPeer::consultGlobalPlannerAtOnce(*node);
+  auto response = std::make_shared<mgg_msgs::srv::PlannerSrv::Response>();
+  PlannerNodeTestPeer::plan(*node, response);
+  EXPECT_FALSE(PlannerNodeTestPeer::bestPathFromGlobalGraph(*node));
+  // A straight departure, ahead or back along the robot's heading (turned
+  // by at most kDepartureMaxTurnRad), if any path at all.
+  for (const auto& pose : response->path) {
+    const double dx = pose.position.x - 1.0, dy = pose.position.y;
+    if (std::hypot(dx, dy) < 1e-6) continue;
+    EXPECT_LE(std::abs(dx) / std::hypot(dx, dy),
+              std::sin(mgg::kDepartureMaxTurnRad) + 1e-6)
+        << "pose at (" << pose.position.x << ", " << pose.position.y << ")";
+  }
+  EXPECT_EQ(PlannerNodeTestPeer::boxedInDepartures(*node) +
+                PlannerNodeTestPeer::boxedInWithoutDeparture(*node),
+            1);
+}
+
 TEST_F(PlannerNodeTest, OverlappingNoGoZoneMessagesEndWithTheLastSet) {
   // Review r0, I-4: the subscription was in the node's reentrant group, and
   // under the multithreaded executor an older replacement could take the
