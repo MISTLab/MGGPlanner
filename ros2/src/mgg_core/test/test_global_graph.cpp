@@ -485,6 +485,47 @@ TEST(AddRefPathToGraph, VertexOverloadCarriesTypeAndStopsAtHangingVertices) {
   EXPECT_EQ(fixture.nearest(Eigen::Vector3d(3.0, 0.0, 0.0)), nullptr);
 }
 
+TEST(AddRefPathToGraph, AVertexRefusedGainNeitherMarksNorOverwrites) {
+  // Task 16 review r1, m1: a lattice computed inside an exploration region
+  // leaves the frontier at (2, 0), outside it, without gain. Carried
+  // across, that gain would demote the roadmap's own frontier for good.
+  for (const bool refused : {false, true}) {
+    SCOPED_TRACE(refused ? "outside vertices refused" : "every vertex carries");
+    Roadmap fixture;
+    Vertex* frontier = fixture.add(fixture.global, StateVec(2.0, 0.0, 0.0, 0.0),
+                                   fixture.add(fixture.global,
+                                               StateVec(1.0, 0.0, 0.0, 0.0),
+                                               fixture.global.getVertex(0)),
+                                   VertexType::kFrontier);
+    frontier->vol_gain.gain = 9.0;
+    GraphManager local;
+    local.addVertex(new Vertex(0, StateVec(0.0, 0.0, 0.0, 0.0)));
+    Vertex* middle = fixture.add(local, StateVec(1.0, 0.0, 0.0, 0.0),
+                                 local.getVertex(0));
+    Vertex* seen = fixture.add(local, StateVec(2.0, 0.0, 0.0, 0.0), middle);
+    Vertex* beyond = fixture.add(local, StateVec(3.0, 0.0, 0.0, 0.0), seen,
+                                 VertexType::kFrontier);
+    beyond->vol_gain.gain = 5.0;
+    const mgg::UsableVertexFn inside =
+        refused ? mgg::UsableVertexFn([](const Vertex& vertex) {
+                    return vertex.state.x() < 1.5;
+                  })
+                : mgg::UsableVertexFn();
+    std::vector<Vertex*> added;
+    ASSERT_TRUE(mgg::addRefPathToGraph(
+        fixture.global, {local.getVertex(0), middle, seen, beyond},
+        fixture.ctx, 1.0, &added, inside));
+    ASSERT_EQ(added.size(), 4u);
+    EXPECT_EQ(added[2], frontier);
+    EXPECT_EQ(frontier->type,
+              refused ? VertexType::kFrontier : VertexType::kUnvisited);
+    EXPECT_DOUBLE_EQ(frontier->vol_gain.gain, refused ? 9.0 : 0.0);
+    // A new vertex refused its gain is left unmarked.
+    EXPECT_EQ(added[3]->type,
+              refused ? VertexType::kUnvisited : VertexType::kFrontier);
+  }
+}
+
 TEST(ConnectStateToGraph, LinksTheCurrentStateAndWiresItsNeighbours) {
   Roadmap fixture;
   fixture.planning.nearest_range = 1.5;

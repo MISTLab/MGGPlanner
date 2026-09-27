@@ -180,12 +180,21 @@ bool addRefPathToGraph(GraphManager& graph, const std::vector<StateVec>& path,
                        const ExpandContext& ctx, double vertex_spacing,
                        std::vector<Vertex*>* path_vertices = nullptr);
 
+/// Roadmap vertices a goal lattice may bridge to, e.g. those the robot can
+/// reach; path vertices whose gain may be carried across. Null admits every
+/// vertex.
+using UsableVertexFn = std::function<bool(const Vertex&)>;
+
 /// The vertex overload (rrg.cpp:4808): carries each vertex's type and gain
-/// across, and stops at the first hanging vertex (rrg.cpp:4869).
+/// across, and stops at the first hanging vertex (rrg.cpp:4869). A vertex
+/// `carries_gain` refuses enters as a pose: its gain was computed under a
+/// restriction (an exploration region) the roadmap must not keep, so it
+/// neither marks a new vertex nor overwrites the one it lands on.
 bool addRefPathToGraph(GraphManager& graph,
                        const std::vector<Vertex*>& path,
                        const ExpandContext& ctx, double vertex_spacing,
-                       std::vector<Vertex*>* path_vertices = nullptr);
+                       std::vector<Vertex*>* path_vertices = nullptr,
+                       const UsableVertexFn& carries_gain = {});
 
 /// One keyframe of the robot's trajectory.
 struct TrajectoryKeyframe {
@@ -282,10 +291,6 @@ RoadmapRebuildReport rebuildRoadmapFromTrajectory(
 /// A geofence refusal sets rep.status to kErrorGeofenceViolated.
 bool drivenEdgeTraversable(const ExpandContext& ctx, const Vertex& from,
                            const Vertex& to, ExpandGraphReport& rep);
-
-/// Roadmap vertices a goal lattice may bridge to, e.g. those the robot can
-/// reach. Null admits every vertex.
-using UsableVertexFn = std::function<bool(const Vertex&)>;
 
 /// Bounds the lattice-to-roadmap edge checks of one connectGoalThroughLattice.
 inline constexpr int kMaxGoalBridgeChecks = 4096;

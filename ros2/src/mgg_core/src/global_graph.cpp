@@ -353,7 +353,8 @@ bool addRefPathToGraph(GraphManager& graph, const std::vector<StateVec>& path,
 bool addRefPathToGraph(GraphManager& graph,
                        const std::vector<Vertex*>& path,
                        const ExpandContext& ctx, double vertex_spacing,
-                       std::vector<Vertex*>* path_vertices) {
+                       std::vector<Vertex*>* path_vertices,
+                       const UsableVertexFn& carries_gain) {
   std::vector<RefPose> poses;
   poses.reserve(path.size());
   for (std::size_t i = 0; i < path.size(); ++i) {
@@ -361,7 +362,8 @@ bool addRefPathToGraph(GraphManager& graph,
     // Don't add the part of the path after the first hanging vertex
     // (rrg.cpp:4868).
     if (i > 0 && path[i]->is_hanging) break;
-    poses.push_back({path[i]->state, path[i]});
+    const bool carried = !carries_gain || carries_gain(*path[i]);
+    poses.push_back({path[i]->state, carried ? path[i] : nullptr});
   }
   return addRefPath(graph, poses, ctx, vertex_spacing, path_vertices);
 }

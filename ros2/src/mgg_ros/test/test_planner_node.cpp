@@ -1133,6 +1133,24 @@ class PlannerNodeTestPeer {
     const std::lock_guard<std::recursive_mutex> lock(node.planner_mutex_);
     node.addRefPathToGraph(path);
   }
+  /// A lattice of one chain through `states`, every vertex seen (no
+  /// frontier, no gain), as a lattice computed inside an exploration region
+  /// leaves the vertices outside it.
+  static void setSeenLattice(PlannerNode& node,
+                             const std::vector<mgg::StateVec>& states) {
+    const std::lock_guard<std::recursive_mutex> lock(node.planner_mutex_);
+    node.local_graph_->reset();
+    mgg::Vertex* previous = nullptr;
+    for (const mgg::StateVec& state : states) {
+      auto* v = new mgg::Vertex(node.local_graph_->generateVertexID(), state);
+      node.local_graph_->addVertex(v);
+      if (previous != nullptr) {
+        node.local_graph_->addEdge(
+            v, previous, (v->state - previous->state).head<3>().norm());
+      }
+      previous = v;
+    }
+  }
 };
 
 namespace {
@@ -4370,6 +4388,33 @@ TEST_F(PlannerNodeTest, AFlightReachLeavesOutClustersItCouldNotReturnFrom) {
   PlannerNodeTestPeer::setFlightReach(*node, 20.0);
   EXPECT_NE(PlannerNodeTestPeer::refreshTour(*node), mgg::kNoCluster);
   EXPECT_GT(finite_costs(), 0);
+}
+
+TEST_F(PlannerNodeTest, ARegionsLatticeDoesNotDemoteAnOutsideFrontierItPasses) {
+  // Task 16 review r1, m1: a path chosen on a lattice computed inside the
+  // region runs through this robot's frontier outside it. Joining the
+  // roadmap, it must not carry its region-limited gain onto that frontier.
+  // Without a region the lattice's gain is the truth and does.
+  for (const bool region : {true, false}) {
+    SCOPED_TRACE(region ? "region" : "no region");
+    auto node = makeNode(region ? "region_ref_path" : "no_region_ref_path");
+    PlannerNodeTestPeer::observeFloor(*node, -3.55, 4.55, -1.55, 1.55);
+    PlannerNodeTestPeer::acceptOdometry(*node, 0.0, 0.0, 1.0);
+    const int frontier = PlannerNodeTestPeer::addGlobalChainToFrontier(
+        *node, {{-1.0, 0.0}, {-2.0, 0.0}}, M_PI);
+    const mgg::StateVec root = PlannerNodeTestPeer::globalVertexState(*node, 0);
+    const mgg::StateVec outside =
+        PlannerNodeTestPeer::globalVertexState(*node, frontier);
+    if (region) {
+      ASSERT_TRUE(PlannerNodeTestPeer::setExplorationRegion(
+                      *node, true, {-0.5, -1.5, -5.0}, {4.0, 1.5, 5.0})
+                      ->success);
+    }
+    const mgg::StateVec middle(-1.0, 0.0, root.z(), M_PI);
+    PlannerNodeTestPeer::setSeenLattice(*node, {root, middle, outside});
+    PlannerNodeTestPeer::addExplorationPath(*node, {root, middle, outside});
+    EXPECT_EQ(PlannerNodeTestPeer::isGlobalFrontier(*node, frontier), region);
+  }
 }
 
 }  // namespace mgg_ros

@@ -2054,6 +2054,15 @@ void PlannerNode::addRefPathToGraph(const std::vector<mgg::StateVec>& path) {
     lattice.push_back(vertex);
   }
   const mgg::ExpandContext ctx = makeGlobalContext();
+  // The lattice's gain outside an exploration region counts nothing there
+  // (buildLocalGraph): carried across, it would demote the roadmap's own
+  // frontiers outside the region for good. Those vertices enter as poses.
+  mgg::UsableVertexFn carries_gain;
+  if (exploration_region_) {
+    carries_gain = [region = *exploration_region_](const mgg::Vertex& vertex) {
+      return region.isInsideSpace(vertex.state.head<3>());
+    };
+  }
   std::vector<mgg::Vertex*> added_vertices;
   const auto add = [&]() {
     return lattice.empty()
@@ -2062,7 +2071,7 @@ void PlannerNode::addRefPathToGraph(const std::vector<mgg::StateVec>& path) {
                                         &added_vertices)
                : mgg::addRefPathToGraph(*global_graph_, lattice, ctx,
                                         global_vertex_spacing_,
-                                        &added_vertices);
+                                        &added_vertices, carries_gain);
   };
   int before = global_graph_->getNumVertices();
   bool added = add();
@@ -2087,7 +2096,7 @@ void PlannerNode::addRefPathToGraph(const std::vector<mgg::StateVec>& path) {
                                               &rebuilt_added)
                      : mgg::addRefPathToGraph(graph, lattice, ctx,
                                               global_vertex_spacing_,
-                                              &rebuilt_added);
+                                              &rebuilt_added, carries_gain);
         });
     if (rebuilt) {
       before = rebuilt_before;
