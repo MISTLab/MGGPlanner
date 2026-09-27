@@ -965,3 +965,29 @@ TEST(GroundProjection, APlanCacheCastsAgainFromInsideAWall) {
 }
 
 }  // namespace
+
+TEST(GroundProjection, PlatformCellRiseLimitsKeepSmoothFifteenDegreeRamp) {
+  std::map<std::pair<std::int64_t,std::int64_t>,double> heights;
+  const double slope=std::tan(15*M_PI/180);
+  for(int x=-20;x<=20;++x) for(int y=-20;y<=20;++y)
+    heights[{x,y}]=(x+.5)*.2*slope;
+  const mgg_test::TerrainFixture ramp(.2,heights);
+  struct Platform { double length,width,base,step,rise,tilt,residual,cross; };
+  for(const Platform p : {Platform{.612,.580,.1225,.15,.075,25,.08,18},
+                         Platform{1.023,.778,.2,.15,.12,20,.10,18},
+                         Platform{1.1,.5,.5,.30,.25,25,.25,12}}) {
+    auto params=makeParams();
+    params.max_ground_height=p.base+p.step+.175;
+    params.max_step_height=p.step;
+    params.max_inclination=27*M_PI/180;
+    params.max_cross_slope=p.cross*M_PI/180;
+    params.max_footprint_tilt=p.tilt*M_PI/180;
+    params.max_footprint_step=p.residual;
+    params.max_footprint_cell_rise=p.rise;
+    mgg::GroundProjection ground(ramp,params);
+    std::vector<Eigen::Vector3d> path;
+    EXPECT_EQ(ground.getProjectedEdgeStatus({0,0,params.max_ground_height},
+        {1,0,slope+params.max_ground_height},{p.length+.05,p.width+.05,2*p.base+.05},
+        false,path,false),mgg::ProjectedEdgeStatus::kAdmissible) << p.length;
+  }
+}

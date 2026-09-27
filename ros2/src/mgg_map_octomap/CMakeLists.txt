@@ -91,6 +91,10 @@ if(BUILD_TESTING)
   target_link_libraries(test_mola_map ${PROJECT_NAME})
   target_compile_definitions(test_mola_map PRIVATE
     MGG_MAP_TEST_DATA_DIR="${CMAKE_CURRENT_SOURCE_DIR}/test/data")
+  ament_add_gtest(test_gate_terrain test/test_gate_terrain.cpp)
+  target_link_libraries(test_gate_terrain ${PROJECT_NAME})
+  target_compile_definitions(test_gate_terrain PRIVATE
+    MGG_MAP_TEST_DATA_DIR="${CMAKE_CURRENT_SOURCE_DIR}/test/data")
   ament_add_gtest(test_native_mola_index test/test_native_mola_index.cpp)
   target_link_libraries(test_native_mola_index ${PROJECT_NAME})
   ament_add_gtest(test_native_gain test/test_native_gain.cpp)

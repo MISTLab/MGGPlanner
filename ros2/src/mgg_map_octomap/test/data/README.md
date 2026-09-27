@@ -25,3 +25,16 @@ otherwise. Other cells are unknown.
 
 `make_departure_fixtures.py <grid dir> <output dir>` regenerates the files
 from r0.sdpg, r1.sdpg (diag-run5/data), r0n.sdpg, r1n.sdpg and r3r15.sdpg.
+
+## Hangar gate Scout grid
+
+`gate_scout_grid.txt` preserves occupied/free voxel indices and measured
+surface heights from Scout revision 50, source SHA256
+`ffd05e2cbf4df580943fd09544eb86a48b3472d07db583eb76fdaca9c4b19ff1`
+(diag-gate/off/snapshots/1200/robot_2/64173edb2655c749.sdpg).
+Only XY is cropped: cell centres in navigation x=[3,8], y=[-4.5,1.5];
+resolution is 0.2 m. Navigation XY = world XY - (-16.5,1).
+No free-space inference or ground-height filtering is applied.
+`test_gate_terrain.cpp` checks the actual native map backend, not a plane-only
+surrogate. At world x=-10.5, y=+0.7/+0.8 are already collision-blocked in this
+saved map; enabling rise must not newly close any baseline-admissible strip.
