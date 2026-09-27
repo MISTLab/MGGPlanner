@@ -4538,4 +4538,94 @@ TEST_F(PlannerNodeTest, ARegionsLatticeUpdatesAnInsideFrontierByItsWholeView) {
   }
 }
 
+/// Odometry at (x, y, z), facing +x, moving along x at `speed`.
+nav_msgs::msg::Odometry::SharedPtr odometryAt(double x, double y, double z,
+                                              int stamp, double speed = 0.0) {
+  auto msg = std::make_shared<nav_msgs::msg::Odometry>();
+  msg->header.stamp.sec = stamp;
+  msg->pose.pose.position.x = x;
+  msg->pose.pose.position.y = y;
+  msg->pose.pose.position.z = z;
+  msg->pose.pose.orientation.w = 1.0;
+  msg->twist.twist.linear.x = speed;
+  return msg;
+}
+
+/// A drone's planner with aerial_home_height_m `anchor`, over an observed
+/// floor with observed air up to 2 m.
+std::shared_ptr<PlannerNode> droneOverAFloor(const std::string& name,
+                                             double anchor) {
+  auto node = makeNode(name, "world",
+                       {rclcpp::Parameter("aerial_home_height_m", anchor)});
+  PlannerNodeTestPeer::setAerialRobot(*node);
+  PlannerNodeTestPeer::observeFloor(*node, -1.5, 6.0, -1.5, 1.5);
+  PlannerNodeTestPeer::observeFreeBox(*node, {2.25, 0.0, 1.2},
+                                      {7.5, 3.0, 1.6});
+  return node;
+}
+
+TEST_F(PlannerNodeTest, ADronesPadStartAnchorsHomeWhereItFliesSoReachIsUsable) {
+  // Review r0, P1: a drone's home, seeded on the pad, has its box in the
+  // floor; no edge joins it, every cluster is unreachable from home, and a
+  // finite reach leaves the drone no candidate. With aerial_home_height_m,
+  // a drone starting at rest on the pad has its home that high over it,
+  // where it takes off to, and its flight links there.
+  for (const double anchor : {0.0, 1.0}) {
+    SCOPED_TRACE(anchor);
+    auto node = droneOverAFloor(
+        "drone_pad_home_" + std::to_string(int(anchor * 10)), anchor);
+    PlannerNodeTestPeer::acceptOdometry(*node, odometryAt(0.0, 0.0, 0.075, 1));
+    const mgg::StateVec home = PlannerNodeTestPeer::globalVertexState(*node, 0);
+    EXPECT_NEAR(home.x(), 0.0, 1e-9);
+    EXPECT_NEAR(home.z(), 0.075 + anchor, 1e-9);
+    int stamp = 2;
+    PlannerNodeTestPeer::acceptOdometry(*node,
+                                        odometryAt(0.0, 0.0, 1.075, stamp++));
+    for (double x = 0.5; x <= 4.0 + 1e-9; x += 0.5) {
+      PlannerNodeTestPeer::acceptOdometry(*node,
+                                          odometryAt(x, 0.0, 1.075, stamp++));
+    }
+    const int far = PlannerNodeTestPeer::globalVertexAt(*node, 4.0, 0.0);
+    if (anchor == 0.0) {
+      EXPECT_EQ(PlannerNodeTestPeer::globalVertices(*node), 1);
+      continue;
+    }
+    ASSERT_GE(far, 0);
+    PlannerNodeTestPeer::markGlobalFrontier(*node, far);
+    PlannerNodeTestPeer::setTour(*node, true, 0.0);
+    PlannerNodeTestPeer::solveTourOnEveryChange(*node);
+    PlannerNodeTestPeer::setFlightReach(*node, 20.0);
+    EXPECT_NE(PlannerNodeTestPeer::refreshTour(*node), mgg::kNoCluster);
+  }
+}
+
+TEST_F(PlannerNodeTest, ADronesPlannerStartedInFlightSeedsHomeWhereItIs) {
+  // A planner restarted mid-flight takes its first odometry in the air or
+  // on the move: that is no pad, and home is where the drone is.
+  auto hovering = droneOverAFloor("drone_restart_hovering", 1.0);
+  PlannerNodeTestPeer::acceptOdometry(*hovering, odometryAt(2.0, 0.0, 1.3, 1));
+  EXPECT_NEAR(PlannerNodeTestPeer::globalVertexState(*hovering, 0).z(), 1.3,
+              1e-9);
+  auto moving = droneOverAFloor("drone_restart_moving", 1.0);
+  PlannerNodeTestPeer::acceptOdometry(*moving,
+                                      odometryAt(0.0, 0.0, 0.075, 1, 1.0));
+  EXPECT_NEAR(PlannerNodeTestPeer::globalVertexState(*moving, 0).z(), 0.075,
+              1e-9);
+}
+
+TEST_F(PlannerNodeTest, ADronesRebuiltHomeIsAnchoredOverItsPadKeyframe) {
+  // The keyframe rebuild makes the first keyframe home: for a drone, the
+  // pad, which gets the same anchor. The planner here restarted in flight.
+  auto node = droneOverAFloor("drone_rebuilt_home", 1.0);
+  PlannerNodeTestPeer::serveMap(*node, "component:test", 0);
+  auto source = std::make_unique<TrajectoryInMemory>();
+  source->trajectory = keyframesAlongX(0.0, 4.0);
+  PlannerNodeTestPeer::setKeyframeSource(*node, std::move(source));
+  PlannerNodeTestPeer::acceptOdometry(*node, odometryAt(4.0, 0.0, 1.3, 1));
+  ASSERT_EQ(PlannerNodeTestPeer::roadmapRebuilds(*node), 1);
+  const mgg::StateVec home = PlannerNodeTestPeer::globalVertexState(*node, 0);
+  EXPECT_NEAR(home.x(), 0.0, 1e-9);
+  EXPECT_NEAR(home.z(), 1.075, 1e-9);
+}
+
 }  // namespace mgg_ros

@@ -288,8 +288,14 @@ class PlannerNode : public rclcpp::Node {
   /// roadmap around it visited.
   void ingestOdometryIntoGlobalGraph();
   /// The root of the global graph is home: the first odometry, dropped onto
-  /// the terrain once the map shows ground under it.
+  /// the terrain once the map shows ground under it; for a drone that
+  /// started on its pad, aerial_pad_home_.
   void seedGlobalGraph();
+  /// Whether an aerial robot at `pose` stands on the ground: the map shows
+  /// ground within kPadGroundGapM under it, or, where it shows nothing
+  /// there, the pose is within that of the odometry frame's origin height
+  /// (odometry starts on the pad).
+  bool onTheGround(const mgg::StateVec& pose) const;
   /// Replaces the global graph with one rebuilt from the robot's keyframe
   /// trajectory (mgg::rebuildRoadmapFromTrajectory), vertex 0 at its home
   /// keyframe, when the trajectory is for the map in service and home has
@@ -658,6 +664,14 @@ class PlannerNode : public rclcpp::Node {
   /// See the parameter's comment in the constructor.
   bool allow_unknown_lattice_body_ = false;
   double hanging_root_edge_length_max_ = 0.0;
+  /// How far over its pad a drone's home is, metres: the height it takes
+  /// off to, where its flight links (drone scout Task 17, fix round 1).
+  /// Zero: home is where the first odometry is.
+  double aerial_home_height_m_ = 0.0;
+  /// The home a drone gets when its first odometry finds it at rest on the
+  /// ground: aerial_home_height_m_ over it. Unset for a planner started in
+  /// flight, and for every ground robot.
+  std::optional<mgg::StateVec> aerial_pad_home_;
   /// The last cycle's frontier paths join the global graph before that
   /// graph is rebuilt (rrg.cpp:121 Rrg::reset).
   bool add_frontiers_to_global_graph_ = false;

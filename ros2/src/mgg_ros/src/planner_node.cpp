@@ -48,6 +48,10 @@ constexpr double kTourSetAsideMoveM = 2.0;
 constexpr double kStandingStartMoveM = 0.5;
 /// seedGlobalGraph creates the global graph's root, home, as vertex 0.
 constexpr int kHomeVertexId = 0;
+/// A drone moving slower than this is at rest (PlannerNode::aerial_pad_home_).
+constexpr double kPadRestSpeedMps = 0.1;
+/// A drone with ground at most this far under it stands on the ground.
+constexpr double kPadGroundGapM = 0.5;
 
 /// The connected parts of `robot_id`'s in-service vertices in `graph`, over
 /// the edges between them: a part number per vertex id.
@@ -481,6 +485,12 @@ PlannerNode::PlannerNode(const rclcpp::NodeOptions& options)
   hanging_root_edge_length_max_ = std::max(
       0.0, declareOrGet<double>(this, "hanging_root_edge_length_max",
                                 hanging_root_edge_length_max_));
+  // A drone's pad is on the floor, where its box meets the ground and no
+  // edge joins it: its home is this far over the pad, at its take-off
+  // height (seedGlobalGraph, rebuildGlobalGraphFromKeyframes).
+  aerial_home_height_m_ = std::max(
+      0.0, declareOrGet<double>(this, "aerial_home_height_m",
+                                aerial_home_height_m_));
   // The global graph lives only in memory: a restarted planner, or a robot
   // driven far off its graph, is left with a graph that cannot reach where
   // the robot is or home (run 5, 2026-09-25). It is rebuilt from the
@@ -1380,6 +1390,20 @@ void PlannerNode::onOdometry(nav_msgs::msg::Odometry::ConstSharedPtr msg) {
     return;
   }
   last_odometry_stamp_ns_ = stamp_ns;
+  if (!have_odometry_ && robot_params_.type == mgg::RobotType::kAerialRobot &&
+      aerial_home_height_m_ > 0.0) {
+    // At rest on the ground at startup: the pad. A planner restarted in
+    // flight finds the drone in the air or moving, and home stays where it
+    // is (seedGlobalGraph).
+    const auto& v = msg->twist.twist.linear;
+    const bool at_rest =
+        Eigen::Vector3d(v.x, v.y, v.z).norm() < kPadRestSpeedMps;
+    auto map_read = mapReadLease();
+    if (at_rest && onTheGround(state)) {
+      aerial_pad_home_ = state;
+      (*aerial_pad_home_)[2] += aerial_home_height_m_;
+    }
+  }
   current_state_ = state;
   current_tilt_ = tiltFromQuaternion(msg->pose.pose.orientation);
   if (!left_standing_start_) {
@@ -1835,7 +1859,8 @@ void PlannerNode::seedGlobalGraph() {
     // A lone root is a landmark, not a traversability claim: capture it from
     // the first odometry, before anything moves the robot away from home.
     // Until the map shows ground under it no edge attaches to it.
-    mgg::StateVec root_state = current_state_;
+    mgg::StateVec root_state =
+        aerial_pad_home_ ? *aerial_pad_home_ : current_state_;
     global_root_supported_ = projectToDrivingHeight(root_state);
     if (!global_root_supported_) {
       root_state = physicalAnchorAtDrivingHeight(current_state_);
@@ -1849,9 +1874,11 @@ void PlannerNode::seedGlobalGraph() {
     last_state_marker_global_ = current_state_;
     ++graph_revision_;
     RCLCPP_INFO(get_logger(),
-                "global graph seeded at (%.2f, %.2f, %.2f)%s", root_state[0],
+                "global graph seeded at (%.2f, %.2f, %.2f)%s%s", root_state[0],
                 root_state[1], root_state[2],
-                global_root_supported_ ? "" : " (awaiting mapped support)");
+                global_root_supported_ ? "" : " (awaiting mapped support)",
+                aerial_pad_home_ ? " (aerial_home_height_m over the pad)"
+                                 : "");
     return;
   }
   if (global_root_supported_ || !map_->getStatus()) return;
@@ -1871,6 +1898,19 @@ void PlannerNode::seedGlobalGraph() {
   RCLCPP_INFO(get_logger(),
               "global graph root support observed at (%.2f, %.2f, %.2f)",
               supported_root[0], supported_root[1], supported_root[2]);
+}
+
+bool PlannerNode::onTheGround(const mgg::StateVec& pose) const {
+  const Eigen::Vector3d at = pose.head<3>();
+  Eigen::Vector3d end;
+  const mgg::VoxelStatus below =
+      map_->getStatus()
+          ? map_->getRayStatus(at, at - Eigen::Vector3d(0, 0, kPadGroundGapM),
+                               /*stop_at_unknown=*/true, end)
+          : mgg::VoxelStatus::kUnknown;
+  if (below == mgg::VoxelStatus::kOccupied) return true;
+  if (below == mgg::VoxelStatus::kFree) return false;
+  return std::abs(pose.z()) <= kPadGroundGapM;
 }
 
 std::size_t PlannerNode::ownGlobalVertices() const {
@@ -1957,6 +1997,13 @@ bool PlannerNode::rebuildGlobalGraphFromKeyframes(
     entry.roll = std::atan2(r(2, 1), r(2, 2));
     entry.pitch = std::atan2(-r(2, 0), std::hypot(r(2, 1), r(2, 2)));
     keyframes.push_back(entry);
+  }
+  // A drone's first keyframe is its pad, on the floor: home is over it, as
+  // seedGlobalGraph puts it.
+  if (robot_params_.type == mgg::RobotType::kAerialRobot &&
+      aerial_home_height_m_ > 0.0 && !keyframes.empty() &&
+      onTheGround(keyframes.front().pose)) {
+    keyframes.front().pose[2] += aerial_home_height_m_;
   }
 
   auto rebuilt = std::make_shared<mgg::GraphManager>();
