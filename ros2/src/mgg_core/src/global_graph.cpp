@@ -1003,10 +1003,10 @@ GlobalFrontierReport searchGlobalFrontier(
     GraphManager& graph, int source_id, int robot_id,
     const RecomputeGainFn& recompute_gain,
     const std::vector<Eigen::Vector3d>& excluded, double exclusion_radius,
-    const Eigen::Vector3d* target) {
+    const Eigen::Vector3d* target, double time_budget_s) {
   GlobalFrontierReport report;
+  const auto started = std::chrono::steady_clock::now();
 
-  // Re-check all frontiers against the current map (rrg.cpp:5612 to 5625).
   std::vector<Vertex*> global_frontiers;
   for (auto& entry : graph.vertices_map_) {
     Vertex* vertex = entry.second;
@@ -1014,51 +1014,100 @@ GlobalFrontierReport searchGlobalFrontier(
         !graph.inService(*vertex)) {
       continue;
     }
-    if (recompute_gain) recompute_gain(*vertex);
-    if (!vertex->vol_gain.is_frontier) {
-      vertex->type = VertexType::kUnvisited;
-      ++report.demoted;
-      continue;
-    }
     global_frontiers.push_back(vertex);
   }
-  report.frontiers = static_cast<int>(global_frontiers.size());
   if (global_frontiers.empty()) return report;
 
-  // Dijkstra from the current vertex to all (rrg.cpp:5669).
-  if (graph.vertices_map_.find(source_id) == graph.vertices_map_.end()) {
-    return report;
-  }
+  // Dijkstra from the current vertex to all (rrg.cpp:5669), before the
+  // re-check, so that it can take the reachable frontiers first.
   ShortestPathsReport frontier_graph_rep;
-  if (!graph.findShortestPaths(source_id, frontier_graph_rep)) return report;
-
-  // Exploration gain of every reachable frontier (rrg.cpp:5766 to 5818).
-  for (Vertex* frontier : global_frontiers) {
+  const bool routed =
+      graph.vertices_map_.find(source_id) != graph.vertices_map_.end() &&
+      graph.findShortestPaths(source_id, frontier_graph_rep);
+  const auto distance_to = [&](const Vertex* frontier) {
+    if (!routed) return std::numeric_limits<double>::infinity();
     const auto distance = frontier_graph_rep.distance_map.find(frontier->id);
     if (distance == frontier_graph_rep.distance_map.end() ||
         !std::isfinite(distance->second) ||
         distance->second >= std::numeric_limits<double>::max() / 2.0) {
-      continue;  // not connected to where the robot stands
+      return std::numeric_limits<double>::infinity();  // not connected
     }
-    const bool is_excluded = std::any_of(
+    return distance->second;
+  };
+  const auto is_excluded = [&](const Vertex* frontier) {
+    return std::any_of(
         excluded.begin(), excluded.end(),
         [frontier, exclusion_radius](const Eigen::Vector3d& center) {
           return (frontier->state.head<3>() - center).norm() <=
                  exclusion_radius;
         });
-    if (is_excluded) continue;
-    ++report.feasible;
-    double exp_gain = frontier->vol_gain.gain *
-                      std::exp(-kGlobalDistancePenalty * distance->second);
+  };
+  // A frontier's gain discounted by distance, owner and target
+  // (rrg.cpp:5800 to 5808).
+  const auto discounted = [&](const Vertex* frontier, double gain,
+                              double distance) {
+    double exp_gain = gain * std::exp(-kGlobalDistancePenalty * distance);
     if (frontier->robot_id != robot_id) exp_gain *= kGlobalOtherRobotPenalty;
     if (target != nullptr) {
       exp_gain *= std::exp(-kGlobalTargetPenalty *
                            (frontier->state.head<3>() - *target).norm());
     }
+    return exp_gain;
+  };
+
+  // Re-check order: the reachable, unexcluded frontiers by what their last
+  // gain promises, then every other one (whose re-check only demotes).
+  double best_stored = 0.0;
+  for (const Vertex* frontier : global_frontiers) {
+    best_stored = std::max(best_stored, frontier->vol_gain.gain);
+  }
+  struct Candidate {
+    Vertex* frontier;
+    double distance;
+    bool ranked;
+    double promise;
+  };
+  std::vector<Candidate> order;
+  order.reserve(global_frontiers.size());
+  for (Vertex* frontier : global_frontiers) {
+    const double distance = distance_to(frontier);
+    const bool ranked = std::isfinite(distance) && !is_excluded(frontier);
+    const double stored =
+        frontier->vol_gain.gain > 0.0 ? frontier->vol_gain.gain : best_stored;
+    order.push_back({frontier, distance, ranked,
+                     ranked ? discounted(frontier, stored, distance) : 0.0});
+  }
+  std::stable_sort(order.begin(), order.end(),
+                   [](const Candidate& a, const Candidate& b) {
+                     if (a.ranked != b.ranked) return a.ranked;
+                     return a.promise > b.promise;
+                   });
+
+  // Re-check (rrg.cpp:5612 to 5625) and rank (rrg.cpp:5766 to 5818).
+  for (std::size_t i = 0; i < order.size(); ++i) {
+    if (i > 0 && std::chrono::duration<double>(
+                     std::chrono::steady_clock::now() - started)
+                         .count() >= time_budget_s) {
+      report.unchecked = static_cast<int>(order.size() - i);
+      report.frontiers += report.unchecked;
+      break;
+    }
+    Vertex* frontier = order[i].frontier;
+    if (recompute_gain) recompute_gain(*frontier);
+    if (!frontier->vol_gain.is_frontier) {
+      frontier->type = VertexType::kUnvisited;
+      ++report.demoted;
+      continue;
+    }
+    ++report.frontiers;
+    if (!order[i].ranked) continue;
+    ++report.feasible;
+    const double exp_gain =
+        discounted(frontier, frontier->vol_gain.gain, order[i].distance);
     if (exp_gain > report.best_gain) {
       report.best_gain = exp_gain;
       report.best_frontier = frontier;
-      report.best_distance = distance->second;
+      report.best_distance = order[i].distance;
     }
   }
   return report;

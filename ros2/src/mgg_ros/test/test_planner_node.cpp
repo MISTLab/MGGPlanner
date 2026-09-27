@@ -246,6 +246,26 @@ class PlannerNodeTestPeer {
     vertex->robot_id = robot_id;
     node.global_graph_->addNeighbourVertex(vertex, 1000000);
   }
+  static void setCommunicationRange(PlannerNode& node, double range) {
+    const std::lock_guard<std::recursive_mutex> lock(node.planner_mutex_);
+    node.communication_range_ = range;
+  }
+  static bool isQuarantined(PlannerNode& node, int robot_id) {
+    const std::lock_guard<std::recursive_mutex> lock(node.planner_mutex_);
+    return node.global_graph_->isQuarantined(robot_id);
+  }
+  /// Quarantines `robot_id`'s roadmap, as an expired transform does.
+  static void quarantine(PlannerNode& node, int robot_id) {
+    const std::lock_guard<std::recursive_mutex> lock(node.planner_mutex_);
+    node.global_graph_->disconnectNeighbourGraph(robot_id);
+  }
+  static void release(PlannerNode& node, int robot_id) {
+    const std::lock_guard<std::recursive_mutex> lock(node.planner_mutex_);
+    node.global_graph_->releaseNeighbourGraph(robot_id);
+  }
+  static void setGlobalSearchBudget(PlannerNode& node, double seconds) {
+    node.planning_params_.global_search_time_budget_s = seconds;
+  }
   /// Edges touching `robot_id`'s merged vertices.
   static std::size_t neighbourEdges(PlannerNode& node, int robot_id) {
     const std::lock_guard<std::recursive_mutex> lock(node.planner_mutex_);
@@ -1515,6 +1535,78 @@ TEST_F(PlannerNodeTest, AWithdrawnRoadmapIsQuarantinedFromOrdinaryAttachment) {
             mgg_msgs::srv::PlanObjective::Response::SUCCEEDED)
       << response->reason;
   EXPECT_NEAR(response->path.back().position.x, 8.5, 1e-3);
+}
+
+TEST_F(PlannerNodeTest, AQuarantinedRoadmapIsMergedAgainWhenItsTransformReturns) {
+  // Run 8, robot_1: a global search outlasted the transform TTL and every
+  // peer roadmap was quarantined. The transforms came back, but the peers
+  // were beyond communication_range, so no roadmap of theirs was merged
+  // again. The returning transform alone now merges the last roadmap
+  // received back in.
+  TwoPlanners fleet("readmit", /*transform_ttl_s=*/1.0);
+  fleet.share();
+  const std::size_t merged = PlannerNodeTestPeer::neighbourEdges(*fleet.a, 2);
+  ASSERT_GT(merged, 0u);
+  // Robot 2 drives out of range: its roadmaps are no longer taken.
+  PlannerNodeTestPeer::setCommunicationRange(*fleet.a, 1.0);
+  std::this_thread::sleep_for(std::chrono::milliseconds(1200));
+  auto response = std::make_shared<mgg_msgs::srv::PlannerSrv::Response>();
+  PlannerNodeTestPeer::plan(*fleet.a, response);
+  ASSERT_TRUE(PlannerNodeTestPeer::isQuarantined(*fleet.a, 2));
+  EXPECT_EQ(PlannerNodeTestPeer::neighbourEdges(*fleet.a, 2), 0u);
+
+  // Its next roadmap, out of range, changes nothing; its transform does.
+  fleet.share();
+  EXPECT_FALSE(PlannerNodeTestPeer::isQuarantined(*fleet.a, 2));
+  EXPECT_GT(PlannerNodeTestPeer::neighbourEdges(*fleet.a, 2), 0u);
+}
+
+TEST_F(PlannerNodeTest, AQuarantinedNeighbourRoadmapWithholdsExplorationComplete) {
+  // Run 8, robot_1: with every peer roadmap quarantined, its global graph
+  // had no frontier, and it declared exploration complete. While any is
+  // quarantined, a failed search is no path, retried.
+  auto node = makeNode("quarantine_not_complete");
+  PlannerNodeTestPeer::gainFromUnknownVoxelsOnly(*node);
+  PlannerNodeTestPeer::observeFloor(*node, -3.55, 5.55, -2.55, 2.55);
+  PlannerNodeTestPeer::acceptOdometry(*node, 0.0, 0.0, 1.0);
+  PlannerNodeTestPeer::addGlobalChainToFrontier(*node, {{-0.5, 0.0}});
+  PlannerNodeTestPeer::addDisconnectedNeighbourVertex(*node, 5, 30.0, 0.0,
+                                                      0.3);
+  const auto plan = [&node]() {
+    PlannerNodeTestPeer::consultGlobalPlannerAtOnce(*node);
+    auto response = std::make_shared<mgg_msgs::srv::PlannerSrv::Response>();
+    PlannerNodeTestPeer::plan(*node, response);
+    EXPECT_TRUE(response->path.empty());
+    return response->status;
+  };
+  PlannerNodeTestPeer::quarantine(*node, 5);
+  EXPECT_EQ(plan(), PlannerNode::kStatusNoPath);
+  PlannerNodeTestPeer::release(*node, 5);
+  EXPECT_EQ(plan(), PlannerNode::kStatusComplete);
+}
+
+TEST_F(PlannerNodeTest, AGlobalSearchCutShortIsNotExplorationComplete) {
+  // Two global frontiers in a room explored end to end: each re-check
+  // demotes one. With no time for more than one re-check, the search is
+  // cut short with nothing found: no path, retried. With time for both,
+  // exploration is complete.
+  auto node = makeNode("search_cut_short");
+  PlannerNodeTestPeer::gainFromUnknownVoxelsOnly(*node);
+  PlannerNodeTestPeer::observeFloor(*node, -3.55, 5.55, -2.55, 2.55);
+  PlannerNodeTestPeer::acceptOdometry(*node, 0.0, 0.0, 1.0);
+  const auto plan = [&node]() {
+    PlannerNodeTestPeer::consultGlobalPlannerAtOnce(*node);
+    auto response = std::make_shared<mgg_msgs::srv::PlannerSrv::Response>();
+    PlannerNodeTestPeer::plan(*node, response);
+    EXPECT_TRUE(response->path.empty());
+    return response->status;
+  };
+  PlannerNodeTestPeer::addGlobalChainToFrontier(*node, {{-0.5, 0.0}});
+  PlannerNodeTestPeer::addGlobalChainToFrontier(*node, {{0.0, -0.5}});
+  PlannerNodeTestPeer::setGlobalSearchBudget(*node, 0.0);
+  EXPECT_EQ(plan(), PlannerNode::kStatusNoPath);
+  PlannerNodeTestPeer::setGlobalSearchBudget(*node, 10.0);
+  EXPECT_EQ(plan(), PlannerNode::kStatusComplete);
 }
 
 TEST_F(PlannerNodeTest, NeighbourRoadmapDoesNotReachThroughAKnownWall) {

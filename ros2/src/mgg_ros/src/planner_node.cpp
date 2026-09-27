@@ -1030,6 +1030,10 @@ bool PlannerNode::settleIdleRobot(std::string& summary, bool& complete) {
                    std::to_string(frontiers_dropped_in_rebuild_) +
                    " frontier(s): no path";
         frontiers_dropped_in_rebuild_ = 0;
+      } else if (const std::string withheld = completionWithheld();
+                 !withheld.empty()) {
+        summary += "; the fleet's award leaves it nothing, but " + withheld +
+                   ": no path";
       } else {
         complete = true;
         summary +=
@@ -1369,6 +1373,43 @@ void PlannerNode::onNeighbourTransforms(
     t_ours_theirs.translation() = Eigen::Vector3d(p.x, p.y, p.z);
     neighbour_transforms_[t.child_frame_id] = {t_ours_theirs, now};
   }
+  readmitQuarantinedNeighbours();
+}
+
+void PlannerNode::readmitQuarantinedNeighbours() {
+  if (global_graph_->numQuarantined() == 0) return;
+  for (const auto& [robot, frame] : neighbour_frames_) {
+    if (!global_graph_->isQuarantined(robot)) continue;
+    const auto roadmap = neighbour_roadmaps_.find(robot);
+    if (roadmap == neighbour_roadmaps_.end() ||
+        !refreshNeighbourTransform(robot, frame)) {
+      continue;
+    }
+    auto map_read = mapReadLease();
+    const mgg::MergeResult r = mergeNeighbourRoadmap(roadmap->second);
+    if (global_graph_->isQuarantined(robot)) {
+      RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 30000,
+                           "robot %d's transform returned, but its roadmap "
+                           "joins ours nowhere yet: it stays quarantined",
+                           robot);
+    } else {
+      RCLCPP_INFO(get_logger(),
+                  "robot %d's transform returned: its quarantined roadmap is "
+                  "merged again (+%d edges)",
+                  robot, r.edges_added);
+    }
+  }
+}
+
+std::string PlannerNode::completionWithheld() const {
+  if (global_graph_->numQuarantined() > 0) {
+    return std::to_string(global_graph_->numQuarantined()) +
+           " neighbour roadmap(s) quarantined until their transforms return";
+  }
+  if (global_search_cut_short_) {
+    return "the global search was cut short by its time budget";
+  }
+  return "";
 }
 
 bool PlannerNode::refreshNeighbourTransform(int sender,
@@ -1415,6 +1456,34 @@ mgg::ReceiverPlatform PlannerNode::receiverPlatform() const {
   return platform;
 }
 
+mgg::MergeResult PlannerNode::mergeNeighbourRoadmap(
+    const mgg::GraphExchange& incoming) {
+  const mgg::ExpandContext ctx = makeContext();
+  // The merge asks whether the robot could actually drive between two graphs
+  // before joining them; that judgement needs the map, so it is injected.
+  const auto admissible = [this, &ctx](const Eigen::Vector3d& from,
+                                       const Eigen::Vector3d& to) {
+    if (robot_params_.type == mgg::RobotType::kAerialRobot) {
+      return map_->getPathStatus(from, to, ctx.robot_box_size, true) ==
+             mgg::VoxelStatus::kFree;
+    }
+    std::vector<Eigen::Vector3d> projected;
+    return ground_->getProjectedEdgeStatus(from, to, ctx.robot_box_size, true,
+                                           projected, false) ==
+           mgg::ProjectedEdgeStatus::kAdmissible;
+  };
+
+  const int edges_before = global_graph_->getNumEdges();
+  const mgg::MergeResult r = mgg::mergeNeighbourGraph(
+      *global_graph_, incoming, *poses_, admissible, 5.0, receiverPlatform());
+  if (r.vertices_added > 0 || global_graph_->getNumEdges() != edges_before ||
+      r.vertices_replaced > 0 ||
+      r.neighbour_restarted) {
+    ++graph_revision_;
+  }
+  return r;
+}
+
 void PlannerNode::onNeighbourGraph(mgg_msgs::msg::Graph::ConstSharedPtr msg) {
   if (msg->vertices.empty()) return;
   const int sender = msg->vertices.front().robot_id;
@@ -1442,29 +1511,8 @@ void PlannerNode::onNeighbourGraph(mgg_msgs::msg::Graph::ConstSharedPtr msg) {
   }
 
   const mgg::GraphExchange incoming = fromGraphMsg(*msg);
-  const mgg::ExpandContext ctx = makeContext();
-  // The merge asks whether the robot could actually drive between two graphs
-  // before joining them; that judgement needs the map, so it is injected.
-  const auto admissible = [this, &ctx](const Eigen::Vector3d& from,
-                                       const Eigen::Vector3d& to) {
-    if (robot_params_.type == mgg::RobotType::kAerialRobot) {
-      return map_->getPathStatus(from, to, ctx.robot_box_size, true) ==
-             mgg::VoxelStatus::kFree;
-    }
-    std::vector<Eigen::Vector3d> projected;
-    return ground_->getProjectedEdgeStatus(from, to, ctx.robot_box_size, true,
-                                           projected, false) ==
-           mgg::ProjectedEdgeStatus::kAdmissible;
-  };
-
-  const int edges_before = global_graph_->getNumEdges();
-  const mgg::MergeResult r = mgg::mergeNeighbourGraph(
-      *global_graph_, incoming, *poses_, admissible, 5.0, receiverPlatform());
-  if (r.vertices_added > 0 || global_graph_->getNumEdges() != edges_before ||
-      r.vertices_replaced > 0 ||
-      r.neighbour_restarted) {
-    ++graph_revision_;
-  }
+  neighbour_roadmaps_[sender] = incoming;
+  const mgg::MergeResult r = mergeNeighbourRoadmap(incoming);
 
   if (r.transform_unavailable) {
     RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 5000,
@@ -2728,6 +2776,7 @@ bool PlannerNode::runGlobalPlanner(int target_id, std::string& reason,
                                    double min_gain) {
   best_path_.clear();
   best_path_from_global_graph_ = false;
+  global_search_cut_short_ = false;
   if (global_graph_->getNumVertices() <= 1) {
     // rrg.cpp:5582.
     reason = "the global graph holds no frontier to reposition to";
@@ -2771,15 +2820,23 @@ bool PlannerNode::runGlobalPlanner(int target_id, std::string& reason,
         *global_graph_, link_vertex->id,
         static_cast<int>(planning_params_.robot_id), globalFrontierGain(),
         excluded, exclusion_radius,
-        exploration_target_.has_value() ? &*exploration_target_ : nullptr);
+        exploration_target_.has_value() ? &*exploration_target_ : nullptr,
+        planning_params_.global_search_time_budget_s);
     global_space_.setCenter(current_state_, /*use_extension=*/true);
+    global_search_cut_short_ =
+        report.best_frontier == nullptr && report.cut_short();
     if (report.best_frontier == nullptr) {
       // rrg.cpp:5628 and 5759: no frontier, or none the graph can reach.
-      char why[192];
+      char why[224];
       std::snprintf(why, sizeof(why),
                     "%d global frontier(s), none reachable with gain (%d "
-                    "re-checked out)",
-                    report.frontiers, report.demoted);
+                    "re-checked out%s)",
+                    report.frontiers, report.demoted,
+                    report.cut_short()
+                        ? (", " + std::to_string(report.unchecked) +
+                           " left unchecked by the time budget")
+                              .c_str()
+                        : "");
       reason = why;
       return false;
     }
@@ -3071,6 +3128,12 @@ void PlannerNode::onPlanRequest(
                      std::to_string(frontiers_dropped_in_rebuild_) +
                      " frontier(s): no path";
           frontiers_dropped_in_rebuild_ = 0;
+        } else if (const std::string withheld = completionWithheld();
+                   !withheld.empty()) {
+          // Frontiers this robot cannot see now are not explored (run 8,
+          // robot_1): no path, retried.
+          summary += "; no global route (" + reason + "), but " + withheld +
+                     ": no path";
         } else {
           complete = true;
           summary += "; exploration complete: " + reason;

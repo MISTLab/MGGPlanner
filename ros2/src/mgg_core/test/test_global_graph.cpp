@@ -1031,6 +1031,53 @@ TEST(SearchGlobalFrontier, OtherRobotsFrontierIsTakenOnlyWhenNothingElseIs) {
   EXPECT_NEAR(report.best_gain, 100.0 * std::exp(-0.25) * 0.001, 1e-12);
 }
 
+// Run 8: robot_1's search re-checked 496 frontiers for 6 to 16 s, and its
+// neighbour transforms expired meanwhile. With a time budget the re-check
+// takes the most promising reachable frontier first and stops once the
+// budget is spent, after one frontier at least.
+TEST(SearchGlobalFrontier, ATimeBudgetRechecksTheMostPromisingFrontierFirst) {
+  FrontierGraph graph;
+  // Gains as an earlier search left them.
+  for (const auto& [id, gain] : graph.gains_) {
+    graph.fixture.global.getVertex(id)->vol_gain.gain = gain;
+  }
+  int rechecks = 0;
+  const mgg::RecomputeGainFn counted = [&](Vertex& vertex) {
+    ++rechecks;
+    graph.recompute()(vertex);
+  };
+  // The seen frontier promised most, and its re-check demotes it: nothing
+  // found, and the search says it was cut short, so that is no answer.
+  mgg::GlobalFrontierReport report = mgg::searchGlobalFrontier(
+      graph.fixture.global, 0, 0, counted, {Eigen::Vector3d(5.0, 5.0, 0.0)},
+      1.0, nullptr, 0.0);
+  EXPECT_EQ(rechecks, 1);
+  EXPECT_EQ(report.demoted, 1);
+  EXPECT_EQ(graph.seen_->type, VertexType::kUnvisited);
+  EXPECT_EQ(report.best_frontier, nullptr);
+  EXPECT_TRUE(report.cut_short());
+  EXPECT_EQ(report.unchecked, 5);
+  EXPECT_EQ(report.frontiers, 5);
+
+  // Next time the far frontier promises most (150 exp(-0.5) over
+  // 100 exp(-0.25)) and is the one found.
+  rechecks = 0;
+  report = mgg::searchGlobalFrontier(graph.fixture.global, 0, 0, counted,
+                                     {Eigen::Vector3d(5.0, 5.0, 0.0)}, 1.0,
+                                     nullptr, 0.0);
+  EXPECT_EQ(rechecks, 1);
+  EXPECT_EQ(report.best_frontier, graph.far_);
+  EXPECT_EQ(report.unchecked, 4);
+
+  // Without a budget every frontier is re-checked, as before.
+  rechecks = 0;
+  report = mgg::searchGlobalFrontier(graph.fixture.global, 0, 0, counted,
+                                     {Eigen::Vector3d(5.0, 5.0, 0.0)}, 1.0);
+  EXPECT_EQ(rechecks, 5);
+  EXPECT_FALSE(report.cut_short());
+  EXPECT_EQ(report.best_frontier, graph.far_);
+}
+
 TEST(SearchGlobalFrontier, NoReachableFrontierReportsNone) {
   Roadmap fixture;
   // Nothing typed as a frontier at all.

@@ -28,6 +28,7 @@
 
 #include <deque>
 #include <functional>
+#include <limits>
 #include <vector>
 
 #include <Eigen/Dense>
@@ -403,6 +404,12 @@ struct GlobalFrontierReport {
   int frontiers = 0;
   int demoted = 0;
   int feasible = 0;
+  /// Frontiers the time budget left unchecked: counted in `frontiers`, as
+  /// they stand, but not ranked. With any, the search was cut short, and a
+  /// frontier it did not rank may be the best: no frontier found is then
+  /// no answer, not "none left".
+  int unchecked = 0;
+  bool cut_short() const { return unchecked > 0; }
 };
 
 /// Picks the global frontier to reposition to (rrg.cpp:5610 to 5834, the auto
@@ -416,11 +423,20 @@ struct GlobalFrontierReport {
 /// With a `target` (exploring toward a goal with no known route), each
 /// frontier is also discounted by exp(-kGlobalTargetPenalty * its
 /// straight-line distance to the target).
+///
+/// The re-check is what costs: in run 8 robot_1's search over 496 frontiers
+/// held its node for 6 to 16 s, past its neighbour transforms' TTL, and
+/// every peer roadmap was quarantined. Reachable frontiers are re-checked
+/// first, the most promising by their last gain first (a frontier never
+/// scored counts as the best), then the rest; the re-check stops once
+/// `time_budget_s` is spent (after at least one frontier), and the report
+/// counts what it left unchecked (GlobalFrontierReport::unchecked).
 GlobalFrontierReport searchGlobalFrontier(
     GraphManager& graph, int source_id, int robot_id,
     const RecomputeGainFn& recompute_gain,
     const std::vector<Eigen::Vector3d>& excluded = {},
-    double exclusion_radius = 0.0, const Eigen::Vector3d* target = nullptr);
+    double exclusion_radius = 0.0, const Eigen::Vector3d* target = nullptr,
+    double time_budget_s = std::numeric_limits<double>::infinity());
 
 }  // namespace mgg
 

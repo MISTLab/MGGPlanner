@@ -90,6 +90,10 @@ class GraphManager {
   bool isQuarantined(int robot_id) const {
     return quarantined_robots_.count(robot_id) > 0;
   }
+  /// How many neighbours' roadmaps are quarantined.
+  int numQuarantined() const {
+    return static_cast<int>(quarantined_robots_.size());
+  }
   /// Neither retired nor quarantined: a vertex attachment, expansion and
   /// search may use.
   bool inService(const Vertex& vertex) const {

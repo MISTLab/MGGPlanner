@@ -118,6 +118,22 @@ class PlannerNode : public rclcpp::Node {
   /// before a plan uses the graph and before a merge: a withdrawn or expired
   /// placement must not keep an old roadmap routable.
   void withdrawUnplacedNeighbours();
+  /// Merges a neighbour's roadmap with its current transform, as a graph
+  /// message does; bumps the graph revision on any change.
+  mgg::MergeResult mergeNeighbourRoadmap(const mgg::GraphExchange& incoming);
+  /// A quarantined roadmap whose neighbour's transform is current again is
+  /// merged again from the last roadmap received from it
+  /// (neighbour_roadmaps_). In run 8 robot_1's peers were quarantined when
+  /// a long global search outlasted the transform TTL; the transforms came
+  /// back at once, but the peers were beyond communication_range, no
+  /// roadmap of theirs was merged again, and robot_1 declared exploration
+  /// complete with none of their frontiers.
+  void readmitQuarantinedNeighbours();
+  /// Why exploration may not be declared complete although no frontier is
+  /// left to go to, or empty: a quarantined neighbour roadmap, whose
+  /// frontiers are out of every search until its transform returns, or a
+  /// global search cut short by its time budget.
+  std::string completionWithheld() const;
   /// This robot's platform as a neighbour's roadmap is re-read for it.
   mgg::ReceiverPlatform receiverPlatform() const;
   /// Attaches a goal with no mapped ground under it to the nearest vertex of
@@ -397,6 +413,12 @@ class PlannerNode : public rclcpp::Node {
   std::unordered_map<std::string, NeighbourTransform> neighbour_transforms_;
   /// Each neighbour robot id's planning frame, from its graph messages.
   std::unordered_map<int, std::string> neighbour_frames_;
+  /// The last roadmap received within communication range from each
+  /// neighbour, to re-admit it from when its transform returns.
+  std::unordered_map<int, mgg::GraphExchange> neighbour_roadmaps_;
+  /// The last global frontier search was cut short by
+  /// global_search_time_budget_s with nothing found (runGlobalPlanner).
+  bool global_search_cut_short_ = false;
   mgg::RandomSampler random_sampler_;
   mgg::RobotStateHistory robot_state_hist_;
 

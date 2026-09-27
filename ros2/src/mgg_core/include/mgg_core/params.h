@@ -295,6 +295,13 @@ struct PlanningParams {
   bool auto_homing_enable = false;
   bool homing_backward = false;
   double time_budget_limit = std::numeric_limits<double>::max();
+  /// How long the global planner may spend re-checking frontiers for one
+  /// repositioning, seconds (searchGlobalFrontier). In run 8 robot_1's
+  /// search held its node for 6 to 16 s, past its 5 s neighbour transform
+  /// TTL, and every peer roadmap was quarantined. A search cut short with
+  /// nothing found is no path, retried, never exploration complete. Not an
+  /// upstream parameter.
+  double global_search_time_budget_s = 1.0;
   bool auto_landing_enable = false;
   double time_budget_before_landing = std::numeric_limits<double>::max();
   double max_negative_inclination = 0.37;
