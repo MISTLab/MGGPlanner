@@ -40,8 +40,8 @@ class KeyframeTrajectorySource {
 };
 
 /// The graph solution file of SwarmDeck's C-SLAM bridge (graph_solution.json
-/// in the robot's peer root, replaced whole by a rename on each new
-/// solution):
+/// in the robot's peer root, the planner's roadmap_rebuild.graph_solution;
+/// replaced whole by a rename on each new solution):
 ///
 ///   {"schema": "swarmdeck.pose-snapshot.v1",
 ///    "solution": {

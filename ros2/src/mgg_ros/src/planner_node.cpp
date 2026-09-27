@@ -421,6 +421,13 @@ PlannerNode::PlannerNode(const rclcpp::NodeOptions& options)
     }
     const std::string robot = declareOrGet<std::string>(
         this, "roadmap_rebuild.robot_id", peer_root.filename().string());
+    // Derived from the peer root when not given. A deployment whose peer
+    // root is a product directory inside the robot's root (SwarmDeck's
+    // <peer>/planning) gives both: derived, they would name the directory,
+    // not the robot, and a file the bridge never writes.
+    const std::string graph_solution = declareOrGet<std::string>(
+        this, "roadmap_rebuild.graph_solution",
+        (peer_root / "graph_solution.json").string());
     if (peer_root.empty()) {
       rebuild_off = "map.mola.peer_root is empty";
     } else if (robot.empty()) {
@@ -428,11 +435,10 @@ PlannerNode::PlannerNode(const rclcpp::NodeOptions& options)
                     "root " + peer_root.string();
     } else {
       keyframe_source_ = std::make_unique<GraphSolutionFile>(
-          (peer_root / "graph_solution.json").string(), robot,
-          std::size_t{64} * 1024 * 1024);
+          graph_solution, robot, std::size_t{64} * 1024 * 1024);
       RCLCPP_INFO(get_logger(),
                   "global graph rebuilds read %s's keyframes from %s",
-                  robot.c_str(), (peer_root / "graph_solution.json").c_str());
+                  robot.c_str(), graph_solution.c_str());
     }
   }
   if (keyframe_source_ == nullptr) {
