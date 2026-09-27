@@ -1086,6 +1086,12 @@ class PlannerNodeTestPeer {
     return v->id;
   }
   /// A global vertex's last scored gain.
+  /// Whether the last global search left a frontier it did not route to,
+  /// so that no frontier found is not exploration complete.
+  static bool globalFrontierNotRouted(PlannerNode& node) {
+    const std::lock_guard<std::recursive_mutex> lock(node.planner_mutex_);
+    return node.global_frontier_not_routed_;
+  }
   static void setVertexGain(PlannerNode& node, int id, double gain) {
     const std::lock_guard<std::recursive_mutex> lock(node.planner_mutex_);
     node.findGlobalVertex(id)->vol_gain.gain = gain;
@@ -2800,6 +2806,43 @@ TEST_F(PlannerNodeTest, PeerMessagesWaitingOnAPlanEndWithTheLatestSet) {
   }
   executor.cancel();
   spinner.join();
+}
+
+TEST_F(PlannerNodeTest, AFrontierOutsideTheRegionBehindAPeerDoesNotHoldBackCompletion) {
+  // The greedy search's peer diagnosis (run 10c) with the drone's
+  // exploration region: a frontier behind a parked peer keeps the search
+  // from being exploration complete only when the search could take it.
+  // Outside the operator's region it could not, peer or no peer; inside,
+  // or with no region, it still does.
+  for (const bool region : {false, true}) {
+    SCOPED_TRACE(region ? "region" : "no region");
+    std::unique_ptr<MolaFloorProduct> product;
+    auto node = peerFloorNode(
+        region ? "peer_diagnosis_region" : "peer_diagnosis_no_region", -7.5,
+        1.5, -1.5, 1.5, product);
+    PlannerNodeTestPeer::acceptOdometryFacing(*node, 0.0, 0.0, M_PI, 1.0);
+    const int frontier = PlannerNodeTestPeer::addGlobalChainToFrontier(
+        *node, {{-2.0, 0.0}, {-4.0, 0.0}, {-6.0, 0.0}}, M_PI);
+    // A peer's frontier, scored from its owner's counts: this robot's map
+    // has not seen the space it faces.
+    PlannerNodeTestPeer::setFrontierOwner(*node, frontier, 2);
+    PlannerNodeTestPeer::setReportedUnknown(*node, frontier, 1000);
+    PlannerNodeTestPeer::setVertexGain(*node, frontier, 1000.0);
+    PlannerNodeTestPeer::setTour(*node, false, 0.0);
+    if (region) {
+      ASSERT_TRUE(PlannerNodeTestPeer::setExplorationRegion(
+                      *node, true, {-1.0, -1.5, -1.0}, {1.5, 1.5, 2.0})
+                      ->success);
+    }
+    PlannerNodeTestPeer::setPeerBodyTtl(*node, 600.0);
+    PlannerNodeTestPeer::receivePeerBodies(*node, {{-3.0, 0.0}});
+    std::string reason;
+    EXPECT_FALSE(PlannerNodeTestPeer::runGlobalPlanner(*node, reason));
+    EXPECT_EQ(PlannerNodeTestPeer::globalFrontierNotRouted(*node), !region)
+        << reason;
+    EXPECT_EQ(reason.find("blocked by a peer") == std::string::npos, region)
+        << reason;
+  }
 }
 
 TEST_F(PlannerNodeTest, ATourTargetBehindAParkedPeerIsSetAsideBriefly) {

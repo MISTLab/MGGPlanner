@@ -3683,9 +3683,11 @@ bool PlannerNode::runGlobalPlanner(int target_id, std::string& reason,
                   "the search budget";
       } else if (open.status) {
         for (const auto& [id, vertex] : global_graph_->vertices_map_) {
+          // Only a frontier the search could take: one outside the
+          // exploration region is left out, peer or no peer.
           if (vertex == nullptr || vertex->type != mgg::VertexType::kFrontier ||
               !global_graph_->inService(*vertex) ||
-              vertex->vol_gain.gain <= 0.0) {
+              vertex->vol_gain.gain <= 0.0 || !inside_region(*vertex)) {
             continue;
           }
           const auto parent = open.parent_id_map.find(id);
