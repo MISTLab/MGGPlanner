@@ -98,6 +98,35 @@ TEST(TourCosts, DistancesAreSolvedAgainForANewPeerGeneration) {
   EXPECT_EQ(cache.solves(), 4u);
 }
 
+TEST(TourCosts, ALegOneWayOnlyIsCostedAsItsWorseDirection) {
+  // Review r0, M1: a peer body's margin may be left and not entered, so
+  // the roadmap's reachability is directional, while the tour's matrix is
+  // symmetric. A leg costs its worse direction, and is unreachable when
+  // either direction is. From a to b is open (outward); b to a's direct
+  // edge is closed (inward), leaving a 10 m detour through c.
+  GraphManager graph;
+  Vertex* root = add(graph, 0.0, 0.0);
+  Vertex* a = add(graph, 5.0, 0.0, root, VertexType::kFrontier);
+  Vertex* b = add(graph, 10.0, 0.0, a, VertexType::kFrontier);
+  const int a_id = a->id;
+  const int b_id = b->id;
+  graph.setEdgeBlocked([a_id, b_id](const Vertex& from, const Vertex& to) {
+    return from.id == b_id && to.id == a_id;
+  });
+  GraphDistanceCache cache;
+  const std::vector<FrontierCluster> clusters{clusterAt(a), clusterAt(b)};
+  TourCostMatrix costs =
+      mgg::computeTourCosts(graph, 1, cache, root->id, 0.0, clusters, 0.0);
+  EXPECT_EQ(costs.between[0][1], mgg::kUnreachableCost);
+  EXPECT_EQ(costs.between[1][0], mgg::kUnreachableCost);
+  // The detour b - c - a, 5 m each way.
+  Vertex* c = add(graph, 7.5, 4.330127018922193, b);
+  graph.addEdge(c, a, 5.0);
+  costs = mgg::computeTourCosts(graph, 2, cache, root->id, 0.0, clusters, 0.0);
+  EXPECT_NEAR(costs.between[0][1], 10.0, 1e-9);
+  EXPECT_NEAR(costs.between[1][0], 10.0, 1e-9);
+}
+
 TEST(TourCosts, AnotherGraphAtTheSameRevisionIsSolvedAfresh) {
   // Two graphs with the same vertex IDs and revision: the cache must not
   // hand the second graph the first one's distances.

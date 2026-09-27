@@ -64,7 +64,8 @@ struct TourCostMatrix {
   /// Per cluster: graph distance from the robot's vertex plus
   /// heading_weight times the first leg's heading change.
   std::vector<double> from_robot;
-  /// Graph distances between representatives; symmetric, zero diagonal.
+  /// Graph distances between representatives; symmetric, zero diagonal:
+  /// the longer of the two directions, unreachable if either is.
   std::vector<std::vector<double>> between;
 };
 

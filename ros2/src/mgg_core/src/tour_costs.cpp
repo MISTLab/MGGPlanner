@@ -1,5 +1,6 @@
 #include "mgg_core/tour_costs.h"
 
+#include <algorithm>
 #include <cmath>
 #include <limits>
 #include <utility>
@@ -107,14 +108,24 @@ TourCostMatrix computeTourCosts(GraphManager& graph, std::uint64_t revision,
                                                             target, robot_yaw);
     }
   }
+  // A peer body's margin may be left but not entered, so reachability can
+  // differ by direction; the solver's matrix is symmetric. A leg costs its
+  // worse direction, unreachable when either is (review r0, M1).
+  std::vector<const ShortestPathsReport*> from_cluster(n, nullptr);
   for (std::size_t i = 0; i < n; ++i) {
-    const ShortestPathsReport* from_cluster =
-        cache.from(graph, revision, clusters[i].representative_vertex_id,
-                   peer_generation);
-    if (from_cluster == nullptr) continue;
+    from_cluster[i] = cache.from(
+        graph, revision, clusters[i].representative_vertex_id, peer_generation);
+  }
+  for (std::size_t i = 0; i < n; ++i) {
     for (std::size_t j = i + 1; j < n; ++j) {
-      const double distance = reachedDistance(
-          *from_cluster, clusters[j].representative_vertex_id);
+      if (from_cluster[i] == nullptr || from_cluster[j] == nullptr) continue;
+      const double there = reachedDistance(
+          *from_cluster[i], clusters[j].representative_vertex_id);
+      const double back = reachedDistance(
+          *from_cluster[j], clusters[i].representative_vertex_id);
+      const double distance = std::isfinite(there) && std::isfinite(back)
+                                  ? std::max(there, back)
+                                  : kUnreachableCost;
       costs.between[i][j] = distance;
       costs.between[j][i] = distance;
     }
