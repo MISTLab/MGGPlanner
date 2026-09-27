@@ -141,6 +141,8 @@ class GroundProjection {
         params_(params),
         cache_footprint_ground_(cache_footprint_ground) {}
 
+  double maxStepHeight() const { return params_.max_step_height; }
+
   /// How far below `sample` the ground lies.
   ///
   /// Casts downward from `sample` and from four offsets around it. Returns the

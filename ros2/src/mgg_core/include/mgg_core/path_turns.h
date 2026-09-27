@@ -73,7 +73,8 @@ double terrainSlope(GraphManager& graph, const Vertex& vertex, double radius);
 /// graph, whose vertices lie a metre apart along the tracks the robots
 /// drove and so seldom span a plane within a robot's length.
 double groundSlope(const GroundProjection& ground,
-                   const Eigen::Vector3d& position, double radius);
+                   const Eigen::Vector3d& position, double radius,
+                   GraphManager* lattice = nullptr);
 
 /// Whether the robot has room to turn in place at `state`: no occupied voxel
 /// within its turning radius (RobotParams::turningRadius), over the height

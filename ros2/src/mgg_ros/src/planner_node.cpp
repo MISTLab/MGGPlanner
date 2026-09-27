@@ -2314,17 +2314,11 @@ std::string PlannerNode::buildLocalGraph() {
     sharp_turn_allowed = [&turn_check](const mgg::Vertex& v) {
       return turn_check.sharpTurnAllowedAt(v.state.head<3>());
     };
-    // An end on a slope by the lattice's measure or by the map's needs a
-    // way back: the lattice's plane fit can read a slope as level where its
-    // neighbourhood is sparse (the original sparse-slope scene), and such
-    // an end, unclear, was sent by the fallback with none.
-    slope_end_retreat.admitted_on_slope = [this, &turn_check](
-                                              const mgg::Vertex& v) {
-      return (mgg::slopeExemptsTurnSpace(
-                  turn_check.slopeAt(v.state.head<3>())) ||
-              mgg::slopeExemptsTurnSpace(mgg::groundSlope(
-                  *ground_, v.state.head<3>(),
-                  std::max(robot_params_.size.x(), robot_params_.size.y())))) &&
+    slope_end_retreat.admitted_on_slope = [this](const mgg::Vertex& v) {
+      return mgg::slopeExemptsTurnSpace(mgg::groundSlope(
+                 *ground_, v.state.head<3>(),
+                 std::max(robot_params_.size.x(), robot_params_.size.y()),
+                 local_graph_.get())) &&
              !mgg::turnSpaceObserved(*map_, robot_params_, planning_params_,
                                      v.state);
     };
@@ -2343,12 +2337,15 @@ std::string PlannerNode::buildLocalGraph() {
       *local_graph_, selection_params, robot_params_, edge_inclinations_,
       map_->getResolution(), selection_direction, selectionExclusions(),
       reservation_exclusion_radius_m_,
-      [this, &turn_check](const mgg::Vertex& v) {
+      [this](const mgg::Vertex& v) {
         // On a slope, where the path-turn rule forbids turning, an end
         // needs no observed turn space.
         return mgg::viewpointClear(*map_, robot_params_, planning_params_,
-                                   v.state,
-                                   turn_check.slopeAt(v.state.head<3>()));
+                                   v.state, mgg::groundSlope(
+                                       *ground_, v.state.head<3>(),
+                                       std::max(robot_params_.size.x(),
+                                                robot_params_.size.y()),
+                                       local_graph_.get()));
       },
       turns_admissible, sharp_turn_allowed, reach_distance_,
       slope_end_retreat,
@@ -2977,7 +2974,7 @@ mgg::PathOkFn PlannerNode::applyRouteTurnRule(
     const double radius =
         std::max(robot_params_.size.x(), robot_params_.size.y());
     slope = [this, radius](const Eigen::Vector3d& position) {
-      return mgg::groundSlope(*ground_, position, radius);
+      return mgg::groundSlope(*ground_, position, radius, local_graph_.get());
     };
   }
   const std::optional<mgg::StandingStart> standing = standingStart();
@@ -3164,7 +3161,8 @@ bool PlannerNode::runGlobalPlanner(int target_id, std::string& reason,
                                    best_path_[i - 1].head<3>()).norm();
       }
       sloped[i] = mgg::slopeExemptsTurnSpace(
-          mgg::groundSlope(*ground_, best_path_[i].head<3>(), radius));
+          mgg::groundSlope(*ground_, best_path_[i].head<3>(), radius,
+                           local_graph_.get()));
     }
     const auto on_slope = [&](std::size_t i) {
       bool near_slope = false;

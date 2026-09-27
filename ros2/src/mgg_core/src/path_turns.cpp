@@ -97,20 +97,35 @@ double terrainSlope(GraphManager& graph, const Vertex& vertex, double radius) {
 }
 
 double groundSlope(const GroundProjection& ground,
-                   const Eigen::Vector3d& position, double radius) {
+                   const Eigen::Vector3d& position, double radius,
+                   GraphManager* lattice) {
   std::vector<Eigen::Vector3d> points;
-  for (int k = -1; k < 8; ++k) {
-    Eigen::Vector3d probe = position;
-    if (k >= 0) {
-      const double angle = k * M_PI / 4.0;
-      probe.x() += radius * std::cos(angle);
-      probe.y() += radius * std::sin(angle);
+  Eigen::Vector3d center;
+  if (ground.groundBelow(position, center)) {
+    points.push_back(center - position);
+    // The inner ring retains a non-collinear fit on a real ramp when the
+    // outer samples differ by more than a step. Wall/kerb tops are not floor.
+    for (double scale : {1.0, 0.5}) {
+      for (int k = 0; k < 8; ++k) {
+        const double angle = k * M_PI / 4.0;
+        Eigen::Vector3d probe = position;
+        probe.x() += scale * radius * std::cos(angle);
+        probe.y() += scale * radius * std::sin(angle);
+        Eigen::Vector3d found;
+        if (ground.groundBelow(probe, found) &&
+            (ground.maxStepHeight() <= 0.0 ||
+             std::abs(found.z() - center.z()) <= ground.maxStepHeight())) {
+          points.push_back(found - position);
+        }
+      }
     }
-    Eigen::Vector3d found;
-    if (ground.groundBelow(probe, found)) points.push_back(found - position);
   }
-  // About the position.
-  return planeSlope(points);
+  double slope = planeSlope(points);
+  if (lattice != nullptr) {
+    const Vertex probe(-1, StateVec(position.x(), position.y(), position.z(), 0));
+    slope = std::min(slope, terrainSlope(*lattice, probe, radius));
+  }
+  return slope;
 }
 
 TurnCompliantRoutes findTurnCompliantRoutes(
@@ -381,8 +396,9 @@ double PathTurnCheck::slopeAt(const Eigen::Vector3d& position) {
                        StateVec(position.x(), position.y(), position.z(), 0));
     slope = terrainSlope(graph_, probe, window_);
   }
-  if (slope >= kUnknownSlopeRad && robot_tilt_ && robot_tilt_->first == key &&
-      robot_tilt_->second < kLevelGroundSlopeRad) {
+  if ((slope_ || slope >= kUnknownSlopeRad) &&
+      robot_tilt_ && robot_tilt_->first == key &&
+      robot_tilt_->second < 4.0 * M_PI / 180.0) {
     slope = robot_tilt_->second;
   } else if (slope >= kUnknownSlopeRad && unmeasured_) {
     slope = unmeasured_(position);

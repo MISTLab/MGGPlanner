@@ -437,6 +437,41 @@ class Ground : public Walls {
   std::function<std::optional<double>(double, double)> height_;
 };
 
+TEST(GroundSlope, AWallBesideLevelFloorIsNotARamp) {
+  const Ground wall([](double x, double) { return x > 0.5 ? 0.5 : 0.0; });
+  mgg::PlanningParams planning;
+  planning.max_step_height = 0.15;
+  const mgg::GroundProjection ground(wall, planning);
+  EXPECT_NEAR(mgg::groundSlope(ground, {0, 0, 0.6}, 1.0), 0.0, 1e-6);
+  const Ground ramp([](double x, double) { return x * std::tan(16 * kDeg); });
+  const mgg::GroundProjection sloped(ramp, planning);
+  EXPECT_NEAR(mgg::groundSlope(sloped, {0, 0, 0.6}, 1.0), 16 * kDeg, 1e-6);
+}
+
+TEST(PathTurns, LevelImuOverridesANoisyMapAtTheRouteStartOnly) {
+  GraphManager graph;
+  graph.addVertex(new Vertex(0, StateVec(0, 0, 0, 0)));
+  PathTurnCheck check(graph, robot(), {},
+                      [](const Eigen::Vector3d&) { return 20 * kDeg; });
+  check.setRobotTilt({0, 0, 0}, 3 * kDeg);
+  EXPECT_NEAR(check.slopeAt({0, 0, 0}), 3 * kDeg, 1e-9);
+  EXPECT_NEAR(check.slopeAt({1, 0, 0}), 20 * kDeg, 1e-9);
+  check.setRobotTilt({0, 0, 0}, 4 * kDeg);
+  EXPECT_NEAR(check.slopeAt({0, 0, 0}), 20 * kDeg, 1e-9);
+}
+
+TEST(GroundSlope, UsesTheLowerMeasuredLatticeSlopeBesideAWall) {
+  const Ground tilted([](double x, double) { return 0.2 * x; });
+  const mgg::PlanningParams planning;
+  const mgg::GroundProjection ground(tilted, planning);
+  GraphManager lattice;
+  for (int x = -1; x <= 1; ++x)
+    for (int y = -1; y <= 1; ++y)
+      lattice.addVertex(new Vertex(lattice.generateVertexID(),
+                                  StateVec(x * 0.3, y * 0.3, 0.5, 0)));
+  EXPECT_NEAR(mgg::groundSlope(ground, {0, 0, 0.5}, 0.8, &lattice), 0, 1e-9);
+}
+
 TEST(GroundSlope, FitsTheMappedGroundAndFailsClosedWithoutIt) {
   const Ground ramp([](double x, double) { return rampGround(x); });
   const mgg::PlanningParams planning;
