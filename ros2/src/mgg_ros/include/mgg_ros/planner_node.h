@@ -850,6 +850,8 @@ class PlannerNode : public rclcpp::Node {
   /// no_go_zones alone: its messages replace one another, so they are
   /// handled one at a time.
   rclcpp::CallbackGroup::SharedPtr no_go_zones_group_;
+  /// peer_bodies alone, for the same reason (review r1, R3).
+  rclcpp::CallbackGroup::SharedPtr peer_bodies_group_;
 };
 
 }  // namespace mgg_ros

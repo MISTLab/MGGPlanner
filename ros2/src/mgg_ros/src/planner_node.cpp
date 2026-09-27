@@ -276,12 +276,21 @@ PlannerNode::PlannerNode(const rclcpp::NodeOptions& options)
   peer_body_ttl_s_ = std::clamp(
       declareOrGet<double>(this, "peer_body_ttl_s", peer_body_ttl_s_), 0.1,
       30.0);
+  // Each message replaces the set, published under the planner mutex, so
+  // they are handled one at a time, in the order taken, in a group of their
+  // own, as the no-go zones' below: in the reentrant group, messages that
+  // waited on a plan together took the mutex in any order, and an older
+  // set could replace a newer one, with a fresh TTL (review r1, R3).
+  peer_bodies_group_ =
+      create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
+  rclcpp::SubscriptionOptions peer_bodies_opts;
+  peer_bodies_opts.callback_group = peer_bodies_group_;
   peer_bodies_sub_ = create_subscription<geometry_msgs::msg::PoseArray>(
       "peer_bodies", rclcpp::QoS(10),
       [this](geometry_msgs::msg::PoseArray::ConstSharedPtr m) {
         onPeerBodies(m);
       },
-      sub_opts);
+      peer_bodies_opts);
   // Latched: SwarmDeck republishes the whole set on each change and owns
   // the zones' lifetime; a planner started later still gets the last set.
   // Each message replaces the set, so they are handled one at a time, in

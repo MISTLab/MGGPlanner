@@ -541,6 +541,30 @@ class PlannerNodeTestPeer {
       PlannerNode& node) {
     return node.no_go_zones_group_->type();
   }
+  /// The peer_bodies subscription's callback group: its type, and whether
+  /// it is a group of its own, neither the node's reentrant one nor the
+  /// no-go zones'.
+  static std::optional<rclcpp::CallbackGroupType> peerBodiesCallbackGroupType(
+      PlannerNode& node) {
+    if (!node.peer_bodies_group_) return std::nullopt;
+    return node.peer_bodies_group_->type();
+  }
+  static bool peerBodiesHaveTheirOwnGroup(PlannerNode& node) {
+    return node.peer_bodies_group_ &&
+           node.peer_bodies_group_ != node.callback_group_ &&
+           node.peer_bodies_group_ != node.no_go_zones_group_;
+  }
+  /// The planner mutex, held as a plan request holds it.
+  static std::unique_lock<std::recursive_mutex> holdPlannerMutex(
+      PlannerNode& node) {
+    return std::unique_lock<std::recursive_mutex>(node.planner_mutex_);
+  }
+  /// The peer bodies the map holds now, published and not expired.
+  static std::vector<Eigen::Vector2d> peerBodiesInForce(PlannerNode& node) {
+    return node.mola_map_ == nullptr
+               ? std::vector<Eigen::Vector2d>{}
+               : node.mola_map_->activeTransientDiscs().centres;
+  }
   /// No-go zones at `points`, as SwarmDeck publishes them.
   static void receiveNoGoZones(PlannerNode& node, const std::string& frame,
                                const std::vector<Eigen::Vector2d>& points) {
@@ -2479,6 +2503,83 @@ TEST_F(PlannerNodeTest, APeerLeavingLetsTheBackgroundExpansionRunAgain) {
   EXPECT_EQ(PlannerNodeTestPeer::globalEdges(*node), edges);
   EXPECT_GT(PlannerNodeTestPeer::expandGlobalGraph(*node), 0);
   EXPECT_GT(PlannerNodeTestPeer::globalFrontiersBeyond(*node, 8.1), 0);
+}
+
+TEST_F(PlannerNodeTest, PeerMessagesWaitingOnAPlanEndWithTheLatestSet) {
+  // Review r1, R3: peer bodies are published under the planner mutex, and
+  // the subscription was in the node's reentrant group: two messages
+  // arriving while a plan held the mutex waited on it together, and the
+  // older could take it last and put an obsolete set back, with a fresh
+  // TTL. In a mutually exclusive group of its own, as the no-go zones'
+  // (OverlappingNoGoZoneMessagesEndWithTheLastSet), they are handled one at
+  // a time in the order taken. Each round a plan holds the mutex while
+  // older sets and then a newer one arrive; once it lets go, the newest is
+  // in force.
+  std::unique_ptr<MolaFloorProduct> product;
+  auto node = peerFloorNode("peer_order", -2.0, 2.0, -2.0, 2.0, product);
+  // No set expires during the test: what is in force is what came last.
+  PlannerNodeTestPeer::setPeerBodyTtl(*node, 600.0);
+  EXPECT_TRUE(PlannerNodeTestPeer::peerBodiesCallbackGroupType(*node) ==
+              rclcpp::CallbackGroupType::MutuallyExclusive);
+  EXPECT_TRUE(PlannerNodeTestPeer::peerBodiesHaveTheirOwnGroup(*node));
+  auto publisher_node = std::make_shared<rclcpp::Node>("peer_publisher");
+  rclcpp::executors::MultiThreadedExecutor executor(
+      rclcpp::ExecutorOptions(), 4);
+  executor.add_node(node);
+  std::thread spinner([&executor]() { executor.spin(); });
+  auto peers_publisher =
+      publisher_node->create_publisher<geometry_msgs::msg::PoseArray>(
+          "peer_bodies", rclcpp::QoS(10).reliable());
+  const auto peers_at = [](double x) {
+    geometry_msgs::msg::PoseArray msg;
+    msg.header.frame_id = "world";
+    geometry_msgs::msg::Pose pose;
+    pose.position.x = x;
+    pose.orientation.w = 1.0;
+    msg.poses.push_back(pose);
+    return msg;
+  };
+  // Wait for the subscription to be matched before the rounds.
+  const auto matched_by =
+      std::chrono::steady_clock::now() + std::chrono::seconds(5);
+  while (peers_publisher->get_subscription_count() == 0 &&
+         std::chrono::steady_clock::now() < matched_by) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+  }
+  for (int round = 0; round < 10; ++round) {
+    const double newer = -1.0 - round;
+    {
+      auto planning = PlannerNodeTestPeer::holdPlannerMutex(*node);
+      for (int i = 0; i < 9; ++i) {
+        peers_publisher->publish(peers_at(100.0 * (round + 1) + i));
+      }
+      peers_publisher->publish(peers_at(newer));
+      // Taken by the executor, and waiting on the plan.
+      std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    bool settled = false;
+    while (std::chrono::steady_clock::now() < deadline) {
+      const auto peers = PlannerNodeTestPeer::peerBodiesInForce(*node);
+      if (peers.size() == 1 && peers.front().x() == newer) {
+        settled = true;
+        break;
+      }
+      std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+    EXPECT_TRUE(settled) << "round " << round;
+    // Nothing older arrives after it.
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    const auto peers = PlannerNodeTestPeer::peerBodiesInForce(*node);
+    EXPECT_EQ(peers.size(), 1u) << "round " << round;
+    EXPECT_TRUE(!peers.empty() && peers.front().x() == newer)
+        << "round " << round << ": "
+        << (peers.empty() ? std::string("no peer")
+                          : "peer at x " + std::to_string(peers.front().x()));
+  }
+  executor.cancel();
+  spinner.join();
 }
 
 TEST_F(PlannerNodeTest, ATourTargetBehindAParkedPeerIsSetAsideBriefly) {
