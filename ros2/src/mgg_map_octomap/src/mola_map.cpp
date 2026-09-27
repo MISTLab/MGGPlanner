@@ -309,6 +309,7 @@ struct MolaMap::PendingRequest {
 };
 
 thread_local std::vector<MolaMap::ThreadPin> MolaMap::thread_pins_;
+thread_local std::vector<MolaMap::DiscPin> MolaMap::disc_pins_;
 
 MolaMap::ReadLease::ReadLease(const MolaMap& owner)
     : owner_(&owner),
@@ -1149,10 +1150,53 @@ void MolaMap::setNoGoDiscs(std::vector<Eigen::Vector2d> centres,
                     std::shared_ptr<const TransientDiscs>(std::move(discs)));
 }
 
+MolaMap::TransientDiscPin::TransientDiscPin(const MolaMap& map,
+                                            std::vector<Eigen::Vector2d> centres,
+                                            const double radius_m)
+    : map_(&map) {
+  auto discs = std::make_shared<TransientDiscs>();
+  if (std::isfinite(radius_m) && radius_m > 0.0) {
+    for (const Eigen::Vector2d& centre : centres) {
+      if (centre.allFinite()) discs->centres.push_back(centre);
+    }
+    discs->radius_m = radius_m;
+  }
+  discs->expires = Clock::time_point::max();
+  disc_pins_.push_back(DiscPin{map_, std::move(discs)});
+}
+
+MolaMap::TransientDiscPin::~TransientDiscPin() {
+  for (auto pin = disc_pins_.rbegin(); pin != disc_pins_.rend(); ++pin) {
+    if (pin->map == map_) {
+      disc_pins_.erase(std::next(pin).base());
+      return;
+    }
+  }
+}
+
+std::shared_ptr<const MolaMap::TransientDiscs> MolaMap::transientDiscs() const {
+  for (auto pin = disc_pins_.rbegin(); pin != disc_pins_.rend(); ++pin) {
+    if (pin->map == this) return pin->discs;
+  }
+  return std::atomic_load(&transient_discs_);
+}
+
+MolaMap::TransientDiscSet MolaMap::activeTransientDiscs() const {
+  TransientDiscSet set;
+  const auto discs = transientDiscs();
+  if (discs == nullptr || discs->centres.empty() ||
+      Clock::now() > discs->expires) {
+    return set;
+  }
+  set.centres = discs->centres;
+  set.radius_m = discs->radius_m;
+  return set;
+}
+
 bool MolaMap::discsBlockSweep(const Eigen::Vector3d& start,
                               const Eigen::Vector3d& end,
                               const double half_width) const {
-  return discSetBlocksSweep(std::atomic_load(&transient_discs_), start, end,
+  return discSetBlocksSweep(transientDiscs(), start, end,
                             half_width) ||
          discSetBlocksSweep(std::atomic_load(&no_go_discs_), start, end,
                             half_width);
@@ -1161,7 +1205,7 @@ bool MolaMap::discsBlockSweep(const Eigen::Vector3d& start,
 bool MolaMap::transientDiscsBlockSweep(const Eigen::Vector3d& start,
                                        const Eigen::Vector3d& end,
                                        const double half_width) const {
-  return discSetBlocksSweep(std::atomic_load(&transient_discs_), start, end,
+  return discSetBlocksSweep(transientDiscs(), start, end,
                             half_width);
 }
 
@@ -1202,7 +1246,7 @@ bool MolaMap::discSetBlocksSweep(
 
 bool MolaMap::discsBlockBox(const Eigen::Vector3d& center,
                             const Eigen::Vector3d& size) const {
-  return discSetBlocksBox(std::atomic_load(&transient_discs_), center, size) ||
+  return discSetBlocksBox(transientDiscs(), center, size) ||
          discSetBlocksBox(std::atomic_load(&no_go_discs_), center, size);
 }
 

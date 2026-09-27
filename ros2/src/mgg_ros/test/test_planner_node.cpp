@@ -2068,6 +2068,76 @@ TEST_F(PlannerNodeTest, AStraightRouteThroughAPeerIsRefused) {
   EXPECT_GE(nearestTo(response->path, parked), kPeerReachM - 0.01);
 }
 
+namespace {
+
+/// A Navigate or Return Home objective for peerFloorNode's map, to (x, y);
+/// Return Home with no finite goal when `x` is NaN.
+std::shared_ptr<mgg_msgs::srv::PlanObjective::Response> peerObjective(
+    PlannerNode& node, std::uint8_t objective, double x, double y) {
+  auto request = std::make_shared<mgg_msgs::srv::PlanObjective::Request>();
+  request->objective = objective;
+  request->goal.position.x = x;
+  request->goal.position.y = y;
+  request->goal.orientation.w = 1.0;
+  request->component_id = "component:test";
+  request->map_epoch = 1;
+  auto response = std::make_shared<mgg_msgs::srv::PlanObjective::Response>();
+  PlannerNodeTestPeer::objective(node, request, response);
+  return response;
+}
+
+}  // namespace
+
+TEST_F(PlannerNodeTest, NavigateAndReturnHomeBehindAParkedPeerAreBlockedUntilItLeaves) {
+  // Review r0, I2: SwarmDeck retries BLOCKED until its deadline and fails
+  // an UNREACHABLE objective at once, so a peer parked for a while must not
+  // fail Return Home. The robot drove west from home at the origin to
+  // (-6, 0) along a floor 3 m wide; the roadmap is its track. A peer parks
+  // at (-3, 0), on the only way back.
+  using Service = mgg_msgs::srv::PlanObjective;
+  std::unique_ptr<MolaFloorProduct> product;
+  auto node = peerFloorNode("peer_objectives", -7.5, 1.5, -1.5, 1.5, product);
+  double stamp = 1.0;
+  for (double x = 0.0; x >= -6.0 - 1e-9; x -= 0.5) {
+    PlannerNodeTestPeer::acceptOdometryFacing(*node, x, 0.0, M_PI, stamp++);
+  }
+  const Eigen::Vector2d parked(-3.0, 0.0);
+  const auto expect_blocked = [](const Service::Response& response) {
+    EXPECT_EQ(response.status, Service::Response::BLOCKED) << response.reason;
+    EXPECT_NE(response.reason.find("blocked by a peer"), std::string::npos)
+        << response.reason;
+    EXPECT_TRUE(response.path.empty());
+  };
+  // Return Home, to the caller's home and to vertex 0; Navigate beyond
+  // the lattice, and to a goal the peer stands beside.
+  const std::vector<std::pair<std::uint8_t, Eigen::Vector2d>> objectives{
+      {Service::Request::RETURN_HOME, {0.0, 0.0}},
+      {Service::Request::RETURN_HOME, {std::nan(""), std::nan("")}},
+      {Service::Request::NAVIGATE, {0.5, 0.0}},
+      {Service::Request::NAVIGATE, {-3.5, 0.0}},
+  };
+  for (const auto& [objective, goal] : objectives) {
+    SCOPED_TRACE(std::string(objective == Service::Request::NAVIGATE
+                                 ? "NAVIGATE"
+                                 : "RETURN_HOME") +
+                 " to (" + std::to_string(goal.x()) + ", " +
+                 std::to_string(goal.y()) + ")");
+    PlannerNodeTestPeer::receivePeerBodies(*node, {parked});
+    expect_blocked(*peerObjective(*node, objective, goal.x(), goal.y()));
+    PlannerNodeTestPeer::receivePeerBodies(*node, {{1.0, 1.4}});
+    const auto response = peerObjective(*node, objective, goal.x(), goal.y());
+    EXPECT_EQ(response->status, Service::Response::SUCCEEDED)
+        << response->reason;
+    EXPECT_FALSE(response->path.empty());
+  }
+  // A goal no route reaches with or without the peer is still UNREACHABLE.
+  PlannerNodeTestPeer::receivePeerBodies(*node, {parked});
+  const auto off_map =
+      peerObjective(*node, Service::Request::NAVIGATE, 20.0, 20.0);
+  EXPECT_EQ(off_map->status, Service::Response::UNREACHABLE)
+      << off_map->reason;
+}
+
 TEST_F(PlannerNodeTest, ATourTargetBehindAParkedPeerIsSetAsideBriefly) {
   // The robot faces east with a lattice path ahead; the tour's target is a
   // frontier 6 m behind, taken before a peer parked on the only roadmap

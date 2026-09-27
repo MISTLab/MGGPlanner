@@ -3893,6 +3893,31 @@ void PlannerNode::onObjectiveRequest(
   }
   if (!routed) {
     if (!local_reason.empty()) reason += "; local lattice: " + local_reason;
+    // A goal only peer bodies keep the robot from, wherever they stop it
+    // (linking the goal, the lattice round it, the roadmap search, the
+    // route's check), is BLOCKED, which the caller retries until its
+    // deadline, not UNREACHABLE (review r0, I2): the same routing with no
+    // peer bodies finds a route.
+    if (mola_map_ != nullptr &&
+        !mola_map_->activeTransientDiscs().centres.empty()) {
+      const mgg::MolaMap::TransientDiscPin no_peers(*mola_map_, {}, 0.0);
+      peer_edges_open_ = true;
+      std::vector<mgg::StateVec> open_route;
+      mgg::PathOkFn open_turns_ok;
+      std::string open_reason;
+      const bool open_routed =
+          (request->objective == Service::Request::NAVIGATE &&
+           routeOverLocalLattice(goal, open_route, open_turns_ok,
+                                 open_reason)) ||
+          routeOverGlobalGraph(goal, tolerance, open_route, open_turns_ok,
+                               open_reason);
+      peer_edges_open_ = false;
+      if (open_routed) {
+        response->status = Service::Response::BLOCKED;
+        response->reason = "blocked by a peer: " + reason;
+        return;
+      }
+    }
     response->status = Service::Response::UNREACHABLE;
     response->reason = reason;
     return;

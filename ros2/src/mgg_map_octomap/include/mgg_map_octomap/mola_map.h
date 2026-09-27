@@ -172,6 +172,29 @@ class MolaMap : public MapInterface {
   bool transientDiscsBlockSweep(const Eigen::Vector3d& start,
                                 const Eigen::Vector3d& end,
                                 double half_width) const;
+  /// The transient discs this thread's queries see now: a pin's, or those
+  /// published and not expired; no centres when there are none.
+  struct TransientDiscSet {
+    std::vector<Eigen::Vector2d> centres;
+    double radius_m = 0.0;
+  };
+  TransientDiscSet activeTransientDiscs() const;
+  /// While it lives, every query of this map on the constructing thread
+  /// sees `centres` of `radius_m` as the transient discs, without expiry,
+  /// in place of those setTransientDiscs published; no centres, none.
+  /// Other threads are unaffected. Pins nest; the innermost applies. For
+  /// one planning request to see one peer set throughout, or none.
+  class TransientDiscPin {
+   public:
+    TransientDiscPin(const MolaMap& map, std::vector<Eigen::Vector2d> centres,
+                     double radius_m);
+    ~TransientDiscPin();
+    TransientDiscPin(const TransientDiscPin&) = delete;
+    TransientDiscPin& operator=(const TransientDiscPin&) = delete;
+
+   private:
+    const MolaMap* map_;
+  };
   VoxelStatus getVoxelStatus(const Eigen::Vector3d& position) const override;
   VoxelStatus getRayStatus(const Eigen::Vector3d& view_point,
                            const Eigen::Vector3d& voxel_to_test,
@@ -281,6 +304,14 @@ class MolaMap : public MapInterface {
   };
   std::shared_ptr<const TransientDiscs> transient_discs_;
   std::shared_ptr<const TransientDiscs> no_go_discs_;
+  /// The transient discs queries on this thread see: the innermost
+  /// TransientDiscPin's, or those published.
+  std::shared_ptr<const TransientDiscs> transientDiscs() const;
+  struct DiscPin {
+    const MolaMap* map;
+    std::shared_ptr<const TransientDiscs> discs;
+  };
+  static thread_local std::vector<DiscPin> disc_pins_;
   bool discsBlockBox(const Eigen::Vector3d& center,
                      const Eigen::Vector3d& size) const;
   static bool discSetBlocksBox(
