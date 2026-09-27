@@ -3976,6 +3976,7 @@ void PlannerNode::onObjectiveRequest(
       request->objective == Service::Request::NAVIGATE &&
       routeOverLocalLattice(goal, route, turns_ok, local_reason);
   const int rebuilds_before = roadmap_rebuilds_;
+  peer_diagnosis_cut_short_ = false;
   bool routed =
       local || routeOverGlobalGraph(goal, tolerance, route, turns_ok, reason);
   if (home_is_vertex_zero && roadmap_rebuilds_ != rebuilds_before) {
@@ -3991,13 +3992,18 @@ void PlannerNode::onObjectiveRequest(
     // route's check), is BLOCKED, which the caller retries until its
     // deadline, not UNREACHABLE (review r0, I2): the same routing with no
     // peer bodies finds a route.
-    // The routing may have told already, within its search budget; the
-    // routing again is bound by it too, and cut short is retryable as well
-    // (review r0, I4).
+    // The routing's own diagnosis only says whether a search without peers
+    // reaches the goal, not that a route there is admissible (a no-go zone
+    // may still hold the goal, review r1, R1): only its being cut short
+    // decides here, as retryable. Otherwise the whole routing runs again
+    // without peers, bound by the search budget too (review r0, I4).
     if (peersInForce()) {
-      if (last_route_blocked_by_peer_) {
+      if (peer_diagnosis_cut_short_) {
         response->status = Service::Response::BLOCKED;
-        response->reason = "blocked by a peer: " + reason;
+        response->reason =
+            "blocked by a peer, or not: the check was cut short by the "
+            "search budget: " +
+            reason;
         return;
       }
       const mgg::MolaMap::TransientDiscPin no_peers(*mola_map_, {}, 0.0);
@@ -4032,6 +4038,7 @@ void PlannerNode::onObjectiveRequest(
             reason;
         return;
       }
+      reason += "; without peers: " + open_reason;
     }
     response->status = Service::Response::UNREACHABLE;
     response->reason = reason;

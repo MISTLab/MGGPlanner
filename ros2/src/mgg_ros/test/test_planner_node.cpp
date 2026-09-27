@@ -2101,6 +2101,33 @@ std::shared_ptr<mgg_msgs::srv::PlanObjective::Response> peerObjective(
 
 }  // namespace
 
+TEST_F(PlannerNodeTest, AHomeInANoGoZoneBehindAPeerIsUnreachableNotBlocked) {
+  // Review r1, R1: the peer-free search reaching home is not a route to it.
+  // The robot drove from home at (1.5, 0) to (0.4, 0); a no-go zone centred
+  // at the origin, reach 2 m, holds both, and a peer at (1.2, 0) stands on
+  // the roadmap between them. Driving out of the zone its edges stay open,
+  // so a search with the peer left out reaches home; but a route may not
+  // end in a zone, peer or not. Return Home is UNREACHABLE, not BLOCKED.
+  using Service = mgg_msgs::srv::PlanObjective;
+  auto node = makeNode("peer_and_no_go_home", "world",
+                       {rclcpp::Parameter("PlanningParams.no_go_radius_m", 1.9)});
+  MolaFloorProduct product(-3.0, 4.0, -1.5, 1.5);
+  PlannerNodeTestPeer::useMolaMap(*node, product.serve());
+  PlannerNodeTestPeer::serveMap(*node, "component:test", 1);
+  PlannerNodeTestPeer::setMinObservedGround(*node, 0.0);
+  double stamp = 1.0;
+  for (const double x : {1.5, 1.0, 0.4}) {
+    PlannerNodeTestPeer::acceptOdometryFacing(*node, x, 0.0, M_PI, stamp++);
+  }
+  PlannerNodeTestPeer::receiveNoGoZones(*node, "world", {{0.0, 0.0}});
+  PlannerNodeTestPeer::receivePeerBodies(*node, {{1.2, 0.0}});
+  const auto response = peerObjective(*node, Service::Request::RETURN_HOME,
+                                      std::nan(""), std::nan(""));
+  EXPECT_EQ(response->status, Service::Response::UNREACHABLE)
+      << response->reason;
+  EXPECT_TRUE(response->path.empty());
+}
+
 TEST_F(PlannerNodeTest, NavigateAndReturnHomeBehindAParkedPeerAreBlockedUntilItLeaves) {
   // Review r0, I2: SwarmDeck retries BLOCKED until its deadline and fails
   // an UNREACHABLE objective at once, so a peer parked for a while must not
