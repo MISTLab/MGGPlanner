@@ -5,6 +5,8 @@
 #include <limits>
 #include <utility>
 
+#include "mgg_core/global_graph.h"
+
 namespace mgg {
 
 const ShortestPathsReport* GraphDistanceCache::from(GraphManager& graph,
@@ -148,6 +150,29 @@ void capTourCostsByReach(TourCostMatrix& costs,
       costs.from_robot[i] = kUnreachableCost;
     }
   }
+}
+
+double tourClusterValue(const FrontierCluster& cluster, double distance) {
+  if (!std::isfinite(distance)) return 0.0;
+  return cluster.gain * std::exp(-kGlobalDistancePenalty * distance);
+}
+
+int capTourCostsByValue(TourCostMatrix& costs,
+                        const std::vector<FrontierCluster>& clusters,
+                        double min_value) {
+  int left_out = 0;
+  for (std::size_t i = 0;
+       i < costs.from_robot.size() && i < clusters.size(); ++i) {
+    if (!std::isfinite(costs.from_robot[i])) continue;
+    const double distance = i < costs.distance_from_robot.size()
+                                ? costs.distance_from_robot[i]
+                                : kUnreachableCost;
+    if (!(tourClusterValue(clusters[i], distance) >= min_value)) {
+      costs.from_robot[i] = kUnreachableCost;
+      ++left_out;
+    }
+  }
+  return left_out;
 }
 
 }  // namespace mgg

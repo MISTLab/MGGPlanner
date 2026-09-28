@@ -263,4 +263,27 @@ TEST(TourCosts, ReachCapsClustersTheRobotCouldNotReturnFrom) {
   EXPECT_EQ(unlimited.from_robot[0], 50.0);
 }
 
+TEST(TourCosts, ValueLeavesOutClustersNotWorthTheirDistance) {
+  // MGG's global value, gain * exp(-0.05 * distance) (rrg.cpp:5798): at
+  // 60 m a cluster needs about 20 times the gain of one at the robot.
+  std::vector<FrontierCluster> clusters(4);
+  clusters[0].gain = 10000.0;  // 2 m: 9048
+  clusters[1].gain = 10000.0;  // 60 m: 498
+  clusters[2].gain = 200000.0;  // 60 m: 9957
+  clusters[3].gain = 1e9;  // unreachable stays so, and is not counted
+  TourCostMatrix costs;
+  costs.distance_from_robot = {2.0, 60.0, 60.0, mgg::kUnreachableCost};
+  // The heading preference is in from_robot; the value uses the distance.
+  costs.from_robot = {2.0 + M_PI, 60.0, 60.0, mgg::kUnreachableCost};
+  costs.between.assign(4, std::vector<double>(4, 1.0));
+  EXPECT_NEAR(mgg::tourClusterValue(clusters[0], 2.0),
+              10000.0 * std::exp(-0.1), 1e-6);
+  EXPECT_EQ(mgg::tourClusterValue(clusters[3], mgg::kUnreachableCost), 0.0);
+  EXPECT_EQ(mgg::capTourCostsByValue(costs, clusters, 9000.0), 1);
+  EXPECT_DOUBLE_EQ(costs.from_robot[0], 2.0 + M_PI);
+  EXPECT_EQ(costs.from_robot[1], mgg::kUnreachableCost);
+  EXPECT_DOUBLE_EQ(costs.from_robot[2], 60.0);
+  EXPECT_EQ(costs.from_robot[3], mgg::kUnreachableCost);
+}
+
 }  // namespace

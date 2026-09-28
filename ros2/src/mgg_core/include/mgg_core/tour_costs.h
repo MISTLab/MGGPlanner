@@ -92,6 +92,23 @@ void capTourCostsByReach(TourCostMatrix& costs,
                          const std::vector<double>& cluster_to_home,
                          double reach_m);
 
+/// A cluster's value to the robot: its gain discounted by the graph
+/// distance to it, gain * exp(-kGlobalDistancePenalty * distance), as
+/// MGG's global planner valued a frontier (rrg.cpp:5798 to 5801,
+/// searchGlobalFrontier). Zero when the cluster cannot be reached.
+double tourClusterValue(const FrontierCluster& cluster, double distance);
+
+/// Leaves out of the tour every cluster whose tourClusterValue, at its
+/// distance_from_robot, is below `min_value` (tour.min_cluster_gain): its
+/// from_robot becomes kUnreachableCost. At 0.05 per metre a cluster 60 m
+/// away needs about 20 times the gain of one at the robot. The tour orders
+/// the clusters left; the others are the greedy search's to weigh. Returns
+/// how many it left out. Run 12, robot_3: a tour of one small cluster
+/// 48 m back in the start hangar sent it back through the corridor.
+int capTourCostsByValue(TourCostMatrix& costs,
+                        const std::vector<FrontierCluster>& clusters,
+                        double min_value);
+
 }  // namespace mgg
 
 #endif  // MGG_CORE_TOUR_COSTS_H_

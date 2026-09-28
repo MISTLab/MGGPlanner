@@ -991,6 +991,14 @@ std::optional<mgg::FrontierCluster> PlannerNode::refreshTour(
         current_state_[3], clusters, tour_params_.heading_weight,
         peer_generation_);
     mgg::capTourCostsByReach(costs, homeDistances(clusters), flight_reach_m_);
+    // MGG weighed a global frontier's gain against its distance
+    // (rrg.cpp:5798); the tour takes only the clusters worth theirs. With
+    // fleet assignment the auction has costed distance already, and an
+    // award the tour refused would leave the robot idle, so only without.
+    tour_value_left_out_ =
+        fleet_ ? 0
+               : mgg::capTourCostsByValue(costs, clusters,
+                                          tour_params_.min_cluster_gain);
     tour_planner_->solve(clusters, costs, graph_revision_,
                          tour_assignment_version_, now_s, peer_generation_);
     tour_solve_ms_ = std::chrono::duration<double, std::milli>(
@@ -1016,6 +1024,13 @@ std::optional<mgg::FrontierCluster> PlannerNode::refreshTour(
                   cluster.position.z(), tour_solve_ms_);
     note = buf;
     return cluster;
+  }
+  if (!tour_clusters_.empty() && tour_value_left_out_ > 0) {
+    note = "; tour: no reachable cluster worth its distance (" +
+           std::to_string(tour_value_left_out_) + " of " +
+           std::to_string(tour_clusters_.size()) +
+           " below the value floor)";
+    return std::nullopt;
   }
   note = tour_clusters_.empty() ? "; tour: no cluster"
                                 : "; tour: no reachable cluster";

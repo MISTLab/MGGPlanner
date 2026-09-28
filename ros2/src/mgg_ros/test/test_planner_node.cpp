@@ -1022,6 +1022,23 @@ class PlannerNodeTestPeer {
     node.tour_params_.recompute_interval_s = 0.0;
     node.tour_planner_ = std::make_unique<mgg::TourPlanner>(node.tour_params_);
   }
+  /// refreshTour alone, outside a plan request; its note.
+  static std::string refreshTourNote(PlannerNode& node) {
+    const std::lock_guard<std::recursive_mutex> lock(node.planner_mutex_);
+    std::string note;
+    node.refreshTour(note);
+    return note;
+  }
+  /// Where the clusters of the last tour solve are, in tour order.
+  static std::vector<Eigen::Vector3d> tourPlanPositions(PlannerNode& node) {
+    const std::lock_guard<std::recursive_mutex> lock(node.planner_mutex_);
+    std::vector<Eigen::Vector3d> positions;
+    for (const mgg::FrontierCluster& cluster :
+         node.tour_planner_->plan().clusters) {
+      positions.push_back(cluster.position);
+    }
+    return positions;
+  }
   /// refreshTour alone, outside a plan request; its target or kNoCluster.
   static mgg::ClusterId refreshTour(PlannerNode& node) {
     const std::lock_guard<std::recursive_mutex> lock(node.planner_mutex_);
@@ -7079,6 +7096,81 @@ TEST_F(PlannerNodeTest, AClusterBehindTheRobotWithinReachStaysInTheTour) {
   EXPECT_NE(PlannerNodeTestPeer::refreshTour(*node), mgg::kNoCluster);
   PlannerNodeTestPeer::setFlightReach(*node, 9.0);
   EXPECT_EQ(PlannerNodeTestPeer::refreshTour(*node), mgg::kNoCluster);
+}
+
+/// Run 12's scene in small: the robot at home facing +x, a frontier 3.5 m
+/// ahead and one about 14.4 m off along y = 1, each the frontier end of
+/// its own chain of the roadmap from home. `fleet` sets fleet assignment.
+std::shared_ptr<PlannerNode> nearAndFarFrontiers(const std::string& name,
+                                                 bool fleet, int& near,
+                                                 int& far) {
+  auto node = makeNode(name, "world",
+                       {rclcpp::Parameter("fleet.enabled", fleet)});
+  PlannerNodeTestPeer::observeFloor(*node, -1.5, 12.0, -1.5, 2.0);
+  PlannerNodeTestPeer::acceptOdometry(*node, 0.0, 0.0, 1.0);
+  near = PlannerNodeTestPeer::addGlobalChainToFrontier(
+      *node, {{1.0, 0.0}, {2.0, 0.0}, {3.5, 0.0}});
+  std::vector<Eigen::Vector2d> chain;
+  for (int x = 1; x <= 14; ++x) chain.emplace_back(x, 1.0);
+  far = PlannerNodeTestPeer::addGlobalChainToFrontier(*node, chain);
+  PlannerNodeTestPeer::setTour(*node, true, 9000.0);
+  PlannerNodeTestPeer::solveTourOnEveryChange(*node);
+  return node;
+}
+
+TEST_F(PlannerNodeTest, AFarSmallClusterIsNotToured) {
+  // Operator, run 12: a missing voxel is not worth backtracking to the
+  // beginning; MGG valued a frontier at gain * exp(-0.05 * distance)
+  // (rrg.cpp:5798). With gain 15000 each, the near cluster is worth 12593
+  // at 3.5 m, the far one 7300 at 14.4 m, under the 9000 floor: the tour
+  // is the near one alone. A far cluster with the gain to pay for its
+  // distance stays in it.
+  int near = -1;
+  int far = -1;
+  auto node = nearAndFarFrontiers("tour_far_small", false, near, far);
+  PlannerNodeTestPeer::setVertexGain(*node, near, 15000.0);
+  PlannerNodeTestPeer::setVertexGain(*node, far, 15000.0);
+  ASSERT_NE(PlannerNodeTestPeer::refreshTour(*node), mgg::kNoCluster);
+  const auto positions = PlannerNodeTestPeer::tourPlanPositions(*node);
+  ASSERT_EQ(positions.size(), 1u);
+  EXPECT_NEAR(positions.front().x(), 3.5, 1e-6);
+
+  PlannerNodeTestPeer::setVertexGain(*node, far, 1e6);
+  ASSERT_NE(PlannerNodeTestPeer::refreshTour(*node), mgg::kNoCluster);
+  EXPECT_EQ(PlannerNodeTestPeer::tourPlanPositions(*node).size(), 2u);
+}
+
+TEST_F(PlannerNodeTest, AFarSmallClusterAloneLeavesTheChoiceToTheGreedySearch) {
+  // Only the far small cluster is left: the tour has no target and says
+  // why. The greedy search then applies its own discounted ranking, which
+  // still takes the far frontier (no floor there): it is not explored, so
+  // exploration is not complete.
+  int near = -1;
+  int far = -1;
+  auto node = nearAndFarFrontiers("tour_far_small_alone", false, near, far);
+  PlannerNodeTestPeer::setGlobalVertexType(*node, near,
+                                           mgg::VertexType::kUnvisited);
+  PlannerNodeTestPeer::setVertexGain(*node, far, 15000.0);
+  EXPECT_EQ(PlannerNodeTestPeer::refreshTour(*node), mgg::kNoCluster);
+  EXPECT_NE(PlannerNodeTestPeer::refreshTourNote(*node).find(
+                "worth its distance"),
+            std::string::npos);
+  std::string reason;
+  ASSERT_TRUE(PlannerNodeTestPeer::runGlobalPlanner(*node, reason)) << reason;
+  EXPECT_EQ(PlannerNodeTestPeer::repositioningTarget(*node), far);
+}
+
+TEST_F(PlannerNodeTest, WithFleetAssignmentTheTourTakesAFarSmallCluster) {
+  // The auction costs distance in every bid, and an award the tour refused
+  // would leave the robot idle: with fleet assignment the value floor does
+  // not apply, and the far small cluster stays in the tour.
+  int near = -1;
+  int far = -1;
+  auto node = nearAndFarFrontiers("tour_far_small_fleet", true, near, far);
+  PlannerNodeTestPeer::setVertexGain(*node, near, 15000.0);
+  PlannerNodeTestPeer::setVertexGain(*node, far, 15000.0);
+  ASSERT_NE(PlannerNodeTestPeer::refreshTour(*node), mgg::kNoCluster);
+  EXPECT_EQ(PlannerNodeTestPeer::tourPlanPositions(*node).size(), 2u);
 }
 
 TEST_F(PlannerNodeTest, APlannerWithoutAPositiveSpeedDoesNotStart) {

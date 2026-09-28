@@ -801,6 +801,9 @@ class PlannerNode : public rclcpp::Node {
   std::uint64_t tour_fleet_assignment_version_ = 0;
   /// The last tour's costing and solving time, for the plan summary.
   double tour_solve_ms_ = 0.0;
+  /// Clusters the last tour solve left out as not worth their distance
+  /// (capTourCostsByValue; fleet assignment off only).
+  int tour_value_left_out_ = 0;
   /// Fleet frontier assignment (tour-exploration design §3); null when
   /// fleet.enabled is false.
   std::unique_ptr<mgg::FleetCoordinator> fleet_;
