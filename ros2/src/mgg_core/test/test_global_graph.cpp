@@ -1250,16 +1250,55 @@ TEST(DemoteFleetCoveredFrontiers, TheRoadmapFirstThenLinksNearestFirstUpToOneTha
   EXPECT_EQ(links.deferred, 0);
 }
 
+/// A frontier of this robot at (x, 0) with 12 peer vertices, marked
+/// visited, within 1.5 m: behind the wall (y 0.25 to 0.45) at (x, 0.60),
+/// (x, 0.65), ... (x, 1.15), nearest first, except that the one at rank
+/// `clear_rank` (1-based; 0 for none) stands clear at (x, -d) instead.
+Vertex* frontierWithTwelvePeers(GraphManager& graph, double x,
+                                int clear_rank) {
+  Vertex* frontier = ownFrontierAt(graph, x, 0.0);
+  for (int rank = 1; rank <= 12; ++rank) {
+    const double d = 0.55 + 0.05 * rank;
+    peerVertexAt(graph, x, rank == clear_rank ? -d : d, 0.0, true);
+  }
+  return frontier;
+}
+
+TEST(DemoteFleetCoveredFrontiers, OnlyTheNearestKPeerVerticesAreLinkCandidates) {
+  // Review r4: a frontier's links run to its K (8) nearest peer vertices
+  // within 1.5 m, not to all of them. Of 12, a clear one 8th nearest
+  // covers the frontier after 8 checks; one 9th nearest is no candidate,
+  // and the frontier stays after the same 8.
+  for (const int clear_rank : {8, 9}) {
+    SCOPED_TRACE(clear_rank);
+    Roadmap fixture;
+    CountingSlab wall(0.25, 0.45);
+    fixture.ctx.map = &wall;
+    GraphManager graph;
+    graph.setRobotId(1);
+    Vertex* frontier = frontierWithTwelvePeers(graph, 0.0, clear_rank);
+    mgg::FleetCoverageLinks links{&fixture.ctx};
+    ASSERT_EQ(links.max_links_per_frontier, 8);
+    EXPECT_EQ(mgg::demoteFleetCoveredFrontiers(graph, 1, 3.0, &links),
+              clear_rank <= 8 ? 1 : 0);
+    EXPECT_EQ(frontier->fleet_covered, clear_rank <= 8);
+    EXPECT_EQ(links.checks, 8);
+    EXPECT_EQ(links.deferred, 0);
+  }
+}
+
 TEST(DemoteFleetCoveredFrontiers, ARotatingCursorReachesEveryFrontierWithinTheBudgetsPasses) {
-  // Review r3, P2: 20 frontiers whose 20 links all cross a wall come
-  // first; 20 more follow, each with 19 such links and, farthest, one
-  // clear link to a peer's visited vertex. 800 links, 200 a pass: from
-  // where the last pass stopped, every frontier is reached within
-  // ceil(800 / 200) = 4 passes, the last 20 covered in passes 3 and 4,
-  // though the map is a new one every pass (its revision changes each
-  // time, as a cloud map's does). Starting over each pass instead, the
-  // first 10 walled frontiers take the budget every time, and none is
-  // covered.
+  // Review r4: with a budget of one frontier's candidates (K = 8), three
+  // frontiers whose 12 nearby peer vertices all stand behind a wall come
+  // first, then three whose 8th nearest is clear. The cursor was pinned
+  // on a frontier with more candidates than the budget, and restarted its
+  // list every pass. A frontier is now started only when its K candidates
+  // fit the budget left, and finished: each pass judges one frontier
+  // whole, and every frontier is reached within ceil(6 x 8 / 8) = 6
+  // passes, though the map is a new one every pass (its revision changes
+  // each time, as a cloud map's does). The coverable three are covered in
+  // passes 4 to 6. Starting over each pass instead, the first walled
+  // frontier takes the budget every time.
   for (const bool rotating : {true, false}) {
     SCOPED_TRACE(rotating ? "rotating cursor" : "starting over");
     Roadmap fixture;
@@ -1267,40 +1306,28 @@ TEST(DemoteFleetCoveredFrontiers, ARotatingCursorReachesEveryFrontierWithinTheBu
     graph.setRobotId(1);
     std::vector<Vertex*> walled;
     std::vector<Vertex*> coverable;
-    for (int i = 0; i < 40; ++i) {
-      const double x = 5.0 * i;
-      Vertex* frontier = ownFrontierAt(graph, x, 0.0);
-      (i < 20 ? walled : coverable).push_back(frontier);
-      for (const double dx : {-0.8, -0.4, 0.0, 0.4, 0.8}) {
-        for (const double y : {0.6, 0.8, 1.0, 1.2}) {
-          // The farthest behind the wall, 1.44 m, makes way for the clear
-          // one, 1.46 m, checked last.
-          if (i >= 20 && dx == 0.8 && y == 1.2) continue;
-          peerVertexAt(graph, x + dx, y, 0.0, true);
-        }
-      }
-      if (i >= 20) peerVertexAt(graph, x, -1.46, 0.0, true);
+    for (int i = 0; i < 6; ++i) {
+      (i < 3 ? walled : coverable)
+          .push_back(frontierWithTwelvePeers(graph, 5.0 * i, i < 3 ? 0 : 8));
     }
     mgg::FleetCoverageCursor cursor;
-    const auto covered = [&coverable]() {
-      return std::count_if(coverable.begin(), coverable.end(),
-                           [](const Vertex* v) { return v->fleet_covered; });
-    };
     std::vector<long> covered_after;
-    for (int pass = 0; pass < 4; ++pass) {
+    for (int pass = 0; pass < 6; ++pass) {
       CountingSlab wall(0.25, 0.45);  // a new map every pass
       fixture.ctx.map = &wall;
       mgg::FleetCoverageLinks links{&fixture.ctx, rotating ? &cursor : nullptr};
+      links.max_checks = mgg::kFleetCoverageMaxLinksPerFrontier;
       mgg::demoteFleetCoveredFrontiers(graph, 1, 3.0, &links);
-      EXPECT_EQ(links.checks, mgg::kFleetCoverageMaxLinkChecks);
+      EXPECT_EQ(links.checks, 8);
       EXPECT_LE(wall.calls, links.checks * kQueriesPerLinkMax);
-      EXPECT_GT(links.deferred, 0);
-      covered_after.push_back(covered());
+      covered_after.push_back(std::count_if(
+          coverable.begin(), coverable.end(),
+          [](const Vertex* v) { return v->fleet_covered; }));
     }
     if (rotating) {
-      EXPECT_EQ(covered_after, (std::vector<long>{0, 0, 10, 20}));
+      EXPECT_EQ(covered_after, (std::vector<long>{0, 0, 0, 1, 2, 3}));
     } else {
-      EXPECT_EQ(covered_after, (std::vector<long>{0, 0, 0, 0}));
+      EXPECT_EQ(covered_after, (std::vector<long>{0, 0, 0, 0, 0, 0}));
     }
     for (const Vertex* v : walled) EXPECT_EQ(v->type, VertexType::kFrontier);
   }

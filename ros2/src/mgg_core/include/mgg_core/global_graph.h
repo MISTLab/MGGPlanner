@@ -410,6 +410,10 @@ inline constexpr double kFleetCoverageLinkM = 1.5;
 /// Fleet coverage: the swept link checks one coverage pass may make, by
 /// default (fleet_coverage_max_link_checks).
 inline constexpr int kFleetCoverageMaxLinkChecks = 200;
+/// Fleet coverage: the peer vertices, nearest first, one frontier's links
+/// may run to, by default (fleet_coverage_max_links_per_frontier). A
+/// frontier's links are all checked in one pass or none are (review r4).
+inline constexpr int kFleetCoverageMaxLinksPerFrontier = 8;
 
 /// Where the next coverage pass starts among this robot's frontiers (by
 /// vertex id, wrapping round): at the first one the last pass's budget
@@ -431,6 +435,9 @@ struct FleetCoverageLinks {
   Eigen::Vector3d box = Eigen::Vector3d::Zero();
   /// Swept checks this pass may make.
   int max_checks = kFleetCoverageMaxLinkChecks;
+  /// The most links one frontier may be checked for: its nearest in-service
+  /// peer vertices within kFleetCoverageLinkM. At most max_checks.
+  int max_links_per_frontier = kFleetCoverageMaxLinksPerFrontier;
   /// Out: the swept checks made, and the frontiers the budget left
   /// unchanged, to be judged next pass.
   int checks = 0;
@@ -461,11 +468,15 @@ bool fleetCoverageLinkClear(const MapInterface& map,
 /// one link, never added to the graph, to an in-service peer vertex of any
 /// type within kFleetCoverageLinkM that is fleetCoverageLinkClear with
 /// links->box, centred at the robot's center_offset from the vertices; its
-/// length counts. Links are tried nearest first, up to the first that
-/// joins. Frontiers are taken in vertex id order from links->cursor on;
-/// once links->max_checks are made, those still needing one are left as
-/// they are (links->deferred), and the cursor points at the first. Nothing
-/// is kept from one pass to the next but the cursor. Without such a walk
+/// length counts. Only the links->max_links_per_frontier nearest are
+/// candidates; they are tried nearest first, up to the first that joins.
+/// Frontiers are taken in vertex id order from links->cursor on. One is
+/// started only while the budget left (links->max_checks less the checks
+/// made) holds all its candidates, and a started one is finished; at the
+/// first that does not fit, link checks stop for the pass, the frontiers
+/// still needing them are left as they are (links->deferred), and the
+/// cursor points at that first one (review r4). Nothing is kept from one
+/// pass to the next but the cursor. Without such a walk
 /// (a wall between them, review r0 I-1) the frontier stays for the greedy
 /// search and completion to see.
 /// One-way: a covered vertex re-typed a frontier since (a lattice path

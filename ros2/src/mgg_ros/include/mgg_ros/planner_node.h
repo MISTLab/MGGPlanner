@@ -865,6 +865,13 @@ class PlannerNode : public rclcpp::Node {
   /// (fleet_coverage_max_link_checks); the frontiers left over wait for the
   /// next pass.
   int fleet_coverage_max_link_checks_ = mgg::kFleetCoverageMaxLinkChecks;
+  /// The nearest peer vertices one frontier's links may run to
+  /// (fleet_coverage_max_links_per_frontier); the budget is at least this.
+  int fleet_coverage_max_links_per_frontier_ =
+      mgg::kFleetCoverageMaxLinksPerFrontier;
+  /// fleet_coverage_max_link_checks was below it and was raised, with an
+  /// error logged.
+  bool fleet_coverage_link_budget_raised_ = false;
   /// Where the next coverage pass starts among this robot's frontiers.
   mgg::FleetCoverageCursor fleet_coverage_cursor_;
   /// The bound mode RobotParams were loaded with: coverage links are swept

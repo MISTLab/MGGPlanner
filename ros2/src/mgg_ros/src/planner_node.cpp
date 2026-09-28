@@ -347,6 +347,24 @@ PlannerNode::PlannerNode(const rclcpp::NodeOptions& options)
       declareOrGet<std::int64_t>(this, "fleet_coverage_max_link_checks",
                                  fleet_coverage_max_link_checks_),
       0, std::numeric_limits<int>::max()));
+  fleet_coverage_max_links_per_frontier_ =
+      static_cast<int>(std::clamp<std::int64_t>(
+          declareOrGet<std::int64_t>(this,
+                                     "fleet_coverage_max_links_per_frontier",
+                                     fleet_coverage_max_links_per_frontier_),
+          1, std::numeric_limits<int>::max()));
+  // A frontier's links are checked in one pass or not at all: a budget
+  // smaller than one frontier's would never start one (review r4).
+  if (fleet_coverage_max_link_checks_ < fleet_coverage_max_links_per_frontier_) {
+    RCLCPP_ERROR(get_logger(),
+                 "fleet_coverage_max_link_checks (%d) is below "
+                 "fleet_coverage_max_links_per_frontier (%d): raised to %d",
+                 fleet_coverage_max_link_checks_,
+                 fleet_coverage_max_links_per_frontier_,
+                 fleet_coverage_max_links_per_frontier_);
+    fleet_coverage_max_link_checks_ = fleet_coverage_max_links_per_frontier_;
+    fleet_coverage_link_budget_raised_ = true;
+  }
   coordination_exclusions_sub_ =
       create_subscription<geometry_msgs::msg::PoseArray>(
           "coordination_exclusions", rclcpp::QoS(10),
@@ -846,7 +864,8 @@ void PlannerNode::demoteFleetCoveredFrontiers() {
   nominal.bound_mode = nominal_bound_mode_;
   mgg::FleetCoverageLinks links{&ctx, &fleet_coverage_cursor_,
                                 nominal.getPlanningSize(),
-                                fleet_coverage_max_link_checks_};
+                                fleet_coverage_max_link_checks_,
+                                fleet_coverage_max_links_per_frontier_};
   const int demoted = mgg::demoteFleetCoveredFrontiers(
       *global_graph_, static_cast<int>(planning_params_.robot_id),
       fleet_coverage_radius_m_, map_serves ? &links : nullptr);

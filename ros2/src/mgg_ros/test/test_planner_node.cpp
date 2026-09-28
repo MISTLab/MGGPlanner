@@ -427,6 +427,17 @@ class PlannerNodeTestPeer {
     node.robot_params_.size_extension = Eigen::Vector3d(extension, extension, 0.0);
     node.robot_params_.bound_mode = mode;
   }
+  /// The coverage link budget in force, the per-frontier candidate
+  /// limit, and whether the budget was raised to it (an error logged).
+  static int fleetCoverageLinkBudget(PlannerNode& node) {
+    return node.fleet_coverage_max_link_checks_;
+  }
+  static int fleetCoverageLinksPerFrontier(PlannerNode& node) {
+    return node.fleet_coverage_max_links_per_frontier_;
+  }
+  static bool fleetCoverageLinkBudgetRaised(PlannerNode& node) {
+    return node.fleet_coverage_link_budget_raised_;
+  }
   /// The owner of vertex `id`, a peer's, marked it visited (event E1).
   static void markOwnerVisited(PlannerNode& node, int id) {
     const std::lock_guard<std::recursive_mutex> lock(node.planner_mutex_);
@@ -7540,6 +7551,36 @@ TEST_F(PlannerNodeTest, ACoverageLinkIsSweptWithTheNominalBoxWhateverTheRequests
       PlannerNodeTestPeer::frontierClusters(*node);
       EXPECT_EQ(PlannerNodeTestPeer::isGlobalFrontier(*node, frontier), column);
     }
+  }
+}
+
+TEST_F(PlannerNodeTest, ALinkBudgetBelowOneFrontiersCandidatesIsRaisedToIt) {
+  // Review r4: a frontier's links are checked in one pass or not at all,
+  // so a budget below one frontier's candidates (K) would never start
+  // one. It is an error, logged, and the budget is raised to K.
+  struct Case {
+    std::int64_t budget;
+    std::int64_t per_frontier;
+    int budget_in_force;
+    bool raised;
+  };
+  for (const Case& c : {Case{200, 8, 200, false}, Case{3, 8, 8, true},
+                        Case{10, 12, 12, true}, Case{0, 8, 8, true}}) {
+    SCOPED_TRACE(c.budget);
+    SCOPED_TRACE(c.per_frontier);
+    auto node = makeNode(
+        "fleet_cover_budget_" + std::to_string(c.budget) + "_" +
+            std::to_string(c.per_frontier),
+        "world",
+        {rclcpp::Parameter("fleet_coverage_max_link_checks", c.budget),
+         rclcpp::Parameter("fleet_coverage_max_links_per_frontier",
+                           c.per_frontier)});
+    EXPECT_EQ(PlannerNodeTestPeer::fleetCoverageLinksPerFrontier(*node),
+              c.per_frontier);
+    EXPECT_EQ(PlannerNodeTestPeer::fleetCoverageLinkBudget(*node),
+              c.budget_in_force);
+    EXPECT_EQ(PlannerNodeTestPeer::fleetCoverageLinkBudgetRaised(*node),
+              c.raised);
   }
 }
 

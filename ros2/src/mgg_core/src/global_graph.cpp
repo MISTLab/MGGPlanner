@@ -1088,10 +1088,11 @@ namespace {
 /// it to any of `covering` within `max_walk` (demoteFleetCoveredFrontiers):
 /// the roadmap does not, but once merged a peer's later extension beside
 /// the frontier gets no edge to it (review r1). A link runs to an
-/// in-service peer vertex within kFleetCoverageLinkM and must be
-/// fleetCoverageLinkClear. Links are tried nearest first, up to the first
-/// that joins; once the pass's budget is spent the frontier is left as it
-/// is (review r2, M-1): links->deferred counts it.
+/// in-service peer vertex among the links->max_links_per_frontier nearest
+/// within kFleetCoverageLinkM and must be fleetCoverageLinkClear. Links are
+/// tried nearest first, up to the first that joins. A frontier whose
+/// candidates the budget left does not hold, or any after one such this
+/// pass, is left as it is (review r2 M-1, r4): links->deferred counts it.
 bool joinedByALink(GraphManager& graph, const Vertex& frontier, int robot_id,
                    const std::unordered_set<int>& covering, double max_walk,
                    FleetCoverageLinks* links) {
@@ -1121,12 +1122,22 @@ bool joinedByALink(GraphManager& graph, const Vertex& frontier, int robot_id,
               return a.first != b.first ? a.first < b.first
                                         : a.second->id < b.second->id;
             });
+  // The K nearest only, and never more than a whole budget holds, so that
+  // every frontier can be started in some pass (review r4).
+  const std::size_t limit = static_cast<std::size_t>(std::max(
+      0, std::min(links->max_links_per_frontier, links->max_checks)));
+  if (candidates.size() > limit) candidates.resize(limit);
+  if (candidates.empty()) return false;
+  // Started only when the budget left holds all its candidates, then
+  // finished; once one does not fit, no other is started this pass.
+  if (links->deferred > 0 ||
+      links->max_checks - links->checks <
+          static_cast<int>(candidates.size())) {
+    ++links->deferred;
+    return false;
+  }
   const Eigen::Vector3d& offset = links->ctx->robot->center_offset;
   for (const auto& [length, peer] : candidates) {
-    if (links->checks >= links->max_checks) {
-      ++links->deferred;
-      return false;
-    }
     ++links->checks;
     if (fleetCoverageLinkClear(*links->ctx->map,
                                frontier.state.head<3>() + offset,
