@@ -82,10 +82,12 @@ class SlowScanMap : public mgg::OctomapMap {
 /// A MOLA planner product, as the mapping worker publishes it, of a level
 /// floor: an occupied 0.2 m voxel layer at z index -1 over [x0, x1) x [y0,
 /// y1) and free voxels above it, and 0.6 m round it, up to 0.8 m. The same layout as
-/// test_mola_map.cpp's Publication, reduced to one revision.
+/// test_mola_map.cpp's Publication, reduced to one revision. Each of
+/// `walls`, {x0, x1, y0, y1}, is occupied instead of free up to 0.8 m.
 class MolaFloorProduct {
  public:
-  MolaFloorProduct(double x0, double x1, double y0, double y1) {
+  MolaFloorProduct(double x0, double x1, double y0, double y1,
+                   const std::vector<std::array<double, 4>>& walls = {}) {
     static int sequence = 0;
     root_ = std::filesystem::temp_directory_path() /
             ("mgg-planner-mola-" + std::to_string(::getpid()) + "-" +
@@ -104,7 +106,14 @@ class MolaFloorProduct {
         const bool floor = x >= index(x0) && x < index(x1) &&
                            y >= index(y0) && y < index(y1);
         if (floor) occupied.push_back({x, y, -1});
-        for (std::int64_t z = 0; z <= 3; ++z) free.push_back({x, y, z});
+        const bool wall = std::any_of(
+            walls.begin(), walls.end(), [&](const std::array<double, 4>& w) {
+              return x >= index(w[0]) && x < index(w[1]) &&
+                     y >= index(w[2]) && y < index(w[3]);
+            });
+        for (std::int64_t z = 0; z <= 3; ++z) {
+          (wall ? occupied : free).push_back({x, y, z});
+        }
       }
     }
     const std::string geometry(64, 'a');
@@ -200,6 +209,9 @@ class MolaFloorProduct {
   }
   ~MolaFloorProduct() { std::filesystem::remove_all(root_); }
 
+  /// The heartbeat request naming this product.
+  const mgg::MolaSnapshotRequest& request() const { return request_; }
+
   /// A MolaMap serving the product, once it has loaded it.
   /// A `Map`, a MolaMap or one derived from it, serving the product once
   /// it has loaded it.
@@ -260,6 +272,18 @@ class PlannerNodeTestPeer {
     node.map_ = std::move(map);
     node.ground_ = std::make_unique<mgg::GroundProjection>(
         *node.map_, node.planning_params_);
+  }
+  /// Hands the MOLA map in service `request`; a valid one is awaited until
+  /// its snapshot serves. An invalid one withdraws the snapshot at once.
+  static bool requestMapSnapshot(PlannerNode& node,
+                                 const mgg::MolaSnapshotRequest& request) {
+    node.mola_map_->requestSnapshot(request);
+    for (int i = 0; i < 400 && !request.component_id.empty() &&
+                    !node.mola_map_->getStatus();
+         ++i) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+    return node.mola_map_->getStatus();
   }
   static void useCloudMap(PlannerNode& node, std::unique_ptr<mgg::OctomapMap> map) {
     node.cloud_map_ = map.get();
@@ -7402,6 +7426,40 @@ TEST_F(PlannerNodeTest, AWallSeenBetweenAFrontierAndANearPeerVertexKeepsIt) {
     PlannerNodeTestPeer::frontierClusters(*node);
     EXPECT_EQ(PlannerNodeTestPeer::isGlobalFrontier(*node, frontier), wall);
   }
+}
+
+TEST_F(PlannerNodeTest, AMapOutageLinksNothingSoAWallSeenBeforeStillKeepsTheFrontier) {
+  // Review r2, I-1: the MOLA map shows a wall at y = 0.4 to 0.6 between
+  // the frontier at (3, 0) and the peer's visited vertex at (3, 1), 6.2 m
+  // apart by the roadmap. While the map serves, the wall refuses the link.
+  // Its snapshot then lapses; a map with no snapshot knows nothing
+  // occupied, and a link checked against it would cover the frontier for
+  // good. No link is made without a map in service, and once the snapshot
+  // returns, with the same wall, the frontier is still one.
+  auto node = makeNode("fleet_cover_map_outage");
+  MolaFloorProduct product(-1.5, 4.0, -1.5, 1.5, {{{2.0, 4.0, 0.4, 0.6}}});
+  PlannerNodeTestPeer::useMolaMap(*node, product.serve());
+  PlannerNodeTestPeer::serveMap(*node, "component:test", 1);
+  PlannerNodeTestPeer::setMinObservedGround(*node, 0.0);
+  PlannerNodeTestPeer::acceptOdometry(*node, 0.0, 0.0, 1.0);
+  const int frontier = PlannerNodeTestPeer::addGlobalChainToFrontier(
+      *node, {{1.5, 0.0}, {3.0, 0.0}});
+  PlannerNodeTestPeer::setVertexGain(*node, frontier, 20000.0);
+  const double z = PlannerNodeTestPeer::globalVertexState(*node, 0).z();
+  const int peer =
+      PlannerNodeTestPeer::addGlobalVertex(*node, 2, 3.0, 1.0, z, {0});
+  PlannerNodeTestPeer::markOwnerVisited(*node, peer);
+  PlannerNodeTestPeer::frontierClusters(*node);
+  ASSERT_TRUE(PlannerNodeTestPeer::isGlobalFrontier(*node, frontier));
+
+  ASSERT_FALSE(PlannerNodeTestPeer::requestMapSnapshot(
+      *node, mgg::MolaSnapshotRequest{}));
+  PlannerNodeTestPeer::frontierClusters(*node);  // as a fleet bid would
+  EXPECT_TRUE(PlannerNodeTestPeer::isGlobalFrontier(*node, frontier));
+
+  ASSERT_TRUE(PlannerNodeTestPeer::requestMapSnapshot(*node, product.request()));
+  PlannerNodeTestPeer::frontierClusters(*node);
+  EXPECT_TRUE(PlannerNodeTestPeer::isGlobalFrontier(*node, frontier));
 }
 
 TEST_F(PlannerNodeTest, AFrontierAcrossAWallFromWhereAPeerDroveIsNotCovered) {

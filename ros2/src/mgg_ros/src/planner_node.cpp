@@ -825,12 +825,16 @@ void PlannerNode::noteGlobalGraphEdges() {
 
 void PlannerNode::demoteFleetCoveredFrontiers() {
   // The walk to a peer's visited vertex may start with a link checked
-  // against this robot's map, clear of what it has seen occupied.
+  // against this robot's map, clear of what it has seen occupied. Only a
+  // map in service can say: one without its snapshot knows nothing
+  // occupied, and a demotion is for good (review r2, I-1). Without one,
+  // the roadmap alone.
   auto map_read = mapReadLease();
   const mgg::ExpandContext ctx = makeGlobalContext();
+  const bool map_serves = ctx.map != nullptr && ctx.map->getStatus();
   const int demoted = mgg::demoteFleetCoveredFrontiers(
       *global_graph_, static_cast<int>(planning_params_.robot_id),
-      fleet_coverage_radius_m_, ctx.map != nullptr ? &ctx : nullptr);
+      fleet_coverage_radius_m_, map_serves ? &ctx : nullptr);
   if (demoted > 0) {
     RCLCPP_INFO(get_logger(),
                 "%d frontier(s) covered by the fleet: a peer's visited vertex "
