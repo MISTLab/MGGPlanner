@@ -269,11 +269,17 @@ struct PlanningParams {
   bool planning_backward = false;
   bool path_safety_enhance_enable = false;
   double path_interpolation_distance = 0.5;
-  /// Clearance that an exploration path's final pose keeps from known
-  /// obstacles (viewpointClear), metres, beyond what the robot needs: for a
-  /// ground robot, room to turn there and kViewpointArrivalSlack; for an
-  /// aerial one, its inscribed radius. Not an upstream parameter.
+  /// Clearance that a ground robot's exploration path's final pose keeps
+  /// from known obstacles (viewpointClear), metres, beyond room to turn
+  /// there and kViewpointArrivalSlack. Not an upstream parameter.
   double viewpoint_clearance_margin = 0.1;
+  /// The same for an aerial robot, beyond its circumscribed radius (half
+  /// the diagonal of RobotParams::size x and y). The default ends a 0.5 m
+  /// square drone's paths at least 1.0 m from an occupied cell; ends 0.7 m
+  /// from a wall brought it into contact in the drone smoke test (drone
+  /// scout Task 15).
+  /// Not an upstream parameter.
+  double aerial_viewpoint_clearance_margin = 0.65;
   /// Whether a ground robot boxed in where it stands, with no room to turn
   /// in place, may be sent straight back out along its heading when there is
   /// no room ahead (mgg::findDeparture). SwarmDeck's Nav2

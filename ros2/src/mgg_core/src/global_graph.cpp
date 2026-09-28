@@ -353,7 +353,8 @@ bool addRefPathToGraph(GraphManager& graph, const std::vector<StateVec>& path,
 bool addRefPathToGraph(GraphManager& graph,
                        const std::vector<Vertex*>& path,
                        const ExpandContext& ctx, double vertex_spacing,
-                       std::vector<Vertex*>* path_vertices) {
+                       std::vector<Vertex*>* path_vertices,
+                       const UsableVertexFn& carries_gain) {
   std::vector<RefPose> poses;
   poses.reserve(path.size());
   for (std::size_t i = 0; i < path.size(); ++i) {
@@ -361,7 +362,8 @@ bool addRefPathToGraph(GraphManager& graph,
     // Don't add the part of the path after the first hanging vertex
     // (rrg.cpp:4868).
     if (i > 0 && path[i]->is_hanging) break;
-    poses.push_back({path[i]->state, path[i]});
+    const bool carried = !carries_gain || carries_gain(*path[i]);
+    poses.push_back({path[i]->state, carried ? path[i] : nullptr});
   }
   return addRefPath(graph, poses, ctx, vertex_spacing, path_vertices);
 }
@@ -1004,14 +1006,15 @@ GlobalFrontierReport searchGlobalFrontier(
     const RecomputeGainFn& recompute_gain,
     const std::vector<Eigen::Vector3d>& excluded, double exclusion_radius,
     const Eigen::Vector3d* target, double time_budget_s,
-    const Eigen::Vector3d* robot_position, double reach_distance) {
+    const Eigen::Vector3d* robot_position, double reach_distance,
+    const UsableVertexFn& eligible) {
   GlobalFrontierReport report;
 
   std::vector<Vertex*> global_frontiers;
   for (auto& entry : graph.vertices_map_) {
     Vertex* vertex = entry.second;
     if (vertex == nullptr || vertex->type != VertexType::kFrontier ||
-        !graph.inService(*vertex)) {
+        !graph.inService(*vertex) || (eligible && !eligible(*vertex))) {
       continue;
     }
     global_frontiers.push_back(vertex);
@@ -1072,11 +1075,11 @@ GlobalFrontierReport searchGlobalFrontier(
   order.reserve(global_frontiers.size());
   for (Vertex* frontier : global_frontiers) {
     const double distance = distance_to(frontier);
-    const bool eligible = std::isfinite(distance) && !is_excluded(frontier);
-    const bool within_reach = eligible && robot_position != nullptr &&
+    const bool routable = std::isfinite(distance) && !is_excluded(frontier);
+    const bool within_reach = routable && robot_position != nullptr &&
         (frontier->state.head<2>() - robot_position->head<2>()).norm() <=
             reach_distance;
-    const bool ranked = eligible && !within_reach;
+    const bool ranked = routable && !within_reach;
     const double stored =
         frontier->vol_gain.gain > 0.0 ? frontier->vol_gain.gain : best_stored;
     order.push_back({frontier, distance, ranked, within_reach,

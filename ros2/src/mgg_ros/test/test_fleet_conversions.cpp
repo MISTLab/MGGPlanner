@@ -26,6 +26,7 @@ FleetCluster cluster(mgg::ClusterId id, int owner, double x, double y) {
 
 TourBidData sampleBid() {
   TourBidData bid;
+  bid.speed_mps = 1.0;
   bid.robot_id = 2;
   bid.seq = 17;
   bid.stamp_s = 123.25;
@@ -185,6 +186,22 @@ TEST(FleetConversions, UnrepresentableStampsBecomeZero) {
   EXPECT_EQ(last_second.sec, 2147483647);
   EXPECT_EQ(last_second.nanosec, 0u);
   EXPECT_DOUBLE_EQ(mgg_ros::stampSeconds(last_second), 2147483647.0);
+}
+
+TEST(FleetConversions, ADronesSpeedReachAndHomeTravelWithTheBid) {
+  TourBidData bid = sampleBid();
+  bid.leaving = true;
+  bid.speed_mps = 4.0;
+  bid.reach_m = 250.0;
+  bid.home = Eigen::Vector3d(1.0, 0.0, 0.0);
+  Eigen::Isometry3d t_ours_theirs = Eigen::Isometry3d::Identity();
+  t_ours_theirs.translation() = Eigen::Vector3d(5.0, 0.0, 0.0);
+  const TourBidData out = mgg_ros::fromTourBidMsg(
+      mgg_ros::toTourBidMsg(bid, "robot_4/odom"), t_ours_theirs);
+  EXPECT_TRUE(out.leaving);
+  EXPECT_EQ(out.speed_mps, 4.0);
+  EXPECT_EQ(out.reach_m, 250.0);
+  EXPECT_TRUE(out.home.isApprox(Eigen::Vector3d(6.0, 0.0, 0.0)));
 }
 
 }  // namespace

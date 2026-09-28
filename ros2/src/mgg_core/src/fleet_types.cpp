@@ -16,6 +16,8 @@ bool TourBidData::wellFormed() const {
     return false;
   }
   if (!pose.allFinite()) return false;
+  if (!std::isfinite(speed_mps) || !(speed_mps > 0.0)) return false;
+  if (std::isnan(reach_m) || reach_m < 0.0 || !home.allFinite()) return false;
   for (const FleetCluster& cluster : clusters) {
     if (cluster.id == kNoCluster || !cluster.position.allFinite()) {
       return false;

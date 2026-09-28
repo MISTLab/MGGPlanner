@@ -1,6 +1,7 @@
 #include "mgg_ros/param_loader.h"
 
 #include <algorithm>
+#include <cmath>
 
 namespace mgg_ros {
 namespace {
@@ -236,7 +237,11 @@ bool loadPlanningParams(const ParamLoader& p, const std::string& ns,
 
   p.get(ns + "/global_frame_id", out.global_frame_id);
   p.get(ns + "/freespace_cloud_enable", out.freespace_cloud_enable);
-  p.get(ns + "/v_max", out.v_max);
+  // Bids are costed in time at v_max: it must be a speed.
+  if (p.get(ns + "/v_max", out.v_max) &&
+      !(std::isfinite(out.v_max) && out.v_max > 0.0)) {
+    return false;
+  }
   p.get(ns + "/v_homing_max", out.v_homing_max);
   p.get(ns + "/yaw_rate_max", out.yaw_rate_max);
   p.get(ns + "/yaw_tangent_correction", out.yaw_tangent_correction);
@@ -292,6 +297,8 @@ bool loadPlanningParams(const ParamLoader& p, const std::string& ns,
   p.get(ns + "/path_safety_enhance_enable", out.path_safety_enhance_enable);
   p.get(ns + "/path_interpolation_distance", out.path_interpolation_distance);
   p.get(ns + "/viewpoint_clearance_margin", out.viewpoint_clearance_margin);
+  p.get(ns + "/aerial_viewpoint_clearance_margin",
+        out.aerial_viewpoint_clearance_margin);
   p.get(ns + "/departure_reverse_allowed", out.departure_reverse_allowed);
   p.get(ns + "/min_observed_ground_fraction",
         out.min_observed_ground_fraction);

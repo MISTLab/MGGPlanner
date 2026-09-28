@@ -70,7 +70,10 @@ struct AuctionBidder {
 
 /// The bid's costs over the pool: its own where it lists the cluster (the
 /// least of its entries merged into one), otherwise `estimate` on the
-/// auctioneer's roadmap (kUnreachableCost without one).
+/// auctioneer's roadmap (kUnreachableCost without one). Clusters the bidder
+/// could not reach and return home from within reach_m are unreachable;
+/// the rest are times, at the bid's speed_mps. A bid without a positive
+/// speed bids on nothing.
 AuctionBidder bidderCosts(const TourBidData& bid,
                           const std::vector<int>& bid_to_pool,
                           const ClusterPool& pool,
@@ -84,7 +87,8 @@ struct AuctionResult {
   std::vector<int> unassigned;
 };
 
-/// §3.4 steps 1 and 2 over the pool clusters not `fixed`.
+/// §3.4 steps 1 and 2 over the pool clusters not `fixed`. A bidder bids
+/// only on clusters its from_pose cost is finite for.
 AuctionResult runSequentialAuction(const std::vector<AuctionBidder>& bidders,
                                    const std::vector<bool>& fixed,
                                    double commit_margin,

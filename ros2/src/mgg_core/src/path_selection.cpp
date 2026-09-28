@@ -12,16 +12,18 @@ bool viewpointClear(const MapInterface& map, const RobotParams& robot,
                     const PlanningParams& planning, const StateVec& viewpoint,
                     double slope) {
   // A ground robot stops only where it can turn: a clear viewpoint passes
-  // turnClear, which asks for the same cylinder at the turning radius.
-  const double needed =
-      robot.type == RobotType::kGroundRobot
-          ? robot.turningRadius() + kViewpointArrivalSlack
-          : 0.5 * std::min(robot.size.x(), robot.size.y());
-  // A negative margin may take an aerial robot's radius in, but never a
-  // ground robot's below its turning radius (review r0, M-2).
-  double radius = needed + planning.viewpoint_clearance_margin;
+  // turnClear, which asks for the same cylinder at the turning radius. A
+  // negative margin never takes it below its turning radius (review r0,
+  // M-2), nor an aerial robot's below its circumscribed radius.
+  double radius = 0.0;
   if (robot.type == RobotType::kGroundRobot) {
-    radius = std::max(radius, robot.turningRadius());
+    radius = std::max(robot.turningRadius() + kViewpointArrivalSlack +
+                          planning.viewpoint_clearance_margin,
+                      robot.turningRadius());
+  } else {
+    const double drone_radius = 0.5 * robot.size.head<2>().norm();
+    radius = drone_radius +
+             std::max(0.0, planning.aerial_viewpoint_clearance_margin);
   }
   // Where it can turn, as roomToTurn has it: with the space it would turn
   // in observed (item 7). Not on a measured slope, where it may not turn.

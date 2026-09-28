@@ -32,6 +32,9 @@ struct GainContext {
   const BoundedSpaceParams* global_space = nullptr;
   /// Regions that contribute no gain even when unknown. Optional.
   const std::vector<BoundedSpaceParams>* no_gain_zones = nullptr;
+  /// When set, only voxels inside this volume count: the operator's
+  /// "Explore here" region (drone scout design §3.5). Optional.
+  const BoundedSpaceParams* gain_region = nullptr;
   /// Sensors named by planning->exp_sensor_list.
   const std::unordered_map<std::string, SensorParams>* sensors = nullptr;
 };
