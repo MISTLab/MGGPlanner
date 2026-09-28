@@ -396,6 +396,11 @@ class PlannerNodeTestPeer {
   static void setFrontierOwner(PlannerNode& node, int id, int owner) {
     node.global_graph_->getVertex(id)->robot_id = owner;
   }
+  /// The owner of vertex `id`, a peer's, marked it visited (event E1).
+  static void markOwnerVisited(PlannerNode& node, int id) {
+    const std::lock_guard<std::recursive_mutex> lock(node.planner_mutex_);
+    node.global_graph_->getVertex(id)->owner_visited = true;
+  }
   static void configureGroundRobot(PlannerNode& node) {
     const std::lock_guard<std::recursive_mutex> lock(node.planner_mutex_);
     node.robot_params_.type = mgg::RobotType::kGroundRobot;
@@ -7305,6 +7310,37 @@ TEST_F(PlannerNodeTest, AFrontierTheFleetCoveredIsNeitherResumedNorHoldsBackComp
   EXPECT_FALSE(PlannerNodeTestPeer::runGlobalPlanner(*fleet.a, reason));
   EXPECT_FALSE(PlannerNodeTestPeer::isGlobalFrontier(*fleet.a, covered));
   EXPECT_TRUE(PlannerNodeTestPeer::completionWithheld(*fleet.a).empty());
+}
+
+TEST_F(PlannerNodeTest, AFrontierAcrossAWallFromWhereAPeerDroveIsNotCovered) {
+  // Review r0, I-1: the peer's vertex at (2.5, 0), which it marked
+  // visited, is 2.5 m from this robot's last frontier at (5, 0), but a
+  // partition at x = 3 stands between them: the roadmap joins them only
+  // round it, through (0, 4) and (5, 4), 15.5 m. The peer did not see
+  // behind the partition, so the frontier stays: the greedy search
+  // repositions to it, and exploration is not complete. Joined through a
+  // doorway (an edge between them), the peer covers it and nothing is left.
+  auto node = makeNode("fleet_cover_wall");
+  PlannerNodeTestPeer::observeFloor(*node, -1.5, 1.5, -1.5, 1.5);
+  PlannerNodeTestPeer::acceptOdometry(*node, 0.0, 0.0, 1.0);
+  const int frontier = PlannerNodeTestPeer::addGlobalChainToFrontier(
+      *node, {{0.0, 2.0}, {0.0, 4.0}, {5.0, 4.0}, {5.0, 0.0}});
+  PlannerNodeTestPeer::setVertexGain(*node, frontier, 20000.0);
+  const double z = PlannerNodeTestPeer::globalVertexState(*node, 0).z();
+  const int peer =
+      PlannerNodeTestPeer::addGlobalVertex(*node, 2, 2.5, 0.0, z, {0});
+  PlannerNodeTestPeer::markOwnerVisited(*node, peer);
+
+  std::string reason;
+  ASSERT_TRUE(PlannerNodeTestPeer::runGlobalPlanner(*node, reason)) << reason;
+  EXPECT_EQ(PlannerNodeTestPeer::repositioningTarget(*node), frontier);
+  EXPECT_TRUE(PlannerNodeTestPeer::isGlobalFrontier(*node, frontier));
+
+  PlannerNodeTestPeer::addGlobalEdgeOnly(*node, frontier, peer);
+  EXPECT_FALSE(PlannerNodeTestPeer::runGlobalPlanner(*node, reason));
+  EXPECT_FALSE(PlannerNodeTestPeer::isGlobalFrontier(*node, frontier));
+  EXPECT_TRUE(PlannerNodeTestPeer::completionWithheld(*node).empty())
+      << PlannerNodeTestPeer::completionWithheld(*node);
 }
 
 TEST_F(PlannerNodeTest, APlannerWithoutAPositiveSpeedDoesNotStart) {

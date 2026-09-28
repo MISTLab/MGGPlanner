@@ -830,8 +830,9 @@ void PlannerNode::demoteFleetCoveredFrontiers() {
   if (demoted > 0) {
     RCLCPP_INFO(get_logger(),
                 "%d frontier(s) covered by the fleet: a peer's visited vertex "
-                "lies within %.1f m",
-                demoted, fleet_coverage_radius_m_);
+                "lies within %.1f m, joined by a roadmap walk of %.1f m",
+                demoted, fleet_coverage_radius_m_,
+                mgg::kFleetCoveragePathFactor * fleet_coverage_radius_m_);
   }
 }
 

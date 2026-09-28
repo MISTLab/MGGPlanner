@@ -7,6 +7,7 @@
 #include <limits>
 #include <queue>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 
 #include "mgg_core/departure.h"
@@ -1010,6 +1011,45 @@ FrontierAdditionReport addFrontiers(GraphManager& global_graph,
   return report;
 }
 
+namespace {
+
+/// Whether a walk over in-service roadmap edges (own, peer and merge edges,
+/// each checked when it was added) of at most `max_length_m` joins
+/// `source_id` to any of `targets`: Dijkstra, cut off at that length.
+bool joinedWithin(GraphManager& graph, int source_id,
+                  const std::unordered_set<int>& targets,
+                  double max_length_m) {
+  using Entry = std::pair<double, int>;
+  std::priority_queue<Entry, std::vector<Entry>, std::greater<Entry>> open;
+  std::unordered_map<int, double> best{{source_id, 0.0}};
+  open.push({0.0, source_id});
+  while (!open.empty()) {
+    const auto [length, at] = open.top();
+    open.pop();
+    if (length > best[at]) continue;
+    if (targets.count(at) > 0) return true;
+    const auto edges = graph.edge_map_.find(at);
+    if (edges == graph.edge_map_.end()) continue;
+    for (const auto& [next, weight] : edges->second) {
+      const double next_length = length + weight;
+      if (next_length > max_length_m) continue;
+      const auto vertex = graph.vertices_map_.find(next);
+      if (vertex == graph.vertices_map_.end() || vertex->second == nullptr ||
+          !graph.inService(*vertex->second) ||
+          !graph.graph_->edgeExists(at, next)) {
+        continue;
+      }
+      const auto known = best.find(next);
+      if (known != best.end() && known->second <= next_length) continue;
+      best[next] = next_length;
+      open.push({next_length, next});
+    }
+  }
+  return false;
+}
+
+}  // namespace
+
 int demoteFleetCoveredFrontiers(GraphManager& graph, int robot_id,
                                 double radius_m, double max_dz_m) {
   if (!(radius_m > 0.0)) return 0;
@@ -1025,15 +1065,24 @@ int demoteFleetCoveredFrontiers(GraphManager& graph, int robot_id,
       }
       std::vector<Vertex*> nearby;
       if (!graph.getNearestVertices(&vertex->state, reach, &nearby)) continue;
-      const bool covered = std::any_of(
-          nearby.begin(), nearby.end(), [&](const Vertex* peer) {
-            return peer != nullptr && peer->robot_id != robot_id &&
-                   peer->owner_visited && graph.inService(*peer) &&
-                   (peer->state.head<2>() - vertex->state.head<2>()).norm() <=
-                       radius_m &&
-                   std::abs(peer->state.z() - vertex->state.z()) <= max_dz_m;
-          });
-      if (!covered) continue;
+      std::unordered_set<int> covering;
+      for (const Vertex* peer : nearby) {
+        if (peer != nullptr && peer->robot_id != robot_id &&
+            peer->owner_visited && graph.inService(*peer) &&
+            (peer->state.head<2>() - vertex->state.head<2>()).norm() <=
+                radius_m &&
+            std::abs(peer->state.z() - vertex->state.z()) <= max_dz_m) {
+          covering.insert(peer->id);
+        }
+      }
+      // Near is not seen: a peer vertex across a wall is as near (review
+      // r0, I-1). Only one the roadmap joins to the frontier by a short
+      // walk covers it.
+      if (covering.empty() ||
+          !joinedWithin(graph, vertex->id, covering,
+                        kFleetCoveragePathFactor * radius_m)) {
+        continue;
+      }
       vertex->fleet_covered = true;
     }
     if (vertex->type == VertexType::kFrontier) {

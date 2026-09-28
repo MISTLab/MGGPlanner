@@ -851,7 +851,8 @@ class PlannerNode : public rclcpp::Node {
   bool have_coordination_exclusions_ = false;
   double reservation_exclusion_radius_m_ = 4.0;
   /// An own frontier within this of a peer's visited vertex, horizontally,
-  /// is covered by the fleet (demoteFleetCoveredFrontiers); zero disables.
+  /// and a roadmap walk of 1.5 times this from it, is covered by the fleet
+  /// (demoteFleetCoveredFrontiers); zero disables.
   double fleet_coverage_radius_m_ = 3.0;
   double reservation_exclusion_ttl_s_ = 3.0;
   double peer_body_radius_m_ = 0.6;

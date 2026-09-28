@@ -400,6 +400,9 @@ inline constexpr double kGlobalTargetPenalty = 0.05;
 /// this robot's frontier a peer's visited vertex may be and still cover
 /// it, metres. An aerial peer flying over a floor is not on it.
 inline constexpr double kFleetCoverageMaxDzM = 1.0;
+/// Fleet coverage: how long the roadmap walk from this robot's frontier to
+/// the covering peer vertex may be, times the coverage radius.
+inline constexpr double kFleetCoveragePathFactor = 1.5;
 
 /// MGG shared its global graph so the fleet explored as one (event E1,
 /// rrg.cpp:5270, marks the roadmap round where a robot drove visited). Each
@@ -407,8 +410,11 @@ inline constexpr double kFleetCoverageMaxDzM = 1.0;
 /// robot's (`robot_id`) where peers have driven never demotes on it. Here
 /// every in-service kFrontier vertex of this robot within `radius_m`
 /// horizontally and `max_dz_m` vertically of an in-service peer vertex its
-/// owner marked visited (Vertex::owner_visited) is covered by the fleet:
-/// fleet_covered, kUnvisited, not a frontier, no gain. One-way: a covered
+/// owner marked visited (Vertex::owner_visited), and joined to it by in-service
+/// roadmap edges within kFleetCoveragePathFactor * `radius_m`, is covered by
+/// the fleet: fleet_covered, kUnvisited, not a frontier, no gain. Without
+/// that short walk (a wall between them, review r0 I-1) the frontier stays
+/// for the greedy search and completion to see. One-way: a covered
 /// vertex re-typed a frontier since (a lattice path passing it) is demoted
 /// again. A radius of zero or less covers nothing. Returns how many
 /// frontiers it demoted.
