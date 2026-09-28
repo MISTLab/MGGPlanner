@@ -196,6 +196,9 @@ struct PlanningParams {
   /// lane sweep); telling them apart needs a finer ground model, such as the
   /// 0.05 m metric map.
   double max_footprint_cell_rise = 0.0;
+  /// Soft extra clearance beyond the planning body, including tracking error.
+  /// Zero disables the preference; never used as an admissibility limit.
+  double path_clearance_margin = 0.0;
   double max_step_height = 0.0;
   /// How far above a goal's requested height its ground may lie, metres.
   /// A 2-D goal is seeded at the robot's altitude, which on another level

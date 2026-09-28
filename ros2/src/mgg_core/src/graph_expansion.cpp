@@ -257,7 +257,9 @@ void expandGraph(GraphManager& graph, Vertex& new_vertex,
   graph.addVertex(added);
   ++rep.num_vertices_added;
   rep.vertex_added = added;
-  graph.addEdge(added, nearest_vertex, direction_norm);
+  graph.addEdge(added, nearest_vertex,
+                ctx.edge_cost ? ctx.edge_cost(origin, new_state.head<3>())
+                              : direction_norm);
   ++rep.num_edges_added;
   if (ctx.inclinations != nullptr && !projected_edge.empty()) {
     ctx.inclinations->set(added->id, nearest_vertex->id,
@@ -308,7 +310,10 @@ void expandGraph(GraphManager& graph, Vertex& new_vertex,
     if (ctx.robot->type == RobotType::kGroundRobot) {
       recordProjectedEdge(ctx.projected_graph, neighbour_edge, ctx.robot_id);
     }
-    graph.addEdge(added, neighbour, d_norm);
+    const double cost = ctx.edge_cost
+                            ? ctx.edge_cost(new_origin, neighbour->state.head<3>())
+                            : d_norm;
+    graph.addEdge(added, neighbour, cost);
     ++rep.num_edges_added;
     if (ctx.inclinations != nullptr && !neighbour_edge.empty()) {
       ctx.inclinations->set(added->id, neighbour->id,

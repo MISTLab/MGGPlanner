@@ -188,9 +188,14 @@ PathType shortcutPath(const PathType& path, const SegmentFreeFn& segment_free) {
 }
 
 PathType shortcutPath(const PathType& path, const SegmentFreeFn& segment_free,
-                      const PathOkFn& path_ok) {
-  if (path.size() < 3 || !segment_free || !path_ok || !path_ok(path)) {
-    return shortcutPath(path, segment_free);
+                      const PathOkFn& path_ok, const SegmentCostFn& cost) {
+  if (path.size() < 3 || !segment_free) return path;
+  const bool check_path = path_ok && path_ok(path);
+  std::vector<double> original_cost(path.size(), 0.0);
+  if (cost) {
+    for (size_t i = 1; i < path.size(); ++i) {
+      original_cost[i] = original_cost[i - 1] + cost(path[i - 1], path[i]);
+    }
   }
   PathType out;
   out.push_back(path.front());
@@ -200,9 +205,13 @@ PathType shortcutPath(const PathType& path, const SegmentFreeFn& segment_free,
     size_t next = at + 1;
     for (size_t candidate = path.size() - 1; candidate > at + 1; --candidate) {
       if (!segment_free(path[at], path[candidate])) continue;
+      if (cost && cost(path[at], path[candidate]) >
+                      original_cost[candidate] - original_cost[at] + 1e-9) {
+        continue;
+      }
       trial = out;
       trial.insert(trial.end(), path.begin() + candidate, path.end());
-      if (path_ok(trial)) {
+      if (!check_path || path_ok(trial)) {
         next = candidate;
         break;
       }

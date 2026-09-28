@@ -660,6 +660,88 @@ bool GroundProjection::freeInColumn(const Eigen::Vector2d& cell, double top,
   return std::any_of(column.free_z.begin(), column.free_z.end(), between);
 }
 
+bool GroundProjection::clearanceHazard(const Eigen::Vector3d& cell,
+                                       const Eigen::Vector3d& box_size) const {
+  const ClearanceKey key{micro(cell.x()), micro(cell.y()), micro(cell.z()),
+                     micro(box_size.z()), micro(params_.max_footprint_cell_rise),
+                     micro(params_.max_ground_height)};
+  if (cache_footprint_ground_) {
+    const auto found = clearance_hazards_.find(key);
+    if (found != clearance_hazards_.end()) return found->second;
+  }
+  const double resolution = map_.getResolution();
+  bool hazard = map_.getBoxStatus(
+      cell, {resolution, resolution, box_size.z()}, false) ==
+      VoxelStatus::kOccupied;
+  Eigen::Vector3d ground;
+  if (!hazard && params_.max_footprint_cell_rise > 0.0 &&
+      footprintGroundBelow(cell, ground)) {
+    // Only the raised cell is a hazard, not its lower, drivable neighbour.
+    // Compare actual support heights, not height above the robot: smooth
+    // ramps keep their clearance and floors on another level do not alias.
+    for (const Eigen::Vector2d& offset :
+         {Eigen::Vector2d(resolution, 0), Eigen::Vector2d(-resolution, 0),
+          Eigen::Vector2d(0, resolution), Eigen::Vector2d(0, -resolution)}) {
+      Eigen::Vector3d neighbour;
+      if (footprintGroundBelow(cell + Eigen::Vector3d(offset.x(), offset.y(), 0),
+                               neighbour) &&
+          ground.z() - neighbour.z() > params_.max_footprint_cell_rise) {
+        hazard = true;
+        break;
+      }
+    }
+  }
+  if (cache_footprint_ground_) clearance_hazards_.emplace(key, hazard);
+  return hazard;
+}
+
+double GroundProjection::clearancePenalty(
+    const Eigen::Vector3d& point, const Eigen::Vector3d& box_size) const {
+  // A cap bounds compute work even for a malformed deployment setting.
+  const double margin = std::min(params_.path_clearance_margin, 1.0);
+  if (!(margin > 0.0)) return 0.0;
+  const double body_radius = 0.5 * box_size.head<2>().norm();
+  const double cell_radius = map_.getResolution() / std::sqrt(2.0);
+  std::vector<XYCellCenter> cells;
+  if (!map_.getCircleIntersectingXYCellCenters(
+          point.head<2>(), body_radius + margin + cell_radius, 1024, cells)) {
+    // Unmeasurable clearance is the largest finite preference cost, not a
+    // new collision rule. Even a very fine map can still use the passage.
+    return 1.0;
+  }
+  double clearance = margin;
+  for (const auto& cell : cells) {
+    const double distance = std::max(
+        0.0, (cell.center - point.head<2>()).norm() - body_radius - cell_radius);
+    if (distance >= clearance) continue;
+    if (clearanceHazard({cell.center.x(), cell.center.y(), point.z()}, box_size)) {
+      clearance = distance;
+      if (clearance == 0.0) break;
+    }
+  }
+  return 1.0 - clearance / margin;
+}
+
+double GroundProjection::clearanceCost(
+    const Eigen::Vector3d& start, const Eigen::Vector3d& end,
+    const Eigen::Vector3d& box_size) const {
+  const double length = (end - start).norm();
+  if (!(params_.path_clearance_margin > 0.0) || !(length > 0.0)) return length;
+  const int samples = std::max(1, std::min(32,
+      static_cast<int>(std::ceil(std::min(length, 6.4) / 0.2))));
+  double penalty = 0.0;
+  for (int i = 0; i < samples; ++i) {
+    Eigen::Vector3d point = start + ((i + 0.5) / samples) * (end - start);
+    // Follow the support surface even on a shortcut spanning a ramp crest.
+    Eigen::Vector3d ground;
+    if (footprintGroundBelow(point, ground)) {
+      point.z() = ground.z() + params_.max_ground_height;
+    }
+    penalty += clearancePenalty(point, box_size);
+  }
+  return length * (1.0 + 4.0 * penalty / samples);
+}
+
 FootprintPlane GroundProjection::footprintPlane(
     const Eigen::Vector3d& point, const Eigen::Vector2d& heading,
     const Eigen::Vector3d& box_size) const {

@@ -53,16 +53,19 @@ PathType shortcutPath(const PathType& path, const SegmentFreeFn& segment_free);
 /// Is a whole path acceptable, e.g. PathTurnCheck::admissible? Supplied by
 /// the caller.
 using PathOkFn = std::function<bool(const PathType& path)>;
+using SegmentCostFn = std::function<double(const VectorType&, const VectorType&)>;
 
 /// shortcutPath that takes a leap only when the path it makes, the points
 /// kept so far, the leap and the rest of `path` as it is, passes `path_ok`.
 /// Joining two segments can make a turn neither had: segment headings of 0,
 /// 30, 60 and 90 degrees become 15 and 75, a 60 degree turn. Leaping one
 /// point ahead keeps the path as it is, so a `path` that passes `path_ok`
-/// gives a shortcut that passes too. A `path` that fails it, or no
+/// gives a shortcut that passes too. With `cost`, a leap must also cost no
+/// more than the original subpath; adjacent edges always remain available.
+/// Costs never override segment or turn checks. A `path` that fails it, or no
 /// `path_ok`, is shortcut as by shortcutPath.
 PathType shortcutPath(const PathType& path, const SegmentFreeFn& segment_free,
-                      const PathOkFn& path_ok);
+                      const PathOkFn& path_ok, const SegmentCostFn& cost = {});
 
 /// Dynamic time warping distance between two paths.
 double computeDTWDistance(const PathType& a, const PathType& b);

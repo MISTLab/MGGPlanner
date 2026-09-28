@@ -235,6 +235,10 @@
       # The largest height difference between neighbouring ground cells
       # under the footprint (metres), a rock's edge; zero disables it.
       max_footprint_cell_rise: 0.0
+      # Soft distance preference beyond the planning body: includes 0.3 m
+      # controller tracking allowance and 0.3 m desired stand-off. Never
+      # closes a narrow route; cost is bounded to five times path length.
+      path_clearance_margin: 0.6
       yaw_tangent_correction: true
       traverse_length_max: 10.0
       traverse_time_max: 40.0

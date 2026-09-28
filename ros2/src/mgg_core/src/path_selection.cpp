@@ -157,7 +157,6 @@ PathSelectionResult selectBestPath(GraphManager& graph,
   // needs room to turn within kDepartureMaxM back along it. A refusal
   // counts in `refused`, when given.
   const auto way_back = [&](const std::vector<Vertex*>& path,
-                            const std::vector<double>& along,
                             std::size_t end, int* refused) {
     if (!retreat_checked) return true;
     const bool needs_retreat =
@@ -165,8 +164,12 @@ PathSelectionResult selectBestPath(GraphManager& graph,
         cached(on_slope_by_id, path[end], slope_end_retreat.admitted_on_slope);
     if (!needs_retreat) return true;
     if (!planning.departure_reverse_allowed) return false;
+    double retreat_distance = 0.0;
     for (std::size_t i = end; i-- > 0;) {
-      if (along[end] - along[i] > kDepartureMaxM + 1e-9) break;
+      // Routing weights include soft clearance; retreat reach is metres.
+      retreat_distance += (path[i + 1]->state.head<3>() -
+                           path[i]->state.head<3>()).norm();
+      if (retreat_distance > kDepartureMaxM + 1e-9) break;
       if (cached(room_by_id, path[i], slope_end_retreat.room_to_turn)) {
         return true;
       }
@@ -299,7 +302,7 @@ PathSelectionResult selectBestPath(GraphManager& graph,
         return Ending::kInadmissible;
       }
       if (end == 0 || excluded(path.back()) ||
-          !way_back(candidate.path, candidate.along, end, nullptr)) {
+          !way_back(candidate.path, end, nullptr)) {
         return Ending::kInadmissible;
       }
       if (end + 1 == candidate.path.size()) {
@@ -359,7 +362,7 @@ PathSelectionResult selectBestPath(GraphManager& graph,
       if (leaf.admissible) {
         std::size_t end = candidate.path.size() - 1;
         while (end > 0 &&
-               !way_back(candidate.path, candidate.along, end, nullptr)) {
+               !way_back(candidate.path, end, nullptr)) {
           --end;
         }
         std::vector<Vertex*> path;
@@ -380,7 +383,7 @@ PathSelectionResult selectBestPath(GraphManager& graph,
       std::size_t end = candidate.path.size() - 1;
       while (end > 0 &&
              !((clear(candidate.path[end]) || retreat_checked) &&
-               way_back(candidate.path, candidate.along, end,
+               way_back(candidate.path, end,
                         &result.slope_ends_without_way_back))) {
         --end;
       }

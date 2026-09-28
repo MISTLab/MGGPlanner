@@ -103,6 +103,16 @@ GridGraphResult buildGridGraph(GraphManager& graph, const StateVec& state,
     return true;
   };
 
+  // Only lattice routing weights carry clearance; roadmap geometry and the
+  // physical tree distance retain metres. GroundProjection is plan-scoped.
+  ExpandContext weighted_ctx = ctx;
+  if (ground_robot && ctx.planning->path_clearance_margin > 0.0) {
+    weighted_ctx.edge_cost =
+        [&](const Eigen::Vector3d& a, const Eigen::Vector3d& b) {
+          return ctx.ground->clearanceCost(a, b, ctx.robot_box_size);
+        };
+  }
+
   // Offers one cell, already charged, to expandGraph.
   const auto offer = [&](const Eigen::Vector3d& cell, int i, int j,
                          bool first_pass, bool& added) {
@@ -131,7 +141,7 @@ GridGraphResult buildGridGraph(GraphManager& graph, const StateVec& state,
     Vertex candidate(vertex_id++, StateVec(cell.x(), cell.y(), cell.z(), heading));
     candidate.robot_id = ctx.robot_id;
     ExpandGraphReport rep;
-    expandGraph(graph, candidate, rep, ctx);
+    expandGraph(graph, candidate, rep, weighted_ctx);
     if (first_pass) {
       ++result.rejected[static_cast<int>(rep.status)];
       if (rep.no_ground) ++result.no_ground;

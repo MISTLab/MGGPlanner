@@ -2347,7 +2347,17 @@ void PlannerNode::shortcutAndResample(std::vector<mgg::StateVec>& path,
   for (const mgg::StateVec& s : path) points.push_back(s.head(3));
   const mgg::PathType unshortcut = points;
   const bool unshortcut_ok = turns_ok && turns_ok(unshortcut);
-  points = mgg::shortcutPath(points, segment_free, turns_ok);
+  // The same bounded geometry cost as lattice selection; per-call caching
+  // cannot outlive the map's read lease or retain transient obstacles.
+  mgg::GroundProjection clearance_ground(*map_, planning_params_, true);
+  mgg::SegmentCostFn clearance_cost;
+  if (robot_params_.type == mgg::RobotType::kGroundRobot &&
+      planning_params_.path_clearance_margin > 0.0) {
+    clearance_cost = [&](const Eigen::Vector3d& a, const Eigen::Vector3d& b) {
+      return clearance_ground.clearanceCost(a, b, ctx.robot_box_size);
+    };
+  }
+  points = mgg::shortcutPath(points, segment_free, turns_ok, clearance_cost);
   path_shortcut_corners_ = static_cast<int>(points.size());
   mgg::PathType resampled;
   if (planning_params_.path_interpolation_distance > 0.0 &&

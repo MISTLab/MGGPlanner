@@ -272,6 +272,14 @@ class GroundProjection {
                            const Eigen::Vector2d& heading,
                            const Eigen::Vector3d& box_size) const;
 
+  /// Length-weighted soft clearance cost (between length and 5*length).
+  /// Samples at most 32 points and 1024 nearby cells per point. Obstacles
+  /// at body height and support cells rising past the enabled cell-rise
+  /// limit are hazards. Their distance beyond the body's circumscribed
+  /// radius is preferred, never required; unknown evidence adds no hazard.
+  double clearanceCost(const Eigen::Vector3d& start, const Eigen::Vector3d& end,
+                       const Eigen::Vector3d& box_size) const;
+
   /// The ground straight below `point`, false when none is mapped within
   /// max_projection_length.
   bool groundBelow(const Eigen::Vector3d& point, Eigen::Vector3d& ground) const;
@@ -339,6 +347,12 @@ class GroundProjection {
                                        const Eigen::Vector2d& heading,
                                        const Eigen::Vector3d& box_size) const;
 
+  double clearancePenalty(const Eigen::Vector3d& point,
+                          const Eigen::Vector3d& box_size) const;
+  bool clearanceHazard(const Eigen::Vector3d& cell,
+                       const Eigen::Vector3d& box_size) const;
+  using ClearanceKey = std::array<std::int64_t, 6>;
+  mutable std::unordered_map<ClearanceKey, bool, CacheKeyHash> clearance_hazards_;
   const MapInterface& map_;
   const PlanningParams& params_;
   const bool cache_footprint_ground_ = false;

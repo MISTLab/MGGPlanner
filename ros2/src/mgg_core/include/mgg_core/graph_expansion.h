@@ -47,6 +47,8 @@ struct ExpandContext {
   /// between the endpoints.
   EdgeInclinations* inclinations = nullptr;
 
+  /// Optional soft routing cost; never used for physical reach or admission.
+  std::function<double(const Eigen::Vector3d&, const Eigen::Vector3d&)> edge_cost;
   int robot_id = 0;
   /// Planning footprint, i.e. robot->getPlanningSize().
   Eigen::Vector3d robot_box_size = Eigen::Vector3d::Zero();

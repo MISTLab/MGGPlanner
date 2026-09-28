@@ -126,3 +126,16 @@ TEST(Trajectory, ShortcutWithoutAPredicateIsIdentity) {
   const mgg::PathType path = {{0.0, 0.0, 0.0}, {1.0, 1.0, 0.0}, {2.0, 0.0, 0.0}};
   EXPECT_EQ(mgg::shortcutPath(path, nullptr).size(), path.size());
 }
+
+TEST(Trajectory, ClearanceCostNeverOverridesCollisionOrTurnChecks) {
+  const mgg::PathType path{{0, 0, 0}, {1, 0, 0}, {1, 1, 0}, {2, 1, 0}};
+  const mgg::SegmentCostFn cost = [](const auto& a, const auto& b) {
+    return (b - a).norm();
+  };
+  const auto keep_turn = [](const mgg::PathType& trial) {
+    return trial.size() >= 3;
+  };
+  const auto blocked = [](const auto&, const auto&) { return false; };
+  EXPECT_EQ(mgg::shortcutPath(path, blocked, keep_turn, cost), path);
+  EXPECT_GE(mgg::shortcutPath(path, alwaysFree, keep_turn, cost).size(), 3u);
+}

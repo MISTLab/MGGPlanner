@@ -95,6 +95,8 @@ if(BUILD_TESTING)
   target_link_libraries(test_footprint_plane ${PROJECT_NAME})
   target_compile_definitions(test_footprint_plane PRIVATE
     MGG_TEST_DATA_DIR="${CMAKE_CURRENT_SOURCE_DIR}/test/data")
+  ament_add_gtest(test_clearance test/test_clearance.cpp)
+  target_link_libraries(test_clearance ${PROJECT_NAME})
   ament_add_gtest(test_grid_graph test/test_grid_graph.cpp)
   target_link_libraries(test_grid_graph ${PROJECT_NAME})
   ament_add_gtest(test_gain test/test_gain.cpp)

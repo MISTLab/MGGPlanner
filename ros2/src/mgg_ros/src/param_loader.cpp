@@ -261,6 +261,7 @@ bool loadPlanningParams(const ParamLoader& p, const std::string& ns,
   p.get(ns + "/max_footprint_tilt", out.max_footprint_tilt);
   p.get(ns + "/max_footprint_step", out.max_footprint_step);
   p.get(ns + "/max_footprint_cell_rise", out.max_footprint_cell_rise);
+  p.get(ns + "/path_clearance_margin", out.path_clearance_margin);
   p.get(ns + "/max_goal_ground_rise", out.max_goal_ground_rise);
   p.get(ns + "/exp_sensor_list", out.exp_sensor_list);
   p.get(ns + "/no_gain_zones_list", out.no_gain_zones_list);

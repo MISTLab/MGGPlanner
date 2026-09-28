@@ -781,3 +781,23 @@ TEST(PathSelection, EmptyGraphIsHandled) {
 }
 
 }  // namespace
+
+TEST(PathSelection, ClearanceRoutingCostDoesNotConsumePhysicalRetreatReach) {
+  GraphManager graph;
+  for (int i = 0; i < 4; ++i) {
+    auto* v = new Vertex(i, StateVec(i * 0.5, 0, 0, 0));
+    v->vol_gain.gain = i == 3 ? 100 : 0;
+    graph.addVertex(v);
+    // 0.5 m, with maximal soft cost: still only 1.5 m back to turning room.
+    if (i) graph.addEdge(v, graph.getVertex(i - 1), 2.5);
+  }
+  mgg::SlopeEndRetreat retreat;
+  retreat.admitted_on_slope = [](const Vertex&) { return false; };
+  retreat.room_to_turn = [](const Vertex& v) { return v.id == 0; };
+  auto planning = makePlanning();
+  planning.departure_reverse_allowed = true;
+  const auto selected = mgg::selectBestPath(
+      graph, planning, RobotParams(), EdgeInclinations(), 0.2, 0, {}, 0,
+      [](const Vertex& v) { return v.id == 0; }, {}, {}, 0, retreat);
+  EXPECT_EQ(selected.best_path_id, 3);
+}
