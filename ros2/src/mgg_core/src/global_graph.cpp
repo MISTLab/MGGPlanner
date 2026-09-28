@@ -740,6 +740,15 @@ Vertex* connectGoalThroughLattice(GraphManager& graph, const StateVec& goal,
   GoalLatticeReport& out = report != nullptr ? *report : scratch_report;
   out = GoalLatticeReport{};
 
+  // This scratch lattice only establishes reachability. It may use the
+  // node's uncached ground projection, so do not pay for soft local-routing
+  // preferences on every sweep. Hard checks and caller settings stay intact.
+  PlanningParams metric_planning = *ctx.planning;
+  metric_planning.path_clearance_margin = 0.0;
+  ExpandContext metric_ctx = ctx;
+  metric_ctx.planning = &metric_planning;
+  metric_ctx.edge_cost = {};
+
   // The lattice itself is scratch; only the path through it that reaches the
   // roadmap is kept. Rooted at the goal, so every lattice vertex it reaches
   // has a verified way back to the goal.
@@ -755,7 +764,7 @@ Vertex* connectGoalThroughLattice(GraphManager& graph, const StateVec& goal,
   // stays within one sweep's num_vertices_max.
   for (int pass = 0; pass < kMaxGoalLatticePasses; ++pass) {
     const GridGraphResult built =
-        buildGridGraph(lattice, goal, grid, ctx, heading);
+        buildGridGraph(lattice, goal, grid, metric_ctx, heading);
     if (built.status != GridGraphStatus::kOk) return nullptr;
     ++out.passes;
     if (built.vertices_added == 0 ||

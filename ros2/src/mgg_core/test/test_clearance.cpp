@@ -6,6 +6,7 @@
 #include <gtest/gtest.h>
 
 #include "mgg_core/grid_graph.h"
+#include "mgg_core/global_graph.h"
 #include "mgg_core/trajectory.h"
 #include "terrain_fixture.h"
 
@@ -213,6 +214,52 @@ TEST(Clearance, WorkAndCostStayBoundedWhenMapCannotEnumerate) {
   p.path_clearance_margin = 0.0;
   EXPECT_DOUBLE_EQ(ground.clearanceCost(a, b, {0.662, 0.630, 0.295}), 100);
   EXPECT_EQ(map.calls, 32);
+}
+
+class GoalClearanceMap : public mgg_test::TerrainFixture {
+ public:
+  GoalClearanceMap() : TerrainFixture(doorway(2.5)) {}
+  bool getCircleIntersectingXYCellCenters(
+      const Eigen::Vector2d& center, double radius, std::size_t limit,
+      std::vector<mgg::XYCellCenter>& cells) const override {
+    if (radius > 0.7) ++clearance_queries;
+    return TerrainFixture::getCircleIntersectingXYCellCenters(
+        center, radius, limit, cells);
+  }
+  mutable int clearance_queries = 0;
+};
+
+TEST(Clearance, GoalLatticeSkipsCostAndKeepsMetricEdges) {
+  GoalClearanceMap map;
+  auto p = planning(0.6);
+  mgg::GroundProjection ground(map, p);  // same uncached context as the node
+  mgg::RobotParams robot;
+  robot.type = mgg::RobotType::kGroundRobot;
+  robot.size = {0.612, 0.580, 0.245};
+  robot.size_extension = {0.05, 0.05, 0.05};
+  mgg::ExpandContext ctx;
+  ctx.map = &map;
+  ctx.planning = &p;
+  ctx.robot = &robot;
+  ctx.ground = &ground;
+  ctx.robot_box_size = {0.662, 0.630, 0.295};
+  mgg::GraphManager graph;
+  graph.addVertex(new mgg::Vertex(0, mgg::StateVec(-2, 0, 0.4475, 0)));
+  mgg::GridGraphParams grid;
+  grid.min_val = {-4.2, -1.0, 0};
+  grid.max_val = {0.2, 1.0, 0};
+  grid.resolution = {0.2, 0.2, 0.1};
+  auto* goal = mgg::connectGoalThroughLattice(
+      graph, {2, 0, 0.4475, 0}, grid, ctx, 0, {});
+  ASSERT_NE(goal, nullptr);
+  EXPECT_EQ(map.clearance_queries, 0);
+  for (const auto& [from, edges] : graph.edge_map_) {
+    for (const auto& [to, weight] : edges) {
+      EXPECT_NEAR(weight, (graph.getVertex(from)->state.head<3>() -
+                          graph.getVertex(to)->state.head<3>()).norm(), 1e-9);
+    }
+  }
+  EXPECT_DOUBLE_EQ(p.path_clearance_margin, 0.6);
 }
 
 }  // namespace
