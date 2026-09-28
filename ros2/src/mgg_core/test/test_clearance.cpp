@@ -262,4 +262,38 @@ TEST(Clearance, GoalLatticeSkipsCostAndKeepsMetricEdges) {
   EXPECT_DOUBLE_EQ(p.path_clearance_margin, 0.6);
 }
 
+class NoisyClearanceFloor : public mgg_test::TerrainFixture {
+ public:
+  NoisyClearanceFloor() : TerrainFixture(0.2, heights()) {}
+  static std::map<std::pair<std::int64_t, std::int64_t>, double> heights() {
+    std::map<std::pair<std::int64_t, std::int64_t>, double> out;
+    for (int x = -20; x <= 20; ++x)
+      for (int y = -20; y <= 20; ++y) out[{x, y}] = x % 2 ? 0.02 : 0;
+    return out;
+  }
+  mgg::VoxelStatus getBoxStatus(const Eigen::Vector3d& point,
+                                const Eigen::Vector3d& size,
+                                bool unknown) const override {
+    ++box_calls;
+    return TerrainFixture::getBoxStatus(point, size, unknown);
+  }
+  mutable int box_calls = 0;
+};
+
+TEST(Clearance, HazardCacheSharesNoisySupportHeightsWithinOneVoxel) {
+  NoisyClearanceFloor map;
+  auto p = planning(0.6);
+  p.max_footprint_cell_rise = 0;
+  mgg::GroundProjection cached(map, p, true), plain(map, p);
+  const Eigen::Vector3d box(0.662, 0.630, 0.295);
+  cached.clearanceCost({0.1, 0.1, 0.5}, {0.11, 0.1, 0.5}, box);
+  const int first = map.box_calls;
+  ASSERT_GT(first, 10);
+  const double cost = cached.clearanceCost(
+      {0.3, 0.1, 0.5}, {0.31, 0.1, 0.5}, box);
+  EXPECT_LT(map.box_calls - first, first / 2);
+  EXPECT_DOUBLE_EQ(cost, plain.clearanceCost(
+      {0.3, 0.1, 0.5}, {0.31, 0.1, 0.5}, box));
+}
+
 }  // namespace

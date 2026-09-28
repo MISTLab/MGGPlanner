@@ -662,20 +662,25 @@ bool GroundProjection::freeInColumn(const Eigen::Vector2d& cell, double top,
 
 bool GroundProjection::clearanceHazard(const Eigen::Vector3d& cell,
                                        const Eigen::Vector3d& box_size) const {
-  const ClearanceKey key{micro(cell.x()), micro(cell.y()), micro(cell.z()),
+  const double resolution = map_.getResolution();
+  const auto height_bin = static_cast<std::int64_t>(std::floor(cell.z() / resolution));
+  // Canonical voxel-centre height makes reuse independent of query order.
+  // Quantisation is only for the soft cost; hard body/terrain checks are exact.
+  Eigen::Vector3d sample = cell;
+  sample.z() = (static_cast<double>(height_bin) + 0.5) * resolution;
+  const ClearanceKey key{micro(cell.x()), micro(cell.y()), height_bin,
                      micro(box_size.z()), micro(params_.max_footprint_cell_rise),
                      micro(params_.max_ground_height)};
   if (cache_footprint_ground_) {
     const auto found = clearance_hazards_.find(key);
     if (found != clearance_hazards_.end()) return found->second;
   }
-  const double resolution = map_.getResolution();
   bool hazard = map_.getBoxStatus(
-      cell, {resolution, resolution, box_size.z()}, false) ==
+      sample, {resolution, resolution, box_size.z()}, false) ==
       VoxelStatus::kOccupied;
   Eigen::Vector3d ground;
   if (!hazard && params_.max_footprint_cell_rise > 0.0 &&
-      footprintGroundBelow(cell, ground)) {
+      footprintGroundBelow(sample, ground)) {
     // Only the raised cell is a hazard, not its lower, drivable neighbour.
     // Compare actual support heights, not height above the robot: smooth
     // ramps keep their clearance and floors on another level do not alias.
@@ -683,7 +688,7 @@ bool GroundProjection::clearanceHazard(const Eigen::Vector3d& cell,
          {Eigen::Vector2d(resolution, 0), Eigen::Vector2d(-resolution, 0),
           Eigen::Vector2d(0, resolution), Eigen::Vector2d(0, -resolution)}) {
       Eigen::Vector3d neighbour;
-      if (footprintGroundBelow(cell + Eigen::Vector3d(offset.x(), offset.y(), 0),
+      if (footprintGroundBelow(sample + Eigen::Vector3d(offset.x(), offset.y(), 0),
                                neighbour) &&
           ground.z() - neighbour.z() > params_.max_footprint_cell_rise) {
         hazard = true;
