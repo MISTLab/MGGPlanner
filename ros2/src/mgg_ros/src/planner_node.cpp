@@ -991,14 +991,20 @@ std::optional<mgg::FrontierCluster> PlannerNode::refreshTour(
         current_state_[3], clusters, tour_params_.heading_weight,
         peer_generation_);
     mgg::capTourCostsByReach(costs, homeDistances(clusters), flight_reach_m_);
-    // MGG weighed a global frontier's gain against its distance
-    // (rrg.cpp:5798); the tour takes only the clusters worth theirs. With
-    // fleet assignment the auction has costed distance already, and an
-    // award the tour refused would leave the robot idle, so only without.
+    // MGG weighed a global frontier's gain against its distance, and a
+    // peer's frontier at a thousandth (rrg.cpp:5798 to 5804); the tour
+    // takes only the clusters worth theirs. Run 12, robot_2: when its own
+    // last cluster dipped under the floor the tour fell back to 24 peer
+    // clusters and drove to one, then back when its own returned. With
+    // fleet assignment the auction has costed distance and ownership
+    // already, and an award the tour refused would leave the robot idle,
+    // so only without.
     tour_value_left_out_ =
         fleet_ ? 0
-               : mgg::capTourCostsByValue(costs, clusters,
-                                          tour_params_.min_cluster_gain);
+               : mgg::capTourCostsByValue(
+                     costs, clusters, tour_params_.min_cluster_gain,
+                     static_cast<int>(planning_params_.robot_id),
+                     mgg::kGlobalOtherRobotPenalty);
     tour_planner_->solve(clusters, costs, graph_revision_,
                          tour_assignment_version_, now_s, peer_generation_);
     tour_solve_ms_ = std::chrono::duration<double, std::milli>(

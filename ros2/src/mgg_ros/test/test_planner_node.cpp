@@ -7173,6 +7173,48 @@ TEST_F(PlannerNodeTest, WithFleetAssignmentTheTourTakesAFarSmallCluster) {
   EXPECT_EQ(PlannerNodeTestPeer::tourPlanPositions(*node).size(), 2u);
 }
 
+TEST_F(PlannerNodeTest, AnOwnClusterDippingUnderTheFloorDoesNotSendTheTourToAPeers) {
+  // Run 12, robot_2 from 186 s: plans alternated "tour: 1 of 1
+  // cluster(s)" (its own, at (-1.95, -5.77)) and "tour: 24 of 24" (all
+  // peers', target (-2.00, -0.80)), 5 m apart, and it drove back and
+  // forth. Without fleet assignment the tour takes its own clusters when
+  // it has any, else all; its own last cluster's gain hovered at the
+  // 9000 floor. MGG valued a peer's frontier at a thousandth (rrg.cpp:
+  // 5804): the peer's cluster, 20000 here, is not worth the tour, and
+  // when the own cluster dips under the floor the tour has no target.
+  // With fleet assignment the tour takes the peer's cluster as before.
+  for (const bool fleet : {false, true}) {
+    SCOPED_TRACE(fleet ? "fleet on" : "fleet off");
+    int own = -1;
+    int far = -1;
+    auto node = nearAndFarFrontiers(
+        fleet ? "tour_flip_flop_fleet" : "tour_flip_flop", fleet, own, far);
+    PlannerNodeTestPeer::setGlobalVertexType(*node, far,
+                                             mgg::VertexType::kUnvisited);
+    PlannerNodeTestPeer::gainFromUnknownVoxelsOnly(*node);
+    const int peer = PlannerNodeTestPeer::addGlobalChainToFrontier(
+        *node, {{0.0, 1.0}, {-1.0, 1.0}}, M_PI);
+    PlannerNodeTestPeer::setFrontierOwner(*node, peer, 2);
+    PlannerNodeTestPeer::setReportedUnknown(*node, peer, 100000);
+    for (const double own_gain : {15000.0, 8900.0, 15000.0, 8900.0}) {
+      SCOPED_TRACE(own_gain);
+      PlannerNodeTestPeer::setVertexGain(*node, own, own_gain);
+      const mgg::ClusterId target = PlannerNodeTestPeer::refreshTour(*node);
+      const Eigen::Vector3d at =
+          PlannerNodeTestPeer::tourTargetPosition(*node);
+      if (own_gain > 9000.0) {
+        ASSERT_NE(target, mgg::kNoCluster);
+        EXPECT_NEAR(at.x(), 3.5, 1e-6);
+      } else if (!fleet) {
+        EXPECT_EQ(target, mgg::kNoCluster);
+      } else {
+        ASSERT_NE(target, mgg::kNoCluster);
+        EXPECT_NEAR(at.x(), -1.0, 1e-6);
+      }
+    }
+  }
+}
+
 TEST_F(PlannerNodeTest, APlannerWithoutAPositiveSpeedDoesNotStart) {
   // Review r1, P1: every bid is costed at v_max. A node that started with
   // none would bid what its peers refuse, and the loader's early return

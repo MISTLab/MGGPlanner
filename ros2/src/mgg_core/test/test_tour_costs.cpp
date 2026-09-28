@@ -279,11 +279,31 @@ TEST(TourCosts, ValueLeavesOutClustersNotWorthTheirDistance) {
   EXPECT_NEAR(mgg::tourClusterValue(clusters[0], 2.0),
               10000.0 * std::exp(-0.1), 1e-6);
   EXPECT_EQ(mgg::tourClusterValue(clusters[3], mgg::kUnreachableCost), 0.0);
-  EXPECT_EQ(mgg::capTourCostsByValue(costs, clusters, 9000.0), 1);
+  EXPECT_EQ(mgg::capTourCostsByValue(costs, clusters, 9000.0, 0, 1.0), 1);
   EXPECT_DOUBLE_EQ(costs.from_robot[0], 2.0 + M_PI);
   EXPECT_EQ(costs.from_robot[1], mgg::kUnreachableCost);
   EXPECT_DOUBLE_EQ(costs.from_robot[2], 60.0);
   EXPECT_EQ(costs.from_robot[3], mgg::kUnreachableCost);
+}
+
+TEST(TourCosts, AnotherRobotsClusterIsWorthAThousandthOfItsValue) {
+  // rrg.cpp:5804 kGOtherRobotPenalty: a peer's cluster pays the factor on
+  // top of its distance; this robot's own does not.
+  std::vector<FrontierCluster> clusters(3);
+  clusters[0].owner_robot_id = 1;
+  clusters[0].gain = 20000.0;
+  clusters[1].owner_robot_id = 2;
+  clusters[1].gain = 1e6;  // 1000 at the robot
+  clusters[2].owner_robot_id = 2;
+  clusters[2].gain = 2e7;  // 20000 at the robot
+  TourCostMatrix costs;
+  costs.distance_from_robot = {0.0, 0.0, 0.0};
+  costs.from_robot = costs.distance_from_robot;
+  costs.between.assign(3, std::vector<double>(3, 1.0));
+  EXPECT_EQ(mgg::capTourCostsByValue(costs, clusters, 9000.0, 1, 0.001), 1);
+  EXPECT_EQ(costs.from_robot[0], 0.0);
+  EXPECT_EQ(costs.from_robot[1], mgg::kUnreachableCost);
+  EXPECT_EQ(costs.from_robot[2], 0.0);
 }
 
 }  // namespace

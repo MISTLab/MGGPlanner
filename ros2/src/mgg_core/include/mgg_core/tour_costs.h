@@ -101,13 +101,17 @@ double tourClusterValue(const FrontierCluster& cluster, double distance);
 /// Leaves out of the tour every cluster whose tourClusterValue, at its
 /// distance_from_robot, is below `min_value` (tour.min_cluster_gain): its
 /// from_robot becomes kUnreachableCost. At 0.05 per metre a cluster 60 m
-/// away needs about 20 times the gain of one at the robot. The tour orders
-/// the clusters left; the others are the greedy search's to weigh. Returns
-/// how many it left out. Run 12, robot_3: a tour of one small cluster
-/// 48 m back in the start hangar sent it back through the corridor.
+/// away needs about 20 times the gain of one at the robot. A cluster
+/// another robot than `robot_id` owns is worth `other_robot_factor` of
+/// that (kGlobalOtherRobotPenalty, rrg.cpp:5804: each robot prefers the
+/// frontiers it found). The tour orders the clusters left; the others are
+/// the greedy search's to weigh. Returns how many it left out. Run 12,
+/// robot_3: a tour of one small cluster 48 m back in the start hangar sent
+/// it back through the corridor.
 int capTourCostsByValue(TourCostMatrix& costs,
                         const std::vector<FrontierCluster>& clusters,
-                        double min_value);
+                        double min_value, int robot_id,
+                        double other_robot_factor);
 
 }  // namespace mgg
 
