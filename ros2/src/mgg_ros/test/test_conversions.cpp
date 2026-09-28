@@ -75,6 +75,26 @@ TEST(Conversions, GraphMsgRoundTripsThroughTheExchangeStruct) {
   EXPECT_EQ(ex.edges[0].target_id, 1);
 }
 
+TEST(Conversions, TheVisitedMarkTravelsWithTheGraph) {
+  // Fleet coverage: the sender's kVisited vertices go out marked visited,
+  // and the mark comes back into the exchange struct.
+  mgg::GraphManager graph;
+  graph.setRobotId(2);
+  auto* home = new mgg::Vertex(0, StateVec(0.0, 0.0, 0.3, 0.0));
+  home->robot_id = 2;
+  home->type = mgg::VertexType::kVisited;
+  graph.addVertex(home);
+  auto* frontier = new mgg::Vertex(1, StateVec(1.0, 0.0, 0.3, 0.0));
+  frontier->robot_id = 2;
+  frontier->type = mgg::VertexType::kFrontier;
+  graph.addVertex(frontier);
+  const auto msg = mgg_ros::toGraphMsg(graph, 2, 0.3);
+  ASSERT_EQ(msg.vertices.size(), 2u);
+  for (const auto& v : msg.vertices) EXPECT_EQ(v.visited, v.id == 0);
+  const auto ex = mgg_ros::fromGraphMsg(msg);
+  for (const auto& v : ex.vertices) EXPECT_EQ(v.visited, v.id == 0);
+}
+
 TEST(Conversions, OutgoingGraphCarriesOnlyThisRobotsVertices) {
   GraphManager gm;
   gm.setRobotId(1);

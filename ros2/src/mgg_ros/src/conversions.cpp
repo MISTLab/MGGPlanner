@@ -50,6 +50,7 @@ mgg::GraphExchange fromGraphMsg(const mgg_msgs::msg::Graph& msg) {
     ev.num_occupied_voxels = v.num_occupied_voxels;
     ev.num_free_voxels = v.num_free_voxels;
     ev.is_frontier = v.is_frontier;
+    ev.visited = v.visited;
     out.vertices.push_back(ev);
   }
   out.edges.reserve(msg.edges.size());
@@ -78,6 +79,7 @@ mgg_msgs::msg::Graph toGraphMsg(mgg::GraphManager& graph, int robot_id,
     vertex.num_occupied_voxels = v->vol_gain.num_occupied_voxels;
     vertex.num_free_voxels = v->vol_gain.num_free_voxels;
     vertex.is_frontier = v->vol_gain.is_frontier;
+    vertex.visited = v->type == mgg::VertexType::kVisited;
     vertex.robot_id = v->robot_id;
     msg.vertices.push_back(vertex);
   }

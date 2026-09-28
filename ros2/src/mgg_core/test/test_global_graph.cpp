@@ -1018,6 +1018,86 @@ struct FrontierGraph {
   std::map<int, double> gains_;
 };
 
+/// This robot's (1) frontier at (x, y, z) and a peer's (2) vertex, its
+/// owner's visited mark as given.
+Vertex* ownFrontierAt(GraphManager& graph, double x, double y, double z = 0.0) {
+  auto* v = new Vertex(graph.generateVertexID(), StateVec(x, y, z, 0.0));
+  v->robot_id = 1;
+  v->type = VertexType::kFrontier;
+  v->vol_gain.is_frontier = true;
+  v->vol_gain.gain = 20000.0;
+  graph.addVertex(v);
+  return v;
+}
+
+Vertex* peerVertexAt(GraphManager& graph, double x, double y, double z,
+                     bool visited) {
+  auto* v = new Vertex(graph.generateVertexID(), StateVec(x, y, z, 0.0));
+  v->robot_id = 2;
+  v->owner_visited = visited;
+  graph.addNeighbourVertex(v, v->id);
+  return v;
+}
+
+TEST(DemoteFleetCoveredFrontiers, AnOwnFrontierWhereAPeerDroveIsNoLongerOne) {
+  // Operator, run 12: four robots going round an area explore it. A peer's
+  // vertex its owner marked visited, 2.5 m off horizontally and 0.8 m up,
+  // covers this robot's frontier; one 4 m off does not cover another.
+  GraphManager graph;
+  graph.setRobotId(1);
+  Vertex* covered = ownFrontierAt(graph, 0.0, 0.0);
+  Vertex* kept = ownFrontierAt(graph, 10.0, 0.0);
+  peerVertexAt(graph, 2.5, 0.0, 0.8, true);
+  peerVertexAt(graph, 14.0, 0.0, 0.0, true);
+  EXPECT_EQ(mgg::demoteFleetCoveredFrontiers(graph, 1, 3.0), 1);
+  EXPECT_TRUE(covered->fleet_covered);
+  EXPECT_EQ(covered->type, VertexType::kUnvisited);
+  EXPECT_FALSE(covered->vol_gain.is_frontier);
+  EXPECT_EQ(covered->vol_gain.gain, 0.0);
+  EXPECT_FALSE(kept->fleet_covered);
+  EXPECT_EQ(kept->type, VertexType::kFrontier);
+  // One-way: typed a frontier again (a lattice path passing it), it is
+  // demoted again, even with the peer's vertex gone from the index.
+  covered->type = VertexType::kFrontier;
+  covered->vol_gain.is_frontier = true;
+  graph.retireNeighbourGraph(2);
+  EXPECT_EQ(mgg::demoteFleetCoveredFrontiers(graph, 1, 3.0), 1);
+  EXPECT_EQ(covered->type, VertexType::kUnvisited);
+  EXPECT_EQ(mgg::demoteFleetCoveredFrontiers(graph, 1, 3.0), 0);
+}
+
+TEST(DemoteFleetCoveredFrontiers, OnlyAVisitedPeerVertexAtTheFrontiersLevelCovers) {
+  // A peer vertex without its owner's visited mark (a sender built before
+  // the field, or one it only mapped), one 2 m above (an aerial peer
+  // flying over), this robot's own visited vertex, and a peer's frontier
+  // near a visited one: none is covered. A radius of zero covers nothing.
+  GraphManager graph;
+  graph.setRobotId(1);
+  Vertex* a = ownFrontierAt(graph, 0.0, 0.0);
+  peerVertexAt(graph, 1.0, 0.0, 0.0, false);
+  Vertex* b = ownFrontierAt(graph, 20.0, 0.0);
+  peerVertexAt(graph, 20.5, 0.0, 2.0, true);
+  Vertex* c = ownFrontierAt(graph, 40.0, 0.0);
+  auto* mine = new Vertex(graph.generateVertexID(), StateVec(40.5, 0, 0, 0));
+  mine->robot_id = 1;
+  mine->owner_visited = true;
+  mine->type = VertexType::kVisited;
+  graph.addVertex(mine);
+  Vertex* theirs = peerVertexAt(graph, 60.0, 0.0, 0.0, false);
+  theirs->type = VertexType::kFrontier;
+  theirs->vol_gain.is_frontier = true;
+  peerVertexAt(graph, 60.5, 0.0, 0.0, true);
+  EXPECT_EQ(mgg::demoteFleetCoveredFrontiers(graph, 1, 3.0), 0);
+  for (const Vertex* v : {a, b, c, theirs}) {
+    EXPECT_EQ(v->type, VertexType::kFrontier);
+    EXPECT_FALSE(v->fleet_covered);
+  }
+  peerVertexAt(graph, 0.5, 0.0, 0.0, true);
+  EXPECT_EQ(mgg::demoteFleetCoveredFrontiers(graph, 1, 0.0), 0);
+  EXPECT_EQ(a->type, VertexType::kFrontier);
+  EXPECT_EQ(mgg::demoteFleetCoveredFrontiers(graph, 1, 3.0), 1);
+}
+
 TEST(SearchGlobalFrontier, PicksTheReachableFrontierWithTheBestDiscountedGain) {
   FrontierGraph graph;
   const mgg::GlobalFrontierReport report = mgg::searchGlobalFrontier(

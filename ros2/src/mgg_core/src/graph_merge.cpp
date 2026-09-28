@@ -44,6 +44,7 @@ Vertex* makeVertex(GraphManager& graph, const GraphExchangeVertex& v,
   vertex->vol_gain.num_free_voxels = v.num_free_voxels;
   vertex->vol_gain.is_frontier = v.is_frontier;
   vertex->robot_id = v.robot_id;
+  vertex->owner_visited = v.visited;
   if (v.is_frontier) vertex->type = VertexType::kFrontier;
   return vertex;
 }
@@ -54,6 +55,7 @@ void refreshVertex(Vertex* vertex, const GraphExchangeVertex& v) {
   vertex->vol_gain.num_free_voxels = v.num_free_voxels;
   vertex->vol_gain.is_frontier = v.is_frontier && !vertex->locally_explored;
   vertex->robot_id = v.robot_id;
+  vertex->owner_visited = v.visited;
   // Owner evidence can demote a frontier. Receiver evidence from a local
   // addFrontiers re-check can also demote it, and survives rebroadcasts:
   // the owner may never observe the space this robot already explored.

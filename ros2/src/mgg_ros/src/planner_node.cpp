@@ -339,6 +339,9 @@ PlannerNode::PlannerNode(const rclcpp::NodeOptions& options)
   reservation_exclusion_ttl_s_ = std::max(
       0.0, declareOrGet<double>(this, "reservation_exclusion_ttl_s",
                                 reservation_exclusion_ttl_s_));
+  fleet_coverage_radius_m_ = std::max(
+      0.0, declareOrGet<double>(this, "fleet_coverage_radius_m",
+                                fleet_coverage_radius_m_));
   coordination_exclusions_sub_ =
       create_subscription<geometry_msgs::msg::PoseArray>(
           "coordination_exclusions", rclcpp::QoS(10),
@@ -820,7 +823,20 @@ void PlannerNode::noteGlobalGraphEdges() {
   tour_graph_edges_ = edges;
 }
 
+void PlannerNode::demoteFleetCoveredFrontiers() {
+  const int demoted = mgg::demoteFleetCoveredFrontiers(
+      *global_graph_, static_cast<int>(planning_params_.robot_id),
+      fleet_coverage_radius_m_);
+  if (demoted > 0) {
+    RCLCPP_INFO(get_logger(),
+                "%d frontier(s) covered by the fleet: a peer's visited vertex "
+                "lies within %.1f m",
+                demoted, fleet_coverage_radius_m_);
+  }
+}
+
 std::vector<mgg::FrontierCluster> PlannerNode::globalFrontierClusters() {
+  demoteFleetCoveredFrontiers();
   // Counts and the frontier flag are the owner's latest map evidence.
   // Never replace them with this robot's unknown view of a peer's space.
   const auto score = globalFrontierGain();
@@ -3673,6 +3689,8 @@ bool PlannerNode::runGlobalPlanner(int target_id, std::string& reason,
     reason = "the global graph holds no frontier to reposition to";
     return false;
   }
+  // A frontier the fleet has covered is neither resumed nor chosen.
+  demoteFleetCoveredFrontiers();
   const auto inside_region = [this](const mgg::Vertex& vertex) {
     return !exploration_region_ ||
            exploration_region_->isInsideSpace(vertex.state.head<3>());

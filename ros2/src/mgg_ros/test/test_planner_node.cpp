@@ -5727,7 +5727,10 @@ TEST_F(PlannerNodeTest, PeerFrontierRescoringDoesNotLapseATourSetAside) {
   PlannerNodeTestPeer::observeFloor(*fleet.a, -3.55, 10.55, -3.55, 3.55);
   PlannerNodeTestPeer::setTour(*fleet.a, true, 0.0);
   PlannerNodeTestPeer::solveTourOnEveryChange(*fleet.a);
-  PlannerNodeTestPeer::addGlobalChainToFrontier(*fleet.a, {{-2.0, 0.0}}, M_PI);
+  // Beyond fleet_coverage_radius_m (3 m) of b's home at (0, 0), which b
+  // marks visited: a frontier nearer is covered by the fleet.
+  PlannerNodeTestPeer::addGlobalChainToFrontier(
+      *fleet.a, {{-2.0, 0.0}, {-3.2, 0.0}}, M_PI);
   auto graph = PlannerNodeTestPeer::ownGraph(*fleet.b);
   auto frontier = std::max_element(graph.vertices.begin(), graph.vertices.end(),
       [](const auto& a, const auto& b) { return a.pose.position.x < b.pose.position.x; });
@@ -7213,6 +7216,95 @@ TEST_F(PlannerNodeTest, AnOwnClusterDippingUnderTheFloorDoesNotSendTheTourToAPee
       }
     }
   }
+}
+
+TEST_F(PlannerNodeTest, AnOwnFrontierWhereAPeerDroveIsCoveredByTheFleet) {
+  // Operator, run 12: an area four robots went round is explored, and MGG
+  // shared its global graph for that. Each robot's map holds only its own
+  // observations, so its frontier where a peer drove never demoted on it.
+  // robot_1 (b) drove x = 0 to 4 in its frame, 5 to 9 in a's, and its
+  // roadmap marks those vertices visited (event E1). a's frontier at
+  // (6.5, 0.5) lies within 3 m of them and is covered; its frontier at
+  // (1, -1), 4 m from them, is not. b's own frontier, scored from b's
+  // counts, is untouched. A peer that does not mark visited vertices (a
+  // sender without the field) covers nothing.
+  for (const bool marked : {false, true}) {
+    SCOPED_TRACE(marked ? "visited marked" : "no visited mark");
+    TwoPlanners fleet(marked ? "fleet_cover" : "fleet_cover_unmarked");
+    PlannerNodeTestPeer::gainFromUnknownVoxelsOnly(*fleet.a);
+    PlannerNodeTestPeer::setTour(*fleet.a, true, 1.0);
+    PlannerNodeTestPeer::solveTourOnEveryChange(*fleet.a);
+    const int covered = PlannerNodeTestPeer::addGlobalChainToFrontier(
+        *fleet.a, {{5.0, 0.5}, {6.0, 0.5}, {6.5, 0.5}});
+    const int kept = PlannerNodeTestPeer::addGlobalChainToFrontier(
+        *fleet.a, {{0.5, -1.0}, {1.0, -1.0}});
+    PlannerNodeTestPeer::setVertexGain(*fleet.a, covered, 20000.0);
+    PlannerNodeTestPeer::setVertexGain(*fleet.a, kept, 20000.0);
+
+    auto graph = PlannerNodeTestPeer::ownGraph(*fleet.b);
+    ASSERT_GT(std::count_if(graph.vertices.begin(), graph.vertices.end(),
+                            [](const auto& v) { return v.visited; }),
+              0);
+    if (!marked) {
+      for (auto& v : graph.vertices) v.visited = false;
+    }
+    auto peer_frontier = std::max_element(
+        graph.vertices.begin(), graph.vertices.end(),
+        [](const auto& a, const auto& b) {
+          return a.pose.position.x < b.pose.position.x;
+        });
+    ASSERT_NE(peer_frontier, graph.vertices.end());
+    peer_frontier->is_frontier = true;
+    peer_frontier->num_unknown_voxels = 1000;
+    PlannerNodeTestPeer::receiveTransform(*fleet.a, "robot_0/odom",
+                                          "robot_1/odom", 5.0, 0.0);
+    PlannerNodeTestPeer::receiveGraph(*fleet.a, graph);
+
+    const auto clusters = PlannerNodeTestPeer::frontierClusters(*fleet.a);
+    const auto near = [&clusters](double x, double y) {
+      return std::find_if(clusters.begin(), clusters.end(),
+                          [x, y](const mgg::FrontierCluster& c) {
+                            return (c.position.head<2>() -
+                                    Eigen::Vector2d(x, y)).norm() < 0.3;
+                          });
+    };
+    EXPECT_EQ(near(6.5, 0.5) != clusters.end(), !marked);
+    EXPECT_EQ(PlannerNodeTestPeer::isGlobalFrontier(*fleet.a, covered),
+              !marked);
+    EXPECT_NE(near(1.0, -1.0), clusters.end());
+    const auto theirs = near(9.0, 0.0);
+    ASSERT_NE(theirs, clusters.end());
+    EXPECT_EQ(theirs->owner_robot_id, 2);
+    EXPECT_DOUBLE_EQ(theirs->gain, 10000.0);
+  }
+}
+
+TEST_F(PlannerNodeTest, AFrontierTheFleetCoveredIsNeitherResumedNorHoldsBackCompletion) {
+  // a's only frontier lies where b drove. Before b's roadmap arrives the
+  // greedy search repositions to it. Once b's visited vertices cover it,
+  // the repositioning is not resumed, no frontier is left, and nothing
+  // withholds completion: the fleet explored it. Typed a frontier again
+  // (a lattice path passing it), it is covered again.
+  TwoPlanners fleet("fleet_cover_complete");
+  const int covered = PlannerNodeTestPeer::addGlobalChainToFrontier(
+      *fleet.a, {{5.0, 0.5}, {6.0, 0.5}, {6.5, 0.5}});
+  PlannerNodeTestPeer::setVertexGain(*fleet.a, covered, 20000.0);
+  std::string reason;
+  ASSERT_TRUE(PlannerNodeTestPeer::runGlobalPlanner(*fleet.a, reason))
+      << reason;
+  ASSERT_EQ(PlannerNodeTestPeer::repositioningTarget(*fleet.a), covered);
+
+  fleet.share();
+  EXPECT_FALSE(PlannerNodeTestPeer::runGlobalPlanner(*fleet.a, reason, covered));
+  EXPECT_FALSE(PlannerNodeTestPeer::isGlobalFrontier(*fleet.a, covered));
+  EXPECT_TRUE(PlannerNodeTestPeer::bestPath(*fleet.a).empty());
+  EXPECT_TRUE(PlannerNodeTestPeer::completionWithheld(*fleet.a).empty())
+      << PlannerNodeTestPeer::completionWithheld(*fleet.a);
+
+  PlannerNodeTestPeer::markGlobalFrontier(*fleet.a, covered);
+  EXPECT_FALSE(PlannerNodeTestPeer::runGlobalPlanner(*fleet.a, reason));
+  EXPECT_FALSE(PlannerNodeTestPeer::isGlobalFrontier(*fleet.a, covered));
+  EXPECT_TRUE(PlannerNodeTestPeer::completionWithheld(*fleet.a).empty());
 }
 
 TEST_F(PlannerNodeTest, APlannerWithoutAPositiveSpeedDoesNotStart) {

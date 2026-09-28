@@ -1010,6 +1010,42 @@ FrontierAdditionReport addFrontiers(GraphManager& global_graph,
   return report;
 }
 
+int demoteFleetCoveredFrontiers(GraphManager& graph, int robot_id,
+                                double radius_m, double max_dz_m) {
+  if (!(radius_m > 0.0)) return 0;
+  const double reach = std::hypot(radius_m, std::max(0.0, max_dz_m));
+  int demoted = 0;
+  for (auto& entry : graph.vertices_map_) {
+    Vertex* vertex = entry.second;
+    if (vertex == nullptr || vertex->robot_id != robot_id) continue;
+    if (!vertex->fleet_covered) {
+      if (vertex->type != VertexType::kFrontier ||
+          !graph.inService(*vertex)) {
+        continue;
+      }
+      std::vector<Vertex*> nearby;
+      if (!graph.getNearestVertices(&vertex->state, reach, &nearby)) continue;
+      const bool covered = std::any_of(
+          nearby.begin(), nearby.end(), [&](const Vertex* peer) {
+            return peer != nullptr && peer->robot_id != robot_id &&
+                   peer->owner_visited && graph.inService(*peer) &&
+                   (peer->state.head<2>() - vertex->state.head<2>()).norm() <=
+                       radius_m &&
+                   std::abs(peer->state.z() - vertex->state.z()) <= max_dz_m;
+          });
+      if (!covered) continue;
+      vertex->fleet_covered = true;
+    }
+    if (vertex->type == VertexType::kFrontier) {
+      vertex->type = VertexType::kUnvisited;
+      ++demoted;
+    }
+    vertex->vol_gain.is_frontier = false;
+    vertex->vol_gain.gain = 0.0;
+  }
+  return demoted;
+}
+
 GlobalFrontierReport searchGlobalFrontier(
     GraphManager& graph, int source_id, int robot_id,
     const RecomputeGainFn& recompute_gain,

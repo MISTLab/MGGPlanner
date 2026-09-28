@@ -444,6 +444,11 @@ class PlannerNode : public rclcpp::Node {
   /// double the retry up to 4x, until new gain or a progressing decision.
   void setTourClusterAside(const mgg::FrontierCluster& cluster,
                            double retry_s, bool at_target = false);
+  /// Demotes this robot's frontiers a peer's visited vertex covers
+  /// (mgg::demoteFleetCoveredFrontiers, fleet_coverage_radius_m). Runs
+  /// before every choice of a frontier: the tour's clusters, the fleet
+  /// bid's, and the greedy search's.
+  void demoteFleetCoveredFrontiers();
   /// Every frontier cluster of the global graph, other robots' included,
   /// under its stable name (tour-exploration design §2.1).
   std::vector<mgg::FrontierCluster> globalFrontierClusters();
@@ -845,6 +850,9 @@ class PlannerNode : public rclcpp::Node {
   std::chrono::steady_clock::time_point coordination_exclusions_received_{};
   bool have_coordination_exclusions_ = false;
   double reservation_exclusion_radius_m_ = 4.0;
+  /// An own frontier within this of a peer's visited vertex, horizontally,
+  /// is covered by the fleet (demoteFleetCoveredFrontiers); zero disables.
+  double fleet_coverage_radius_m_ = 3.0;
   double reservation_exclusion_ttl_s_ = 3.0;
   double peer_body_radius_m_ = 0.6;
   double peer_body_ttl_s_ = 3.0;

@@ -169,6 +169,32 @@ TEST(GraphMerge, AFrontierItsOwnerDemotedIsNoLongerAFrontierHere) {
   EXPECT_FALSE(gm.getNeighbourVertex(2, 2)->vol_gain.is_frontier);
 }
 
+TEST(GraphMerge, TheOwnersVisitedMarkIsKeptBesideTheRoutingType) {
+  // Fleet coverage reads where a peer drove (Vertex::owner_visited); the
+  // merged vertex's type stays what routing over it needs. The mark
+  // follows the owner's latest broadcast, and a sender without the field
+  // (visited left false) marks nothing.
+  GraphManager gm;
+  buildOwnGraph(gm);
+  StaticPoseSource poses;
+  poses.setOffset(2, 0.0, 1.0);
+  GraphExchange first = neighbourGraph();
+  first.vertices[1].visited = true;
+  first.vertices[2].is_frontier = true;
+  mergeNeighbourGraph(gm, first, poses, kAlwaysAdmissible);
+  EXPECT_FALSE(gm.getNeighbourVertex(0, 2)->owner_visited);
+  EXPECT_TRUE(gm.getNeighbourVertex(1, 2)->owner_visited);
+  EXPECT_EQ(gm.getNeighbourVertex(1, 2)->type, mgg::VertexType::kUnvisited);
+  EXPECT_EQ(gm.getNeighbourVertex(2, 2)->type, mgg::VertexType::kFrontier);
+
+  GraphExchange second = neighbourGraph();
+  second.vertices[0].visited = true;
+  mergeNeighbourGraph(gm, second, poses, kAlwaysAdmissible);
+  EXPECT_TRUE(gm.getNeighbourVertex(0, 2)->owner_visited);
+  EXPECT_FALSE(gm.getNeighbourVertex(1, 2)->owner_visited);
+  EXPECT_EQ(gm.getNeighbourVertex(0, 2)->type, mgg::VertexType::kUnvisited);
+}
+
 // The ROS 1 offsets translated x and y only, so two robots facing different
 // directions merged their graphs rotated. A full transform fixes that.
 TEST(GraphMerge, RotationBetweenRobotFramesIsApplied) {

@@ -127,6 +127,15 @@ struct Vertex {
   /// a new vertex). Accepted by the controller: a map loses knowledge only
   /// when its snapshot or component changes, which usually rebuilds anyway.
   bool locally_explored = false;
+  /// Another robot's vertex its owner marked visited (kVisited: within its
+  /// kUpdateRadius of where it drove, event E1), as its latest broadcast
+  /// said. The vertex's type here stays what routing over it needs.
+  bool owner_visited = false;
+  /// This robot's frontier near a peer's visited vertex: the fleet has
+  /// been there (demoteFleetCoveredFrontiers). No longer a frontier, and
+  /// one-way, as locally_explored is: nothing re-promotes it for the life
+  /// of the vertex.
+  bool fleet_covered = false;
   /// NBVP legacy, kept in case a tree is wanted for comparison.
   Vertex* parent = nullptr;
   std::vector<Vertex*> children;

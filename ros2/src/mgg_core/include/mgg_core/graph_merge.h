@@ -65,6 +65,9 @@ struct GraphExchangeVertex {
   int num_free_voxels = 0;
   int num_occupied_voxels = 0;
   bool is_frontier = false;
+  /// The sender marked it visited (kVisited). A sender built before the
+  /// field existed leaves it false.
+  bool visited = false;
 };
 
 struct GraphExchangeEdge {

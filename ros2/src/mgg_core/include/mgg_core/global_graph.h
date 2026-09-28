@@ -396,6 +396,26 @@ inline constexpr double kGlobalOtherRobotPenalty = 0.001;
 /// the robot must travel to reach it: a soft preference, never a refusal.
 inline constexpr double kGlobalTargetPenalty = 0.05;
 
+/// Fleet coverage (demoteFleetCoveredFrontiers): how far above or below
+/// this robot's frontier a peer's visited vertex may be and still cover
+/// it, metres. An aerial peer flying over a floor is not on it.
+inline constexpr double kFleetCoverageMaxDzM = 1.0;
+
+/// MGG shared its global graph so the fleet explored as one (event E1,
+/// rrg.cpp:5270, marks the roadmap round where a robot drove visited). Each
+/// robot's map holds only its own observations, so a frontier of this
+/// robot's (`robot_id`) where peers have driven never demotes on it. Here
+/// every in-service kFrontier vertex of this robot within `radius_m`
+/// horizontally and `max_dz_m` vertically of an in-service peer vertex its
+/// owner marked visited (Vertex::owner_visited) is covered by the fleet:
+/// fleet_covered, kUnvisited, not a frontier, no gain. One-way: a covered
+/// vertex re-typed a frontier since (a lattice path passing it) is demoted
+/// again. A radius of zero or less covers nothing. Returns how many
+/// frontiers it demoted.
+int demoteFleetCoveredFrontiers(GraphManager& graph, int robot_id,
+                                double radius_m,
+                                double max_dz_m = kFleetCoverageMaxDzM);
+
 struct GlobalFrontierReport {
   /// The best feasible frontier, or null when none exists.
   Vertex* best_frontier = nullptr;
