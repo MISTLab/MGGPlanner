@@ -809,6 +809,12 @@ class PlannerNode : public rclcpp::Node {
   /// Clusters the last tour solve left out as not worth their distance
   /// (capTourCostsByValue; fleet assignment off only).
   int tour_value_left_out_ = 0;
+  /// The last tour solve without fleet assignment: each cluster the reach
+  /// cap left in, at its distance from the robot then, and those of them
+  /// worth it. Every refresh judges these again on the current gains
+  /// (review r0, I-2).
+  std::unordered_map<mgg::ClusterId, double> tour_value_distances_;
+  std::set<mgg::ClusterId> tour_value_worth_;
   /// Fleet frontier assignment (tour-exploration design §3); null when
   /// fleet.enabled is false.
   std::unique_ptr<mgg::FleetCoordinator> fleet_;

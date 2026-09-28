@@ -98,10 +98,18 @@ void capTourCostsByReach(TourCostMatrix& costs,
 /// searchGlobalFrontier). Zero when the cluster cannot be reached.
 double tourClusterValue(const FrontierCluster& cluster, double distance);
 
-/// Leaves out of the tour every cluster whose tourClusterValue, at its
-/// distance_from_robot, is below `min_value` (tour.min_cluster_gain): its
-/// from_robot becomes kUnreachableCost. At 0.05 per metre a cluster 60 m
-/// away needs about 20 times the gain of one at the robot. A cluster
+/// Whether `cluster`, `distance` from the robot, is worth it:
+/// tourClusterValue, times `other_robot_factor` when a robot other than
+/// `robot_id` owns it, at least `min_value`.
+bool tourClusterWorthItsDistance(const FrontierCluster& cluster,
+                                 double distance, double min_value,
+                                 int robot_id, double other_robot_factor);
+
+/// Leaves out of the tour every cluster not tourClusterWorthItsDistance at
+/// its distance_from_robot, whose tourClusterValue is below `min_value`
+/// (tour.min_cluster_gain): its from_robot becomes kUnreachableCost. At
+/// 0.05 per metre a cluster 60 m away needs about 20 times the gain of
+/// one at the robot. A cluster
 /// another robot than `robot_id` owns is worth `other_robot_factor` of
 /// that (kGlobalOtherRobotPenalty, rrg.cpp:5804: each robot prefers the
 /// frontiers it found). The tour orders the clusters left; the others are

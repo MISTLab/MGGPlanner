@@ -157,6 +157,14 @@ double tourClusterValue(const FrontierCluster& cluster, double distance) {
   return cluster.gain * std::exp(-kGlobalDistancePenalty * distance);
 }
 
+bool tourClusterWorthItsDistance(const FrontierCluster& cluster,
+                                 double distance, double min_value,
+                                 int robot_id, double other_robot_factor) {
+  double value = tourClusterValue(cluster, distance);
+  if (cluster.owner_robot_id != robot_id) value *= other_robot_factor;
+  return value >= min_value;
+}
+
 int capTourCostsByValue(TourCostMatrix& costs,
                         const std::vector<FrontierCluster>& clusters,
                         double min_value, int robot_id,
@@ -168,9 +176,8 @@ int capTourCostsByValue(TourCostMatrix& costs,
     const double distance = i < costs.distance_from_robot.size()
                                 ? costs.distance_from_robot[i]
                                 : kUnreachableCost;
-    double value = tourClusterValue(clusters[i], distance);
-    if (clusters[i].owner_robot_id != robot_id) value *= other_robot_factor;
-    if (!(value >= min_value)) {
+    if (!tourClusterWorthItsDistance(clusters[i], distance, min_value,
+                                     robot_id, other_robot_factor)) {
       costs.from_robot[i] = kUnreachableCost;
       ++left_out;
     }

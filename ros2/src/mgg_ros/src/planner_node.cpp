@@ -992,7 +992,27 @@ std::optional<mgg::FrontierCluster> PlannerNode::refreshTour(
       break;
     }
   }
-  if (tour_planner_->needsSolve(clusters, graph_revision_,
+  // Without fleet assignment a cluster's worth is judged on every refresh,
+  // on its current gain at its distance at the last solve: one crossing
+  // the value floor either way solves the tour again at once, so a target
+  // no longer worth its distance is not kept, nor one now worth it left
+  // out, while the graph stays as it is (review r0, I-2).
+  const int own_id = static_cast<int>(planning_params_.robot_id);
+  const bool worth_changed =
+      !fleet_ &&
+      std::any_of(clusters.begin(), clusters.end(),
+                  [&](const mgg::FrontierCluster& cluster) {
+                    const auto distance =
+                        tour_value_distances_.find(cluster.id);
+                    if (distance == tour_value_distances_.end()) return false;
+                    return mgg::tourClusterWorthItsDistance(
+                               cluster, distance->second,
+                               tour_params_.min_cluster_gain, own_id,
+                               mgg::kGlobalOtherRobotPenalty) !=
+                           (tour_value_worth_.count(cluster.id) > 0);
+                  });
+  if (worth_changed ||
+      tour_planner_->needsSolve(clusters, graph_revision_,
                                 tour_assignment_version_, now_s,
                                 peer_generation_)) {
     mgg::Vertex* link = linkRobotToGlobalGraph();
@@ -1016,12 +1036,25 @@ std::optional<mgg::FrontierCluster> PlannerNode::refreshTour(
     // fleet assignment the auction has costed distance and ownership
     // already, and an award the tour refused would leave the robot idle,
     // so only without.
-    tour_value_left_out_ =
-        fleet_ ? 0
-               : mgg::capTourCostsByValue(
-                     costs, clusters, tour_params_.min_cluster_gain,
-                     static_cast<int>(planning_params_.robot_id),
-                     mgg::kGlobalOtherRobotPenalty);
+    tour_value_distances_.clear();
+    tour_value_worth_.clear();
+    tour_value_left_out_ = 0;
+    if (!fleet_) {
+      for (std::size_t i = 0; i < clusters.size(); ++i) {
+        if (std::isfinite(costs.from_robot[i])) {
+          tour_value_distances_[clusters[i].id] =
+              costs.distance_from_robot[i];
+        }
+      }
+      tour_value_left_out_ = mgg::capTourCostsByValue(
+          costs, clusters, tour_params_.min_cluster_gain, own_id,
+          mgg::kGlobalOtherRobotPenalty);
+      for (std::size_t i = 0; i < clusters.size(); ++i) {
+        if (std::isfinite(costs.from_robot[i])) {
+          tour_value_worth_.insert(clusters[i].id);
+        }
+      }
+    }
     tour_planner_->solve(clusters, costs, graph_revision_,
                          tour_assignment_version_, now_s, peer_generation_);
     tour_solve_ms_ = std::chrono::duration<double, std::milli>(

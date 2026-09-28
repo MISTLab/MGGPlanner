@@ -7223,6 +7223,45 @@ TEST_F(PlannerNodeTest, AnOwnClusterDippingUnderTheFloorDoesNotSendTheTourToAPee
   }
 }
 
+TEST_F(PlannerNodeTest, AGainDropUnderTheDiscountedFloorDropsTheTourTarget) {
+  // Review r0, I-2: the value floor is judged on the gains of every
+  // refresh, not only when the graph changes. The roadmap stays as it is;
+  // the far cluster is alone, 14.4 m off, beyond the reached radius. At
+  // gain 20000 it is worth 9728 at its distance, over the 9000 floor, and
+  // is the target. Rescored to 15000, over the floor undiscounted, it is
+  // worth 7296: not its distance, and no longer the target.
+  int near = -1;
+  int far = -1;
+  auto node = nearAndFarFrontiers("tour_value_gain_drop", false, near, far);
+  PlannerNodeTestPeer::setGlobalVertexType(*node, near,
+                                           mgg::VertexType::kUnvisited);
+  PlannerNodeTestPeer::setVertexGain(*node, far, 20000.0);
+  ASSERT_NE(PlannerNodeTestPeer::refreshTour(*node), mgg::kNoCluster);
+  EXPECT_NEAR(PlannerNodeTestPeer::tourTargetPosition(*node).x(), 14.0, 1e-6);
+
+  PlannerNodeTestPeer::setVertexGain(*node, far, 15000.0);
+  const std::string note = PlannerNodeTestPeer::refreshTourNote(*node);
+  EXPECT_NE(note.find("worth its distance"), std::string::npos) << note;
+  EXPECT_EQ(PlannerNodeTestPeer::refreshTour(*node), mgg::kNoCluster);
+}
+
+TEST_F(PlannerNodeTest, AGainRiseOverTheDiscountedFloorTakesTheCluster) {
+  // The reverse of the drop: at 15000 the far cluster is not worth its
+  // 14.4 m and the tour has none; rescored to 20000, with the roadmap as
+  // it was, it is, and becomes the target.
+  int near = -1;
+  int far = -1;
+  auto node = nearAndFarFrontiers("tour_value_gain_rise", false, near, far);
+  PlannerNodeTestPeer::setGlobalVertexType(*node, near,
+                                           mgg::VertexType::kUnvisited);
+  PlannerNodeTestPeer::setVertexGain(*node, far, 15000.0);
+  EXPECT_EQ(PlannerNodeTestPeer::refreshTour(*node), mgg::kNoCluster);
+
+  PlannerNodeTestPeer::setVertexGain(*node, far, 20000.0);
+  ASSERT_NE(PlannerNodeTestPeer::refreshTour(*node), mgg::kNoCluster);
+  EXPECT_NEAR(PlannerNodeTestPeer::tourTargetPosition(*node).x(), 14.0, 1e-6);
+}
+
 TEST_F(PlannerNodeTest, AnOwnFrontierWhereAPeerDroveIsCoveredByTheFleet) {
   // Operator, run 12: an area four robots went round is explored, and MGG
   // shared its global graph for that. Each robot's map holds only its own
