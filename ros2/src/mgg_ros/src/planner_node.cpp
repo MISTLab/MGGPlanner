@@ -685,6 +685,7 @@ void PlannerNode::loadParameters() {
   if (!loadRobotParams(p, "RobotParams", robot_params_)) {
     RCLCPP_ERROR(get_logger(), "RobotParams failed to load");
   }
+  nominal_bound_mode_ = robot_params_.bound_mode;
   const bool planning_loaded =
       loadPlanningParams(p, "PlanningParams", planning_params_);
   // Every bid is costed in time at v_max (drone scout Task 17): a planner
@@ -837,11 +838,14 @@ void PlannerNode::demoteFleetCoveredFrontiers() {
   auto map_read = mapReadLease();
   const mgg::ExpandContext ctx = makeGlobalContext();
   const bool map_serves = ctx.map != nullptr && ctx.map->getStatus();
-  // A link's check holds while the map and the peers' placement do; a pass
-  // makes at most fleet_coverage_max_link_checks of them (review r2, M-1).
-  refreshMapRevision();
-  fleet_coverage_links_.keyTo(map_revision_, peer_roadmap_generation_);
-  mgg::FleetCoverageLinks links{&ctx, &fleet_coverage_links_,
+  // A pass makes at most fleet_coverage_max_link_checks swept checks
+  // (review r2, M-1), starting where the last one stopped (review r3, P2).
+  // Each is swept with the nominal box, whatever this request's bound mode
+  // (review r3, P1), and nothing of it is kept.
+  mgg::RobotParams nominal = robot_params_;
+  nominal.bound_mode = nominal_bound_mode_;
+  mgg::FleetCoverageLinks links{&ctx, &fleet_coverage_cursor_,
+                                nominal.getPlanningSize(),
                                 fleet_coverage_max_link_checks_};
   const int demoted = mgg::demoteFleetCoveredFrontiers(
       *global_graph_, static_cast<int>(planning_params_.robot_id),
@@ -2077,9 +2081,6 @@ mgg::MergeResult PlannerNode::mergeNeighbourRoadmap(
       r.vertices_replaced > 0 ||
       r.neighbour_restarted) {
     ++graph_revision_;
-  }
-  if (r.vertices_replaced > 0 || r.neighbour_restarted) {
-    ++peer_roadmap_generation_;
   }
   return r;
 }

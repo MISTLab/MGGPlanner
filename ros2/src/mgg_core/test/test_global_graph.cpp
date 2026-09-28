@@ -5,6 +5,7 @@
 // Rrg::timerCallback. The ROS 1 versions ran only inside a full planning
 // cycle or a live timer.
 
+#include <algorithm>
 #include <cmath>
 #include <chrono>
 #include <thread>
@@ -1198,9 +1199,16 @@ TEST(DemoteFleetCoveredFrontiers, OneLinkToANearPeerVertexNotSeenBlockedJoinsThe
 }
 
 /// A thin wall (SlabSpace) that counts the swept checks made against it.
+/// A thin wall (SlabSpace) that counts the map queries made of it: box
+/// queries (a static sweep is made of them) and swept path queries.
 class CountingSlab : public SlabSpace {
  public:
   using SlabSpace::SlabSpace;
+  VoxelStatus getBoxStatus(const Eigen::Vector3d& c, const Eigen::Vector3d& s,
+                           bool u) const override {
+    ++calls;
+    return SlabSpace::getBoxStatus(c, s, u);
+  }
   VoxelStatus getPathStatus(const Eigen::Vector3d& a, const Eigen::Vector3d& b,
                             const Eigen::Vector3d& box,
                             bool s) const override {
@@ -1209,6 +1217,10 @@ class CountingSlab : public SlabSpace {
   }
   mutable int calls = 0;
 };
+
+/// The map queries one coverage link of up to kFleetCoverageLinkM may make
+/// on the Roadmap fixture's 0.2 m grid: a box per cell along it.
+constexpr int kQueriesPerLinkMax = 8;
 
 TEST(DemoteFleetCoveredFrontiers, TheRoadmapFirstThenLinksNearestFirstUpToOneThatJoins) {
   // Review r2, M-1: a frontier the roadmap joins to a peer's visited
@@ -1233,56 +1245,155 @@ TEST(DemoteFleetCoveredFrontiers, TheRoadmapFirstThenLinksNearestFirstUpToOneTha
   mgg::FleetCoverageLinks links{&fixture.ctx};
   EXPECT_EQ(mgg::demoteFleetCoveredFrontiers(graph, 1, 3.0, &links), 3);
   EXPECT_EQ(links.checks, 3);
-  EXPECT_EQ(map.calls, 3);
+  EXPECT_GT(map.calls, 0);
+  EXPECT_LE(map.calls, 3 * kQueriesPerLinkMax);
   EXPECT_EQ(links.deferred, 0);
 }
 
-TEST(DemoteFleetCoveredFrontiers, LinkChecksStayWithinTheBudgetAndResultsAreNotCheckedAgain) {
-  // Review r2, M-1: 40 frontiers, each with 20 visited peer vertices
-  // within 1.5 m behind a wall and no roadmap edge: 800 links to check.
-  // A pass makes no more than the budget (500); the frontiers it did not
-  // reach are left as they are, for the next pass. A cached result is not
-  // checked again while the map revision and the peers' roadmap
-  // generation hold; a new one of either checks afresh.
+TEST(DemoteFleetCoveredFrontiers, ARotatingCursorReachesEveryFrontierWithinTheBudgetsPasses) {
+  // Review r3, P2: 20 frontiers whose 20 links all cross a wall come
+  // first; 20 more follow, each with 19 such links and, farthest, one
+  // clear link to a peer's visited vertex. 800 links, 200 a pass: from
+  // where the last pass stopped, every frontier is reached within
+  // ceil(800 / 200) = 4 passes, the last 20 covered in passes 3 and 4,
+  // though the map is a new one every pass (its revision changes each
+  // time, as a cloud map's does). Starting over each pass instead, the
+  // first 10 walled frontiers take the budget every time, and none is
+  // covered.
+  for (const bool rotating : {true, false}) {
+    SCOPED_TRACE(rotating ? "rotating cursor" : "starting over");
+    Roadmap fixture;
+    GraphManager graph;
+    graph.setRobotId(1);
+    std::vector<Vertex*> walled;
+    std::vector<Vertex*> coverable;
+    for (int i = 0; i < 40; ++i) {
+      const double x = 5.0 * i;
+      Vertex* frontier = ownFrontierAt(graph, x, 0.0);
+      (i < 20 ? walled : coverable).push_back(frontier);
+      for (const double dx : {-0.8, -0.4, 0.0, 0.4, 0.8}) {
+        for (const double y : {0.6, 0.8, 1.0, 1.2}) {
+          // The farthest behind the wall, 1.44 m, makes way for the clear
+          // one, 1.46 m, checked last.
+          if (i >= 20 && dx == 0.8 && y == 1.2) continue;
+          peerVertexAt(graph, x + dx, y, 0.0, true);
+        }
+      }
+      if (i >= 20) peerVertexAt(graph, x, -1.46, 0.0, true);
+    }
+    mgg::FleetCoverageCursor cursor;
+    const auto covered = [&coverable]() {
+      return std::count_if(coverable.begin(), coverable.end(),
+                           [](const Vertex* v) { return v->fleet_covered; });
+    };
+    std::vector<long> covered_after;
+    for (int pass = 0; pass < 4; ++pass) {
+      CountingSlab wall(0.25, 0.45);  // a new map every pass
+      fixture.ctx.map = &wall;
+      mgg::FleetCoverageLinks links{&fixture.ctx, rotating ? &cursor : nullptr};
+      mgg::demoteFleetCoveredFrontiers(graph, 1, 3.0, &links);
+      EXPECT_EQ(links.checks, mgg::kFleetCoverageMaxLinkChecks);
+      EXPECT_LE(wall.calls, links.checks * kQueriesPerLinkMax);
+      EXPECT_GT(links.deferred, 0);
+      covered_after.push_back(covered());
+    }
+    if (rotating) {
+      EXPECT_EQ(covered_after, (std::vector<long>{0, 0, 10, 20}));
+    } else {
+      EXPECT_EQ(covered_after, (std::vector<long>{0, 0, 0, 0}));
+    }
+    for (const Vertex* v : walled) EXPECT_EQ(v->type, VertexType::kFrontier);
+  }
+}
+
+/// Open space but for an occupied column, square in plan, found by a box
+/// query whose box reaches into it.
+class ColumnForBoxes : public OpenSpace {
+ public:
+  ColumnForBoxes(double x, double y, double half_width)
+      : x_(x), y_(y), half_(half_width) {}
+  VoxelStatus getVoxelStatus(const Eigen::Vector3d& p) const override {
+    return std::abs(p.x() - x_) < half_ && std::abs(p.y() - y_) < half_
+               ? VoxelStatus::kOccupied
+               : VoxelStatus::kFree;
+  }
+  VoxelStatus getBoxStatus(const Eigen::Vector3d& c, const Eigen::Vector3d& s,
+                           bool) const override {
+    return std::abs(c.x() - x_) < half_ + 0.5 * s.x() &&
+                   std::abs(c.y() - y_) < half_ + 0.5 * s.y()
+               ? VoxelStatus::kOccupied
+               : VoxelStatus::kFree;
+  }
+
+ private:
+  double x_;
+  double y_;
+  double half_;
+};
+
+TEST(DemoteFleetCoveredFrontiers, TheLinkIsSweptWithTheNominalBoxWhateverTheBoundMode) {
+  // Review r3, P1: a request's bound mode sets the planning box, and a
+  // link judged with a narrow one could cover what a wide one finds
+  // walled. The link from (0, 0) to the peer's visited vertex at (0, 1.2)
+  // passes 0.3 m from a column: the nominal (extended) 0.8 m box meets
+  // it, the exact 0.2 m box would not. Whichever box the request set, the
+  // link is blocked. In open space it covers.
+  for (const mgg::BoundModeType mode :
+       {mgg::BoundModeType::kExactBound, mgg::BoundModeType::kExtendedBound,
+        mgg::BoundModeType::kNoBound}) {
+    for (const bool column : {true, false}) {
+      SCOPED_TRACE(static_cast<int>(mode));
+      SCOPED_TRACE(column ? "column" : "open");
+      Roadmap fixture;
+      fixture.robot.type = RobotType::kGroundRobot;
+      fixture.robot.size = Eigen::Vector3d(0.2, 0.2, 0.2);
+      fixture.robot.size_extension = Eigen::Vector3d(0.6, 0.6, 0.0);
+      fixture.robot.bound_mode = mode;
+      fixture.ctx.robot_box_size = fixture.robot.getPlanningSize();
+      const ColumnForBoxes map(column ? 0.35 : 20.0, 0.6, 0.05);
+      fixture.ctx.map = &map;
+      GraphManager graph;
+      graph.setRobotId(1);
+      Vertex* frontier = ownFrontierAt(graph, 0.0, 0.0);
+      peerVertexAt(graph, 0.0, 1.2, 0.0, true);
+      // The caller's nominal box; the request's (ctx.robot_box_size) is
+      // not the one swept.
+      mgg::FleetCoverageLinks links{&fixture.ctx};
+      links.box = fixture.robot.size + fixture.robot.size_extension;
+      EXPECT_EQ(mgg::demoteFleetCoveredFrontiers(graph, 1, 3.0, &links),
+                column ? 0 : 1);
+      EXPECT_EQ(frontier->fleet_covered, !column);
+    }
+  }
+}
+
+TEST(DemoteFleetCoveredFrontiers, AGraphRebuiltWithTheSameIdsIsJudgedAfresh) {
+  // Review r3, P1: a roadmap rebuilt from the keyframes numbers its
+  // vertices from zero again. Nothing of a link's check outlives the pass
+  // that made it, so the same ids naming other places are checked anew:
+  // walled in the first graph, clear in the rebuilt one.
   Roadmap fixture;
   CountingSlab wall(0.25, 0.45);
   fixture.ctx.map = &wall;
-  GraphManager graph;
-  graph.setRobotId(1);
-  std::vector<Vertex*> frontiers;
-  for (int i = 0; i < 40; ++i) {
-    const double x = 5.0 * i;
-    frontiers.push_back(ownFrontierAt(graph, x, 0.0));
-    for (const double dx : {-0.8, -0.4, 0.0, 0.4, 0.8}) {
-      for (const double y : {0.6, 0.8, 1.0, 1.2}) {
-        peerVertexAt(graph, x + dx, y, 0.0, true);
-      }
-    }
-  }
-  mgg::FleetCoverageLinkCache cache;
-  const auto pass = [&](std::uint64_t map_revision,
-                        std::uint64_t peer_generation) {
-    cache.keyTo(map_revision, peer_generation);
-    mgg::FleetCoverageLinks links{&fixture.ctx, &cache};
-    const int calls_before = wall.calls;
-    EXPECT_EQ(mgg::demoteFleetCoveredFrontiers(graph, 1, 3.0, &links), 0);
-    EXPECT_EQ(wall.calls - calls_before, links.checks);
-    EXPECT_LE(links.checks, mgg::kFleetCoverageMaxLinkChecks);
-    return links;
-  };
-  mgg::FleetCoverageLinks first = pass(7, 3);
-  EXPECT_EQ(first.checks, 500);
-  EXPECT_EQ(first.deferred, 15);
-  mgg::FleetCoverageLinks second = pass(7, 3);
-  EXPECT_EQ(second.checks, 300);
-  EXPECT_EQ(second.deferred, 0);
-  EXPECT_EQ(pass(7, 3).checks, 0);
-  EXPECT_EQ(pass(8, 3).checks, 500);
-  EXPECT_EQ(pass(8, 3).checks, 300);
-  EXPECT_EQ(pass(8, 4).checks, 500);
-  for (const Vertex* frontier : frontiers) {
-    EXPECT_EQ(frontier->type, VertexType::kFrontier);
-  }
+  mgg::FleetCoverageCursor cursor;
+  GraphManager first;
+  first.setRobotId(1);
+  Vertex* walled = ownFrontierAt(first, 0.0, 0.0);
+  Vertex* beyond = peerVertexAt(first, 0.0, 1.0, 0.0, true);
+  mgg::FleetCoverageLinks links{&fixture.ctx, &cursor};
+  EXPECT_EQ(mgg::demoteFleetCoveredFrontiers(first, 1, 3.0, &links), 0);
+  EXPECT_EQ(links.checks, 1);
+
+  GraphManager rebuilt;
+  rebuilt.setRobotId(1);
+  Vertex* open = ownFrontierAt(rebuilt, 10.0, 0.0);
+  Vertex* below = peerVertexAt(rebuilt, 10.0, -1.0, 0.0, true);
+  ASSERT_EQ(open->id, walled->id);
+  ASSERT_EQ(below->id, beyond->id);
+  links = mgg::FleetCoverageLinks{&fixture.ctx, &cursor};
+  EXPECT_EQ(mgg::demoteFleetCoveredFrontiers(rebuilt, 1, 3.0, &links), 1);
+  EXPECT_EQ(links.checks, 1);
+  EXPECT_TRUE(open->fleet_covered);
 }
 
 TEST(SearchGlobalFrontier, PicksTheReachableFrontierWithTheBestDiscountedGain) {

@@ -420,6 +420,13 @@ class PlannerNodeTestPeer {
   static void setFrontierOwner(PlannerNode& node, int id, int owner) {
     node.global_graph_->getVertex(id)->robot_id = owner;
   }
+  /// The robot's size extension, and the bound mode a request has set.
+  static void setBoundMode(PlannerNode& node, double extension,
+                           mgg::BoundModeType mode) {
+    const std::lock_guard<std::recursive_mutex> lock(node.planner_mutex_);
+    node.robot_params_.size_extension = Eigen::Vector3d(extension, extension, 0.0);
+    node.robot_params_.bound_mode = mode;
+  }
   /// The owner of vertex `id`, a peer's, marked it visited (event E1).
   static void markOwnerVisited(PlannerNode& node, int id) {
     const std::lock_guard<std::recursive_mutex> lock(node.planner_mutex_);
@@ -7460,6 +7467,80 @@ TEST_F(PlannerNodeTest, AMapOutageLinksNothingSoAWallSeenBeforeStillKeepsTheFron
   ASSERT_TRUE(PlannerNodeTestPeer::requestMapSnapshot(*node, product.request()));
   PlannerNodeTestPeer::frontierClusters(*node);
   EXPECT_TRUE(PlannerNodeTestPeer::isGlobalFrontier(*node, frontier));
+}
+
+/// A robot on the mola_snapshot backend over a floor from (-1.5, -1.5) to
+/// (4, 1.5) with `walls`, its last frontier at (3, 0) and a peer's visited
+/// vertex at (3, 1), 1 m off but 6.2 m by the roadmap, round by home.
+std::shared_ptr<PlannerNode> frontierBesideAPeerVertex(
+    const std::string& name, const std::vector<std::array<double, 4>>& walls,
+    std::unique_ptr<MolaFloorProduct>& product, int& frontier) {
+  auto node = makeNode(name);
+  product = std::make_unique<MolaFloorProduct>(-1.5, 4.0, -1.5, 1.5, walls);
+  PlannerNodeTestPeer::useMolaMap(*node, product->serve());
+  PlannerNodeTestPeer::serveMap(*node, "component:test", 1);
+  PlannerNodeTestPeer::setMinObservedGround(*node, 0.0);
+  PlannerNodeTestPeer::setPeerBodyTtl(*node, 600.0);
+  PlannerNodeTestPeer::acceptOdometry(*node, 0.0, 0.0, 1.0);
+  frontier = PlannerNodeTestPeer::addGlobalChainToFrontier(
+      *node, {{1.5, 0.0}, {3.0, 0.0}});
+  PlannerNodeTestPeer::setVertexGain(*node, frontier, 20000.0);
+  const double z = PlannerNodeTestPeer::globalVertexState(*node, 0).z();
+  const int peer =
+      PlannerNodeTestPeer::addGlobalVertex(*node, 2, 3.0, 1.0, z, {0});
+  PlannerNodeTestPeer::markOwnerVisited(*node, peer);
+  return node;
+}
+
+TEST_F(PlannerNodeTest, APeerBodyOrANoGoDiscIsNoWallForACoverageLink) {
+  // Review r3, P1: the link is judged on the map's static occupancy. A
+  // peer standing between the frontier and the peer's visited vertex, or
+  // a no-go disc there, is not a wall: the link covers the frontier as in
+  // open space. A wall seen there still keeps it.
+  for (const std::string scene : {"peer_body", "no_go", "wall"}) {
+    SCOPED_TRACE(scene);
+    std::unique_ptr<MolaFloorProduct> product;
+    int frontier = -1;
+    auto node = frontierBesideAPeerVertex(
+        "fleet_cover_static_" + scene,
+        scene == "wall" ? std::vector<std::array<double, 4>>{{2.0, 4.0, 0.4, 0.6}}
+                        : std::vector<std::array<double, 4>>{},
+        product, frontier);
+    if (scene == "peer_body") {
+      PlannerNodeTestPeer::receivePeerBodies(*node, {{3.0, 0.5}});
+      ASSERT_EQ(PlannerNodeTestPeer::peerBodiesInForce(*node).size(), 1u);
+    } else if (scene == "no_go") {
+      PlannerNodeTestPeer::receiveNoGoZones(*node, "world", {{3.0, 0.5}});
+    }
+    PlannerNodeTestPeer::frontierClusters(*node);
+    EXPECT_EQ(PlannerNodeTestPeer::isGlobalFrontier(*node, frontier),
+              scene == "wall");
+  }
+}
+
+TEST_F(PlannerNodeTest, ACoverageLinkIsSweptWithTheNominalBoxWhateverTheRequestsBoundMode) {
+  // Review r3, P1: a column at x = 3.2 to 3.4 beside the link along x = 3.
+  // The robot's nominal box, as loaded (extended: 0.2 m and 0.6 m of
+  // extension), meets it; the exact 0.2 m box a request may set does not.
+  // Either way the column keeps the frontier; without it, it is covered.
+  for (const mgg::BoundModeType mode :
+       {mgg::BoundModeType::kExactBound, mgg::BoundModeType::kExtendedBound}) {
+    for (const bool column : {true, false}) {
+      SCOPED_TRACE(static_cast<int>(mode));
+      SCOPED_TRACE(column ? "column" : "open");
+      std::unique_ptr<MolaFloorProduct> product;
+      int frontier = -1;
+      auto node = frontierBesideAPeerVertex(
+          "fleet_cover_box_" + std::to_string(static_cast<int>(mode)) +
+              (column ? "_column" : "_open"),
+          column ? std::vector<std::array<double, 4>>{{3.2, 3.4, 0.4, 0.6}}
+                 : std::vector<std::array<double, 4>>{},
+          product, frontier);
+      PlannerNodeTestPeer::setBoundMode(*node, 0.6, mode);
+      PlannerNodeTestPeer::frontierClusters(*node);
+      EXPECT_EQ(PlannerNodeTestPeer::isGlobalFrontier(*node, frontier), column);
+    }
+  }
 }
 
 TEST_F(PlannerNodeTest, AFrontierAcrossAWallFromWhereAPeerDroveIsNotCovered) {

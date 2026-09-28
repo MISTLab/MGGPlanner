@@ -865,12 +865,11 @@ class PlannerNode : public rclcpp::Node {
   /// (fleet_coverage_max_link_checks); the frontiers left over wait for the
   /// next pass.
   int fleet_coverage_max_link_checks_ = mgg::kFleetCoverageMaxLinkChecks;
-  /// Coverage link checks already made, while map_revision_ and
-  /// peer_roadmap_generation_ hold.
-  mgg::FleetCoverageLinkCache fleet_coverage_links_;
-  /// Advances when a merge moves a neighbour's roadmap vertices already
-  /// held (re-placed under a new transform, or the neighbour restarted).
-  std::uint64_t peer_roadmap_generation_ = 0;
+  /// Where the next coverage pass starts among this robot's frontiers.
+  mgg::FleetCoverageCursor fleet_coverage_cursor_;
+  /// The bound mode RobotParams were loaded with: coverage links are swept
+  /// with its box whatever a request sets (review r3, P1).
+  mgg::BoundModeType nominal_bound_mode_ = mgg::BoundModeType::kExtendedBound;
   double reservation_exclusion_ttl_s_ = 3.0;
   double peer_body_radius_m_ = 0.6;
   double peer_body_ttl_s_ = 3.0;

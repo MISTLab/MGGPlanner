@@ -5,7 +5,6 @@
 #include <cmath>
 #include <functional>
 #include <limits>
-#include <optional>
 #include <queue>
 #include <unordered_map>
 #include <unordered_set>
@@ -1059,33 +1058,28 @@ bool joinedWithin(GraphManager& graph,
 
 }  // namespace
 
-void FleetCoverageLinkCache::keyTo(std::uint64_t map_revision,
-                                   std::uint64_t peer_roadmap_generation) {
-  if (keyed_ && map_revision == map_revision_ &&
-      peer_roadmap_generation == peer_roadmap_generation_) {
-    return;
+bool fleetCoverageLinkClear(const MapInterface& map,
+                            const Eigen::Vector3d& from,
+                            const Eigen::Vector3d& to,
+                            const Eigen::Vector3d& box) {
+  const double resolution = map.getResolution();
+  if (!(resolution > 0.0) || !from.allFinite() || !to.allFinite() ||
+      !box.allFinite() || (box.array() < 0.0).any()) {
+    return false;
   }
-  results_.clear();
-  keyed_ = true;
-  map_revision_ = map_revision;
-  peer_roadmap_generation_ = peer_roadmap_generation;
-}
-
-std::uint64_t FleetCoverageLinkCache::pairKey(int frontier_id, int peer_id) {
-  return (static_cast<std::uint64_t>(static_cast<std::uint32_t>(frontier_id))
-          << 32) |
-         static_cast<std::uint32_t>(peer_id);
-}
-
-std::optional<bool> FleetCoverageLinkCache::find(int frontier_id,
-                                                 int peer_id) const {
-  const auto found = results_.find(pairKey(frontier_id, peer_id));
-  if (found == results_.end()) return std::nullopt;
-  return found->second;
-}
-
-void FleetCoverageLinkCache::store(int frontier_id, int peer_id, bool clear) {
-  results_[pairKey(frontier_id, peer_id)] = clear;
+  const double length = (to - from).norm();
+  const double steps_d = std::max(1.0, std::ceil(length / resolution - 1e-9));
+  if (!std::isfinite(steps_d) || steps_d > 1e4) return false;
+  const int steps = static_cast<int>(steps_d);
+  const Eigen::Vector3d step = (to - from) / steps_d;
+  const Eigen::Vector3d swept = box + step.cwiseAbs();
+  for (int i = 0; i < steps; ++i) {
+    if (map.getStaticBoxStatus(from + (i + 0.5) * step, swept, false) ==
+        VoxelStatus::kOccupied) {
+      return false;
+    }
+  }
+  return true;
 }
 
 namespace {
@@ -1094,15 +1088,17 @@ namespace {
 /// it to any of `covering` within `max_walk` (demoteFleetCoveredFrontiers):
 /// the roadmap does not, but once merged a peer's later extension beside
 /// the frontier gets no edge to it (review r1). A link runs to an
-/// in-service peer vertex within kFleetCoverageLinkM and must cross nothing
-/// the map has seen occupied. Links are tried nearest first, up to the
-/// first that joins; a check the cache holds is not made again, and once
-/// the pass's budget is spent the frontier is left as it is (review r2,
-/// M-1).
+/// in-service peer vertex within kFleetCoverageLinkM and must be
+/// fleetCoverageLinkClear. Links are tried nearest first, up to the first
+/// that joins; once the pass's budget is spent the frontier is left as it
+/// is (review r2, M-1): links->deferred counts it.
 bool joinedByALink(GraphManager& graph, const Vertex& frontier, int robot_id,
                    const std::unordered_set<int>& covering, double max_walk,
                    FleetCoverageLinks* links) {
-  if (links == nullptr || links->ctx == nullptr) return false;
+  if (links == nullptr || links->ctx == nullptr ||
+      links->ctx->map == nullptr || links->ctx->robot == nullptr) {
+    return false;
+  }
   std::vector<Vertex*> nearby;
   if (!graph.getNearestVertices(&frontier.state, kFleetCoverageLinkM,
                                 &nearby)) {
@@ -1125,25 +1121,17 @@ bool joinedByALink(GraphManager& graph, const Vertex& frontier, int robot_id,
               return a.first != b.first ? a.first < b.first
                                         : a.second->id < b.second->id;
             });
+  const Eigen::Vector3d& offset = links->ctx->robot->center_offset;
   for (const auto& [length, peer] : candidates) {
-    std::optional<bool> clear;
-    if (links->cache != nullptr) {
-      clear = links->cache->find(frontier.id, peer->id);
+    if (links->checks >= links->max_checks) {
+      ++links->deferred;
+      return false;
     }
-    if (!clear.has_value()) {
-      if (links->checks >= links->max_checks) {
-        ++links->deferred;
-        return false;
-      }
-      ++links->checks;
-      clear = !throughKnownObstacle(*links->ctx, frontier.state, peer->state,
-                                    links->ctx->robot_box_size);
-      if (links->cache != nullptr) {
-        links->cache->store(frontier.id, peer->id, *clear);
-      }
-    }
-    if (*clear && joinedWithin(graph, {{peer->id, length}}, covering,
-                               max_walk)) {
+    ++links->checks;
+    if (fleetCoverageLinkClear(*links->ctx->map,
+                               frontier.state.head<3>() + offset,
+                               peer->state.head<3>() + offset, links->box) &&
+        joinedWithin(graph, {{peer->id, length}}, covering, max_walk)) {
       return true;
     }
   }
@@ -1157,10 +1145,25 @@ int demoteFleetCoveredFrontiers(GraphManager& graph, int robot_id,
                                 double max_dz_m) {
   if (!(radius_m > 0.0)) return 0;
   const double reach = std::hypot(radius_m, std::max(0.0, max_dz_m));
-  int demoted = 0;
+  // This robot's vertices in id order, from the cursor on, wrapping round.
+  std::vector<Vertex*> own;
   for (auto& entry : graph.vertices_map_) {
-    Vertex* vertex = entry.second;
-    if (vertex == nullptr || vertex->robot_id != robot_id) continue;
+    if (entry.second != nullptr && entry.second->robot_id == robot_id) {
+      own.push_back(entry.second);
+    }
+  }
+  std::sort(own.begin(), own.end(),
+            [](const Vertex* a, const Vertex* b) { return a->id < b->id; });
+  FleetCoverageCursor* cursor = links != nullptr ? links->cursor : nullptr;
+  if (cursor != nullptr) {
+    const auto first = std::lower_bound(
+        own.begin(), own.end(), cursor->next_frontier_id,
+        [](const Vertex* v, int id) { return v->id < id; });
+    std::rotate(own.begin(), first, own.end());
+  }
+  int first_deferred = -1;
+  int demoted = 0;
+  for (Vertex* vertex : own) {
     if (!vertex->fleet_covered) {
       if (vertex->type != VertexType::kFrontier ||
           !graph.inService(*vertex)) {
@@ -1182,10 +1185,15 @@ int demoteFleetCoveredFrontiers(GraphManager& graph, int robot_id,
       // Near is not seen: a peer vertex across a wall is as near (review
       // r0, I-1). Only one a short walk joins to the frontier covers it.
       const double max_walk = kFleetCoveragePathFactor * radius_m;
-      if (!joinedWithin(graph, {{vertex->id, 0.0}}, covering, max_walk) &&
-          !joinedByALink(graph, *vertex, robot_id, covering, max_walk,
-                         links)) {
-        continue;
+      if (!joinedWithin(graph, {{vertex->id, 0.0}}, covering, max_walk)) {
+        const int deferred = links != nullptr ? links->deferred : 0;
+        const bool joined = joinedByALink(graph, *vertex, robot_id, covering,
+                                          max_walk, links);
+        if (links != nullptr && links->deferred > deferred &&
+            first_deferred < 0) {
+          first_deferred = vertex->id;
+        }
+        if (!joined) continue;
       }
       vertex->fleet_covered = true;
     }
@@ -1195,6 +1203,9 @@ int demoteFleetCoveredFrontiers(GraphManager& graph, int robot_id,
     }
     vertex->vol_gain.is_frontier = false;
     vertex->vol_gain.gain = 0.0;
+  }
+  if (cursor != nullptr) {
+    cursor->next_frontier_id = first_deferred >= 0 ? first_deferred : 0;
   }
   return demoted;
 }
