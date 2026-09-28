@@ -861,6 +861,16 @@ class PlannerNode : public rclcpp::Node {
   /// map-checked link of up to 1.5 m to a peer vertex), is covered by the
   /// fleet (mgg::demoteFleetCoveredFrontiers); zero disables.
   double fleet_coverage_radius_m_ = 3.0;
+  /// Swept link checks one coverage pass may make
+  /// (fleet_coverage_max_link_checks); the frontiers left over wait for the
+  /// next pass.
+  int fleet_coverage_max_link_checks_ = mgg::kFleetCoverageMaxLinkChecks;
+  /// Coverage link checks already made, while map_revision_ and
+  /// peer_roadmap_generation_ hold.
+  mgg::FleetCoverageLinkCache fleet_coverage_links_;
+  /// Advances when a merge moves a neighbour's roadmap vertices already
+  /// held (re-placed under a new transform, or the neighbour restarted).
+  std::uint64_t peer_roadmap_generation_ = 0;
   double reservation_exclusion_ttl_s_ = 3.0;
   double peer_body_radius_m_ = 0.6;
   double peer_body_ttl_s_ = 3.0;

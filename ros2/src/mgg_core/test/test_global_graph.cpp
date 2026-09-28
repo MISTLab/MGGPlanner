@@ -1190,9 +1190,98 @@ TEST(DemoteFleetCoveredFrontiers, OneLinkToANearPeerVertexNotSeenBlockedJoinsThe
     }
     // Without a map to check it against, no link is made.
     EXPECT_EQ(mgg::demoteFleetCoveredFrontiers(graph, 1, 3.0), 0);
-    EXPECT_EQ(mgg::demoteFleetCoveredFrontiers(graph, 1, 3.0, &fixture.ctx),
+    mgg::FleetCoverageLinks links{&fixture.ctx};
+    EXPECT_EQ(mgg::demoteFleetCoveredFrontiers(graph, 1, 3.0, &links),
               c.covered ? 1 : 0);
     EXPECT_EQ(frontier->fleet_covered, c.covered);
+  }
+}
+
+/// A thin wall (SlabSpace) that counts the swept checks made against it.
+class CountingSlab : public SlabSpace {
+ public:
+  using SlabSpace::SlabSpace;
+  VoxelStatus getPathStatus(const Eigen::Vector3d& a, const Eigen::Vector3d& b,
+                            const Eigen::Vector3d& box,
+                            bool s) const override {
+    ++calls;
+    return SlabSpace::getPathStatus(a, b, box, s);
+  }
+  mutable int calls = 0;
+};
+
+TEST(DemoteFleetCoveredFrontiers, TheRoadmapFirstThenLinksNearestFirstUpToOneThatJoins) {
+  // Review r2, M-1: a frontier the roadmap joins to a peer's visited
+  // vertex needs no swept check; otherwise links are checked nearest
+  // first, and no further once one joins. At (0, 0) an edge joins; at
+  // (20, 0) the nearest of three visited vertices joins; at (40, 0) the
+  // nearest, clear, leads nowhere, and the next joins.
+  Roadmap fixture;
+  CountingSlab map(50.0, 50.1);  // nowhere near: every link is clear
+  fixture.ctx.map = &map;
+  GraphManager graph;
+  graph.setRobotId(1);
+  Vertex* joined = ownFrontierAt(graph, 0.0, 0.0);
+  joinVertices(graph, joined, peerVertexAt(graph, 1.0, 0.0, 0.0, true));
+  ownFrontierAt(graph, 20.0, 0.0);
+  for (const double d : {1.4, 0.5, 1.0}) {
+    peerVertexAt(graph, 20.0, d, 0.0, true);
+  }
+  ownFrontierAt(graph, 40.0, 0.0);
+  peerVertexAt(graph, 40.0, 0.5, 0.0, false);
+  peerVertexAt(graph, 40.0, -1.0, 0.0, true);
+  mgg::FleetCoverageLinks links{&fixture.ctx};
+  EXPECT_EQ(mgg::demoteFleetCoveredFrontiers(graph, 1, 3.0, &links), 3);
+  EXPECT_EQ(links.checks, 3);
+  EXPECT_EQ(map.calls, 3);
+  EXPECT_EQ(links.deferred, 0);
+}
+
+TEST(DemoteFleetCoveredFrontiers, LinkChecksStayWithinTheBudgetAndResultsAreNotCheckedAgain) {
+  // Review r2, M-1: 40 frontiers, each with 20 visited peer vertices
+  // within 1.5 m behind a wall and no roadmap edge: 800 links to check.
+  // A pass makes no more than the budget (500); the frontiers it did not
+  // reach are left as they are, for the next pass. A cached result is not
+  // checked again while the map revision and the peers' roadmap
+  // generation hold; a new one of either checks afresh.
+  Roadmap fixture;
+  CountingSlab wall(0.25, 0.45);
+  fixture.ctx.map = &wall;
+  GraphManager graph;
+  graph.setRobotId(1);
+  std::vector<Vertex*> frontiers;
+  for (int i = 0; i < 40; ++i) {
+    const double x = 5.0 * i;
+    frontiers.push_back(ownFrontierAt(graph, x, 0.0));
+    for (const double dx : {-0.8, -0.4, 0.0, 0.4, 0.8}) {
+      for (const double y : {0.6, 0.8, 1.0, 1.2}) {
+        peerVertexAt(graph, x + dx, y, 0.0, true);
+      }
+    }
+  }
+  mgg::FleetCoverageLinkCache cache;
+  const auto pass = [&](std::uint64_t map_revision,
+                        std::uint64_t peer_generation) {
+    cache.keyTo(map_revision, peer_generation);
+    mgg::FleetCoverageLinks links{&fixture.ctx, &cache};
+    const int calls_before = wall.calls;
+    EXPECT_EQ(mgg::demoteFleetCoveredFrontiers(graph, 1, 3.0, &links), 0);
+    EXPECT_EQ(wall.calls - calls_before, links.checks);
+    EXPECT_LE(links.checks, mgg::kFleetCoverageMaxLinkChecks);
+    return links;
+  };
+  mgg::FleetCoverageLinks first = pass(7, 3);
+  EXPECT_EQ(first.checks, 500);
+  EXPECT_EQ(first.deferred, 15);
+  mgg::FleetCoverageLinks second = pass(7, 3);
+  EXPECT_EQ(second.checks, 300);
+  EXPECT_EQ(second.deferred, 0);
+  EXPECT_EQ(pass(7, 3).checks, 0);
+  EXPECT_EQ(pass(8, 3).checks, 500);
+  EXPECT_EQ(pass(8, 3).checks, 300);
+  EXPECT_EQ(pass(8, 4).checks, 500);
+  for (const Vertex* frontier : frontiers) {
+    EXPECT_EQ(frontier->type, VertexType::kFrontier);
   }
 }
 

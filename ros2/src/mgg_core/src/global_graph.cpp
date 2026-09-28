@@ -5,6 +5,7 @@
 #include <cmath>
 #include <functional>
 #include <limits>
+#include <optional>
 #include <queue>
 #include <unordered_map>
 #include <unordered_set>
@@ -1058,9 +1059,101 @@ bool joinedWithin(GraphManager& graph,
 
 }  // namespace
 
+void FleetCoverageLinkCache::keyTo(std::uint64_t map_revision,
+                                   std::uint64_t peer_roadmap_generation) {
+  if (keyed_ && map_revision == map_revision_ &&
+      peer_roadmap_generation == peer_roadmap_generation_) {
+    return;
+  }
+  results_.clear();
+  keyed_ = true;
+  map_revision_ = map_revision;
+  peer_roadmap_generation_ = peer_roadmap_generation;
+}
+
+std::uint64_t FleetCoverageLinkCache::pairKey(int frontier_id, int peer_id) {
+  return (static_cast<std::uint64_t>(static_cast<std::uint32_t>(frontier_id))
+          << 32) |
+         static_cast<std::uint32_t>(peer_id);
+}
+
+std::optional<bool> FleetCoverageLinkCache::find(int frontier_id,
+                                                 int peer_id) const {
+  const auto found = results_.find(pairKey(frontier_id, peer_id));
+  if (found == results_.end()) return std::nullopt;
+  return found->second;
+}
+
+void FleetCoverageLinkCache::store(int frontier_id, int peer_id, bool clear) {
+  results_[pairKey(frontier_id, peer_id)] = clear;
+}
+
+namespace {
+
+/// Whether a walk starting with one query-only link from `frontier` joins
+/// it to any of `covering` within `max_walk` (demoteFleetCoveredFrontiers):
+/// the roadmap does not, but once merged a peer's later extension beside
+/// the frontier gets no edge to it (review r1). A link runs to an
+/// in-service peer vertex within kFleetCoverageLinkM and must cross nothing
+/// the map has seen occupied. Links are tried nearest first, up to the
+/// first that joins; a check the cache holds is not made again, and once
+/// the pass's budget is spent the frontier is left as it is (review r2,
+/// M-1).
+bool joinedByALink(GraphManager& graph, const Vertex& frontier, int robot_id,
+                   const std::unordered_set<int>& covering, double max_walk,
+                   FleetCoverageLinks* links) {
+  if (links == nullptr || links->ctx == nullptr) return false;
+  std::vector<Vertex*> nearby;
+  if (!graph.getNearestVertices(&frontier.state, kFleetCoverageLinkM,
+                                &nearby)) {
+    return false;
+  }
+  std::vector<std::pair<double, const Vertex*>> candidates;
+  for (const Vertex* peer : nearby) {
+    if (peer == nullptr || peer->robot_id == robot_id ||
+        !graph.inService(*peer)) {
+      continue;
+    }
+    const double length =
+        (peer->state.head<3>() - frontier.state.head<3>()).norm();
+    if (length <= kFleetCoverageLinkM && length <= max_walk) {
+      candidates.emplace_back(length, peer);
+    }
+  }
+  std::sort(candidates.begin(), candidates.end(),
+            [](const auto& a, const auto& b) {
+              return a.first != b.first ? a.first < b.first
+                                        : a.second->id < b.second->id;
+            });
+  for (const auto& [length, peer] : candidates) {
+    std::optional<bool> clear;
+    if (links->cache != nullptr) {
+      clear = links->cache->find(frontier.id, peer->id);
+    }
+    if (!clear.has_value()) {
+      if (links->checks >= links->max_checks) {
+        ++links->deferred;
+        return false;
+      }
+      ++links->checks;
+      clear = !throughKnownObstacle(*links->ctx, frontier.state, peer->state,
+                                    links->ctx->robot_box_size);
+      if (links->cache != nullptr) {
+        links->cache->store(frontier.id, peer->id, *clear);
+      }
+    }
+    if (*clear && joinedWithin(graph, {{peer->id, length}}, covering,
+                               max_walk)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+}  // namespace
+
 int demoteFleetCoveredFrontiers(GraphManager& graph, int robot_id,
-                                double radius_m,
-                                const ExpandContext* link_ctx,
+                                double radius_m, FleetCoverageLinks* links,
                                 double max_dz_m) {
   if (!(radius_m > 0.0)) return 0;
   const double reach = std::hypot(radius_m, std::max(0.0, max_dz_m));
@@ -1088,32 +1181,10 @@ int demoteFleetCoveredFrontiers(GraphManager& graph, int robot_id,
       if (covering.empty()) continue;
       // Near is not seen: a peer vertex across a wall is as near (review
       // r0, I-1). Only one a short walk joins to the frontier covers it.
-      // The walk follows the roadmap, and may start with one link, never
-      // added to the graph, to a peer vertex within kFleetCoverageLinkM
-      // that crosses nothing this robot's map has seen occupied: once
-      // merged, a peer's later extension beside the frontier gets no edge
-      // to it (review r1).
-      std::vector<std::pair<int, double>> starts{{vertex->id, 0.0}};
-      std::vector<Vertex*> linkable;
-      if (link_ctx != nullptr &&
-          graph.getNearestVertices(&vertex->state, kFleetCoverageLinkM,
-                                   &linkable)) {
-        for (const Vertex* peer : linkable) {
-          if (peer == nullptr || peer->robot_id == robot_id ||
-              !graph.inService(*peer)) {
-            continue;
-          }
-          const double length =
-              (peer->state.head<3>() - vertex->state.head<3>()).norm();
-          if (length <= kFleetCoverageLinkM &&
-              !throughKnownObstacle(*link_ctx, vertex->state, peer->state,
-                                    link_ctx->robot_box_size)) {
-            starts.emplace_back(peer->id, length);
-          }
-        }
-      }
-      if (!joinedWithin(graph, starts, covering,
-                        kFleetCoveragePathFactor * radius_m)) {
+      const double max_walk = kFleetCoveragePathFactor * radius_m;
+      if (!joinedWithin(graph, {{vertex->id, 0.0}}, covering, max_walk) &&
+          !joinedByALink(graph, *vertex, robot_id, covering, max_walk,
+                         links)) {
         continue;
       }
       vertex->fleet_covered = true;

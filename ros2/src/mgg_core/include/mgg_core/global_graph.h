@@ -26,9 +26,12 @@
 #ifndef MGG_CORE_GLOBAL_GRAPH_H_
 #define MGG_CORE_GLOBAL_GRAPH_H_
 
+#include <cstdint>
 #include <deque>
 #include <functional>
 #include <limits>
+#include <optional>
+#include <unordered_map>
 #include <vector>
 
 #include <Eigen/Dense>
@@ -406,6 +409,48 @@ inline constexpr double kFleetCoveragePathFactor = 1.5;
 /// Fleet coverage: the longest query-only link from this robot's frontier
 /// to a peer vertex the walk may start with, metres.
 inline constexpr double kFleetCoverageLinkM = 1.5;
+/// Fleet coverage: the swept link checks one coverage pass may make, by
+/// default (fleet_coverage_max_link_checks).
+inline constexpr int kFleetCoverageMaxLinkChecks = 500;
+
+/// What swept checks of fleet coverage links (frontier vertex id, peer
+/// vertex id) found, clear or blocked, kept while the map and the placement
+/// of the peers' roadmaps stay as they were: a result is a function of the
+/// two positions and the map alone.
+class FleetCoverageLinkCache {
+ public:
+  /// Forgets every result unless already keyed to `map_revision` and
+  /// `peer_roadmap_generation`.
+  void keyTo(std::uint64_t map_revision,
+             std::uint64_t peer_roadmap_generation);
+  /// The result of the link's check: true clear, false blocked; none when
+  /// it was not checked at this key.
+  std::optional<bool> find(int frontier_id, int peer_id) const;
+  void store(int frontier_id, int peer_id, bool clear);
+  std::size_t size() const { return results_.size(); }
+
+ private:
+  static std::uint64_t pairKey(int frontier_id, int peer_id);
+  bool keyed_ = false;
+  std::uint64_t map_revision_ = 0;
+  std::uint64_t peer_roadmap_generation_ = 0;
+  std::unordered_map<std::uint64_t, bool> results_;
+};
+
+/// One coverage pass's query-only links: the map they are checked against,
+/// the results of earlier passes, and a budget of swept checks.
+struct FleetCoverageLinks {
+  /// The map and robot box each link is swept against; required.
+  const ExpandContext* ctx = nullptr;
+  /// Optional; the caller keys it (FleetCoverageLinkCache::keyTo).
+  FleetCoverageLinkCache* cache = nullptr;
+  /// Swept checks this pass may make; a cached result costs none.
+  int max_checks = kFleetCoverageMaxLinkChecks;
+  /// Out: the swept checks made, and the frontiers the budget left
+  /// unchanged, to be judged again next pass.
+  int checks = 0;
+  int deferred = 0;
+};
 
 /// MGG shared its global graph so the fleet explored as one (event E1,
 /// rrg.cpp:5270, marks the roadmap round where a robot drove visited). Each
@@ -416,19 +461,22 @@ inline constexpr double kFleetCoverageLinkM = 1.5;
 /// owner marked visited (Vertex::owner_visited), and joined to it by a walk
 /// within kFleetCoveragePathFactor * `radius_m`, is covered by the fleet:
 /// fleet_covered, kUnvisited, not a frontier, no gain. The walk follows
-/// in-service roadmap edges, and with `link_ctx` may start with one link,
-/// never added to the graph, to an in-service peer vertex of any type
-/// within kFleetCoverageLinkM whose straight segment, swept by the robot's
-/// box (link_ctx->robot_box_size) at its driving height, crosses nothing
-/// link_ctx->map knows occupied; unknown space passes. Its length counts.
-/// Without such a walk (a wall between them, review r0 I-1) the frontier
-/// stays for the greedy search and completion to see. One-way: a covered
-/// vertex re-typed a frontier since (a lattice path passing it) is demoted
-/// again. A radius of zero or less covers nothing. Returns how many
-/// frontiers it demoted.
+/// in-service roadmap edges. Failing that, with `links`, it may start with
+/// one link, never added to the graph, to an in-service peer vertex of any
+/// type within kFleetCoverageLinkM whose straight segment, swept by the
+/// robot's box (links->ctx->robot_box_size) at its driving height, crosses
+/// nothing links->ctx->map knows occupied; unknown space passes. Its length
+/// counts. Links are tried nearest first, up to the first that joins; a
+/// check links->cache holds is not made again, and once links->max_checks
+/// are made the frontiers still needing one are left as they are
+/// (links->deferred). Without such a walk (a wall between them, review r0
+/// I-1) the frontier stays for the greedy search and completion to see.
+/// One-way: a covered vertex re-typed a frontier since (a lattice path
+/// passing it) is demoted again. A radius of zero or less covers nothing.
+/// Returns how many frontiers it demoted.
 int demoteFleetCoveredFrontiers(GraphManager& graph, int robot_id,
                                 double radius_m,
-                                const ExpandContext* link_ctx = nullptr,
+                                FleetCoverageLinks* links = nullptr,
                                 double max_dz_m = kFleetCoverageMaxDzM);
 
 struct GlobalFrontierReport {

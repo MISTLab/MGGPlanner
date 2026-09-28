@@ -6,6 +6,7 @@
 #include <cstdio>
 #include <filesystem>
 #include <functional>
+#include <limits>
 #include <geometry_msgs/msg/transform_stamped.hpp>
 #include <random>
 #include <regex>
@@ -342,6 +343,10 @@ PlannerNode::PlannerNode(const rclcpp::NodeOptions& options)
   fleet_coverage_radius_m_ = std::max(
       0.0, declareOrGet<double>(this, "fleet_coverage_radius_m",
                                 fleet_coverage_radius_m_));
+  fleet_coverage_max_link_checks_ = static_cast<int>(std::clamp<std::int64_t>(
+      declareOrGet<std::int64_t>(this, "fleet_coverage_max_link_checks",
+                                 fleet_coverage_max_link_checks_),
+      0, std::numeric_limits<int>::max()));
   coordination_exclusions_sub_ =
       create_subscription<geometry_msgs::msg::PoseArray>(
           "coordination_exclusions", rclcpp::QoS(10),
@@ -832,9 +837,21 @@ void PlannerNode::demoteFleetCoveredFrontiers() {
   auto map_read = mapReadLease();
   const mgg::ExpandContext ctx = makeGlobalContext();
   const bool map_serves = ctx.map != nullptr && ctx.map->getStatus();
+  // A link's check holds while the map and the peers' placement do; a pass
+  // makes at most fleet_coverage_max_link_checks of them (review r2, M-1).
+  refreshMapRevision();
+  fleet_coverage_links_.keyTo(map_revision_, peer_roadmap_generation_);
+  mgg::FleetCoverageLinks links{&ctx, &fleet_coverage_links_,
+                                fleet_coverage_max_link_checks_};
   const int demoted = mgg::demoteFleetCoveredFrontiers(
       *global_graph_, static_cast<int>(planning_params_.robot_id),
-      fleet_coverage_radius_m_, map_serves ? &ctx : nullptr);
+      fleet_coverage_radius_m_, map_serves ? &links : nullptr);
+  if (links.deferred > 0) {
+    RCLCPP_INFO(get_logger(),
+                "fleet coverage: %d link check(s), the pass's budget, made; "
+                "%d frontier(s) left for the next pass",
+                links.checks, links.deferred);
+  }
   if (demoted > 0) {
     RCLCPP_INFO(get_logger(),
                 "%d frontier(s) covered by the fleet: a peer's visited vertex "
@@ -2060,6 +2077,9 @@ mgg::MergeResult PlannerNode::mergeNeighbourRoadmap(
       r.vertices_replaced > 0 ||
       r.neighbour_restarted) {
     ++graph_revision_;
+  }
+  if (r.vertices_replaced > 0 || r.neighbour_restarted) {
+    ++peer_roadmap_generation_;
   }
   return r;
 }
