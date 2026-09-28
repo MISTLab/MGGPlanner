@@ -4,6 +4,7 @@
 #include <fstream>
 #include <sstream>
 #include "mgg_core/ground_projection.h"
+#include "mgg_core/grid_graph.h"
 #include "mgg_map_octomap/native_mola_grid.h"
 
 namespace {
@@ -83,5 +84,75 @@ TEST(GateTerrain, BunkerRiseKeepsObservedAdmissibleHangarFloor) {
     }
   }
   EXPECT_GT(admissible,50);
+}
+TEST(GateTerrain, DisabledRiseClearanceRouteAvoidsSouthToe) {
+  auto map = gate();
+  auto p = scout();
+  p.max_footprint_cell_rise = 0.0;
+  p.path_clearance_margin = 0.6;
+  p.rr_mode = mgg::RRModeType::kGraph;
+  p.edge_length_min = 0.01;
+  p.edge_length_max = 0.6;
+  p.edge_overshoot = 0.0;
+  p.nearest_range = 0.3;
+  p.nearest_range_min = 0.01;
+  p.nearest_range_max = 0.31;
+  p.num_vertices_max = 3000;
+  p.num_edges_max = 30000;
+  p.num_loops_max = 50000;
+  mgg::GroundProjection ground(map, p, true);
+  mgg::RobotParams robot;
+  robot.type = mgg::RobotType::kGroundRobot;
+  robot.size = {0.612, 0.580, 0.245};
+  robot.size_extension = {0.05, 0.05, 0.05};
+  const auto driving = [&](double world_x, double world_y) {
+    Eigen::Vector3d point(world_x + 16.5, world_y - 1, 0.4);
+    mgg::VoxelStatus status;
+    const double drop = ground.projectSample(point, status);
+    EXPECT_EQ(status, mgg::VoxelStatus::kOccupied);
+    point.z() -= drop - p.max_ground_height;
+    return mgg::StateVec(point.x(), point.y(), point.z(), 0);
+  };
+  const auto start = driving(-12.5, -1.4);
+  const auto goal = driving(-10.1, 0.0);
+  mgg::GraphManager graph;
+  graph.addVertex(new mgg::Vertex(0, start));
+  mgg::ExpandContext ctx;
+  ctx.map = &map;
+  ctx.planning = &p;
+  ctx.robot = &robot;
+  ctx.ground = &ground;
+  ctx.robot_box_size = box;
+  mgg::GridGraphParams grid;
+  grid.min_val = {-0.8, -1.0, 0};
+  grid.max_val = {3.6, 3.0, 0};
+  grid.resolution = {0.2, 0.2, 0.1};
+  mgg::buildGridGraph(graph, start, grid, ctx, 0);
+  mgg::Vertex* end = nullptr;
+  ASSERT_TRUE(graph.getNearestVertex(&goal, &end));
+  ASSERT_NE(end, nullptr);
+  ASSERT_LT((end->state.head<2>() - goal.head<2>()).norm(), 0.01);
+  mgg::ShortestPathsReport report;
+  ASSERT_TRUE(graph.findShortestPaths(0, report));
+  std::vector<mgg::Vertex*> path;
+  graph.getShortestPath(end->id, report, true, path);
+  ASSERT_GT(path.size(), 2u);
+  bool crossed = false;
+  double lowest_y = 100;
+  for (size_t i = 1; i < path.size(); ++i) {
+    for (int k = 0; k <= 20; ++k) {
+      const Eigen::Vector3d point = path[i - 1]->state.head<3>() +
+          (k / 20.0) * (path[i]->state - path[i - 1]->state).head<3>();
+      const double x = point.x() - 16.5, y = point.y() + 1;
+      if (x >= -11.8 && x <= -10.8) {
+        crossed = true;
+        lowest_y = std::min(lowest_y, y);
+        EXPECT_GT(y, -1.0) << "world x=" << x;
+      }
+    }
+  }
+  EXPECT_TRUE(crossed);
+  std::printf("native gate rise=0 margin=0.6: %zu poses, minimum y %.3f\n",
+              path.size(), lowest_y);
 }
 } // namespace
