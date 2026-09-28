@@ -186,18 +186,23 @@ PathSelectionResult selectBestPath(GraphManager& graph,
   std::vector<Vertex*> leaves;
   graph.getLeafVertices(leaves);
 
-  // A candidate is a route from the root with the edge cost to each of its
-  // vertices: every leaf's shortest path and, before a fallback, the routes
-  // findTurnCompliantRoutes finds.
+  // Weighted searches choose routes; gain (and its absolute low-gain
+  // threshold) is discounted in physical metres, including detour routes.
   using Candidate = TurnCompliantRoutes::Route;
+  const auto metric_along = [](Candidate& candidate) {
+    candidate.along.assign(candidate.path.size(), 0.0);
+    for (std::size_t i = 1; i < candidate.path.size(); ++i) {
+      candidate.along[i] = candidate.along[i - 1] +
+          (candidate.path[i]->state.head<3>() -
+           candidate.path[i - 1]->state.head<3>()).norm();
+    }
+  };
   std::vector<Candidate> shortest;
   for (Vertex* leaf : leaves) {
     if (leaf == nullptr) continue;
     Candidate candidate;
     graph.getShortestPath(leaf->id, rep, true, candidate.path);
-    for (const Vertex* v : candidate.path) {
-      candidate.along.push_back(graph.getShortestDistance(v->id, rep));
-    }
+    metric_along(candidate);
     shortest.push_back(std::move(candidate));
   }
 
@@ -461,7 +466,10 @@ PathSelectionResult selectBestPath(GraphManager& graph,
       candidates.reserve(routes.to.size());
       for (const int id : destinations) {
         const auto found = routes.to.find(id);
-        if (found != routes.to.end()) candidates.push_back(found->second);
+        if (found != routes.to.end()) {
+          candidates.push_back(found->second);
+          metric_along(candidates.back());
+        }
       }
       detour = choose(true, candidates);
     }

@@ -801,3 +801,19 @@ TEST(PathSelection, ClearanceRoutingCostDoesNotConsumePhysicalRetreatReach) {
       [](const Vertex& v) { return v.id == 0; }, {}, {}, 0, retreat);
   EXPECT_EQ(selected.best_path_id, 3);
 }
+
+TEST(PathSelection, WeightedRoutingKeepsMetricGainDiscount) {
+  GraphManager graph;
+  for (int i = 0; i < 3; ++i) {
+    auto* v = new Vertex(i, StateVec(i, 0, 0, 0));
+    v->vol_gain.gain = i == 2 ? 100.0 : 0.0;
+    graph.addVertex(v);
+    if (i) graph.addEdge(v, graph.getVertex(i - 1), 5.0);
+  }
+  auto p = makePlanning();
+  p.path_length_penalty = 0.25;
+  const auto result = mgg::selectBestPath(
+      graph, p, RobotParams(), EdgeInclinations(), 0.2, 0.0);
+  EXPECT_NEAR(result.best_gain, 100 * std::exp(-0.25 * 2), 1e-9);
+  EXPECT_NEAR(result.best_full_gain, 100 * std::exp(-0.25 * 2), 1e-9);
+}

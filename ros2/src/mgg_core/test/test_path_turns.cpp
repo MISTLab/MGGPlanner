@@ -883,7 +883,7 @@ TEST(PathTurnCheck, ArrivalTurningWhereItMayNotLeavesTheSearchLooking) {
   Vertex* b = add(3, -2.0, 2.0);
   Vertex* c = add(4, 0.0, 2.0);
   const auto link = [&graph](Vertex* u, Vertex* v) {
-    graph.addEdge(u, v, (u->state - v->state).head<3>().norm());
+    graph.addEdge(u, v, 5 * (u->state - v->state).head<3>().norm());
   };
   link(r, a);
   link(a, f);
@@ -900,7 +900,7 @@ TEST(PathTurnCheck, ArrivalTurningWhereItMayNotLeavesTheSearchLooking) {
   ASSERT_EQ(routes.to.count(f->id), 1u);
   EXPECT_EQ(routes.to.at(f->id).path,
             (std::vector<Vertex*>{r, b, c, f}));
-  EXPECT_NEAR(routes.to.at(f->id).along.back(), 5.6, 1e-9);
+  EXPECT_NEAR(routes.to.at(f->id).along.back(), 28.0, 1e-9);
   EXPECT_EQ(routes.arrivals_refused, 1);
   EXPECT_FALSE(routes.capped);
 
@@ -923,12 +923,14 @@ TEST(PathTurnCheck, ArrivalTurningWhereItMayNotLeavesTheSearchLooking) {
     return check.sharpTurnAllowedAt(v.state.head<3>());
   };
   mgg::PlanningParams planning;
-  planning.path_length_penalty = 0.0;
+  planning.path_length_penalty = 0.25;
   planning.path_direction_penalty = 0.0;
   mgg::EdgeInclinations flat;
   const auto sel = mgg::selectBestPath(graph, planning, robot(), flat, 0.2,
                                        0.0, {}, 0.0, nullptr, std::ref(check),
                                        allowed);
+  EXPECT_NEAR(sel.best_gain, 100 * std::exp(-0.25 * 5.6), 1e-9);
+  EXPECT_NEAR(sel.best_full_gain, 100 * std::exp(-0.25 * 5.6), 1e-9);
   EXPECT_TRUE(sel.sharp_turn_detour);
   EXPECT_FALSE(sel.sharp_turn_fallback);
   EXPECT_EQ(sel.best_path, (std::vector<Vertex*>{r, b, c, f}));
