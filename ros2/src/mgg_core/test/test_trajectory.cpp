@@ -139,3 +139,38 @@ TEST(Trajectory, ClearanceCostNeverOverridesCollisionOrTurnChecks) {
   EXPECT_EQ(mgg::shortcutPath(path, blocked, keep_turn, cost), path);
   EXPECT_GE(mgg::shortcutPath(path, alwaysFree, keep_turn, cost).size(), 3u);
 }
+
+TEST(Trajectory, CostAwareShortcutBoundsOriginalArcBeforeCollisionChecks) {
+  mgg::PathType path;
+  // A folded path: distant-in-arc candidates can be nearby in Euclidean space.
+  for (int i = 0; i <= 100; ++i) path.emplace_back(i * 0.1, (i % 2) * 0.5, 0);
+  std::vector<double> arc(path.size(), 0);
+  for (size_t i = 1; i < path.size(); ++i)
+    arc[i] = arc[i - 1] + (path[i] - path[i - 1]).norm();
+  const auto free = [&](const auto& a, const auto& b) {
+    const auto i = static_cast<size_t>(std::lround(a.x() * 10));
+    const auto j = static_cast<size_t>(std::lround(b.x() * 10));
+    EXPECT_LE(arc[j] - arc[i], 6.4 + 1e-9);
+    return true;
+  };
+  const auto cost = [](const auto& a, const auto& b) { return (b - a).norm(); };
+  const auto result = mgg::shortcutPath(path, free, {}, cost);
+  EXPECT_EQ(result.front(), path.front());
+  EXPECT_EQ(result.back(), path.back());
+  EXPECT_GT(result.size(), 2u);
+  EXPECT_EQ(mgg::shortcutPath(path, alwaysFree).size(), 2u);
+  EXPECT_EQ(mgg::shortcutPath(path, alwaysFree, {}).size(), 2u);
+}
+
+TEST(Trajectory, CostAwareShortcutReturnsRemainderAfter64CostRejections) {
+  mgg::PathType path;
+  for (int i = 0; i <= 100; ++i) path.emplace_back(i * 0.05, 0, 0);
+  int checks = 0;
+  const auto free = [&](const auto&, const auto&) { ++checks; return true; };
+  const auto cost = [](const auto& a, const auto& b) {
+    const double length = (b - a).norm();
+    return length <= 0.051 ? length : 5 * length;
+  };
+  EXPECT_EQ(mgg::shortcutPath(path, free, {}, cost), path);
+  EXPECT_EQ(checks, 64);
+}

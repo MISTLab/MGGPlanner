@@ -62,6 +62,8 @@ using SegmentCostFn = std::function<double(const VectorType&, const VectorType&)
 /// point ahead keeps the path as it is, so a `path` that passes `path_ok`
 /// gives a shortcut that passes too. With `cost`, a leap must also cost no
 /// more than the original subpath; adjacent edges always remain available.
+/// Cost-aware leaps span at most 6.4 m of original arc. After 64 cost
+/// rejections, the untouched suffix is retained.
 /// Costs never override segment or turn checks. A `path` that fails it, or no
 /// `path_ok`, is shortcut as by shortcutPath.
 PathType shortcutPath(const PathType& path, const SegmentFreeFn& segment_free,

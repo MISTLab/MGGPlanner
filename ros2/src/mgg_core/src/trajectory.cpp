@@ -192,9 +192,12 @@ PathType shortcutPath(const PathType& path, const SegmentFreeFn& segment_free,
   if (path.size() < 3 || !segment_free) return path;
   const bool check_path = path_ok && path_ok(path);
   std::vector<double> original_cost(path.size(), 0.0);
+  std::vector<double> original_arc(path.size(), 0.0);
+  int cost_rejections = 0;
   if (cost) {
     for (size_t i = 1; i < path.size(); ++i) {
       original_cost[i] = original_cost[i - 1] + cost(path[i - 1], path[i]);
+      original_arc[i] = original_arc[i - 1] + (path[i] - path[i - 1]).norm();
     }
   }
   PathType out;
@@ -204,9 +207,18 @@ PathType shortcutPath(const PathType& path, const SegmentFreeFn& segment_free,
   while (at + 1 < path.size()) {
     size_t next = at + 1;
     for (size_t candidate = path.size() - 1; candidate > at + 1; --candidate) {
+      // 32 samples at 0.2 m: never pay for a longer collision sweep when
+      // its clearance would be sampled more coarsely than the original.
+      if (cost && original_arc[candidate] - original_arc[at] > 6.4) continue;
       if (!segment_free(path[at], path[candidate])) continue;
       if (cost && cost(path[at], path[candidate]) >
                       original_cost[candidate] - original_cost[at] + 1e-9) {
+        if (++cost_rejections >= 64) {
+          // Keep the last accepted prefix and untouched suffix. Advancing
+          // one edge and restarting would spend the budget all over again.
+          out.insert(out.end(), path.begin() + at + 1, path.end());
+          return out;
+        }
         continue;
       }
       trial = out;
