@@ -7351,14 +7351,69 @@ TEST_F(PlannerNodeTest, AFrontierTheFleetCoveredIsNeitherResumedNorHoldsBackComp
   EXPECT_TRUE(PlannerNodeTestPeer::completionWithheld(*fleet.a).empty());
 }
 
+TEST_F(PlannerNodeTest, APeerExtensionBesideARemoteFrontierCoversItAfterTheMerge) {
+  // Review r1: the roadmaps merge near home. a's frontier at (12, 3) is
+  // far from anything b has then. b drives on to beside it, (7, 3) in its
+  // frame, and a imports that extension into the merged graph, which adds
+  // no edge between them there. a has not moved; b's visited vertices,
+  // 0.5 m from the frontier over space a's map has not seen occupied,
+  // cover it.
+  TwoPlanners fleet("fleet_cover_later");
+  const int remote = PlannerNodeTestPeer::addGlobalChainToFrontier(
+      *fleet.a, {{2.0, 3.0}, {6.0, 3.0}, {10.0, 3.0}, {12.0, 3.0}});
+  PlannerNodeTestPeer::setVertexGain(*fleet.a, remote, 20000.0);
+  fleet.share();
+  PlannerNodeTestPeer::frontierClusters(*fleet.a);
+  ASSERT_TRUE(PlannerNodeTestPeer::isGlobalFrontier(*fleet.a, remote));
+
+  PlannerNodeTestPeer::observeFloor(*fleet.b, -1.5, 9.0, -1.5, 4.5);
+  double stamp = 20.0;
+  for (double x = 4.5; x <= 7.0 + 1e-9; x += 0.5) {
+    PlannerNodeTestPeer::acceptOdometry(*fleet.b, x, 0.0, stamp++);
+  }
+  for (double y = 0.5; y <= 3.5 + 1e-9; y += 0.5) {
+    PlannerNodeTestPeer::acceptOdometry(*fleet.b, 7.0, y, stamp++);
+  }
+  fleet.share();
+  PlannerNodeTestPeer::frontierClusters(*fleet.a);
+  EXPECT_FALSE(PlannerNodeTestPeer::isGlobalFrontier(*fleet.a, remote));
+}
+
+TEST_F(PlannerNodeTest, AWallSeenBetweenAFrontierAndANearPeerVertexKeepsIt) {
+  // Review r1: the link from a frontier to a peer vertex within 1.5 m
+  // must cross nothing this robot's map has seen occupied. The peer's
+  // visited vertex at (3, 1) is 1 m from the frontier at (3, 0) and 6.2 m
+  // from it by the roadmap, round by home. With the space between not
+  // seen, the peer covers the frontier; with a wall seen at y = 0.5, it
+  // does not.
+  for (const bool wall : {false, true}) {
+    SCOPED_TRACE(wall ? "wall seen" : "nothing seen");
+    auto node = makeNode(wall ? "fleet_cover_seen_wall" : "fleet_cover_open");
+    PlannerNodeTestPeer::observeFloor(*node, -1.5, 1.5, -1.5, 1.5);
+    PlannerNodeTestPeer::acceptOdometry(*node, 0.0, 0.0, 1.0);
+    const int frontier = PlannerNodeTestPeer::addGlobalChainToFrontier(
+        *node, {{1.5, 0.0}, {3.0, 0.0}});
+    PlannerNodeTestPeer::setVertexGain(*node, frontier, 20000.0);
+    const double z = PlannerNodeTestPeer::globalVertexState(*node, 0).z();
+    const int peer =
+        PlannerNodeTestPeer::addGlobalVertex(*node, 2, 3.0, 1.0, z, {0});
+    PlannerNodeTestPeer::markOwnerVisited(*node, peer);
+    if (wall) PlannerNodeTestPeer::observeWall(*node, 2.0, 4.0, 0.5);
+    PlannerNodeTestPeer::frontierClusters(*node);
+    EXPECT_EQ(PlannerNodeTestPeer::isGlobalFrontier(*node, frontier), wall);
+  }
+}
+
 TEST_F(PlannerNodeTest, AFrontierAcrossAWallFromWhereAPeerDroveIsNotCovered) {
   // Review r0, I-1: the peer's vertex at (2.5, 0), which it marked
   // visited, is 2.5 m from this robot's last frontier at (5, 0), but a
   // partition at x = 3 stands between them: the roadmap joins them only
-  // round it, through (0, 4) and (5, 4), 15.5 m. The peer did not see
-  // behind the partition, so the frontier stays: the greedy search
-  // repositions to it, and exploration is not complete. Joined through a
-  // doorway (an edge between them), the peer covers it and nothing is left.
+  // round it, through (0, 4) and (5, 4), 15.5 m. It is the nearest peer
+  // vertex, beyond the 1.5 m a query link may span (review r1). The peer
+  // did not see behind the partition, so the frontier stays: the greedy
+  // search repositions to it, and exploration is not complete. Joined
+  // through a doorway (an edge between them), the peer covers it and
+  // nothing is left.
   auto node = makeNode("fleet_cover_wall");
   PlannerNodeTestPeer::observeFloor(*node, -1.5, 1.5, -1.5, 1.5);
   PlannerNodeTestPeer::acceptOdometry(*node, 0.0, 0.0, 1.0);

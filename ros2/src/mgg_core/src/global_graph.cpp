@@ -1013,16 +1013,24 @@ FrontierAdditionReport addFrontiers(GraphManager& global_graph,
 
 namespace {
 
-/// Whether a walk over in-service roadmap edges (own, peer and merge edges,
-/// each checked when it was added) of at most `max_length_m` joins
-/// `source_id` to any of `targets`: Dijkstra, cut off at that length.
-bool joinedWithin(GraphManager& graph, int source_id,
+/// Whether a walk of at most `max_length_m` joins any of `starts` (a
+/// vertex id and the length already walked to it) to any of `targets` over
+/// in-service roadmap edges (own, peer and merge edges, each checked when it
+/// was added): Dijkstra, cut off at that length.
+bool joinedWithin(GraphManager& graph,
+                  const std::vector<std::pair<int, double>>& starts,
                   const std::unordered_set<int>& targets,
                   double max_length_m) {
   using Entry = std::pair<double, int>;
   std::priority_queue<Entry, std::vector<Entry>, std::greater<Entry>> open;
-  std::unordered_map<int, double> best{{source_id, 0.0}};
-  open.push({0.0, source_id});
+  std::unordered_map<int, double> best;
+  for (const auto& [id, length] : starts) {
+    if (length > max_length_m) continue;
+    const auto known = best.find(id);
+    if (known != best.end() && known->second <= length) continue;
+    best[id] = length;
+    open.push({length, id});
+  }
   while (!open.empty()) {
     const auto [length, at] = open.top();
     open.pop();
@@ -1051,7 +1059,9 @@ bool joinedWithin(GraphManager& graph, int source_id,
 }  // namespace
 
 int demoteFleetCoveredFrontiers(GraphManager& graph, int robot_id,
-                                double radius_m, double max_dz_m) {
+                                double radius_m,
+                                const ExpandContext* link_ctx,
+                                double max_dz_m) {
   if (!(radius_m > 0.0)) return 0;
   const double reach = std::hypot(radius_m, std::max(0.0, max_dz_m));
   int demoted = 0;
@@ -1075,11 +1085,34 @@ int demoteFleetCoveredFrontiers(GraphManager& graph, int robot_id,
           covering.insert(peer->id);
         }
       }
+      if (covering.empty()) continue;
       // Near is not seen: a peer vertex across a wall is as near (review
-      // r0, I-1). Only one the roadmap joins to the frontier by a short
-      // walk covers it.
-      if (covering.empty() ||
-          !joinedWithin(graph, vertex->id, covering,
+      // r0, I-1). Only one a short walk joins to the frontier covers it.
+      // The walk follows the roadmap, and may start with one link, never
+      // added to the graph, to a peer vertex within kFleetCoverageLinkM
+      // that crosses nothing this robot's map has seen occupied: once
+      // merged, a peer's later extension beside the frontier gets no edge
+      // to it (review r1).
+      std::vector<std::pair<int, double>> starts{{vertex->id, 0.0}};
+      std::vector<Vertex*> linkable;
+      if (link_ctx != nullptr &&
+          graph.getNearestVertices(&vertex->state, kFleetCoverageLinkM,
+                                   &linkable)) {
+        for (const Vertex* peer : linkable) {
+          if (peer == nullptr || peer->robot_id == robot_id ||
+              !graph.inService(*peer)) {
+            continue;
+          }
+          const double length =
+              (peer->state.head<3>() - vertex->state.head<3>()).norm();
+          if (length <= kFleetCoverageLinkM &&
+              !throughKnownObstacle(*link_ctx, vertex->state, peer->state,
+                                    link_ctx->robot_box_size)) {
+            starts.emplace_back(peer->id, length);
+          }
+        }
+      }
+      if (!joinedWithin(graph, starts, covering,
                         kFleetCoveragePathFactor * radius_m)) {
         continue;
       }

@@ -824,13 +824,17 @@ void PlannerNode::noteGlobalGraphEdges() {
 }
 
 void PlannerNode::demoteFleetCoveredFrontiers() {
+  // The walk to a peer's visited vertex may start with a link checked
+  // against this robot's map, clear of what it has seen occupied.
+  auto map_read = mapReadLease();
+  const mgg::ExpandContext ctx = makeGlobalContext();
   const int demoted = mgg::demoteFleetCoveredFrontiers(
       *global_graph_, static_cast<int>(planning_params_.robot_id),
-      fleet_coverage_radius_m_);
+      fleet_coverage_radius_m_, ctx.map != nullptr ? &ctx : nullptr);
   if (demoted > 0) {
     RCLCPP_INFO(get_logger(),
                 "%d frontier(s) covered by the fleet: a peer's visited vertex "
-                "lies within %.1f m, joined by a roadmap walk of %.1f m",
+                "lies within %.1f m, joined by a walk of %.1f m",
                 demoted, fleet_coverage_radius_m_,
                 mgg::kFleetCoveragePathFactor * fleet_coverage_radius_m_);
   }

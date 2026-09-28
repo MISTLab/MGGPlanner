@@ -1141,6 +1141,61 @@ TEST(DemoteFleetCoveredFrontiers, APeerVertexAcrossAWallDoesNotCover) {
   EXPECT_TRUE(frontier->fleet_covered);
 }
 
+TEST(DemoteFleetCoveredFrontiers, OneLinkToANearPeerVertexNotSeenBlockedJoinsThem) {
+  // Review r1: a peer's later extension beside this robot's frontier gets
+  // no edge to it once the roadmaps have merged. A query-only link from the
+  // frontier to a peer vertex (any type) within 1.5 m joins them, when this
+  // robot's map shows nothing occupied along it; unknown space passes. The
+  // walk on from there counts the link: 1.5 times the radius in all.
+  struct Case {
+    const char* name;
+    double link_y;     // the linked peer vertex, at (0, link_y)
+    double visited_y;  // the visited one past it, joined to it, at (0, y)
+    const MapInterface* map;
+    bool covered;
+  };
+  const OpenSpace open_space;
+  const OpenSpace unknown(0.3, /*unknown_instead=*/true);
+  const SlabSpace wall(0.45, 0.55);
+  for (const Case& c : {
+           Case{"visited, open", 1.0, 0.0, &open_space, true},
+           Case{"visited, unknown between", 1.0, 0.0, &unknown, true},
+           Case{"visited, a wall seen between", 1.0, 0.0, &wall, false},
+           Case{"visited, 1.6 m off", 1.6, 0.0, &open_space, false},
+           Case{"unvisited, a visited one 1.8 m on", 1.2, 3.0, &open_space,
+                true},
+           Case{"unvisited, 5.8 m in all", 1.4, -1.6, &open_space, false},
+       }) {
+    SCOPED_TRACE(c.name);
+    Roadmap fixture;
+    fixture.ctx.map = c.map;
+    GraphManager graph;
+    graph.setRobotId(1);
+    Vertex* frontier = ownFrontierAt(graph, 0.0, 0.0);
+    if (c.visited_y == 0.0) {
+      peerVertexAt(graph, 0.0, c.link_y, 0.0, true);
+    } else {
+      Vertex* link = peerVertexAt(graph, 0.0, c.link_y, 0.0, false);
+      Vertex* visited = peerVertexAt(graph, 0.0, c.visited_y, 0.0, true);
+      if (c.visited_y > 0.0) {
+        joinVertices(graph, link, visited);
+      } else {
+        // From the linked vertex 4.4 m round, within the 4.5 m, but 5.8 m
+        // with the 1.4 m link. Every vertex but the linked one is over
+        // 1.5 m from the frontier.
+        Vertex* round = peerVertexAt(graph, 1.6, 0.0, 0.0, false);
+        joinVertices(graph, link, round);
+        joinVertices(graph, round, visited);
+      }
+    }
+    // Without a map to check it against, no link is made.
+    EXPECT_EQ(mgg::demoteFleetCoveredFrontiers(graph, 1, 3.0), 0);
+    EXPECT_EQ(mgg::demoteFleetCoveredFrontiers(graph, 1, 3.0, &fixture.ctx),
+              c.covered ? 1 : 0);
+    EXPECT_EQ(frontier->fleet_covered, c.covered);
+  }
+}
+
 TEST(SearchGlobalFrontier, PicksTheReachableFrontierWithTheBestDiscountedGain) {
   FrontierGraph graph;
   const mgg::GlobalFrontierReport report = mgg::searchGlobalFrontier(

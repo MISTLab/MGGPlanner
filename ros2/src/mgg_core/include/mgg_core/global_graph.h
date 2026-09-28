@@ -403,6 +403,9 @@ inline constexpr double kFleetCoverageMaxDzM = 1.0;
 /// Fleet coverage: how long the roadmap walk from this robot's frontier to
 /// the covering peer vertex may be, times the coverage radius.
 inline constexpr double kFleetCoveragePathFactor = 1.5;
+/// Fleet coverage: the longest query-only link from this robot's frontier
+/// to a peer vertex the walk may start with, metres.
+inline constexpr double kFleetCoverageLinkM = 1.5;
 
 /// MGG shared its global graph so the fleet explored as one (event E1,
 /// rrg.cpp:5270, marks the roadmap round where a robot drove visited). Each
@@ -410,16 +413,22 @@ inline constexpr double kFleetCoveragePathFactor = 1.5;
 /// robot's (`robot_id`) where peers have driven never demotes on it. Here
 /// every in-service kFrontier vertex of this robot within `radius_m`
 /// horizontally and `max_dz_m` vertically of an in-service peer vertex its
-/// owner marked visited (Vertex::owner_visited), and joined to it by in-service
-/// roadmap edges within kFleetCoveragePathFactor * `radius_m`, is covered by
-/// the fleet: fleet_covered, kUnvisited, not a frontier, no gain. Without
-/// that short walk (a wall between them, review r0 I-1) the frontier stays
-/// for the greedy search and completion to see. One-way: a covered
+/// owner marked visited (Vertex::owner_visited), and joined to it by a walk
+/// within kFleetCoveragePathFactor * `radius_m`, is covered by the fleet:
+/// fleet_covered, kUnvisited, not a frontier, no gain. The walk follows
+/// in-service roadmap edges, and with `link_ctx` may start with one link,
+/// never added to the graph, to an in-service peer vertex of any type
+/// within kFleetCoverageLinkM whose straight segment, swept by the robot's
+/// box (link_ctx->robot_box_size) at its driving height, crosses nothing
+/// link_ctx->map knows occupied; unknown space passes. Its length counts.
+/// Without such a walk (a wall between them, review r0 I-1) the frontier
+/// stays for the greedy search and completion to see. One-way: a covered
 /// vertex re-typed a frontier since (a lattice path passing it) is demoted
 /// again. A radius of zero or less covers nothing. Returns how many
 /// frontiers it demoted.
 int demoteFleetCoveredFrontiers(GraphManager& graph, int robot_id,
                                 double radius_m,
+                                const ExpandContext* link_ctx = nullptr,
                                 double max_dz_m = kFleetCoverageMaxDzM);
 
 struct GlobalFrontierReport {
