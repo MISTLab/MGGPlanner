@@ -199,8 +199,7 @@ TEST(ParamLoader, ReverseExitLengthMustBeFiniteAndNonnegative) {
     auto node = std::make_shared<rclcpp::Node>("reverse_exit_length", opts);
     ParamLoader loader(node.get());
     mgg::PlanningParams params;
-    EXPECT_THROW(mgg_ros::loadPlanningParams(loader, "PlanningParams", params),
-                 std::invalid_argument);
+    EXPECT_FALSE(mgg_ros::loadPlanningParams(loader, "PlanningParams", params));
   }
 }
 
