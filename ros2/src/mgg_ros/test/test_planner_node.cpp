@@ -4405,6 +4405,62 @@ std::shared_ptr<mgg_msgs::srv::PlanObjective::Response> returnHome(
   return response;
 }
 
+TEST_F(PlannerNodeTest, DeployedStandingStartAllowsObservedArrivalDisksInsideItsBand) {
+  for (const bool bunker : {true, false}) {
+    auto node = makeNode(bunker ? "bunker_observed_departure" : "spot_observed_start");
+    PlannerNodeTestPeer::setRobotFootprint(*node, bunker ? 1.023 : 1.10,
+                                          bunker ? 0.778 : 0.50);
+    PlannerNodeTestPeer::setHangingRootReach(*node, bunker ? 2.0 : 2.5);
+    PlannerNodeTestPeer::setReachDistance(*node, 0.3);
+    PlannerNodeTestPeer::observeFloor(*node, -3.05, 3.05, -2.05, 2.05);
+    if (bunker) {
+      PlannerNodeTestPeer::observeWall(*node, -0.2, 3, 0.5);
+      PlannerNodeTestPeer::observeWall(*node, -0.2, 3, -0.5);
+    }
+    PlannerNodeTestPeer::serveMap(*node, "component:test", 0);
+    auto source = std::make_unique<TrajectoryInMemory>();
+    source->trajectory = keyframesAlong({{0, 0}});
+    PlannerNodeTestPeer::setKeyframeSource(*node, std::move(source));
+    PlannerNodeTestPeer::acceptOdometry(*node, 0, 0, 1);
+    ASSERT_TRUE(PlannerNodeTestPeer::standingStart(*node));
+    if (bunker) {
+      const auto start = PlannerNodeTestPeer::drivingState(*node, 0, 0, 0);
+      ASSERT_FALSE(PlannerNodeTestPeer::roomToTurnObserved(*node, start));
+      std::vector<mgg::StateVec> path;
+      bool reverse = false;
+      ASSERT_TRUE(PlannerNodeTestPeer::straightDeparture(*node, start, path, reverse));
+      ASSERT_TRUE(reverse);
+      EXPECT_LT(path.back().x(), -1.0);
+      EXPECT_GE(path.back().x(), -1.3);
+      EXPECT_TRUE(PlannerNodeTestPeer::roomToTurnObserved(*node, path.back()));
+    } else {
+      PlannerNodeTestPeer::setLattice(*node, {0, 0}, {1.5, 0});
+      auto response = std::make_shared<mgg_msgs::srv::PlannerSrv::Response>();
+      PlannerNodeTestPeer::plan(*node, response);
+      ASSERT_GE(response->path.size(), 2u);
+      EXPECT_LE(response->path.back().position.x, 1.5);
+    }
+  }
+}
+
+TEST_F(PlannerNodeTest, ATrulyBlindStandingStartExplainsTheRefusalAndNeverCompletes) {
+  auto node = makeNode("blind_start_diagnostic");
+  PlannerNodeTestPeer::setHangingRootReach(*node, 2.5);
+  PlannerNodeTestPeer::observeFreeBox(*node, {0, 0, 0.4}, {6, 6, 0.5});
+  PlannerNodeTestPeer::serveMap(*node, "component:test", 0);
+  auto source = std::make_unique<TrajectoryInMemory>();
+  source->trajectory = keyframesAlong({{0, 0}});
+  PlannerNodeTestPeer::setKeyframeSource(*node, std::move(source));
+  PlannerNodeTestPeer::acceptOdometry(*node, 0, 0, 1);
+  PlannerNodeTestPeer::consultGlobalPlannerAtOnce(*node);
+  const auto summary = PlannerNodeTestPeer::buildLocalGraph(*node);
+  EXPECT_NE(summary.find("no admissible observed-arrival goal"), std::string::npos) << summary;
+  auto response = std::make_shared<mgg_msgs::srv::PlannerSrv::Response>();
+  PlannerNodeTestPeer::plan(*node, response);
+  EXPECT_TRUE(response->path.empty());
+  EXPECT_EQ(response->status, PlannerNode::kStatusNoPath);
+}
+
 TEST_F(PlannerNodeTest, StandingStartIsReadOncePerDeparturePlanNotPerEndpoint) {
   auto node = makeNode("standing_start_once");
   PlannerNodeTestPeer::observeFloor(*node, -4.05, 4.05, -2.05, 2.05);

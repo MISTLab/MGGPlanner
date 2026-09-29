@@ -401,6 +401,27 @@ bool roomToTurn(const MapInterface& map, const RobotParams& robot,
          turnSpaceObserved(map, robot, planning, state, standing);
 }
 
+bool observedArrivalDisk(const MapInterface& map, const RobotParams& robot,
+                          const PlanningParams& planning, const StateVec& goal,
+                          double arrival_tolerance) {
+  if (!roomToTurn(map, robot, planning, goal, nullptr)) return false;
+  const Eigen::Vector3d center = goal.head<3>() + robot.center_offset;
+  const double radius = robot.turningRadius() + std::max(0.0, arrival_tolerance);
+  std::vector<XYCellCenter> cells;
+  if (!map.getCircleIntersectingXYCellCenters(center.head<2>(), radius, 4096, cells) ||
+      cells.empty()) return false;
+  if (map.getOccupiedOnlyCylinderPathStatus(center, center, radius,
+      robot.getPlanningSize().z()) == VoxelStatus::kOccupied) return false;
+  for (const auto& cell : cells) {
+    const Eigen::Vector3d from(cell.center.x(), cell.center.y(), center.z());
+    Eigen::Vector3d ground;
+    if (map.getGroundRayStatus(from,
+            from - Eigen::Vector3d(0, 0, 2.0 * planning.max_ground_height),
+            false, ground) != VoxelStatus::kOccupied) return false;
+  }
+  return true;
+}
+
 PathTurnCheck::PathTurnCheck(GraphManager& graph, const RobotParams& robot,
                              TurnRoomFn room_to_turn, SlopeFn slope)
     : graph_(graph),

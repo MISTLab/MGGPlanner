@@ -107,6 +107,14 @@ bool roomToTurn(const MapInterface& map, const RobotParams& robot,
                 const PlanningParams& planning, const StateVec& state,
                 const StandingStart* standing = nullptr);
 
+/// A fully observed first-goal arrival disk, independent of the standing
+/// prior. Every ground column touched by any arrival's turn circle must
+/// have mapped support at driving height; the union must be obstacle clear.
+/// Unlike the ordinary fractional support rule, no blind cell is admitted.
+bool observedArrivalDisk(const MapInterface& map, const RobotParams& robot,
+                          const PlanningParams& planning, const StateVec& goal,
+                          double arrival_tolerance);
+
 /// Whether a path turns sharply only where it may.
 using PathTurnsFn = std::function<bool(const std::vector<Vertex*>&)>;
 

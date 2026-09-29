@@ -1598,7 +1598,9 @@ std::optional<mgg::StandingStart> PlannerNode::readStandingStart() {
 
 bool PlannerNode::standingStartGoalAdmissible(const mgg::StateVec& goal) {
   const auto standing = standingStart();
-  return !standing || standing->admitsGoal(goal.head<2>(), reach_distance_);
+  return !standing || standing->admitsGoal(goal.head<2>(), reach_distance_) ||
+         mgg::observedArrivalDisk(*map_, robot_params_, planning_params_, goal,
+                                  reach_distance_);
 }
 
 Eigen::Isometry3d PlannerNode::navigationFromComponent() const {
@@ -3062,7 +3064,7 @@ std::string PlannerNode::buildLocalGraph() {
       slope_end_retreat,
       [this, &standing](const mgg::Vertex& v) {
         return no_go_.inside(v.state.head<3>()) ||
-               (standing && !standing->admitsGoal(v.state.head<2>(), reach_distance_));
+               (standing && !standingStartGoalAdmissible(v.state));
       },
       // A path the final check would refuse is left out, so another is
       // chosen rather than none (review r1, R1-1).
@@ -3308,7 +3310,13 @@ std::string PlannerNode::buildLocalGraph() {
                   corner.on_slope ? "slope" : "no room");
     corner_note = first;
   }
-  return std::string(buf) + standing_note + room_note + corner_note;
+  std::string arrival_note;
+  if (standing && best_path_.empty()) {
+    local_gain_remains_now_ = true;
+    arrival_note = "; standing start: no admissible observed-arrival goal; "
+                   "waiting for observed support/clearance";
+  }
+  return std::string(buf) + standing_note + room_note + corner_note + arrival_note;
 }
 
 std::string PlannerNode::departBoxedIn(const mgg::StateVec& root_state,
@@ -4489,6 +4497,7 @@ void PlannerNode::onPlanRequest(
   robot_params_.bound_mode = previous;
   refreshNoGoZones();
   recordSentPath();
+  if (best_path_.empty() && standingStart()) complete = false;
   response->status = !best_path_.empty()
                          ? mgg_msgs::srv::PlannerSrv::Response::FORWARD
                      : complete ? kStatusComplete

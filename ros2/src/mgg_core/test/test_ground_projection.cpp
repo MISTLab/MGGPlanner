@@ -117,6 +117,32 @@ PlanningParams makeParams() {
   return p;
 }
 
+TEST(StandingStart, ObservedArrivalDiskChecksSupportBeyondTheEndpointTurnCircle) {
+  mgg::RobotParams robot;
+  robot.type = mgg::RobotType::kGroundRobot;
+  robot.size = {0.6, 0.2, 0.2};
+  robot.size_extension.setZero();
+  robot.bound_mode = mgg::BoundModeType::kExactBound;
+  auto params = makeParams();
+  params.min_observed_ground_fraction = 0.75;
+  std::map<std::pair<std::int64_t, std::int64_t>, double> tops;
+  for (int x = -10; x < 10; ++x) {
+    for (int y = -10; y < 10; ++y) tops[{x, y}] = 0;
+  }
+  const mgg::StateVec goal(0.1, 0.1, 0.5, 0);
+  mgg_test::TerrainFixture observed(0.2, tops);
+  EXPECT_TRUE(mgg::observedArrivalDisk(observed, robot, params, goal, 0.3));
+  // The endpoint itself has room, but an early/lateral arrival would put
+  // part of its turning footprint over a blind cell (or a measured drop).
+  tops.erase({3, 0});
+  for (const bool drop : {false, true}) {
+    if (drop) tops[{3, 0}] = -2.0;
+    mgg_test::TerrainFixture missing(0.2, tops);
+    ASSERT_TRUE(mgg::roomToTurn(missing, robot, params, goal));
+    EXPECT_FALSE(mgg::observedArrivalDisk(missing, robot, params, goal, 0.3));
+  }
+}
+
 TEST(StandingStart, FirstGoalArrivalBandMustClearTheAnchoredPrior) {
   const mgg::StandingStart start{Eigen::Vector2d(2, -1), 1.2};
   EXPECT_FALSE(start.admitsGoal({2.8, -0.2}, 0.25));
