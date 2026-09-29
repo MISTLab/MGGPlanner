@@ -277,6 +277,15 @@ class MolaFloorProduct {
 
 class PlannerNodeTestPeer {
  public:
+  static std::string retainBestPath(PlannerNode& node) { return node.rememberReverseExit(); }
+  static void trackMeasuredGround(PlannerNode& node) {
+    node.cloud_map_->setTrackMeasuredSurfaceZ(true);
+  }
+  static std::pair<double, double> refugeSlopes(PlannerNode& node, const mgg::StateVec& pose) {
+    const double radius = std::max(node.robot_params_.size.x(), node.robot_params_.size.y());
+    return {mgg::groundSlope(*node.ground_, pose.head<3>(), radius),
+            mgg::groundSlope(*node.ground_, pose.head<3>(), radius, node.local_graph_.get())};
+  }
   static std::size_t storedReversePoses(const PlannerNode& node) {
     return node.stored_reverse_exit_.size();
   }
@@ -4337,6 +4346,69 @@ TEST_F(PlannerNodeTest, ReturnHomeFromANarrowEndpointUsesAndKeepsTheReverseCorri
       EXPECT_NE(response->reason.find("reverse exit"), std::string::npos) << response->reason;
     }
   }
+}
+
+TEST_F(PlannerNodeTest, AFailedRetentionExcludesTheEndpointOnTheNextSelection) {
+  MolaFloorProduct clear(-2, 7, -2, 2,
+      {{{0.8, 7, 0.4, 0.6}}, {{0.8, 7, -0.6, -0.4}}});
+  auto node = makeNode("retention_exclusion");
+  PlannerNodeTestPeer::useMolaMap(*node, clear.serve());
+  PlannerNodeTestPeer::setRobotFootprint(*node, 1.0, 0.3);
+  PlannerNodeTestPeer::setLattice(*node, {0, 0}, {5.5, 0});
+  PlannerNodeTestPeer::acceptOdometryFacing(*node, 0, 0, 0, 1);
+  PlannerNodeTestPeer::buildLocalGraph(*node);
+  const auto first = PlannerNodeTestPeer::bestPath(*node);
+  ASSERT_GE(first.size(), 2u);
+  const auto failed_endpoint = first.back().head<3>().eval();
+  MolaFloorProduct blocked(-2, 7, -2, 2,
+      {{{0.8, 7, 0.4, 0.6}}, {{0.8, 7, -0.6, -0.4}}, {{2.8, 3, -2, 2}}});
+  PlannerNodeTestPeer::useMolaMap(*node, blocked.serve());
+  const auto refusal = PlannerNodeTestPeer::retainBestPath(*node);
+  EXPECT_NE(refusal.find("reverse exit retention refused"), std::string::npos);
+  ASSERT_TRUE(PlannerNodeTestPeer::bestPath(*node).empty());
+  PlannerNodeTestPeer::useMolaMap(*node, clear.serve());
+  // A request rejected before selection must not consume the queued retry
+  // exclusion; it belongs to the next actual endpoint selection.
+  auto request = std::make_shared<mgg_msgs::srv::PlanObjective::Request>();
+  auto response = std::make_shared<mgg_msgs::srv::PlanObjective::Response>();
+  PlannerNodeTestPeer::objective(*node, request, response);
+  ASSERT_EQ(response->status, mgg_msgs::srv::PlanObjective::Response::STALE_REVISION);
+  PlannerNodeTestPeer::buildLocalGraph(*node);
+  const auto next = PlannerNodeTestPeer::bestPath(*node);
+  EXPECT_TRUE(next.empty() || (next.back().head<3>() - failed_endpoint).norm() > 0.35);
+}
+
+TEST_F(PlannerNodeTest, NearEightDegreeRefugeUsesTheSameSlopeForCutbackAndRetention) {
+  auto node = makeNode("one_refuge_predicate");
+  PlannerNodeTestPeer::setRobotFootprint(*node, 1.0, 0.3);
+  PlannerNodeTestPeer::trackMeasuredGround(*node);
+  const double map_grade = std::tan(8.3 * M_PI / 180);
+  PlannerNodeTestPeer::observeSparseSlope(*node, -2, 3, -2, 2, map_grade, false);
+  PlannerNodeTestPeer::observeWall(*node, 0.5, 3, 0.25);
+  PlannerNodeTestPeer::observeWall(*node, 0.5, 3, -0.25);
+  PlannerNodeTestPeer::acceptOdometryFacing(*node, 0, 0, 0, 1);
+  const auto root = PlannerNodeTestPeer::drivingState(*node, 0, 0, 0);
+  std::vector<mgg::StateVec> lattice;
+  for (double x : {-0.6, 0.0, 0.6}) {
+    for (double y : {-0.6, 0.0, 0.6}) {
+      lattice.emplace_back(x, y, root.z() + std::tan(7.7 * M_PI / 180) * x, 0);
+    }
+  }
+  PlannerNodeTestPeer::setSeenLattice(*node, lattice);
+  const auto slopes = PlannerNodeTestPeer::refugeSlopes(*node, root);
+  ASSERT_GT(slopes.first, mgg::kLevelGroundSlopeRad);
+  ASSERT_LT(slopes.second, mgg::kLevelGroundSlopeRad);
+  int target = 0;
+  for (double x : {0.5, 1.0, 1.5}) {
+    target = PlannerNodeTestPeer::addGlobalVertex(*node, 1, x, 0,
+        root.z() + map_grade * x, {target});
+  }
+  PlannerNodeTestPeer::markGlobalFrontier(*node, target);
+  std::string reason;
+  // Map-only refuge certification must reject before a tour decision is
+  // committed, not admit with the lattice then drop during retention.
+  EXPECT_FALSE(PlannerNodeTestPeer::runGlobalPlanner(*node, reason, target));
+  EXPECT_TRUE(PlannerNodeTestPeer::bestPath(*node).empty());
 }
 
 TEST_F(PlannerNodeTest, LongNarrowCorridorAdmitsAnEndpointWithAValidatedReverseExit) {

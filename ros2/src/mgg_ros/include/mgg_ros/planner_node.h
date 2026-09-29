@@ -141,7 +141,8 @@ class PlannerNode : public rclcpp::Node {
   void readmitQuarantinedNeighbours();
   /// Updates the turn-back hysteresis from the path a plan request sends.
   void recordSentPath();
-  void rememberReverseExit();
+  std::string rememberReverseExit();
+  bool reverseExitEndpointExcluded(const mgg::StateVec& pose) const;
   bool tryStoredReverseExit(const mgg::StateVec& start, std::string& note);
   bool storedReverseExitApplies(const mgg::StateVec& pose) const;
   bool reverseExitRefuge(const mgg::StateVec& pose) const;
@@ -411,7 +412,7 @@ class PlannerNode : public rclcpp::Node {
   // Nested entry points share one lazy snapshot; the outer plan owns its
   // lifetime, including cached absence and the unreadable-source diagnostic.
   struct StandingStartScope {
-    explicit StandingStartScope(PlannerNode& node);
+    explicit StandingStartScope(PlannerNode& node, bool selecting = false);
     ~StandingStartScope();
     PlannerNode& node;
   };
@@ -423,6 +424,8 @@ class PlannerNode : public rclcpp::Node {
   // reused across requests or map generations; the request pins peers.
   mutable std::map<std::array<double, 6>, bool> plan_reverse_edges_;
   mutable std::uint64_t plan_reverse_generation_ = 0;
+  std::vector<Eigen::Vector3d> pending_reverse_exit_exclusions_;
+  std::vector<Eigen::Vector3d> plan_reverse_exit_exclusions_;
   bool standingStartGoalAdmissible(const mgg::StateVec& goal);
   /// keyframe_source_->read. A failure is an ERROR, logged at once and then
   /// at most every kKeyframeReadErrorPeriodS until a read succeeds: without
