@@ -1539,6 +1539,17 @@ class PlannerNodeTestPeer {
     node.global_exploration_ongoing_ = true;
     node.current_global_vertex_id_ = target_id;
   }
+  /// The last lattice's candidate ends: its vertices with gain, the root
+  /// aside.
+  static std::vector<Eigen::Vector3d> localGainVertices(PlannerNode& node) {
+    std::vector<Eigen::Vector3d> positions;
+    for (const auto& entry : node.local_graph_->vertices_map_) {
+      if (entry.first != 0 && entry.second->vol_gain.gain > 0) {
+        positions.push_back(entry.second->state.head<3>());
+      }
+    }
+    return positions;
+  }
   static std::vector<mgg::StateVec> localStates(PlannerNode& node) {
     std::vector<mgg::StateVec> states;
     for (const auto& entry : node.local_graph_->vertices_map_)
@@ -5517,6 +5528,52 @@ TEST_F(PlannerNodeTest, AnExclusionGivenUpAfterThreeRefusalsNoLongerWithholdsCom
   PlannerNodeTestPeer::acceptOdometry(*node, 0.6, 0.0, 2.0);
   EXPECT_EQ(PlannerNodeTestPeer::reverseExitExclusions(*node), 0u);
   EXPECT_TRUE(PlannerNodeTestPeer::isGlobalFrontier(*node, frontier));
+}
+
+// mgg-run14 review r2: a robot with room whose only local frontier
+// candidates are given up, with no other target, completes: given-up
+// frontiers are not local gain remaining. One candidate left un-excluded
+// still gets a path or no path, never COMPLETE.
+TEST_F(PlannerNodeTest, GivenUpLocalFrontiersAreNotLocalGainRemaining) {
+  for (const bool one_left : {false, true}) {
+    SCOPED_TRACE(one_left);
+    auto node = makeNode("given_up_local_frontiers");
+    PlannerNodeTestPeer::gainFromUnknownVoxelsOnly(*node);
+    // The floor ends 2 m ahead: lattice vertices near its end see unknown
+    // space beyond it and are frontiers.
+    PlannerNodeTestPeer::observeFloor(*node, -3.55, 2.05, -2.55, 2.55);
+    PlannerNodeTestPeer::acceptOdometry(*node, 0.0, 0.0, 1.0);
+    PlannerNodeTestPeer::consultGlobalPlannerAtOnce(*node);
+    ASSERT_TRUE(PlannerNodeTestPeer::roomToTurnObserved(*node,
+        PlannerNodeTestPeer::drivingState(*node, 0, 0, 0)));
+    PlannerNodeTestPeer::buildLocalGraph(*node);
+    auto candidates = PlannerNodeTestPeer::localGainVertices(*node);
+    ASSERT_GE(candidates.size(), 2u);
+    std::sort(candidates.begin(), candidates.end(),
+              [](const auto& a, const auto& b) { return a.x() < b.x(); });
+    if (one_left) candidates.erase(candidates.begin());  // the nearest stays open
+    for (const auto& candidate : candidates) {
+      for (int refusal = 0; refusal < 3; ++refusal) {
+        PlannerNodeTestPeer::excludeReverseExitEndpoint(*node, candidate);
+      }
+      ASSERT_TRUE(PlannerNodeTestPeer::reverseExitExclusionAt(*node, candidate).second);
+    }
+    int status = 0;
+    bool sent = false;
+    for (int request = 0; request < 3 && status != PlannerNode::kStatusComplete; ++request) {
+      auto response = std::make_shared<mgg_msgs::srv::PlannerSrv::Response>();
+      PlannerNodeTestPeer::plan(*node, response);
+      status = response->status;
+      sent = sent || !response->path.empty();
+    }
+    if (one_left) {
+      EXPECT_NE(status, PlannerNode::kStatusComplete);
+      EXPECT_TRUE(sent || status == PlannerNode::kStatusNoPath);
+    } else {
+      EXPECT_EQ(status, PlannerNode::kStatusComplete);
+      EXPECT_FALSE(sent);
+    }
+  }
 }
 
 TEST_F(PlannerNodeTest, NearEightDegreeRefugeUsesTheSameSlopeForCutbackAndRetention) {

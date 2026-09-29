@@ -2979,10 +2979,15 @@ std::string PlannerNode::buildLocalGraph() {
       *local_graph_, gain_ctx, planning_params_.leafs_only_for_volumetric_gain,
       planning_params_.cluster_vertices_for_gain);
   int frontiers = 0;
+  // Frontiers given up as unreachable from here (retention refused three
+  // times) are no local gain remaining: they must not hold completion back
+  // (run14 review r2), here or in the fleet's settling.
+  int outstanding_frontiers = 0;
   for (const auto& entry : local_graph_->vertices_map_) {
     if (entry.second != nullptr &&
         entry.second->type == mgg::VertexType::kFrontier) {
       ++frontiers;
+      if (!reverseExitEndpointGivenUp(entry.second->state)) ++outstanding_frontiers;
     }
   }
   // The graph's frontiers are worth keeping whether or not a path is chosen.
@@ -3300,7 +3305,7 @@ std::string PlannerNode::buildLocalGraph() {
   } else if (frontiers == 0 || goes_nowhere || best_path_.empty()) {
     ++low_gain_rounds_;
     local_gain_remains_now_ =
-        frontiers > 0 || (goes_nowhere && sel.best_full_gain > 0.0);
+        outstanding_frontiers > 0 || (goes_nowhere && sel.best_full_gain > 0.0);
   } else if (!is_boxed_in && sel.best_gain < low_gain_score) {
     ++low_gain_rounds_;
     low_gain_path_now_ = true;
@@ -4655,6 +4660,15 @@ bool PlannerNode::reverseExitEdge(const mgg::GroundProjection& ground,
       });
   if (standing_start_scope_depth_ > 0) plan_reverse_edges_[key] = allowed;
   return allowed;
+}
+
+bool PlannerNode::reverseExitEndpointGivenUp(const mgg::StateVec& pose) const {
+  return std::any_of(reverse_exit_exclusions_.begin(), reverse_exit_exclusions_.end(),
+      [&](const ReverseExitExclusion& exclusion) {
+        return exclusion.given_up &&
+               (pose.head<3>() - exclusion.position).norm() <=
+                   reach_distance_ + mgg::kViewpointArrivalSlack;
+      });
 }
 
 bool PlannerNode::reverseExitEndpointExcluded(const mgg::StateVec& pose) const {

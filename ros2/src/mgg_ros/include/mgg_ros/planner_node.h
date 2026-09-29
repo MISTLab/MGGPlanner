@@ -157,6 +157,8 @@ class PlannerNode : public rclcpp::Node {
   void keepReverseDeparture(const std::vector<mgg::StateVec>& path);
   void retainEntryPastRefuge(const std::vector<mgg::StateVec>& reverse);
   bool reverseExitEndpointExcluded(const mgg::StateVec& pose) const;
+  /// Within the radius of a given-up exclusion: unreachable from here.
+  bool reverseExitEndpointGivenUp(const mgg::StateVec& pose) const;
   /// Records one retention refusal of each end (a path's end, a global
   /// target): a new exclusion, or a refused one again with a fresh TTL and
   /// one more refusal counted. Returns what was given up, for the summary.
