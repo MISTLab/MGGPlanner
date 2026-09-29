@@ -143,6 +143,13 @@ class PlannerNode : public rclcpp::Node {
   void recordSentPath();
   void enforceSafeCompletion(bool& complete);
   std::string rememberReverseExit();
+  std::string retainReverseExit(const std::vector<mgg::StateVec>& path, bool departure);
+  // True means attempted; an empty output path is a refusal. Does not alter
+  // exploration state or consume the stored corridor.
+  bool validateStoredReverseExit(const mgg::StateVec& start,
+      std::vector<mgg::StateVec>& path, std::string& note);
+  void keepReverseDeparture(const std::vector<mgg::StateVec>& path);
+  void beginEndpointSelection();
   bool reverseExitEndpointExcluded(const mgg::StateVec& pose) const;
   bool tryStoredReverseExit(const mgg::StateVec& start, std::string& note);
   bool storedReverseExitApplies(const mgg::StateVec& pose) const;
@@ -415,7 +422,7 @@ class PlannerNode : public rclcpp::Node {
   // Nested entry points share one lazy snapshot; the outer plan owns its
   // lifetime, including cached absence and the unreadable-source diagnostic.
   struct StandingStartScope {
-    explicit StandingStartScope(PlannerNode& node, bool selecting = false);
+    explicit StandingStartScope(PlannerNode& node);
     ~StandingStartScope();
     PlannerNode& node;
   };

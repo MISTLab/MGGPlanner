@@ -1555,11 +1555,14 @@ bool PlannerNode::readOwnKeyframes(KeyframeTrajectory& trajectory,
   return false;
 }
 
-PlannerNode::StandingStartScope::StandingStartScope(PlannerNode& node, bool selecting) : node(node) {
+PlannerNode::StandingStartScope::StandingStartScope(PlannerNode& node) : node(node) {
   ++node.standing_start_scope_depth_;
-  if (selecting && node.plan_reverse_exit_exclusions_.empty()) {
-    node.plan_reverse_exit_exclusions_ = std::move(node.pending_reverse_exit_exclusions_);
-    node.pending_reverse_exit_exclusions_.clear();
+}
+
+void PlannerNode::beginEndpointSelection() {
+  if (plan_reverse_exit_exclusions_.empty()) {
+    plan_reverse_exit_exclusions_ = std::move(pending_reverse_exit_exclusions_);
+    pending_reverse_exit_exclusions_.clear();
   }
 }
 
@@ -2899,7 +2902,7 @@ std::string PlannerNode::buildLocalGraph() {
   // Held for the whole cycle: the map must not change under a planner that is
   // ray-casting through it.
   const std::lock_guard<std::recursive_mutex> lock(planner_mutex_);
-  StandingStartScope standing_scope(*this, /*selecting=*/true);
+  StandingStartScope standing_scope(*this);
   auto map_read = mapReadLease();
   refreshMapRevision();
   best_path_.clear();
@@ -3069,6 +3072,7 @@ std::string PlannerNode::buildLocalGraph() {
   // gain (mgg::pathTurnsBack).
   const mgg::PlanningParams selection_params =
       turn_back_hysteresis_.selectionParams(planning_params_);
+  beginEndpointSelection();
   const mgg::PathSelectionResult sel = mgg::selectBestPath(
       *local_graph_, selection_params, robot_params_, edge_inclinations_,
       map_->getResolution(), selection_direction, selectionExclusions(),
@@ -3876,7 +3880,7 @@ mgg::PathOkFn PlannerNode::applyRouteTurnRule(
 
 bool PlannerNode::runGlobalPlanner(int target_id, std::string& reason,
                                    double min_gain) {
-  StandingStartScope standing_scope(*this, /*selecting=*/true);
+  StandingStartScope standing_scope(*this);
   best_path_.clear();
   best_path_from_global_graph_ = false;
   global_search_cut_short_ = false;
@@ -3896,6 +3900,7 @@ bool PlannerNode::runGlobalPlanner(int target_id, std::string& reason,
   };
   if (target_id >= 0) {
     const auto* target = findGlobalVertex(target_id);
+    if (target && target->type == mgg::VertexType::kFrontier) beginEndpointSelection();
     if (target && reverseExitEndpointExcluded(target->state)) {
       global_frontier_not_routed_ = true;
       reason = "target excluded after reverse-exit retention refusal";
@@ -3938,6 +3943,7 @@ bool PlannerNode::runGlobalPlanner(int target_id, std::string& reason,
                           fleet_params_.cluster_merge_radius_m)
                : reservation_exclusion_radius_m_;
     const Eigen::Vector3d robot_position = current_state_.head<3>();
+    beginEndpointSelection();
     const mgg::GlobalFrontierReport report = mgg::searchGlobalFrontier(
         *global_graph_, link_vertex->id,
         static_cast<int>(planning_params_.robot_id), globalFrontierGain(),
@@ -4595,8 +4601,39 @@ bool PlannerNode::reverseExitEndpointExcluded(const mgg::StateVec& pose) const {
 
 std::string PlannerNode::rememberReverseExit() {
   if (best_path_.empty() || stored_reverse_sent_now_) return {};
-  const bool extending = storedReverseExitApplies(best_path_.front()) &&
-      !mgg::roomToTurn(*map_, robot_params_, planning_params_, best_path_.front(), nullptr);
+  const std::string refusal = retainReverseExit(best_path_, departure_sent_now_);
+  if (refusal.empty()) return {};
+  pending_reverse_exit_exclusions_ = {best_path_.back().head<3>()};
+  if (best_path_from_global_graph_) {
+    if (const auto* target = findGlobalVertex(current_global_vertex_id_)) {
+      pending_reverse_exit_exclusions_.push_back(target->state.head<3>());
+    }
+  }
+  if (tour_planner_) {
+    for (const auto& cluster : tour_clusters_) {
+      const bool serves_target = best_path_from_global_graph_
+          ? cluster.representative_vertex_id == current_global_vertex_id_
+          : localPathServesTour(best_path_.back().head<3>(), cluster.position);
+      if (cluster.id == tour_planner_->target() && serves_target) {
+        setTourClusterAside(cluster, tour_params_.route_retry_s);
+        break;
+      }
+    }
+  }
+  best_path_.clear();
+  global_exploration_ongoing_ = false;
+  global_frontier_not_routed_ = true;
+  const std::string note = "; reverse exit retention refused: " + refusal +
+                           "; endpoint excluded for next plan; no path";
+  RCLCPP_WARN(get_logger(), "%s", note.c_str() + 2);
+  return note;
+}
+
+std::string PlannerNode::retainReverseExit(const std::vector<mgg::StateVec>& path,
+                                            bool departure) {
+  if (path.empty()) return {};
+  const bool extending = storedReverseExitApplies(path.front()) &&
+      !mgg::roomToTurn(*map_, robot_params_, planning_params_, path.front(), nullptr);
   if (!extending) {
     stored_reverse_retreating_ = false;
     stored_reverse_exit_.clear();
@@ -4604,12 +4641,12 @@ std::string PlannerNode::rememberReverseExit() {
   // Short departures independently validate an opening within kDepartureMaxM.
   // Keep any old corridor until odometry leaves it; a lost old refuge must not
   // veto that independently validated escape (M-2).
-  if (departure_sent_now_ || best_path_.size() < 2 ||
+  if (departure || path.size() < 2 ||
       robot_params_.type != mgg::RobotType::kGroundRobot ||
       !planning_params_.departure_reverse_allowed) return {};
-  const auto& end = best_path_.back();
+  const auto& end = path.back();
   if (!extending && !endpointNeedsReverseExit(end)) return {};
-  std::vector<mgg::StateVec> backtrack(best_path_.rbegin(), best_path_.rend());
+  std::vector<mgg::StateVec> backtrack(path.rbegin(), path.rend());
   if (extending) {
     std::size_t nearest = 0;
     for (std::size_t i = 1; i < stored_reverse_exit_.size(); ++i) {
@@ -4634,34 +4671,15 @@ std::string PlannerNode::rememberReverseExit() {
     reverse.back()[3] = reverse[reverse.size() - 2][3];
     // While extending, turn room ahead of the current root cannot rescue a
     // cancellation before that opening. Preserve the refuge behind the root.
-    if ((!extending || i >= best_path_.size() - 1) && reverseExitRefuge(to)) {
-      reverse_exit_entry_path_.assign(reverse.rbegin(), reverse.rend());
+    if ((!extending || i >= path.size() - 1) && reverseExitRefuge(to)) {
+      if (extending) reverse_exit_entry_path_.assign(reverse.rbegin(), reverse.rend());
+      else reverse_exit_entry_path_ = path;
       stored_reverse_exit_ = std::move(reverse);
       stored_reverse_retreating_ = false;
       return {};
     }
   }
-  // An admitted narrow end must have an executable escape, not merely a
-  // graph-level promise that was lost in shortcutting or map revision.
-  pending_reverse_exit_exclusions_ = {end.head<3>()};
-  if (const auto* target = findGlobalVertex(current_global_vertex_id_)) {
-    pending_reverse_exit_exclusions_.push_back(target->state.head<3>());
-  }
-  if (tour_planner_) {
-    for (const auto& cluster : tour_clusters_) {
-      if (cluster.id == tour_planner_->target()) {
-        setTourClusterAside(cluster, tour_params_.route_retry_s);
-        break;
-      }
-    }
-  }
-  best_path_.clear();
-  global_exploration_ongoing_ = false;
-  global_frontier_not_routed_ = true;
-  const std::string note = "; reverse exit retention refused: no validated refuge within the length bound on current map; "
-                           "endpoint excluded for next plan; no path";
-  RCLCPP_WARN(get_logger(), "%s", note.c_str() + 2);
-  return note;
+  return "no validated refuge within the length bound on current map";
 }
 
 void PlannerNode::forgetReverseExitIfOffRoute() {
@@ -4681,15 +4699,35 @@ bool PlannerNode::storedReverseExitApplies(const mgg::StateVec& pose) const {
                      reach_distance_ + mgg::kViewpointArrivalSlack);
 }
 
+void PlannerNode::keepReverseDeparture(const std::vector<mgg::StateVec>& path) {
+  stored_reverse_exit_ = path;
+  reverse_exit_entry_path_ = path;
+  stored_reverse_retreating_ = true;
+}
+
 bool PlannerNode::tryStoredReverseExit(const mgg::StateVec& start, std::string& note) {
+  std::vector<mgg::StateVec> path;
+  if (!validateStoredReverseExit(start, path, note)) return false;
+  best_path_ = std::move(path);
+  best_path_from_global_graph_ = false;
+  global_exploration_ongoing_ = false;
+  if (!best_path_.empty()) {
+    keepReverseDeparture(best_path_);
+    stored_reverse_sent_now_ = true;
+    departure_sent_now_ = true;
+    ++boxed_in_departures_;
+  }
+  return true;
+}
+
+bool PlannerNode::validateStoredReverseExit(const mgg::StateVec& start,
+    std::vector<mgg::StateVec>& path, std::string& note) {
+  path.clear();
   if (!storedReverseExitApplies(start)) return false;
   if (mgg::roomToTurn(*map_, robot_params_, planning_params_, start, nullptr)) {
     note = "; stored reverse exit not needed: projected current pose has observed turn room";
     return false;
   }
-  best_path_.clear();
-  best_path_from_global_graph_ = false;
-  global_exploration_ongoing_ = false;
   const auto refused = [&](const char* reason) {
     note = std::string("; stored reverse exit refused: ") + reason;
     RCLCPP_WARN(get_logger(), "%s", note.c_str() + 2);
@@ -4752,13 +4790,7 @@ bool PlannerNode::tryStoredReverseExit(const mgg::StateVec& start, std::string& 
   if (!reverse_turns.admissible(points, start[3] + M_PI)) {
     return refused("reverse corner fails current slope or turn-room checks");
   }
-  best_path_ = std::move(reverse);
-  stored_reverse_exit_ = best_path_;
-  reverse_exit_entry_path_ = best_path_;
-  stored_reverse_retreating_ = true;
-  stored_reverse_sent_now_ = true;
-  departure_sent_now_ = true;
-  ++boxed_in_departures_;
+  path = std::move(reverse);
   note = "; stored reverse exit revalidated: reversing to the refuge";
   RCLCPP_INFO(get_logger(), "%s (%.2f m)", note.c_str() + 2, length);
   return true;
@@ -4980,7 +5012,8 @@ void PlannerNode::onObjectiveRequest(
         : request->objective == Service::Request::RETURN_HOME ? "RETURN_HOME"
                                                               : "UNKNOWN";
     const auto& g = request->goal.position;
-    if (response->status == Service::Response::SUCCEEDED) {
+    if (response->status == Service::Response::SUCCEEDED ||
+        response->status == Service::Response::DEPARTURE_FIRST) {
       RCLCPP_INFO(get_logger(),
                   "objective %s route (robot at %.2f, %.2f; goal %.2f, %.2f, "
                   "%.2f): %zu poses %s",
@@ -5153,11 +5186,13 @@ void PlannerNode::onObjectiveRequest(
     mgg::StateVec start = current_state_;
     if (!projectToDrivingHeight(start)) start = physicalAnchorAtDrivingHeight(current_state_);
     std::string exit_note;
-    if (tryStoredReverseExit(start, exit_note) && !best_path_.empty()) {
+    std::vector<mgg::StateVec> exit_path;
+    if (validateStoredReverseExit(start, exit_path, exit_note) && !exit_path.empty()) {
+      keepReverseDeparture(exit_path);
       response->status = Service::Response::DEPARTURE_FIRST;
-      response->reason = "revalidated reverse exit to refuge; request the objective again from there";
+      response->reason = "stored reverse exit revalidated to refuge; request the objective again from there";
       route_note = response->reason;
-      for (const auto& pose : best_path_) response->path.push_back(toPoseMsg(pose));
+      for (const auto& pose : exit_path) response->path.push_back(toPoseMsg(pose));
     } else {
       if (exit_note.empty()) exit_note = "; stored reverse exit unavailable at projected current pose";
       mgg::Departure departure;
@@ -5193,7 +5228,16 @@ void PlannerNode::onObjectiveRequest(
     response->reason = "blocked by a peer: the route meets a peer body";
     return;
   }
-  stored_reverse_exit_.clear();  // a new objective supersedes the entry path
+  if (!route.empty() && storedReverseExitApplies(route.front()) &&
+      !mgg::roomToTurn(*map_, robot_params_, planning_params_, route.front(), nullptr)) {
+    const std::string refusal = retainReverseExit(route, false);
+    if (!refusal.empty()) {
+      response->reason = "escape corridor not retained: " + refusal;
+      RCLCPP_WARN(get_logger(), "%s", response->reason.c_str());
+    }
+  } else {
+    stored_reverse_exit_.clear();
+  }
   response->status = Service::Response::SUCCEEDED;
   for (const mgg::StateVec& s : route) response->path.push_back(toPoseMsg(s));
   char note[160];

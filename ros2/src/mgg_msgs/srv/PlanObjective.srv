@@ -3,7 +3,8 @@
 # caller's home in the planning frame, and ends exactly there; only when
 # `goal` is not finite does it route to the initial anchor. The response
 # carries the whole route, shortcut where the map already vouches for the
-# straight line, or a reason it could not be produced. The identity fields
+# straight line, or a reason it could not be produced. DEPARTURE_FIRST carries
+# only a validated departure leg; request the objective again after it. Identity fields
 # echo the map the route was planned on so the caller can tell a route from
 # a superseded map apart from one it can execute.
 uint8 NAVIGATE=1

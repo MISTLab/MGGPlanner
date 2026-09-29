@@ -303,6 +303,26 @@ class PlannerNodeTestPeer {
     EXPECT_FALSE(node.tryStoredReverseExit(start, note));
     return note;
   }
+  static void buildWithoutOdometry(PlannerNode& node) {
+    node.have_odometry_ = false;
+    auto response = std::make_shared<std_srvs::srv::Trigger::Response>();
+    node.onBuildRequest(std::make_shared<std_srvs::srv::Trigger::Request>(), response);
+    EXPECT_EQ(response->message, "no odometry received yet");
+    node.have_odometry_ = true;
+  }
+  static void unrelatedTourTarget(PlannerNode& node) {
+    mgg::FrontierCluster cluster;
+    cluster.id = 42;
+    cluster.position = {-4, 0, 0.2};
+    cluster.gain = 100;
+    node.tour_clusters_ = {cluster};
+    mgg::TourCostMatrix costs;
+    costs.from_robot = {1};
+    costs.distance_from_robot = {1};
+    costs.between = {{0}};
+    node.tour_planner_->solve(node.tour_clusters_, costs, 0, 0, 0);
+    ASSERT_EQ(node.tour_planner_->target(), 42u);
+  }
   static std::size_t storedReversePoses(const PlannerNode& node) {
     return node.stored_reverse_exit_.size();
   }
@@ -4349,6 +4369,7 @@ TEST_F(PlannerNodeTest, InterruptedEntryAndRetreatKeepARevalidatedWayToTheRefuge
 
 TEST_F(PlannerNodeTest, ReturnHomeFromANarrowEndpointUsesAndKeepsTheReverseCorridor) {
   using Service = mgg_msgs::srv::PlanObjective;
+  EXPECT_EQ(Service::Response::DEPARTURE_FIRST, 5);
   for (const bool peer : {false, true}) {
     MolaFloorProduct map(-2, 7, -2, 2,
         {{{0.8, 7, 0.4, 0.6}}, {{0.8, 7, -0.6, -0.4}}});
@@ -4470,6 +4491,47 @@ TEST_F(PlannerNodeTest, AnObjectiveWithALostRefugeUsesAValidatedDepartureFirst) 
   EXPECT_NE(objective->reason.find("validated departure"), std::string::npos);
 }
 
+TEST_F(PlannerNodeTest, ObjectiveDepartureRefusalPreservesExplorationState) {
+  MolaFloorProduct entry(-2, 7, -2, 2,
+      {{{0.8, 7, 0.4, 0.6}}, {{0.8, 7, -0.6, -0.4}}});
+  auto node = makeNode("lost_refuge_departure");
+  PlannerNodeTestPeer::useMolaMap(*node, entry.serve());
+  PlannerNodeTestPeer::serveMap(*node, "component:test", 1);
+  PlannerNodeTestPeer::setRobotFootprint(*node, 1.0, 0.3);
+  PlannerNodeTestPeer::setLattice(*node, {0, 0}, {5.5, 0});
+  PlannerNodeTestPeer::acceptOdometryFacing(*node, 0, 0, 0, 1);
+  auto response = std::make_shared<mgg_msgs::srv::PlannerSrv::Response>();
+  PlannerNodeTestPeer::plan(*node, response);
+  ASSERT_GE(response->path.size(), 2u);
+  // The old refuge at x=0 lost turn room, but new observations show an
+  // opening ahead of x=3.4. The ordinary terrain-validated departure fits.
+  MolaFloorProduct changed(-2, 7, -2, 2,
+      {{{-0.8, 7, 0.4, 0.6}}, {{-0.8, 7, -0.6, -0.4}}});
+  PlannerNodeTestPeer::useMolaMap(*node, changed.serve());
+  PlannerNodeTestPeer::setLattice(*node, {0, 0}, {0, 0});
+  PlannerNodeTestPeer::acceptOdometryFacing(*node, 3, 0, 0, 2);
+  using Service = mgg_msgs::srv::PlanObjective;
+  auto request = std::make_shared<Service::Request>();
+  request->component_id = "component:test";
+  request->map_epoch = 1;
+  request->objective = Service::Request::RETURN_HOME;
+  request->goal.position.x = std::nan("");
+  request->goal.position.y = std::nan("");
+  request->goal.orientation.w = 1;
+  auto objective = std::make_shared<Service::Response>();
+  const auto before = PlannerNodeTestPeer::bestPath(*node);
+  const int departures = PlannerNodeTestPeer::boxedInDepartures(*node);
+  const int refusals = PlannerNodeTestPeer::boxedInWithoutDeparture(*node);
+  PlannerNodeTestPeer::objective(*node, request, objective);
+  ASSERT_EQ(objective->status, Service::Response::BLOCKED) << objective->reason;
+  EXPECT_TRUE(objective->path.empty());
+  EXPECT_NE(objective->reason.find("stored reverse exit refused"), std::string::npos);
+  EXPECT_NE(objective->reason.find("validated departure refused"), std::string::npos);
+  EXPECT_EQ(PlannerNodeTestPeer::bestPath(*node), before);
+  EXPECT_EQ(PlannerNodeTestPeer::boxedInDepartures(*node), departures);
+  EXPECT_EQ(PlannerNodeTestPeer::boxedInWithoutDeparture(*node), refusals);
+}
+
 TEST_F(PlannerNodeTest, ANewForwardPathInsideTheCorridorKeepsItsBoundedReverseExit) {
   for (const bool over_bound : {false, true}) {
     MolaFloorProduct entry(-2, 10, -2, 2,
@@ -4483,6 +4545,10 @@ TEST_F(PlannerNodeTest, ANewForwardPathInsideTheCorridorKeepsItsBoundedReverseEx
     PlannerNodeTestPeer::plan(*node, response);
     ASSERT_GE(response->path.size(), 2u);
     ASSERT_LT(response->path.back().position.x, 5.2);
+    // The initial entry starts before the chosen refuge. Its first odometry
+    // update must not be mistaken for leaving the stored entry route.
+    PlannerNodeTestPeer::acceptOdometryFacing(*node, 0.01, 0, 0, 2);
+    EXPECT_GT(PlannerNodeTestPeer::storedReversePoses(*node), 1u);
     const double mouth = over_bound ? 7.2 : 5.2;
     MolaFloorProduct open_ahead(-2, 10, -2, 2,
         {{{0.8, mouth, 0.4, 0.6}}, {{0.8, mouth, -0.6, -0.4}}});
@@ -4509,6 +4575,64 @@ TEST_F(PlannerNodeTest, ANewForwardPathInsideTheCorridorKeepsItsBoundedReverseEx
     PlannerNodeTestPeer::plan(*node, response);
     ASSERT_GE(response->path.size(), 2u);
     EXPECT_LT(response->path.back().position.x, 0.8);
+  }
+}
+
+TEST_F(PlannerNodeTest, ForwardObjectivesKeepOptionalBoundedEscapeWithoutVetoingTheGoal) {
+  using Service = mgg_msgs::srv::PlanObjective;
+  for (const bool over_bound : {false, true}) {
+    MolaFloorProduct entry(-2, 10, -2, 2,
+        {{{0.8, 9, 0.4, 0.6}}, {{0.8, 9, -0.6, -0.4}}});
+    auto node = makeNode("objective_corridor_memory");
+    PlannerNodeTestPeer::useMolaMap(*node, entry.serve());
+    PlannerNodeTestPeer::serveMap(*node, "component:test", 1);
+    PlannerNodeTestPeer::setRobotFootprint(*node, 1.0, 0.3);
+    PlannerNodeTestPeer::setLattice(*node, {0, 0}, {5.5, 0});
+    PlannerNodeTestPeer::acceptOdometryFacing(*node, 0, 0, 0, 1);
+    auto exploration = std::make_shared<mgg_msgs::srv::PlannerSrv::Response>();
+    PlannerNodeTestPeer::plan(*node, exploration);
+    ASSERT_GE(exploration->path.size(), 2u);
+    const double mouth = over_bound ? 7.2 : 5.2;
+    MolaFloorProduct open_ahead(-2, 10, -2, 2,
+        {{{0.8, mouth, 0.4, 0.6}}, {{0.8, mouth, -0.6, -0.4}}});
+    PlannerNodeTestPeer::useMolaMap(*node, open_ahead.serve());
+    PlannerNodeTestPeer::acceptOdometryFacing(*node, 3, 0, 0, 2);
+    PlannerNodeTestPeer::setLattice(*node, {0, 0}, {6, 0});
+    auto request = std::make_shared<Service::Request>();
+    request->component_id = "component:test";
+    request->map_epoch = 1;
+    request->objective = Service::Request::NAVIGATE;
+    request->goal.position.x = mouth + 1.0;
+    request->goal.position.z = exploration->path.front().position.z;
+    request->goal.orientation.w = 1;
+    const auto before = PlannerNodeTestPeer::bestPath(*node);
+    auto response = std::make_shared<Service::Response>();
+    PlannerNodeTestPeer::objective(*node, request, response);
+    ASSERT_EQ(response->status, Service::Response::SUCCEEDED) << response->reason;
+    ASSERT_FALSE(response->path.empty());
+    EXPECT_NEAR(response->path.back().position.x, request->goal.position.x, 0.001);
+    EXPECT_EQ(PlannerNodeTestPeer::bestPath(*node), before);
+    EXPECT_GT(PlannerNodeTestPeer::storedReversePoses(*node), 1u);
+    if (over_bound) {
+      EXPECT_NE(response->reason.find("escape corridor not retained"), std::string::npos);
+      PlannerNodeTestPeer::acceptOdometryFacing(*node, 7.5, 0, 0, 3);
+      EXPECT_EQ(PlannerNodeTestPeer::storedReversePoses(*node), 0u);
+    } else {
+      PlannerNodeTestPeer::acceptOdometryFacing(*node, 5.5, 0, 0, 3);
+      response = std::make_shared<Service::Response>();
+      PlannerNodeTestPeer::objective(*node, request, response);
+      ASSERT_EQ(response->status, Service::Response::SUCCEEDED) << response->reason;
+      EXPECT_NEAR(response->path.back().position.x, request->goal.position.x, 0.001);
+      request->objective = Service::Request::RETURN_HOME;
+      request->goal.position.x = -0.8;
+      response = std::make_shared<Service::Response>();
+      PlannerNodeTestPeer::objective(*node, request, response);
+      ASSERT_EQ(response->status, Service::Response::DEPARTURE_FIRST) << response->reason;
+      ASSERT_GE(response->path.size(), 2u);
+      EXPECT_LT(response->path.back().position.x, 0.8);
+      for (const auto& pose : response->path) EXPECT_NEAR(pose.orientation.z, 0, 1e-6);
+      EXPECT_EQ(PlannerNodeTestPeer::bestPath(*node), before);
+    }
   }
 }
 
@@ -4568,8 +4692,10 @@ TEST_F(PlannerNodeTest, AFailedRetentionExcludesTheEndpointOnTheNextSelection) {
   MolaFloorProduct blocked(-2, 7, -2, 2,
       {{{0.8, 7, 0.4, 0.6}}, {{0.8, 7, -0.6, -0.4}}, {{2.8, 3, -2, 2}}});
   PlannerNodeTestPeer::useMolaMap(*node, blocked.serve());
+  PlannerNodeTestPeer::unrelatedTourTarget(*node);
   const auto refusal = PlannerNodeTestPeer::retainBestPath(*node);
   EXPECT_NE(refusal.find("reverse exit retention refused"), std::string::npos);
+  EXPECT_EQ(PlannerNodeTestPeer::tourTarget(*node), 42u);
   ASSERT_TRUE(PlannerNodeTestPeer::bestPath(*node).empty());
   PlannerNodeTestPeer::useMolaMap(*node, clear.serve());
   // A request rejected before selection must not consume the queued retry
@@ -4578,6 +4704,7 @@ TEST_F(PlannerNodeTest, AFailedRetentionExcludesTheEndpointOnTheNextSelection) {
   auto response = std::make_shared<mgg_msgs::srv::PlanObjective::Response>();
   PlannerNodeTestPeer::objective(*node, request, response);
   ASSERT_EQ(response->status, mgg_msgs::srv::PlanObjective::Response::STALE_REVISION);
+  PlannerNodeTestPeer::buildWithoutOdometry(*node);
   PlannerNodeTestPeer::buildLocalGraph(*node);
   const auto next = PlannerNodeTestPeer::bestPath(*node);
   EXPECT_TRUE(next.empty() || (next.back().head<3>() - failed_endpoint).norm() > 0.35);
