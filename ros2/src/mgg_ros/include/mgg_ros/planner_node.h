@@ -143,6 +143,7 @@ class PlannerNode : public rclcpp::Node {
   void recordSentPath();
   void rememberReverseExit();
   bool tryStoredReverseExit(const mgg::StateVec& start, std::string& note);
+  bool storedReverseExitApplies(const mgg::StateVec& pose) const;
   bool reverseExitRefuge(const mgg::StateVec& pose) const;
   bool reverseExitEdge(const mgg::GroundProjection& ground,
                        const mgg::StateVec& from, const mgg::StateVec& to) const;
@@ -918,6 +919,8 @@ class PlannerNode : public rclcpp::Node {
   std::vector<mgg::StateVec> stored_reverse_exit_;
   std::vector<mgg::StateVec> reverse_exit_entry_path_;
   bool departure_sent_now_ = false;
+  bool stored_reverse_sent_now_ = false;
+  bool stored_reverse_retreating_ = false;
   /// Whether best_path_ is a global-graph route (already in the roadmap) or
   /// a lattice path (joins it once accepted).
   bool best_path_from_global_graph_ = false;

@@ -67,6 +67,18 @@ constexpr int kHomeVertexId = 0;
 /// (PlannerNode::home_seeded_landed_).
 constexpr const char* kFlightStateLanded = "landed";
 
+bool nearPathXY(const std::vector<mgg::StateVec>& path,
+                const Eigen::Vector2d& point, double tolerance) {
+  for (std::size_t i = 1; i < path.size(); ++i) {
+    const Eigen::Vector2d a = path[i - 1].head<2>();
+    const Eigen::Vector2d step = path[i].head<2>() - a;
+    const double t = step.squaredNorm() > 1e-12
+        ? std::clamp((point - a).dot(step) / step.squaredNorm(), 0.0, 1.0) : 0.0;
+    if ((point - a - t * step).norm() <= tolerance) return true;
+  }
+  return false;
+}
+
 /// The in-service vertices of `graph` a route from home reaches: Dijkstra
 /// over its edges, those a no-go zone blocks left out and other robots'
 /// vertices passed through, as routeOverGlobalGraph searches (the caller
@@ -4176,6 +4188,7 @@ void PlannerNode::onPlanRequest(
   std::optional<mgg::MolaMap::TransientDiscPin> peer_pin;
   pinPeerBodies(peer_pin);
   departure_sent_now_ = false;
+  stored_reverse_sent_now_ = false;
   lattice_path_.clear();
   peer_blocked_edges_.clear();
   withdrawUnplacedNeighbours();
@@ -4553,7 +4566,10 @@ bool PlannerNode::reverseExitEdge(const mgg::GroundProjection& ground,
 }
 
 void PlannerNode::rememberReverseExit() {
-  if (best_path_.empty()) return;  // a refusal is not a new sent path
+  if (best_path_.empty() || stored_reverse_sent_now_) return;
+  // A new entry replaces the old escape, but sending a retreat is not its
+  // completion. Its remaining corridor survives cancellation and replanning.
+  stored_reverse_retreating_ = false;
   stored_reverse_exit_.clear();
   if (departure_sent_now_ || best_path_.size() < 2 ||
       robot_params_.type != mgg::RobotType::kGroundRobot ||
@@ -4593,23 +4609,22 @@ void PlannerNode::rememberReverseExit() {
 void PlannerNode::forgetReverseExitIfOffRoute() {
   if (stored_reverse_exit_.size() < 2) return;
   const double tolerance = reach_distance_ + mgg::kViewpointArrivalSlack;
-  for (std::size_t i = 1; i < reverse_exit_entry_path_.size(); ++i) {
-    const Eigen::Vector2d a = reverse_exit_entry_path_[i - 1].head<2>();
-    const Eigen::Vector2d step = reverse_exit_entry_path_[i].head<2>() - a;
-    const double t = step.squaredNorm() > 1e-12
-        ? std::clamp((current_state_.head<2>() - a).dot(step) / step.squaredNorm(), 0.0, 1.0)
-        : 0.0;
-    if ((current_state_.head<2>() - a - t * step).norm() <= tolerance) return;
+  const bool at_refuge = stored_reverse_retreating_ &&
+      (current_state_.head<2>() - stored_reverse_exit_.back().head<2>()).norm() <= tolerance;
+  if (at_refuge || !nearPathXY(reverse_exit_entry_path_, current_state_.head<2>(), tolerance)) {
+    stored_reverse_exit_.clear();
+    reverse_exit_entry_path_.clear();
+    stored_reverse_retreating_ = false;
   }
-  stored_reverse_exit_.clear();
+}
+
+bool PlannerNode::storedReverseExitApplies(const mgg::StateVec& pose) const {
+  return nearPathXY(stored_reverse_exit_, pose.head<2>(),
+                     reach_distance_ + mgg::kViewpointArrivalSlack);
 }
 
 bool PlannerNode::tryStoredReverseExit(const mgg::StateVec& start, std::string& note) {
-  const double tolerance = reach_distance_ + mgg::kViewpointArrivalSlack;
-  if (stored_reverse_exit_.size() < 2 ||
-      (start.head<2>() - stored_reverse_exit_.front().head<2>()).norm() > tolerance) {
-    return false;
-  }
+  if (!storedReverseExitApplies(start)) return false;
   best_path_.clear();
   best_path_from_global_graph_ = false;
   global_exploration_ongoing_ = false;
@@ -4678,6 +4693,10 @@ bool PlannerNode::tryStoredReverseExit(const mgg::StateVec& start, std::string& 
     return refused("reverse corner fails current slope or turn-room checks");
   }
   best_path_ = std::move(reverse);
+  stored_reverse_exit_ = best_path_;
+  reverse_exit_entry_path_ = best_path_;
+  stored_reverse_retreating_ = true;
+  stored_reverse_sent_now_ = true;
   departure_sent_now_ = true;
   ++boxed_in_departures_;
   note = "; stored reverse exit revalidated: reversing to the refuge";
