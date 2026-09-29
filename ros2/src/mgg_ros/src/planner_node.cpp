@@ -3197,6 +3197,7 @@ std::string PlannerNode::buildLocalGraph() {
   const bool stored_exit_tried =
       (is_boxed_in || sel.sharp_turn_fallback || best_path_.empty()) &&
       tryStoredReverseExit(root_state, boxed_in);
+  if (!stored_exit_tried) boxed_in.clear();
   if (stored_exit_tried) {
     if (best_path_.empty()) boxed_in += departBoxedIn(root_state, "stored exit refused", false);
     path_shortcut_from_ = path_shortcut_corners_ = path_shortcut_to_ =
@@ -3802,12 +3803,12 @@ bool PlannerNode::routeStartsWithTurnWithoutRoom(
   const std::vector<double> turns = mgg::pathTurns(
       points, start_heading,
       std::max(robot_params_.size.x(), robot_params_.size.y()));
+  mgg::StateVec start = current_state_;
+  if (!projectToDrivingHeight(start)) start = physicalAnchorAtDrivingHeight(current_state_);
   const std::optional<mgg::StandingStart> standing = standingStart();
   return !turns.empty() && turns.front() > mgg::kSharpTurnRad + 1e-9 &&
-         !mgg::roomToTurn(*map_, robot_params_, planning_params_,
-                          mgg::StateVec(points.front().x(), points.front().y(),
-                                        points.front().z(), start_heading),
-                          standing ? &*standing : nullptr);
+         !mgg::roomToTurn(*map_, robot_params_, planning_params_, start,
+                          !storedReverseExitApplies(start) && standing ? &*standing : nullptr);
 }
 
 mgg::PathOkFn PlannerNode::applyRouteTurnRule(
@@ -4663,8 +4664,11 @@ bool PlannerNode::storedReverseExitApplies(const mgg::StateVec& pose) const {
 }
 
 bool PlannerNode::tryStoredReverseExit(const mgg::StateVec& start, std::string& note) {
-  if (!storedReverseExitApplies(start) ||
-      mgg::roomToTurn(*map_, robot_params_, planning_params_, start, nullptr)) return false;
+  if (!storedReverseExitApplies(start)) return false;
+  if (mgg::roomToTurn(*map_, robot_params_, planning_params_, start, nullptr)) {
+    note = "; stored reverse exit not needed: projected current pose has observed turn room";
+    return false;
+  }
   best_path_.clear();
   best_path_from_global_graph_ = false;
   global_exploration_ongoing_ = false;
@@ -5137,6 +5141,7 @@ void PlannerNode::onObjectiveRequest(
       route_note = response->reason;
       for (const auto& pose : best_path_) response->path.push_back(toPoseMsg(pose));
     } else {
+      if (exit_note.empty()) exit_note = "; stored reverse exit unavailable at projected current pose";
       mgg::Departure departure;
       if (straightDeparture(start, departure)) {
         response->status = Service::Response::DEPARTURE_FIRST;

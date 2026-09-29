@@ -294,6 +294,15 @@ class PlannerNodeTestPeer {
     EXPECT_GT(check.slopeAt(path.back()), mgg::kLevelGroundSlopeRad);
     return node.reverseExitShortcutAdmissible(path);
   }
+  static bool routeStartsWithTurnWithoutRoom(PlannerNode& node, const mgg::PathType& points) {
+    return node.routeStartsWithTurnWithoutRoom(points);
+  }
+  static std::string storedRoomGateNote(PlannerNode& node, const mgg::StateVec& start) {
+    node.stored_reverse_exit_ = {start, start - mgg::StateVec(1, 0, 0, 0)};
+    std::string note;
+    EXPECT_FALSE(node.tryStoredReverseExit(start, note));
+    return note;
+  }
   static std::size_t storedReversePoses(const PlannerNode& node) {
     return node.stored_reverse_exit_.size();
   }
@@ -4459,6 +4468,22 @@ TEST_F(PlannerNodeTest, AnObjectiveWithALostRefugeUsesAValidatedDepartureFirst) 
   ASSERT_GE(objective->path.size(), 2u);
   EXPECT_GE(objective->path.back().position.x, 3.8 - 1e-9);
   EXPECT_NE(objective->reason.find("validated departure"), std::string::npos);
+}
+
+TEST_F(PlannerNodeTest, RouteAndStoredExitRoomGatesUseTheProjectedCurrentPose) {
+  MolaFloorProduct floor(-2, 2, -2, 2);
+  auto node = makeNode("projected_room_gate");
+  PlannerNodeTestPeer::useMolaMap(*node, floor.serve());
+  PlannerNodeTestPeer::setRobotFootprint(*node, 1.0, 0.3);
+  PlannerNodeTestPeer::acceptOdometryFacing(*node, 0, 0, 0, 1);
+  const auto start = PlannerNodeTestPeer::drivingState(*node, 0, 0, 0);
+  ASSERT_TRUE(PlannerNodeTestPeer::roomToTurnObserved(*node, start));
+  // The roadmap's old height has no observed ground below it, while the
+  // projected actual body does have room. Both decisions must use the latter.
+  EXPECT_FALSE(PlannerNodeTestPeer::routeStartsWithTurnWithoutRoom(*node,
+      {{0, 0, 3}, {-1, 0, 3}}));
+  const auto note = PlannerNodeTestPeer::storedRoomGateNote(*node, start);
+  EXPECT_NE(note.find("turn room"), std::string::npos) << note;
 }
 
 TEST_F(PlannerNodeTest, AnEmptySelectionWithNewTurningRoomDoesNotTryItsStoredExit) {
