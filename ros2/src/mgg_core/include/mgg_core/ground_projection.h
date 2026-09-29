@@ -16,6 +16,7 @@
 #ifndef MGG_CORE_GROUND_PROJECTION_H_
 #define MGG_CORE_GROUND_PROJECTION_H_
 
+#include <algorithm>
 #include <array>
 #include <cstdint>
 #include <functional>
@@ -107,6 +108,11 @@ struct StandingStart {
   /// Whether `point` (x, y) lies in the disk.
   bool covers(const Eigen::Vector2d& point) const {
     return (point - center).norm() <= radius;
+  }
+  /// A first goal must not stop in the prior's disk after the allowance
+  /// expires en route, including an early controller arrival.
+  bool admitsGoal(const Eigen::Vector2d& point, double arrival_tolerance) const {
+    return (point - center).norm() > radius + std::max(0.0, arrival_tolerance) + 1e-9;
   }
 };
 

@@ -1582,6 +1582,11 @@ std::optional<mgg::StandingStart> PlannerNode::standingStart() {
   return mgg::StandingStart{*standing_start_xy_, hanging_root_edge_length_max_};
 }
 
+bool PlannerNode::standingStartGoalAdmissible(const mgg::StateVec& goal) {
+  const auto standing = standingStart();
+  return !standing || standing->admitsGoal(goal.head<2>(), reach_distance_);
+}
+
 Eigen::Isometry3d PlannerNode::navigationFromComponent() const {
   const auto& t = mapping_snapshot_.component_from_navigation.translation;
   const auto& q = mapping_snapshot_.component_from_navigation.rotation;
@@ -3019,7 +3024,10 @@ std::string PlannerNode::buildLocalGraph() {
       },
       turns_admissible, sharp_turn_allowed, reach_distance_,
       slope_end_retreat,
-      [this](const mgg::Vertex& v) { return no_go_.inside(v.state.head<3>()); },
+      [this, &standing](const mgg::Vertex& v) {
+        return no_go_.inside(v.state.head<3>()) ||
+               (standing && !standing->admitsGoal(v.state.head<2>(), reach_distance_));
+      },
       // A path the final check would refuse is left out, so another is
       // chosen rather than none (review r1, R1-1).
       no_go_.empty()
@@ -3304,6 +3312,7 @@ bool PlannerNode::straightDeparture(const mgg::StateVec& start,
           for (const auto& pose : path) points.push_back(pose.template head<3>());
           if (!no_go_.pathAdmissible(points)) return false;
           const auto& end = path.back();
+          if (!standingStartGoalAdmissible(end)) return false;
           const double slope = mgg::groundSlope(ground, end.template head<3>(),
               std::max(robot_params_.size.x(), robot_params_.size.y()),
               local_graph_.get());
@@ -3322,7 +3331,11 @@ bool PlannerNode::straightDeparture(const mgg::StateVec& start,
     return found;
   }
   return mgg::findDeparture(*map_, ground, robot_params_, planning_params_,
-                            start, departure);
+                            start, departure, [this, &ground](const auto& path) {
+                              return standingStartGoalAdmissible(path.back()) &&
+                                  mgg::roomToTurn(*map_, robot_params_, planning_params_,
+                                                  path.back(), ground.standingStart());
+                            });
 }
 
 bool PlannerNode::routeOverGlobalGraph(const mgg::StateVec goal,
@@ -4013,6 +4026,14 @@ bool PlannerNode::runGlobalPlanner(int target_id, std::string& reason,
       return mgg::viewpointClear(*map_, robot_params_, planning_params_, pose);
     });
   }
+  if (!best_path_.empty() && !standingStartGoalAdmissible(best_path_.back())) {
+    best_path_.clear();
+    global_frontier_not_routed_ = true;
+    global_exploration_ongoing_ = false;
+    current_global_vertex_id_ = -1;
+    reason = "the goal intersects the standing-start arrival band";
+    return false;
+  }
   // Check the final end, after shortcutting and all viewpoint cutbacks.
   // Run 11: a nearby high-gain tour target repeatedly replaced a useful
   // local path with a route PCI rejected as already reached. The same
@@ -4354,6 +4375,10 @@ void PlannerNode::onPlanRequest(
         summary += "; low-gain local path handed over";
       }
     }
+  }
+  if (!best_path_.empty() && !standingStartGoalAdmissible(best_path_.back())) {
+    best_path_.clear();
+    summary += "; the goal intersects the standing-start arrival band: no path";
   }
   if (!noGoAdmissible(best_path_)) {
     // The last net: whatever produced it, nothing is sent into a zone. It
@@ -4778,6 +4803,11 @@ void PlannerNode::onObjectiveRequest(
     return;
   }
   shortcutAndResample(route, turns_ok);
+  if (!route.empty() && !standingStartGoalAdmissible(route.back())) {
+    response->status = Service::Response::UNREACHABLE;
+    response->reason = "the goal intersects the standing-start arrival band";
+    return;
+  }
   if (!noGoAdmissible(route)) {
     response->status = Service::Response::UNREACHABLE;
     response->reason = "the route enters a no-go zone";

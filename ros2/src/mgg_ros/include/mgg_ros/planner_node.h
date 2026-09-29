@@ -399,6 +399,7 @@ class PlannerNode : public rclcpp::Node {
   /// read, and without a hanging_root_edge_length_max. Once the trajectory
   /// shows the robot left, it never stands at its start again.
   std::optional<mgg::StandingStart> standingStart();
+  bool standingStartGoalAdmissible(const mgg::StateVec& goal);
   /// keyframe_source_->read. A failure is an ERROR, logged at once and then
   /// at most every kKeyframeReadErrorPeriodS until a read succeeds: without
   /// its keyframes a robot has neither a standing start nor a roadmap

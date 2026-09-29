@@ -117,6 +117,15 @@ PlanningParams makeParams() {
   return p;
 }
 
+TEST(StandingStart, FirstGoalArrivalBandMustClearTheAnchoredPrior) {
+  const mgg::StandingStart start{Eigen::Vector2d(2, -1), 1.2};
+  EXPECT_FALSE(start.admitsGoal({2.8, -0.2}, 0.25));
+  EXPECT_FALSE(start.admitsGoal({3.4, -1}, 0.25));
+  EXPECT_FALSE(start.admitsGoal({3.45, -1}, 0.25));
+  EXPECT_TRUE(start.admitsGoal({3.46, -1}, 0.25));
+  EXPECT_TRUE(start.admitsGoal({2, 0.46}, 0.25));
+}
+
 TEST(GroundProjection, FindsGroundBelowASample) {
   Terrain map;
   PlanningParams params = makeParams();

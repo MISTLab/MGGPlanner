@@ -4295,6 +4295,9 @@ TEST_F(PlannerNodeTest, AStandingStartInItsLidarsBlindDiskIsNotBoxedIn) {
   const auto scene = [](const std::string& name,
                         const KeyframeTrajectory& keyframes) {
     auto node = makeNode(name);
+    // Leave room for one complete first departure beyond the prior + arrival
+    // band; a short intermediate stop in that disk is no longer admissible.
+    PlannerNodeTestPeer::setLattice(*node, {-3, -1}, {3, 1});
     PlannerNodeTestPeer::observeRaisedRing(*node, 0.6, 3.5, 0.0);
     PlannerNodeTestPeer::observeWall(*node, -1.0, 1.0, 0.8);
     PlannerNodeTestPeer::observeWallAlongY(*node, 0.2, 0.8, 0.4);
@@ -5007,6 +5010,35 @@ TEST_F(PlannerNodeTest, TheTourNoLongerExploresAwayFromANearTargetAndRoutesBack)
     PlannerNodeTestPeer::acceptOdometry(*node, robot.x(), robot.y(),
                                         2.0 + cycle);
   }
+}
+
+TEST_F(PlannerNodeTest, Run12ShortFirstTourGoalDoesNotStopInsideTheBlindArrivalBand) {
+  auto node = makeNode("run12_short_first_goal");
+  PlannerNodeTestPeer::allowUnknownLatticeBody(*node);
+  PlannerNodeTestPeer::observeRaisedRing(*node, 1.0, 4.0, 0.0);
+  PlannerNodeTestPeer::setHangingRootReach(*node, 1.2);
+  PlannerNodeTestPeer::setReachDistance(*node, 0.25);
+  PlannerNodeTestPeer::serveMap(*node, "component:test", 0);
+  auto source = std::make_unique<TrajectoryInMemory>();
+  source->trajectory = keyframesAlong({{0.0, 0.0}});
+  PlannerNodeTestPeer::setKeyframeSource(*node, std::move(source));
+  PlannerNodeTestPeer::acceptOdometry(*node, 0.0, 0.0, 1.0);
+  ASSERT_TRUE(PlannerNodeTestPeer::standingStart(*node));
+  // Run 12 target (0.80, 0.80), arrival 0.25 m early: already beyond
+  // the 0.5 m lifetime, but still inside the unobserved disk.
+  const int frontier = PlannerNodeTestPeer::addGlobalChainToFrontier(
+      *node, {{0.8, 0.8}}, M_PI / 4);
+  PlannerNodeTestPeer::setVertexGain(*node, frontier, 1e6);
+  PlannerNodeTestPeer::setTour(*node, true, 1e5);
+  std::string reason;
+  EXPECT_FALSE(PlannerNodeTestPeer::runGlobalPlanner(*node, reason, frontier));
+  EXPECT_NE(reason.find("standing-start arrival band"), std::string::npos) << reason;
+  auto response = std::make_shared<mgg_msgs::srv::PlannerSrv::Response>();
+  PlannerNodeTestPeer::plan(*node, response);
+  ASSERT_GE(response->path.size(), 2u);
+  const auto& end = response->path.back().position;
+  EXPECT_GT(std::hypot(end.x, end.y) - 0.25, 1.2);
+  EXPECT_FALSE(PlannerNodeTestPeer::bestPathFromGlobalGraph(*node));
 }
 
 TEST_F(PlannerNodeTest, ANearHighGainTourTargetKeepsTheMovingLocalPathAndStaysAside) {
