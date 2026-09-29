@@ -1543,7 +1543,21 @@ bool PlannerNode::readOwnKeyframes(KeyframeTrajectory& trajectory,
   return false;
 }
 
+PlannerNode::StandingStartScope::StandingStartScope(PlannerNode& node) : node(node) {
+  ++node.standing_start_scope_depth_;
+}
+
+PlannerNode::StandingStartScope::~StandingStartScope() {
+  if (--node.standing_start_scope_depth_ == 0) node.plan_standing_start_.reset();
+}
+
 std::optional<mgg::StandingStart> PlannerNode::standingStart() {
+  if (standing_start_scope_depth_ == 0) return readStandingStart();
+  if (!plan_standing_start_) plan_standing_start_.emplace(readStandingStart());
+  return *plan_standing_start_;
+}
+
+std::optional<mgg::StandingStart> PlannerNode::readStandingStart() {
   standing_start_unread_keyframes_.clear();
   if (robot_params_.type != mgg::RobotType::kGroundRobot ||
       !standing_start_xy_ || !(hanging_root_edge_length_max_ > 0.0) ||
@@ -2854,6 +2868,7 @@ std::string PlannerNode::buildLocalGraph() {
   // Held for the whole cycle: the map must not change under a planner that is
   // ray-casting through it.
   const std::lock_guard<std::recursive_mutex> lock(planner_mutex_);
+  StandingStartScope standing_scope(*this);
   auto map_read = mapReadLease();
   refreshMapRevision();
   best_path_.clear();
@@ -3345,6 +3360,7 @@ std::string PlannerNode::departBoxedIn(const mgg::StateVec& root_state,
 
 bool PlannerNode::straightDeparture(const mgg::StateVec& start,
                                     mgg::Departure& departure) {
+  StandingStartScope standing_scope(*this);
   mgg::GroundProjection ground(*map_, planning_params_);
   ground.setStandingStart(standingStart());
   if (no_go_.inside(start.head<3>())) {
@@ -3842,6 +3858,7 @@ mgg::PathOkFn PlannerNode::applyRouteTurnRule(
 
 bool PlannerNode::runGlobalPlanner(int target_id, std::string& reason,
                                    double min_gain) {
+  StandingStartScope standing_scope(*this);
   best_path_.clear();
   best_path_from_global_graph_ = false;
   global_search_cut_short_ = false;
@@ -4142,6 +4159,7 @@ void PlannerNode::onPlanRequest(
     const std::shared_ptr<mgg_msgs::srv::PlannerSrv::Request> request,
     std::shared_ptr<mgg_msgs::srv::PlannerSrv::Response> response) {
   const std::lock_guard<std::recursive_mutex> lock(planner_mutex_);
+  StandingStartScope standing_scope(*this);
   // One peer set for the whole request (review r0, I5).
   std::optional<mgg::MolaMap::TransientDiscPin> peer_pin;
   pinPeerBodies(peer_pin);
@@ -4838,6 +4856,7 @@ void PlannerNode::onObjectiveRequest(
     std::shared_ptr<mgg_msgs::srv::PlanObjective::Response> response) {
   using Service = mgg_msgs::srv::PlanObjective;
   const std::lock_guard<std::recursive_mutex> lock(planner_mutex_);
+  StandingStartScope standing_scope(*this);
   // One peer set for the whole request (review r0, I5).
   std::optional<mgg::MolaMap::TransientDiscPin> peer_pin;
   pinPeerBodies(peer_pin);

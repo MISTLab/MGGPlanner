@@ -4405,6 +4405,26 @@ std::shared_ptr<mgg_msgs::srv::PlanObjective::Response> returnHome(
   return response;
 }
 
+TEST_F(PlannerNodeTest, StandingStartIsReadOncePerDeparturePlanNotPerEndpoint) {
+  auto node = makeNode("standing_start_once");
+  PlannerNodeTestPeer::observeFloor(*node, -4.05, 4.05, -2.05, 2.05);
+  PlannerNodeTestPeer::setHangingRootReach(*node, 1.2);
+  PlannerNodeTestPeer::serveMap(*node, "component:test", 0);
+  auto source = std::make_unique<TrajectoryInMemory>();
+  auto* observed = source.get();
+  source->trajectory = keyframesAlong({{0, 0}});
+  PlannerNodeTestPeer::setKeyframeSource(*node, std::move(source));
+  PlannerNodeTestPeer::acceptOdometry(*node, 0, 0, 1);
+  observed->reads = 0;
+  const auto start = PlannerNodeTestPeer::drivingState(*node, 0, 0, 0);
+  for (int plan = 1; plan <= 2; ++plan) {
+    std::vector<mgg::StateVec> path;
+    bool reverse = false;
+    ASSERT_TRUE(PlannerNodeTestPeer::straightDeparture(*node, start, path, reverse));
+    EXPECT_EQ(observed->reads, plan);
+  }
+}
+
 TEST_F(PlannerNodeTest, AStandingStartInItsLidarsBlindDiskIsNotBoxedIn) {
   // Run 6: robot_3 stood where it was placed for the whole run, robot_1
   // for 18 minutes. Their lidars never saw the ground within about 2 m of

@@ -404,7 +404,17 @@ class PlannerNode : public rclcpp::Node {
   /// turned off, or a backend without keyframes), without a trajectory to
   /// read, and without a hanging_root_edge_length_max. Once the trajectory
   /// shows the robot left, it never stands at its start again.
+  // Nested entry points share one lazy snapshot; the outer plan owns its
+  // lifetime, including cached absence and the unreadable-source diagnostic.
+  struct StandingStartScope {
+    explicit StandingStartScope(PlannerNode& node);
+    ~StandingStartScope();
+    PlannerNode& node;
+  };
   std::optional<mgg::StandingStart> standingStart();
+  std::optional<mgg::StandingStart> readStandingStart();
+  int standing_start_scope_depth_ = 0;
+  std::optional<std::optional<mgg::StandingStart>> plan_standing_start_;
   bool standingStartGoalAdmissible(const mgg::StateVec& goal);
   /// keyframe_source_->read. A failure is an ERROR, logged at once and then
   /// at most every kKeyframeReadErrorPeriodS until a read succeeds: without
