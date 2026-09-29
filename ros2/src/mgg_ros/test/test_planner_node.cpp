@@ -753,6 +753,10 @@ class PlannerNodeTestPeer {
     node.cloud_map_->augmentFreeBox(center, size);
     ++node.map_revision_;
   }
+  static bool observedArrivalDisk(PlannerNode& node, const mgg::StateVec& goal) {
+    return mgg::observedArrivalDisk(*node.map_, node.robot_params_, node.planning_params_,
+                                   goal, node.reach_distance_);
+  }
   static std::optional<mgg::StandingStart> standingStart(PlannerNode& node) {
     const std::lock_guard<std::recursive_mutex> lock(node.planner_mutex_);
     return node.standingStart();
@@ -4592,7 +4596,9 @@ TEST_F(PlannerNodeTest, AStandingStartInItsLidarsBlindDiskIsNotBoxedIn) {
   EXPECT_EQ(response->status, mgg_msgs::srv::PlannerSrv::Response::FORWARD);
   ASSERT_GE(response->path.size(), 2u);
   const geometry_msgs::msg::Point& end = response->path.back().position;
-  EXPECT_GE(std::hypot(end.x, end.y), 0.4) << end.x << ", " << end.y;
+  EXPECT_TRUE(std::hypot(end.x, end.y) > 1.2 + 0.3 ||
+      PlannerNodeTestPeer::observedArrivalDisk(*standing,
+          mgg::StateVec(end.x, end.y, end.z, 0))) << end.x << ", " << end.y;
   EXPECT_LT(end.y, 0.8);
   EXPECT_EQ(PlannerNodeTestPeer::boxedInWithoutDeparture(*standing), 0);
 

@@ -177,6 +177,59 @@ TEST(ReverseExit, ANoGoZoneAllowsDepartureButNotReverseReentry) {
       mgg::StateVec(2, 0, 0.5, 0), mgg::StateVec(0, 0, 0.5, 0), allowed));
 }
 
+TEST(ReverseExit, SelectionKeepsTheSlopeTurnVetoEvenWithAValidatedExit) {
+  auto p = planning();
+  const auto r = robot();
+  const double grade = std::tan(16 * M_PI / 180);
+  Tops tops = floor();
+  for (int x = -10; x < 40; ++x) {
+    for (int y = 10; y < 20; ++y) tops[{x, y}] = 0;
+  }
+  for (auto& [cell, top] : tops) {
+    top = grade * std::max(0.0, (cell.first + 0.5) * 0.2 - 1.0);
+  }
+  mgg_test::TerrainFixture map(0.2, tops);
+  mgg::GroundProjection ground(map, p);
+  mgg::GraphManager graph;
+  const std::vector<Eigen::Vector2d> xy{{0.1, 0.1}, {1.1, 0.1},
+                                      {2.1, 0.1}, {2.1, 1.1}, {2.1, 2.1}};
+  for (std::size_t i = 0; i < xy.size(); ++i) {
+    auto* v = new mgg::Vertex(i, {xy[i].x(), xy[i].y(),
+        0.5 + grade * std::max(0.0, xy[i].x() - 1.0), 0});
+    v->vol_gain.gain = i + 1 == xy.size() ? 100 : 0;
+    graph.addVertex(v);
+    if (i) graph.addEdge(v, graph.getVertex(i - 1), 1.0);
+  }
+  mgg::SlopeEndRetreat retreat;
+  retreat.admitted_on_slope = [](const mgg::Vertex&) { return true; };
+  retreat.room_to_turn = [&](const mgg::Vertex& v) {
+    return v.id == 0 && mgg::roomToTurn(map, r, p, v.state);
+  };
+  int validated = 0;
+  retreat.reverse_edge_admissible = [&](const mgg::Vertex& a, const mgg::Vertex& b) {
+    const bool ok = mgg::reverseExitEdgeAdmissible(map, ground, r, p, a.state, b.state);
+    if (ok) ++validated;
+    return ok;
+  };
+  mgg::PathTurnCheck check(graph, r, [&](const auto& pose) {
+    return mgg::roomToTurn(map, r, p, pose);
+  }, [&](const Eigen::Vector3d& at) { return mgg::groundSlope(ground, at, 0.5); });
+  const auto select = [&](const mgg::PathTurnsFn& turns) {
+    return mgg::selectBestPath(graph, p, r, {}, 0.2, 0, {}, 0,
+        [](const mgg::Vertex&) { return false; }, turns, {}, 0.25, retreat);
+  };
+  const auto refused = select(std::ref(check));
+  EXPECT_TRUE(refused.sharp_turn_fallback);
+  EXPECT_GT(refused.paths_with_sharp_turns, 0);
+  EXPECT_GT(check.refused_on_slope, 0);
+  EXPECT_GT(validated, 0);
+  // Escape admission itself succeeds; only the independent corner veto
+  // prevents this being classified as a turn-compliant path.
+  const auto exit_only = select({});
+  EXPECT_EQ(exit_only.best_path_id, 4);
+  EXPECT_FALSE(exit_only.sharp_turn_fallback);
+}
+
 TEST(ReverseExit, SlopeTurnVetoRemainsIndependentOfTheExit) {
   mgg::GraphManager graph;
   const auto r = robot();
