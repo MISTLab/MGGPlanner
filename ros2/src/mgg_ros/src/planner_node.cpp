@@ -4604,6 +4604,17 @@ bool PlannerNode::refugeArrivalBandAdmissible(const std::vector<mgg::StateVec>& 
   return remaining <= 1e-9;  // no extrapolating beyond the known corridor
 }
 
+bool PlannerNode::reverseExitEdgeWithoutPeers(const mgg::StateVec& from,
+                                              const mgg::StateVec& to) const {
+  // Peer bodies are transient discs in the map as well as the sweep check:
+  // pin an empty set over the request's, and use fresh ground lookups.
+  std::optional<mgg::MolaMap::TransientDiscPin> no_peers;
+  if (mola_map_ != nullptr) no_peers.emplace(*mola_map_, std::vector<Eigen::Vector2d>{}, 0.0);
+  mgg::GroundProjection ground(*map_, planning_params_, true);
+  return mgg::reverseExitEdgeAdmissible(*map_, ground, robot_params_, planning_params_,
+      from, to, [this](const auto& a, const auto& b) { return no_go_.pathAdmissible({a, b}); });
+}
+
 bool PlannerNode::reverseExitEdge(const mgg::GroundProjection& ground,
                                   const mgg::StateVec& from,
                                   const mgg::StateVec& to) const {
@@ -4822,7 +4833,19 @@ void PlannerNode::keepReverseDeparture(const std::vector<mgg::StateVec>& path) {
 
 bool PlannerNode::tryStoredReverseExit(const mgg::StateVec& start, std::string& note) {
   std::vector<mgg::StateVec> path;
-  if (!validateStoredReverseExit(start, path, note)) return false;
+  std::string unusable_here;
+  if (!validateStoredReverseExit(start, path, note, &unusable_here)) return false;
+  if (!unusable_here.empty()) {
+    // Run 14: a corridor that cannot be driven from here is no escape, and
+    // keeping it only vetoes every new path (extension mode). New paths
+    // from this pose are judged as fresh ones, under the same 6 m bound.
+    stored_reverse_exit_.clear();
+    reverse_exit_entry_path_.clear();
+    stored_reverse_retreating_ = false;
+    const std::string dropped = "; stored reverse exit dropped: " + unusable_here;
+    RCLCPP_WARN(get_logger(), "%s", dropped.c_str() + 2);
+    note += dropped;
+  }
   best_path_ = std::move(path);
   best_path_from_global_graph_ = false;
   global_exploration_ongoing_ = false;
@@ -4836,16 +4859,19 @@ bool PlannerNode::tryStoredReverseExit(const mgg::StateVec& start, std::string& 
 }
 
 bool PlannerNode::validateStoredReverseExit(const mgg::StateVec& start,
-    std::vector<mgg::StateVec>& path, std::string& note) {
+    std::vector<mgg::StateVec>& path, std::string& note, std::string* unusable_here) {
   path.clear();
   if (!storedReverseExitApplies(start)) return false;
   if (mgg::roomToTurn(*map_, robot_params_, planning_params_, start, nullptr)) {
     note = "; stored reverse exit not needed: projected current pose has observed turn room";
     return false;
   }
-  const auto refused = [&](const char* reason) {
+  // A static refusal: nothing but the map, the zones or the pose changing
+  // makes the corridor drivable from here.
+  const auto refused = [&](const char* reason, bool static_here = false) {
     note = std::string("; stored reverse exit refused: ") + reason;
     RCLCPP_WARN(get_logger(), "%s", note.c_str() + 2);
+    if (static_here && unusable_here != nullptr) *unusable_here = reason;
     return true;  // tried; exploration may still try a validated departure
   };
   if (!planning_params_.departure_reverse_allowed) return refused("reverse disabled");
@@ -4874,7 +4900,9 @@ bool PlannerNode::validateStoredReverseExit(const mgg::StateVec& start,
   }
   const double heading = std::atan2(start.y() - reverse[1].y(), start.x() - reverse[1].x());
   const double turn = std::remainder(heading - start[3], 2.0 * M_PI);
-  if (std::abs(turn) > mgg::kDepartureMaxTurnRad + 1e-9) return refused("entry heading mismatch");
+  if (std::abs(turn) > mgg::kDepartureMaxTurnRad + 1e-9) {
+    return refused("entry heading mismatch", true);
+  }
   // The same angular envelope/steps as findDeparture, without excusing the
   // standing body. No separate rotate-in-place pose is emitted.
   mgg::OrientedBox body;
@@ -4884,7 +4912,7 @@ bool PlannerNode::validateStoredReverseExit(const mgg::StateVec& start,
     body.heading = start[3] + turn * i / turns;
     if (mgg::orientedBoxPathStatus(*map_, start.head<3>() + robot_params_.center_offset,
         start.head<3>() + robot_params_.center_offset, body, false, nullptr) != mgg::VoxelStatus::kFree) {
-      return refused("entry heading has no swept body clearance");
+      return refused("entry heading has no swept body clearance", true);
     }
   }
   reverse.front()[3] = heading;
@@ -4896,7 +4924,12 @@ bool PlannerNode::validateStoredReverseExit(const mgg::StateVec& start,
     length += (reverse[i].head<3>() - reverse[i - 1].head<3>()).norm();
     if (length > limit + 1e-9) return refused("length bound exceeded");
     if (!reverseExitEdge(ground, reverse[i - 1], reverse[i])) {
-      return refused("current reverse edge fails terrain, clearance, peer or no-go validation");
+      // One more sweep, without peers, tells a peer standing in the
+      // corridor (transient: keep it) from a static failure.
+      if (reverseExitEdgeWithoutPeers(reverse[i - 1], reverse[i])) {
+        return refused("current reverse edge is blocked by a peer");
+      }
+      return refused("current reverse edge fails terrain, clearance or no-go validation", true);
     }
   }
   if (!refugeArrivalBandAdmissible(reverse)) return refused("refuge arrival band lacks observed level turn room");

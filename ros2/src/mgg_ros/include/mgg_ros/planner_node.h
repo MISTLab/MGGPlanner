@@ -148,9 +148,12 @@ class PlannerNode : public rclcpp::Node {
   std::string rememberReverseExit();
   std::string retainReverseExit(const std::vector<mgg::StateVec>& path, bool departure);
   // True means attempted; an empty output path is a refusal. Does not alter
-  // exploration state or consume the stored corridor.
+  // exploration state or consume the stored corridor. A refusal that no
+  // peer's moving on can lift (heading, swept clearance, or a reverse edge
+  // that fails without peers too) is named in unusable_here.
   bool validateStoredReverseExit(const mgg::StateVec& start,
-      std::vector<mgg::StateVec>& path, std::string& note);
+      std::vector<mgg::StateVec>& path, std::string& note,
+      std::string* unusable_here = nullptr);
   void keepReverseDeparture(const std::vector<mgg::StateVec>& path);
   void retainEntryPastRefuge(const std::vector<mgg::StateVec>& reverse);
   bool reverseExitEndpointExcluded(const mgg::StateVec& pose) const;
@@ -170,6 +173,8 @@ class PlannerNode : public rclcpp::Node {
                                     bool require_level = true) const;
   bool reverseExitEdge(const mgg::GroundProjection& ground,
                        const mgg::StateVec& from, const mgg::StateVec& to) const;
+  /// reverseExitEdge with no peer bodies: whether only a peer blocks it.
+  bool reverseExitEdgeWithoutPeers(const mgg::StateVec& from, const mgg::StateVec& to) const;
   void forgetReverseExitIfOffRoute();
   /// Whether a route, the robot's pose first, starts with a sharp turn
   /// (kSharpTurnRad, measured over the robot's length from its heading)

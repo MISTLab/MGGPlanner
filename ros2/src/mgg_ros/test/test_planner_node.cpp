@@ -5032,6 +5032,47 @@ TEST_F(PlannerNodeTest, AFailedRetentionExcludesTheEndpointOnTheNextSelection) {
   EXPECT_TRUE(next.empty() || (next.back().head<3>() - failed_endpoint).norm() > 0.35);
 }
 
+// diag-run14 §1, §5 item 1: a Bunker stopped where it cannot turn, inside
+// its retained corridor. Its stored exit is refused (entry heading
+// mismatch), and the forward candidates end beyond the 6 m reverse bound.
+// Run 14 refused A, then B, then A again, each time with NO_PATH, until the
+// trial ended. Now each plan sends a path, departs, or reports boxed in, and
+// a path follows.
+TEST_F(PlannerNodeTest, Run14RoomlessCorridorEndWithARefusedExitDoesNotLivelock) {
+  // 1.2 m wide: still no room to turn the 1.2 x 0.3 m body.
+  MolaFloorProduct entry(-2, 10, -2, 2,
+      {{{1.0, 9, 0.6, 0.8}}, {{1.0, 9, -0.8, -0.6}}});
+  auto node = makeNode("run14_retention_livelock");
+  PlannerNodeTestPeer::useMolaMap(*node, entry.serve());
+  PlannerNodeTestPeer::setRobotFootprint(*node, 1.2, 0.3);
+  PlannerNodeTestPeer::setLattice(*node, {0, 0}, {5.5, 0});
+  PlannerNodeTestPeer::acceptOdometryFacing(*node, 0, 0, 0, 1);
+  auto response = std::make_shared<mgg_msgs::srv::PlannerSrv::Response>();
+  PlannerNodeTestPeer::plan(*node, response);
+  ASSERT_GE(response->path.size(), 2u);
+  PlannerNodeTestPeer::acceptOdometryFacing(*node, 0.01, 0, 0, 2);
+  ASSERT_GT(PlannerNodeTestPeer::storedReversePoses(*node), 1u);
+  MolaFloorProduct open_ahead(-2, 10, -2, 2,
+      {{{1.0, 7.2, 0.6, 0.8}}, {{1.0, 7.2, -0.8, -0.6}}});
+  PlannerNodeTestPeer::useMolaMap(*node, open_ahead.serve());
+  // Stopped 0.3 m to the side of the entry line, facing along it: joining
+  // the corridor 0.5 m back needs a 37-degree heading, beyond the
+  // 30-degree departure envelope (entry heading mismatch).
+  PlannerNodeTestPeer::acceptOdometryFacing(*node, 3, 0.3, 0, 3);
+  ASSERT_FALSE(PlannerNodeTestPeer::roomToTurnObserved(*node,
+      PlannerNodeTestPeer::drivingState(*node, 3, 0.3, 0)));
+  bool sent = false;
+  for (int plan = 0; plan < 4 && !sent; ++plan) {
+    SCOPED_TRACE(plan);
+    const int boxed = PlannerNodeTestPeer::boxedInWithoutDeparture(*node);
+    response = std::make_shared<mgg_msgs::srv::PlannerSrv::Response>();
+    PlannerNodeTestPeer::plan(*node, response);
+    sent = !response->path.empty();
+    EXPECT_TRUE(sent || PlannerNodeTestPeer::boxedInWithoutDeparture(*node) > boxed);
+  }
+  EXPECT_TRUE(sent);
+}
+
 // mgg-run14 (a): a refused retention falls back in the same request, as the
 // boxed-in branch does: the stored exit first, then a validated departure.
 TEST_F(PlannerNodeTest, ARefusedRetentionFallsBackToTheStoredExitThenADeparture) {
@@ -5151,6 +5192,47 @@ TEST_F(PlannerNodeTest, RetentionExclusionsThatExhaustSelectionAreBoxedIn) {
   ASSERT_GE(path.size(), 2u) << summary;
   EXPECT_EQ(PlannerNodeTestPeer::boxedInDepartures(*node), departures + 1);
   EXPECT_GE(path.back().x(), 3.8 - 1e-9);
+}
+
+// mgg-run14 (c): a stored exit refused at the current pose for a static
+// reason is dropped; it cannot be driven from here and would only force the
+// extension veto on every new path. A peer on an edge is transient: kept.
+TEST_F(PlannerNodeTest, AStoredExitRefusedForAStaticReasonIsDroppedButAPeerBlockKeepsIt) {
+  for (const int refusal : {0, 1, 2}) {  // heading mismatch, mapped wall, peer
+    SCOPED_TRACE(refusal);
+    MolaFloorProduct entry(-2, 7, -2, 2,
+        {{{0.8, 7, 0.4, 0.6}}, {{0.8, 7, -0.6, -0.4}}});
+    auto node = makeNode("stored_exit_dropped");
+    PlannerNodeTestPeer::useMolaMap(*node, entry.serve());
+    PlannerNodeTestPeer::setRobotFootprint(*node, 1.0, 0.3);
+    PlannerNodeTestPeer::setLattice(*node, {0, 0}, {5.5, 0});
+    PlannerNodeTestPeer::acceptOdometryFacing(*node, 0, 0, 0, 1);
+    auto response = std::make_shared<mgg_msgs::srv::PlannerSrv::Response>();
+    PlannerNodeTestPeer::plan(*node, response);
+    ASSERT_GE(response->path.size(), 2u);
+    const double endpoint = response->path.back().position.x;
+    ASSERT_GT(endpoint, 4.0);
+    std::vector<std::array<double, 4>> walls = {
+        {0.8, 7, 0.4, 0.6}, {0.8, 7, -0.6, -0.4}, {endpoint + 0.6, endpoint + 0.8, -2, 2}};
+    if (refusal == 1) walls.push_back({2.8, 3.0, -2, 2});
+    MolaFloorProduct arrived(-2, 7, -2, 2, walls);
+    PlannerNodeTestPeer::useMolaMap(*node, arrived.serve());
+    if (refusal == 2) PlannerNodeTestPeer::receivePeerBodies(*node, {{3, 0}});
+    PlannerNodeTestPeer::setLattice(*node, {0, 0}, {0, 0});
+    PlannerNodeTestPeer::acceptOdometryFacing(*node, endpoint - 0.2, 0,
+                                              refusal == 0 ? 0.7 : 0.0, 2);
+    ASSERT_GT(PlannerNodeTestPeer::storedReversePoses(*node), 1u);
+    const auto summary = PlannerNodeTestPeer::buildLocalGraph(*node);
+    EXPECT_TRUE(PlannerNodeTestPeer::bestPath(*node).empty());
+    EXPECT_NE(summary.find("stored reverse exit refused"), std::string::npos) << summary;
+    if (refusal == 2) {
+      EXPECT_GT(PlannerNodeTestPeer::storedReversePoses(*node), 1u);
+      EXPECT_EQ(summary.find("stored reverse exit dropped"), std::string::npos) << summary;
+    } else {
+      EXPECT_EQ(PlannerNodeTestPeer::storedReversePoses(*node), 0u);
+      EXPECT_NE(summary.find("stored reverse exit dropped: "), std::string::npos) << summary;
+    }
+  }
 }
 
 TEST_F(PlannerNodeTest, NearEightDegreeRefugeUsesTheSameSlopeForCutbackAndRetention) {
