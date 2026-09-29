@@ -153,8 +153,12 @@ class PlannerNode : public rclcpp::Node {
       std::vector<mgg::StateVec>& path, std::string& note);
   void keepReverseDeparture(const std::vector<mgg::StateVec>& path);
   void retainEntryPastRefuge(const std::vector<mgg::StateVec>& reverse);
-  void beginEndpointSelection();
   bool reverseExitEndpointExcluded(const mgg::StateVec& pose) const;
+  void excludeReverseExitEndpoint(const Eigen::Vector3d& endpoint);
+  /// Forgets the exclusions once the robot is more than
+  /// kReverseExitExclusionMoveM from where the first was made, or the map
+  /// in service is another component or epoch.
+  void expireReverseExitExclusions();
   bool tryStoredReverseExit(const mgg::StateVec& start, std::string& note);
   bool storedReverseExitApplies(const mgg::StateVec& pose) const;
   bool currentPoseNeedsStoredExit() const;
@@ -443,8 +447,13 @@ class PlannerNode : public rclcpp::Node {
   // reused across requests or map generations; the request pins peers.
   mutable std::map<std::array<double, 6>, bool> plan_reverse_edges_;
   mutable std::uint64_t plan_reverse_generation_ = 0;
-  std::vector<Eigen::Vector3d> pending_reverse_exit_exclusions_;
-  std::vector<Eigen::Vector3d> plan_reverse_exit_exclusions_;
+  // Endpoints whose reverse-exit retention was refused. They accumulate while
+  // the robot stays put, so selection cannot alternate between two refused
+  // candidates (run 14).
+  static constexpr double kReverseExitExclusionMoveM = 0.5;
+  std::vector<Eigen::Vector3d> reverse_exit_exclusions_;
+  Eigen::Vector2d reverse_exit_exclusions_anchor_ = Eigen::Vector2d::Zero();
+  std::pair<std::string, std::uint64_t> reverse_exit_exclusions_map_;
   bool standingStartGoalAdmissible(const mgg::StateVec& goal);
   /// keyframe_source_->read. A failure is an ERROR, logged at once and then
   /// at most every kKeyframeReadErrorPeriodS until a read succeeds: without

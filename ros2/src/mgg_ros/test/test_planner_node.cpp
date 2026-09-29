@@ -350,6 +350,12 @@ class PlannerNodeTestPeer {
     return node.rememberReverseExit();
   }
   static mgg::StateVec storedRefuge(PlannerNode& node) { return node.stored_reverse_exit_.back(); }
+  static std::size_t reverseExitExclusions(PlannerNode& node) {
+    return node.reverse_exit_exclusions_.size();
+  }
+  static void excludeReverseExitEndpoint(PlannerNode& node, const Eigen::Vector3d& endpoint) {
+    node.excludeReverseExitEndpoint(endpoint);
+  }
   static void clearStoredReverseExit(PlannerNode& node) {
     node.stored_reverse_exit_.clear();
   }
@@ -5067,6 +5073,84 @@ TEST_F(PlannerNodeTest, ARefusedRetentionFallsBackToTheStoredExitThenADeparture)
       for (const auto& pose : response->path) EXPECT_NEAR(pose.orientation.z, 0, 1e-6);
     }
   }
+}
+
+// mgg-run14 (b): refused endpoints accumulate while the robot stays within
+// 0.5 m of where the first was refused, so selection cannot alternate
+// between two refused candidates.
+TEST_F(PlannerNodeTest, RetentionRefusalsAccumulateUntilTheRobotMoves) {
+  const std::vector<std::array<double, 4>> corridor{{0.8, 7, 0.4, 0.6}, {0.8, 7, -0.6, -0.4}};
+  auto blocked_walls = corridor;
+  blocked_walls.push_back({1.0, 1.2, -2, 2});
+  MolaFloorProduct clear(-2, 7, -2, 2, corridor);
+  MolaFloorProduct blocked(-2, 7, -2, 2, blocked_walls);
+  auto node = makeNode("retention_exclusions_accumulate");
+  PlannerNodeTestPeer::serveMap(*node, "component:test", 1);
+  PlannerNodeTestPeer::setRobotFootprint(*node, 1.0, 0.3);
+  PlannerNodeTestPeer::setLattice(*node, {0, 0}, {5.5, 0});
+  PlannerNodeTestPeer::useMolaMap(*node, clear.serve());
+  PlannerNodeTestPeer::acceptOdometryFacing(*node, 0, 0, 0, 1);
+  std::vector<Eigen::Vector3d> refused;
+  for (int i = 0; i < 3; ++i) {
+    SCOPED_TRACE(i);
+    PlannerNodeTestPeer::useMolaMap(*node, clear.serve());
+    PlannerNodeTestPeer::buildLocalGraph(*node);
+    const auto path = PlannerNodeTestPeer::bestPath(*node);
+    // Neither A nor B again: another end, or none left.
+    for (const auto& earlier : refused) {
+      EXPECT_TRUE(path.empty() || (path.back().head<3>() - earlier).norm() > 0.35);
+    }
+    if (i == 2) break;
+    ASSERT_GE(path.size(), 2u);
+    PlannerNodeTestPeer::useMolaMap(*node, blocked.serve());
+    const auto note = PlannerNodeTestPeer::retainBestPath(*node);
+    ASSERT_NE(note.find("reverse exit retention refused"), std::string::npos) << note;
+    refused.push_back(path.back().head<3>());
+  }
+  EXPECT_EQ(PlannerNodeTestPeer::reverseExitExclusions(*node), 2u);
+  PlannerNodeTestPeer::acceptOdometryFacing(*node, 0.4, 0, 0, 2);
+  EXPECT_EQ(PlannerNodeTestPeer::reverseExitExclusions(*node), 2u);
+  // More than 0.5 m from where the first was refused: forgotten.
+  PlannerNodeTestPeer::acceptOdometryFacing(*node, -0.6, 0, 0, 3);
+  EXPECT_EQ(PlannerNodeTestPeer::reverseExitExclusions(*node), 0u);
+  PlannerNodeTestPeer::useMolaMap(*node, clear.serve());
+  PlannerNodeTestPeer::buildLocalGraph(*node);
+  ASSERT_GE(PlannerNodeTestPeer::bestPath(*node).size(), 2u);
+  PlannerNodeTestPeer::useMolaMap(*node, blocked.serve());
+  PlannerNodeTestPeer::retainBestPath(*node);
+  EXPECT_EQ(PlannerNodeTestPeer::reverseExitExclusions(*node), 1u);
+  // A new map epoch re-anchors the coordinates: forgotten too.
+  PlannerNodeTestPeer::serveMap(*node, "component:test", 2);
+  PlannerNodeTestPeer::acceptOdometryFacing(*node, -0.6, 0, 0, 4);
+  EXPECT_EQ(PlannerNodeTestPeer::reverseExitExclusions(*node), 0u);
+}
+
+// mgg-run14 (b): when the exclusions leave selection no candidate, a robot
+// with no room to turn gets the boxed-in handling, not a bare no path.
+TEST_F(PlannerNodeTest, RetentionExclusionsThatExhaustSelectionAreBoxedIn) {
+  MolaFloorProduct opening(-2, 7, -2, 2,
+      {{{-0.8, 3.4, 0.4, 0.6}}, {{-0.8, 3.4, -0.6, -0.4}}});
+  auto node = makeNode("retention_exclusions_boxed_in");
+  PlannerNodeTestPeer::useMolaMap(*node, opening.serve());
+  PlannerNodeTestPeer::setRobotFootprint(*node, 1.0, 0.3);
+  PlannerNodeTestPeer::setLattice(*node, {0, 0}, {2, 0});
+  PlannerNodeTestPeer::acceptOdometryFacing(*node, 3, 0, 0, 1);
+  ASSERT_FALSE(PlannerNodeTestPeer::roomToTurnObserved(*node,
+      PlannerNodeTestPeer::drivingState(*node, 3, 0, 0)));
+  PlannerNodeTestPeer::buildLocalGraph(*node);
+  ASSERT_GE(PlannerNodeTestPeer::bestPath(*node).size(), 2u);
+  const auto root = PlannerNodeTestPeer::drivingState(*node, 3, 0, 0);
+  for (double x = 3.25; x <= 5.5; x += 0.25) {
+    PlannerNodeTestPeer::excludeReverseExitEndpoint(*node, {x, 0, root.z()});
+  }
+  const int departures = PlannerNodeTestPeer::boxedInDepartures(*node);
+  const auto summary = PlannerNodeTestPeer::buildLocalGraph(*node);
+  EXPECT_NE(summary.find("boxed in"), std::string::npos) << summary;
+  // The straight departure ahead to the opening at x = 3.4.
+  const auto path = PlannerNodeTestPeer::bestPath(*node);
+  ASSERT_GE(path.size(), 2u) << summary;
+  EXPECT_EQ(PlannerNodeTestPeer::boxedInDepartures(*node), departures + 1);
+  EXPECT_GE(path.back().x(), 3.8 - 1e-9);
 }
 
 TEST_F(PlannerNodeTest, NearEightDegreeRefugeUsesTheSameSlopeForCutbackAndRetention) {

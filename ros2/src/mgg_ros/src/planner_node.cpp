@@ -1559,18 +1559,10 @@ PlannerNode::StandingStartScope::StandingStartScope(PlannerNode& node) : node(no
   ++node.standing_start_scope_depth_;
 }
 
-void PlannerNode::beginEndpointSelection() {
-  if (plan_reverse_exit_exclusions_.empty()) {
-    plan_reverse_exit_exclusions_ = std::move(pending_reverse_exit_exclusions_);
-    pending_reverse_exit_exclusions_.clear();
-  }
-}
-
 PlannerNode::StandingStartScope::~StandingStartScope() {
   if (--node.standing_start_scope_depth_ == 0) {
     node.plan_standing_start_.reset();
     node.plan_reverse_edges_.clear();
-    node.plan_reverse_exit_exclusions_.clear();
   }
 }
 
@@ -1707,6 +1699,7 @@ void PlannerNode::onOdometry(nav_msgs::msg::Odometry::ConstSharedPtr msg) {
   auto map_read = mapReadLease();
   refreshMapRevision();
   forgetReverseExitIfOffRoute();
+  expireReverseExitExclusions();
   seedGlobalGraph();
   if (home_state_wait_started_) return;
   // On start, or after the graph was lost, it holds only its seed.
@@ -3075,7 +3068,7 @@ std::string PlannerNode::buildLocalGraph() {
   // gain (mgg::pathTurnsBack).
   const mgg::PlanningParams selection_params =
       turn_back_hysteresis_.selectionParams(planning_params_);
-  beginEndpointSelection();
+  int retention_excluded = 0;
   const mgg::PathSelectionResult sel = mgg::selectBestPath(
       *local_graph_, selection_params, robot_params_, edge_inclinations_,
       map_->getResolution(), selection_direction, selectionExclusions(),
@@ -3092,9 +3085,13 @@ std::string PlannerNode::buildLocalGraph() {
       },
       turns_admissible, sharp_turn_allowed, reach_distance_,
       slope_end_retreat,
-      [this, &standing](const mgg::Vertex& v) {
-        return no_go_.inside(v.state.head<3>()) || reverseExitEndpointExcluded(v.state) ||
-               (standing && !standingStartGoalAdmissible(v.state));
+      [this, &standing, &retention_excluded](const mgg::Vertex& v) {
+        if (no_go_.inside(v.state.head<3>())) return true;
+        if (reverseExitEndpointExcluded(v.state)) {
+          ++retention_excluded;
+          return true;
+        }
+        return standing && !standingStartGoalAdmissible(v.state);
       },
       // A path the final check would refuse is left out, so another is
       // chosen rather than none (review r1, R1-1).
@@ -3197,7 +3194,10 @@ std::string PlannerNode::buildLocalGraph() {
                                          [](const auto& entry) {
                                            return entry.second &&
                                                entry.second->vol_gain.gain > 0;
-                                         }))) &&
+                                         })) ||
+                            // Run 14: the candidates ran out where the
+                            // robot has stood since they were refused.
+                            (sel.best_path.empty() && retention_excluded > 0)) &&
                            turns_admissible &&
                            !mgg::roomToTurn(*map_, robot_params_, planning_params_,
                                             root_state, standing_on)));
@@ -3214,6 +3214,8 @@ std::string PlannerNode::buildLocalGraph() {
         : goes_nowhere ? "its best path goes nowhere"
         : sel.best_path.empty() && sel.slope_ends_without_way_back > 0
             ? "no narrow or slope end has a way back"
+        : sel.best_path.empty() && retention_excluded > 0
+            ? "every other end was refused a reverse exit here"
             : "no path turns only where it may";
     boxed_in = departBoxedIn(root_state, reason);
     // Sent as it is: not a lattice path, and the roadmap keeps no edge the
@@ -3906,7 +3908,6 @@ bool PlannerNode::runGlobalPlanner(int target_id, std::string& reason,
   };
   if (target_id >= 0) {
     const auto* target = findGlobalVertex(target_id);
-    if (target && target->type == mgg::VertexType::kFrontier) beginEndpointSelection();
     if (target && reverseExitEndpointExcluded(target->state)) {
       global_frontier_not_routed_ = true;
       reason = "target excluded after reverse-exit retention refusal";
@@ -3949,7 +3950,6 @@ bool PlannerNode::runGlobalPlanner(int target_id, std::string& reason,
                           fleet_params_.cluster_merge_radius_m)
                : reservation_exclusion_radius_m_;
     const Eigen::Vector3d robot_position = current_state_.head<3>();
-    beginEndpointSelection();
     const mgg::GlobalFrontierReport report = mgg::searchGlobalFrontier(
         *global_graph_, link_vertex->id,
         static_cast<int>(planning_params_.robot_id), globalFrontierGain(),
@@ -4221,6 +4221,7 @@ void PlannerNode::onPlanRequest(
                 secondsSince(last_odometry_received_));
     return;
   }
+  expireReverseExitExclusions();
   // A caller may pin the bound mode for this cycle, e.g. to squeeze through a
   // gap it would normally refuse.
   const mgg::BoundModeType previous = robot_params_.bound_mode;
@@ -4548,8 +4549,9 @@ std::string PlannerNode::clearInadmissibleBestPath() {
 }
 
 void PlannerNode::enforceSafeCompletion(bool& complete) {
-  if (best_path_.empty() && (standingStart() || !pending_reverse_exit_exclusions_.empty() ||
-                            !plan_reverse_exit_exclusions_.empty())) complete = false;
+  if (best_path_.empty() && (standingStart() || !reverse_exit_exclusions_.empty())) {
+    complete = false;
+  }
 }
 
 bool PlannerNode::endpointNeedsReverseExit(const mgg::StateVec& pose) const {
@@ -4626,20 +4628,46 @@ bool PlannerNode::reverseExitEdge(const mgg::GroundProjection& ground,
 }
 
 bool PlannerNode::reverseExitEndpointExcluded(const mgg::StateVec& pose) const {
-  return std::any_of(plan_reverse_exit_exclusions_.begin(), plan_reverse_exit_exclusions_.end(),
+  return std::any_of(reverse_exit_exclusions_.begin(), reverse_exit_exclusions_.end(),
       [&](const auto& excluded) {
         return (pose.head<3>() - excluded).norm() <= reach_distance_ + mgg::kViewpointArrivalSlack;
       });
+}
+
+void PlannerNode::excludeReverseExitEndpoint(const Eigen::Vector3d& endpoint) {
+  expireReverseExitExclusions();
+  if (reverse_exit_exclusions_.empty()) {
+    reverse_exit_exclusions_anchor_ = current_state_.head<2>();
+    reverse_exit_exclusions_map_ = have_mapping_snapshot_
+        ? std::make_pair(mapping_snapshot_.component_id, mapping_snapshot_.epoch)
+        : std::make_pair(std::string(), std::uint64_t{0});
+  }
+  reverse_exit_exclusions_.push_back(endpoint);
+}
+
+void PlannerNode::expireReverseExitExclusions() {
+  if (reverse_exit_exclusions_.empty()) return;
+  // Not on every map revision: those arrive with each scan, and forgetting
+  // at that rate brought back run 14's alternation between two refused
+  // candidates. A new component or epoch re-anchors the coordinates.
+  const auto map = have_mapping_snapshot_
+      ? std::make_pair(mapping_snapshot_.component_id, mapping_snapshot_.epoch)
+      : std::make_pair(std::string(), std::uint64_t{0});
+  if ((current_state_.head<2>() - reverse_exit_exclusions_anchor_).norm() >
+          kReverseExitExclusionMoveM ||
+      map != reverse_exit_exclusions_map_) {
+    reverse_exit_exclusions_.clear();
+  }
 }
 
 std::string PlannerNode::rememberReverseExit() {
   if (best_path_.empty() || stored_reverse_sent_now_) return {};
   const std::string refusal = retainReverseExit(best_path_, departure_sent_now_);
   if (refusal.empty()) return {};
-  pending_reverse_exit_exclusions_ = {best_path_.back().head<3>()};
+  excludeReverseExitEndpoint(best_path_.back().head<3>());
   if (best_path_from_global_graph_) {
     if (const auto* target = findGlobalVertex(current_global_vertex_id_)) {
-      pending_reverse_exit_exclusions_.push_back(target->state.head<3>());
+      excludeReverseExitEndpoint(target->state.head<3>());
     }
   }
   if (tour_planner_) {
@@ -4658,7 +4686,8 @@ std::string PlannerNode::rememberReverseExit() {
   global_exploration_ongoing_ = false;
   global_frontier_not_routed_ = true;
   std::string note = "; reverse exit retention refused: " + refusal +
-                     "; endpoint excluded for next plan";
+                     "; endpoint excluded until the robot moves (" +
+                     std::to_string(reverse_exit_exclusions_.size()) + " excluded)";
   RCLCPP_WARN(get_logger(), "%s", note.c_str() + 2);
   // Run 14: returning no path here left a robot that cannot turn choosing
   // the same refused candidates forever. Fall back in this request, as the
