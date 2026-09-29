@@ -4470,6 +4470,48 @@ TEST_F(PlannerNodeTest, AnObjectiveWithALostRefugeUsesAValidatedDepartureFirst) 
   EXPECT_NE(objective->reason.find("validated departure"), std::string::npos);
 }
 
+TEST_F(PlannerNodeTest, ANewForwardPathInsideTheCorridorKeepsItsBoundedReverseExit) {
+  for (const bool over_bound : {false, true}) {
+    MolaFloorProduct entry(-2, 10, -2, 2,
+        {{{0.8, 9, 0.4, 0.6}}, {{0.8, 9, -0.6, -0.4}}});
+    auto node = makeNode("continued_corridor_entry");
+    PlannerNodeTestPeer::useMolaMap(*node, entry.serve());
+    PlannerNodeTestPeer::setRobotFootprint(*node, 1.0, 0.3);
+    PlannerNodeTestPeer::setLattice(*node, {0, 0}, {5.5, 0});
+    PlannerNodeTestPeer::acceptOdometryFacing(*node, 0, 0, 0, 1);
+    auto response = std::make_shared<mgg_msgs::srv::PlannerSrv::Response>();
+    PlannerNodeTestPeer::plan(*node, response);
+    ASSERT_GE(response->path.size(), 2u);
+    ASSERT_LT(response->path.back().position.x, 5.2);
+    const double mouth = over_bound ? 7.2 : 5.2;
+    MolaFloorProduct open_ahead(-2, 10, -2, 2,
+        {{{0.8, mouth, 0.4, 0.6}}, {{0.8, mouth, -0.6, -0.4}}});
+    PlannerNodeTestPeer::useMolaMap(*node, open_ahead.serve());
+    PlannerNodeTestPeer::acceptOdometryFacing(*node, 3, 0, 0, 2);
+    PlannerNodeTestPeer::setLattice(*node, {0, 0}, {over_bound ? 5.5 : 3.5, 0});
+    response = std::make_shared<mgg_msgs::srv::PlannerSrv::Response>();
+    PlannerNodeTestPeer::plan(*node, response);
+    EXPECT_GT(PlannerNodeTestPeer::storedReversePoses(*node), 1u);
+    if (over_bound) {
+      EXPECT_TRUE(response->path.empty());
+      EXPECT_EQ(response->status, PlannerNode::kStatusNoPath);
+      PlannerNodeTestPeer::setLattice(*node, {0, 0}, {0, 0});
+    } else {
+      ASSERT_GE(response->path.size(), 2u);
+      EXPECT_GT(response->path.back().position.x, 5.7);
+      // Cancel beyond the first entry's endpoint, still before turn room.
+      PlannerNodeTestPeer::acceptOdometryFacing(*node, 5.5, 0, 0, 3);
+      ASSERT_FALSE(PlannerNodeTestPeer::roomToTurnObserved(*node,
+          PlannerNodeTestPeer::drivingState(*node, 5.5, 0, 0)));
+      PlannerNodeTestPeer::setLattice(*node, {0, 0}, {0, 0});
+    }
+    response = std::make_shared<mgg_msgs::srv::PlannerSrv::Response>();
+    PlannerNodeTestPeer::plan(*node, response);
+    ASSERT_GE(response->path.size(), 2u);
+    EXPECT_LT(response->path.back().position.x, 0.8);
+  }
+}
+
 TEST_F(PlannerNodeTest, RouteAndStoredExitRoomGatesUseTheProjectedCurrentPose) {
   MolaFloorProduct floor(-2, 2, -2, 2);
   auto node = makeNode("projected_room_gate");

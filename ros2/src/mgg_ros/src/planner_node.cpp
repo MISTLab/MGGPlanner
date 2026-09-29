@@ -4595,31 +4595,49 @@ bool PlannerNode::reverseExitEndpointExcluded(const mgg::StateVec& pose) const {
 
 std::string PlannerNode::rememberReverseExit() {
   if (best_path_.empty() || stored_reverse_sent_now_) return {};
-  // A new entry replaces the old escape, but sending a retreat is not its
-  // completion. Its remaining corridor survives cancellation and replanning.
-  stored_reverse_retreating_ = false;
-  stored_reverse_exit_.clear();
+  const bool extending = storedReverseExitApplies(best_path_.front()) &&
+      !mgg::roomToTurn(*map_, robot_params_, planning_params_, best_path_.front(), nullptr);
+  if (!extending) {
+    stored_reverse_retreating_ = false;
+    stored_reverse_exit_.clear();
+  }
+  // Short departures independently validate an opening within kDepartureMaxM.
+  // Keep any old corridor until odometry leaves it; a lost old refuge must not
+  // veto that independently validated escape (M-2).
   if (departure_sent_now_ || best_path_.size() < 2 ||
       robot_params_.type != mgg::RobotType::kGroundRobot ||
       !planning_params_.departure_reverse_allowed) return {};
   const auto& end = best_path_.back();
-  if (!endpointNeedsReverseExit(end)) return {};
+  if (!extending && !endpointNeedsReverseExit(end)) return {};
+  std::vector<mgg::StateVec> backtrack(best_path_.rbegin(), best_path_.rend());
+  if (extending) {
+    std::size_t nearest = 0;
+    for (std::size_t i = 1; i < stored_reverse_exit_.size(); ++i) {
+      if ((backtrack.back().head<3>() - stored_reverse_exit_[i].head<3>()).squaredNorm() <
+          (backtrack.back().head<3>() - stored_reverse_exit_[nearest].head<3>()).squaredNorm()) nearest = i;
+    }
+    backtrack.insert(backtrack.end(), stored_reverse_exit_.begin() + nearest + 1,
+                     stored_reverse_exit_.end());
+  }
   mgg::GroundProjection ground(*map_, planning_params_, true);
   std::vector<mgg::StateVec> reverse{end};
   double length = 0.0;
   const double limit = planning_params_.reverse_exit_max_length > 0.0
       ? planning_params_.reverse_exit_max_length : mgg::kDepartureMaxM;
-  for (std::size_t i = best_path_.size() - 1; i-- > 0;) {
-    const auto& to = best_path_[i];
-    const auto& from = best_path_[i + 1];
+  for (std::size_t i = 1; i < backtrack.size(); ++i) {
+    const auto& to = backtrack[i];
+    const auto& from = backtrack[i - 1];
     length += (from.head<3>() - to.head<3>()).norm();
     if (length > limit + 1e-9 || !reverseExitEdge(ground, from, to)) break;
     reverse.back()[3] = std::atan2(from.y() - to.y(), from.x() - to.x());
     reverse.push_back(to);
     reverse.back()[3] = reverse[reverse.size() - 2][3];
-    if (reverseExitRefuge(to)) {
-      reverse_exit_entry_path_ = best_path_;
+    // While extending, turn room ahead of the current root cannot rescue a
+    // cancellation before that opening. Preserve the refuge behind the root.
+    if ((!extending || i >= best_path_.size() - 1) && reverseExitRefuge(to)) {
+      reverse_exit_entry_path_.assign(reverse.rbegin(), reverse.rend());
       stored_reverse_exit_ = std::move(reverse);
+      stored_reverse_retreating_ = false;
       return {};
     }
   }
@@ -4640,7 +4658,7 @@ std::string PlannerNode::rememberReverseExit() {
   best_path_.clear();
   global_exploration_ongoing_ = false;
   global_frontier_not_routed_ = true;
-  const std::string note = "; reverse exit retention refused: no validated refuge on current map; "
+  const std::string note = "; reverse exit retention refused: no validated refuge within the length bound on current map; "
                            "endpoint excluded for next plan; no path";
   RCLCPP_WARN(get_logger(), "%s", note.c_str() + 2);
   return note;
