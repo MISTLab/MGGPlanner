@@ -332,9 +332,11 @@ class PlannerNode : public rclcpp::Node {
   /// resamples it at path_interpolation_distance (rrg.cpp:4160 and 4176).
   /// With `turns_ok`, a route that passes it still passes afterwards: the
   /// shortcut takes only leaps that keep it, and a resampled route that
-  /// fails it is replaced by the route as it came.
+  /// fails it is replaced by the route as it came. `corridor_ok` is mandatory
+  /// even when the original path is a sharp-turn fallback.
   void shortcutAndResample(std::vector<mgg::StateVec>& path,
-                           const mgg::PathOkFn& turns_ok = nullptr);
+                           const mgg::PathOkFn& turns_ok = nullptr,
+                           const mgg::PathOkFn& corridor_ok = nullptr);
 
   /// The roadmap side of the cycle: the accepted exploration path and the
   /// frontier clusters of the local graph join the global graph.

@@ -851,9 +851,10 @@ class PlannerNodeTestPeer {
   /// far.
   static int shortcutAndResample(PlannerNode& node,
                                  std::vector<mgg::StateVec>& path,
-                                 const mgg::PathOkFn& turns_ok) {
+                                 const mgg::PathOkFn& turns_ok,
+                                 const mgg::PathOkFn& corridor_ok = {}) {
     const std::lock_guard<std::recursive_mutex> lock(node.planner_mutex_);
-    node.shortcutAndResample(path, turns_ok);
+    node.shortcutAndResample(path, turns_ok, corridor_ok);
     return node.shortcut_turn_reverts_;
   }
   /// A robot `length` along x and `width` across, box and all.
@@ -3817,6 +3818,23 @@ TEST_F(PlannerNodeTest, AResampledRouteThatFailsTheTurnCheckIsSentUnshortcut) {
     EXPECT_TRUE(reverted[i].head<3>().isApprox(lattice[i].head<3>()))
         << "pose " << i;
   }
+}
+
+TEST_F(PlannerNodeTest, SharpTurnFallbackShortcutStillPreservesItsReverseRefuge) {
+  auto node = makeNode("fallback_reverse_guard");
+  PlannerNodeTestPeer::observeFloor(*node, -1, 4, -1, 3);
+  std::vector<mgg::StateVec> path = {
+      {0, 0, 0.35, 0}, {1, 0, 0.35, 0}, {1, 1, 0.35, 0}, {2, 1, 0.35, 0}};
+  const mgg::PathOkFn slope_turn_refused = [](const auto&) { return false; };
+  const mgg::PathOkFn has_refuge = [](const mgg::PathType& points) {
+    return std::any_of(points.begin(), points.end(), [](const auto& p) {
+      return (p - Eigen::Vector3d(1, 0, 0.35)).norm() < 1e-6;
+    });
+  };
+  PlannerNodeTestPeer::shortcutAndResample(*node, path, slope_turn_refused, has_refuge);
+  mgg::PathType result;
+  for (const auto& pose : path) result.push_back(pose.head<3>());
+  EXPECT_TRUE(has_refuge(result));
 }
 
 namespace {

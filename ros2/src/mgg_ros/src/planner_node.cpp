@@ -2768,7 +2768,8 @@ void PlannerNode::addFrontiers() {
 // Paths
 
 void PlannerNode::shortcutAndResample(std::vector<mgg::StateVec>& path,
-                                      const mgg::PathOkFn& turns_ok) {
+                                      const mgg::PathOkFn& turns_ok,
+                                      const mgg::PathOkFn& corridor_ok) {
   path_shortcut_from_ = static_cast<int>(path.size());
   path_shortcut_corners_ = path_shortcut_from_;
   path_shortcut_to_ = path_shortcut_from_;
@@ -2811,6 +2812,14 @@ void PlannerNode::shortcutAndResample(std::vector<mgg::StateVec>& path,
   for (const mgg::StateVec& s : path) points.push_back(s.head(3));
   const mgg::PathType unshortcut = points;
   const bool unshortcut_ok = turns_ok && turns_ok(unshortcut);
+  if (corridor_ok && !corridor_ok(unshortcut)) {
+    path.clear();
+    return;
+  }
+  const mgg::PathOkFn admissible = [&](const mgg::PathType& trial) {
+    return (!unshortcut_ok || turns_ok(trial)) &&
+           (!corridor_ok || corridor_ok(trial));
+  };
   // The same bounded geometry cost as lattice selection; per-call caching
   // cannot outlive the map's read lease or retain transient obstacles.
   mgg::GroundProjection clearance_ground(*map_, planning_params_, true);
@@ -2821,7 +2830,7 @@ void PlannerNode::shortcutAndResample(std::vector<mgg::StateVec>& path,
       return clearance_ground.clearanceCost(a, b, ctx.robot_box_size);
     };
   }
-  points = mgg::shortcutPath(points, segment_free, turns_ok, clearance_cost);
+  points = mgg::shortcutPath(points, segment_free, admissible, clearance_cost);
   path_shortcut_corners_ = static_cast<int>(points.size());
   mgg::PathType resampled;
   if (planning_params_.path_interpolation_distance > 0.0 &&
@@ -2838,12 +2847,12 @@ void PlannerNode::shortcutAndResample(std::vector<mgg::StateVec>& path,
   }
   // Resampling moves where each turn's measuring window ends, so the route
   // is checked again as it will be sent.
-  if (unshortcut_ok && !turns_ok(points)) {
+  if (!admissible(points)) {
     points = unshortcut;
     path_shortcut_corners_ = static_cast<int>(points.size());
     ++shortcut_turn_reverts_;
     RCLCPP_WARN(get_logger(),
-                "shortcut route turns where the lattice path does not; sent "
+                "shortcut route fails turn or reverse-corridor checks; sent "
                 "unshortcut (%d so far)",
                 shortcut_turn_reverts_);
   }
@@ -3197,7 +3206,9 @@ std::string PlannerNode::buildLocalGraph() {
     const double start_heading = current_state_[3];
     shortcutAndResample(best_path_, turns_admissible
         ? mgg::PathOkFn([&](const mgg::PathType& points) {
-            if (!turn_check.admissible(points, start_heading)) return false;
+            return turn_check.admissible(points, start_heading);
+          }) : mgg::PathOkFn(),
+        turns_admissible ? mgg::PathOkFn([&](const mgg::PathType& points) {
             // A shortcut must not skip the refuge or replace its validated
             // reverse corridor. Otherwise shortcutAndResample keeps entry's
             // original, already-qualified route.
