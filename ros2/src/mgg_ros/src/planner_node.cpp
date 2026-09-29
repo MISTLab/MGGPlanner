@@ -4493,22 +4493,7 @@ void PlannerNode::onPlanRequest(
       }
     }
   }
-  if (!best_path_.empty() && !standingStartGoalAdmissible(best_path_.back())) {
-    best_path_.clear();
-    summary += "; the goal intersects the standing-start arrival band: no path";
-  }
-  if (!noGoAdmissible(best_path_)) {
-    // The last net: whatever produced it, nothing is sent into a zone. It
-    // runs with the request's bound mode still applied.
-    best_path_.clear();
-    summary += "; the path enters a no-go zone: no path";
-  }
-  if (!peerAdmissible(best_path_)) {
-    // And nothing is sent through a peer body of the set this request
-    // planned with.
-    best_path_.clear();
-    summary += "; the path meets a peer body: no path";
-  }
+  summary += clearInadmissibleBestPath();
   if (!peer_blocked_edges_.empty()) {
     summary += "; " + std::to_string(peer_blocked_edges_.size()) +
                " global graph edge(s) blocked by peers";
@@ -4540,6 +4525,26 @@ void PlannerNode::onPlanRequest(
     planner_config_state_.last_plan_generation = planner_config_state_.generation;
     publishPlannerConfigState();
   }
+}
+
+std::string PlannerNode::clearInadmissibleBestPath() {
+  if (!best_path_.empty() && !standingStartGoalAdmissible(best_path_.back())) {
+    best_path_.clear();
+    return "; the goal intersects the standing-start arrival band: no path";
+  }
+  if (!noGoAdmissible(best_path_)) {
+    // The last net: whatever produced it, nothing is sent into a zone. It
+    // runs with the request's bound mode still applied.
+    best_path_.clear();
+    return "; the path enters a no-go zone: no path";
+  }
+  if (!peerAdmissible(best_path_)) {
+    // And nothing is sent through a peer body of the set this request
+    // planned with.
+    best_path_.clear();
+    return "; the path meets a peer body: no path";
+  }
+  return {};
 }
 
 void PlannerNode::enforceSafeCompletion(bool& complete) {
@@ -4649,11 +4654,33 @@ std::string PlannerNode::rememberReverseExit() {
     }
   }
   best_path_.clear();
+  best_path_from_global_graph_ = false;
   global_exploration_ongoing_ = false;
   global_frontier_not_routed_ = true;
-  const std::string note = "; reverse exit retention refused: " + refusal +
-                           "; endpoint excluded for next plan; no path";
+  std::string note = "; reverse exit retention refused: " + refusal +
+                     "; endpoint excluded for next plan";
   RCLCPP_WARN(get_logger(), "%s", note.c_str() + 2);
+  // Run 14: returning no path here left a robot that cannot turn choosing
+  // the same refused candidates forever. Fall back in this request, as the
+  // boxed-in branch does (M-2): the stored exit, then a validated departure.
+  mgg::StateVec root_state = current_state_;
+  if (!projectToDrivingHeight(root_state)) {
+    root_state = physicalAnchorAtDrivingHeight(current_state_);
+  }
+  std::string fallback;
+  if (tryStoredReverseExit(root_state, fallback)) {
+    if (best_path_.empty()) fallback += departBoxedIn(root_state, "stored exit refused", false);
+  } else {
+    // A robot with room to turn is not boxed in: the exclusion moves it on.
+    const std::optional<mgg::StandingStart> standing = standingStart();
+    fallback = mgg::roomToTurn(*map_, robot_params_, planning_params_, root_state,
+                               standing ? &*standing : nullptr)
+        ? std::string()
+        : departBoxedIn(root_state, "its path's reverse exit retention was refused", false);
+  }
+  note += fallback;
+  if (!best_path_.empty()) note += clearInadmissibleBestPath();
+  if (best_path_.empty() && note.find("no path") == std::string::npos) note += "; no path";
   return note;
 }
 

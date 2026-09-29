@@ -142,6 +142,9 @@ class PlannerNode : public rclcpp::Node {
   /// Updates the turn-back hysteresis from the path a plan request sends.
   void recordSentPath();
   void enforceSafeCompletion(bool& complete);
+  /// The last nets on best_path_: the standing-start arrival band, no-go
+  /// zones and peer bodies. Clears a path one refuses; returns why.
+  std::string clearInadmissibleBestPath();
   std::string rememberReverseExit();
   std::string retainReverseExit(const std::vector<mgg::StateVec>& path, bool departure);
   // True means attempted; an empty output path is a refusal. Does not alter

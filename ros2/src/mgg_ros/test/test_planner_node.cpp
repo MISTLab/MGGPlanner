@@ -4834,8 +4834,11 @@ TEST_F(PlannerNodeTest, ANewForwardPathInsideTheCorridorKeepsItsBoundedReverseEx
     PlannerNodeTestPeer::plan(*node, response);
     EXPECT_GT(PlannerNodeTestPeer::storedReversePoses(*node), 1u);
     if (over_bound) {
-      EXPECT_TRUE(response->path.empty());
-      EXPECT_EQ(response->status, PlannerNode::kStatusNoPath);
+      // The over-bound continuation is refused; the same request reverses
+      // to the old refuge instead of returning no path (mgg-run14 (a)).
+      ASSERT_GE(response->path.size(), 2u);
+      EXPECT_NEAR(response->path.front().position.x, 3, 0.1);
+      EXPECT_LT(response->path.back().position.x, 0.8);
       PlannerNodeTestPeer::setLattice(*node, {0, 0}, {0, 0});
     } else {
       ASSERT_GE(response->path.size(), 2u);
@@ -5021,6 +5024,49 @@ TEST_F(PlannerNodeTest, AFailedRetentionExcludesTheEndpointOnTheNextSelection) {
   PlannerNodeTestPeer::buildLocalGraph(*node);
   const auto next = PlannerNodeTestPeer::bestPath(*node);
   EXPECT_TRUE(next.empty() || (next.back().head<3>() - failed_endpoint).norm() > 0.35);
+}
+
+// mgg-run14 (a): a refused retention falls back in the same request, as the
+// boxed-in branch does: the stored exit first, then a validated departure.
+TEST_F(PlannerNodeTest, ARefusedRetentionFallsBackToTheStoredExitThenADeparture) {
+  for (const bool refuge_lost : {false, true}) {
+    SCOPED_TRACE(refuge_lost);
+    MolaFloorProduct entry(-2, 10, -2, 2,
+        {{{0.8, 9, 0.4, 0.6}}, {{0.8, 9, -0.6, -0.4}}});
+    auto node = makeNode("retention_fallback");
+    PlannerNodeTestPeer::useMolaMap(*node, entry.serve());
+    PlannerNodeTestPeer::setRobotFootprint(*node, 1.0, 0.3);
+    PlannerNodeTestPeer::setLattice(*node, {0, 0}, {5.5, 0});
+    PlannerNodeTestPeer::acceptOdometryFacing(*node, 0, 0, 0, 1);
+    auto response = std::make_shared<mgg_msgs::srv::PlannerSrv::Response>();
+    PlannerNodeTestPeer::plan(*node, response);
+    ASSERT_GE(response->path.size(), 2u);
+    PlannerNodeTestPeer::acceptOdometryFacing(*node, 0.01, 0, 0, 2);
+    ASSERT_GT(PlannerNodeTestPeer::storedReversePoses(*node), 1u);
+    // Open ahead: the forward candidates end beyond the 6 m bound from the
+    // refuge behind. With the refuge lost, the corridor runs back past the
+    // old refuge instead, and opens 0.4 m ahead of the robot.
+    MolaFloorProduct changed(-2, 10, -2, 2, refuge_lost
+        ? std::vector<std::array<double, 4>>{{-0.8, 3.4, 0.4, 0.6}, {-0.8, 3.4, -0.6, -0.4}}
+        : std::vector<std::array<double, 4>>{{0.8, 7.2, 0.4, 0.6}, {0.8, 7.2, -0.6, -0.4}});
+    PlannerNodeTestPeer::useMolaMap(*node, changed.serve());
+    PlannerNodeTestPeer::acceptOdometryFacing(*node, 3, 0, 0, 3);
+    ASSERT_FALSE(PlannerNodeTestPeer::roomToTurnObserved(*node,
+        PlannerNodeTestPeer::drivingState(*node, 3, 0, 0)));
+    response = std::make_shared<mgg_msgs::srv::PlannerSrv::Response>();
+    PlannerNodeTestPeer::plan(*node, response);
+    ASSERT_GE(response->path.size(), 2u);
+    EXPECT_NEAR(response->path.front().position.x, 3, 0.1);
+    if (refuge_lost) {
+      // A validated straight departure ahead to the opening.
+      EXPECT_GE(response->path.back().position.x, 3.8 - 1e-9);
+      EXPECT_LE(pathLength(response->path), mgg::kDepartureMaxM + 1e-6);
+    } else {
+      // The stored exit, reversing to the refuge with the entry heading.
+      EXPECT_LT(response->path.back().position.x, 0.8);
+      for (const auto& pose : response->path) EXPECT_NEAR(pose.orientation.z, 0, 1e-6);
+    }
+  }
 }
 
 TEST_F(PlannerNodeTest, NearEightDegreeRefugeUsesTheSameSlopeForCutbackAndRetention) {
