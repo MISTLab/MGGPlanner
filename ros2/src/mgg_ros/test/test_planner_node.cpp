@@ -323,6 +323,9 @@ class PlannerNodeTestPeer {
     node.tour_planner_->solve(node.tour_clusters_, costs, 0, 0, 0);
     ASSERT_EQ(node.tour_planner_->target(), 42u);
   }
+  static void clearStoredReverseExit(PlannerNode& node) {
+    node.stored_reverse_exit_.clear();
+  }
   static std::size_t storedReversePoses(const PlannerNode& node) {
     return node.stored_reverse_exit_.size();
   }
@@ -3803,8 +3806,9 @@ TEST_F(PlannerNodeTest, NeighbourRoadmapDoesNotReachThroughAKnownWall) {
 
 TEST_F(PlannerNodeTest, ARobotAgainstAWallDepartsButItsPoseIsNoGoalLater) {
   // The robot stopped with its box touching a wall (robot_1 on the SubT
-  // return, 2026-09-23). It is routed home from there, along a first
-  // segment clear only for its centre line. Once it has driven away, the
+  // return, 2026-09-23). Its home route starts with a turn without room,
+  // so a validated departure must precede the whole home route. The initial
+  // roadmap link is clear only for its centre line. Once driven away, the
   // same pose as a goal is refused: that segment was never checked for the
   // box, so it is not a roadmap edge (review r0).
   auto node = makeNode("wall_departure");
@@ -3826,11 +3830,23 @@ TEST_F(PlannerNodeTest, ARobotAgainstAWallDepartsButItsPoseIsNoGoalLater) {
   auto response = std::make_shared<mgg_msgs::srv::PlanObjective::Response>();
   PlannerNodeTestPeer::objective(*node, request, response);
   ASSERT_EQ(response->status,
-            mgg_msgs::srv::PlanObjective::Response::SUCCEEDED)
+            mgg_msgs::srv::PlanObjective::Response::DEPARTURE_FIRST)
       << response->reason;
   ASSERT_GE(response->path.size(), 2u);
   EXPECT_NEAR(response->path.front().position.x, 2.0, 0.05);
   EXPECT_NEAR(response->path.front().position.y, 0.52, 0.05);
+  const auto departure_end = response->path.back();
+  const double yaw = 2 * std::atan2(departure_end.orientation.z, departure_end.orientation.w);
+  EXPECT_TRUE(PlannerNodeTestPeer::roomToTurnObserved(*node,
+      mgg::StateVec(departure_end.position.x, departure_end.position.y,
+                    departure_end.position.z, yaw)));
+  PlannerNodeTestPeer::acceptOdometryFacing(*node, departure_end.position.x,
+      departure_end.position.y, yaw, stamp++);
+  response = std::make_shared<mgg_msgs::srv::PlanObjective::Response>();
+  PlannerNodeTestPeer::objective(*node, request, response);
+  ASSERT_EQ(response->status, mgg_msgs::srv::PlanObjective::Response::SUCCEEDED)
+      << response->reason;
+  ASSERT_GE(response->path.size(), 2u);
   EXPECT_NEAR(response->path.back().position.x, 0.0, 1e-3);
   EXPECT_NEAR(response->path.back().position.y, 0.0, 1e-3);
 
@@ -4417,6 +4433,67 @@ TEST_F(PlannerNodeTest, ReturnHomeFromANarrowEndpointUsesAndKeepsTheReverseCorri
       EXPECT_NEAR(response->path.back().position.x, request->goal.position.x, 0.001);
       EXPECT_NEAR(response->path.back().position.y, request->goal.position.y, 0.001);
       EXPECT_NEAR(response->path.back().position.z, request->goal.position.z, 0.001);
+    }
+  }
+}
+
+TEST_F(PlannerNodeTest, AnObjectiveNeverSucceedsWithARoomlessInitialTurnAfterEarlyArrival) {
+  using Service = mgg_msgs::srv::PlanObjective;
+  // All three outcomes of a room-less objective start: retained reverse,
+  // no retained exit but validated departure, and neither exit available.
+  for (const int branch : {0, 1, 2}) {
+    SCOPED_TRACE(branch);
+    MolaFloorProduct corridor(-3, 8, -2, 2,
+        {{{0.8, 7, 0.4, 0.6}}, {{0.8, 7, -0.6, -0.4}}});
+    auto node = makeNode("early_refuge_objective");
+    PlannerNodeTestPeer::useMolaMap(*node, corridor.serve());
+    PlannerNodeTestPeer::serveMap(*node, "component:test", 1);
+    PlannerNodeTestPeer::setRobotFootprint(*node, 1.0, 0.3);
+    PlannerNodeTestPeer::setLattice(*node, {0, 0}, {5.5, 0});
+    PlannerNodeTestPeer::acceptOdometryFacing(*node, 0, 0, 0, 1);
+    auto entry = std::make_shared<mgg_msgs::srv::PlannerSrv::Response>();
+    PlannerNodeTestPeer::plan(*node, entry);
+    ASSERT_GE(entry->path.size(), 2u);
+    PlannerNodeTestPeer::acceptOdometryFacing(*node, entry->path.back().position.x, 0, 0, 2);
+    auto request = std::make_shared<Service::Request>();
+    request->component_id = "component:test";
+    request->map_epoch = 1;
+    request->objective = Service::Request::RETURN_HOME;
+    request->goal.position.x = -0.8;
+    request->goal.position.z = entry->path.front().position.z;
+    request->goal.orientation.w = 1;
+    auto response = std::make_shared<Service::Response>();
+    PlannerNodeTestPeer::objective(*node, request, response);
+    ASSERT_EQ(response->status, Service::Response::DEPARTURE_FIRST) << response->reason;
+    ASSERT_GE(response->path.size(), 2u);
+    const double stopped = response->path.back().position.x + 0.225;
+    PlannerNodeTestPeer::acceptOdometryFacing(*node, stopped, 0, 0, 3);
+    EXPECT_GT(PlannerNodeTestPeer::storedReversePoses(*node), 1u);
+    if (branch != 0) PlannerNodeTestPeer::clearStoredReverseExit(*node);
+    MolaFloorProduct no_refuge(-3, 8, -2, 2,
+        {{{-2, 7, 0.4, 0.6}}, {{-2, 7, -0.6, -0.4}}});
+    if (branch == 2) PlannerNodeTestPeer::useMolaMap(*node, no_refuge.serve());
+    ASSERT_FALSE(PlannerNodeTestPeer::roomToTurnObserved(*node,
+        PlannerNodeTestPeer::drivingState(*node, stopped, 0, 0)));
+    response = std::make_shared<Service::Response>();
+    PlannerNodeTestPeer::objective(*node, request, response);
+    // Invariant: matching the goal never licenses a turn at this root.
+    EXPECT_NE(response->status, Service::Response::SUCCEEDED);
+    const auto expected = branch == 2 ? Service::Response::BLOCKED : Service::Response::DEPARTURE_FIRST;
+    EXPECT_EQ(response->status, expected) << response->reason;
+    EXPECT_FALSE(response->reason.empty());
+    if (response->status != expected) continue;
+    if (branch == 2) {
+      EXPECT_TRUE(response->path.empty());
+      EXPECT_NE(response->reason.find("stored reverse exit unavailable"), std::string::npos);
+      EXPECT_NE(response->reason.find("validated departure refused"), std::string::npos);
+    } else {
+      ASSERT_GE(response->path.size(), 2u);
+      EXPECT_NEAR(response->path.front().position.x, stopped, 1e-6);
+      EXPECT_LT(response->path.back().position.x, stopped);
+      for (const auto& pose : response->path) EXPECT_NEAR(pose.orientation.z, 0, 1e-6);
+      EXPECT_NE(response->reason.find(branch == 0 ? "stored reverse exit revalidated"
+                                                : "validated departure"), std::string::npos);
     }
   }
 }

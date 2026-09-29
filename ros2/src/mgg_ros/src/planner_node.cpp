@@ -1693,7 +1693,6 @@ void PlannerNode::onOdometry(nav_msgs::msg::Odometry::ConstSharedPtr msg) {
   }
   last_odometry_stamp_ns_ = stamp_ns;
   current_state_ = state;
-  forgetReverseExitIfOffRoute();
   current_tilt_ = tiltFromQuaternion(msg->pose.pose.orientation);
   if (!left_standing_start_) {
     if (!standing_start_xy_) standing_start_xy_ = state.head<2>();
@@ -1707,6 +1706,7 @@ void PlannerNode::onOdometry(nav_msgs::msg::Odometry::ConstSharedPtr msg) {
 
   auto map_read = mapReadLease();
   refreshMapRevision();
+  forgetReverseExitIfOffRoute();
   seedGlobalGraph();
   if (home_state_wait_started_) return;
   // On start, or after the graph was lost, it holds only its seed.
@@ -4685,8 +4685,15 @@ std::string PlannerNode::retainReverseExit(const std::vector<mgg::StateVec>& pat
 void PlannerNode::forgetReverseExitIfOffRoute() {
   if (stored_reverse_exit_.size() < 2) return;
   const double tolerance = reach_distance_ + mgg::kViewpointArrivalSlack;
-  const bool at_refuge = stored_reverse_retreating_ &&
-      (current_state_.head<2>() - stored_reverse_exit_.back().head<2>()).norm() <= tolerance;
+  bool at_refuge = false;
+  if (stored_reverse_retreating_ &&
+      (current_state_.head<2>() - stored_reverse_exit_.back().head<2>()).norm() <= tolerance) {
+    mgg::StateVec start = current_state_;
+    // Controller goal tolerance may stop the robot on the corridor side of
+    // the refuge. Proximity alone does not make a turn safe at that pose.
+    at_refuge = projectToDrivingHeight(start) &&
+        mgg::roomToTurn(*map_, robot_params_, planning_params_, start, nullptr);
+  }
   if (at_refuge || !nearPathXY(reverse_exit_entry_path_, current_state_.head<2>(), tolerance)) {
     stored_reverse_exit_.clear();
     reverse_exit_entry_path_.clear();
@@ -5181,8 +5188,12 @@ void PlannerNode::onObjectiveRequest(
     response->reason = reason;
     return;
   }
-  if (storedReverseExitApplies(current_state_) &&
-      last_route_starts_with_turn_without_room_) {
+  shortcutAndResample(route, turns_ok);
+  mgg::PathType objective_points;
+  for (const auto& pose : route) objective_points.push_back(pose.head<3>());
+  // Check the actual route being sent, even without retained escape memory.
+  // No SUCCEEDED objective may start with a turn at a room-less root.
+  if (routeStartsWithTurnWithoutRoom(objective_points)) {
     mgg::StateVec start = current_state_;
     if (!projectToDrivingHeight(start)) start = physicalAnchorAtDrivingHeight(current_state_);
     std::string exit_note;
@@ -5212,7 +5223,6 @@ void PlannerNode::onObjectiveRequest(
     }
     return;  // keep the remaining escape; never command an in-place turn
   }
-  shortcutAndResample(route, turns_ok);
   if (!route.empty() && !standingStartGoalAdmissible(route.back())) {
     response->status = Service::Response::UNREACHABLE;
     response->reason = "the goal intersects the standing-start arrival band";
