@@ -109,8 +109,10 @@ bool roomToTurn(const MapInterface& map, const RobotParams& robot,
 
 /// A fully observed first-goal arrival disk, independent of the standing
 /// prior. Every ground column touched by any arrival's turn circle must
-/// have mapped support at driving height; the union must be obstacle clear.
-/// Unlike the ordinary fractional support rule, no blind cell is admitted.
+/// have observed ground within max_ground_height below the floor (the same
+/// depth rule as turnSpaceObserved); the union must be obstacle clear.
+/// Shallow ledges count as support, but unlike the ordinary fractional
+/// support rule, no blind cell is admitted.
 bool observedArrivalDisk(const MapInterface& map, const RobotParams& robot,
                           const PlanningParams& planning, const StateVec& goal,
                           double arrival_tolerance);
