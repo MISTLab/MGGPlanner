@@ -323,6 +323,28 @@ class PlannerNodeTestPeer {
     node.tour_planner_->solve(node.tour_clusters_, costs, 0, 0, 0);
     ASSERT_EQ(node.tour_planner_->target(), 42u);
   }
+  static void observeLowCorridorWalls(PlannerNode& node) {
+    for (double x = 0.85; x < 7; x += 0.1) {
+      for (double y : {-0.45, 0.45}) {
+        for (int repeat = 0; repeat < 6; ++repeat) {
+          node.cloud_map_->insertPointCloud({Eigen::Vector3d(x, y, 0.25)},
+                                            Eigen::Vector3d(x, y, 1.5));
+        }
+      }
+    }
+    ++node.map_revision_;
+  }
+  static void replaceGlobalRoute(PlannerNode& node, const mgg::StateVec& from,
+                                 const mgg::StateVec& to) {
+    node.global_graph_->reset();
+    auto* a = new mgg::Vertex(node.global_graph_->generateVertexID(), from);
+    auto* b = new mgg::Vertex(node.global_graph_->generateVertexID(), to);
+    a->robot_id = b->robot_id = node.planning_params_.robot_id;
+    node.global_graph_->addVertex(a);
+    node.global_graph_->addVertex(b);
+    node.global_graph_->addEdge(a, b, (to - from).head<3>().norm());
+    ++node.graph_revision_;
+  }
   static void clearStoredReverseExit(PlannerNode& node) {
     node.stored_reverse_exit_.clear();
   }
@@ -4711,6 +4733,44 @@ TEST_F(PlannerNodeTest, ForwardObjectivesKeepOptionalBoundedEscapeWithoutVetoing
       EXPECT_EQ(PlannerNodeTestPeer::bestPath(*node), before);
     }
   }
+}
+
+TEST_F(PlannerNodeTest, OptionalObjectiveEscapeMemoryUsesTheProjectedBodyNotRoadmapHeight) {
+  using Service = mgg_msgs::srv::PlanObjective;
+  auto node = makeNode("objective_memory_projected_body");
+  PlannerNodeTestPeer::setRobotFootprint(*node, 1.0, 0.3);
+  PlannerNodeTestPeer::observeFloor(*node, -2, 8, -2, 2);
+  PlannerNodeTestPeer::observeLowCorridorWalls(*node);
+  PlannerNodeTestPeer::setLattice(*node, {0, 0}, {5.5, 0});
+  PlannerNodeTestPeer::acceptOdometryFacing(*node, 0, 0, 0, 1);
+  auto entry = std::make_shared<mgg_msgs::srv::PlannerSrv::Response>();
+  PlannerNodeTestPeer::plan(*node, entry);
+  ASSERT_GE(entry->path.size(), 2u);
+  ASSERT_GT(PlannerNodeTestPeer::storedReversePoses(*node), 1u);
+  PlannerNodeTestPeer::acceptOdometryFacing(*node, 3, 0, 0, 2);
+  const auto projected = PlannerNodeTestPeer::drivingState(*node, 3, 0, 0);
+  auto roadmap_start = projected;
+  roadmap_start.z() += 0.09;  // reused roadmap vertex within its 0.1 m link tolerance
+  auto goal = projected;
+  goal.x() = 6;
+  ASSERT_FALSE(PlannerNodeTestPeer::roomToTurnObserved(*node, projected));
+  ASSERT_TRUE(PlannerNodeTestPeer::roomToTurnObserved(*node, roadmap_start));
+  PlannerNodeTestPeer::replaceGlobalRoute(*node, roadmap_start, goal);
+  PlannerNodeTestPeer::setLattice(*node, {0, 0}, {0, 0});  // objective uses the roadmap
+  auto request = std::make_shared<Service::Request>();
+  request->objective = Service::Request::NAVIGATE;
+  request->goal.position.x = goal.x();
+  request->goal.position.z = goal.z();
+  request->goal.orientation.w = 1;
+  auto response = std::make_shared<Service::Response>();
+  PlannerNodeTestPeer::objective(*node, request, response);
+  ASSERT_EQ(response->status, Service::Response::SUCCEEDED) << response->reason;
+  ASSERT_GE(response->path.size(), 2u);
+  EXPECT_NEAR(response->path.front().position.z, roadmap_start.z(), 1e-6);
+  EXPECT_NEAR(response->path.back().position.x, goal.x(), 0.001);
+  // Whether extension validates or merely preserves the old corridor, a
+  // stale high start must not erase escape memory at this room-less body.
+  EXPECT_GT(PlannerNodeTestPeer::storedReversePoses(*node), 1u);
 }
 
 TEST_F(PlannerNodeTest, RouteAndStoredExitRoomGatesUseTheProjectedCurrentPose) {

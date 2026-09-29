@@ -4632,8 +4632,7 @@ std::string PlannerNode::rememberReverseExit() {
 std::string PlannerNode::retainReverseExit(const std::vector<mgg::StateVec>& path,
                                             bool departure) {
   if (path.empty()) return {};
-  const bool extending = storedReverseExitApplies(path.front()) &&
-      !mgg::roomToTurn(*map_, robot_params_, planning_params_, path.front(), nullptr);
+  const bool extending = currentPoseNeedsStoredExit();
   if (!extending) {
     stored_reverse_retreating_ = false;
     stored_reverse_exit_.clear();
@@ -4704,6 +4703,13 @@ void PlannerNode::forgetReverseExitIfOffRoute() {
 bool PlannerNode::storedReverseExitApplies(const mgg::StateVec& pose) const {
   return nearPathXY(stored_reverse_exit_, pose.head<2>(),
                      reach_distance_ + mgg::kViewpointArrivalSlack);
+}
+
+bool PlannerNode::currentPoseNeedsStoredExit() const {
+  mgg::StateVec start = current_state_;
+  if (!projectToDrivingHeight(start)) start = physicalAnchorAtDrivingHeight(current_state_);
+  return storedReverseExitApplies(start) &&
+      !mgg::roomToTurn(*map_, robot_params_, planning_params_, start, nullptr);
 }
 
 void PlannerNode::keepReverseDeparture(const std::vector<mgg::StateVec>& path) {
@@ -5238,8 +5244,7 @@ void PlannerNode::onObjectiveRequest(
     response->reason = "blocked by a peer: the route meets a peer body";
     return;
   }
-  if (!route.empty() && storedReverseExitApplies(route.front()) &&
-      !mgg::roomToTurn(*map_, robot_params_, planning_params_, route.front(), nullptr)) {
+  if (!route.empty() && currentPoseNeedsStoredExit()) {
     const std::string refusal = retainReverseExit(route, false);
     if (!refusal.empty()) {
       response->reason = "escape corridor not retained: " + refusal;
