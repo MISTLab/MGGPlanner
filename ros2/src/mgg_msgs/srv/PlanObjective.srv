@@ -22,7 +22,7 @@ uint8 UNREACHABLE=1
 uint8 STALE_REVISION=2
 uint8 UNSUPPORTED_OBJECTIVE=3
 uint8 BLOCKED=4
-# Validated reverse leg to a refuge, NOT objective completion. Execute this
+# Validated departure leg to turn room, NOT objective completion. Execute this
 # leg with reversing allowed, then request the same objective again.
 uint8 DEPARTURE_FIRST=5
 uint8 status

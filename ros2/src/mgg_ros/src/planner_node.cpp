@@ -3198,6 +3198,7 @@ std::string PlannerNode::buildLocalGraph() {
       (is_boxed_in || sel.sharp_turn_fallback || best_path_.empty()) &&
       tryStoredReverseExit(root_state, boxed_in);
   if (stored_exit_tried) {
+    if (best_path_.empty()) boxed_in += departBoxedIn(root_state, "stored exit refused", false);
     path_shortcut_from_ = path_shortcut_corners_ = path_shortcut_to_ =
         static_cast<int>(best_path_.size());
   } else if (is_boxed_in) {
@@ -3327,9 +3328,10 @@ std::string PlannerNode::buildLocalGraph() {
 }
 
 std::string PlannerNode::departBoxedIn(const mgg::StateVec& root_state,
-                                       const char* why) {
+                                       const char* why, bool consult_stored) {
   std::string stored_note;
-  if (tryStoredReverseExit(root_state, stored_note)) return stored_note;
+  if (consult_stored && tryStoredReverseExit(root_state, stored_note) &&
+      !best_path_.empty()) return stored_note;
   char note[160];
   mgg::Departure departure;
   best_path_.clear();
@@ -3370,7 +3372,7 @@ std::string PlannerNode::departBoxedIn(const mgg::StateVec& root_state,
                 mgg::kDepartureMaxTurnRad * 180.0 / M_PI,
                 boxed_in_without_departure_);
   }
-  return note;
+  return stored_note + note;
 }
 
 bool PlannerNode::straightDeparture(const mgg::StateVec& start,
@@ -4667,11 +4669,9 @@ bool PlannerNode::tryStoredReverseExit(const mgg::StateVec& start, std::string& 
   best_path_from_global_graph_ = false;
   global_exploration_ongoing_ = false;
   const auto refused = [&](const char* reason) {
-    boxed_in_without_departure_now_ = true;
-    ++boxed_in_without_departure_;
-    note = std::string("; stored reverse exit refused: ") + reason + "; no path";
+    note = std::string("; stored reverse exit refused: ") + reason;
     RCLCPP_WARN(get_logger(), "%s", note.c_str() + 2);
-    return true;  // tried, so never replace it with an unchecked fallback
+    return true;  // tried; exploration may still try a validated departure
   };
   if (!planning_params_.departure_reverse_allowed) return refused("reverse disabled");
   // Connect the actual (possibly early) arrival to the entry corridor. Drop
@@ -5137,8 +5137,20 @@ void PlannerNode::onObjectiveRequest(
       route_note = response->reason;
       for (const auto& pose : best_path_) response->path.push_back(toPoseMsg(pose));
     } else {
-      response->status = Service::Response::BLOCKED;
-      response->reason = "objective requires a reverse exit" + exit_note;
+      mgg::Departure departure;
+      if (straightDeparture(start, departure)) {
+        response->status = Service::Response::DEPARTURE_FIRST;
+        response->reason = std::string("validated departure ") +
+            (departure.reverse ? "in reverse" : "ahead") +
+            "; request the objective again from its end" + exit_note;
+        route_note = response->reason;
+        for (const auto& pose : departure.path) response->path.push_back(toPoseMsg(pose));
+      } else {
+        response->status = Service::Response::BLOCKED;
+        response->reason = "objective requires a departure" + exit_note +
+            "; validated departure refused: no terrain-clear leg with turn room within " +
+            std::to_string(mgg::kDepartureMaxM) + " m";
+      }
     }
     return;  // keep the remaining escape; never command an in-place turn
   }

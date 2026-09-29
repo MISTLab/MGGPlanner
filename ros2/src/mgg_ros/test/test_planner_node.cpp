@@ -4391,6 +4391,76 @@ TEST_F(PlannerNodeTest, ReturnHomeFromANarrowEndpointUsesAndKeepsTheReverseCorri
   }
 }
 
+TEST_F(PlannerNodeTest, ARefusedStoredRefugeStillAllowsAValidatedStraightDeparture) {
+  MolaFloorProduct entry(-2, 7, -2, 2,
+      {{{0.8, 7, 0.4, 0.6}}, {{0.8, 7, -0.6, -0.4}}});
+  auto node = makeNode("lost_refuge_departure");
+  PlannerNodeTestPeer::useMolaMap(*node, entry.serve());
+  PlannerNodeTestPeer::setRobotFootprint(*node, 1.0, 0.3);
+  PlannerNodeTestPeer::setLattice(*node, {0, 0}, {5.5, 0});
+  PlannerNodeTestPeer::acceptOdometryFacing(*node, 0, 0, 0, 1);
+  auto response = std::make_shared<mgg_msgs::srv::PlannerSrv::Response>();
+  PlannerNodeTestPeer::plan(*node, response);
+  ASSERT_GE(response->path.size(), 2u);
+  // The old refuge at x=0 lost turn room, but new observations show an
+  // opening ahead of x=3.4. The ordinary terrain-validated departure fits.
+  MolaFloorProduct changed(-2, 7, -2, 2,
+      {{{-0.8, 3.4, 0.4, 0.6}}, {{-0.8, 3.4, -0.6, -0.4}}});
+  PlannerNodeTestPeer::useMolaMap(*node, changed.serve());
+  PlannerNodeTestPeer::setLattice(*node, {0, 0}, {0, 0});
+  PlannerNodeTestPeer::acceptOdometryFacing(*node, 3, 0, 0, 2);
+  const auto root = PlannerNodeTestPeer::drivingState(*node, 3, 0, 0);
+  std::vector<mgg::StateVec> departure;
+  bool reverse = false;
+  ASSERT_TRUE(PlannerNodeTestPeer::straightDeparture(*node, root, departure, reverse));
+  ASSERT_FALSE(reverse);
+  response = std::make_shared<mgg_msgs::srv::PlannerSrv::Response>();
+  PlannerNodeTestPeer::plan(*node, response);
+  ASSERT_GE(response->path.size(), 2u);
+  EXPECT_GE(response->path.back().position.x, 3.8 - 1e-9);
+  EXPECT_EQ(PlannerNodeTestPeer::boxedInWithoutDeparture(*node), 0);
+}
+
+TEST_F(PlannerNodeTest, AnObjectiveWithALostRefugeUsesAValidatedDepartureFirst) {
+  MolaFloorProduct entry(-2, 7, -2, 2,
+      {{{0.8, 7, 0.4, 0.6}}, {{0.8, 7, -0.6, -0.4}}});
+  auto node = makeNode("lost_refuge_departure");
+  PlannerNodeTestPeer::useMolaMap(*node, entry.serve());
+  PlannerNodeTestPeer::serveMap(*node, "component:test", 1);
+  PlannerNodeTestPeer::setRobotFootprint(*node, 1.0, 0.3);
+  PlannerNodeTestPeer::setLattice(*node, {0, 0}, {5.5, 0});
+  PlannerNodeTestPeer::acceptOdometryFacing(*node, 0, 0, 0, 1);
+  auto response = std::make_shared<mgg_msgs::srv::PlannerSrv::Response>();
+  PlannerNodeTestPeer::plan(*node, response);
+  ASSERT_GE(response->path.size(), 2u);
+  // The old refuge at x=0 lost turn room, but new observations show an
+  // opening ahead of x=3.4. The ordinary terrain-validated departure fits.
+  MolaFloorProduct changed(-2, 7, -2, 2,
+      {{{-0.8, 3.4, 0.4, 0.6}}, {{-0.8, 3.4, -0.6, -0.4}}});
+  PlannerNodeTestPeer::useMolaMap(*node, changed.serve());
+  PlannerNodeTestPeer::setLattice(*node, {0, 0}, {0, 0});
+  PlannerNodeTestPeer::acceptOdometryFacing(*node, 3, 0, 0, 2);
+  const auto root = PlannerNodeTestPeer::drivingState(*node, 3, 0, 0);
+  std::vector<mgg::StateVec> departure;
+  bool reverse = false;
+  ASSERT_TRUE(PlannerNodeTestPeer::straightDeparture(*node, root, departure, reverse));
+  ASSERT_FALSE(reverse);
+  using Service = mgg_msgs::srv::PlanObjective;
+  auto request = std::make_shared<Service::Request>();
+  request->component_id = "component:test";
+  request->map_epoch = 1;
+  request->objective = Service::Request::RETURN_HOME;
+  request->goal.position.x = std::nan("");
+  request->goal.position.y = std::nan("");
+  request->goal.orientation.w = 1;
+  auto objective = std::make_shared<Service::Response>();
+  PlannerNodeTestPeer::objective(*node, request, objective);
+  ASSERT_EQ(objective->status, Service::Response::DEPARTURE_FIRST) << objective->reason;
+  ASSERT_GE(objective->path.size(), 2u);
+  EXPECT_GE(objective->path.back().position.x, 3.8 - 1e-9);
+  EXPECT_NE(objective->reason.find("validated departure"), std::string::npos);
+}
+
 TEST_F(PlannerNodeTest, AnEmptySelectionWithNewTurningRoomDoesNotTryItsStoredExit) {
   for (const bool peer : {false, true}) {
     MolaFloorProduct narrow(-2, 7, -2, 2,

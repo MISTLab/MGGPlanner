@@ -300,7 +300,7 @@ class PlannerNode : public rclcpp::Node {
   /// (straightDeparture), or empty when it has none, which sets
   /// boxed_in_without_departure_now_. Counts and logs the outcome; returns
   /// the note for the plan summary.
-  std::string departBoxedIn(const mgg::StateVec& root_state, const char* why);
+  std::string departBoxedIn(const mgg::StateVec& root_state, const char* why, bool consult_stored = true);
   /// Dijkstra over the global graph to the best frontier (rrg.cpp:5559
   /// Rrg::runGlobalPlanner), or to `target_id` when the current global
   /// repositioning is resumed. Fills best_path_; returns false with a reason
