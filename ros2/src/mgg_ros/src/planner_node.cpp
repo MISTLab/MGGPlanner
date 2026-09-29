@@ -2987,6 +2987,7 @@ std::string PlannerNode::buildLocalGraph() {
   }
   // The graph's frontiers are worth keeping whether or not a path is chosen.
   add_frontiers_to_global_graph_ = local_graph_->getNumVertices() > 1;
+  retireReverseExitExclusionsWithoutGain();
 
   const auto t_gain = Clock::now();
   // Paths are penalised for leaving the way the robot faces
@@ -3069,7 +3070,8 @@ std::string PlannerNode::buildLocalGraph() {
   const mgg::PlanningParams selection_params =
       turn_back_hysteresis_.selectionParams(planning_params_);
   int retention_excluded = 0;
-  const mgg::PathSelectionResult sel = mgg::selectBestPath(
+  bool exclusions_lifted = false;
+  const auto select_path = [&]() { return mgg::selectBestPath(
       *local_graph_, selection_params, robot_params_, edge_inclinations_,
       map_->getResolution(), selection_direction, selectionExclusions(),
       reservation_exclusion_radius_m_,
@@ -3085,9 +3087,9 @@ std::string PlannerNode::buildLocalGraph() {
       },
       turns_admissible, sharp_turn_allowed, reach_distance_,
       slope_end_retreat,
-      [this, &standing, &retention_excluded](const mgg::Vertex& v) {
+      [this, &standing, &retention_excluded, &exclusions_lifted](const mgg::Vertex& v) {
         if (no_go_.inside(v.state.head<3>())) return true;
-        if (reverseExitEndpointExcluded(v.state)) {
+        if (!exclusions_lifted && reverseExitEndpointExcluded(v.state)) {
           ++retention_excluded;
           return true;
         }
@@ -3102,7 +3104,27 @@ std::string PlannerNode::buildLocalGraph() {
               points.reserve(path.size());
               for (const mgg::Vertex* v : path) points.push_back(v->state.head<3>());
               return no_go_.pathAdmissible(points);
-            }));
+            })); };
+  mgg::PathSelectionResult sel = select_path();
+  // Only excluded ends left, and room to turn here (no boxed-in escape):
+  // every kReconsiderExclusionsEveryPlans such plans, select once without
+  // them. Retention judges the result again; a refusal keeps it excluded.
+  std::string reconsidered;
+  if (reverse_exit_exclusions_.empty()) exclusion_only_empty_plans_ = 0;
+  if (sel.best_path.empty() && retention_excluded > 0 && turns_admissible &&
+      mgg::roomToTurn(*map_, robot_params_, planning_params_, root_state, standing_on) &&
+      ++exclusion_only_empty_plans_ >= kReconsiderExclusionsEveryPlans) {
+    exclusion_only_empty_plans_ = 0;
+    exclusions_lifted = true;
+    sel = select_path();
+    exclusions_lifted = false;
+    reconsidered = "; retention exclusions lifted for one plan (" +
+                   std::to_string(reverse_exit_exclusions_.size()) +
+                   " excluded, every " + std::to_string(kReconsiderExclusionsEveryPlans) +
+                   "th plan with only excluded ends): " +
+                   (sel.best_path.empty() ? "still no path" : "retrying one");
+    RCLCPP_INFO(get_logger(), "%s", reconsidered.c_str() + 2);
+  }
   for (const mgg::Vertex* v : sel.best_path) {
     if (v != nullptr) best_path_.push_back(v->state);
   }
@@ -3334,7 +3356,8 @@ std::string PlannerNode::buildLocalGraph() {
     arrival_note = "; standing start: no admissible observed-arrival goal; "
                    "waiting for observed support/clearance";
   }
-  return std::string(buf) + standing_note + room_note + corner_note + arrival_note;
+  return std::string(buf) + standing_note + room_note + corner_note + arrival_note +
+         reconsidered;
 }
 
 std::string PlannerNode::departBoxedIn(const mgg::StateVec& root_state,
@@ -4549,7 +4572,12 @@ std::string PlannerNode::clearInadmissibleBestPath() {
 }
 
 void PlannerNode::enforceSafeCompletion(bool& complete) {
-  if (best_path_.empty() && (standingStart() || !reverse_exit_exclusions_.empty())) {
+  if (best_path_.empty() &&
+      (standingStart() || std::any_of(reverse_exit_exclusions_.begin(),
+                                      reverse_exit_exclusions_.end(),
+                                      [this](const Eigen::Vector3d& excluded) {
+                                        return reverseExitExclusionRelevant(excluded);
+                                      }))) {
     complete = false;
   }
 }
@@ -4653,7 +4681,45 @@ void PlannerNode::excludeReverseExitEndpoint(const Eigen::Vector3d& endpoint) {
         ? std::make_pair(mapping_snapshot_.component_id, mapping_snapshot_.epoch)
         : std::make_pair(std::string(), std::uint64_t{0});
   }
-  reverse_exit_exclusions_.push_back(endpoint);
+  if (std::none_of(reverse_exit_exclusions_.begin(), reverse_exit_exclusions_.end(),
+                   [&](const Eigen::Vector3d& excluded) {
+                     return (excluded - endpoint).norm() <=
+                            reach_distance_ + mgg::kViewpointArrivalSlack;
+                   })) {
+    reverse_exit_exclusions_.push_back(endpoint);
+  }
+}
+
+bool PlannerNode::reverseExitExclusionRelevant(const Eigen::Vector3d& excluded) const {
+  // The same tolerance that excludes a vertex: an end still worth reaching
+  // is a lattice candidate with gain, or a roadmap frontier, near it.
+  const double tolerance = reach_distance_ + mgg::kViewpointArrivalSlack;
+  const auto near = [&](const mgg::Vertex* v) {
+    return v != nullptr && (v->state.head<3>() - excluded).norm() <= tolerance;
+  };
+  for (const auto& entry : local_graph_->vertices_map_) {
+    if (near(entry.second) && entry.second->vol_gain.gain > 0) return true;
+  }
+  for (const auto& entry : global_graph_->vertices_map_) {
+    if (near(entry.second) && entry.second->type == mgg::VertexType::kFrontier) return true;
+  }
+  return false;
+}
+
+void PlannerNode::retireReverseExitExclusionsWithoutGain() {
+  const std::size_t before = reverse_exit_exclusions_.size();
+  reverse_exit_exclusions_.erase(
+      std::remove_if(reverse_exit_exclusions_.begin(), reverse_exit_exclusions_.end(),
+                     [this](const Eigen::Vector3d& excluded) {
+                       return !reverseExitExclusionRelevant(excluded);
+                     }),
+      reverse_exit_exclusions_.end());
+  if (reverse_exit_exclusions_.size() < before) {
+    RCLCPP_INFO(get_logger(),
+                "%zu retention exclusion(s) retired: no frontier or candidate with gain "
+                "is left there (%zu left)",
+                before - reverse_exit_exclusions_.size(), reverse_exit_exclusions_.size());
+  }
 }
 
 void PlannerNode::expireReverseExitExclusions() {

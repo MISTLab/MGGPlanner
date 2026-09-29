@@ -162,6 +162,10 @@ class PlannerNode : public rclcpp::Node {
   /// kReverseExitExclusionMoveM from where the first was made, or the map
   /// in service is another component or epoch.
   void expireReverseExitExclusions();
+  /// Whether an excluded end still stands for exploration left: a lattice
+  /// vertex with gain, or a roadmap frontier, within the exclusion radius.
+  bool reverseExitExclusionRelevant(const Eigen::Vector3d& excluded) const;
+  void retireReverseExitExclusionsWithoutGain();
   bool tryStoredReverseExit(const mgg::StateVec& start, std::string& note);
   bool storedReverseExitApplies(const mgg::StateVec& pose) const;
   bool currentPoseNeedsStoredExit() const;
@@ -456,6 +460,10 @@ class PlannerNode : public rclcpp::Node {
   // the robot stays put, so selection cannot alternate between two refused
   // candidates (run 14).
   static constexpr double kReverseExitExclusionMoveM = 0.5;
+  // Plans with room to turn whose selection was empty only for exclusions;
+  // every kReconsiderExclusionsEveryPlans-th selects once without them.
+  static constexpr int kReconsiderExclusionsEveryPlans = 10;
+  int exclusion_only_empty_plans_ = 0;
   std::vector<Eigen::Vector3d> reverse_exit_exclusions_;
   Eigen::Vector2d reverse_exit_exclusions_anchor_ = Eigen::Vector2d::Zero();
   std::pair<std::string, std::uint64_t> reverse_exit_exclusions_map_;
