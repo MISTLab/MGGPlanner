@@ -157,15 +157,17 @@ class PlannerNode : public rclcpp::Node {
   void keepReverseDeparture(const std::vector<mgg::StateVec>& path);
   void retainEntryPastRefuge(const std::vector<mgg::StateVec>& reverse);
   bool reverseExitEndpointExcluded(const mgg::StateVec& pose) const;
-  void excludeReverseExitEndpoint(const Eigen::Vector3d& endpoint);
+  /// Records one retention refusal of each end (a path's end, a global
+  /// target): a new exclusion, or a refused one again with a fresh TTL and
+  /// one more refusal counted. Returns what was given up, for the summary.
+  std::string excludeReverseExitEndpoints(const std::vector<Eigen::Vector3d>& ends);
+  void excludeReverseExitEndpoint(const Eigen::Vector3d& endpoint) {
+    excludeReverseExitEndpoints({endpoint});
+  }
   /// Forgets the exclusions once the robot is more than
   /// kReverseExitExclusionMoveM from where the first was made, or the map
   /// in service is another component or epoch.
   void expireReverseExitExclusions();
-  /// Whether an excluded end still stands for exploration left: a lattice
-  /// vertex with gain, or a roadmap frontier, within the exclusion radius.
-  bool reverseExitExclusionRelevant(const Eigen::Vector3d& excluded) const;
-  void retireReverseExitExclusionsWithoutGain();
   bool tryStoredReverseExit(const mgg::StateVec& start, std::string& note);
   bool storedReverseExitApplies(const mgg::StateVec& pose) const;
   bool currentPoseNeedsStoredExit() const;
@@ -456,15 +458,28 @@ class PlannerNode : public rclcpp::Node {
   // reused across requests or map generations; the request pins peers.
   mutable std::map<std::array<double, 6>, bool> plan_reverse_edges_;
   mutable std::uint64_t plan_reverse_generation_ = 0;
-  // Endpoints whose reverse-exit retention was refused. They accumulate while
-  // the robot stays put, so selection cannot alternate between two refused
-  // candidates (run 14).
+  // Ends (path ends and global targets) whose reverse-exit retention was
+  // refused. They accumulate while the robot stays put, so selection cannot
+  // alternate between two refused candidates (run 14). Each lasts
+  // kReverseExitExclusionPlans plan requests, then is judged again by normal
+  // selection and retention; refused kReverseExitExclusionGiveUpRefusals
+  // times from here it is given up until the robot moves or the map epoch
+  // changes, and no longer withholds completion.
   static constexpr double kReverseExitExclusionMoveM = 0.5;
-  // Plans with room to turn whose selection was empty only for exclusions;
-  // every kReconsiderExclusionsEveryPlans-th selects once without them.
-  static constexpr int kReconsiderExclusionsEveryPlans = 10;
-  int exclusion_only_empty_plans_ = 0;
-  std::vector<Eigen::Vector3d> reverse_exit_exclusions_;
+  static constexpr std::uint64_t kReverseExitExclusionPlans = 10;
+  static constexpr int kReverseExitExclusionGiveUpRefusals = 3;
+  struct ReverseExitExclusion {
+    Eigen::Vector3d position;
+    std::uint64_t excluded_through_request = 0;  // plan_requests_ value
+    int refusals = 1;
+    bool given_up = false;
+  };
+  bool reverseExitExclusionActive(const ReverseExitExclusion& exclusion) const {
+    return exclusion.given_up || plan_requests_ <= exclusion.excluded_through_request;
+  }
+  // Plan requests that planned (past the readiness checks).
+  std::uint64_t plan_requests_ = 0;
+  std::vector<ReverseExitExclusion> reverse_exit_exclusions_;
   Eigen::Vector2d reverse_exit_exclusions_anchor_ = Eigen::Vector2d::Zero();
   std::pair<std::string, std::uint64_t> reverse_exit_exclusions_map_;
   bool standingStartGoalAdmissible(const mgg::StateVec& goal);

@@ -356,6 +356,33 @@ class PlannerNodeTestPeer {
   static void excludeReverseExitEndpoint(PlannerNode& node, const Eigen::Vector3d& endpoint) {
     node.excludeReverseExitEndpoint(endpoint);
   }
+  static void advancePlanRequests(PlannerNode& node, std::uint64_t requests) {
+    node.plan_requests_ += requests;
+  }
+  /// The refusals counted for the exclusion at `position` (0: none), and
+  /// whether it is given up.
+  static std::pair<int, bool> reverseExitExclusionAt(PlannerNode& node,
+                                                     const Eigen::Vector3d& position) {
+    for (const auto& exclusion : node.reverse_exit_exclusions_) {
+      if ((exclusion.position - position).norm() <=
+          node.reach_distance_ + mgg::kViewpointArrivalSlack) {
+        return {exclusion.refusals, exclusion.given_up};
+      }
+    }
+    return {0, false};
+  }
+  /// Whether a lattice vertex with gain lies within the exclusion radius.
+  static bool gainNear(PlannerNode& node, const Eigen::Vector3d& position) {
+    for (const auto& entry : node.local_graph_->vertices_map_) {
+      if (entry.second->vol_gain.gain > 0 &&
+          (entry.second->state.head<3>() - position).norm() <=
+              node.reach_distance_ + mgg::kViewpointArrivalSlack) return true;
+    }
+    return false;
+  }
+  static void setReverseExitMaxLength(PlannerNode& node, double length) {
+    node.planning_params_.reverse_exit_max_length = length;
+  }
   /// The frontier `id` explored elsewhere, as a re-check demotes it.
   static void demoteGlobalFrontier(PlannerNode& node, int id) {
     const std::lock_guard<std::recursive_mutex> lock(node.planner_mutex_);
@@ -5187,7 +5214,7 @@ TEST_F(PlannerNodeTest, RetentionExclusionsThatExhaustSelectionAreBoxedIn) {
   PlannerNodeTestPeer::buildLocalGraph(*node);
   ASSERT_GE(PlannerNodeTestPeer::bestPath(*node).size(), 2u);
   const auto root = PlannerNodeTestPeer::drivingState(*node, 3, 0, 0);
-  for (double x = 3.25; x <= 5.5; x += 0.25) {
+  for (double x = 3.5; x <= 5.0; x += 0.5) {
     PlannerNodeTestPeer::excludeReverseExitEndpoint(*node, {x, 0, root.z()});
   }
   const int departures = PlannerNodeTestPeer::boxedInDepartures(*node);
@@ -5280,17 +5307,170 @@ TEST_F(PlannerNodeTest, ADroppedCorridorClearsTheExclusionsJudgedAgainstIt) {
   EXPECT_GT(response->path.back().position.x, 7.2);
 }
 
-// mgg-run14 review r0, issue 2: an exclusion holds completion back only
-// while its end is still a frontier or a candidate with gain. Once another
-// robot has explored it, the exclusion retires and exploration completes.
-TEST_F(PlannerNodeTest, AnExclusionWhoseFrontierWasExploredElsewhereRetires) {
-  auto node = makeNode("exclusion_retires");
+// mgg-run14 review r1, issue 1: a global-only exclusion. The route to a
+// remote frontier fails retention after a compatible map update; the next
+// update restores its escape. Its exclusion lasts 10 plan requests; then the
+// frontier is judged again by normal routing and retention, and sent.
+TEST_F(PlannerNodeTest, AGlobalOnlyExcludedFrontierIsRoutedAgainAfterItsTtl) {
+  auto node = makeNode("global_exclusion_ttl");
+  PlannerNodeTestPeer::gainFromUnknownVoxelsOnly(*node);
+  PlannerNodeTestPeer::setRobotFootprint(*node, 0.6, 0.2);
+  PlannerNodeTestPeer::observeFloor(*node, -2, 5.55, -2, 2);
+  PlannerNodeTestPeer::observeWall(*node, 0.8, 5.55, 0.25);
+  PlannerNodeTestPeer::observeWall(*node, 0.8, 5.55, -0.25);
+  PlannerNodeTestPeer::acceptOdometry(*node, 0.0, 0.0, 1.0);
+  const int frontier = PlannerNodeTestPeer::addGlobalChainToFrontier(
+      *node, {{0.5, 0}, {1, 0}, {1.5, 0}, {2, 0}, {2.5, 0}, {3, 0},
+              {3.5, 0}, {4, 0}, {4.5, 0}, {5, 0}}, 0);
+  // A lattice with nothing to gain: the frontier is the robot's only goal.
+  PlannerNodeTestPeer::setLattice(*node, {-0.5, -0.5}, {0.5, 0.5});
+  PlannerNodeTestPeer::consultGlobalPlannerAtOnce(*node);
+  std::string reason;
+  ASSERT_TRUE(PlannerNodeTestPeer::runGlobalPlanner(*node, reason, frontier)) << reason;
+  // Seen blocked between the route's checks and retention ...
+  PlannerNodeTestPeer::observeWallAlongY(*node, -0.25, 0.25, 1.5);
+  const auto note = PlannerNodeTestPeer::retainBestPath(*node);
+  ASSERT_NE(note.find("reverse exit retention refused"), std::string::npos) << note;
+  // ... and seen free again: the escape is restored; the frontier keeps
+  // its gain, beyond the floor's end.
+  PlannerNodeTestPeer::observeFreeBox(*node, {1.5, 0, 0.35}, {0.2, 0.38, 0.6});
+  int sent_at = 0;
+  for (int request = 1; request <= 12 && sent_at == 0; ++request) {
+    auto response = std::make_shared<mgg_msgs::srv::PlannerSrv::Response>();
+    PlannerNodeTestPeer::plan(*node, response);
+    if (!response->path.empty()) {
+      sent_at = request;
+      EXPECT_GT(response->path.back().position.x, 4.0);
+    } else {
+      EXPECT_EQ(response->status, PlannerNode::kStatusNoPath) << request;
+    }
+  }
+  EXPECT_EQ(sent_at, 11);
+}
+
+// mgg-run14 review r1, issue 2: selection may cut a route to gain back to
+// an end with no gain of its own. Its refusal must hold for the
+// exclusion's lifetime, not lapse at the next plan for want of gain there.
+TEST_F(PlannerNodeTest, AGainlessCutBackEndpointIsNotReRefusedEveryPlan) {
+  auto node = makeNode("gainless_cut_back");
+  PlannerNodeTestPeer::gainFromUnknownVoxelsOnly(*node);
+  // Only the far end sees past the floor: the vertices short of it see
+  // nothing unknown.
+  PlannerNodeTestPeer::setSensorRange(*node, 1.0);
+  PlannerNodeTestPeer::setReverseExitMaxLength(*node, 3.0);
+  PlannerNodeTestPeer::setRobotFootprint(*node, 0.6, 0.2);
+  PlannerNodeTestPeer::observeFloor(*node, -2, 4.55, -2, 2);
+  PlannerNodeTestPeer::observeWall(*node, 0.8, 4.55, 0.25);
+  PlannerNodeTestPeer::observeWall(*node, 0.8, 4.55, -0.25);
+  PlannerNodeTestPeer::setLattice(*node, {0, 0}, {4.5, 0});
+  PlannerNodeTestPeer::acceptOdometry(*node, 0.0, 0.0, 1.0);
+  PlannerNodeTestPeer::buildLocalGraph(*node);
+  const auto first = PlannerNodeTestPeer::bestPath(*node);
+  ASSERT_GE(first.size(), 2u);
+  // Cut back from the gain-bearing end to within the 3 m reverse bound:
+  // the end chosen has no gain of its own.
+  ASSERT_LT(first.back().x(), 4.0);
+  EXPECT_FALSE(PlannerNodeTestPeer::gainNear(*node, first.back().head<3>()));
+  // Seen blocked between selection and retention, then free again.
+  PlannerNodeTestPeer::observeWallAlongY(*node, -0.25, 0.25, 1.5);
+  ASSERT_NE(PlannerNodeTestPeer::retainBestPath(*node).find("retention refused"),
+            std::string::npos);
+  PlannerNodeTestPeer::observeFreeBox(*node, {1.5, 0, 0.35}, {0.2, 0.38, 0.6});
+  for (int plan = 0; plan < 3; ++plan) {
+    SCOPED_TRACE(plan);
+    PlannerNodeTestPeer::buildLocalGraph(*node);
+    const auto next = PlannerNodeTestPeer::bestPath(*node);
+    EXPECT_TRUE(next.empty() || (next.back().head<3>() - first.back().head<3>()).norm() > 0.35);
+  }
+}
+
+// mgg-run14 round 3: a local exclusion lasts 10 plan requests. Then its end
+// is judged again by normal selection and retention: sent when retention now
+// passes.
+TEST_F(PlannerNodeTest, ALocalExclusionIsJudgedAgainAfterTenPlanRequests) {
+  const std::vector<std::array<double, 4>> corridor{{0.8, 7, 0.4, 0.6}, {0.8, 7, -0.6, -0.4}};
+  auto blocked_walls = corridor;
+  blocked_walls.push_back({1.0, 1.2, -2, 2});
+  MolaFloorProduct clear(-2, 7, -2, 2, corridor);
+  MolaFloorProduct blocked(-2, 7, -2, 2, blocked_walls);
+  auto node = makeNode("local_exclusion_ttl");
+  PlannerNodeTestPeer::setRobotFootprint(*node, 1.0, 0.3);
+  PlannerNodeTestPeer::setLattice(*node, {0, 0}, {5.5, 0});
+  PlannerNodeTestPeer::useMolaMap(*node, clear.serve());
+  PlannerNodeTestPeer::acceptOdometryFacing(*node, 0, 0, 0, 1);
+  PlannerNodeTestPeer::buildLocalGraph(*node);
+  const auto refused = PlannerNodeTestPeer::bestPath(*node);
+  ASSERT_GE(refused.size(), 2u);
+  const Eigen::Vector3d end = refused.back().head<3>();
+  // Seen blocked between selection and retention, then free again.
+  PlannerNodeTestPeer::useMolaMap(*node, blocked.serve());
+  ASSERT_NE(PlannerNodeTestPeer::retainBestPath(*node).find("retention refused"),
+            std::string::npos);
+  PlannerNodeTestPeer::useMolaMap(*node, clear.serve());
+  for (int request = 1; request <= 12; ++request) {
+    SCOPED_TRACE(request);
+    auto response = std::make_shared<mgg_msgs::srv::PlannerSrv::Response>();
+    PlannerNodeTestPeer::plan(*node, response);
+    ASSERT_FALSE(response->path.empty());
+    const auto& last = response->path.back().position;
+    const bool at_end = (Eigen::Vector3d(last.x, last.y, last.z) - end).norm() <= 0.35;
+    // Another end while excluded; then judged again, valid, and sent.
+    EXPECT_EQ(at_end, request >= 11);
+  }
+}
+
+// mgg-run14 round 3: judged again and refused again, an end is excluded
+// again with a fresh TTL and one more refusal counted; the third refusal
+// from here gives it up: no more TTL lifts until the robot moves.
+TEST_F(PlannerNodeTest, ARefusedAgainExclusionCountsUpAndIsGivenUpAtThree) {
+  const std::vector<std::array<double, 4>> corridor{{0.8, 7, 0.4, 0.6}, {0.8, 7, -0.6, -0.4}};
+  auto blocked_walls = corridor;
+  blocked_walls.push_back({1.0, 1.2, -2, 2});
+  MolaFloorProduct clear(-2, 7, -2, 2, corridor);
+  MolaFloorProduct blocked(-2, 7, -2, 2, blocked_walls);
+  auto node = makeNode("local_exclusion_refused_again");
+  PlannerNodeTestPeer::setRobotFootprint(*node, 1.0, 0.3);
+  PlannerNodeTestPeer::setLattice(*node, {0, 0}, {5.5, 0});
+  PlannerNodeTestPeer::useMolaMap(*node, clear.serve());
+  PlannerNodeTestPeer::acceptOdometryFacing(*node, 0, 0, 0, 1);
+  PlannerNodeTestPeer::buildLocalGraph(*node);
+  const Eigen::Vector3d end = PlannerNodeTestPeer::bestPath(*node).back().head<3>();
+  const auto selects_end = [&]() {
+    PlannerNodeTestPeer::useMolaMap(*node, clear.serve());
+    PlannerNodeTestPeer::buildLocalGraph(*node);
+    const auto path = PlannerNodeTestPeer::bestPath(*node);
+    return !path.empty() && (path.back().head<3>() - end).norm() <= 0.35;
+  };
+  for (int refusal = 1; refusal <= 3; ++refusal) {
+    SCOPED_TRACE(refusal);
+    ASSERT_TRUE(selects_end());
+    PlannerNodeTestPeer::useMolaMap(*node, blocked.serve());
+    const auto note = PlannerNodeTestPeer::retainBestPath(*node);
+    ASSERT_NE(note.find("retention refused"), std::string::npos) << note;
+    EXPECT_EQ(note.find("given up: unreachable from here") != std::string::npos, refusal == 3);
+    EXPECT_EQ(PlannerNodeTestPeer::reverseExitExclusionAt(*node, end),
+              std::make_pair(refusal, refusal == 3));
+    PlannerNodeTestPeer::advancePlanRequests(*node, 10);
+    EXPECT_FALSE(selects_end());  // excluded through the 10th request
+    PlannerNodeTestPeer::advancePlanRequests(*node, 1);
+  }
+  EXPECT_FALSE(selects_end());  // given up: no lift
+  PlannerNodeTestPeer::advancePlanRequests(*node, 25);
+  EXPECT_FALSE(selects_end());
+}
+
+// mgg-run14 review r0, issue 2 (under the round-3 TTL): an exclusion
+// withholds completion only while it lasts; its frontier explored elsewhere,
+// exploration completes once it lapses.
+TEST_F(PlannerNodeTest, AnExclusionWhoseFrontierWasExploredElsewhereLapsesAfterItsTtl) {
+  auto node = makeNode("exclusion_lapses");
   PlannerNodeTestPeer::gainFromUnknownVoxelsOnly(*node);
   PlannerNodeTestPeer::observeFloor(*node, -3.55, 5.55, -2.55, 2.55);
   PlannerNodeTestPeer::acceptOdometry(*node, 0.0, 0.0, 1.0);
   const int frontier = PlannerNodeTestPeer::addGlobalChainToFrontier(*node, {{-0.5, 0.0}});
   PlannerNodeTestPeer::excludeReverseExitEndpoint(*node,
       PlannerNodeTestPeer::globalVertexState(*node, frontier).head<3>());
+  PlannerNodeTestPeer::demoteGlobalFrontier(*node, frontier);
   const auto plan = [&node]() {
     PlannerNodeTestPeer::consultGlobalPlannerAtOnce(*node);
     auto response = std::make_shared<mgg_msgs::srv::PlannerSrv::Response>();
@@ -5298,61 +5478,45 @@ TEST_F(PlannerNodeTest, AnExclusionWhoseFrontierWasExploredElsewhereRetires) {
     EXPECT_TRUE(response->path.empty());
     return response->status;
   };
-  EXPECT_EQ(plan(), PlannerNode::kStatusNoPath);
-  EXPECT_EQ(PlannerNodeTestPeer::reverseExitExclusions(*node), 1u);
-  bool complete = true;
-  PlannerNodeTestPeer::enforceSafeCompletion(*node, complete);
-  EXPECT_FALSE(complete);
-  PlannerNodeTestPeer::demoteGlobalFrontier(*node, frontier);
-  // Not yet retired (no plan since), but no longer relevant.
-  complete = true;
-  PlannerNodeTestPeer::enforceSafeCompletion(*node, complete);
-  EXPECT_TRUE(complete);
-  EXPECT_EQ(PlannerNodeTestPeer::reverseExitExclusions(*node), 1u);
+  for (int request = 1; request <= 10; ++request) {
+    EXPECT_EQ(plan(), PlannerNode::kStatusNoPath) << request;
+  }
   EXPECT_EQ(plan(), PlannerNode::kStatusComplete);
-  EXPECT_EQ(PlannerNodeTestPeer::reverseExitExclusions(*node), 0u);
 }
 
-// mgg-run14 review r0, issue 2: a robot with room whose only candidates
-// are excluded retries them once every 10th such plan. Retention judges
-// the retried path again, and a refusal keeps it excluded.
-TEST_F(PlannerNodeTest, ExcludedCandidatesAreReconsideredEveryTenthEmptyPlan) {
-  const std::vector<std::array<double, 4>> corridor{{0.8, 7, 0.4, 0.6}, {0.8, 7, -0.6, -0.4}};
-  auto blocked_walls = corridor;
-  blocked_walls.push_back({1.0, 1.2, -2, 2});
-  MolaFloorProduct clear(-2, 7, -2, 2, corridor);
-  MolaFloorProduct blocked(-2, 7, -2, 2, blocked_walls);
-  auto node = makeNode("exclusions_reconsidered");
-  PlannerNodeTestPeer::setRobotFootprint(*node, 1.0, 0.3);
-  PlannerNodeTestPeer::setLattice(*node, {0, 0}, {5.5, 0});
-  PlannerNodeTestPeer::useMolaMap(*node, clear.serve());
-  PlannerNodeTestPeer::acceptOdometryFacing(*node, 0, 0, 0, 1);
-  ASSERT_TRUE(PlannerNodeTestPeer::roomToTurnObserved(*node,
-      PlannerNodeTestPeer::drivingState(*node, 0, 0, 0)));
-  // Refuse every candidate, as in RetentionRefusalsAccumulateUntilTheRobotMoves.
-  for (int i = 0; i < 2; ++i) {
-    PlannerNodeTestPeer::useMolaMap(*node, clear.serve());
-    PlannerNodeTestPeer::buildLocalGraph(*node);
-    ASSERT_GE(PlannerNodeTestPeer::bestPath(*node).size(), 2u);
-    PlannerNodeTestPeer::useMolaMap(*node, blocked.serve());
-    PlannerNodeTestPeer::retainBestPath(*node);
+// mgg-run14 round 3: refused three times from the same place, an end is
+// given up: excluded until the robot moves, and no longer withholding
+// completion, though its frontier stands.
+TEST_F(PlannerNodeTest, AnExclusionGivenUpAfterThreeRefusalsNoLongerWithholdsCompletion) {
+  auto node = makeNode("exclusion_given_up");
+  PlannerNodeTestPeer::gainFromUnknownVoxelsOnly(*node);
+  PlannerNodeTestPeer::observeFloor(*node, -3.55, 5.55, -2.55, 2.55);
+  PlannerNodeTestPeer::acceptOdometry(*node, 0.0, 0.0, 1.0);
+  // Beyond the lattice, facing unknown space past the floor's end: it stays
+  // a frontier throughout.
+  const int frontier = PlannerNodeTestPeer::addGlobalChainToFrontier(
+      *node, {{1, 0}, {2, 0}, {3, 0}, {4, 0}, {5, 0}});
+  const Eigen::Vector3d target = PlannerNodeTestPeer::globalVertexState(*node, frontier).head<3>();
+  const auto plan = [&node]() {
+    PlannerNodeTestPeer::consultGlobalPlannerAtOnce(*node);
+    auto response = std::make_shared<mgg_msgs::srv::PlannerSrv::Response>();
+    PlannerNodeTestPeer::plan(*node, response);
+    EXPECT_TRUE(response->path.empty());
+    return response->status;
+  };
+  for (int refusal = 1; refusal <= 3; ++refusal) {
+    SCOPED_TRACE(refusal);
+    PlannerNodeTestPeer::excludeReverseExitEndpoint(*node, target);
+    EXPECT_EQ(PlannerNodeTestPeer::reverseExitExclusionAt(*node, target),
+              std::make_pair(refusal, refusal == 3));
+    EXPECT_EQ(plan(), refusal < 3 ? PlannerNode::kStatusNoPath : PlannerNode::kStatusComplete);
   }
-  ASSERT_EQ(PlannerNodeTestPeer::reverseExitExclusions(*node), 2u);
-  PlannerNodeTestPeer::useMolaMap(*node, clear.serve());
-  for (int plan = 1; plan <= 11; ++plan) {
-    SCOPED_TRACE(plan);
-    const auto summary = PlannerNodeTestPeer::buildLocalGraph(*node);
-    const bool retried = !PlannerNodeTestPeer::bestPath(*node).empty();
-    EXPECT_EQ(retried, plan == 10) << summary;
-    EXPECT_EQ(summary.find("exclusions lifted") != std::string::npos, plan == 10) << summary;
-    if (plan == 10 && retried) {
-      PlannerNodeTestPeer::useMolaMap(*node, blocked.serve());
-      const auto note = PlannerNodeTestPeer::retainBestPath(*node);
-      EXPECT_NE(note.find("reverse exit retention refused"), std::string::npos) << note;
-      PlannerNodeTestPeer::useMolaMap(*node, clear.serve());
-    }
-    EXPECT_EQ(PlannerNodeTestPeer::reverseExitExclusions(*node), 2u);
-  }
+  // Given up, it stays excluded (no TTL lift) until the robot moves.
+  for (int request = 0; request < 11; ++request) plan();
+  EXPECT_EQ(PlannerNodeTestPeer::reverseExitExclusionAt(*node, target), std::make_pair(3, true));
+  PlannerNodeTestPeer::acceptOdometry(*node, 0.6, 0.0, 2.0);
+  EXPECT_EQ(PlannerNodeTestPeer::reverseExitExclusions(*node), 0u);
+  EXPECT_TRUE(PlannerNodeTestPeer::isGlobalFrontier(*node, frontier));
 }
 
 TEST_F(PlannerNodeTest, NearEightDegreeRefugeUsesTheSameSlopeForCutbackAndRetention) {
