@@ -3223,25 +3223,7 @@ std::string PlannerNode::buildLocalGraph() {
             return turn_check.admissible(points, start_heading);
           }) : mgg::PathOkFn(),
         turns_admissible ? mgg::PathOkFn([&](const mgg::PathType& points) {
-            // A shortcut must not skip the refuge or replace its validated
-            // reverse corridor. Otherwise shortcutAndResample keeps entry's
-            // original, already-qualified route.
-            std::vector<mgg::StateVec> route;
-            for (const auto& point : points) {
-              route.emplace_back(point.x(), point.y(), point.z(), 0.0);
-            }
-            const auto vertex = [&](std::size_t i) { return mgg::Vertex(-1, route[i]); };
-            const bool found = mgg::cutBackToWayBack(route,
-                [&](std::size_t i) {
-                  return !mgg::viewpointClear(*map_, robot_params_, planning_params_,
-                                              route[i], turn_check.slopeAt(points[i])) ||
-                         slope_end_retreat.admitted_on_slope(vertex(i));
-                },
-                [&](std::size_t i) { return slope_end_retreat.room_to_turn(vertex(i)); },
-                planning_params_.departure_reverse_allowed,
-                [&](std::size_t a, std::size_t b) { return reverse_edge(route[a], route[b]); },
-                planning_params_.reverse_exit_max_length);
-            return found && route.size() == points.size();
+            return reverseExitShortcutAdmissible(points);
           }) : mgg::PathOkFn());
   }
   // Free cells with no vertices is the characteristic bring-up failure: the
@@ -4548,6 +4530,27 @@ void PlannerNode::enforceSafeCompletion(bool& complete) {
                             !plan_reverse_exit_exclusions_.empty())) complete = false;
 }
 
+bool PlannerNode::endpointNeedsReverseExit(const mgg::StateVec& pose) const {
+  const double slope = mgg::groundSlope(*ground_, pose.head<3>(),
+      std::max(robot_params_.size.x(), robot_params_.size.y()), local_graph_.get());
+  return !mgg::viewpointClear(*map_, robot_params_, planning_params_, pose, slope) ||
+         (mgg::slopeExemptsTurnSpace(slope) &&
+          !mgg::turnSpaceObserved(*map_, robot_params_, planning_params_, pose));
+}
+
+bool PlannerNode::reverseExitShortcutAdmissible(const mgg::PathType& points) {
+  std::vector<mgg::StateVec> route;
+  for (const auto& point : points) route.emplace_back(point.x(), point.y(), point.z(), 0.0);
+  mgg::GroundProjection ground(*map_, planning_params_, true);
+  const bool found = mgg::cutBackToWayBack(route,
+      [&](std::size_t i) { return endpointNeedsReverseExit(route[i]); },
+      [&](std::size_t i) { return reverseExitRefuge(route[i]); },
+      planning_params_.departure_reverse_allowed,
+      [&](std::size_t a, std::size_t b) { return reverseExitEdge(ground, route[a], route[b]); },
+      planning_params_.reverse_exit_max_length);
+  return found && route.size() == points.size();
+}
+
 bool PlannerNode::reverseExitRefuge(const mgg::StateVec& pose) const {
   // Selection, cutback, retention and execution use this same map-only fit:
   // a lower lattice estimate must not certify a refuge retention will refuse.
@@ -4597,11 +4600,7 @@ std::string PlannerNode::rememberReverseExit() {
       robot_params_.type != mgg::RobotType::kGroundRobot ||
       !planning_params_.departure_reverse_allowed) return {};
   const auto& end = best_path_.back();
-  const double slope = mgg::groundSlope(*ground_, end.head<3>(),
-      std::max(robot_params_.size.x(), robot_params_.size.y()), local_graph_.get());
-  if (mgg::viewpointClear(*map_, robot_params_, planning_params_, end, slope) &&
-      !(mgg::slopeExemptsTurnSpace(slope) &&
-        !mgg::turnSpaceObserved(*map_, robot_params_, planning_params_, end))) return {};
+  if (!endpointNeedsReverseExit(end)) return {};
   mgg::GroundProjection ground(*map_, planning_params_, true);
   std::vector<mgg::StateVec> reverse{end};
   double length = 0.0;

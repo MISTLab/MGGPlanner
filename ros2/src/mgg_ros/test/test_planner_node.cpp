@@ -289,6 +289,11 @@ class PlannerNodeTestPeer {
     return {mgg::groundSlope(*node.ground_, pose.head<3>(), radius),
             mgg::groundSlope(*node.ground_, pose.head<3>(), radius, node.local_graph_.get())};
   }
+  static bool shortcutReverseGuard(PlannerNode& node, const mgg::PathType& path) {
+    mgg::PathTurnCheck check(*node.local_graph_, node.robot_params_);
+    EXPECT_GT(check.slopeAt(path.back()), mgg::kLevelGroundSlopeRad);
+    return node.reverseExitShortcutAdmissible(path);
+  }
   static std::size_t storedReversePoses(const PlannerNode& node) {
     return node.stored_reverse_exit_.size();
   }
@@ -3882,6 +3887,26 @@ TEST_F(PlannerNodeTest, ReverseEdgeQueriesAreCachedOnlyWithinOnePlan) {
   const auto second = PlannerNodeTestPeer::repeatedReverseQueries(*node, *map);
   EXPECT_GT(second.first, first.second);  // no old map/peer result next plan
   EXPECT_EQ(second.first, second.second);
+}
+
+TEST_F(PlannerNodeTest, ShortcutEndpointUsesRetentionSlopeInsteadOfTheTurnFit) {
+  auto node = makeNode("shortcut_endpoint_slope");
+  PlannerNodeTestPeer::setRobotFootprint(*node, 1.0, 0.3);
+  PlannerNodeTestPeer::trackMeasuredGround(*node);
+  PlannerNodeTestPeer::observeSparseSlope(*node, -2, 3, -2, 2,
+      std::tan(7.7 * M_PI / 180), true);
+  const mgg::StateVec end(0, 0, 0.3, 0);
+  std::vector<mgg::StateVec> lattice;
+  for (double x : {-0.6, 0.0, 0.6}) {
+    for (double y : {-0.6, 0.0, 0.6}) {
+      lattice.emplace_back(x, y, end.z() + std::tan(8.3 * M_PI / 180) * x, 0);
+    }
+  }
+  PlannerNodeTestPeer::setSeenLattice(*node, lattice);
+  EXPECT_LT(PlannerNodeTestPeer::refugeSlopes(*node, end).second, mgg::kLevelGroundSlopeRad);
+  // The higher turn-fit exempts the unknown turn footprint, but retention's
+  // ground fit does not. With no refuge, even a two-point shortcut must fail.
+  EXPECT_FALSE(PlannerNodeTestPeer::shortcutReverseGuard(*node, {{-0.2, 0, 0.3}, end.head<3>()}));
 }
 
 TEST_F(PlannerNodeTest, SharpTurnFallbackShortcutStillPreservesItsReverseRefuge) {

@@ -146,6 +146,8 @@ class PlannerNode : public rclcpp::Node {
   bool reverseExitEndpointExcluded(const mgg::StateVec& pose) const;
   bool tryStoredReverseExit(const mgg::StateVec& start, std::string& note);
   bool storedReverseExitApplies(const mgg::StateVec& pose) const;
+  bool reverseExitShortcutAdmissible(const mgg::PathType& points);
+  bool endpointNeedsReverseExit(const mgg::StateVec& pose) const;
   bool reverseExitRefuge(const mgg::StateVec& pose) const;
   bool reverseExitEdge(const mgg::GroundProjection& ground,
                        const mgg::StateVec& from, const mgg::StateVec& to) const;
