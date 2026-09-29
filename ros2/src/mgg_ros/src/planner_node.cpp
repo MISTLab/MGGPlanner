@@ -4842,7 +4842,14 @@ bool PlannerNode::tryStoredReverseExit(const mgg::StateVec& start, std::string& 
     stored_reverse_exit_.clear();
     reverse_exit_entry_path_.clear();
     stored_reverse_retreating_ = false;
-    const std::string dropped = "; stored reverse exit dropped: " + unusable_here;
+    // Every current exclusion was judged in extension mode, against this
+    // corridor. The next retention judges fresh; refusals re-accumulate.
+    std::string dropped = "; stored reverse exit dropped: " + unusable_here;
+    if (!reverse_exit_exclusions_.empty()) {
+      dropped += "; " + std::to_string(reverse_exit_exclusions_.size()) +
+                 " retention exclusion(s) judged against it cleared";
+      reverse_exit_exclusions_.clear();
+    }
     RCLCPP_WARN(get_logger(), "%s", dropped.c_str() + 2);
     note += dropped;
   }

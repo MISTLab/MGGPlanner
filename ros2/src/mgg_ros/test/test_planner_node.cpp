@@ -5235,6 +5235,45 @@ TEST_F(PlannerNodeTest, AStoredExitRefusedForAStaticReasonIsDroppedButAPeerBlock
   }
 }
 
+// mgg-run14 review r0, issue 1: the only forward candidate fails
+// extension-mode retention; the stored exit is refused for heading and
+// dropped, and no departure exists. Its exclusion was judged against the
+// dropped corridor, so it goes too: judged fresh, the path is sent.
+TEST_F(PlannerNodeTest, ADroppedCorridorClearsTheExclusionsJudgedAgainstIt) {
+  MolaFloorProduct entry(-2, 10, -2, 2,
+      {{{1.0, 9, 0.6, 0.8}}, {{1.0, 9, -0.8, -0.6}}});
+  auto node = makeNode("dropped_corridor_exclusions");
+  PlannerNodeTestPeer::useMolaMap(*node, entry.serve());
+  PlannerNodeTestPeer::setRobotFootprint(*node, 1.2, 0.3);
+  PlannerNodeTestPeer::setLattice(*node, {0, 0}, {5.5, 0});
+  PlannerNodeTestPeer::acceptOdometryFacing(*node, 0, 0, 0, 1);
+  auto response = std::make_shared<mgg_msgs::srv::PlannerSrv::Response>();
+  PlannerNodeTestPeer::plan(*node, response);
+  ASSERT_GE(response->path.size(), 2u);
+  PlannerNodeTestPeer::acceptOdometryFacing(*node, 0.01, 0, 0, 2);
+  ASSERT_GT(PlannerNodeTestPeer::storedReversePoses(*node), 1u);
+  MolaFloorProduct open_ahead(-2, 10, -2, 2,
+      {{{1.0, 7.2, 0.6, 0.8}}, {{1.0, 7.2, -0.8, -0.6}}});
+  PlannerNodeTestPeer::useMolaMap(*node, open_ahead.serve());
+  // As in the run-14 regression: entry heading mismatch at (3, 0.3). The
+  // lattice reaches x = 8, so one end beyond the corridor mouth has room.
+  PlannerNodeTestPeer::acceptOdometryFacing(*node, 3, 0.3, 0, 3);
+  PlannerNodeTestPeer::setLattice(*node, {0, 0}, {5, 0});
+  response = std::make_shared<mgg_msgs::srv::PlannerSrv::Response>();
+  PlannerNodeTestPeer::plan(*node, response);
+  ASSERT_TRUE(response->path.empty());
+  EXPECT_EQ(PlannerNodeTestPeer::storedReversePoses(*node), 0u);
+  EXPECT_EQ(PlannerNodeTestPeer::reverseExitExclusions(*node), 0u);
+  bool sent = false;
+  for (int plan = 0; plan < 3 && !sent; ++plan) {
+    response = std::make_shared<mgg_msgs::srv::PlannerSrv::Response>();
+    PlannerNodeTestPeer::plan(*node, response);
+    sent = !response->path.empty();
+  }
+  ASSERT_TRUE(sent);
+  EXPECT_GT(response->path.back().position.x, 7.2);
+}
+
 TEST_F(PlannerNodeTest, NearEightDegreeRefugeUsesTheSameSlopeForCutbackAndRetention) {
   auto node = makeNode("one_refuge_predicate");
   PlannerNodeTestPeer::setRobotFootprint(*node, 1.0, 0.3);
