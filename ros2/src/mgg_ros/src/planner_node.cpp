@@ -1548,7 +1548,10 @@ PlannerNode::StandingStartScope::StandingStartScope(PlannerNode& node) : node(no
 }
 
 PlannerNode::StandingStartScope::~StandingStartScope() {
-  if (--node.standing_start_scope_depth_ == 0) node.plan_standing_start_.reset();
+  if (--node.standing_start_scope_depth_ == 0) {
+    node.plan_standing_start_.reset();
+    node.plan_reverse_edges_.clear();
+  }
 }
 
 std::optional<mgg::StandingStart> PlannerNode::standingStart() {
@@ -3016,12 +3019,7 @@ std::string PlannerNode::buildLocalGraph() {
   // Unlike outward root edges, an escape has no blind-start allowance.
   mgg::GroundProjection reverse_ground(*map_, planning_params_, true);
   const auto reverse_edge = [&](const mgg::StateVec& from, const mgg::StateVec& to) {
-    return mgg::reverseExitEdgeAdmissible(*map_, reverse_ground, robot_params_,
-        planning_params_, from, to, [this](const auto& a, const auto& b) {
-          return no_go_.pathAdmissible({a, b}) &&
-                 !peerBlocksSegment(a - robot_params_.center_offset,
-                                    b - robot_params_.center_offset);
-        });
+    return reverseExitEdge(reverse_ground, from, to);
   };
   std::map<std::pair<int, int>, bool> reverse_edges;
 
@@ -4105,13 +4103,8 @@ bool PlannerNode::runGlobalPlanner(int target_id, std::string& reason,
               const auto key = std::make_pair(a, b);
               const auto found = reverse_edges.find(key);
               if (found != reverse_edges.end()) return found->second;
-              return reverse_edges[key] = mgg::reverseExitEdgeAdmissible(
-                  *map_, reverse_ground, robot_params_, planning_params_, best_path_[a], best_path_[b],
-                  [this](const auto& from, const auto& to) {
-                    return no_go_.pathAdmissible({from, to}) &&
-                           !peerBlocksSegment(from - robot_params_.center_offset,
-                                              to - robot_params_.center_offset);
-                  });
+              return reverse_edges[key] = reverseExitEdge(
+                  reverse_ground, best_path_[a], best_path_[b]);
             }, planning_params_.reverse_exit_max_length)) {
       best_path_.clear();
       global_frontier_not_routed_ = true;
@@ -4539,12 +4532,24 @@ bool PlannerNode::reverseExitRefuge(const mgg::StateVec& pose) const {
 bool PlannerNode::reverseExitEdge(const mgg::GroundProjection& ground,
                                   const mgg::StateVec& from,
                                   const mgg::StateVec& to) const {
-  return mgg::reverseExitEdgeAdmissible(*map_, ground, robot_params_, planning_params_,
+  const std::uint64_t generation = mola_map_ ? mola_map_->activeGeneration() : map_revision_;
+  if (generation != plan_reverse_generation_) {
+    plan_reverse_edges_.clear();
+    plan_reverse_generation_ = generation;
+  }
+  const std::array<double, 6> key{from.x(), from.y(), from.z(), to.x(), to.y(), to.z()};
+  if (standing_start_scope_depth_ > 0) {
+    const auto found = plan_reverse_edges_.find(key);
+    if (found != plan_reverse_edges_.end()) return found->second;
+  }
+  const bool allowed = mgg::reverseExitEdgeAdmissible(*map_, ground, robot_params_, planning_params_,
       from, to, [this](const auto& a, const auto& b) {
         return no_go_.pathAdmissible({a, b}) &&
                !peerBlocksSegment(a - robot_params_.center_offset,
                                   b - robot_params_.center_offset);
       });
+  if (standing_start_scope_depth_ > 0) plan_reverse_edges_[key] = allowed;
+  return allowed;
 }
 
 void PlannerNode::rememberReverseExit() {

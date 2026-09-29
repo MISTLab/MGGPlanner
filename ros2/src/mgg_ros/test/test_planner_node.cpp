@@ -79,6 +79,21 @@ class SlowScanMap : public mgg::OctomapMap {
   }
 };
 
+class CountingBoxMap : public mgg::OctomapMap {
+ public:
+  CountingBoxMap() : mgg::OctomapMap([] {
+    mgg::OctomapConfig config;
+    config.resolution = 0.1;
+    return config;
+  }()) {}
+  mutable int box_queries = 0;
+  mgg::VoxelStatus getBoxStatus(const Eigen::Vector3d& center,
+                                const Eigen::Vector3d& size, bool stop) const override {
+    ++box_queries;
+    return mgg::OctomapMap::getBoxStatus(center, size, stop);
+  }
+};
+
 /// A MOLA planner product, as the mapping worker publishes it, of a level
 /// floor: an occupied 0.2 m voxel layer at z index -1 over [x0, x1) x [y0,
 /// y1) and free voxels above it, and 0.6 m round it, up to 0.8 m. The same layout as
@@ -273,6 +288,24 @@ class PlannerNodeTestPeer {
     std::string note;
     EXPECT_TRUE(node.tryStoredReverseExit(route.front(), note));
     return note;
+  }
+  static CountingBoxMap* countBoxQueries(PlannerNode& node) {
+    auto map = std::make_unique<CountingBoxMap>();
+    auto* result = map.get();
+    node.cloud_map_ = result;
+    node.mola_map_ = nullptr;
+    node.map_ = std::move(map);
+    node.ground_ = std::make_unique<mgg::GroundProjection>(*node.map_, node.planning_params_);
+    return result;
+  }
+  static std::pair<int, int> repeatedReverseQueries(PlannerNode& node, CountingBoxMap& map) {
+    PlannerNode::StandingStartScope plan(node);
+    mgg::GroundProjection ground(*node.map_, node.planning_params_, true);
+    const mgg::StateVec from(2, 0, 0.35, 0), to(0, 0, 0.35, 0);
+    EXPECT_TRUE(node.reverseExitEdge(ground, from, to));
+    const int first = map.box_queries;
+    EXPECT_TRUE(node.reverseExitEdge(ground, from, to));
+    return {first, map.box_queries};
   }
   static std::vector<mgg::FrontierCluster> frontierClusters(PlannerNode& node) {
     const std::lock_guard<std::recursive_mutex> lock(node.planner_mutex_);
@@ -3818,6 +3851,18 @@ TEST_F(PlannerNodeTest, AResampledRouteThatFailsTheTurnCheckIsSentUnshortcut) {
     EXPECT_TRUE(reverted[i].head<3>().isApprox(lattice[i].head<3>()))
         << "pose " << i;
   }
+}
+
+TEST_F(PlannerNodeTest, ReverseEdgeQueriesAreCachedOnlyWithinOnePlan) {
+  auto node = makeNode("reverse_query_cache");
+  auto* map = PlannerNodeTestPeer::countBoxQueries(*node);
+  PlannerNodeTestPeer::observeFloor(*node, -1, 4, -1, 1);
+  const auto first = PlannerNodeTestPeer::repeatedReverseQueries(*node, *map);
+  EXPECT_GT(first.first, 0);
+  EXPECT_EQ(first.first, first.second);
+  const auto second = PlannerNodeTestPeer::repeatedReverseQueries(*node, *map);
+  EXPECT_GT(second.first, first.second);  // no old map/peer result next plan
+  EXPECT_EQ(second.first, second.second);
 }
 
 TEST_F(PlannerNodeTest, SharpTurnFallbackShortcutStillPreservesItsReverseRefuge) {

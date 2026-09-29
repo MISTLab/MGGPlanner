@@ -26,6 +26,7 @@
 #include <cstdint>
 #include <functional>
 #include <limits>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -417,6 +418,10 @@ class PlannerNode : public rclcpp::Node {
   std::optional<mgg::StandingStart> readStandingStart();
   int standing_start_scope_depth_ = 0;
   std::optional<std::optional<mgg::StandingStart>> plan_standing_start_;
+  // Directed geometry, shared by selection and every shortcut trial. Never
+  // reused across requests or map generations; the request pins peers.
+  mutable std::map<std::array<double, 6>, bool> plan_reverse_edges_;
+  mutable std::uint64_t plan_reverse_generation_ = 0;
   bool standingStartGoalAdmissible(const mgg::StateVec& goal);
   /// keyframe_source_->read. A failure is an ERROR, logged at once and then
   /// at most every kKeyframeReadErrorPeriodS until a read succeeds: without
