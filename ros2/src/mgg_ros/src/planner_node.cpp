@@ -2065,6 +2065,18 @@ std::string PlannerNode::completionWithheld() const {
   if (global_frontier_not_routed_) {
     return "the global search found a frontier it could not route to";
   }
+  // Retention's veto on a global route counts only while that target's
+  // exclusion lives: a given-up target is unreachable from here, and a
+  // lapsed one is back in the search (run14 review r3).
+  if (global_target_refused_by_retention_ &&
+      std::any_of(reverse_exit_exclusions_.begin(), reverse_exit_exclusions_.end(),
+                  [this](const ReverseExitExclusion& exclusion) {
+                    return !exclusion.given_up && reverseExitExclusionActive(exclusion) &&
+                           (exclusion.position - *global_target_refused_by_retention_).norm() <=
+                               reach_distance_ + mgg::kViewpointArrivalSlack;
+                  })) {
+    return "the route to its global frontier was refused a reverse exit";
+  }
   return "";
 }
 
@@ -3898,6 +3910,7 @@ bool PlannerNode::runGlobalPlanner(int target_id, std::string& reason,
   best_path_from_global_graph_ = false;
   global_search_cut_short_ = false;
   global_frontier_not_routed_ = false;
+  global_target_refused_by_retention_.reset();
   global_route_at_target_ = false;
   last_route_blocked_by_peer_ = false;
   if (global_graph_->getNumVertices() <= 1) {
@@ -3914,7 +3927,7 @@ bool PlannerNode::runGlobalPlanner(int target_id, std::string& reason,
   if (target_id >= 0) {
     const auto* target = findGlobalVertex(target_id);
     if (target && reverseExitEndpointExcluded(target->state)) {
-      global_frontier_not_routed_ = true;
+      global_target_refused_by_retention_ = target->state.head<3>();
       reason = "target excluded after reverse-exit retention refusal";
       return false;
     }
@@ -4747,6 +4760,9 @@ std::string PlannerNode::rememberReverseExit() {
   if (best_path_from_global_graph_) {
     if (const auto* target = findGlobalVertex(current_global_vertex_id_)) {
       refused_ends.push_back(target->state.head<3>());
+      // A refused global route vetoes completion while its exclusion lives;
+      // a refused local path is no global routing failure.
+      global_target_refused_by_retention_ = target->state.head<3>();
     }
   }
   const std::string given_up = excludeReverseExitEndpoints(refused_ends);
@@ -4764,7 +4780,6 @@ std::string PlannerNode::rememberReverseExit() {
   best_path_.clear();
   best_path_from_global_graph_ = false;
   global_exploration_ongoing_ = false;
-  global_frontier_not_routed_ = true;
   std::string note = "; reverse exit retention refused: " + refusal +
                      "; endpoint excluded for " + std::to_string(kReverseExitExclusionPlans) +
                      " plans (" + std::to_string(reverse_exit_exclusions_.size()) +

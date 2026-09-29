@@ -5576,6 +5576,116 @@ TEST_F(PlannerNodeTest, GivenUpLocalFrontiersAreNotLocalGainRemaining) {
   }
 }
 
+/// An answered, empty fleet award for `node`, which heard robot 2 and is
+/// the auctioneer: settleIdleRobot's completion branch is reached.
+void awardNothing(PlannerNode& node) {
+  PlannerNodeTestPeer::hearPeer(node, 2);
+  bool complete = false;
+  std::string note;
+  ASSERT_TRUE(PlannerNodeTestPeer::settleIdle(node, note, complete));
+  const double now = node.now().seconds();
+  PlannerNodeTestPeer::fleetTick(node, now);
+  PlannerNodeTestPeer::fleetTick(node, now + 1.1);
+  ASSERT_TRUE(PlannerNodeTestPeer::fleetHasAward(node));
+}
+
+/// The fleet's award leaves the robot nothing: complete, after the plan
+/// request's final safety guard?
+bool fleetCompletes(PlannerNode& node, std::string& note) {
+  PlannerNodeTestPeer::localGainRemains(node, false);  // held apart (round 4)
+  bool complete = false;
+  note.clear();
+  EXPECT_TRUE(PlannerNodeTestPeer::settleIdle(node, note, complete));
+  PlannerNodeTestPeer::enforceSafeCompletion(node, complete);
+  return complete;
+}
+
+// mgg-run14 review r3: a refused local path is no global routing failure.
+// Real retention refusals of a local end, given up at the third, must let
+// an answered empty fleet award complete the robot.
+TEST_F(PlannerNodeTest, AFleetRobotCompletesOnceItsRefusedLocalEndIsGivenUp) {
+  const std::vector<std::array<double, 4>> corridor{{0.8, 7, 0.4, 0.6}, {0.8, 7, -0.6, -0.4}};
+  auto blocked_walls = corridor;
+  blocked_walls.push_back({1.0, 1.2, -2, 2});
+  MolaFloorProduct clear(-2, 7, -2, 2, corridor);
+  MolaFloorProduct blocked(-2, 7, -2, 2, blocked_walls);
+  auto node = makeNode("fleet_local_given_up");
+  PlannerNodeTestPeer::setRobotFootprint(*node, 1.0, 0.3);
+  PlannerNodeTestPeer::setLattice(*node, {0, 0}, {5.5, 0});
+  PlannerNodeTestPeer::useMolaMap(*node, clear.serve());
+  PlannerNodeTestPeer::acceptOdometryFacing(*node, 0, 0, 0, 1);
+  awardNothing(*node);
+  PlannerNodeTestPeer::buildLocalGraph(*node);
+  const Eigen::Vector3d end = PlannerNodeTestPeer::bestPath(*node).back().head<3>();
+  for (int refusal = 1; refusal <= 3; ++refusal) {
+    SCOPED_TRACE(refusal);
+    PlannerNodeTestPeer::useMolaMap(*node, clear.serve());
+    PlannerNodeTestPeer::buildLocalGraph(*node);
+    const auto path = PlannerNodeTestPeer::bestPath(*node);
+    ASSERT_FALSE(path.empty());
+    ASSERT_LE((path.back().head<3>() - end).norm(), 0.35);
+    PlannerNodeTestPeer::useMolaMap(*node, blocked.serve());
+    ASSERT_NE(PlannerNodeTestPeer::retainBestPath(*node).find("retention refused"),
+              std::string::npos);
+    ASSERT_TRUE(PlannerNodeTestPeer::bestPath(*node).empty());
+    EXPECT_FALSE(PlannerNodeTestPeer::globalFrontierNotRouted(*node));
+    std::string note;
+    // A live exclusion withholds completion; a given-up one does not.
+    EXPECT_EQ(fleetCompletes(*node, note), refusal == 3) << note;
+    PlannerNodeTestPeer::advancePlanRequests(*node, 11);
+  }
+}
+
+// mgg-run14 review r3: a refused global route withholds completion while
+// its target's exclusion lives, and no longer once it is given up; in the
+// fleet's settling and for a single robot alike.
+TEST_F(PlannerNodeTest, AGivenUpGlobalRouteNoLongerWithholdsCompletion) {
+  for (const bool fleet : {true, false}) {
+    SCOPED_TRACE(fleet);
+    auto node = makeNode(fleet ? "fleet_global_given_up" : "solo_global_given_up");
+    PlannerNodeTestPeer::gainFromUnknownVoxelsOnly(*node);
+    PlannerNodeTestPeer::setRobotFootprint(*node, 0.6, 0.2);
+    PlannerNodeTestPeer::observeFloor(*node, -2, 5.55, -2, 2);
+    PlannerNodeTestPeer::observeWall(*node, 0.8, 5.55, 0.25);
+    PlannerNodeTestPeer::observeWall(*node, 0.8, 5.55, -0.25);
+    PlannerNodeTestPeer::acceptOdometry(*node, 0.0, 0.0, 1.0);
+    const int frontier = PlannerNodeTestPeer::addGlobalChainToFrontier(
+        *node, {{0.5, 0}, {1, 0}, {1.5, 0}, {2, 0}, {2.5, 0}, {3, 0},
+                {3.5, 0}, {4, 0}, {4.5, 0}, {5, 0}}, 0);
+    PlannerNodeTestPeer::setLattice(*node, {-0.5, -0.5}, {0.5, 0.5});
+    PlannerNodeTestPeer::consultGlobalPlannerAtOnce(*node);
+    if (fleet) awardNothing(*node);
+    for (int refusal = 1; refusal <= 3; ++refusal) {
+      SCOPED_TRACE(refusal);
+      std::string reason;
+      ASSERT_TRUE(PlannerNodeTestPeer::runGlobalPlanner(*node, reason, frontier)) << reason;
+      // Seen blocked between the route's checks and retention, then free.
+      PlannerNodeTestPeer::observeWallAlongY(*node, -0.25, 0.25, 1.5);
+      ASSERT_NE(PlannerNodeTestPeer::retainBestPath(*node).find("retention refused"),
+                std::string::npos);
+      PlannerNodeTestPeer::observeFreeBox(*node, {1.5, 0, 0.35}, {0.2, 0.38, 0.6});
+      if (fleet) {
+        std::string note;
+        EXPECT_EQ(fleetCompletes(*node, note), refusal == 3) << note;
+        if (refusal < 3) {
+          EXPECT_NE(note.find("reverse exit"), std::string::npos) << note;
+        }
+      }
+      PlannerNodeTestPeer::advancePlanRequests(*node, 11);
+    }
+    if (!fleet) {
+      int status = 0;
+      for (int request = 0; request < 3 && status != PlannerNode::kStatusComplete; ++request) {
+        auto response = std::make_shared<mgg_msgs::srv::PlannerSrv::Response>();
+        PlannerNodeTestPeer::plan(*node, response);
+        EXPECT_TRUE(response->path.empty());
+        status = response->status;
+      }
+      EXPECT_EQ(status, PlannerNode::kStatusComplete);
+    }
+  }
+}
+
 TEST_F(PlannerNodeTest, NearEightDegreeRefugeUsesTheSameSlopeForCutbackAndRetention) {
   auto node = makeNode("one_refuge_predicate");
   PlannerNodeTestPeer::setRobotFootprint(*node, 1.0, 0.3);

@@ -645,6 +645,10 @@ class PlannerNode : public rclcpp::Node {
   /// The last global search found a frontier, or resumed one, and routing
   /// to it failed (runGlobalPlanner).
   bool global_frontier_not_routed_ = false;
+  /// The global target whose route reverse-exit retention refused, kept
+  /// apart from routing failures: it withholds completion only while a
+  /// live, not-given-up exclusion covers it (completionWithheld).
+  std::optional<Eigen::Vector3d> global_target_refused_by_retention_;
   /// The last global route failed its final progress check while the
   /// robot was already within reach_distance of the requested frontier.
   bool global_route_at_target_ = false;
