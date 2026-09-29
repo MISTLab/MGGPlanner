@@ -5088,6 +5088,22 @@ void PlannerNode::onObjectiveRequest(
     response->reason = reason;
     return;
   }
+  if (storedReverseExitApplies(current_state_) &&
+      last_route_starts_with_turn_without_room_) {
+    mgg::StateVec start = current_state_;
+    if (!projectToDrivingHeight(start)) start = physicalAnchorAtDrivingHeight(current_state_);
+    std::string exit_note;
+    if (tryStoredReverseExit(start, exit_note) && !best_path_.empty()) {
+      response->status = Service::Response::SUCCEEDED;
+      response->reason = "revalidated reverse exit to refuge; request the objective again from there";
+      route_note = response->reason;
+      for (const auto& pose : best_path_) response->path.push_back(toPoseMsg(pose));
+    } else {
+      response->status = Service::Response::BLOCKED;
+      response->reason = "objective requires a reverse exit" + exit_note;
+    }
+    return;  // keep the remaining escape; never command an in-place turn
+  }
   shortcutAndResample(route, turns_ok);
   if (!route.empty() && !standingStartGoalAdmissible(route.back())) {
     response->status = Service::Response::UNREACHABLE;

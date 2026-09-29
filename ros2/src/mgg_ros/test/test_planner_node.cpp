@@ -4299,6 +4299,46 @@ TEST_F(PlannerNodeTest, InterruptedEntryAndRetreatKeepARevalidatedWayToTheRefuge
   }
 }
 
+TEST_F(PlannerNodeTest, ReturnHomeFromANarrowEndpointUsesAndKeepsTheReverseCorridor) {
+  using Service = mgg_msgs::srv::PlanObjective;
+  for (const bool peer : {false, true}) {
+    MolaFloorProduct map(-2, 7, -2, 2,
+        {{{0.8, 7, 0.4, 0.6}}, {{0.8, 7, -0.6, -0.4}}});
+    auto node = makeNode("objective_reverse_exit");
+    PlannerNodeTestPeer::useMolaMap(*node, map.serve());
+    PlannerNodeTestPeer::serveMap(*node, "component:test", 1);
+    PlannerNodeTestPeer::setRobotFootprint(*node, 1.0, 0.3);
+    PlannerNodeTestPeer::setLattice(*node, {0, 0}, {5.5, 0});
+    PlannerNodeTestPeer::acceptOdometryFacing(*node, 0, 0, 0, 1);
+    auto entry = std::make_shared<mgg_msgs::srv::PlannerSrv::Response>();
+    PlannerNodeTestPeer::plan(*node, entry);
+    ASSERT_GE(entry->path.size(), 2u);
+    ASSERT_GT(entry->path.back().position.x, 4.0);
+    PlannerNodeTestPeer::acceptOdometryFacing(*node, entry->path.back().position.x, 0, 0, 2);
+    if (peer) PlannerNodeTestPeer::receivePeerBodies(*node, {{2, 0}});
+    auto request = std::make_shared<Service::Request>();
+    request->component_id = "component:test";
+    request->map_epoch = 1;
+    request->objective = Service::Request::RETURN_HOME;
+    request->goal.position.x = std::nan("");
+    request->goal.position.y = std::nan("");
+    request->goal.orientation.w = 1;
+    auto response = std::make_shared<Service::Response>();
+    PlannerNodeTestPeer::objective(*node, request, response);
+    EXPECT_GT(PlannerNodeTestPeer::storedReversePoses(*node), 1u);
+    if (peer) {
+      EXPECT_EQ(response->status, Service::Response::BLOCKED) << response->reason;
+      EXPECT_TRUE(response->path.empty());
+    } else {
+      ASSERT_EQ(response->status, Service::Response::SUCCEEDED) << response->reason;
+      ASSERT_GE(response->path.size(), 2u);
+      EXPECT_LT(response->path.back().position.x, 0.8);
+      for (const auto& pose : response->path) EXPECT_NEAR(pose.orientation.z, 0, 1e-6);
+      EXPECT_NE(response->reason.find("reverse exit"), std::string::npos) << response->reason;
+    }
+  }
+}
+
 TEST_F(PlannerNodeTest, LongNarrowCorridorAdmitsAnEndpointWithAValidatedReverseExit) {
   auto node = makeNode("long_reverse_exit");
   PlannerNodeTestPeer::setRobotFootprint(*node, 0.6, 0.2);
