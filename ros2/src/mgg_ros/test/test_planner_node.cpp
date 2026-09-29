@@ -4334,8 +4334,9 @@ TEST_F(PlannerNodeTest, ReturnHomeFromANarrowEndpointUsesAndKeepsTheReverseCorri
     request->component_id = "component:test";
     request->map_epoch = 1;
     request->objective = Service::Request::RETURN_HOME;
-    request->goal.position.x = std::nan("");
-    request->goal.position.y = std::nan("");
+    request->goal.position.x = -0.8;
+    request->goal.position.y = 0;
+    request->goal.position.z = entry->path.front().position.z;
     request->goal.orientation.w = 1;
     auto response = std::make_shared<Service::Response>();
     PlannerNodeTestPeer::objective(*node, request, response);
@@ -4344,11 +4345,23 @@ TEST_F(PlannerNodeTest, ReturnHomeFromANarrowEndpointUsesAndKeepsTheReverseCorri
       EXPECT_EQ(response->status, Service::Response::BLOCKED) << response->reason;
       EXPECT_TRUE(response->path.empty());
     } else {
-      ASSERT_EQ(response->status, Service::Response::SUCCEEDED) << response->reason;
+      ASSERT_EQ(response->status, Service::Response::DEPARTURE_FIRST) << response->reason;
       ASSERT_GE(response->path.size(), 2u);
       EXPECT_LT(response->path.back().position.x, 0.8);
       for (const auto& pose : response->path) EXPECT_NEAR(pose.orientation.z, 0, 1e-6);
-      EXPECT_NE(response->reason.find("reverse exit"), std::string::npos) << response->reason;
+      EXPECT_FALSE(response->reason.empty());
+      EXPECT_EQ(response->component_id, request->component_id);
+      EXPECT_EQ(response->map_epoch, request->map_epoch);
+      const auto refuge = response->path.back().position;
+      EXPECT_GT(std::abs(refuge.x - request->goal.position.x), 0.001);
+      PlannerNodeTestPeer::acceptOdometryFacing(*node, refuge.x, refuge.y, 0, 3);
+      response = std::make_shared<Service::Response>();
+      PlannerNodeTestPeer::objective(*node, request, response);
+      ASSERT_EQ(response->status, Service::Response::SUCCEEDED) << response->reason;
+      ASSERT_FALSE(response->path.empty());
+      EXPECT_NEAR(response->path.back().position.x, request->goal.position.x, 0.001);
+      EXPECT_NEAR(response->path.back().position.y, request->goal.position.y, 0.001);
+      EXPECT_NEAR(response->path.back().position.z, request->goal.position.z, 0.001);
     }
   }
 }

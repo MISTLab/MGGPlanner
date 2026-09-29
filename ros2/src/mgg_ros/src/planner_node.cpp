@@ -5133,7 +5133,7 @@ void PlannerNode::onObjectiveRequest(
     if (!projectToDrivingHeight(start)) start = physicalAnchorAtDrivingHeight(current_state_);
     std::string exit_note;
     if (tryStoredReverseExit(start, exit_note) && !best_path_.empty()) {
-      response->status = Service::Response::SUCCEEDED;
+      response->status = Service::Response::DEPARTURE_FIRST;
       response->reason = "revalidated reverse exit to refuge; request the objective again from there";
       route_note = response->reason;
       for (const auto& pose : best_path_) response->path.push_back(toPoseMsg(pose));
