@@ -4658,7 +4658,8 @@ bool PlannerNode::storedReverseExitApplies(const mgg::StateVec& pose) const {
 }
 
 bool PlannerNode::tryStoredReverseExit(const mgg::StateVec& start, std::string& note) {
-  if (!storedReverseExitApplies(start)) return false;
+  if (!storedReverseExitApplies(start) ||
+      mgg::roomToTurn(*map_, robot_params_, planning_params_, start, nullptr)) return false;
   best_path_.clear();
   best_path_from_global_graph_ = false;
   global_exploration_ongoing_ = false;

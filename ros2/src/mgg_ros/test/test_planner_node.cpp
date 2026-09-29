@@ -4199,11 +4199,13 @@ TEST_F(PlannerNodeTest, ReverseExitRechecksCurrentPeerDiscsIncludingTheRootEdge)
 }
 
 TEST_F(PlannerNodeTest, ReverseExecutionRechecksCornersAgainstTheCurrentMap) {
-  MolaFloorProduct product(-2, 6, -2, 6, {{{2.6, 2.8, 0.2, 0.4}}});
+  MolaFloorProduct product(-2, 6, -2, 6,
+      {{{2.6, 2.8, 0.2, 0.4}}, {{3.4, 3.6, 2, 4}}});
   auto node = makeNode("reverse_corner_current_map");
   PlannerNodeTestPeer::useMolaMap(*node, product.serve());
   PlannerNodeTestPeer::setRobotFootprint(*node, 1.0, 0.3);
-  // Both axis-aligned sweeps still fit. The newly observed corner obstacle
+  // The endpoint lacks turn room, so its stored escape applies. Both
+  // axis-aligned sweeps still fit. The newly observed corner obstacle
   // prevents the chassis turning between them; edge checks alone miss it.
   const auto note = PlannerNodeTestPeer::executeStoredReverse(*node,
       {{3, 3, 0.2, M_PI_2}, {3, 0, 0.2, 0}, {0, 0, 0.2, 0}});
@@ -4345,6 +4347,31 @@ TEST_F(PlannerNodeTest, ReturnHomeFromANarrowEndpointUsesAndKeepsTheReverseCorri
       for (const auto& pose : response->path) EXPECT_NEAR(pose.orientation.z, 0, 1e-6);
       EXPECT_NE(response->reason.find("reverse exit"), std::string::npos) << response->reason;
     }
+  }
+}
+
+TEST_F(PlannerNodeTest, AnEmptySelectionWithNewTurningRoomDoesNotTryItsStoredExit) {
+  for (const bool peer : {false, true}) {
+    MolaFloorProduct narrow(-2, 7, -2, 2,
+        {{{0.8, 7, 0.4, 0.6}}, {{0.8, 7, -0.6, -0.4}}});
+    auto node = makeNode("new_root_turning_room");
+    PlannerNodeTestPeer::useMolaMap(*node, narrow.serve());
+    PlannerNodeTestPeer::setRobotFootprint(*node, 1.0, 0.3);
+    PlannerNodeTestPeer::setLattice(*node, {0, 0}, {5.5, 0});
+    PlannerNodeTestPeer::acceptOdometryFacing(*node, 0, 0, 0, 1);
+    auto response = std::make_shared<mgg_msgs::srv::PlannerSrv::Response>();
+    PlannerNodeTestPeer::plan(*node, response);
+    ASSERT_GE(response->path.size(), 2u);
+    const double endpoint = response->path.back().position.x;
+    MolaFloorProduct open(-2, 7, -2, 2);
+    PlannerNodeTestPeer::useMolaMap(*node, open.serve());
+    PlannerNodeTestPeer::setLattice(*node, {0, 0}, {0, 0});
+    PlannerNodeTestPeer::acceptOdometryFacing(*node, endpoint, 0, 0, 2);
+    if (peer) PlannerNodeTestPeer::receivePeerBodies(*node, {{2, 0}});
+    const auto summary = PlannerNodeTestPeer::buildLocalGraph(*node);
+    EXPECT_TRUE(PlannerNodeTestPeer::bestPath(*node).empty());
+    EXPECT_EQ(summary.find("stored reverse exit"), std::string::npos) << summary;
+    EXPECT_EQ(PlannerNodeTestPeer::boxedInWithoutDeparture(*node), 0);
   }
 }
 
