@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <stdexcept>
 
 namespace mgg_ros {
 namespace {
@@ -300,6 +301,10 @@ bool loadPlanningParams(const ParamLoader& p, const std::string& ns,
   p.get(ns + "/aerial_viewpoint_clearance_margin",
         out.aerial_viewpoint_clearance_margin);
   p.get(ns + "/departure_reverse_allowed", out.departure_reverse_allowed);
+  p.get(ns + "/reverse_exit_max_length", out.reverse_exit_max_length);
+  if (!std::isfinite(out.reverse_exit_max_length) || out.reverse_exit_max_length < 0.0) {
+    throw std::invalid_argument("reverse_exit_max_length must be finite and nonnegative");
+  }
   p.get(ns + "/min_observed_ground_fraction",
         out.min_observed_ground_fraction);
   p.get(ns + "/relaxed_corridor_multiplier", out.relaxed_corridor_multiplier);

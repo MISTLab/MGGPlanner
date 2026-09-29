@@ -1,6 +1,7 @@
 // Tests for the ROS 2 parameter boundary.
 
 #include <memory>
+#include <limits>
 
 #include <gtest/gtest.h>
 #include <rclcpp/rclcpp.hpp>
@@ -31,6 +32,7 @@ class ParamFixture : public ::testing::Test {
         {"PlanningParams.max_footprint_tilt", 0.3491},
         {"PlanningParams.max_footprint_step", 0.12},
         {"PlanningParams.departure_reverse_allowed", false},
+        {"PlanningParams.reverse_exit_max_length", 7.0},
         {"PlanningParams.min_observed_ground_fraction", 0.6},
         {"PlanningParams.max_footprint_cell_rise", 0.13},
         {"PlanningParams.path_clearance_margin", 0.6},
@@ -107,6 +109,7 @@ TEST_F(ParamFixture, LoadsPlanningParams) {
   EXPECT_DOUBLE_EQ(params.max_footprint_tilt, 0.3491);
   EXPECT_DOUBLE_EQ(params.max_footprint_step, 0.12);
   EXPECT_FALSE(params.departure_reverse_allowed);
+  EXPECT_DOUBLE_EQ(params.reverse_exit_max_length, 7.0);
   EXPECT_DOUBLE_EQ(params.min_observed_ground_fraction, 0.6);
   EXPECT_DOUBLE_EQ(params.max_footprint_cell_rise, 0.13);
   EXPECT_DOUBLE_EQ(params.path_clearance_margin, 0.6);
@@ -184,6 +187,20 @@ TEST(ParamLoader, APlanningSpeedThatIsNotPositiveIsRefused) {
     mgg::PlanningParams params;
     EXPECT_FALSE(mgg_ros::loadPlanningParams(p, "PlanningParams", params))
         << v_max;
+  }
+}
+
+TEST(ParamLoader, ReverseExitLengthMustBeFiniteAndNonnegative) {
+  for (const double length : {-1.0, std::numeric_limits<double>::infinity(),
+                               std::numeric_limits<double>::quiet_NaN()}) {
+    rclcpp::NodeOptions opts;
+    opts.automatically_declare_parameters_from_overrides(true);
+    opts.parameter_overrides({{"PlanningParams.reverse_exit_max_length", length}});
+    auto node = std::make_shared<rclcpp::Node>("reverse_exit_length", opts);
+    ParamLoader loader(node.get());
+    mgg::PlanningParams params;
+    EXPECT_THROW(mgg_ros::loadPlanningParams(loader, "PlanningParams", params),
+                 std::invalid_argument);
   }
 }
 

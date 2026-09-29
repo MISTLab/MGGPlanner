@@ -2961,13 +2961,13 @@ std::string PlannerNode::buildLocalGraph() {
   // place; a path that turns elsewhere is taken only when no other path
   // would be.
   int room_occupied = 0, room_unobserved = 0;
-  const auto room_to_turn = [&](const mgg::StateVec& pose) {
+  const auto room_to_turn = [&](const mgg::StateVec& pose, bool allow_prior = true) {
     if (!mgg::turnClear(*map_, robot_params_, pose)) {
       ++room_occupied;
       return false;
     }
     if (!mgg::turnSpaceObserved(*map_, robot_params_, planning_params_, pose,
-                               standing_on)) {
+                               allow_prior ? standing_on : nullptr)) {
       ++room_unobserved;
       return false;
     }
@@ -2986,6 +2986,18 @@ std::string PlannerNode::buildLocalGraph() {
   // A path end on a slope, which needs no observed turn space, needs room
   // to turn within kDepartureMaxM back along its path (review r0, P1).
   mgg::SlopeEndRetreat slope_end_retreat;
+  // Unlike outward root edges, an escape has no blind-start allowance.
+  mgg::GroundProjection reverse_ground(*map_, planning_params_, true);
+  const auto reverse_edge = [&](const mgg::StateVec& from, const mgg::StateVec& to) {
+    return mgg::reverseExitEdgeAdmissible(*map_, reverse_ground, robot_params_,
+        planning_params_, from, to, [this](const auto& a, const auto& b) {
+          return no_go_.pathAdmissible({a, b}) &&
+                 !peerBlocksSegment(a - robot_params_.center_offset,
+                                    b - robot_params_.center_offset);
+        });
+  };
+  std::map<std::pair<int, int>, bool> reverse_edges;
+
   if (robot_params_.type == mgg::RobotType::kGroundRobot) {
     turns_admissible = std::ref(turn_check);
     sharp_turn_allowed = [&turn_check](const mgg::Vertex& v) {
@@ -2999,8 +3011,16 @@ std::string PlannerNode::buildLocalGraph() {
              !mgg::turnSpaceObserved(*map_, robot_params_, planning_params_,
                                      v.state);
     };
-    slope_end_retreat.room_to_turn = [&room_to_turn](const mgg::Vertex& v) {
-      return room_to_turn(v.state);
+    slope_end_retreat.room_to_turn = [&](const mgg::Vertex& v) {
+      return turn_check.slopeAt(v.state.head<3>()) <= mgg::kLevelGroundSlopeRad &&
+             room_to_turn(v.state, false);
+    };
+    slope_end_retreat.reverse_edge_admissible = [&](const mgg::Vertex& a,
+                                                   const mgg::Vertex& b) {
+      const auto key = std::make_pair(a.id, b.id);
+      const auto found = reverse_edges.find(key);
+      if (found != reverse_edges.end()) return found->second;
+      return reverse_edges[key] = reverse_edge(a.state, b.state);
     };
   }
   // Right after a plan that turned back, the direction penalty is not
@@ -3151,14 +3171,29 @@ std::string PlannerNode::buildLocalGraph() {
     if (best_path_.size() >= 2) addRefPathToGraph(best_path_);
     // The shortcut must not make a turn the chosen path did not have.
     const double start_heading = current_state_[3];
-    shortcutAndResample(
-        best_path_, turns_admissible
-                        ? mgg::PathOkFn([&turn_check, start_heading](
-                                            const mgg::PathType& points) {
-                            return turn_check.admissible(points,
-                                                         start_heading);
-                          })
-                        : mgg::PathOkFn());
+    shortcutAndResample(best_path_, turns_admissible
+        ? mgg::PathOkFn([&](const mgg::PathType& points) {
+            if (!turn_check.admissible(points, start_heading)) return false;
+            // A shortcut must not skip the refuge or replace its validated
+            // reverse corridor. Otherwise shortcutAndResample keeps entry's
+            // original, already-qualified route.
+            std::vector<mgg::StateVec> route;
+            for (const auto& point : points) {
+              route.emplace_back(point.x(), point.y(), point.z(), 0.0);
+            }
+            const auto vertex = [&](std::size_t i) { return mgg::Vertex(-1, route[i]); };
+            const bool found = mgg::cutBackToWayBack(route,
+                [&](std::size_t i) {
+                  return !mgg::viewpointClear(*map_, robot_params_, planning_params_,
+                                              route[i], turn_check.slopeAt(points[i])) ||
+                         slope_end_retreat.admitted_on_slope(vertex(i));
+                },
+                [&](std::size_t i) { return slope_end_retreat.room_to_turn(vertex(i)); },
+                planning_params_.departure_reverse_allowed,
+                [&](std::size_t a, std::size_t b) { return reverse_edge(route[a], route[b]); },
+                planning_params_.reverse_exit_max_length);
+            return found && route.size() == points.size();
+          }) : mgg::PathOkFn());
   }
   // Free cells with no vertices is the characteristic bring-up failure: the
   // lattice is finding space but every candidate is being turned away. The
@@ -3969,13 +4004,20 @@ bool PlannerNode::runGlobalPlanner(int target_id, std::string& reason,
     return false;
   }
   if (!routed) return false;
+  if (!best_path_.empty() && !standingStartGoalAdmissible(best_path_.back())) {
+    best_path_.clear();
+    global_frontier_not_routed_ = true;
+    global_exploration_ongoing_ = false;
+    current_global_vertex_id_ = -1;
+    reason = "the goal intersects the standing-start arrival band";
+    return false;
+  }
   shortcutAndResample(best_path_, turns_ok);
   // A repositioning's end on a slope, where the robot may not turn, needs
   // a way back as a lattice path's does (review r1, R1-3): the route is cut
   // back to its last end with one, or not taken.
   if (robot_params_.type == mgg::RobotType::kGroundRobot &&
       !last_route_starts_with_turn_without_room_ && best_path_.size() >= 2) {
-    const std::optional<mgg::StandingStart> standing = standingStart();
     const double radius =
         std::max(robot_params_.size.x(), robot_params_.size.y());
     // The map's slope at each pose, from nine ground points round it, is
@@ -4004,13 +4046,27 @@ bool PlannerNode::runGlobalPlanner(int target_id, std::string& reason,
                                                    planning_params_,
                                                    best_path_[i]));
     };
+    mgg::GroundProjection reverse_ground(*map_, planning_params_, true);
+    std::map<std::pair<std::size_t, std::size_t>, bool> reverse_edges;
     if (!mgg::cutBackToWayBack(
             best_path_, on_slope,
-            [this, &standing](std::size_t i) {
-              return mgg::roomToTurn(*map_, robot_params_, planning_params_,
-                                     best_path_[i],
-                                     standing ? &*standing : nullptr);
-            }, planning_params_.departure_reverse_allowed)) {
+            [this, radius](std::size_t i) {
+              return mgg::groundSlope(*ground_, best_path_[i].head<3>(), radius,
+                                      local_graph_.get()) <= mgg::kLevelGroundSlopeRad &&
+                     mgg::roomToTurn(*map_, robot_params_, planning_params_, best_path_[i]);
+            }, planning_params_.departure_reverse_allowed,
+            [&](std::size_t a, std::size_t b) {
+              const auto key = std::make_pair(a, b);
+              const auto found = reverse_edges.find(key);
+              if (found != reverse_edges.end()) return found->second;
+              return reverse_edges[key] = mgg::reverseExitEdgeAdmissible(
+                  *map_, reverse_ground, robot_params_, planning_params_, best_path_[a], best_path_[b],
+                  [this](const auto& from, const auto& to) {
+                    return no_go_.pathAdmissible({from, to}) &&
+                           !peerBlocksSegment(from - robot_params_.center_offset,
+                                              to - robot_params_.center_offset);
+                  });
+            }, planning_params_.reverse_exit_max_length)) {
       best_path_.clear();
       global_frontier_not_routed_ = true;
       reason = "the route ends on a slope or in a narrow passage with no way back";

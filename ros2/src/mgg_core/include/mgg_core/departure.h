@@ -74,6 +74,19 @@ VoxelStatus orientedBoxPathStatus(const MapInterface& map,
                                   bool stop_at_unknown_voxel,
                                   const OrientedBox* standing);
 
+/// Validates travel from `from` back to `to`, with the body facing the
+/// opposite direction (the forward entry heading). Uses the forward edge's
+/// oriented sweep and ground predicates, with no root/standing exemptions,
+/// and applies the descent limit to the reverse direction. `ground` must
+/// have no standing-start prior. `segment_admissible` checks current peers
+/// and no-go zones on every projected segment.
+bool reverseExitEdgeAdmissible(
+    const MapInterface& map, const GroundProjection& ground,
+    const RobotParams& robot, const PlanningParams& planning,
+    const StateVec& from, const StateVec& to,
+    const std::function<bool(const Eigen::Vector3d&, const Eigen::Vector3d&)>&
+        segment_admissible = {});
+
 /// A way out for a robot boxed in at a pose.
 struct Departure {
   /// Where the robot stands, at the heading it departs with, then every

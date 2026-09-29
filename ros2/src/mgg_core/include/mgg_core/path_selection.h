@@ -113,17 +113,12 @@ using ViewpointClearFn = std::function<bool(const Vertex&)>;
 /// reservation: e.g. one inside a no-go zone.
 using EndExcludedFn = std::function<bool(const Vertex&)>;
 
-/// How selectBestPath gives a path end on a slope, admitted by viewpointClear
-/// without its turn space observed, a way back (review r0, P1; controller
-/// ruling): such an end is clear only if the path has, within kDepartureMaxM
-/// of path length back from it, a vertex (the root included) where the robot
-/// has room to turn. The robot, which may not turn on the slope, can back
-/// out to there straight, as a boxed-in robot departs, and goes down a ramp
-/// in steps of at most kDepartureMaxM, the lidar of each observing the turn
-/// space the next needs. Both are needed, or no end needs a way back.
-// Also applies to an end that fails viewpoint clearance (a narrow passage).
-// The same predicate governs clear selection, cutbacks, detours and fallback;
-// neither kind of end is admitted without reverse permission and a way back.
+/// A narrow or slope-exempt endpoint needs a refuge back along its own
+/// candidate path: observed room on level ground where it can turn. Reverse
+/// capability is mandatory. With reverse_edge_admissible every edge, including
+/// the forward-only root edge, is explicitly checked in reverse, bounded by
+/// PlanningParams::reverse_exit_max_length. Without that validator the legacy
+/// kDepartureMaxM limit remains. Neither case relaxes the path-turn veto.
 struct SlopeEndRetreat {
   /// Whether viewpoint_clear admits the vertex only because it stands on a
   /// slope (slopeExemptsTurnSpace, and not turnSpaceObserved).
@@ -131,19 +126,28 @@ struct SlopeEndRetreat {
   /// Whether the robot has room to turn in place at a vertex, e.g.
   /// roomToTurn.
   std::function<bool(const Vertex&)> room_to_turn;
+  /// Explicit reverse-direction checks, including the forward-only root
+  /// edge. When present the search uses reverse_exit_max_length; without
+  /// it, the legacy two-metre bound remains (never an unchecked extension).
+  std::function<bool(const Vertex&, const Vertex&)> reverse_edge_admissible;
 };
 
 /// Ends `route` (the robot's pose first) at its last pose with a way back,
 /// dropping the poses after it: a pose that is not `on_slope` has one, and
-/// one that is has one when a pose within kDepartureMaxM of route length
-/// back from it (the first included) has `room_to_turn` (SlopeEndRetreat's
+/// one that is has one when a pose within `max_reverse_length` of route length
+/// back from it (the first included) has `room_to_turn`, with every reverse
+/// edge passing `reverse_edge_admissible` when supplied (SlopeEndRetreat's
 /// rule, for a route of poses: review r1, R1-3). Both are asked by the
 /// pose's index in `route`. Returns false, leaving `route` untouched, when
-/// no pose after the first has one.
+/// no pose after the first has one. Without explicit reverse validation the
+/// bound cannot exceed kDepartureMaxM. Zero uses that legacy bound.
 bool cutBackToWayBack(std::vector<StateVec>& route,
                       const std::function<bool(std::size_t)>& on_slope,
                       const std::function<bool(std::size_t)>& room_to_turn,
-                      bool reverse_allowed = true);
+                      bool reverse_allowed = true,
+                      const std::function<bool(std::size_t, std::size_t)>&
+                          reverse_edge_admissible = {},
+                      double max_reverse_length = 2.0);
 
 /// Ends `route` at its last pose that passes `clear`, dropping the poses
 /// after it; the first pose, where the robot stands, is never asked. Returns
@@ -174,7 +178,7 @@ struct PathSelectionResult {
   int paths_pulled_back = 0;
   int paths_without_clear_viewpoint = 0;
   /// Narrow or slope-exempt path ends refused for having no room to turn
-  /// within kDepartureMaxM back along the path
+  /// within the bounded, validated reverse route
   /// (SlopeEndRetreat), counted once per candidate end.
   int slope_ends_without_way_back = 0;
   /// No admissible path ended clear, so the best fallback was chosen.

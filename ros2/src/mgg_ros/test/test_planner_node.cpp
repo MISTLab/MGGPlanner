@@ -4081,6 +4081,56 @@ TEST_F(PlannerNodeTest, APathGoingNowhereFromWhereTheRobotCannotTurnDepartsInste
   }
 }
 
+TEST_F(PlannerNodeTest, ReverseExitRechecksCurrentPeerDiscsIncludingTheRootEdge) {
+  MolaFloorProduct product(-2, 6, -2, 2);
+  auto map = product.serve();
+  mgg::RobotParams robot;
+  robot.type = mgg::RobotType::kGroundRobot;
+  robot.size = {0.6, 0.2, 0.15};
+  robot.size_extension.setZero();
+  robot.bound_mode = mgg::BoundModeType::kExactBound;
+  mgg::PlanningParams planning;
+  planning.max_ground_height = 0.4;
+  planning.max_step_height = 0.1;
+  planning.max_inclination = 0.5;
+  const mgg::StateVec root(0, 0, 0.3, 0), end(3, 0, 0.3, 0);
+  const auto reverse_ok = [&] {
+    mgg::GroundProjection ground(*map, planning);
+    return mgg::reverseExitEdgeAdmissible(*map, ground, robot, planning, end, root);
+  };
+  ASSERT_TRUE(reverse_ok());
+  map->setTransientDiscs({{1.5, 0}}, 0.6, 60.0);
+  EXPECT_FALSE(reverse_ok());
+  map->setTransientDiscs({{0, 0}}, 0.6, 60.0);
+  EXPECT_FALSE(reverse_ok());  // no root-standing swept-body exception
+  map->setTransientDiscs({}, 0.6, 60.0);
+  EXPECT_TRUE(reverse_ok());
+}
+
+TEST_F(PlannerNodeTest, LongNarrowCorridorAdmitsAnEndpointWithAValidatedReverseExit) {
+  auto node = makeNode("long_reverse_exit");
+  PlannerNodeTestPeer::setRobotFootprint(*node, 0.6, 0.2);
+  PlannerNodeTestPeer::observeFloor(*node, -2, 7, -2, 2);
+  PlannerNodeTestPeer::observeWall(*node, 0.8, 7, 0.25);
+  PlannerNodeTestPeer::observeWall(*node, 0.8, 7, -0.25);
+  PlannerNodeTestPeer::acceptOdometry(*node, 0.0, 0.0, 1.0);
+  const int frontier = PlannerNodeTestPeer::addGlobalChainToFrontier(
+      *node, {{0.5, 0}, {1, 0}, {1.5, 0}, {2, 0}, {2.5, 0}, {3, 0},
+              {3.5, 0}, {4, 0}, {4.5, 0}, {5, 0}, {5.5, 0}}, 0);
+  std::string reason;
+  ASSERT_TRUE(PlannerNodeTestPeer::runGlobalPlanner(*node, reason, frontier)) << reason;
+  const auto path = PlannerNodeTestPeer::bestPath(*node);
+  ASSERT_GE(path.size(), 2u);
+  EXPECT_NEAR(path.back().x(), 5.5, 0.1);
+  // The local selector and its shortcut/resampling guard use the same
+  // reverse validation, not just the global cutback path above.
+  PlannerNodeTestPeer::setLattice(*node, {0, 0}, {5.5, 0});
+  const auto summary = PlannerNodeTestPeer::buildLocalGraph(*node);
+  const auto local = PlannerNodeTestPeer::bestPath(*node);
+  ASSERT_GE(local.size(), 2u) << summary;
+  EXPECT_NEAR(local.back().x(), 5.5, 0.1) << summary;
+}
+
 TEST_F(PlannerNodeTest, ABunkerAtAnExploredRoomEntersACorridorTooNarrowToEndIn) {
   // Review r0, I-3: a Bunker (1.023 x 0.778 m) in an explored room, 1 m from
   // the mouth of a corridor 1.3 m wide and 6 m long (walls at y = +-0.65
@@ -4299,6 +4349,9 @@ TEST_F(PlannerNodeTest, AStandingStartInItsLidarsBlindDiskIsNotBoxedIn) {
     // band; a short intermediate stop in that disk is no longer admissible.
     PlannerNodeTestPeer::setLattice(*node, {-3, -1}, {3, 1});
     PlannerNodeTestPeer::observeRaisedRing(*node, 0.6, 3.5, 0.0);
+    // Fully observed refuge beyond the blind patch, including its body
+    // columns; the old float-stepped ring leaves gaps in those columns.
+    PlannerNodeTestPeer::observeFloor(*node, -1.55, 1.55, -3.55, -0.65);
     PlannerNodeTestPeer::observeWall(*node, -1.0, 1.0, 0.8);
     PlannerNodeTestPeer::observeWallAlongY(*node, 0.2, 0.8, 0.4);
     PlannerNodeTestPeer::observeWallAlongY(*node, 0.2, 0.8, -0.4);
@@ -5016,6 +5069,7 @@ TEST_F(PlannerNodeTest, Run12ShortFirstTourGoalDoesNotStopInsideTheBlindArrivalB
   auto node = makeNode("run12_short_first_goal");
   PlannerNodeTestPeer::allowUnknownLatticeBody(*node);
   PlannerNodeTestPeer::observeRaisedRing(*node, 1.0, 4.0, 0.0);
+  PlannerNodeTestPeer::observeFloor(*node, 1.05, 4.05, -2.05, 2.05);
   PlannerNodeTestPeer::setHangingRootReach(*node, 1.2);
   PlannerNodeTestPeer::setReachDistance(*node, 0.25);
   PlannerNodeTestPeer::serveMap(*node, "component:test", 0);

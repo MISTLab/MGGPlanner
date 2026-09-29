@@ -286,6 +286,11 @@ struct PlanningParams {
   /// controllers drive backwards (DWB min_vel_x below zero). Not an
   /// upstream parameter.
   bool departure_reverse_allowed = true;
+  /// Maximum metres backed along a candidate's own route to observed, level
+  /// turn room. Every reverse edge is validated at plan time, including the
+  /// root edge. Six metres covers a short tunnel without promising a long
+  /// blind retreat. Zero disables the longer exit (legacy 2 m still checked).
+  double reverse_exit_max_length = 6.0;
   /// A ground robot never drives or turns onto space it has not observed
   /// (operator decision after run 5, 2026-09-25). At every pose of an edge
   /// (GroundProjection::getProjectedEdgeStatus), at least this fraction of

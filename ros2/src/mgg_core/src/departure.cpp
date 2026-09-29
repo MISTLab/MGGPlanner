@@ -144,6 +144,44 @@ VoxelStatus orientedBoxPathStatus(const MapInterface& map,
   return unknown ? VoxelStatus::kUnknown : VoxelStatus::kFree;
 }
 
+bool reverseExitEdgeAdmissible(
+    const MapInterface& map, const GroundProjection& ground,
+    const RobotParams& robot, const PlanningParams& planning,
+    const StateVec& from, const StateVec& to,
+    const std::function<bool(const Eigen::Vector3d&, const Eigen::Vector3d&)>&
+        segment_admissible) {
+  if (!planning.departure_reverse_allowed || ground.standingStart() ||
+      robot.type != RobotType::kGroundRobot) return false;
+  const Eigen::Vector3d delta = to.head<3>() - from.head<3>();
+  if (delta.z() < -std::max(map.getResolution(), planning.max_step_height) &&
+      std::atan2(-delta.z(), delta.head<2>().norm()) > planning.max_negative_inclination) {
+    return false;
+  }
+  OrientedBox body;
+  // Signed motion is backwards: chassis heading stays that of entry.
+  body.heading = std::atan2(from.y() - to.y(), from.x() - to.x());
+  body.size = robot.getPlanningSize();
+  EdgeBodyCheck check;
+  check.sweep = [&](const Eigen::Vector3d& a, const Eigen::Vector3d& b) {
+    return orientedBoxPathStatus(map, a, b, body, false, nullptr);
+  };
+  std::vector<Eigen::Vector3d> projected;
+  if (ground.getProjectedEdgeStatus(
+          from.head<3>() + robot.center_offset, to.head<3>() + robot.center_offset,
+          body.size, false, projected, false, false, &check,
+          EdgeTravel::kForward) != ProjectedEdgeStatus::kAdmissible) return false;
+  for (std::size_t i = 1; i < projected.size(); ++i) {
+    const Eigen::Vector3d delta = projected[i] - projected[i - 1];
+    if (delta.z() < -planning.max_step_height - 1e-6 &&
+        std::atan2(-delta.z(), delta.head<2>().norm()) >
+            planning.max_negative_inclination) return false;
+    if (segment_admissible && !segment_admissible(projected[i - 1], projected[i])) {
+      return false;
+    }
+  }
+  return true;
+}
+
 bool findDeparture(const MapInterface& map, const GroundProjection& ground,
                    const RobotParams& robot, const PlanningParams& planning,
                    const StateVec& start, Departure& departure,

@@ -256,6 +256,10 @@
       # turns only where it may, drives straight out ahead or, with this,
       # straight back, until it has room. Nav2's DWB reverses (min_vel_x < 0).
       departure_reverse_allowed: true
+      # Bounded reverse exit along the candidate route to observed, level
+      # turn room. Every edge is rechecked in reverse, including the root.
+      # Set departure_reverse_allowed false for non-reversing platforms.
+      reverse_exit_max_length: 6.0
       # A ground robot never drives or turns onto unobserved space: at every
       # pose of an edge this fraction of the cells under the leading half of
       # its footprint, and where it turns in place of its turning circle, must

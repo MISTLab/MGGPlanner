@@ -94,7 +94,9 @@ void TurnBackHysteresis::record(const std::vector<Eigen::Vector3d>& path,
 bool cutBackToWayBack(std::vector<StateVec>& route,
                       const std::function<bool(std::size_t)>& on_slope,
                       const std::function<bool(std::size_t)>& room_to_turn,
-                      bool reverse_allowed) {
+                      bool reverse_allowed,
+                      const std::function<bool(std::size_t, std::size_t)>& reverse_edge_admissible,
+                      double max_reverse_length) {
   if (route.size() < 2) return false;
   std::vector<double> along(route.size(), 0.0);
   for (std::size_t i = 1; i < route.size(); ++i) {
@@ -109,7 +111,10 @@ bool cutBackToWayBack(std::vector<StateVec>& route,
   for (std::size_t end = route.size() - 1; end > 0; --end) {
     bool way_back = !on_slope(end);
     for (std::size_t i = end; reverse_allowed && !way_back && i-- > 0;) {
-      if (along[end] - along[i] > kDepartureMaxM + 1e-9) break;
+      const double limit = reverse_edge_admissible
+          ? (max_reverse_length > 0.0 ? max_reverse_length : kDepartureMaxM) : kDepartureMaxM;
+      if (along[end] - along[i] > limit + 1e-9) break;
+      if (reverse_edge_admissible && !reverse_edge_admissible(i + 1, i)) break;
       way_back = room_at(i);
     }
     if (way_back) {
@@ -156,8 +161,9 @@ PathSelectionResult selectBestPath(GraphManager& graph,
     return by_id[v->id] = ask(*v);
   };
   // Whether path[end] may end the path: a narrow or slope-exempt end
-  // needs room to turn within kDepartureMaxM back along it. A refusal
-  // counts in `refused`, when given.
+  // needs a reverse way back to turn room. Extending beyond the old two
+  // metres requires explicit reverse-edge validation. A refusal counts in
+  // `refused`, when given.
   const auto way_back = [&](const std::vector<Vertex*>& path,
                             std::size_t end, int* refused) {
     if (!retreat_checked) return true;
@@ -171,7 +177,11 @@ PathSelectionResult selectBestPath(GraphManager& graph,
       // Routing weights include soft clearance; retreat reach is metres.
       retreat_distance += (path[i + 1]->state.head<3>() -
                            path[i]->state.head<3>()).norm();
-      if (retreat_distance > kDepartureMaxM + 1e-9) break;
+      const double limit = slope_end_retreat.reverse_edge_admissible
+          ? (planning.reverse_exit_max_length > 0.0 ? planning.reverse_exit_max_length : kDepartureMaxM) : kDepartureMaxM;
+      if (retreat_distance > limit + 1e-9) break;
+      if (slope_end_retreat.reverse_edge_admissible &&
+          !slope_end_retreat.reverse_edge_admissible(*path[i + 1], *path[i])) break;
       if (cached(room_by_id, path[i], slope_end_retreat.room_to_turn)) {
         return true;
       }
