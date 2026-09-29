@@ -457,12 +457,18 @@ bool PathTurnCheck::roomAt(const Eigen::Vector3d& position) {
 }
 
 PathTurnCheck::Refusal PathTurnCheck::firstRefusal(
-    const std::vector<Eigen::Vector3d>& points, double start_heading) {
+    const std::vector<Eigen::Vector3d>& points, double start_heading, bool record) {
   const std::vector<double> turns = pathTurns(points, start_heading, window_);
   for (std::size_t i = 0; i < turns.size(); ++i) {
     if (turns[i] <= kSharpTurnRad + 1e-9) continue;
-    if (slopeAt(points[i]) > kLevelGroundSlopeRad) return Refusal::kSlope;
-    if (!roomAt(points[i])) return Refusal::kRoom;
+    const double slope = slopeAt(points[i]);
+    const bool on_slope = slope > kLevelGroundSlopeRad;
+    if (on_slope || !roomAt(points[i])) {
+      if (record && !first_refused_corner) {
+        first_refused_corner = RefusedCorner{points[i], turns[i], slope, on_slope};
+      }
+      return on_slope ? Refusal::kSlope : Refusal::kRoom;
+    }
   }
   return Refusal::kNone;
 }
@@ -481,7 +487,7 @@ bool PathTurnCheck::operator()(const std::vector<Vertex*>& path) {
   std::vector<Eigen::Vector3d> points;
   points.reserve(path.size());
   for (const Vertex* v : path) points.push_back(v->state.head<3>());
-  switch (firstRefusal(points, path.front()->state[3])) {
+  switch (firstRefusal(points, path.front()->state[3], true)) {
     case Refusal::kSlope:
       ++refused_on_slope;
       return false;

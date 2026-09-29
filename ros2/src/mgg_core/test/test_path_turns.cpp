@@ -134,6 +134,25 @@ TEST(TerrainSlope, FailsClosedWhereNoPlaneCanBeFitted) {
   for (Vertex* v : path) delete v;
 }
 
+TEST(PathTurnCheck, RecordsFirstRefusedCornerWithoutChangingTheVeto) {
+  GraphManager graph;
+  Vertex a(0, StateVec(0, 0, 0.5, 0));
+  Vertex b(1, StateVec(0, 1, 0.5, 0));
+  for (const bool sloped : {false, true}) {
+    PathTurnCheck check(graph, robot(), [](const StateVec&) { return false; },
+                        [sloped](const Eigen::Vector3d&) {
+                          return sloped ? 16 * kDeg : 0.0;
+                        });
+    ASSERT_FALSE(check({&a, &b}));
+    ASSERT_TRUE(check.first_refused_corner);
+    EXPECT_TRUE(check.first_refused_corner->position.isApprox(a.state.head<3>()));
+    EXPECT_NEAR(check.first_refused_corner->turn, M_PI_2, 1e-9);
+    EXPECT_EQ(check.first_refused_corner->on_slope, sloped);
+    EXPECT_EQ(check.refused_on_slope, sloped ? 1 : 0);
+    EXPECT_EQ(check.refused_without_room, sloped ? 0 : 1);
+  }
+}
+
 TEST(PathTurnCheck, TheRobotsTiltIsItsSlopeWhereTheLatticeCannotMeasureIt) {
   // Run 6: robot_3 and robot_1 stood where the lattice had no vertex with
   // ground within a robot's length, and every path turning there was

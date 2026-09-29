@@ -1670,6 +1670,10 @@ TEST_F(PlannerNodeTest, ASlopeWithNoRoomToTurnOnTheDefaultLatticeGetsNoPathNotCo
   const mgg::StateVec root =
       PlannerNodeTestPeer::drivingState(*node, 0.0, 0.0, 0.0);
   ASSERT_FALSE(PlannerNodeTestPeer::roomToTurnObserved(*node, root));
+  const auto diagnostic = PlannerNodeTestPeer::buildLocalGraph(*node);
+  EXPECT_NE(diagnostic.find("first refused corner"), std::string::npos)
+      << diagnostic;
+
   auto response = std::make_shared<mgg_msgs::srv::PlannerSrv::Response>();
   PlannerNodeTestPeer::plan(*node, response);
   EXPECT_TRUE(response->path.empty())
@@ -4336,6 +4340,19 @@ TEST_F(PlannerNodeTest, AStandingStartInItsLidarsBlindDiskIsNotBoxedIn) {
   EXPECT_EQ(PlannerNodeTestPeer::boxedInWithoutDeparture(*moved), 1);
 }
 
+TEST_F(PlannerNodeTest, SparseLatticeReportsRejectionsAndExpiredStandingStart) {
+  auto node = makeNode("sparse_rejection_report");
+  PlannerNodeTestPeer::observeFloor(*node, -2, 4, -2, 2);
+  PlannerNodeTestPeer::setLattice(*node, {0, 0}, {1.5, 0});
+  PlannerNodeTestPeer::acceptOdometry(*node, 0.0, 0.0, 1.0);
+  PlannerNodeTestPeer::acceptOdometry(*node, 0.6, 0.0, 2.0);
+  const auto summary = PlannerNodeTestPeer::buildLocalGraph(*node);
+  EXPECT_NE(summary.find("3 vertices"), std::string::npos) << summary;
+  EXPECT_NE(summary.find("(rejected:"), std::string::npos) << summary;
+  EXPECT_NE(summary.find("standing start: expired"), std::string::npos) << summary;
+  EXPECT_NE(summary.find("room refusals:"), std::string::npos) << summary;
+}
+
 TEST_F(PlannerNodeTest, KeyframesItCannotReadAreAnErrorAndLeaveNoStandingStart) {
   // Runs 9 and 10: the planner looked for its keyframes where the bridge
   // never writes them. Every robot stood blind at its start without a
@@ -4366,7 +4383,7 @@ TEST_F(PlannerNodeTest, KeyframesItCannotReadAreAnErrorAndLeaveNoStandingStart) 
   EXPECT_EQ(PlannerNodeTestPeer::keyframeReadErrorsLogged(*node), 1);
 
   // Once the bridge writes it, the robot stands at its start, and the plan
-  // says nothing about it.
+  // reports the active allowance.
   std::ofstream(file)
       << R"({"schema": "swarmdeck.pose-snapshot.v1", "solution": {
         "revision": {"component_id": "component:test", "epoch": 0,
@@ -4377,7 +4394,7 @@ TEST_F(PlannerNodeTest, KeyframesItCannotReadAreAnErrorAndLeaveNoStandingStart) 
                                             [0, 0, 1, 0.075],
                                             [0, 0, 0, 1]]}]}})";
   summary = PlannerNodeTestPeer::buildLocalGraph(*node);
-  EXPECT_EQ(summary.find("standing start"), std::string::npos) << summary;
+  EXPECT_NE(summary.find("standing start: active"), std::string::npos) << summary;
   EXPECT_TRUE(PlannerNodeTestPeer::standingStart(*node).has_value());
   EXPECT_EQ(PlannerNodeTestPeer::keyframeReadErrorsLogged(*node), 1);
   std::filesystem::remove_all(peer);

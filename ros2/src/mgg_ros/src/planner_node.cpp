@@ -2896,9 +2896,11 @@ std::string PlannerNode::buildLocalGraph() {
   const mgg::StandingStart* standing_on = standing ? &*standing : nullptr;
   // A robot that may stand blind at its start, and cannot tell, is told
   // of in every plan (runs 9 and 10).
-  const std::string standing_inactive =
+  const std::string standing_note =
       standing_start_unread_keyframes_.empty()
-          ? std::string()
+          ? (standing ? "; standing start: active"
+                      : left_standing_start_ ? "; standing start: expired"
+                                             : "; standing start: inactive")
           : "; standing start: inactive (no keyframes at " +
                 standing_start_unread_keyframes_ + ")";
 
@@ -2953,12 +2955,20 @@ std::string PlannerNode::buildLocalGraph() {
   // A ground robot turns sharply only on level ground with room to turn in
   // place; a path that turns elsewhere is taken only when no other path
   // would be.
-  mgg::PathTurnCheck turn_check(
-      *local_graph_, robot_params_,
-      [this, standing_on](const mgg::StateVec& pose) {
-        return mgg::roomToTurn(*map_, robot_params_, planning_params_, pose,
-                               standing_on);
-      });
+  int room_occupied = 0, room_unobserved = 0;
+  const auto room_to_turn = [&](const mgg::StateVec& pose) {
+    if (!mgg::turnClear(*map_, robot_params_, pose)) {
+      ++room_occupied;
+      return false;
+    }
+    if (!mgg::turnSpaceObserved(*map_, robot_params_, planning_params_, pose,
+                               standing_on)) {
+      ++room_unobserved;
+      return false;
+    }
+    return true;
+  };
+  mgg::PathTurnCheck turn_check(*local_graph_, robot_params_, room_to_turn);
   turn_check.setRobotTilt(root_state.head<3>(), current_tilt_);
   // Where the lattice is too sparse to fit the ground, the map measures it.
   turn_check.setUnmeasuredSlope([this](const Eigen::Vector3d& position) {
@@ -2984,10 +2994,8 @@ std::string PlannerNode::buildLocalGraph() {
              !mgg::turnSpaceObserved(*map_, robot_params_, planning_params_,
                                      v.state);
     };
-    slope_end_retreat.room_to_turn = [this,
-                                      standing_on](const mgg::Vertex& v) {
-      return mgg::roomToTurn(*map_, robot_params_, planning_params_, v.state,
-                             standing_on);
+    slope_end_retreat.room_to_turn = [&room_to_turn](const mgg::Vertex& v) {
+      return room_to_turn(v.state);
     };
   }
   // Right after a plan that turned back, the direction penalty is not
@@ -3149,7 +3157,7 @@ std::string PlannerNode::buildLocalGraph() {
   // reason breakdown is the only thing that separates a geometry mistake from
   // a genuinely blocked robot, so report it whenever it happens.
   char why[224] = "";
-  if (r.vertices_added == 0 && r.free_cells > 0) {
+  if (r.vertices_added <= 16 && r.free_cells > 0) {
     std::snprintf(why, sizeof(why),
                   " (rejected: %d collision, %d no ground; edges: %d ok, "
                   "%d steep, %d occupied, %d unmapped, %d hanging, %d "
@@ -3219,7 +3227,23 @@ std::string PlannerNode::buildLocalGraph() {
   // (recordSentPath).
   lattice_path_ = is_boxed_in || goes_nowhere ? std::vector<mgg::StateVec>{}
                                                : best_path_;
-  return std::string(buf) + standing_inactive;
+  char room_note[128];
+  std::snprintf(room_note, sizeof(room_note),
+                "; room refusals: %d occupancy, %d missing observation",
+                room_occupied, room_unobserved);
+  std::string corner_note;
+  if (turn_check.first_refused_corner) {
+    const auto& corner = *turn_check.first_refused_corner;
+    char first[192];
+    std::snprintf(first, sizeof(first),
+                  "; first refused corner (%.2f, %.2f, %.2f): %.1f deg turn, "
+                  "%.1f deg slope, %s",
+                  corner.position.x(), corner.position.y(), corner.position.z(),
+                  corner.turn * 180.0 / M_PI, corner.slope * 180.0 / M_PI,
+                  corner.on_slope ? "slope" : "no room");
+    corner_note = first;
+  }
+  return std::string(buf) + standing_note + room_note + corner_note;
 }
 
 std::string PlannerNode::departBoxedIn(const mgg::StateVec& root_state,

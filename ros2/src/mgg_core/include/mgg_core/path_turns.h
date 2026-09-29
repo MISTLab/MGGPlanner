@@ -219,13 +219,21 @@ class PathTurnCheck {
   /// without room to turn.
   int refused_on_slope = 0;
   int refused_without_room = 0;
+  struct RefusedCorner {
+    Eigen::Vector3d position;
+    double turn = 0.0;
+    double slope = 0.0;
+    bool on_slope = false;
+  };
+  /// First refused corner in candidate evaluation order, not search probes.
+  std::optional<RefusedCorner> first_refused_corner;
 
  private:
   enum class Refusal { kNone, kSlope, kRoom };
   using PositionKey = std::array<long long, 3>;
 
   Refusal firstRefusal(const std::vector<Eigen::Vector3d>& points,
-                       double start_heading);
+                       double start_heading, bool record = false);
   bool roomAt(const Eigen::Vector3d& position);
 
   GraphManager& graph_;
