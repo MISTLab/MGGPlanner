@@ -149,6 +149,7 @@ class PlannerNode : public rclcpp::Node {
   bool validateStoredReverseExit(const mgg::StateVec& start,
       std::vector<mgg::StateVec>& path, std::string& note);
   void keepReverseDeparture(const std::vector<mgg::StateVec>& path);
+  void retainEntryPastRefuge(const std::vector<mgg::StateVec>& reverse);
   void beginEndpointSelection();
   bool reverseExitEndpointExcluded(const mgg::StateVec& pose) const;
   bool tryStoredReverseExit(const mgg::StateVec& start, std::string& note);
@@ -156,7 +157,10 @@ class PlannerNode : public rclcpp::Node {
   bool currentPoseNeedsStoredExit() const;
   bool reverseExitShortcutAdmissible(const mgg::PathType& points);
   bool endpointNeedsReverseExit(const mgg::StateVec& pose) const;
-  bool reverseExitRefuge(const mgg::StateVec& pose) const;
+  // Travel order, current/candidate pose first and refuge last. Objective
+  // findDeparture keeps its slope semantics but still needs the room band.
+  bool refugeArrivalBandAdmissible(const std::vector<mgg::StateVec>& path,
+                                    bool require_level = true) const;
   bool reverseExitEdge(const mgg::GroundProjection& ground,
                        const mgg::StateVec& from, const mgg::StateVec& to) const;
   void forgetReverseExitIfOffRoute();
@@ -300,7 +304,8 @@ class PlannerNode : public rclcpp::Node {
   /// A departure for a ground robot boxed in at `start`, at driving height:
   /// mgg::findDeparture on this robot's map. Returns false, with `path`
   /// empty, when there is no way out.
-  bool straightDeparture(const mgg::StateVec& start, mgg::Departure& departure);
+  bool straightDeparture(const mgg::StateVec& start, mgg::Departure& departure,
+                         bool arrival_band = false);
   /// The robot is boxed in at `root_state`, its pose at driving height as
   /// the lattice root takes it: it has no room to turn where it stands, and
   /// `why`, for the log, says why the path it would otherwise be sent

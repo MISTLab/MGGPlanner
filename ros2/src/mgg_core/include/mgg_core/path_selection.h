@@ -114,7 +114,7 @@ using ViewpointClearFn = std::function<bool(const Vertex&)>;
 using EndExcludedFn = std::function<bool(const Vertex&)>;
 
 /// A narrow or slope-exempt endpoint needs a refuge back along its own
-/// candidate path: observed room on level ground where it can turn. Reverse
+/// candidate path: observed room over its arrival band on level ground. Reverse
 /// capability is mandatory. With reverse_edge_admissible every edge, including
 /// the forward-only root edge, is explicitly checked in reverse, bounded by
 /// PlanningParams::reverse_exit_max_length. Without that validator the legacy
@@ -123,9 +123,10 @@ struct SlopeEndRetreat {
   /// Whether viewpoint_clear admits the vertex only because it stands on a
   /// slope (slopeExemptsTurnSpace, and not turnSpaceObserved).
   std::function<bool(const Vertex&)> admitted_on_slope;
-  /// Whether the robot has room to turn in place at a vertex, e.g.
-  /// roomToTurn.
-  std::function<bool(const Vertex&)> room_to_turn;
+  /// Certifies a refuge and its arrival band along this candidate path.
+  /// Indices name the candidate endpoint and the refuge nearer the root.
+  std::function<bool(const std::vector<Vertex*>&, std::size_t, std::size_t)>
+      refuge_admissible;
   /// Explicit reverse-direction checks, including the forward-only root
   /// edge. When present the search uses reverse_exit_max_length; without
   /// it, the legacy two-metre bound remains (never an unchecked extension).
@@ -135,7 +136,7 @@ struct SlopeEndRetreat {
 /// Ends `route` (the robot's pose first) at its last pose with a way back,
 /// dropping the poses after it: a pose that is not `on_slope` has one, and
 /// one that is has one when a pose within `max_reverse_length` of route length
-/// back from it (the first included) has `room_to_turn`, with every reverse
+/// back from it (the first included) passes `refuge_admissible`, with every reverse
 /// edge passing `reverse_edge_admissible` when supplied (SlopeEndRetreat's
 /// rule, for a route of poses: review r1, R1-3). Both are asked by the
 /// pose's index in `route`. Returns false, leaving `route` untouched, when
@@ -143,7 +144,7 @@ struct SlopeEndRetreat {
 /// bound cannot exceed kDepartureMaxM. Zero uses that legacy bound.
 bool cutBackToWayBack(std::vector<StateVec>& route,
                       const std::function<bool(std::size_t)>& on_slope,
-                      const std::function<bool(std::size_t)>& room_to_turn,
+                      const std::function<bool(std::size_t)>& refuge_admissible,
                       bool reverse_allowed = true,
                       const std::function<bool(std::size_t, std::size_t)>&
                           reverse_edge_admissible = {},

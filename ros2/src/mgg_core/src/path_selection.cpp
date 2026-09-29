@@ -93,7 +93,7 @@ void TurnBackHysteresis::record(const std::vector<Eigen::Vector3d>& path,
 
 bool cutBackToWayBack(std::vector<StateVec>& route,
                       const std::function<bool(std::size_t)>& on_slope,
-                      const std::function<bool(std::size_t)>& room_to_turn,
+                      const std::function<bool(std::size_t)>& refuge_admissible,
                       bool reverse_allowed,
                       const std::function<bool(std::size_t, std::size_t)>& reverse_edge_admissible,
                       double max_reverse_length) {
@@ -105,7 +105,7 @@ bool cutBackToWayBack(std::vector<StateVec>& route,
   }
   std::vector<signed char> room(route.size(), -1);
   const auto room_at = [&](std::size_t i) {
-    if (room[i] < 0) room[i] = room_to_turn(i) ? 1 : 0;
+    if (room[i] < 0) room[i] = refuge_admissible(i) ? 1 : 0;
     return room[i] == 1;
   };
   for (std::size_t end = route.size() - 1; end > 0; --end) {
@@ -151,9 +151,8 @@ PathSelectionResult selectBestPath(GraphManager& graph,
   };
   const bool retreat_checked =
       static_cast<bool>(slope_end_retreat.admitted_on_slope) &&
-      static_cast<bool>(slope_end_retreat.room_to_turn);
+      static_cast<bool>(slope_end_retreat.refuge_admissible);
   std::unordered_map<int, bool> on_slope_by_id;
-  std::unordered_map<int, bool> room_by_id;
   const auto cached = [](std::unordered_map<int, bool>& by_id,
                          const Vertex* v, const auto& ask) {
     const auto found = by_id.find(v->id);
@@ -182,7 +181,8 @@ PathSelectionResult selectBestPath(GraphManager& graph,
       if (retreat_distance > limit + 1e-9) break;
       if (slope_end_retreat.reverse_edge_admissible &&
           !slope_end_retreat.reverse_edge_admissible(*path[i + 1], *path[i])) break;
-      if (cached(room_by_id, path[i], slope_end_retreat.room_to_turn)) {
+      // A refuge's band depends on this path, not just the vertex id.
+      if (slope_end_retreat.refuge_admissible(path, end, i)) {
         return true;
       }
     }

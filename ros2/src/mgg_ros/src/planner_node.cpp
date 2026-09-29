@@ -3056,8 +3056,11 @@ std::string PlannerNode::buildLocalGraph() {
              !mgg::turnSpaceObserved(*map_, robot_params_, planning_params_,
                                      v.state);
     };
-    slope_end_retreat.room_to_turn = [&](const mgg::Vertex& v) {
-      return reverseExitRefuge(v.state);
+    slope_end_retreat.refuge_admissible = [this](const auto& path, std::size_t end,
+                                                std::size_t refuge) {
+      std::vector<mgg::StateVec> reverse;
+      for (std::size_t i = end + 1; i-- > refuge;) reverse.push_back(path[i]->state);
+      return refugeArrivalBandAdmissible(reverse);
     };
     slope_end_retreat.reverse_edge_admissible = [&](const mgg::Vertex& a,
                                                    const mgg::Vertex& b) {
@@ -3381,7 +3384,7 @@ std::string PlannerNode::departBoxedIn(const mgg::StateVec& root_state,
 }
 
 bool PlannerNode::straightDeparture(const mgg::StateVec& start,
-                                    mgg::Departure& departure) {
+                                    mgg::Departure& departure, bool arrival_band) {
   StandingStartScope standing_scope(*this);
   mgg::GroundProjection ground(*map_, planning_params_);
   ground.setStandingStart(standingStart());
@@ -3390,12 +3393,13 @@ bool PlannerNode::straightDeparture(const mgg::StateVec& start,
     // outward path ending outside every zone can replace the empty choice.
     int endpoints_without_room = 0;
     const bool found = mgg::findDeparture(*map_, ground, robot_params_, planning_params_,
-        start, departure, [this, &ground, &endpoints_without_room](const auto& path) {
+        start, departure, [this, &ground, &endpoints_without_room, arrival_band](const auto& path) {
           std::vector<Eigen::Vector3d> points;
           for (const auto& pose : path) points.push_back(pose.template head<3>());
           if (!no_go_.pathAdmissible(points)) return false;
           const auto& end = path.back();
           if (!standingStartGoalAdmissible(end)) return false;
+          if (arrival_band) return refugeArrivalBandAdmissible(path, false);
           const double slope = mgg::groundSlope(ground, end.template head<3>(),
               std::max(robot_params_.size.x(), robot_params_.size.y()),
               local_graph_.get());
@@ -3414,7 +3418,9 @@ bool PlannerNode::straightDeparture(const mgg::StateVec& start,
     return found;
   }
   return mgg::findDeparture(*map_, ground, robot_params_, planning_params_,
-                            start, departure, [this, &ground](const auto& path) {
+                            start, departure, [this, &ground, arrival_band](const auto& path) {
+                              if (arrival_band) return standingStartGoalAdmissible(path.back()) &&
+                                  refugeArrivalBandAdmissible(path, false);
                               return standingStartGoalAdmissible(path.back()) &&
                                   mgg::roomToTurn(*map_, robot_params_, planning_params_,
                                                   path.back(), ground.standingStart());
@@ -4109,7 +4115,9 @@ bool PlannerNode::runGlobalPlanner(int target_id, std::string& reason,
     std::map<std::pair<std::size_t, std::size_t>, bool> reverse_edges;
     if (!mgg::cutBackToWayBack(
             best_path_, on_slope,
-            [this](std::size_t i) { return reverseExitRefuge(best_path_[i]); }, planning_params_.departure_reverse_allowed,
+            [this](std::size_t i) {
+              return refugeArrivalBandAdmissible({best_path_.rbegin(), best_path_.rend() - i});
+            }, planning_params_.departure_reverse_allowed,
             [&](std::size_t a, std::size_t b) {
               const auto key = std::make_pair(a, b);
               const auto found = reverse_edges.find(key);
@@ -4553,20 +4561,40 @@ bool PlannerNode::reverseExitShortcutAdmissible(const mgg::PathType& points) {
   mgg::GroundProjection ground(*map_, planning_params_, true);
   const bool found = mgg::cutBackToWayBack(route,
       [&](std::size_t i) { return endpointNeedsReverseExit(route[i]); },
-      [&](std::size_t i) { return reverseExitRefuge(route[i]); },
+      [&](std::size_t i) {
+        return refugeArrivalBandAdmissible({route.rbegin(), route.rend() - i});
+      },
       planning_params_.departure_reverse_allowed,
       [&](std::size_t a, std::size_t b) { return reverseExitEdge(ground, route[a], route[b]); },
       planning_params_.reverse_exit_max_length);
   return found && route.size() == points.size();
 }
 
-bool PlannerNode::reverseExitRefuge(const mgg::StateVec& pose) const {
-  // Selection, cutback, retention and execution use this same map-only fit:
-  // a lower lattice estimate must not certify a refuge retention will refuse.
-  return mgg::groundSlope(*ground_, pose.head<3>(),
-                          std::max(robot_params_.size.x(), robot_params_.size.y())) <=
-             mgg::kLevelGroundSlopeRad &&
-         mgg::roomToTurn(*map_, robot_params_, planning_params_, pose);
+bool PlannerNode::refugeArrivalBandAdmissible(const std::vector<mgg::StateVec>& path,
+                                               bool require_level) const {
+  if (path.size() < 2) return false;
+  // Accepted discretisation: overlapping turn circles at <= 0.1 m arc
+  // steps, including both band ends. This is not a continuous-space proof.
+  constexpr double kArrivalBandStepM = 0.1;
+  const auto room = [&](const mgg::StateVec& pose) {
+    return (!require_level || mgg::groundSlope(*ground_, pose.head<3>(),
+        std::max(robot_params_.size.x(), robot_params_.size.y())) <= mgg::kLevelGroundSlopeRad) &&
+        mgg::roomToTurn(*map_, robot_params_, planning_params_, pose, nullptr);
+  };
+  if (!room(path.back())) return false;
+  double remaining = reach_distance_ + mgg::kViewpointArrivalSlack;
+  for (std::size_t i = path.size() - 1; i > 0 && remaining > 1e-9; --i) {
+    const auto delta = (path[i - 1] - path[i]).eval();
+    const double length = delta.head<3>().norm();
+    if (length < 1e-9) continue;
+    const double checked = std::min(length, remaining);
+    const int steps = std::max(1, static_cast<int>(std::ceil(checked / kArrivalBandStepM)));
+    for (int sample = 1; sample <= steps; ++sample) {
+      if (!room(path[i] + delta * (checked * sample / steps / length))) return false;
+    }
+    remaining -= checked;
+  }
+  return remaining <= 1e-9;  // no extrapolating beyond the known corridor
 }
 
 bool PlannerNode::reverseExitEdge(const mgg::GroundProjection& ground,
@@ -4654,6 +4682,12 @@ std::string PlannerNode::retainReverseExit(const std::vector<mgg::StateVec>& pat
     }
     backtrack.insert(backtrack.end(), stored_reverse_exit_.begin() + nearest + 1,
                      stored_reverse_exit_.end());
+    auto entry_refuge = std::min_element(reverse_exit_entry_path_.begin(), reverse_exit_entry_path_.end(),
+        [&](const auto& a, const auto& b) {
+          return (a.template head<3>() - backtrack.back().head<3>()).squaredNorm() <
+                 (b.template head<3>() - backtrack.back().head<3>()).squaredNorm();
+        });
+    while (entry_refuge != reverse_exit_entry_path_.begin()) backtrack.push_back(*--entry_refuge);
   }
   mgg::GroundProjection ground(*map_, planning_params_, true);
   std::vector<mgg::StateVec> reverse{end};
@@ -4670,8 +4704,8 @@ std::string PlannerNode::retainReverseExit(const std::vector<mgg::StateVec>& pat
     reverse.back()[3] = reverse[reverse.size() - 2][3];
     // While extending, turn room ahead of the current root cannot rescue a
     // cancellation before that opening. Preserve the refuge behind the root.
-    if ((!extending || i >= path.size() - 1) && reverseExitRefuge(to)) {
-      if (extending) reverse_exit_entry_path_.assign(reverse.rbegin(), reverse.rend());
+    if ((!extending || i >= path.size() - 1) && refugeArrivalBandAdmissible(reverse)) {
+      if (extending) retainEntryPastRefuge(reverse);
       else reverse_exit_entry_path_ = path;
       stored_reverse_exit_ = std::move(reverse);
       stored_reverse_retreating_ = false;
@@ -4712,9 +4746,21 @@ bool PlannerNode::currentPoseNeedsStoredExit() const {
       !mgg::roomToTurn(*map_, robot_params_, planning_params_, start, nullptr);
 }
 
+void PlannerNode::retainEntryPastRefuge(const std::vector<mgg::StateVec>& path) {
+  // Keep the entry prefix beyond the refuge for a later band extension, but
+  // discard the outward portion already passed on this retreat.
+  const auto refuge = std::min_element(reverse_exit_entry_path_.begin(), reverse_exit_entry_path_.end(),
+      [&](const auto& a, const auto& b) {
+        return (a.template head<3>() - path.back().head<3>()).squaredNorm() <
+               (b.template head<3>() - path.back().head<3>()).squaredNorm();
+      });
+  reverse_exit_entry_path_.erase(refuge, reverse_exit_entry_path_.end());
+  reverse_exit_entry_path_.insert(reverse_exit_entry_path_.end(), path.rbegin(), path.rend());
+}
+
 void PlannerNode::keepReverseDeparture(const std::vector<mgg::StateVec>& path) {
   stored_reverse_exit_ = path;
-  reverse_exit_entry_path_ = path;
+  retainEntryPastRefuge(path);
   stored_reverse_retreating_ = true;
 }
 
@@ -4760,6 +4806,16 @@ bool PlannerNode::validateStoredReverseExit(const mgg::StateVec& start,
          (start.head<2>() - stored_reverse_exit_[join].head<2>()).norm() < mgg::kDepartureMinM) ++join;
   std::vector<mgg::StateVec> reverse{start};
   reverse.insert(reverse.end(), stored_reverse_exit_.begin() + join, stored_reverse_exit_.end());
+  if (!refugeArrivalBandAdmissible(reverse)) {
+    auto refuge = std::min_element(reverse_exit_entry_path_.begin(), reverse_exit_entry_path_.end(),
+        [&](const auto& a, const auto& b) {
+          return (a.template head<3>() - reverse.back().head<3>()).squaredNorm() <
+                 (b.template head<3>() - reverse.back().head<3>()).squaredNorm();
+        });
+    while (refuge != reverse_exit_entry_path_.begin() && !refugeArrivalBandAdmissible(reverse)) {
+      reverse.push_back(*--refuge);
+    }
+  }
   const double heading = std::atan2(start.y() - reverse[1].y(), start.x() - reverse[1].x());
   const double turn = std::remainder(heading - start[3], 2.0 * M_PI);
   if (std::abs(turn) > mgg::kDepartureMaxTurnRad + 1e-9) return refused("entry heading mismatch");
@@ -4787,7 +4843,7 @@ bool PlannerNode::validateStoredReverseExit(const mgg::StateVec& start,
       return refused("current reverse edge fails terrain, clearance, peer or no-go validation");
     }
   }
-  if (!reverseExitRefuge(reverse.back())) return refused("refuge no longer has observed level turn room");
+  if (!refugeArrivalBandAdmissible(reverse)) return refused("refuge arrival band lacks observed level turn room");
   // Edge sweeps alone do not certify the chassis transition at a corner,
   // especially the new actual-arrival connector. Keep the same sharp-turn
   // veto, with travel heading opposite the entry body heading.
@@ -5213,7 +5269,7 @@ void PlannerNode::onObjectiveRequest(
     } else {
       if (exit_note.empty()) exit_note = "; stored reverse exit unavailable at projected current pose";
       mgg::Departure departure;
-      if (straightDeparture(start, departure)) {
+      if (straightDeparture(start, departure, /*arrival_band=*/true)) {
         response->status = Service::Response::DEPARTURE_FIRST;
         response->reason = std::string("validated departure ") +
             (departure.reverse ? "in reverse" : "ahead") +

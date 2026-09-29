@@ -60,14 +60,15 @@ TEST(ReverseExit, LongNarrowCorridorNeedsExplicitReverseValidationAndRespectsBou
   }
   mgg::SlopeEndRetreat retreat;
   retreat.admitted_on_slope = [](const mgg::Vertex&) { return false; };
-  retreat.room_to_turn = [&](const mgg::Vertex& v) {
+  retreat.refuge_admissible = [&](const auto& path, std::size_t, std::size_t refuge) {
+    const auto& v = *path[refuge];
     return mgg::roomToTurn(map, r, p, v.state);
   };
   const auto clear = [&](const mgg::Vertex& v) {
     return mgg::viewpointClear(map, r, p, v.state, 0.0);
   };
-  ASSERT_TRUE(retreat.room_to_turn(*graph.getVertex(0)));
-  ASSERT_FALSE(retreat.room_to_turn(*graph.getVertex(10)));
+  ASSERT_TRUE(retreat.refuge_admissible({graph.getVertex(0)}, 0, 0));
+  ASSERT_FALSE(retreat.refuge_admissible({graph.getVertex(10)}, 0, 0));
   const auto select = [&] {
     return mgg::selectBestPath(graph, p, r, {}, 0.2, 0, {}, 0, clear,
                                 {}, {}, 0.25, retreat);
@@ -202,7 +203,8 @@ TEST(ReverseExit, SelectionKeepsTheSlopeTurnVetoEvenWithAValidatedExit) {
   }
   mgg::SlopeEndRetreat retreat;
   retreat.admitted_on_slope = [](const mgg::Vertex&) { return true; };
-  retreat.room_to_turn = [&](const mgg::Vertex& v) {
+  retreat.refuge_admissible = [&](const auto& path, std::size_t, std::size_t refuge) {
+    const auto& v = *path[refuge];
     return v.id == 0 && mgg::roomToTurn(map, r, p, v.state);
   };
   int validated = 0;

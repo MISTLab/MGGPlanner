@@ -432,7 +432,7 @@ TEST(PathGoesNowhere, APulledBackPathLeadingToGainIsStillSent) {
   // asked of the fallback.
   mgg::SlopeEndRetreat retreat;
   retreat.admitted_on_slope = [](const Vertex& v) { return v.id == 2; };
-  retreat.room_to_turn = [](const Vertex&) { return false; };
+  retreat.refuge_admissible = [](const auto&, std::size_t, std::size_t) { return false; };
   const auto refused = mgg::selectBestPath(
       graph, makePlanning(), RobotParams(), flat, 0.2, 0.0, {}, 0.0,
       [](const Vertex&) { return true; }, nullptr, nullptr, 0.0, retreat);
@@ -454,7 +454,9 @@ TEST(PathSelection, ANarrowTargetWithAWayBackBeatsAClearPrefix) {
   }
   mgg::SlopeEndRetreat retreat;
   retreat.admitted_on_slope = [](const Vertex&) { return false; };
-  retreat.room_to_turn = [](const Vertex& v) { return v.id <= 1; };
+  retreat.refuge_admissible = [](const auto& path, std::size_t, std::size_t refuge) {
+    return path[refuge]->id <= 1;
+  };
   PlanningParams planning = makePlanning();
   planning.departure_reverse_allowed = true;
   const auto select = [&]() {
@@ -466,7 +468,7 @@ TEST(PathSelection, ANarrowTargetWithAWayBackBeatsAClearPrefix) {
   planning.departure_reverse_allowed = false;
   EXPECT_EQ(select().best_path_id, 1);
   planning.departure_reverse_allowed = true;
-  retreat.room_to_turn = [](const Vertex&) { return false; };
+  retreat.refuge_admissible = [](const auto&, std::size_t, std::size_t) { return false; };
   EXPECT_EQ(select().best_path_id, 1);  // never the narrow end without a way back
 }
 
@@ -475,7 +477,7 @@ TEST(PathSelection, NoRoomAnywhereMeansNoNarrowFallbackPath) {
   f.x_branch.back()->vol_gain.gain = 100.0;
   mgg::SlopeEndRetreat retreat;
   retreat.admitted_on_slope = [](const Vertex&) { return false; };
-  retreat.room_to_turn = [](const Vertex&) { return false; };
+  retreat.refuge_admissible = [](const auto&, std::size_t, std::size_t) { return false; };
   const auto result = mgg::selectBestPath(
       f.graph, makePlanning(), RobotParams(), EdgeInclinations(), 0.2, 0,
       {}, 0, [](const Vertex&) { return false; }, {}, {}, 0, retreat);
@@ -504,7 +506,9 @@ TEST(PathSelection, AFallbackCutBackForItsWayBackNeverEndsInAReservation) {
   };
   mgg::SlopeEndRetreat retreat;
   retreat.admitted_on_slope = [](const Vertex& v) { return v.id == 2; };
-  retreat.room_to_turn = [](const Vertex& v) { return v.id == 0; };
+  retreat.refuge_admissible = [](const auto& path, std::size_t, std::size_t refuge) {
+    return path[refuge]->id == 0;
+  };
   // Unreserved, the cut path ends at the inner vertex with a way back.
   const auto free = mgg::selectBestPath(
       graph, makePlanning(), RobotParams(), flat, 0.2, 0.0, {}, 0.0,
@@ -793,7 +797,9 @@ TEST(PathSelection, ClearanceRoutingCostDoesNotConsumePhysicalRetreatReach) {
   }
   mgg::SlopeEndRetreat retreat;
   retreat.admitted_on_slope = [](const Vertex&) { return false; };
-  retreat.room_to_turn = [](const Vertex& v) { return v.id == 0; };
+  retreat.refuge_admissible = [](const auto& path, std::size_t, std::size_t refuge) {
+    return path[refuge]->id == 0;
+  };
   auto planning = makePlanning();
   planning.departure_reverse_allowed = true;
   const auto selected = mgg::selectBestPath(

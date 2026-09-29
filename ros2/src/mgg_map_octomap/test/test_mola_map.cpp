@@ -2321,7 +2321,8 @@ std::unique_ptr<SparseCrestPlan> planOnSparseCrest(
     return mgg::slopeExemptsTurnSpace(turns.slopeAt(v.state.head<3>())) &&
            !mgg::turnSpaceObserved(map, robot, q, v.state);
   };
-  retreat.room_to_turn = [&](const mgg::Vertex& v) {
+  retreat.refuge_admissible = [&](const auto& path, std::size_t, std::size_t refuge) {
+    const auto& v = *path[refuge];
     return room_anywhere && mgg::roomToTurn(map, robot, q, v.state);
   };
   plan->selection = mgg::selectBestPath(
