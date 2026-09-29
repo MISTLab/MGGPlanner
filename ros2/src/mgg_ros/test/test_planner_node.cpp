@@ -277,6 +277,9 @@ class MolaFloorProduct {
 
 class PlannerNodeTestPeer {
  public:
+  static void enforceSafeCompletion(PlannerNode& node, bool& complete) {
+    node.enforceSafeCompletion(complete);
+  }
   static std::string retainBestPath(PlannerNode& node) { return node.rememberReverseExit(); }
   static void trackMeasuredGround(PlannerNode& node) {
     node.cloud_map_->setTrackMeasuredSurfaceZ(true);
@@ -4716,6 +4719,13 @@ TEST_F(PlannerNodeTest, ATrulyBlindStandingStartExplainsTheRefusalAndNeverComple
   PlannerNodeTestPeer::plan(*node, response);
   EXPECT_TRUE(response->path.empty());
   EXPECT_EQ(response->status, PlannerNode::kStatusNoPath);
+  EXPECT_NE(response->status, PlannerNode::kStatusComplete);
+  // Defence in depth: local_gain_remains_now_ currently prevents the
+  // service from reaching this guard with complete=true. Seed that input
+  // explicitly so removing the final guard is still a regression.
+  bool complete = true;
+  PlannerNodeTestPeer::enforceSafeCompletion(*node, complete);
+  EXPECT_FALSE(complete);
 }
 
 TEST_F(PlannerNodeTest, StandingStartIsReadOncePerDeparturePlanNotPerEndpoint) {

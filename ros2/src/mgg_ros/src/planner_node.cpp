@@ -4522,8 +4522,7 @@ void PlannerNode::onPlanRequest(
   robot_params_.bound_mode = previous;
   refreshNoGoZones();
   recordSentPath();
-  if (best_path_.empty() && (standingStart() || !pending_reverse_exit_exclusions_.empty() ||
-                            !plan_reverse_exit_exclusions_.empty())) complete = false;
+  enforceSafeCompletion(complete);
   response->status = !best_path_.empty()
                          ? mgg_msgs::srv::PlannerSrv::Response::FORWARD
                      : complete ? kStatusComplete
@@ -4542,6 +4541,11 @@ void PlannerNode::onPlanRequest(
     planner_config_state_.last_plan_generation = planner_config_state_.generation;
     publishPlannerConfigState();
   }
+}
+
+void PlannerNode::enforceSafeCompletion(bool& complete) {
+  if (best_path_.empty() && (standingStart() || !pending_reverse_exit_exclusions_.empty() ||
+                            !plan_reverse_exit_exclusions_.empty())) complete = false;
 }
 
 bool PlannerNode::reverseExitRefuge(const mgg::StateVec& pose) const {

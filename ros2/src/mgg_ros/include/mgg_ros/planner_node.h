@@ -141,6 +141,7 @@ class PlannerNode : public rclcpp::Node {
   void readmitQuarantinedNeighbours();
   /// Updates the turn-back hysteresis from the path a plan request sends.
   void recordSentPath();
+  void enforceSafeCompletion(bool& complete);
   std::string rememberReverseExit();
   bool reverseExitEndpointExcluded(const mgg::StateVec& pose) const;
   bool tryStoredReverseExit(const mgg::StateVec& start, std::string& note);
