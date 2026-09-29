@@ -262,6 +262,18 @@ class MolaFloorProduct {
 
 class PlannerNodeTestPeer {
  public:
+  static std::string executeStoredReverse(PlannerNode& node,
+                                           const std::vector<mgg::StateVec>& route) {
+    node.stored_reverse_exit_ = route;
+    node.reverse_exit_entry_path_.assign(route.rbegin(), route.rend());
+    mgg::GroundProjection ground(*node.map_, node.planning_params_, true);
+    for (std::size_t i = 1; i < route.size(); ++i) {
+      EXPECT_TRUE(node.reverseExitEdge(ground, route[i - 1], route[i]));
+    }
+    std::string note;
+    EXPECT_TRUE(node.tryStoredReverseExit(route.front(), note));
+    return note;
+  }
   static std::vector<mgg::FrontierCluster> frontierClusters(PlannerNode& node) {
     const std::lock_guard<std::recursive_mutex> lock(node.planner_mutex_);
     return node.globalFrontierClusters();  // deliberately no caller-side lease
@@ -4105,6 +4117,68 @@ TEST_F(PlannerNodeTest, ReverseExitRechecksCurrentPeerDiscsIncludingTheRootEdge)
   EXPECT_FALSE(reverse_ok());  // no root-standing swept-body exception
   map->setTransientDiscs({}, 0.6, 60.0);
   EXPECT_TRUE(reverse_ok());
+}
+
+TEST_F(PlannerNodeTest, ReverseExecutionRechecksCornersAgainstTheCurrentMap) {
+  MolaFloorProduct product(-2, 6, -2, 6, {{{2.6, 2.8, 0.2, 0.4}}});
+  auto node = makeNode("reverse_corner_current_map");
+  PlannerNodeTestPeer::useMolaMap(*node, product.serve());
+  PlannerNodeTestPeer::setRobotFootprint(*node, 1.0, 0.3);
+  // Both axis-aligned sweeps still fit. The newly observed corner obstacle
+  // prevents the chassis turning between them; edge checks alone miss it.
+  const auto note = PlannerNodeTestPeer::executeStoredReverse(*node,
+      {{3, 3, 0.2, M_PI_2}, {3, 0, 0.2, 0}, {0, 0, 0.2, 0}});
+  EXPECT_TRUE(PlannerNodeTestPeer::bestPath(*node).empty());
+  EXPECT_NE(note.find("corner"), std::string::npos) << note;
+}
+
+TEST_F(PlannerNodeTest, ArrivedNarrowEndpointDrivesItsStoredReverseExitOrFailsClosed) {
+  for (const int obstruction : {0, 1, 2, 3, 4}) {
+    SCOPED_TRACE(obstruction);  // clear, peer, map, leaves entry route, yaw mismatch
+    MolaFloorProduct entry(-2, 7, -2, 2,
+        {{{0.8, 7, 0.4, 0.6}}, {{0.8, 7, -0.6, -0.4}}});
+    auto node = makeNode("stored_reverse_" + std::to_string(obstruction));
+    PlannerNodeTestPeer::useMolaMap(*node, entry.serve());
+    PlannerNodeTestPeer::setRobotFootprint(*node, 1.0, 0.3);
+    PlannerNodeTestPeer::setLattice(*node, {0, 0}, {5.5, 0});
+    PlannerNodeTestPeer::acceptOdometryFacing(*node, 0, 0, 0, 1);
+    auto response = std::make_shared<mgg_msgs::srv::PlannerSrv::Response>();
+    PlannerNodeTestPeer::plan(*node, response);
+    ASSERT_GE(response->path.size(), 2u);
+    const double endpoint = response->path.back().position.x;
+    ASSERT_GT(endpoint, 4.0);
+
+    // The scan on arrival reveals a dead end. The original refuge is now
+    // more than 2 m behind, beyond the old straight-departure executor.
+    std::vector<std::array<double, 4>> walls = {
+        {0.8, 7, 0.4, 0.6}, {0.8, 7, -0.6, -0.4}, {endpoint + 0.6, endpoint + 0.8, -2, 2}};
+    if (obstruction == 2) walls.push_back({2.8, 3.0, -2, 2});
+    MolaFloorProduct arrived(-2, 7, -2, 2, walls);
+    PlannerNodeTestPeer::useMolaMap(*node, arrived.serve());
+    if (obstruction == 1) PlannerNodeTestPeer::receivePeerBodies(*node, {{3, 0}});
+    PlannerNodeTestPeer::setLattice(*node, {-5.5, 0}, {0.5, 0});
+    // Stop early, as a real controller does: the connector must be checked.
+    if (obstruction == 3) {
+      PlannerNodeTestPeer::acceptOdometryFacing(*node, endpoint - 0.2, 2, 0, 1.5);
+    }
+    PlannerNodeTestPeer::acceptOdometryFacing(*node, endpoint - 0.2, 0,
+                                              obstruction == 4 ? M_PI_2 : 0, 2);
+    response = std::make_shared<mgg_msgs::srv::PlannerSrv::Response>();
+    PlannerNodeTestPeer::plan(*node, response);
+    if (obstruction) {
+      EXPECT_TRUE(response->path.empty());
+      EXPECT_EQ(response->status, PlannerNode::kStatusNoPath);
+    } else {
+      ASSERT_GE(response->path.size(), 2u);
+      EXPECT_NEAR(response->path.front().position.x, endpoint - 0.2, 0.1);
+      EXPECT_LT(response->path.back().position.x, 0.8);
+      EXPECT_GT(pathLength(response->path), 4.0);
+      for (const auto& pose : response->path) {
+        EXPECT_NEAR(pose.position.y, 0, 1e-6);
+        EXPECT_NEAR(pose.orientation.z, 0, 1e-6);  // entry yaw, NOT pi
+      }
+    }
+  }
 }
 
 TEST_F(PlannerNodeTest, LongNarrowCorridorAdmitsAnEndpointWithAValidatedReverseExit) {

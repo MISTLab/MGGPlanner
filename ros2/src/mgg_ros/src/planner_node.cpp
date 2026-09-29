@@ -1654,6 +1654,7 @@ void PlannerNode::onOdometry(nav_msgs::msg::Odometry::ConstSharedPtr msg) {
   }
   last_odometry_stamp_ns_ = stamp_ns;
   current_state_ = state;
+  forgetReverseExitIfOffRoute();
   current_tilt_ = tiltFromQuaternion(msg->pose.pose.orientation);
   if (!left_standing_start_) {
     if (!standing_start_xy_) standing_start_xy_ = state.head<2>();
@@ -3153,7 +3154,13 @@ std::string PlannerNode::buildLocalGraph() {
                            turns_admissible &&
                            !mgg::roomToTurn(*map_, robot_params_, planning_params_,
                                             root_state, standing_on)));
-  if (is_boxed_in) {
+  const bool stored_exit_tried =
+      (is_boxed_in || sel.sharp_turn_fallback || best_path_.empty()) &&
+      tryStoredReverseExit(root_state, boxed_in);
+  if (stored_exit_tried) {
+    path_shortcut_from_ = path_shortcut_corners_ = path_shortcut_to_ =
+        static_cast<int>(best_path_.size());
+  } else if (is_boxed_in) {
     const char* reason = zone_escape ? "no admissible end outside no-go zones"
         : goes_nowhere ? "its best path goes nowhere"
         : sel.best_path.empty() && sel.slope_ends_without_way_back > 0
@@ -3268,7 +3275,7 @@ std::string PlannerNode::buildLocalGraph() {
   }
   // The lattice path as it will be sent, unless something replaces it
   // (recordSentPath).
-  lattice_path_ = is_boxed_in || goes_nowhere ? std::vector<mgg::StateVec>{}
+  lattice_path_ = stored_exit_tried || is_boxed_in || goes_nowhere ? std::vector<mgg::StateVec>{}
                                                : best_path_;
   char room_note[128];
   std::snprintf(room_note, sizeof(room_note),
@@ -3291,10 +3298,13 @@ std::string PlannerNode::buildLocalGraph() {
 
 std::string PlannerNode::departBoxedIn(const mgg::StateVec& root_state,
                                        const char* why) {
+  std::string stored_note;
+  if (tryStoredReverseExit(root_state, stored_note)) return stored_note;
   char note[160];
   mgg::Departure departure;
   best_path_.clear();
   if (straightDeparture(root_state, departure)) {
+    departure_sent_now_ = true;
     best_path_ = departure.path;
     ++boxed_in_departures_;
     const double length =
@@ -4135,6 +4145,7 @@ void PlannerNode::onPlanRequest(
   // One peer set for the whole request (review r0, I5).
   std::optional<mgg::MolaMap::TransientDiscPin> peer_pin;
   pinPeerBodies(peer_pin);
+  departure_sent_now_ = false;
   lattice_path_.clear();
   peer_blocked_edges_.clear();
   withdrawUnplacedNeighbours();
@@ -4452,6 +4463,11 @@ void PlannerNode::onPlanRequest(
     summary += "; " + std::to_string(peer_blocked_edges_.size()) +
                " global graph edge(s) blocked by peers";
   }
+  // Capture/recheck the escape for the actual route and bound mode sent.
+  {
+    auto map_read = mapReadLease();
+    rememberReverseExit();
+  }
   robot_params_.bound_mode = previous;
   refreshNoGoZones();
   recordSentPath();
@@ -4473,6 +4489,157 @@ void PlannerNode::onPlanRequest(
     planner_config_state_.last_plan_generation = planner_config_state_.generation;
     publishPlannerConfigState();
   }
+}
+
+bool PlannerNode::reverseExitRefuge(const mgg::StateVec& pose) const {
+  return mgg::groundSlope(*ground_, pose.head<3>(),
+                          std::max(robot_params_.size.x(), robot_params_.size.y())) <=
+             mgg::kLevelGroundSlopeRad &&
+         mgg::roomToTurn(*map_, robot_params_, planning_params_, pose);
+}
+
+bool PlannerNode::reverseExitEdge(const mgg::GroundProjection& ground,
+                                  const mgg::StateVec& from,
+                                  const mgg::StateVec& to) const {
+  return mgg::reverseExitEdgeAdmissible(*map_, ground, robot_params_, planning_params_,
+      from, to, [this](const auto& a, const auto& b) {
+        return no_go_.pathAdmissible({a, b}) &&
+               !peerBlocksSegment(a - robot_params_.center_offset,
+                                  b - robot_params_.center_offset);
+      });
+}
+
+void PlannerNode::rememberReverseExit() {
+  if (best_path_.empty()) return;  // a refusal is not a new sent path
+  stored_reverse_exit_.clear();
+  if (departure_sent_now_ || best_path_.size() < 2 ||
+      robot_params_.type != mgg::RobotType::kGroundRobot ||
+      !planning_params_.departure_reverse_allowed) return;
+  const auto& end = best_path_.back();
+  const double slope = mgg::groundSlope(*ground_, end.head<3>(),
+      std::max(robot_params_.size.x(), robot_params_.size.y()), local_graph_.get());
+  if (mgg::viewpointClear(*map_, robot_params_, planning_params_, end, slope) &&
+      !(mgg::slopeExemptsTurnSpace(slope) &&
+        !mgg::turnSpaceObserved(*map_, robot_params_, planning_params_, end))) return;
+  mgg::GroundProjection ground(*map_, planning_params_, true);
+  std::vector<mgg::StateVec> reverse{end};
+  double length = 0.0;
+  const double limit = planning_params_.reverse_exit_max_length > 0.0
+      ? planning_params_.reverse_exit_max_length : mgg::kDepartureMaxM;
+  for (std::size_t i = best_path_.size() - 1; i-- > 0;) {
+    const auto& to = best_path_[i];
+    const auto& from = best_path_[i + 1];
+    length += (from.head<3>() - to.head<3>()).norm();
+    if (length > limit + 1e-9 || !reverseExitEdge(ground, from, to)) break;
+    reverse.back()[3] = std::atan2(from.y() - to.y(), from.x() - to.x());
+    reverse.push_back(to);
+    reverse.back()[3] = reverse[reverse.size() - 2][3];
+    if (reverseExitRefuge(to)) {
+      reverse_exit_entry_path_ = best_path_;
+      stored_reverse_exit_ = std::move(reverse);
+      return;
+    }
+  }
+  // An admitted narrow end must have an executable escape, not merely a
+  // graph-level promise that was lost in shortcutting or map revision.
+  best_path_.clear();
+  global_exploration_ongoing_ = false;
+  RCLCPP_WARN(get_logger(), "reverse exit could not be retained for sent endpoint: no path");
+}
+
+void PlannerNode::forgetReverseExitIfOffRoute() {
+  if (stored_reverse_exit_.size() < 2) return;
+  const double tolerance = reach_distance_ + mgg::kViewpointArrivalSlack;
+  for (std::size_t i = 1; i < reverse_exit_entry_path_.size(); ++i) {
+    const Eigen::Vector2d a = reverse_exit_entry_path_[i - 1].head<2>();
+    const Eigen::Vector2d step = reverse_exit_entry_path_[i].head<2>() - a;
+    const double t = step.squaredNorm() > 1e-12
+        ? std::clamp((current_state_.head<2>() - a).dot(step) / step.squaredNorm(), 0.0, 1.0)
+        : 0.0;
+    if ((current_state_.head<2>() - a - t * step).norm() <= tolerance) return;
+  }
+  stored_reverse_exit_.clear();
+}
+
+bool PlannerNode::tryStoredReverseExit(const mgg::StateVec& start, std::string& note) {
+  const double tolerance = reach_distance_ + mgg::kViewpointArrivalSlack;
+  if (stored_reverse_exit_.size() < 2 ||
+      (start.head<2>() - stored_reverse_exit_.front().head<2>()).norm() > tolerance) {
+    return false;
+  }
+  best_path_.clear();
+  best_path_from_global_graph_ = false;
+  global_exploration_ongoing_ = false;
+  const auto refused = [&](const char* reason) {
+    boxed_in_without_departure_now_ = true;
+    ++boxed_in_without_departure_;
+    note = std::string("; stored reverse exit refused: ") + reason + "; no path";
+    RCLCPP_WARN(get_logger(), "%s", note.c_str() + 2);
+    return true;  // tried, so never replace it with an unchecked fallback
+  };
+  if (!planning_params_.departure_reverse_allowed) return refused("reverse disabled");
+  // Connect the actual (possibly early) arrival to the entry corridor. Drop
+  // passed poses, and give a lateral arrival at least the existing minimum
+  // departure length to blend back onto it rather than turn in place.
+  std::size_t nearest = 0;
+  for (std::size_t i = 1; i < stored_reverse_exit_.size(); ++i) {
+    if ((start.head<3>() - stored_reverse_exit_[i].head<3>()).squaredNorm() <
+        (start.head<3>() - stored_reverse_exit_[nearest].head<3>()).squaredNorm()) nearest = i;
+  }
+  std::size_t join = std::min(nearest + 1, stored_reverse_exit_.size() - 1);
+  while (join + 1 < stored_reverse_exit_.size() &&
+         (start.head<2>() - stored_reverse_exit_[join].head<2>()).norm() < mgg::kDepartureMinM) ++join;
+  std::vector<mgg::StateVec> reverse{start};
+  reverse.insert(reverse.end(), stored_reverse_exit_.begin() + join, stored_reverse_exit_.end());
+  const double heading = std::atan2(start.y() - reverse[1].y(), start.x() - reverse[1].x());
+  const double turn = std::remainder(heading - start[3], 2.0 * M_PI);
+  if (std::abs(turn) > mgg::kDepartureMaxTurnRad + 1e-9) return refused("entry heading mismatch");
+  // The same angular envelope/steps as findDeparture, without excusing the
+  // standing body. No separate rotate-in-place pose is emitted.
+  mgg::OrientedBox body;
+  body.size = robot_params_.getPlanningSize();
+  const int turns = std::max(1, static_cast<int>(std::ceil(std::abs(turn) / mgg::kDepartureTurnStepRad)));
+  for (int i = 0; i <= turns; ++i) {
+    body.heading = start[3] + turn * i / turns;
+    if (mgg::orientedBoxPathStatus(*map_, start.head<3>() + robot_params_.center_offset,
+        start.head<3>() + robot_params_.center_offset, body, false, nullptr) != mgg::VoxelStatus::kFree) {
+      return refused("entry heading has no swept body clearance");
+    }
+  }
+  reverse.front()[3] = heading;
+  mgg::GroundProjection ground(*map_, planning_params_, true);
+  double length = 0.0;
+  const double limit = planning_params_.reverse_exit_max_length > 0.0
+      ? planning_params_.reverse_exit_max_length : mgg::kDepartureMaxM;
+  for (std::size_t i = 1; i < reverse.size(); ++i) {
+    length += (reverse[i].head<3>() - reverse[i - 1].head<3>()).norm();
+    if (length > limit + 1e-9) return refused("length bound exceeded");
+    if (!reverseExitEdge(ground, reverse[i - 1], reverse[i])) {
+      return refused("current reverse edge fails terrain, clearance, peer or no-go validation");
+    }
+  }
+  if (!reverseExitRefuge(reverse.back())) return refused("refuge no longer has observed level turn room");
+  // Edge sweeps alone do not certify the chassis transition at a corner,
+  // especially the new actual-arrival connector. Keep the same sharp-turn
+  // veto, with travel heading opposite the entry body heading.
+  mgg::PathTurnCheck reverse_turns(*local_graph_, robot_params_,
+      [this](const auto& pose) {
+        return mgg::roomToTurn(*map_, robot_params_, planning_params_, pose);
+      }, [this, &ground](const Eigen::Vector3d& at) {
+        return mgg::groundSlope(ground, at,
+            std::max(robot_params_.size.x(), robot_params_.size.y()));
+      });
+  mgg::PathType points;
+  for (const auto& pose : reverse) points.push_back(pose.head<3>());
+  if (!reverse_turns.admissible(points, start[3] + M_PI)) {
+    return refused("reverse corner fails current slope or turn-room checks");
+  }
+  best_path_ = std::move(reverse);
+  departure_sent_now_ = true;
+  ++boxed_in_departures_;
+  note = "; stored reverse exit revalidated: reversing to the refuge";
+  RCLCPP_INFO(get_logger(), "%s (%.2f m)", note.c_str() + 2, length);
+  return true;
 }
 
 void PlannerNode::recordSentPath() {
@@ -4874,6 +5041,7 @@ void PlannerNode::onObjectiveRequest(
     response->reason = "blocked by a peer: the route meets a peer body";
     return;
   }
+  stored_reverse_exit_.clear();  // a new objective supersedes the entry path
   response->status = Service::Response::SUCCEEDED;
   for (const mgg::StateVec& s : route) response->path.push_back(toPoseMsg(s));
   char note[160];

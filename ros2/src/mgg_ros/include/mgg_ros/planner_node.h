@@ -140,6 +140,12 @@ class PlannerNode : public rclcpp::Node {
   void readmitQuarantinedNeighbours();
   /// Updates the turn-back hysteresis from the path a plan request sends.
   void recordSentPath();
+  void rememberReverseExit();
+  bool tryStoredReverseExit(const mgg::StateVec& start, std::string& note);
+  bool reverseExitRefuge(const mgg::StateVec& pose) const;
+  bool reverseExitEdge(const mgg::GroundProjection& ground,
+                       const mgg::StateVec& from, const mgg::StateVec& to) const;
+  void forgetReverseExitIfOffRoute();
   /// Whether a route, the robot's pose first, starts with a sharp turn
   /// (kSharpTurnRad, measured over the robot's length from its heading)
   /// where the robot has no room to turn: the route a boxed-in robot is
@@ -890,6 +896,11 @@ class PlannerNode : public rclcpp::Node {
   mgg::EdgeInclinations edge_inclinations_;
   /// Last chosen path, in world coordinates.
   std::vector<mgg::StateVec> best_path_;
+  // Endpoint first, refuge last; headings stay those of forward entry.
+  // Only associated with the last nonempty path actually sent.
+  std::vector<mgg::StateVec> stored_reverse_exit_;
+  std::vector<mgg::StateVec> reverse_exit_entry_path_;
+  bool departure_sent_now_ = false;
   /// Whether best_path_ is a global-graph route (already in the roadmap) or
   /// a lattice path (joins it once accepted).
   bool best_path_from_global_graph_ = false;
