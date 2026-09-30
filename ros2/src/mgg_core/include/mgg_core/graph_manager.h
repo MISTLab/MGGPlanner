@@ -182,6 +182,9 @@ class GraphManager {
   struct NeighbourPlacement {
     std::unordered_map<int, StateVec> sent_states;
     std::set<std::pair<int, int>> merge_owned_edges;
+    /// Connection announcement survives a temporarily inadmissible refresh;
+    /// retiring the neighbour's old run resets it with the placement.
+    bool aerial_connection_announced = false;
   };
   std::unordered_map<int, NeighbourPlacement> neighbour_placements_;
 

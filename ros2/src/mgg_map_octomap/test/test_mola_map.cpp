@@ -32,6 +32,7 @@
 #include "mgg_core/departure.h"
 #include "mgg_core/graph_manager.h"
 #include "mgg_core/global_graph.h"
+#include "mgg_core/graph_merge.h"
 #include "mgg_core/ground_projection.h"
 #include "mgg_core/grid_graph.h"
 #include "mgg_core/path_selection.h"
@@ -757,6 +758,44 @@ TEST(MolaMap, AerialRootDepartsPeerAndNoGoMarginsThroughObservedRoom) {
     EXPECT_EQ(report.num_vertices_added, 1);
     if (report.vertex_added) EXPECT_NEAR(report.vertex_added->state.x(), 1.1, 1e-9);
   }
+}
+
+TEST(MolaMap, AerialMergeDoesNotAnnounceReconnectionAfterFailedRefresh) {
+  AerialMolaScene observed, unavailable;
+  observed.load(AerialMolaScene::observedRoom());
+  unavailable.load({});
+  mgg::MapInterface* map = &observed.map;
+  mgg::GraphManager graph;
+  auto* root = new mgg::Vertex(0, observed.hover);
+  auto* next = new mgg::Vertex(1, observed.hover + mgg::StateVec(.4, 0, 0, 0));
+  root->robot_id = next->robot_id = 1;
+  graph.addVertex(root); graph.addVertex(next); graph.addEdge(root, next, .4);
+  mgg::GraphExchange incoming;
+  for (int i = 0; i < 2; ++i) {
+    mgg::GraphExchangeVertex v;
+    v.id = i; v.robot_id = 2; v.state = observed.hover + mgg::StateVec(.6 + .5*i, 0, 0, 0);
+    incoming.vertices.push_back(v);
+  }
+  incoming.edges = {{0, 1, .5}};
+  mgg::StaticPoseSource poses;
+  poses.setOffset(2, 0, 0);
+  mgg::ReceiverPlatform platform;
+  platform.type = mgg::RobotType::kAerialRobot;
+  const auto merge = [&]() {
+    return mgg::mergeNeighbourGraph(graph, incoming, poses,
+        [&](const Eigen::Vector3d& a, const Eigen::Vector3d& b) {
+          return map->getStaticStrictPathStatus(a, b, observed.robot.size) == VoxelStatus::kFree;
+        }, 5, platform);
+  };
+  EXPECT_TRUE(merge().newly_connected);
+  map = &unavailable.map;
+  const auto lost = merge();
+  EXPECT_FALSE(lost.merged);
+  EXPECT_FALSE(lost.newly_connected);
+  map = &observed.map;
+  const auto restored = merge();
+  EXPECT_TRUE(restored.merged);
+  EXPECT_FALSE(restored.newly_connected);
 }
 
 TEST(MolaMap, AerialRoadmapLinkCannotBridgeUnknownAir) {

@@ -249,7 +249,8 @@ MergeResult mergeNeighbourGraph(GraphManager& global_graph,
   const double driving_height = platform.driving_height;
 
   const bool aerial_refresh = platform.type == RobotType::kAerialRobot &&
-                              global_graph.merged_graphs_[neighbour_id];
+                              placement != global_graph.neighbour_placements_.end() &&
+                              placement->second.aerial_connection_announced;
   if (placement != global_graph.neighbour_placements_.end()) {
     result.vertices_replaced = replaceNeighbourVertices(
         global_graph, neighbour_id, placement->second, t_ours_theirs,
@@ -324,6 +325,9 @@ MergeResult mergeNeighbourGraph(GraphManager& global_graph,
   result.merged = global_graph.merged_graphs_[neighbour_id];
   result.newly_connected = !already_merged && result.merged && !aerial_refresh;
   if (!result.merged) return result;
+  if (platform.type == RobotType::kAerialRobot) {
+    global_graph.neighbour_placements_[neighbour_id].aerial_connection_announced = true;
+  }
   // Joined again with a current transform: a quarantine ends here.
   global_graph.releaseNeighbourGraph(neighbour_id);
 
