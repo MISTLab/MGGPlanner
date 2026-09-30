@@ -4046,6 +4046,52 @@ TEST_F(PlannerNodeTest, AerialReturnHomeUsesTakeoffColumnEvidenceAndOccupiedWins
   }
 }
 
+TEST_F(PlannerNodeTest, FiniteAerialReturnHomeUsesTakeoffColumnEvidenceAndOccupiedWins) {
+  using Service = mgg_msgs::srv::PlanObjective;
+  for (int evidence = 0; evidence < 3; ++evidence) {
+    SCOPED_TRACE(evidence);
+    auto node = makeNode("finite_aerial_column_home");
+    PlannerNodeTestPeer::setAerialRobot(*node);
+    PlannerNodeTestPeer::setAerialBodySize(*node, {0.5, 0.5, 0.3});
+    // Only cell [0,.2]x[0,.2]x[.2,.4] is missing. It is wholly inside the
+    // .5x.5x.3 body swept from pad (.1,.1,0) to hover (.1,.1,.3).
+    // The authoritative producer supplies this one free cell after takeoff;
+    // an occupied return at the same cell must override that evidence.
+    const std::vector<std::array<int, 3>> unknown = evidence == 0
+        ? std::vector<std::array<int, 3>>{{0, 0, 1}} : std::vector<std::array<int, 3>>{};
+    const std::vector<std::array<double, 4>> walls = evidence == 2
+        ? std::vector<std::array<double, 4>>{{0, .2, 0, .2}}
+        : std::vector<std::array<double, 4>>{};
+    MolaFloorProduct product(-1, 3, -1, 1, walls, unknown);
+    PlannerNodeTestPeer::useMolaMap(*node, product.serve());
+    PlannerNodeTestPeer::serveMap(*node, "component:test", 1);
+    PlannerNodeTestPeer::acceptOdometryFacing(*node, .1, .1, 0, 1, .3);
+    PlannerNodeTestPeer::addGlobalChainToFrontier(*node, {{1.1, .1}, {2.1, .1}});
+    PlannerNodeTestPeer::acceptOdometryFacing(*node, 1.1, .1, M_PI, 2, .3);
+    auto request = std::make_shared<Service::Request>();
+    request->objective = Service::Request::RETURN_HOME;
+    request->component_id = "component:test";
+    request->map_epoch = 1;
+    // Production RETURN_HOME: finite goal, tolerance zero. The 0.5 mm
+    // correction is within the vertex-0 fallback's 1 mm tolerance, so the
+    // final endpoint assertion also detects accidentally taking that branch.
+    request->goal.position.x = .1005;
+    request->goal.position.y = .1;
+    request->goal.position.z = .3;
+    request->goal.orientation.w = 1;
+    auto response = std::make_shared<Service::Response>();
+    PlannerNodeTestPeer::objective(*node, request, response);
+    EXPECT_EQ(response->status == Service::Response::SUCCEEDED, evidence == 1)
+        << response->reason;
+    if (evidence == 1) {
+      ASSERT_FALSE(response->path.empty());
+      EXPECT_NEAR(response->path.back().position.x, .1005, 1e-6);
+      EXPECT_NEAR(response->path.back().position.y, .1, 1e-6);
+      EXPECT_NEAR(response->path.back().position.z, .3, 1e-6);
+    }
+  }
+}
+
 TEST_F(PlannerNodeTest, AerialTourTargetNearPeerKeepsSearchTimeBlockDiagnosis) {
   auto node = makeNode("aerial_peer_goal");
   PlannerNodeTestPeer::setAerialRobot(*node);
