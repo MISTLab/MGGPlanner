@@ -1707,6 +1707,9 @@ class PlannerNodeTestPeer {
     return node.mergeNeighbourRoadmap(incoming);
   }
   static void advanceMapRevision(PlannerNode& node) { ++node.map_revision_; }
+  static void movePeerTransform(PlannerNode& node, double x) {
+    node.poses_->setOffset(2, x, 0);
+  }
   static void addCheckedOwnPeerEdge(PlannerNode& node, int own, int peer) {
     auto* a = node.global_graph_->getVertex(own);
     auto* b = node.global_graph_->vertex_by_robot_id_.at(2).at(peer);
@@ -4105,6 +4108,81 @@ TEST_F(PlannerNodeTest, FiniteAerialReturnHomeUsesTakeoffColumnEvidenceAndOccupi
       EXPECT_NEAR(response->path.back().position.y, .1, 1e-6);
       EXPECT_NEAR(response->path.back().position.z, .3, 1e-6);
     }
+  }
+}
+
+TEST_F(PlannerNodeTest, AerialLiftsPeerFrontiersWithoutImportingGroundRoadmap) {
+  auto node = makeNode("lift_peer_frontier", "world", {
+      rclcpp::Parameter("fleet.enabled", false),
+      rclcpp::Parameter("neighbour_offsets", std::vector<double>{2, 0, 0, 0}),
+      rclcpp::Parameter("aerial_frontier_height_m", .4),
+      rclcpp::Parameter("aerial_min_height_m", .3),
+      rclcpp::Parameter("aerial_max_height_m", .6)});
+  PlannerNodeTestPeer::setAerialRobot(*node);
+  MolaFloorProduct product(-1, 5, -1, 1);
+  PlannerNodeTestPeer::useMolaMap(*node, product.serve());
+  PlannerNodeTestPeer::acceptOdometryFacing(*node, .1, .1, 0, 1, .4);
+  PlannerNodeTestPeer::addGlobalVertex(*node, 1, 1.1, .1, .4, {0});
+  mgg_msgs::msg::Graph peer;
+  peer.header.frame_id = "world";
+  mgg_msgs::msg::Vertex v;
+  v.id = 0; v.robot_id = 2; v.pose.position.x = 3.1;
+  v.pose.position.y = .1; v.pose.orientation.w = 1;
+  v.is_frontier = true; v.num_unknown_voxels = 1000000;
+  peer.vertices.push_back(v);
+  PlannerNodeTestPeer::receiveGraph(*node, peer);
+  auto clusters = PlannerNodeTestPeer::frontierClusters(*node);
+  ASSERT_EQ(clusters.size(), 1u);
+  EXPECT_EQ(clusters.front().owner_robot_id, 2);
+  EXPECT_NEAR(clusters.front().position.z(), .4, 1e-9);
+  EXPECT_TRUE(PlannerNodeTestPeer::neighbourHeights(*node, 2).empty());
+  std::string reason;
+  EXPECT_TRUE(PlannerNodeTestPeer::runGlobalPlanner(
+      *node, reason, clusters.front().representative_vertex_id)) << reason;
+  const auto published = PlannerNodeTestPeer::ownGraph(*node);
+  EXPECT_EQ(published.vertices.size(), 2u);
+  EXPECT_EQ(published.edges.size(), 1u);
+  PlannerNodeTestPeer::setTour(*node, true, 0);
+  PlannerNodeTestPeer::solveTourOnEveryChange(*node);
+  EXPECT_NE(PlannerNodeTestPeer::refreshTour(*node), mgg::kNoCluster);
+  PlannerNodeTestPeer::setFlightReach(*node, 1.0);
+  EXPECT_EQ(PlannerNodeTestPeer::refreshTour(*node), mgg::kNoCluster);
+  // A newer map with a wall anywhere on the link withdraws the target.
+  MolaFloorProduct blocked(-1, 5, -1, 1, {{2, 2.2, -1, 1}});
+  PlannerNodeTestPeer::useMolaMap(*node, blocked.serve());
+  EXPECT_TRUE(PlannerNodeTestPeer::frontierClusters(*node).empty());
+  MolaFloorProduct unknown(-1, 5, -1, 1, {}, {{10, 0, 2}});
+  PlannerNodeTestPeer::useMolaMap(*node, unknown.serve());
+  EXPECT_TRUE(PlannerNodeTestPeer::frontierClusters(*node).empty());
+  PlannerNodeTestPeer::useMolaMap(*node, product.serve());
+  EXPECT_EQ(PlannerNodeTestPeer::frontierClusters(*node).size(), 1u);
+  PlannerNodeTestPeer::movePeerTransform(*node, 20);
+  EXPECT_TRUE(PlannerNodeTestPeer::frontierClusters(*node).empty());
+  PlannerNodeTestPeer::movePeerTransform(*node, 0);
+  EXPECT_EQ(PlannerNodeTestPeer::frontierClusters(*node).size(), 1u);
+  peer.vertices.front().is_frontier = false;
+  peer.vertices.front().visited = true;
+  PlannerNodeTestPeer::receiveGraph(*node, peer);
+  EXPECT_TRUE(PlannerNodeTestPeer::frontierClusters(*node).empty());
+  EXPECT_EQ(PlannerNodeTestPeer::globalVertices(*node), 3);
+  EXPECT_EQ(PlannerNodeTestPeer::globalEdges(*node), 1);
+}
+
+TEST_F(PlannerNodeTest, AerialReachabilityPrecedesOwnPreferenceGroundUnchanged) {
+  for (const bool aerial : {false, true}) {
+    auto node = makeNode(aerial ? "aerial_reachable_peer" : "ground_own_preference", "world",
+        {rclcpp::Parameter("fleet.enabled", false)});
+    if (aerial) PlannerNodeTestPeer::setAerialRobot(*node);
+    MolaFloorProduct product(-1, 4, -1, 1);
+    PlannerNodeTestPeer::useMolaMap(*node, product.serve());
+    PlannerNodeTestPeer::acceptOdometryFacing(*node, .1, .1, 0, 1, .4);
+    const int reachable = PlannerNodeTestPeer::addGlobalVertex(*node, 1, 1.1, .1, .4, {0});
+    mgg::FrontierCluster own, peer;
+    own.id = 1; own.owner_robot_id = 1; own.representative_vertex_id = 999;
+    peer.id = 2; peer.owner_robot_id = 2; peer.representative_vertex_id = reachable;
+    const auto candidates = PlannerNodeTestPeer::tourCandidates(*node, {own, peer});
+    ASSERT_EQ(candidates.size(), 1u);
+    EXPECT_EQ(candidates.front().id, aerial ? 2u : 1u);
   }
 }
 

@@ -70,7 +70,7 @@ mgg_msgs::msg::Graph toGraphMsg(mgg::GraphManager& graph, int robot_id,
 
   for (const auto& entry : own->second) {
     const mgg::Vertex* v = entry.second;
-    if (v == nullptr) continue;
+    if (v == nullptr || v->lifted_peer_target) continue;
     mgg_msgs::msg::Vertex vertex;
     vertex.id = entry.first;
     vertex.pose = toPoseMsg(v->state);
@@ -105,7 +105,8 @@ mgg_msgs::msg::Graph toGraphMsg(mgg::GraphManager& graph, int robot_id,
         s->second == nullptr || t->second == nullptr) {
       continue;
     }
-    if (s->second->robot_id != robot_id || t->second->robot_id != robot_id) {
+    if (s->second->robot_id != robot_id || t->second->robot_id != robot_id ||
+        s->second->lifted_peer_target || t->second->lifted_peer_target) {
       continue;
     }
     mgg_msgs::msg::Edge edge;

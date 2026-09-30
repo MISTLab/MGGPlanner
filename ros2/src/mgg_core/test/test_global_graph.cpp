@@ -1749,6 +1749,25 @@ TEST(ExpandGlobalGraph, ClustersUnvisitedVerticesByTheLocalBoxRadius) {
   EXPECT_EQ(report.clusters, 2);
 }
 
+TEST(ExpandGlobalGraph, LiftedPeerTargetsAreNotRoadmapEvidenceOrRendezvous) {
+  Roadmap scene;
+  scene.global.getVertex(0)->type = VertexType::kVisited;
+  auto* target = new Vertex(scene.global.generateVertexID(), StateVec(30, 0, 0, 0));
+  target->lifted_peer_target = true;
+  scene.global.addVertex(target);
+  Vertex* nearest = nullptr;
+  ASSERT_TRUE(scene.global.getNearestVertex(&target->state, &nearest));
+  EXPECT_EQ(nearest->id, 0);
+  scene.global.rebuildNearestIndex();
+  ASSERT_TRUE(scene.global.getNearestVertex(&target->state, &nearest));
+  EXPECT_EQ(nearest->id, 0);
+  mgg::RandomSampler sampler = boxSampler(10.0);
+  mgg::RobotStateHistory history;
+  const auto report = mgg::expandGlobalGraph(scene.global, scene.ctx, sampler, history, nullptr, 0.0);
+  EXPECT_EQ(report.unvisited_vertices, 0);
+  EXPECT_EQ(report.clusters, 0);
+}
+
 TEST(ExpandGlobalGraph, TypesNewVerticesAsFrontiersWhenTheirGainSaysSo) {
   ExpansionScene scene;
   mgg::RandomSampler sampler = boxSampler(10.0);

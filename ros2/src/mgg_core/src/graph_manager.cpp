@@ -73,7 +73,8 @@ void GraphManager::setRobotId(int robot_id) {
 }
 
 void GraphManager::addVertex(Vertex* v) {
-  kd_insert3(kd_tree_, v->state.x(), v->state.y(), v->state.z(), v);
+  if (!v->lifted_peer_target)
+    kd_insert3(kd_tree_, v->state.x(), v->state.y(), v->state.z(), v);
   if (v->id == 0){
     int root_vertex_id = 0;
     v->id = root_vertex_id;
@@ -127,7 +128,7 @@ void GraphManager::rebuildNearestIndex() {
   kd_tree_ = kd_create(3);
   for (const auto& entry : vertices_map_) {
     const Vertex* vertex = entry.second;
-    if (vertex == nullptr || !inService(*vertex)) continue;
+    if (vertex == nullptr || vertex->lifted_peer_target || !inService(*vertex)) continue;
     kd_insert3(kd_tree_, vertex->state.x(), vertex->state.y(),
                vertex->state.z(), entry.second);
   }

@@ -1438,8 +1438,8 @@ GlobalGraphExpansionReport expandGlobalGraph(
   std::vector<Vertex*> unvisited_vertices;
   for (auto& entry : global_graph.vertices_map_) {
     Vertex* vertex = entry.second;
-    if (vertex != nullptr && vertex->type == VertexType::kUnvisited &&
-        global_graph.inService(*vertex)) {
+    if (vertex != nullptr && !vertex->lifted_peer_target &&
+        vertex->type == VertexType::kUnvisited && global_graph.inService(*vertex)) {
       unvisited_vertices.push_back(vertex);
     }
   }

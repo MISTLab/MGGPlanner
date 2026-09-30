@@ -120,6 +120,8 @@ struct Vertex {
   /// left uninitialised by the ROS 1 constructor.
   int robot_id = 0;
   VolumetricGain vol_gain;
+  /// Receiver-only aerial query endpoint, not roadmap evidence or a rendezvous.
+  bool lifted_peer_target = false;
   /// Receiver-only evidence: this peer frontier was explored on our map.
   /// Owner broadcasts refresh counts but cannot undo this local demotion.
   /// One-way, like this robot's own demoted frontiers: nothing re-promotes

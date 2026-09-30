@@ -558,6 +558,14 @@ PlannerNode::PlannerNode(const rclcpp::NodeOptions& options)
   // edge joins it: its home is this far over the pad, at its take-off
   // height, when SwarmDeck reports it landed on flight_state as home is
   // seeded (seedGlobalGraph, rebuildGlobalGraphFromKeyframes).
+  aerial_frontier_height_m_ = declareOrGet<double>(this, "aerial_frontier_height_m", aerial_frontier_height_m_);
+  aerial_min_height_m_ = declareOrGet<double>(this, "aerial_min_height_m", aerial_min_height_m_);
+  aerial_max_height_m_ = declareOrGet<double>(this, "aerial_max_height_m", aerial_max_height_m_);
+  if (!std::isfinite(aerial_frontier_height_m_) || !std::isfinite(aerial_min_height_m_) ||
+      !std::isfinite(aerial_max_height_m_) || aerial_min_height_m_ <= 0 ||
+      aerial_max_height_m_ < aerial_min_height_m_) {
+    throw std::invalid_argument("invalid aerial frontier height band");
+  }
   aerial_home_height_m_ = std::max(
       0.0, declareOrGet<double>(this, "aerial_home_height_m",
                                 aerial_home_height_m_));
@@ -922,6 +930,98 @@ void PlannerNode::demoteFleetCoveredFrontiers() {
   }
 }
 
+std::vector<mgg::FrontierCluster> PlannerNode::liftedPeerFrontiers() {
+  auto map_read = mapReadLease();
+  if (lifted_target_graph_.lock() != global_graph_) {
+    lifted_target_vertices_.clear();
+    lifted_target_graph_ = global_graph_;
+  }
+  // Remove every old query edge, including adjacency used by non-Dijkstra
+  // searches. Reusing at most 64 isolated slots bounds storage across updates.
+  for (const int id : lifted_target_vertices_) {
+    auto* v = findGlobalVertex(id);
+    if (!v) continue;
+    if (current_global_vertex_id_ == id) global_exploration_ongoing_ = false;
+    auto neighbours = global_graph_->edge_map_[id];
+    for (const auto& [other, cost] : neighbours) {
+      (void)cost;
+      if (auto* u = findGlobalVertex(other)) global_graph_->removeEdge(v, u);
+      auto& edges = global_graph_->edge_map_[other];
+      edges.erase(std::remove_if(edges.begin(), edges.end(),
+          [id](const auto& edge) { return edge.first == id; }), edges.end());
+    }
+    global_graph_->edge_map_[id].clear();
+    v->type = mgg::VertexType::kUnvisited;
+    v->vol_gain = mgg::VolumetricGain();
+  }
+  std::vector<mgg::FrontierCluster> candidates;
+  const double height = std::clamp(aerial_frontier_height_m_, aerial_min_height_m_, aerial_max_height_m_);
+  for (const auto& [sender, snapshot] : neighbour_roadmaps_) {
+    const auto frame = neighbour_frames_.find(sender);
+    Eigen::Isometry3d transform;
+    if (frame == neighbour_frames_.end() ||
+        !refreshNeighbourTransform(sender, frame->second) ||
+        !poses_->getRobotTransform(sender, transform)) continue;
+    for (const auto& v : snapshot.vertices) {
+      if (!v.is_frontier || v.visited || !v.state.allFinite()) continue;
+      mgg::FrontierCluster c;
+      c.owner_robot_id = sender;
+      c.position = transform * v.state.head<3>();
+      c.position.z() += height;
+      c.gain = std::max(0, v.num_unknown_voxels) * planning_params_.unknown_voxel_gain +
+          std::max(0, v.num_free_voxels) * planning_params_.free_voxel_gain +
+          std::max(0, v.num_occupied_voxels) * planning_params_.occupied_voxel_gain;
+      if (c.gain < tour_params_.min_cluster_gain) continue;
+      c.id = mgg::makeClusterId(sender, c.position, tour_params_.cluster_id_cell_m);
+      candidates.push_back(c);
+    }
+  }
+  std::sort(candidates.begin(), candidates.end(), [](const auto& a, const auto& b) {
+    return a.gain != b.gain ? a.gain > b.gain : a.id < b.id;
+  });
+  std::vector<mgg::FrontierCluster> clusters;
+  const auto box = robot_params_.getPlanningSize();
+  for (auto c : candidates) {
+    if (clusters.size() == 64) break;
+    if (std::any_of(clusters.begin(), clusters.end(), [&](const auto& other) {
+          return (c.position - other.position).norm() <= fleet_params_.cluster_merge_radius_m;
+        })) continue;
+    mgg::StateVec state(c.position.x(), c.position.y(), c.position.z(), 0);
+    std::vector<mgg::Vertex*> anchors;
+    global_graph_->getNearestVertices(&state, 5.0, &anchors);
+    mgg::Vertex* anchor = nullptr;
+    double best = std::numeric_limits<double>::infinity();
+    for (auto* v : anchors) {
+      if (!v || v->lifted_peer_target || !global_graph_->inService(*v) ||
+          v->robot_id != static_cast<int>(planning_params_.robot_id)) continue;
+      const double distance = (v->state.head<3>() - c.position).norm();
+      if (distance >= best || map_->getStaticStrictPathStatus(
+          v->state.head<3>() + robot_params_.center_offset,
+          c.position + robot_params_.center_offset, box) != mgg::VoxelStatus::kFree) continue;
+      best = distance;
+      anchor = v;
+    }
+    if (!anchor) continue;
+    mgg::Vertex* endpoint = nullptr;
+    if (clusters.size() < lifted_target_vertices_.size()) {
+      endpoint = findGlobalVertex(lifted_target_vertices_[clusters.size()]);
+      endpoint->state = state; // never in the nearest-neighbour index
+    } else {
+      endpoint = new mgg::Vertex(global_graph_->generateVertexID(), state);
+      endpoint->robot_id = static_cast<int>(planning_params_.robot_id);
+      endpoint->lifted_peer_target = true;
+      global_graph_->addVertex(endpoint);
+      lifted_target_vertices_.push_back(endpoint->id);
+    }
+    global_graph_->addEdge(anchor, endpoint, best);
+    c.representative_vertex_id = endpoint->id;
+    c.member_vertex_ids = {endpoint->id};
+    clusters.push_back(c);
+  }
+  if (!lifted_target_vertices_.empty()) ++graph_revision_;
+  return clusters;
+}
+
 std::vector<mgg::FrontierCluster> PlannerNode::globalFrontierClusters() {
   demoteFleetCoveredFrontiers();
   // Counts and the frontier flag are the owner's latest map evidence.
@@ -936,9 +1036,14 @@ std::vector<mgg::FrontierCluster> PlannerNode::globalFrontierClusters() {
       *global_graph_, fleet_params_.cluster_merge_radius_m,
       tour_params_.min_cluster_gain, tour_params_.cluster_id_cell_m,
       [this](const mgg::Vertex& v) {
-        return v.robot_id == static_cast<int>(planning_params_.robot_id) ||
-               (v.vol_gain.is_frontier && v.vol_gain.gain > 0.0);
+        return !v.lifted_peer_target &&
+               (v.robot_id == static_cast<int>(planning_params_.robot_id) ||
+                (v.vol_gain.is_frontier && v.vol_gain.gain > 0.0));
       });
+  if (robot_params_.type == mgg::RobotType::kAerialRobot) {
+    auto peers = liftedPeerFrontiers();
+    clusters.insert(clusters.end(), peers.begin(), peers.end());
+  }
   cluster_ids_.stabilize(clusters, fleet_params_.cluster_merge_radius_m);
   return clusters;
 }
@@ -959,6 +1064,30 @@ std::vector<mgg::FrontierCluster> PlannerNode::tourCandidates(
       clusters.end());
   const int own_id = static_cast<int>(planning_params_.robot_id);
   if (!fleet_) {
+    if (robot_params_.type == mgg::RobotType::kAerialRobot && !clusters.empty()) {
+      const auto* link = linkRobotToGlobalGraph();
+      if (!link) {
+        RCLCPP_INFO(get_logger(), "aerial tour: own clusters unreachable: robot off graph");
+        return {};
+      }
+      refreshPeerGeneration();
+      auto costs = mgg::computeTourCosts(*global_graph_, graph_revision_, tour_distances_,
+          link->id, current_state_[3], clusters, tour_params_.heading_weight, peer_generation_);
+      const auto before_cap = costs.from_robot;
+      mgg::capTourCostsByReach(costs, homeDistances(clusters), flight_reach_m_);
+      std::vector<mgg::FrontierCluster> reachable;
+      for (std::size_t i = 0; i < clusters.size(); ++i) {
+        if (std::isfinite(costs.from_robot[i])) reachable.push_back(clusters[i]);
+        else if (clusters[i].owner_robot_id == own_id) {
+          RCLCPP_INFO(get_logger(), "aerial tour: own cluster %016llx unreachable: %s",
+              static_cast<unsigned long long>(clusters[i].id),
+              std::isfinite(before_cap[i]) ? "battery return reach cap" :
+              findGlobalVertex(clusters[i].representative_vertex_id) ?
+                  "disconnected or search-time blocked" : "representative off graph");
+        }
+      }
+      clusters = std::move(reachable);
+    }
     const auto others = [own_id](const mgg::FrontierCluster& cluster) {
       return cluster.owner_robot_id != own_id;
     };
@@ -1113,7 +1242,19 @@ std::optional<mgg::FrontierCluster> PlannerNode::refreshTour(
         *global_graph_, graph_revision_, tour_distances_, link->id,
         current_state_[3], clusters, tour_params_.heading_weight,
         peer_generation_);
+    const auto before_reach_cap = costs.from_robot;
     mgg::capTourCostsByReach(costs, homeDistances(clusters), flight_reach_m_);
+    if (fleet_ && robot_params_.type == mgg::RobotType::kAerialRobot) {
+      for (std::size_t i = 0; i < clusters.size(); ++i) {
+        if (clusters[i].owner_robot_id == own_id && !std::isfinite(costs.from_robot[i])) {
+          RCLCPP_INFO(get_logger(), "aerial tour: own cluster %016llx unreachable: %s",
+              static_cast<unsigned long long>(clusters[i].id),
+              std::isfinite(before_reach_cap[i]) ? "battery return reach cap" :
+              findGlobalVertex(clusters[i].representative_vertex_id) ?
+                  "disconnected or search-time blocked" : "representative off graph");
+        }
+      }
+    }
     // MGG weighed a global frontier's gain against its distance, and a
     // peer's frontier at a thousandth (rrg.cpp:5798 to 5804); the tour
     // takes only the clusters worth theirs. Run 12, robot_2: when its own
@@ -1665,6 +1806,7 @@ std::vector<Eigen::Vector3d> PlannerNode::selectionExclusions() {
 
 mgg::RecomputeGainFn PlannerNode::globalFrontierGain() {
   return [this](mgg::Vertex& vertex) {
+    if (vertex.lifted_peer_target) return;
     if (vertex.robot_id != static_cast<int>(planning_params_.robot_id)) {
       auto& gain = vertex.vol_gain;
       gain.is_frontier = gain.is_frontier && !vertex.locally_explored;
@@ -2076,6 +2218,7 @@ void PlannerNode::onNeighbourTransforms(
     neighbour_transforms_[t.child_frame_id] = {t_ours_theirs, now};
   }
   readmitQuarantinedNeighbours();
+  if (robot_params_.type == mgg::RobotType::kAerialRobot) liftedPeerFrontiers();
 }
 
 void PlannerNode::readmitQuarantinedNeighbours() {
@@ -2159,6 +2302,7 @@ bool PlannerNode::refreshNeighbourTransform(int sender,
 }
 
 void PlannerNode::withdrawUnplacedNeighbours() {
+  if (robot_params_.type == mgg::RobotType::kAerialRobot) liftedPeerFrontiers();
   for (const auto& [robot, frame] : neighbour_frames_) {
     if (refreshNeighbourTransform(robot, frame)) continue;
     if (global_graph_->isQuarantined(robot) ||
@@ -2281,6 +2425,12 @@ void PlannerNode::onNeighbourGraph(mgg_msgs::msg::Graph::ConstSharedPtr msg) {
 
   const mgg::GraphExchange incoming = fromGraphMsg(*msg);
   neighbour_roadmaps_[sender] = incoming;
+  // Ground coordinates cannot be aerial rendezvous. Keep their evidence as
+  // targets only; never import a sender's edges into the aerial roadmap.
+  if (robot_params_.type == mgg::RobotType::kAerialRobot) {
+    liftedPeerFrontiers();
+    return;
+  }
   const mgg::MergeResult r = mergeNeighbourRoadmap(incoming);
   if (r.merged && !global_graph_->isQuarantined(sender)) {
     roadmaps_to_readmit_.erase(sender);
@@ -3633,10 +3783,22 @@ bool PlannerNode::routeOverGlobalGraph(const mgg::StateVec goal,
   mgg::Vertex* goal_vertex = nullptr;
   mgg::StateVec goal_state = goal;
   bool exact_goal = false;
-  if (goal_tolerance <= 0.0 ||
+  // Query endpoints are deliberately absent from the rendezvous index.
+  if (robot_params_.type == mgg::RobotType::kAerialRobot && goal_tolerance > 0) {
+    for (const int id : lifted_target_vertices_) {
+      auto* candidate = findGlobalVertex(id);
+      if (candidate && candidate->lifted_peer_target &&
+          !global_graph_->edge_map_[id].empty() &&
+          (candidate->state.head<3>() - goal.head<3>()).norm() <= goal_tolerance) {
+        goal_vertex = candidate;
+        break;
+      }
+    }
+  }
+  if (!goal_vertex && (goal_tolerance <= 0.0 ||
       !global_graph_->getNearestVertexInRange(&goal, goal_tolerance,
                                               &goal_vertex) ||
-      goal_vertex == nullptr) {
+      goal_vertex == nullptr)) {
     exact_goal = true;
     const int before_goal = global_graph_->getNumVertices();
     if (projectGoalToDrivingHeight(goal_state)) {
@@ -4046,7 +4208,9 @@ bool PlannerNode::runGlobalPlanner(int target_id, std::string& reason,
   if (target_id >= 0) {
     // Resuming the repositioning that was under way (rrg.cpp:5556).
     target = findGlobalVertex(target_id);
-    if (target == nullptr || target->type != mgg::VertexType::kFrontier ||
+    if (target == nullptr ||
+        (target->type != mgg::VertexType::kFrontier &&
+         !(target->lifted_peer_target && !global_graph_->edge_map_[target_id].empty())) ||
         !inside_region(*target)) {
       target = nullptr;  // reached, demoted or excluded: choose anew
     }

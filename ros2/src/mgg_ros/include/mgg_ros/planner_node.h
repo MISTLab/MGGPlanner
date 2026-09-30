@@ -637,6 +637,14 @@ class PlannerNode : public rclcpp::Node {
   /// The last roadmap received within communication range from each
   /// neighbour, to re-admit it from when its transform returns.
   std::unordered_map<int, mgg::GraphExchange> neighbour_roadmaps_;
+  std::vector<mgg::FrontierCluster> liftedPeerFrontiers();
+  // A bounded reusable pool; detached and revalidated on every query. Never
+  // indexed as roadmap anchors, scored as own frontiers, or broadcast.
+  std::weak_ptr<mgg::GraphManager> lifted_target_graph_;
+  std::vector<int> lifted_target_vertices_;
+  double aerial_frontier_height_m_ = 1.3;
+  double aerial_min_height_m_ = 0.8;
+  double aerial_max_height_m_ = 2.5;
   struct AerialMergeCache {
     mgg::GraphExchange snapshot;
     std::weak_ptr<mgg::GraphManager> graph;

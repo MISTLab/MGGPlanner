@@ -1,0 +1,7 @@
+# Aerial fleet targets
+
+Ground roadmap messages carry ground heights, not aerial body centres. A rendezvous at that height fails the aerial observed-free body sweep. An aerial receiver therefore keeps peer snapshots as frontier evidence, rather than importing their edges.
+
+`aerial_frontier_height_m` (default 1.3 m) lifts a peer frontier above its transformed ground height, clamped to `aerial_min_height_m` (0.8) and `aerial_max_height_m` (2.5). Set these to the drone's configured height band. These are candidate targets only: a strict static aerial sweep must join each to the receiver's own roadmap within 5 m. Unknown space refuses the target. At most 64 highest-gain, spatially separated admitted targets have query endpoint slots. The slots are detached and revalidated against the current snapshot, transform and map on each query; explored/withdrawn evidence disappears. They are never nearest-neighbour rendezvous, never scored as own frontiers, and never broadcast. Their edges are receiver-validated, never ground edges.
+
+Without the fleet auction, aerial reachability and battery-return reach filtering precede the preference for own clusters. Ground preference is unchanged. Logs distinguish an own representative missing from the graph, a disconnected/search-blocked route, and the battery return cap. Route admission still checks the entire aerial path with strict observed-free queries.
