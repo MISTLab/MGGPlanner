@@ -1924,14 +1924,24 @@ void PlannerNode::onNoGoZones(
 
 void PlannerNode::onNoGoDiscs(
     geometry_msgs::msg::PoseArray::ConstSharedPtr msg) {
-  if (msg->header.frame_id != world_frame_) return;
+  if (msg->header.frame_id != world_frame_) {
+    RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 5000,
+                         "ignoring no-go discs in frame '%s' (expected '%s')",
+                         msg->header.frame_id.c_str(), world_frame_.c_str());
+    return;
+  }
   std::vector<Eigen::Vector2d> centres;
   std::vector<double> reaches;
   for (const auto& pose : msg->poses) {
     const auto& p = pose.position;
     // Reject the whole replacement, never silently drop a malformed margin.
     if (!std::isfinite(p.x) || !std::isfinite(p.y) ||
-        !std::isfinite(p.z) || p.z <= 0.0) return;
+        !std::isfinite(p.z) || p.z <= 0.0) {
+      RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 5000,
+                           "invalid no-go disc: need finite XY and a positive "
+                           "finite centre-line reach in position.z; keeping previous set");
+      return;
+    }
     centres.emplace_back(p.x, p.y);
     reaches.push_back(p.z);
   }

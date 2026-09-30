@@ -3069,3 +3069,41 @@ TEST(MolaMap, CentreLineDiscsUseTheirOwnReachAndAllowOutwardSweeps) {
   EXPECT_FALSE(provider.dynamicBoxBlocked({0, 0, 0}, {1, 1, 1}));
   EXPECT_TRUE(provider.dynamicBoxBlocked({10, 0, 0}, {1, 1, 1}));
 }
+
+
+TEST(MolaMap, FullPadReachDepartureFromCentreAndNearWall) {
+  for (bool wall : {false, true}) {
+    SCOPED_TRACE(wall);
+    Publication publication;
+    std::vector<Voxel> occupied, free;
+    for (int x = -25; x < 25; ++x) {
+      for (int y = -8; y < 8; ++y) {
+        occupied.push_back({x, y, -1});
+        for (int z = 0; z < 8; ++z) {
+          (wall && x == 4 ? occupied : free).push_back({x, y, z});
+        }
+      }
+    }
+    const auto request = publication.publish(0, occupied, free, true,
+        Eigen::Isometry3d::Identity(), {}, {}, 0.5);
+    MolaMap provider(config(publication));
+    provider.requestSnapshot(request);
+    ASSERT_TRUE(waitFor([&]() { return provider.getStatus(); })) << provider.lastError();
+    provider.setNoGoCentreLineDiscs({{0, 0}}, {2.43});
+    auto robot = bunker();
+    auto planning = bunkerPlanning();
+    planning.min_observed_ground_fraction = 0.0;
+    const mgg::GroundProjection ground(provider, planning);
+    const mgg::StateVec start(0, 0, planning.max_ground_height - 0.1, 0);
+    mgg::Departure departure;
+    ASSERT_TRUE(mgg::findDeparture(provider, ground, robot, planning, start, departure,
+        [&](const auto& path) {
+          return !provider.dynamicBoxBlocked(path.back().template head<3>(), robot.getPlanningSize())
+              && mgg::roomToTurn(provider, robot, planning, path.back());
+        }, 3.0, true));
+    EXPECT_EQ(departure.reverse, wall);
+    EXPECT_GE(std::abs(departure.path.back().x()), 2.43);
+    EXPECT_LE(std::abs(departure.path.back().x()), 3.0);
+    EXPECT_TRUE(provider.dynamicSweepBlocked(departure.path.back().head<3>(), start.head<3>(), 0.6));
+  }
+}

@@ -8,3 +8,10 @@ Both inputs use reliable, transient-local `geometry_msgs/msg/PoseArray` (depth 1
 SwarmDeck uses one explicit disc per drone pad per ground robot: take-off clearance plus that ground platform's planning half-diagonal. Neither topic replaces the other. Both affect graph routing, path validation and MOLA dynamic box/sweep queries. A path starting in a disc may depart monotonically outward; it cannot re-enter and cannot end inside. Static obstacles are never exempted. Multiple overlapping discs still require outward motion from every containing disc; callers must not approximate a larger disc by a ring of smaller centres (which can trap an interior start).
 
 Tests: `NoGoZones.PerDiscReachPreservesTerrainAndAllowsPadDeparture`, `MolaMap.CentreLineDiscsUseTheirOwnReachAndAllowOutwardSweeps`, `PlannerNodeTest.PadDiscsHaveIndependentRadiiAndDoNotReplaceTerrain`, and `PlannerNodeTest.PadDiscsStartingInsidePlansOutOnBothBackends`.
+
+Wrong-frame or malformed discs produce throttled warnings (5 seconds) and keep
+the previous set. Planner and MOLA tests exercise a deployed Bunker planning
+footprint at the exact centre of a 2.43 m disc, both on open floor and with a
+wall 0.8 m ahead: the latter backs out without entering the wall. The bounded
+straight fallback clears the reach within its existing 3.0 m cap in both
+scenes; no departure distance or collision constraint was relaxed.

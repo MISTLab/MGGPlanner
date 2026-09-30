@@ -9853,4 +9853,75 @@ TEST_F(PlannerNodeTest, PadDiscsStartingInsidePlansOutOnBothBackends) {
   }
 }
 
+
+TEST_F(PlannerNodeTest, PadDiscsRejectWithThrottledDiagnostics) {
+  auto node = makeNode("pad_diagnostics");
+  // Throttle state is shared at the log call site across test nodes. Advance
+  // this node's clock past earlier tests, then hold it still for both calls.
+  const auto after_previous_tests = node->now().nanoseconds() + 10000000000LL;
+  auto* clock = node->get_clock()->get_clock_handle();
+  ASSERT_EQ(rcl_enable_ros_time_override(clock), RCL_RET_OK);
+  ASSERT_EQ(rcl_set_ros_time_override(clock, after_previous_tests), RCL_RET_OK);
+  PlannerNodeTestPeer::receiveNoGoDiscs(*node, "world", {{0, 0, 2.43}});
+  testing::internal::CaptureStderr();
+  for (int i = 0; i < 2; ++i) {
+    PlannerNodeTestPeer::receiveNoGoDiscs(*node, "wrong", {});
+    PlannerNodeTestPeer::receiveNoGoDiscs(*node, "world", {{0, 0, -1}});
+  }
+  const std::string log = testing::internal::GetCapturedStderr();
+  for (const std::string text : {"ignoring no-go discs in frame", "invalid no-go disc"}) {
+    const auto first = log.find(text);
+    EXPECT_NE(first, std::string::npos) << log;
+    if (first != std::string::npos) EXPECT_EQ(log.find(text, first + 1), std::string::npos);
+  }
+  EXPECT_FALSE(PlannerNodeTestPeer::noGoAdmits(*node, {{3, 0, 0, 0}, {0, 0, 0, 0}}));
+}
+
+TEST_F(PlannerNodeTest, PadCentreDepartureClearsFullReachWithAndWithoutFrontWall) {
+  for (const bool mola : {false, true}) {
+    for (const bool wall : {false, true}) {
+      SCOPED_TRACE(std::string(mola ? "mola" : "cloud") + (wall ? " wall" : " open"));
+      auto node = makeNode("pad_centre_departure");
+      PlannerNodeTestPeer::setRobotFootprint(*node, 1.073, 0.828);
+      std::unique_ptr<MolaFloorProduct> product;
+      if (mola) {
+        std::vector<std::array<double, 4>> walls;
+        if (wall) walls.push_back({0.8, 1.0, -1.5, 1.5});
+        product = std::make_unique<MolaFloorProduct>(-5, 5, -1.5, 1.5, walls);
+        PlannerNodeTestPeer::useMolaMap(*node, product->serve());
+        PlannerNodeTestPeer::serveMap(*node, "component:test", 1);
+        PlannerNodeTestPeer::setMinObservedGround(*node, 0.0);
+      } else {
+        PlannerNodeTestPeer::observeFloor(*node, -5, 5, -1.5, 1.5);
+        if (wall) PlannerNodeTestPeer::observeWallAlongY(*node, -1.5, 1.5, 0.8);
+      }
+      PlannerNodeTestPeer::acceptOdometry(*node, 0.0, 0.0, 1.0);
+      PlannerNodeTestPeer::receiveNoGoDiscs(*node, "world", {{0, 0, 2.43}});
+      auto response = std::make_shared<mgg_msgs::srv::PlannerSrv::Response>();
+      PlannerNodeTestPeer::plan(*node, response);
+      ASSERT_EQ(response->status, mgg_msgs::srv::PlannerSrv::Response::FORWARD);
+      ASSERT_GE(response->path.size(), 2u);
+      EXPECT_GE(std::abs(response->path.back().position.x), 2.43);
+      EXPECT_LE(std::abs(response->path.back().position.x), 3.0);
+      double previous = 0.0;
+      for (const auto& pose : response->path) {
+        const double out = std::hypot(pose.position.x, pose.position.y);
+        EXPECT_GE(out + 1e-6, previous);
+        previous = out;
+        if (wall) EXPECT_LE(pose.position.x, 1e-6);
+      }
+      // Also force the bounded fallback, rather than relying on the lattice
+      // selecting it. The full plan may find a non-straight admissible route.
+      std::vector<mgg::StateVec> straight;
+      bool reverse = false;
+      ASSERT_TRUE(PlannerNodeTestPeer::straightDeparture(*node,
+          {0, 0, response->path.front().position.z, 0}, straight, reverse));
+      EXPECT_EQ(reverse, wall);
+      EXPECT_GE(std::abs(straight.back().x()), 2.43);
+      EXPECT_LE(std::abs(straight.back().x()), 3.0);
+      for (const auto& pose : straight) EXPECT_NEAR(pose.y(), 0.0, 1e-6);
+    }
+  }
+}
+
 }  // namespace mgg_ros
