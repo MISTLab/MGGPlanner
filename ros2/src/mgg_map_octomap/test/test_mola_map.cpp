@@ -192,8 +192,8 @@ class Publication {
     if (qualified) {
       submap["sensor_origins"] = json::array({json::array({0.0, 0.0, 0.0})});
       submap["ray_evidence"] = {
-          {"return_semantics", "first_return"},
-          {"deskew", "not_required"},
+          {"return_semantics", return_semantics},
+          {"deskew", deskew},
           {"origin_association", "single_capture"}};
     }
     json manifest{{"map_id", "onboard"},
@@ -276,6 +276,9 @@ class Publication {
   }
 
   std::filesystem::path root;
+  // The ray evidence a qualified product's manifest declares.
+  std::string return_semantics = "first_return";
+  std::string deskew = "not_required";
 
  private:
   static bool less(const Voxel& a, const Voxel& b) {
@@ -629,6 +632,59 @@ TEST(MolaMap, RejectsRetirementWithoutQualifiedRayEvidence) {
   EXPECT_NE(provider.lastError().find("lack qualified ray evidence"),
             std::string::npos)
       << provider.lastError();
+}
+
+// A deskewed Ouster capture reports the strongest return per beam. Its
+// keyframes qualify rays exactly as first returns do.
+TEST(MolaMap, AcceptsDeskewedStrongestReturnRayEvidence) {
+  Publication publication;
+  publication.return_semantics = "strongest_return";
+  publication.deskew = "deskewed";
+  const Voxel endpoint{10, 0, 2};
+  const auto request = publication.publish(
+      0, {endpoint}, freeBlockWithout(endpoint), true,
+      Eigen::Isometry3d::Identity(), {}, {}, 0.5, 1);
+  MolaMap provider(config(publication));
+  provider.requestSnapshot(request);
+  ASSERT_TRUE(waitFor([&]() { return provider.getStatus(); }))
+      << provider.lastError();
+  EXPECT_EQ(provider.getVoxelStatus({2.1, 0.1, 0.5}), VoxelStatus::kOccupied);
+  EXPECT_EQ(provider.getVoxelStatus({0.1, 0.1, 0.1}), VoxelStatus::kFree);
+}
+
+TEST(MolaMap, RejectsStrongestReturnGridWithAMismatchedQualifiedCount) {
+  Publication publication;
+  publication.return_semantics = "strongest_return";
+  publication.deskew = "deskewed";
+  const auto request = publication.publish(0, {{5, 0, 0}}, freeBlock());
+  rewriteGridMetadata(publication.root, [](json& metadata) {
+    metadata["qualified_ray_keyframes"] = 2;
+  });
+  MolaMap provider(config(publication));
+  provider.requestSnapshot(request);
+  ASSERT_TRUE(waitFor([&]() { return !provider.lastError().empty(); }));
+  EXPECT_FALSE(provider.getStatus());
+  EXPECT_NE(provider.lastError().find("qualified-ray provenance"),
+            std::string::npos)
+      << provider.lastError();
+}
+
+TEST(MolaMap, OtherReturnSemanticsDoNotQualifyRays) {
+  for (const char* semantics : {"unknown", "last_return", ""}) {
+    Publication publication;
+    publication.return_semantics = semantics;
+    publication.deskew = "deskewed";
+    // The grid claims one qualified keyframe; the manifest does not back it.
+    const auto request = publication.publish(0, {{5, 0, 0}}, freeBlock());
+    MolaMap provider(config(publication));
+    provider.requestSnapshot(request);
+    ASSERT_TRUE(waitFor([&]() { return !provider.lastError().empty(); }))
+        << semantics;
+    EXPECT_FALSE(provider.getStatus()) << semantics;
+    EXPECT_NE(provider.lastError().find("qualified-ray provenance"),
+              std::string::npos)
+        << semantics << ": " << provider.lastError();
+  }
 }
 
 TEST(MolaMap, InvalidAndUnrepresentableQueriesRemainUnknown) {

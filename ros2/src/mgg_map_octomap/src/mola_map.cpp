@@ -816,8 +816,16 @@ std::shared_ptr<const MolaMap::Snapshot> MolaMap::loadOnce(
     }
     const auto evidence = submap.find("ray_evidence");
     const auto origins = submap.find("sensor_origins");
+    // SwarmDeck certifies free space from first returns (simulation) and from
+    // deskewed strongest returns (an Ouster's single-return profile reports
+    // the strongest return per beam, the same data a Nav2 costmap raytraces).
+    // Both qualify a keyframe's rays under the same deskew and origin rules.
+    const std::string returns =
+        evidence != submap.end() && evidence->is_object()
+            ? evidence->value("return_semantics", std::string())
+            : std::string();
     if (evidence != submap.end() && evidence->is_object() &&
-        evidence->value("return_semantics", std::string()) == "first_return" &&
+        (returns == "first_return" || returns == "strongest_return") &&
         (evidence->value("deskew", std::string()) == "deskewed" ||
          evidence->value("deskew", std::string()) == "not_required") &&
         evidence->value("origin_association", std::string()) == "single_capture" &&
