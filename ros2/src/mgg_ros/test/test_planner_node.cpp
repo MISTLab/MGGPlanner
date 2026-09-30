@@ -83,11 +83,11 @@ class MergeCountingMolaMap : public mgg::MolaMap {
  public:
   explicit MergeCountingMolaMap(mgg::MolaMapConfig config) : mgg::MolaMap(config) {}
   mutable int merge_sweeps = 0;
-  mgg::VoxelStatus getStrictPathStatus(const Eigen::Vector3d& a,
-                                      const Eigen::Vector3d& b,
-                                      const Eigen::Vector3d& size) const override {
+  mgg::VoxelStatus getStaticStrictPathStatus(const Eigen::Vector3d& a,
+                                            const Eigen::Vector3d& b,
+                                            const Eigen::Vector3d& size) const override {
     ++merge_sweeps;
-    return mgg::MolaMap::getStrictPathStatus(a, b, size);
+    return mgg::MolaMap::getStaticStrictPathStatus(a, b, size);
   }
 };
 
@@ -4101,6 +4101,35 @@ TEST_F(PlannerNodeTest, IdenticalAerialPeerSnapshotsPreserveOwnEdgesAndSkipSweep
   EXPECT_TRUE(PlannerNodeTestPeer::mergeRoadmap(*node, incoming).merged);
   EXPECT_GT(counter->merge_sweeps, refreshed_sweeps);
   EXPECT_TRUE(PlannerNodeTestPeer::ownPeerEdgeExists(*node, root, 1));
+}
+
+TEST_F(PlannerNodeTest, AerialMergeKeepsSenderEdgesUnderPeerAndNoGoMargins) {
+  for (bool no_go : {false, true}) {
+    SCOPED_TRACE(no_go);
+    auto node = makeNode("aerial_static_merge");
+    PlannerNodeTestPeer::setAerialRobot(*node);
+    MolaFloorProduct product(-1, 3, -1, 1);
+    auto map = product.serve();
+    auto* provider = map.get();
+    if (no_go) provider->setNoGoDiscs({{1.2, .1}}, .6);
+    else provider->setTransientDiscs({{1.2, .1}}, .6, 600);
+    PlannerNodeTestPeer::useMolaMap(*node, std::move(map));
+    const int root = PlannerNodeTestPeer::addGlobalVertex(*node, 1, 0, .1, .4, {});
+    PlannerNodeTestPeer::addGlobalVertex(*node, 1, .5, .1, .4, {root});
+    mgg::GraphExchange incoming;
+    for (int i = 0; i < 2; ++i) {
+      mgg::GraphExchangeVertex v;
+      v.id = i; v.robot_id = 2; v.state = mgg::StateVec(.7 + .5*i, .1, .4, 0);
+      incoming.vertices.push_back(v);
+    }
+    incoming.edges = {{0, 1, .5}};
+    const bool merged = PlannerNodeTestPeer::mergeRoadmap(*node, incoming).merged;
+    EXPECT_TRUE(merged);
+    if (merged) EXPECT_TRUE(PlannerNodeTestPeer::peerEdgeExists(*node, 0, 1));
+    // The margin still exists for the search/controller after static adoption.
+    EXPECT_EQ(provider->getStrictPathStatus({.7, .1, .4}, {1.2, .1, .4}, {.2, .2, .15}),
+              mgg::VoxelStatus::kOccupied);
+  }
 }
 
 TEST_F(PlannerNodeTest, MolaAerialMergeChecksBodyOffsetAndIncomingEdges) {

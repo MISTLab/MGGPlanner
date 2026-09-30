@@ -1395,6 +1395,19 @@ VoxelStatus MolaMap::getStrictPathStatus(
       enclosingSize(transform.linear(), box_size));
 }
 
+VoxelStatus MolaMap::getStaticStrictPathStatus(
+    const Eigen::Vector3d& start, const Eigen::Vector3d& end,
+    const Eigen::Vector3d& box_size) const {
+  const auto snapshot = current();
+  if (snapshot == nullptr) return VoxelStatus::kUnknown;
+  if (!start.allFinite() || !end.allFinite() || !box_size.allFinite() ||
+      (box_size.array() < 0.0).any()) return VoxelStatus::kUnknown;
+  const auto& transform = snapshot->request.component_from_navigation;
+  return snapshot->map->getStrictPathStatus(
+      transform * start, transform * end,
+      enclosingSize(transform.linear(), box_size));
+}
+
 void MolaMap::getScanStatus(
     const Eigen::Vector3d& pos,
     const std::vector<Eigen::Vector3d>& multiray_endpoints, GainCounts& gain,

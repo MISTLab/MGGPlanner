@@ -235,6 +235,9 @@ class MolaMap : public MapInterface {
   VoxelStatus getStrictPathStatus(const Eigen::Vector3d& start,
                                   const Eigen::Vector3d& end,
                                   const Eigen::Vector3d& box_size) const override;
+  VoxelStatus getStaticStrictPathStatus(const Eigen::Vector3d& start,
+                                        const Eigen::Vector3d& end,
+                                        const Eigen::Vector3d& box_size) const override;
   void getScanStatus(
       const Eigen::Vector3d& pos,
       const std::vector<Eigen::Vector3d>& multiray_endpoints, GainCounts& gain,

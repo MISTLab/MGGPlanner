@@ -235,6 +235,13 @@ class MapInterface {
       const Eigen::Vector3d& box_size) const {
     return getPathStatus(start, end, box_size, true);
   }
+  /// Strict static sweep, without dynamic peer/no-go margins. Roadmap
+  /// admission uses this; searches apply the current dynamic margins.
+  virtual VoxelStatus getStaticStrictPathStatus(
+      const Eigen::Vector3d& start, const Eigen::Vector3d& end,
+      const Eigen::Vector3d& box_size) const {
+    return getStrictPathStatus(start, end, box_size);
+  }
   /// Conservatively reject occupied swept volume while allowing valid map
   /// queries to contain unknown air. Each sample is the AABB swept over one
   /// <=voxel-resolution interval, so obstacles at sample boundaries cannot

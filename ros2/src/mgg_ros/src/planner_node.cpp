@@ -2172,14 +2172,19 @@ mgg::MergeResult PlannerNode::mergeNeighbourRoadmap(
       }
     }
   }
+  // Peers occupy the roadmap only at search time, as for keyframe rebuilds.
+  std::optional<mgg::MolaMap::TransientDiscPin> no_peers;
+  if (aerial && mola_map_ != nullptr) {
+    no_peers.emplace(*mola_map_, std::vector<Eigen::Vector2d>{}, 0.0);
+  }
   // The merge asks whether the robot could actually drive between two graphs
   // before joining them; that judgement needs the map, so it is injected.
   const auto admissible = [this, &ctx](const Eigen::Vector3d& from,
                                        const Eigen::Vector3d& to) {
     if (robot_params_.type == mgg::RobotType::kAerialRobot) {
-      return map_->getStrictPathStatus(from + robot_params_.center_offset,
-                                        to + robot_params_.center_offset,
-                                        ctx.robot_box_size) ==
+      return map_->getStaticStrictPathStatus(from + robot_params_.center_offset,
+                                              to + robot_params_.center_offset,
+                                              ctx.robot_box_size) ==
              mgg::VoxelStatus::kFree;
     }
     std::vector<Eigen::Vector3d> projected;
