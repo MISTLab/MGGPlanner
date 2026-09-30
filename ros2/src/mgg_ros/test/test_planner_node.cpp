@@ -4232,6 +4232,21 @@ TEST_F(PlannerNodeTest, AerialPeerCylinderAddsMarginInThreeDimensionsGroundUncha
   }
 }
 
+TEST_F(PlannerNodeTest, AerialCylinderAllowsCurrentPoseToLeaveButNotEnterDeeper) {
+  auto node = makeNode("aerial_cylinder_exit");
+  PlannerNodeTestPeer::setAerialRobot(*node);
+  PlannerNodeTestPeer::acceptOdometryFacing(*node, .5, 0, 0, 1, 1.2);
+  PlannerNodeTestPeer::aerialPeerBodies(*node, .97, .6);
+  EXPECT_TRUE(PlannerNodeTestPeer::peerPathClear(*node, {.5,0,1.2}, {2,0,1.2}));
+  EXPECT_TRUE(PlannerNodeTestPeer::peerPathClear(*node, {.5,0,1.2}, {.6,0,1.2}));
+  EXPECT_TRUE(PlannerNodeTestPeer::peerPathClear(*node, {.5,0,1.2}, {.5,0,1.6}));
+  EXPECT_TRUE(PlannerNodeTestPeer::peerPathClear(*node, {.5,0,1.2}, {.5,1,1.2}));
+  EXPECT_FALSE(PlannerNodeTestPeer::peerPathClear(*node, {.5,0,1.2}, {.4,0,1.2}));
+  EXPECT_FALSE(PlannerNodeTestPeer::peerPathClear(*node, {.5,0,1.2}, {-.6,0,1.2}));
+  EXPECT_FALSE(PlannerNodeTestPeer::peerPathClear(*node, {.5,0,1.2}, {.5,0,1.1}));
+  EXPECT_FALSE(PlannerNodeTestPeer::peerPathClear(*node, {.4,0,1.2}, {2,0,1.2}));
+}
+
 TEST_F(PlannerNodeTest, AerialCylinderDetourSurvivesPlanAndReturnHomeShortcut) {
   for (bool home : {false, true}) {
     SCOPED_TRACE(home);

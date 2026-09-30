@@ -2168,6 +2168,14 @@ bool PlannerNode::peerBlocksSegment(const Eigen::Vector3d& from,
       const double t = delta.squaredNorm() > 0
           ? std::clamp(-a.dot(delta) / delta.squaredNorm(), 0.0, 1.0) : 0;
       const double reach = body.radius + aerial_peer_margin_m_ + .5 * box.head<2>().norm();
+      const Eigen::Vector2d at_start = start.head<2>() - body.top.head<2>();
+      const Eigen::Vector2d travel = end.head<2>() - start.head<2>();
+      // This is a peer margin, not measured occupancy. Like disc exits,
+      // allow a robot already inside to move monotonically away, or climb
+      // vertically. A point query still reports the volume as blocked.
+      if (start.z() <= ceiling && at_start.norm() <= reach &&
+          ((travel.squaredNorm() > 1e-12 && at_start.dot(travel) >= -1e-9) ||
+           (travel.squaredNorm() <= 1e-12 && end.z() > start.z() + 1e-9))) continue;
       if ((a + t * delta).norm() <= reach) return true;
     }
   }
@@ -2234,6 +2242,7 @@ void PlannerNode::pinPeerBodies(std::optional<PeerBodyPin>& pin) {
 
 bool PlannerNode::peerAdmissible(const std::vector<mgg::StateVec>& path) const {
   if (robot_params_.type == mgg::RobotType::kAerialRobot && !path.empty() &&
+      (path.front().head<3>() - current_state_.head<3>()).norm() > 1e-6 &&
       peerBlocksSegment(path.front().head<3>(), path.front().head<3>())) return false;
   for (std::size_t i = 1; i < path.size(); ++i) {
     if (peerBlocksSegment(path[i - 1].head<3>(), path[i].head<3>())) {
