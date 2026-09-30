@@ -56,7 +56,7 @@ struct ExpandContext {
   /// sensor's near-field ground blind spot. The edge is only topology here;
   /// explicit objectives revalidate it with strict body/unknown checks.
   double hanging_root_edge_length_max = 0.0;
-  /// Qualified simulation exploration may offer a lattice candidate whose
+  /// Qualified ground simulation exploration may offer a lattice candidate whose
   /// body volume is partly unobserved. Known occupied volume still rejects
   /// the candidate, and ground projection plus the edge policy remain
   /// mandatory before it can enter the graph. False keeps the hardware and
@@ -65,7 +65,8 @@ struct ExpandContext {
   /// Unobserved space blocks the candidate's edge and its neighbour edges,
   /// as upstream's expandGraph always had it (stop_at_unknown_voxel true at
   /// rrg.cpp:725, 813 and 820). The local lattice leaves this false and
-  /// keeps its own unknown policy; the global roadmap sets it, so a roadmap
+  /// keeps its own ground unknown policy; aerial edges are always strict.
+  /// The global roadmap sets it, so a roadmap
   /// edge is one the map has seen traversable, not one it has not seen.
   bool stop_at_unknown = false;
   /// Qualified simulation bootstrap keeps the physical root at its odometry
@@ -74,6 +75,8 @@ struct ExpandContext {
   bool preserve_hanging_root_start_height = false;
   /// Edges out of vertex zero (the robot) are swept from the edge of the
   /// robot's own footprint: where the robot stands is not an obstacle to it.
+  /// Aerial departures instead allow unknown only inside the physical root's
+  /// body AABB, never occupied cells; root_is_robot must also be true.
   bool root_footprint_exempt = false;
   /// Vertex zero is the robot, where it stands: an edge out of it is only
   /// ever driven outwards, so the ground ahead is checked one way only

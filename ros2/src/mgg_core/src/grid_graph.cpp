@@ -184,8 +184,10 @@ GridGraphResult buildGridGraph(GraphManager& graph, const StateVec& state,
     }
     body.size = ctx.robot_box_size;
     const Eigen::Vector3d center = candidate + ctx.robot->center_offset;
-    VoxelStatus status = ctx.map->getBoxStatus(
-        center, ctx.robot_box_size, !ctx.allow_unknown_lattice_body);
+    VoxelStatus status = ctx.robot->type == RobotType::kAerialRobot
+        ? ctx.map->getStrictBoxStatus(center, ctx.robot_box_size)
+        : ctx.map->getBoxStatus(center, ctx.robot_box_size,
+                                !ctx.allow_unknown_lattice_body);
     if (ground_robot && status == VoxelStatus::kOccupied &&
         !ctx.map->dynamicBoxBlocked(center, ctx.robot_box_size)) {
       status = orientedBoxPathStatus(*ctx.map, center, center, body,

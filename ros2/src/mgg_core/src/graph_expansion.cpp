@@ -1,6 +1,7 @@
 #include "mgg_core/graph_expansion.h"
 #include "mgg_core/departure.h"
 
+#include <algorithm>
 #include <cmath>
 #include <utility>
 #include <vector>
@@ -54,9 +55,47 @@ double averageInclination(const std::vector<Eigen::Vector3d>& edge) {
   return total / static_cast<double>(edge.size() - 1);
 }
 
+// Only the physical aerial root may contain unknown air. Check occupied
+// volume over the whole departure, then check the swept volume outside the
+// root AABB strictly. Splitting each swept interval into slabs preserves the
+// unknown check beside the root, not just after the body has left it.
+bool aerialRootDeparture(const ExpandContext& ctx,
+                         const Eigen::Vector3d& start,
+                         const Eigen::Vector3d& end) {
+  const Eigen::Vector3d size = ctx.robot_box_size;
+  if (ctx.map->getOccupiedOnlyPathStatus(start, end, size) !=
+      VoxelStatus::kFree) return false;
+  const double resolution = ctx.map->getResolution();
+  const double steps_d = std::ceil((end - start).norm() / resolution);
+  constexpr int kMaxRootSweepIntervals = 4096;
+  if (!std::isfinite(steps_d) || resolution <= 0.0 ||
+      steps_d > kMaxRootSweepIntervals)
+    return false;
+  const int steps = std::max(1, static_cast<int>(steps_d));
+  const Eigen::Vector3d step = (end - start) / steps;
+  const Eigen::Vector3d root_lo = start - size / 2;
+  const Eigen::Vector3d root_hi = start + size / 2;
+  for (int i = 0; i < steps; ++i) {
+    const Eigen::Vector3d center = start + (i + 0.5) * step;
+    const Eigen::Vector3d half = (size + step.cwiseAbs()) / 2;
+    const Eigen::Vector3d lo = center - half, hi = center + half;
+    for (int axis = 0; axis < 3; ++axis) {
+      for (bool upper : {false, true}) {
+        Eigen::Vector3d slab_lo = lo, slab_hi = hi;
+        if (upper) slab_lo[axis] = std::max(lo[axis], root_hi[axis]);
+        else slab_hi[axis] = std::min(hi[axis], root_lo[axis]);
+        if (slab_hi[axis] <= slab_lo[axis]) continue;
+        if (ctx.map->getStrictBoxStatus((slab_lo + slab_hi) / 2,
+                                        slab_hi - slab_lo) !=
+            VoxelStatus::kFree) return false;
+      }
+    }
+  }
+  return true;
+}
+
 /// Can the robot travel the segment? Fills `projected_edge` for ground robots.
-/// `stop_at_unknown` makes unobserved space block the edge; the local lattice
-/// leaves it passable, the global roadmap does not.
+/// Only ground lattice edges may use the relaxed unknown policy.
 bool edgeTraversable(const ExpandContext& ctx, const Eigen::Vector3d& start,
                      const Eigen::Vector3d& end, bool is_hanging,
                      bool preserve_start_height,
@@ -64,8 +103,8 @@ bool edgeTraversable(const ExpandContext& ctx, const Eigen::Vector3d& start,
                      ExpandGraphReport& rep, bool stop_at_unknown = false,
                      EdgeTravel travel = EdgeTravel::kBothWays) {
   if (ctx.robot->type == RobotType::kAerialRobot) {
-    return ctx.map->getPathStatus(start, end, ctx.robot_box_size,
-                                  stop_at_unknown) == VoxelStatus::kFree;
+    return ctx.map->getStrictPathStatus(start, end, ctx.robot_box_size) ==
+           VoxelStatus::kFree;
   }
   // Keep the extended body aligned with travel, as for driven roadmap
   // edges; the terrain and observed-ground checks remain unchanged.
@@ -169,6 +208,16 @@ void expandGraph(GraphManager& graph, Vertex& new_vertex,
     }
   }
 
+  // Check the final aerial endpoint, including after edge-length clipping.
+  // The unknown-body allowance belongs to ground exploration, never a hover
+  // viewpoint (even when the endpoint still overlaps the physical root).
+  if (ctx.robot->type == RobotType::kAerialRobot &&
+      ctx.map->getStrictBoxStatus(new_state.head<3>() + ctx.robot->center_offset,
+                                  ctx.robot_box_size) != VoxelStatus::kFree) {
+    rep.status = ExpandGraphStatus::kErrorCollisionEdge;
+    return;
+  }
+
   // Overshoot both ends, except at the root, so an edge that just grazes an
   // obstacle is rejected.
   const Eigen::Vector3d overshoot =
@@ -187,7 +236,8 @@ void expandGraph(GraphManager& graph, Vertex& new_vertex,
   // the lattice was refused (SubT hangar, 2026-09-21). The sweep out of the
   // root therefore starts where the robot's own footprint ends; the rest of
   // the edge, and every other edge, is checked in full.
-  if (nearest_vertex->id == 0 && ctx.root_footprint_exempt &&
+  if (ctx.robot->type == RobotType::kGroundRobot &&
+      nearest_vertex->id == 0 && ctx.root_footprint_exempt &&
       direction_norm > 1e-9) {
     const Eigen::Vector3d unit = direction / direction_norm;
     const double footprint =
@@ -208,12 +258,18 @@ void expandGraph(GraphManager& graph, Vertex& new_vertex,
   // driven outwards only; any other lattice or roadmap edge either way.
   // Vertex zero is home in the roadmap and the goal in a goal lattice,
   // both of which the robot drives into.
-  bool admissible_edge = edgeTraversable(
-      ctx, start_pos, end_pos, is_hanging,
-      ctx.preserve_hanging_root_start_height && nearest_vertex->id == 0,
-      projected_edge, rep, ctx.stop_at_unknown,
-      nearest_vertex->id == 0 && ctx.root_is_robot ? EdgeTravel::kForward
-                                                   : EdgeTravel::kBothWays);
+  const bool aerial_root = ctx.robot->type == RobotType::kAerialRobot &&
+                           nearest_vertex->id == 0 && ctx.root_is_robot &&
+                           ctx.root_footprint_exempt;
+  bool admissible_edge =
+      aerial_root
+          ? aerialRootDeparture(ctx, start_pos, end_pos)
+          : edgeTraversable(
+                ctx, start_pos, end_pos, is_hanging,
+                ctx.preserve_hanging_root_start_height && nearest_vertex->id == 0,
+                projected_edge, rep, ctx.stop_at_unknown,
+                nearest_vertex->id == 0 && ctx.root_is_robot
+                    ? EdgeTravel::kForward : EdgeTravel::kBothWays);
   if (admissible_edge && ctx.projected_edge_admissible &&
       !ctx.projected_edge_admissible(projected_edge)) {
     admissible_edge = false;

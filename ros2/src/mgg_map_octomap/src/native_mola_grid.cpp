@@ -283,6 +283,12 @@ VoxelStatus NativeMolaGrid::getPathStatus(const Eigen::Vector3d& a,
                                           bool u) const {
   return path(a, b, s, u, !u);
 }
+VoxelStatus NativeMolaGrid::getOccupiedOnlyPathStatus(
+    const Eigen::Vector3d& a, const Eigen::Vector3d& b,
+    const Eigen::Vector3d& s) const {
+  // Unknown air is allowed, not measured-surface relief of occupied voxels.
+  return path(a, b, s, false, false);
+}
 VoxelStatus NativeMolaGrid::getStrictPathStatus(
     const Eigen::Vector3d& a, const Eigen::Vector3d& b,
     const Eigen::Vector3d& s) const {

@@ -1320,6 +1320,22 @@ VoxelStatus MolaMap::getPathStatus(const Eigen::Vector3d& start,
                                       stop_at_unknown_voxel);
 }
 
+VoxelStatus MolaMap::getOccupiedOnlyPathStatus(
+    const Eigen::Vector3d& start, const Eigen::Vector3d& end,
+    const Eigen::Vector3d& box_size) const {
+  const auto snapshot = current();
+  if (snapshot == nullptr) return VoxelStatus::kUnknown;
+  if (!start.allFinite() || !end.allFinite() || !box_size.allFinite() ||
+      (box_size.array() < 0.0).any())
+    return VoxelStatus::kUnknown;
+  if (discsBlockSweep(start, end, 0.5 * std::max(box_size.x(), box_size.y())))
+    return VoxelStatus::kOccupied;
+  const auto& transform = snapshot->request.component_from_navigation;
+  return snapshot->map->getOccupiedOnlyPathStatus(
+      transform * start, transform * end,
+      enclosingSize(transform.linear(), box_size));
+}
+
 VoxelStatus MolaMap::getOccupiedOnlyCylinderPathStatus(
     const Eigen::Vector3d& start, const Eigen::Vector3d& end,
     const double radius, const double height) const {

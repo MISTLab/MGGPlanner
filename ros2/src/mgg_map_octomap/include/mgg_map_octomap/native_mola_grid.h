@@ -44,6 +44,9 @@ class NativeMolaGrid final : public MapInterface {
                            bool) const override;
   VoxelStatus getPathStatus(const Eigen::Vector3d&, const Eigen::Vector3d&,
                             const Eigen::Vector3d&, bool) const override;
+  VoxelStatus getOccupiedOnlyPathStatus(const Eigen::Vector3d&,
+                                         const Eigen::Vector3d&,
+                                         const Eigen::Vector3d&) const override;
   VoxelStatus getOccupiedOnlyCylinderPathStatus(const Eigen::Vector3d&,
                                                 const Eigen::Vector3d&, double,
                                                 double) const override;

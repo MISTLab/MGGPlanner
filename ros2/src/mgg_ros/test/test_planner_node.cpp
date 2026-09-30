@@ -3960,6 +3960,41 @@ TEST_F(PlannerNodeTest, ARobotRestingInADipStillPlans) {
   ASSERT_GE(response->path.size(), 2u);
 }
 
+TEST_F(PlannerNodeTest, AerialShortcutCannotCrossToleratedUnknownVoxel) {
+  auto node = makeNode("aerial_strict_shortcut");
+  PlannerNodeTestPeer::setAerialRobot(*node);
+  mgg::OctomapConfig config;
+  config.resolution = 0.1;
+  auto map = std::make_unique<mgg::OctomapMap>(config);
+  // One unknown voxel in an otherwise observed room: small enough to pass
+  // Octomap's legacy 25-percent unknown box tolerance, not safe to shortcut.
+  for (int x = -3; x <= 23; ++x)
+    for (int y = -3; y <= 10; ++y)
+      for (int z = 0; z <= 7; ++z) {
+        if (x == 10 && y == 0 && z == 3) continue;
+        map->augmentFreeBox({0.1 * x + 0.05, 0.1 * y + 0.05, 0.1 * z + 0.05},
+                             {0.01, 0.01, 0.01});
+      }
+  auto* observed = map.get();
+  const Eigen::Vector3d size(0.2, 0.2, 0.15);
+  ASSERT_EQ(map->getPathStatus({0.05, 0.05, 0.35}, {2.05, 0.05, 0.35},
+                                size, true), mgg::VoxelStatus::kFree);
+  ASSERT_EQ(map->getStrictPathStatus({0.05, 0.05, 0.35}, {2.05, 0.05, 0.35},
+                                      size), mgg::VoxelStatus::kUnknown);
+  PlannerNodeTestPeer::useCloudMap(*node, std::move(map));
+  std::vector<mgg::StateVec> path{{0.05, 0.05, 0.35, 0},
+                                  {0.05, 0.65, 0.35, 0},
+                                  {2.05, 0.65, 0.35, 0},
+                                  {2.05, 0.05, 0.35, 0}};
+  PlannerNodeTestPeer::shortcutAndResample(*node, path, {});
+  ASSERT_GE(path.size(), 2u);
+  for (std::size_t i = 1; i < path.size(); ++i) {
+    EXPECT_EQ(observed->getStrictPathStatus(path[i - 1].head<3>(),
+                                            path[i].head<3>(), size),
+              mgg::VoxelStatus::kFree);
+  }
+}
+
 TEST_F(PlannerNodeTest, AResampledRouteThatFailsTheTurnCheckIsSentUnshortcut) {
   auto node = makeNode("shortcut_revert");
   PlannerNodeTestPeer::observeFloor(*node, -1.5, 4.0, -1.5, 1.5);

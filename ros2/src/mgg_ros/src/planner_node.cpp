@@ -2832,7 +2832,9 @@ void PlannerNode::shortcutAndResample(std::vector<mgg::StateVec>& path,
                  nullptr, mgg::EdgeTravel::kForward) ==
              mgg::ProjectedEdgeStatus::kAdmissible;
     }
-    return map_->getPathStatus(from, to, ctx.robot_box_size, true) ==
+    return map_->getStrictPathStatus(from + robot_params_.center_offset,
+                                      to + robot_params_.center_offset,
+                                      ctx.robot_box_size) ==
            mgg::VoxelStatus::kFree;
   };
   mgg::PathType points;

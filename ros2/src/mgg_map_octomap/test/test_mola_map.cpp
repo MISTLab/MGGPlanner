@@ -689,7 +689,9 @@ TEST(MolaMap, ExplorationInACorridorNarrowerThanTheClearanceStillHasAPath) {
   // A corridor 0.6 m wide along x: walls over y=[-0.4,-0.2] and [0.4,0.6].
   std::vector<Voxel> walls;
   std::vector<Voxel> corridor;
-  for (std::int64_t x = 0; x <= 10; ++x) {
+  // Include the closed rear face of the root body at x=0. This test is
+  // about viewpoint clearance, not an unobserved aerial departure.
+  for (std::int64_t x = -1; x <= 10; ++x) {
     for (std::int64_t z = 0; z <= 3; ++z) {
       walls.push_back({x, -2, z});
       walls.push_back({x, 2, z});
@@ -807,6 +809,10 @@ TEST(MolaMap, MeasuredGroundBelowBodyDoesNotInheritVoxelTop) {
   EXPECT_EQ(provider.getOccupiedOnlyCylinderPathStatus(body, body, 0.1, 0.295),
             VoxelStatus::kFree);
   EXPECT_EQ(provider.getStrictBoxStatus(body, {0.2, 0.2, 0.295}),
+            VoxelStatus::kOccupied);
+  // Aerial blind-root departures allow unknown, never ground-specific
+  // measured-surface relief of an occupied voxel.
+  EXPECT_EQ(provider.getOccupiedOnlyPathStatus(body, body, {0.2, 0.2, 0.295}),
             VoxelStatus::kOccupied);
 }
 
