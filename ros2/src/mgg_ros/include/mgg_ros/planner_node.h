@@ -632,6 +632,17 @@ class PlannerNode : public rclcpp::Node {
   /// The last roadmap received within communication range from each
   /// neighbour, to re-admit it from when its transform returns.
   std::unordered_map<int, mgg::GraphExchange> neighbour_roadmaps_;
+  struct AerialMergeCache {
+    mgg::GraphExchange snapshot;
+    std::weak_ptr<mgg::GraphManager> graph;
+    const mgg::MapInterface* map = nullptr;
+    std::uint64_t map_revision = 0;
+    Eigen::Isometry3d transform = Eigen::Isometry3d::Identity();
+    Eigen::Vector3d body_size = Eigen::Vector3d::Zero();
+    Eigen::Vector3d center_offset = Eigen::Vector3d::Zero();
+    bool merged = false;
+  };
+  std::unordered_map<int, AerialMergeCache> aerial_merge_cache_;
   /// Neighbours whose roadmap was merged and is not in the current global
   /// graph: quarantined when its transform expired, or dropped by a roadmap
   /// rebuild. Kept across rebuilds; readmitQuarantinedNeighbours merges

@@ -155,6 +155,30 @@ int GraphManager::cutNeighbourEdges(int robot_id) {
     }
     edge_map_.erase(vertex->id);
   }
+  const auto placement = neighbour_placements_.find(robot_id);
+  if (placement != neighbour_placements_.end()) placement->second.merge_owned_edges.clear();
+  return cut;
+}
+
+int GraphManager::cutMergeOwnedEdges(int robot_id) {
+  const auto found = neighbour_placements_.find(robot_id);
+  if (found == neighbour_placements_.end()) return 0;
+  int cut = 0;
+  for (const auto& [a, b] : found->second.merge_owned_edges) {
+    if (graph_->edgeExists(a, b)) {
+      graph_->removeEdge(a, b);
+      ++cut;
+    }
+    for (const auto& [from, to] : {std::make_pair(a, b), std::make_pair(b, a)}) {
+      const auto adjacency = edge_map_.find(from);
+      if (adjacency == edge_map_.end()) continue;
+      auto& edges = adjacency->second;
+      edges.erase(std::remove_if(edges.begin(), edges.end(), [to](const auto& edge) {
+        return edge.first == to;
+      }), edges.end());
+    }
+  }
+  found->second.merge_owned_edges.clear();
   return cut;
 }
 

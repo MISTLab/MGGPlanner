@@ -79,6 +79,18 @@ class SlowScanMap : public mgg::OctomapMap {
   }
 };
 
+class MergeCountingMolaMap : public mgg::MolaMap {
+ public:
+  explicit MergeCountingMolaMap(mgg::MolaMapConfig config) : mgg::MolaMap(config) {}
+  mutable int merge_sweeps = 0;
+  mgg::VoxelStatus getStrictPathStatus(const Eigen::Vector3d& a,
+                                      const Eigen::Vector3d& b,
+                                      const Eigen::Vector3d& size) const override {
+    ++merge_sweeps;
+    return mgg::MolaMap::getStrictPathStatus(a, b, size);
+  }
+};
+
 class CountingBoxMap : public mgg::OctomapMap {
  public:
   CountingBoxMap() : mgg::OctomapMap([] {
@@ -1674,6 +1686,19 @@ class PlannerNodeTestPeer {
     const std::lock_guard<std::recursive_mutex> lock(node.planner_mutex_);
     node.poses_->setOffset(2, 0, 0);
     return node.mergeNeighbourRoadmap(incoming);
+  }
+  static void advanceMapRevision(PlannerNode& node) { ++node.map_revision_; }
+  static void addCheckedOwnPeerEdge(PlannerNode& node, int own, int peer) {
+    auto* a = node.global_graph_->getVertex(own);
+    auto* b = node.global_graph_->vertex_by_robot_id_.at(2).at(peer);
+    mgg::ExpandGraphReport report;
+    ASSERT_TRUE(mgg::roadmapEdgeTraversable(node.makeGlobalContext(), *a, *b, report));
+    node.global_graph_->addEdge(a, b, (a->state - b->state).head<3>().norm());
+    ++node.graph_revision_;
+  }
+  static bool ownPeerEdgeExists(PlannerNode& node, int own, int peer) {
+    return node.global_graph_->graph_->edgeExists(
+        own, node.global_graph_->vertex_by_robot_id_.at(2).at(peer)->id);
   }
   static bool peerEdgeExists(PlannerNode& node, int from, int to) {
     const auto& vertices = node.global_graph_->vertex_by_robot_id_.at(2);
@@ -4034,6 +4059,48 @@ TEST_F(PlannerNodeTest, AerialFreshHoverCanDepartForTourAndGlobalRoute) {
   EXPECT_NE(PlannerNodeTestPeer::refreshTour(*node), mgg::kNoCluster);
   std::string reason;
   EXPECT_TRUE(PlannerNodeTestPeer::runGlobalPlanner(*node, reason, frontier)) << reason;
+}
+
+TEST_F(PlannerNodeTest, IdenticalAerialPeerSnapshotsPreserveOwnEdgesAndSkipSweeps) {
+  auto node = makeNode("aerial_merge_cache");
+  PlannerNodeTestPeer::setAerialRobot(*node);
+  MolaFloorProduct product(-1, 3, -1, 1);
+  auto map = product.serve<MergeCountingMolaMap>();
+  auto* counter = map.get();
+  PlannerNodeTestPeer::useMolaMap(*node, std::move(map));
+  const int root = PlannerNodeTestPeer::addGlobalVertex(*node, 1, 0, .1, .4, {});
+  PlannerNodeTestPeer::addGlobalVertex(*node, 1, .5, .1, .4, {root});
+  mgg::GraphExchange incoming;
+  for (int i = 0; i < 2; ++i) {
+    mgg::GraphExchangeVertex v;
+    v.id = i; v.robot_id = 2; v.state = mgg::StateVec(.7 + .5*i, .1, .4, 0);
+    incoming.vertices.push_back(v);
+  }
+  incoming.edges = {{0, 1, .5}};
+  ASSERT_TRUE(PlannerNodeTestPeer::mergeRoadmap(*node, incoming).merged);
+  PlannerNodeTestPeer::addCheckedOwnPeerEdge(*node, root, 1);
+  const auto revision = PlannerNodeTestPeer::graphRevision(*node);
+  const int sweeps = counter->merge_sweeps;
+  for (int repeat = 0; repeat < 3; ++repeat) {
+    EXPECT_TRUE(PlannerNodeTestPeer::mergeRoadmap(*node, incoming).merged);
+    EXPECT_TRUE(PlannerNodeTestPeer::ownPeerEdgeExists(*node, root, 1));
+    EXPECT_EQ(PlannerNodeTestPeer::graphRevision(*node), revision);
+    EXPECT_EQ(counter->merge_sweeps, sweeps);
+  }
+  // A genuine snapshot change is processed, but still cannot cut own edges.
+  incoming.vertices[1].visited = true;
+  EXPECT_TRUE(PlannerNodeTestPeer::mergeRoadmap(*node, incoming).merged);
+  EXPECT_GT(counter->merge_sweeps, sweeps);
+  EXPECT_TRUE(PlannerNodeTestPeer::ownPeerEdgeExists(*node, root, 1));
+  const auto refreshed_revision = PlannerNodeTestPeer::graphRevision(*node);
+  const int refreshed_sweeps = counter->merge_sweeps;
+  EXPECT_TRUE(PlannerNodeTestPeer::mergeRoadmap(*node, incoming).merged);
+  EXPECT_EQ(PlannerNodeTestPeer::graphRevision(*node), refreshed_revision);
+  EXPECT_EQ(counter->merge_sweeps, refreshed_sweeps);
+  PlannerNodeTestPeer::advanceMapRevision(*node);
+  EXPECT_TRUE(PlannerNodeTestPeer::mergeRoadmap(*node, incoming).merged);
+  EXPECT_GT(counter->merge_sweeps, refreshed_sweeps);
+  EXPECT_TRUE(PlannerNodeTestPeer::ownPeerEdgeExists(*node, root, 1));
 }
 
 TEST_F(PlannerNodeTest, MolaAerialMergeChecksBodyOffsetAndIncomingEdges) {

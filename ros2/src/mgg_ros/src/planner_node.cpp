@@ -67,6 +67,26 @@ constexpr int kHomeVertexId = 0;
 /// (PlannerNode::home_seeded_landed_).
 constexpr const char* kFlightStateLanded = "landed";
 
+bool sameRoadmapSnapshot(const mgg::GraphExchange& a, const mgg::GraphExchange& b) {
+  if (a.vertices.size() != b.vertices.size() || a.edges.size() != b.edges.size()) return false;
+  for (std::size_t i = 0; i < a.vertices.size(); ++i) {
+    const auto& x = a.vertices[i];
+    const auto& y = b.vertices[i];
+    if (x.id != y.id || x.robot_id != y.robot_id || x.state != y.state ||
+        x.num_unknown_voxels != y.num_unknown_voxels ||
+        x.num_free_voxels != y.num_free_voxels ||
+        x.num_occupied_voxels != y.num_occupied_voxels ||
+        x.is_frontier != y.is_frontier || x.visited != y.visited) return false;
+  }
+  for (std::size_t i = 0; i < a.edges.size(); ++i) {
+    const auto& x = a.edges[i];
+    const auto& y = b.edges[i];
+    if (x.source_id != y.source_id || x.target_id != y.target_id || x.weight != y.weight)
+      return false;
+  }
+  return true;
+}
+
 bool nearPathXY(const std::vector<mgg::StateVec>& path,
                 const Eigen::Vector2d& point, double tolerance) {
   for (std::size_t i = 1; i < path.size(); ++i) {
@@ -2130,6 +2150,28 @@ mgg::MergeResult PlannerNode::mergeNeighbourRoadmap(
     const mgg::GraphExchange& incoming) {
   if (home_state_wait_started_) return {};
   const mgg::ExpandContext ctx = makeContext();
+  const bool aerial = robot_params_.type == mgg::RobotType::kAerialRobot;
+  Eigen::Isometry3d peer_transform = Eigen::Isometry3d::Identity();
+  int sender = -1;
+  if (aerial && !incoming.vertices.empty()) {
+    refreshMapRevision();
+    sender = incoming.vertices.front().robot_id;
+    if (poses_->getRobotTransform(sender, peer_transform)) {
+      const auto cached = aerial_merge_cache_.find(sender);
+      if (cached != aerial_merge_cache_.end()) {
+        const auto& old = cached->second;
+        if (old.graph.lock() == global_graph_ && old.map == map_.get() &&
+            old.map_revision == map_revision_ && !global_graph_->isQuarantined(sender) &&
+            old.transform.matrix().isApprox(peer_transform.matrix(), 0.0) &&
+            old.body_size == ctx.robot_box_size && old.center_offset == robot_params_.center_offset &&
+            sameRoadmapSnapshot(old.snapshot, incoming)) {
+          mgg::MergeResult unchanged;
+          unchanged.merged = old.merged;
+          return unchanged;
+        }
+      }
+    }
+  }
   // The merge asks whether the robot could actually drive between two graphs
   // before joining them; that judgement needs the map, so it is injected.
   const auto admissible = [this, &ctx](const Eigen::Vector3d& from,
@@ -2153,6 +2195,12 @@ mgg::MergeResult PlannerNode::mergeNeighbourRoadmap(
       r.vertices_replaced > 0 ||
       r.neighbour_restarted) {
     ++graph_revision_;
+  }
+  if (aerial && sender >= 0 && !r.transform_unavailable &&
+      global_graph_->neighbour_placements_.count(sender) > 0) {
+    aerial_merge_cache_[sender] = {incoming, global_graph_, map_.get(), map_revision_,
+                                   peer_transform, ctx.robot_box_size,
+                                   robot_params_.center_offset, r.merged};
   }
   return r;
 }

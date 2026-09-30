@@ -22,6 +22,7 @@
 #include <functional>
 #include <map>
 #include <memory>
+#include <set>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
@@ -80,6 +81,9 @@ class GraphManager {
   /// Removes every edge touching a neighbour's merged vertices, its own and
   /// those joining it to other robots' vertices. Returns how many.
   int cutNeighbourEdges(int robot_id);
+  /// Removes only edges installed by an aerial merge, not this robot's
+  /// independently checked connections to the neighbour's vertices.
+  int cutMergeOwnedEdges(int robot_id);
   /// Quarantines a neighbour's roadmap whose transform was withdrawn: its
   /// edges are cut, its merged flag cleared, and its vertices leave the
   /// nearest-neighbour index and every search (inService) until a merge with
@@ -177,6 +181,7 @@ class GraphManager {
   /// neighbour restarted.
   struct NeighbourPlacement {
     std::unordered_map<int, StateVec> sent_states;
+    std::set<std::pair<int, int>> merge_owned_edges;
   };
   std::unordered_map<int, NeighbourPlacement> neighbour_placements_;
 

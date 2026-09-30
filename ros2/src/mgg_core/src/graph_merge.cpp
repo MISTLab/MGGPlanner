@@ -76,6 +76,14 @@ Vertex* findNeighbourVertex(GraphManager& graph, int robot_id, int vertex_id) {
   return vertex_it->second;
 }
 
+void addAerialMergeEdge(GraphManager& graph, int robot_id, Vertex* a, Vertex* b,
+                        double weight) {
+  if (graph.graph_->edgeExists(a->id, b->id)) return;
+  graph.addNeighbourEdge(a, b, weight);
+  graph.neighbour_placements_[robot_id].merge_owned_edges.insert(
+      std::minmax(a->id, b->id));
+}
+
 /// Adds the incoming edges, skipping any whose endpoints are not both present
 /// and any this robot could not climb. Always deduplicated: an edge may
 /// already be in the graph from an earlier snapshot, and GraphManager::addEdge
@@ -99,7 +107,11 @@ int addEdges(GraphManager& graph, const GraphExchange& incoming, int robot_id,
         !is_admissible(source->state.head<3>(), target->state.head<3>())) {
       continue;
     }
-    graph.addNeighbourEdge(source, target, e.weight);
+    if (platform.type == RobotType::kAerialRobot) {
+      addAerialMergeEdge(graph, robot_id, source, target, e.weight);
+    } else {
+      graph.addNeighbourEdge(source, target, e.weight);
+    }
     ++added;
   }
   return added;
@@ -242,16 +254,16 @@ MergeResult mergeNeighbourGraph(GraphManager& global_graph,
     result.vertices_replaced = replaceNeighbourVertices(
         global_graph, neighbour_id, placement->second, t_ours_theirs,
         driving_height);
-    if (result.vertices_replaced > 0 || platform.type == RobotType::kAerialRobot) {
-      // Aerial receivers revalidate both rendezvous and incoming edges on
-      // every snapshot: ground peers' edges are not flight evidence. Cut
-      // both adjacency stores before readoption, even without a transform move.
+    if (result.vertices_replaced > 0) {
       // Every edge was judged where its vertices stood before: the links
       // joining its roadmap to the rest against this robot's map, its own
       // edges against this robot's step and grade limits, which a tilted
       // transform changes. All are dropped; the rendezvous is looked for
       // again and its edges re-read from this complete snapshot.
       global_graph.cutNeighbourEdges(neighbour_id);
+      global_graph.merged_graphs_[neighbour_id] = false;
+    } else if (platform.type == RobotType::kAerialRobot) {
+      global_graph.cutMergeOwnedEdges(neighbour_id);
       global_graph.merged_graphs_[neighbour_id] = false;
     }
   }
@@ -284,8 +296,13 @@ MergeResult mergeNeighbourGraph(GraphManager& global_graph,
 
       global_graph.merged_graphs_[neighbour_id] = true;
       if (existing != nullptr) {
-        global_graph.addNeighbourEdge(existing, nearest,
-                                      (target - origin).norm());
+        if (platform.type == RobotType::kAerialRobot) {
+          addAerialMergeEdge(global_graph, neighbour_id, existing, nearest,
+                             (target - origin).norm());
+        } else {
+          global_graph.addNeighbourEdge(existing, nearest,
+                                        (target - origin).norm());
+        }
         continue;
       }
       Vertex* new_vertex = makeVertex(global_graph, v, state);
@@ -294,7 +311,12 @@ MergeResult mergeNeighbourGraph(GraphManager& global_graph,
       new_vertex->parent = nearest;
       new_vertex->distance = nearest->distance + (target - origin).norm();
       nearest->children.push_back(new_vertex);
-      global_graph.addEdge(new_vertex, nearest, (target - origin).norm());
+      if (platform.type == RobotType::kAerialRobot) {
+        addAerialMergeEdge(global_graph, neighbour_id, new_vertex, nearest,
+                           (target - origin).norm());
+      } else {
+        global_graph.addEdge(new_vertex, nearest, (target - origin).norm());
+      }
       ++result.vertices_added;
     }
   }
