@@ -842,6 +842,9 @@ class PlannerNodeTestPeer {
     const std::lock_guard<std::recursive_mutex> lock(node.planner_mutex_);
     return node.runGlobalPlanner(target_id, reason);
   }
+  static bool lastRouteBlockedByPeer(const PlannerNode& node) {
+    return node.last_route_blocked_by_peer_;
+  }
   static bool isGlobalFrontier(PlannerNode& node, int id) {
     const std::lock_guard<std::recursive_mutex> lock(node.planner_mutex_);
     return node.global_graph_->getVertex(id)->type == mgg::VertexType::kFrontier;
@@ -4041,6 +4044,29 @@ TEST_F(PlannerNodeTest, AerialReturnHomeUsesTakeoffColumnEvidenceAndOccupiedWins
       EXPECT_NEAR(response->path.back().position.x, .1, 1e-6);
     }
   }
+}
+
+TEST_F(PlannerNodeTest, AerialTourTargetNearPeerKeepsSearchTimeBlockDiagnosis) {
+  auto node = makeNode("aerial_peer_goal");
+  PlannerNodeTestPeer::setAerialRobot(*node);
+  MolaFloorProduct product(-1, 4, -1, 2);
+  PlannerNodeTestPeer::useMolaMap(*node, product.serve());
+  PlannerNodeTestPeer::acceptOdometryFacing(*node, .1, .1, 0, 1, .4);
+  const int frontier = PlannerNodeTestPeer::addGlobalChainToFrontier(
+      *node, {{1.1, .1}, {2.1, .1}, {3.1, .1}});
+  PlannerNodeTestPeer::setTour(*node, true, 0);
+  PlannerNodeTestPeer::solveTourOnEveryChange(*node);
+  ASSERT_NE(PlannerNodeTestPeer::refreshTour(*node), mgg::kNoCluster);
+  PlannerNodeTestPeer::setPeerBodyTtl(*node, 600);
+  PlannerNodeTestPeer::receivePeerBodies(*node, {{3.1, .7}});
+  std::string reason;
+  EXPECT_FALSE(PlannerNodeTestPeer::runGlobalPlanner(*node, reason, frontier));
+  EXPECT_EQ(reason.find("not observed free"), std::string::npos) << reason;
+  EXPECT_TRUE(PlannerNodeTestPeer::lastRouteBlockedByPeer(*node)) << reason;
+  EXPECT_NE(reason.find("blocked by a peer"), std::string::npos) << reason;
+  PlannerNodeTestPeer::receivePeerBodies(*node, {});
+  EXPECT_TRUE(PlannerNodeTestPeer::runGlobalPlanner(*node, reason, frontier)) << reason;
+  EXPECT_FALSE(PlannerNodeTestPeer::lastRouteBlockedByPeer(*node));
 }
 
 TEST_F(PlannerNodeTest, AerialFreshHoverCanDepartForTourAndGlobalRoute) {
