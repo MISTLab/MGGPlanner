@@ -946,25 +946,8 @@ std::vector<mgg::FrontierCluster> PlannerNode::liftedPeerFrontiers() {
   auto map_read = mapReadLease();
   if (lifted_target_graph_.lock() != global_graph_) {
     lifted_target_vertices_.clear();
+    lifted_targets_.clear();
     lifted_target_graph_ = global_graph_;
-  }
-  // Remove every old query edge, including adjacency used by non-Dijkstra
-  // searches. Reusing at most 64 isolated slots bounds storage across updates.
-  for (const int id : lifted_target_vertices_) {
-    auto* v = findGlobalVertex(id);
-    if (!v) continue;
-    if (current_global_vertex_id_ == id) global_exploration_ongoing_ = false;
-    auto neighbours = global_graph_->edge_map_[id];
-    for (const auto& [other, cost] : neighbours) {
-      (void)cost;
-      if (auto* u = findGlobalVertex(other)) global_graph_->removeEdge(v, u);
-      auto& edges = global_graph_->edge_map_[other];
-      edges.erase(std::remove_if(edges.begin(), edges.end(),
-          [id](const auto& edge) { return edge.first == id; }), edges.end());
-    }
-    global_graph_->edge_map_[id].clear();
-    v->type = mgg::VertexType::kUnvisited;
-    v->vol_gain = mgg::VolumetricGain();
   }
   std::vector<mgg::FrontierCluster> candidates;
   const double height = std::clamp(aerial_frontier_height_m_, aerial_min_height_m_, aerial_max_height_m_);
@@ -991,12 +974,12 @@ std::vector<mgg::FrontierCluster> PlannerNode::liftedPeerFrontiers() {
   std::sort(candidates.begin(), candidates.end(), [](const auto& a, const auto& b) {
     return a.gain != b.gain ? a.gain > b.gain : a.id < b.id;
   });
-  std::vector<mgg::FrontierCluster> clusters;
+  std::vector<LiftedTarget> targets;
   const auto box = robot_params_.getPlanningSize();
   for (auto c : candidates) {
-    if (clusters.size() == 64) break;
-    if (std::any_of(clusters.begin(), clusters.end(), [&](const auto& other) {
-          return (c.position - other.position).norm() <= fleet_params_.cluster_merge_radius_m;
+    if (targets.size() == 64) break;
+    if (std::any_of(targets.begin(), targets.end(), [&](const auto& other) {
+          return (c.position - other.cluster.position).norm() <= fleet_params_.cluster_merge_radius_m;
         })) continue;
     mgg::StateVec state(c.position.x(), c.position.y(), c.position.z(), 0);
     std::vector<mgg::Vertex*> anchors;
@@ -1013,24 +996,60 @@ std::vector<mgg::FrontierCluster> PlannerNode::liftedPeerFrontiers() {
       best = distance;
       anchor = v;
     }
-    if (!anchor) continue;
-    mgg::Vertex* endpoint = nullptr;
-    if (clusters.size() < lifted_target_vertices_.size()) {
-      endpoint = findGlobalVertex(lifted_target_vertices_[clusters.size()]);
-      endpoint->state = state; // never in the nearest-neighbour index
-    } else {
-      endpoint = new mgg::Vertex(global_graph_->generateVertexID(), state);
-      endpoint->robot_id = static_cast<int>(planning_params_.robot_id);
-      endpoint->lifted_peer_target = true;
-      global_graph_->addVertex(endpoint);
-      lifted_target_vertices_.push_back(endpoint->id);
-    }
-    global_graph_->addEdge(anchor, endpoint, best);
-    c.representative_vertex_id = endpoint->id;
-    c.member_vertex_ids = {endpoint->id};
-    clusters.push_back(c);
+    if (anchor) targets.push_back({c, anchor->id, best});
   }
-  if (!lifted_target_vertices_.empty()) ++graph_revision_;
+  const bool changed = targets.size() != lifted_targets_.size() ||
+      !std::equal(targets.begin(), targets.end(), lifted_targets_.begin(),
+          [](const auto& a, const auto& b) {
+            return a.cluster.id == b.cluster.id &&
+                a.cluster.owner_robot_id == b.cluster.owner_robot_id &&
+                a.cluster.gain == b.cluster.gain &&
+                a.cluster.position == b.cluster.position &&
+                a.anchor == b.anchor && a.length == b.length;
+          });
+  if (changed) {
+    // Remove both Boost edges and adjacency used by non-Dijkstra searches.
+    // The pool remains bounded across withdrawal and re-admission.
+    for (const int id : lifted_target_vertices_) {
+      auto* v = findGlobalVertex(id);
+      if (!v) continue;
+      if (current_global_vertex_id_ == id) global_exploration_ongoing_ = false;
+      const auto neighbours = global_graph_->edge_map_[id];
+      for (const auto& [other, cost] : neighbours) {
+        (void)cost;
+        if (auto* u = findGlobalVertex(other)) global_graph_->removeEdge(v, u);
+        auto& edges = global_graph_->edge_map_[other];
+        edges.erase(std::remove_if(edges.begin(), edges.end(),
+            [id](const auto& edge) { return edge.first == id; }), edges.end());
+      }
+      global_graph_->edge_map_[id].clear();
+      v->type = mgg::VertexType::kUnvisited;
+      v->vol_gain = mgg::VolumetricGain();
+    }
+    for (std::size_t i = 0; i < targets.size(); ++i) {
+      auto& target = targets[i];
+      auto& c = target.cluster;
+      const mgg::StateVec state(c.position.x(), c.position.y(), c.position.z(), 0);
+      mgg::Vertex* endpoint = nullptr;
+      if (i < lifted_target_vertices_.size()) {
+        endpoint = findGlobalVertex(lifted_target_vertices_[i]);
+        endpoint->state = state; // never in the nearest-neighbour index
+      } else {
+        endpoint = new mgg::Vertex(global_graph_->generateVertexID(), state);
+        endpoint->robot_id = static_cast<int>(planning_params_.robot_id);
+        endpoint->lifted_peer_target = true;
+        global_graph_->addVertex(endpoint);
+        lifted_target_vertices_.push_back(endpoint->id);
+      }
+      global_graph_->addEdge(findGlobalVertex(target.anchor), endpoint, target.length);
+      c.representative_vertex_id = endpoint->id;
+      c.member_vertex_ids = {endpoint->id};
+    }
+    lifted_targets_ = std::move(targets);
+    ++graph_revision_;
+  }
+  std::vector<mgg::FrontierCluster> clusters;
+  for (const auto& target : lifted_targets_) clusters.push_back(target.cluster);
   return clusters;
 }
 
@@ -2048,9 +2067,17 @@ void PlannerNode::onPeerBodies(
 
 void PlannerNode::refreshPeerGeneration() {
   if (robot_params_.type == mgg::RobotType::kAerialRobot) {
-    const bool active = !activeAerialPeerBodies().empty();
-    if (active != aerial_peer_generation_active_) {
-      aerial_peer_generation_active_ = active;
+    std::vector<std::array<double, 4>> key;
+    for (const auto& body : activeAerialPeerBodies()) {
+      key.push_back({std::round(body.top.x() / kPeerGenerationCellM),
+                     std::round(body.top.y() / kPeerGenerationCellM),
+                     std::round(body.top.z() / kPeerGenerationCellM),
+                     std::round(body.radius / kPeerGenerationCellM)});
+    }
+    std::sort(key.begin(), key.end());
+    key.erase(std::unique(key.begin(), key.end()), key.end());
+    if (key != aerial_peer_generation_key_) {
+      aerial_peer_generation_key_ = std::move(key);
       ++peer_generation_;
     }
   }
@@ -2229,10 +2256,10 @@ void PlannerNode::onAerialPeerBodies(geometry_msgs::msg::PoseArray::ConstSharedP
   aerial_peer_bodies_ = std::move(bodies);
   aerial_peer_bodies_received_ = std::chrono::steady_clock::now();
   have_aerial_peer_bodies_ = true;
-  ++peer_generation_;
   // Once the spec-aware input is available, the legacy unbounded XY discs
   // must not prevent a drone from flying safely above a peer.
   if (mola_map_) mola_map_->setTransientDiscs({}, 0, peer_body_ttl_s_);
+  refreshPeerGeneration();
 }
 
 std::vector<PlannerNode::AerialPeerBody> PlannerNode::activeAerialPeerBodies() const {

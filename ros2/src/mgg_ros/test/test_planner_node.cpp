@@ -535,6 +535,17 @@ class PlannerNodeTestPeer {
     node.expandGlobalGraphTimerCallback();
     return globalVertices(node) - before;
   }
+  static mgg::StateVec nextExpansionSample(PlannerNode& node) {
+    auto sampler = node.random_sampler_;
+    mgg::StateVec sample;
+    sampler.generate(node.current_state_, sample);
+    return sample;
+  }
+  static std::uint64_t peerGeneration(PlannerNode& node) {
+    node.refreshPeerGeneration();
+    return node.peer_generation_;
+  }
+  static double tourSolveMilliseconds(PlannerNode& node) { return node.tour_solve_ms_; }
   static void seedExpansionSampler(PlannerNode& node, unsigned seed) {
     const std::lock_guard<std::recursive_mutex> lock(node.planner_mutex_);
     node.random_sampler_.reset(seed);
@@ -4202,6 +4213,54 @@ TEST_F(PlannerNodeTest, AerialLiftsPeerFrontiersWithoutImportingGroundRoadmap) {
   EXPECT_TRUE(PlannerNodeTestPeer::frontierClusters(*node).empty());
   EXPECT_EQ(PlannerNodeTestPeer::globalVertices(*node), 3);
   EXPECT_EQ(PlannerNodeTestPeer::globalEdges(*node), 1);
+}
+
+TEST_F(PlannerNodeTest, UnchangedAerialPeerAndLiftDoNotRetriggerExpansionOrTour) {
+  auto node = makeNode("stable_aerial_peer", "world", {
+      rclcpp::Parameter("fleet.enabled", false),
+      rclcpp::Parameter("neighbour_offsets", std::vector<double>{2,0,0,0}),
+      rclcpp::Parameter("aerial_frontier_height_m", .4),
+      rclcpp::Parameter("aerial_min_height_m", .3)});
+  PlannerNodeTestPeer::setAerialRobot(*node);
+  MolaFloorProduct product(-1, 5, -1, 1);
+  PlannerNodeTestPeer::useMolaMap(*node, product.serve());
+  PlannerNodeTestPeer::acceptOdometryFacing(*node, .1, .1, 0, 1, .4);
+  PlannerNodeTestPeer::addGlobalVertex(*node, 1, 1.1, .1, .4, {0});
+  mgg_msgs::msg::Graph peer;
+  peer.header.frame_id = "world";
+  mgg_msgs::msg::Vertex v;
+  v.robot_id = 2; v.pose.position.x = 3.1; v.pose.position.y = .1;
+  v.is_frontier = true; v.num_unknown_voxels = 2000;
+  peer.vertices.push_back(v);
+  PlannerNodeTestPeer::receiveGraph(*node, peer);
+  // The peer is low enough that the drone can fly over it.
+  PlannerNodeTestPeer::setGlobalFrontierReach(*node, .5);
+  PlannerNodeTestPeer::aerialPeerBodies(*node, -.5, .3);
+  PlannerNodeTestPeer::solveTourOnEveryChange(*node);
+  ASSERT_NE(PlannerNodeTestPeer::refreshTour(*node), mgg::kNoCluster);
+  PlannerNodeTestPeer::setExpansionSamplerBound(*node, {0,0,0}, {0,0,0});
+  EXPECT_EQ(PlannerNodeTestPeer::expandGlobalGraph(*node), 0);
+  const auto sample = PlannerNodeTestPeer::nextExpansionSample(*node);
+  const auto revision = PlannerNodeTestPeer::graphRevision(*node);
+  const auto generation = PlannerNodeTestPeer::peerGeneration(*node);
+  const auto solves = PlannerNodeTestPeer::tourDistanceSolves(*node);
+  const auto solve_ms = PlannerNodeTestPeer::tourSolveMilliseconds(*node);
+  for (double top : {-.5, -.501, -.5}) {
+    PlannerNodeTestPeer::aerialPeerBodies(*node, top, .3);
+    PlannerNodeTestPeer::receiveGraph(*node, peer);
+    EXPECT_EQ(PlannerNodeTestPeer::graphRevision(*node), revision);
+    EXPECT_EQ(PlannerNodeTestPeer::peerGeneration(*node), generation);
+    EXPECT_NE(PlannerNodeTestPeer::refreshTour(*node), mgg::kNoCluster);
+    EXPECT_EQ(PlannerNodeTestPeer::tourDistanceSolves(*node), solves);
+    EXPECT_EQ(PlannerNodeTestPeer::tourSolveMilliseconds(*node), solve_ms);
+    EXPECT_EQ(PlannerNodeTestPeer::expandGlobalGraph(*node), 0);
+    EXPECT_TRUE(PlannerNodeTestPeer::nextExpansionSample(*node).isApprox(sample, 0.0));
+  }
+  PlannerNodeTestPeer::aerialPeerBodies(*node, -.4, .3);
+  EXPECT_GT(PlannerNodeTestPeer::peerGeneration(*node), generation);
+  const auto moved = PlannerNodeTestPeer::peerGeneration(*node);
+  PlannerNodeTestPeer::expireAerialPeers(*node);
+  EXPECT_GT(PlannerNodeTestPeer::peerGeneration(*node), moved);
 }
 
 TEST_F(PlannerNodeTest, AerialReachabilityPrecedesOwnPreferenceGroundUnchanged) {

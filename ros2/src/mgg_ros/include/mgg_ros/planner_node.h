@@ -644,10 +644,16 @@ class PlannerNode : public rclcpp::Node {
   /// neighbour, to re-admit it from when its transform returns.
   std::unordered_map<int, mgg::GraphExchange> neighbour_roadmaps_;
   std::vector<mgg::FrontierCluster> liftedPeerFrontiers();
-  // A bounded reusable pool; detached and revalidated on every query. Never
-  // indexed as roadmap anchors, scored as own frontiers, or broadcast.
+  // Revalidate on every query; replace slots only when their accepted set
+  // changes. Never roadmap anchors, own frontier evidence, or broadcasts.
   std::weak_ptr<mgg::GraphManager> lifted_target_graph_;
   std::vector<int> lifted_target_vertices_;
+  struct LiftedTarget {
+    mgg::FrontierCluster cluster;
+    int anchor;
+    double length;
+  };
+  std::vector<LiftedTarget> lifted_targets_;
   double aerial_frontier_height_m_ = 1.3;
   double aerial_min_height_m_ = 0.8;
   double aerial_max_height_m_ = 2.5;
@@ -1007,7 +1013,7 @@ class PlannerNode : public rclcpp::Node {
   std::vector<AerialPeerBody> aerial_peer_bodies_;
   std::chrono::steady_clock::time_point aerial_peer_bodies_received_;
   bool have_aerial_peer_bodies_ = false;
-  bool aerial_peer_generation_active_ = false;
+  std::vector<std::array<double, 4>> aerial_peer_generation_key_;
   std::optional<std::vector<AerialPeerBody>> pinned_aerial_peer_bodies_;
   std::vector<AerialPeerBody> activeAerialPeerBodies() const;
   struct PeerBodyPin {
