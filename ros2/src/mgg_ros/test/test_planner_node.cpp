@@ -4232,6 +4232,41 @@ TEST_F(PlannerNodeTest, AerialPeerCylinderAddsMarginInThreeDimensionsGroundUncha
   }
 }
 
+TEST_F(PlannerNodeTest, AerialCylinderDetourSurvivesPlanAndReturnHomeShortcut) {
+  for (bool home : {false, true}) {
+    SCOPED_TRACE(home);
+    auto node = makeNode(home ? "cylinder_home_detour" : "cylinder_plan_detour");
+    PlannerNodeTestPeer::setAerialRobot(*node);
+    MolaFloorProduct product(-3, 3, -2, 3);
+    PlannerNodeTestPeer::useMolaMap(*node, product.serve());
+    PlannerNodeTestPeer::serveMap(*node, "component:test", 1);
+    PlannerNodeTestPeer::acceptOdometryFacing(*node, -1.5, -.5, 0, 1, .4);
+    const int target = PlannerNodeTestPeer::addGlobalChainToFrontier(*node, {{-1.5, 1.5}, {1.5, 1.5}});
+    PlannerNodeTestPeer::aerialPeerBodies(*node, .05, .3);
+    std::vector<geometry_msgs::msg::Pose> path;
+    if (home) {
+      PlannerNodeTestPeer::acceptOdometryFacing(*node, 1.5, 1.5, M_PI, 2, .4);
+      auto response = peerObjective(*node, mgg_msgs::srv::PlanObjective::Request::RETURN_HOME,
+                                    std::nan(""), std::nan(""));
+      EXPECT_EQ(response->status, mgg_msgs::srv::PlanObjective::Response::SUCCEEDED) << response->reason;
+      path = response->path;
+    } else {
+      PlannerNodeTestPeer::repositionTowards(*node, target);
+      auto response = std::make_shared<mgg_msgs::srv::PlannerSrv::Response>();
+      PlannerNodeTestPeer::plan(*node, response);
+      EXPECT_EQ(response->status, mgg_msgs::srv::PlannerSrv::Response::FORWARD);
+      path = response->path;
+    }
+    EXPECT_GT(path.size(), 2u);
+    EXPECT_GT(pathLength(path), std::hypot(3., 2.) + .1);
+    for (std::size_t i = 1; i < path.size(); ++i) {
+      const auto& a = path[i-1].position;
+      const auto& b = path[i].position;
+      EXPECT_TRUE(PlannerNodeTestPeer::peerPathClear(*node, {a.x,a.y,a.z}, {b.x,b.y,b.z}));
+    }
+  }
+}
+
 TEST_F(PlannerNodeTest, AerialPeerCylinderClosesSearchNotStoredEdges) {
   auto node = makeNode("aerial_peer_search");
   PlannerNodeTestPeer::setAerialRobot(*node);

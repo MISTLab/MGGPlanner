@@ -3162,6 +3162,8 @@ void PlannerNode::shortcutAndResample(std::vector<mgg::StateVec>& path,
     // inclination) as every graph edge does. Nor may it cross a no-go zone
     // the route went round.
     if (noGoBlocksSegment(from, to)) return false;
+    if (robot_params_.type == mgg::RobotType::kAerialRobot &&
+        peerBlocksSegment(from, to)) return false;
     if (robot_params_.type == mgg::RobotType::kGroundRobot) {
       std::vector<Eigen::Vector3d> projected;
       // Driven from `from` to `to`: the shortcut is the path itself.
