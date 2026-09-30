@@ -1697,6 +1697,31 @@ class PlannerNodeTestPeer {
     node.robot_params_.type = mgg::RobotType::kAerialRobot;
     node.robot_params_.center_offset = center_offset;
   }
+  static void aerialPeerBodies(PlannerNode& node, double top, double radius, double marker = 0) {
+    auto msg = std::make_shared<geometry_msgs::msg::PoseArray>();
+    msg->header.frame_id = node.world_frame_;
+    geometry_msgs::msg::Pose pose;
+    pose.position.z = top;
+    pose.orientation.x = radius;
+    pose.orientation.w = marker;
+    msg->poses.push_back(pose);
+    node.onAerialPeerBodies(msg);
+  }
+  static bool peerPathClear(PlannerNode& node, const Eigen::Vector3d& a, const Eigen::Vector3d& b) {
+    return node.peerAdmissible({mgg::StateVec(a.x(), a.y(), a.z(), 0),
+                                mgg::StateVec(b.x(), b.y(), b.z(), 0)});
+  }
+  static void expireAerialPeers(PlannerNode& node) {
+    node.aerial_peer_bodies_received_ -= std::chrono::seconds(60);
+  }
+  static void checkAerialPeerPin(PlannerNode& node) {
+    std::optional<PlannerNode::PeerBodyPin> pin;
+    node.pinPeerBodies(pin);
+    expireAerialPeers(node);
+    EXPECT_FALSE(peerPathClear(node, {-2, 0, 1.2}, {2, 0, 1.2}));
+    pin.reset();
+    EXPECT_TRUE(peerPathClear(node, {-2, 0, 1.2}, {2, 0, 1.2}));
+  }
   static void setAerialBodySize(PlannerNode& node, const Eigen::Vector3d& size) {
     node.robot_params_.size = size;
   }
@@ -4184,6 +4209,46 @@ TEST_F(PlannerNodeTest, AerialReachabilityPrecedesOwnPreferenceGroundUnchanged) 
     ASSERT_EQ(candidates.size(), 1u);
     EXPECT_EQ(candidates.front().id, aerial ? 2u : 1u);
   }
+}
+
+TEST_F(PlannerNodeTest, AerialPeerCylinderAddsMarginInThreeDimensionsGroundUnchanged) {
+  for (const bool aerial : {false, true}) {
+    auto node = makeNode(aerial ? "aerial_cylinder" : "ground_ignores_cylinder");
+    if (aerial) PlannerNodeTestPeer::setAerialRobot(*node);
+    PlannerNodeTestPeer::aerialPeerBodies(*node, .97, .6);
+    EXPECT_EQ(PlannerNodeTestPeer::peerPathClear(*node, {-2, 0, 1.2}, {2, 0, 1.2}), !aerial);
+    EXPECT_TRUE(PlannerNodeTestPeer::peerPathClear(*node, {-2, 0, 1.6}, {2, 0, 1.6}));
+    EXPECT_EQ(PlannerNodeTestPeer::peerPathClear(*node, {-2, 1., 1.2}, {2, 1., 1.2}), !aerial);
+    EXPECT_TRUE(PlannerNodeTestPeer::peerPathClear(*node, {-2, 1.3, 1.2}, {2, 1.3, 1.2}));
+    // A segment entering below the top must fail even if both endpoints
+    // are outside the horizontal cylinder; passing safely above may slope.
+    EXPECT_EQ(PlannerNodeTestPeer::peerPathClear(*node, {-2, 0, 2.}, {2, 0, .5}), !aerial);
+    // A malformed replacement must not erase the previous safety volume.
+    PlannerNodeTestPeer::aerialPeerBodies(*node, .1, .1, 1);
+    EXPECT_EQ(PlannerNodeTestPeer::peerPathClear(*node, {-2, 0, 1.2}, {2, 0, 1.2}), !aerial);
+    if (aerial) PlannerNodeTestPeer::checkAerialPeerPin(*node);
+    else PlannerNodeTestPeer::expireAerialPeers(*node);
+    EXPECT_TRUE(PlannerNodeTestPeer::peerPathClear(*node, {-2, 0, 1.2}, {2, 0, 1.2}));
+  }
+}
+
+TEST_F(PlannerNodeTest, AerialPeerCylinderClosesSearchNotStoredEdges) {
+  auto node = makeNode("aerial_peer_search");
+  PlannerNodeTestPeer::setAerialRobot(*node);
+  MolaFloorProduct product(-4, 4, -1, 1);
+  PlannerNodeTestPeer::useMolaMap(*node, product.serve());
+  PlannerNodeTestPeer::acceptOdometryFacing(*node, -2.1, .1, 0, 1, .4);
+  const int target = PlannerNodeTestPeer::addGlobalChainToFrontier(*node, {{-1.1,.1}, {.1,.1}, {1.1,.1}, {2.1,.1}});
+  std::string reason;
+  ASSERT_TRUE(PlannerNodeTestPeer::runGlobalPlanner(*node, reason, target)) << reason;
+  const int edges = PlannerNodeTestPeer::globalEdges(*node);
+  PlannerNodeTestPeer::aerialPeerBodies(*node, .05, .3);
+  EXPECT_FALSE(PlannerNodeTestPeer::runGlobalPlanner(*node, reason, target));
+  EXPECT_TRUE(PlannerNodeTestPeer::lastRouteBlockedByPeer(*node)) << reason;
+  EXPECT_EQ(PlannerNodeTestPeer::globalEdges(*node), edges);
+  PlannerNodeTestPeer::expireAerialPeers(*node);
+  EXPECT_TRUE(PlannerNodeTestPeer::runGlobalPlanner(*node, reason, target)) << reason;
+  EXPECT_EQ(PlannerNodeTestPeer::globalEdges(*node), edges);
 }
 
 TEST_F(PlannerNodeTest, AerialTourTargetNearPeerKeepsSearchTimeBlockDiagnosis) {

@@ -275,6 +275,10 @@ PlannerNode::PlannerNode(const rclcpp::NodeOptions& options)
   geofence_ = std::make_unique<mgg::GeofenceManager>();
   local_graph_ = std::make_shared<mgg::GraphManager>();
   global_graph_ = std::make_shared<mgg::GraphManager>();
+  local_graph_->setEdgeBlocked([this](const mgg::Vertex& a, const mgg::Vertex& b) {
+    return robot_params_.type == mgg::RobotType::kAerialRobot &&
+           peerBlocksSegment(a.state.head<3>(), b.state.head<3>());
+  });
   global_graph_->setEdgeBlocked(
       [this](const mgg::Vertex& a, const mgg::Vertex& b) {
         return globalEdgeBlocked(a, b);
@@ -410,6 +414,10 @@ PlannerNode::PlannerNode(const rclcpp::NodeOptions& options)
   peer_body_ttl_s_ = std::clamp(
       declareOrGet<double>(this, "peer_body_ttl_s", peer_body_ttl_s_), 0.1,
       30.0);
+  aerial_peer_margin_m_ = declareOrGet<double>(this, "aerial_peer_margin_m", aerial_peer_margin_m_);
+  if (!std::isfinite(aerial_peer_margin_m_) || aerial_peer_margin_m_ < 0) {
+    throw std::invalid_argument("aerial_peer_margin_m must be finite and non-negative");
+  }
   // Each message replaces the set, published under the planner mutex, so
   // they are handled one at a time, in the order taken, in a group of their
   // own, as the no-go zones' below: in the reentrant group, messages that
@@ -424,6 +432,10 @@ PlannerNode::PlannerNode(const rclcpp::NodeOptions& options)
       [this](geometry_msgs::msg::PoseArray::ConstSharedPtr m) {
         onPeerBodies(m);
       },
+      peer_bodies_opts);
+  aerial_peer_bodies_sub_ = create_subscription<geometry_msgs::msg::PoseArray>(
+      "aerial_peer_bodies", rclcpp::QoS(10),
+      [this](geometry_msgs::msg::PoseArray::ConstSharedPtr m) { onAerialPeerBodies(m); },
       peer_bodies_opts);
   // Latched: SwarmDeck republishes the whole set on each change and owns
   // the zones' lifetime; a planner started later still gets the last set.
@@ -1477,7 +1489,7 @@ void PlannerNode::fleetTick(double now_s) {
   if (!have_odometry_ || home_state_wait_started_) return;
   auto map_read = mapReadLease();
   // Bids and auctions cost routes with one peer set, as a request does.
-  std::optional<mgg::MolaMap::TransientDiscPin> peer_pin;
+  std::optional<PeerBodyPin> peer_pin;
   pinPeerBodies(peer_pin);
   refreshPeerGeneration();
   const mgg::FleetTickOutput out =
@@ -2010,11 +2022,19 @@ void PlannerNode::onPeerBodies(
   // I5. The tour's route costs follow the set through the peer generation
   // (refreshPeerGeneration), not the graph revision.
   const std::lock_guard<std::recursive_mutex> lock(planner_mutex_);
+  if (robot_params_.type == mgg::RobotType::kAerialRobot && have_aerial_peer_bodies_) return;
   mola_map_->setTransientDiscs(std::move(centres), peer_body_radius_m_,
                                peer_body_ttl_s_);
 }
 
 void PlannerNode::refreshPeerGeneration() {
+  if (robot_params_.type == mgg::RobotType::kAerialRobot) {
+    const bool active = !activeAerialPeerBodies().empty();
+    if (active != aerial_peer_generation_active_) {
+      aerial_peer_generation_active_ = active;
+      ++peer_generation_;
+    }
+  }
   if (mola_map_ == nullptr) return;
   // The set in force: a request's pinned one, or, outside a request, the
   // one published and not expired.
@@ -2130,7 +2150,28 @@ bool PlannerNode::noGoBlocksSegment(const Eigen::Vector3d& from,
 
 bool PlannerNode::peerBlocksSegment(const Eigen::Vector3d& from,
                                     const Eigen::Vector3d& to) const {
-  if (mola_map_ == nullptr || peer_edges_open_) return false;
+  if (peer_edges_open_) return false;
+  if (robot_params_.type == mgg::RobotType::kAerialRobot) {
+    const auto box = robot_params_.getPlanningSize();
+    const Eigen::Vector3d start = from + robot_params_.center_offset;
+    const Eigen::Vector3d end = to + robot_params_.center_offset;
+    for (const auto& body : activeAerialPeerBodies()) {
+      const double ceiling = body.top.z() + aerial_peer_margin_m_ + .5 * box.z();
+      if (std::min(start.z(), end.z()) > ceiling) continue;
+      // Clip to the portion at/below the top. The XY closest point on that
+      // interval gives an exact cylinder sweep, not endpoint sampling.
+      double lo = 0, hi = 1;
+      if (start.z() > ceiling) lo = (ceiling - start.z()) / (end.z() - start.z());
+      if (end.z() > ceiling) hi = (ceiling - start.z()) / (end.z() - start.z());
+      const Eigen::Vector2d a = (start + lo * (end - start)).head<2>() - body.top.head<2>();
+      const Eigen::Vector2d delta = ((hi - lo) * (end - start)).head<2>();
+      const double t = delta.squaredNorm() > 0
+          ? std::clamp(-a.dot(delta) / delta.squaredNorm(), 0.0, 1.0) : 0;
+      const double reach = body.radius + aerial_peer_margin_m_ + .5 * box.head<2>().norm();
+      if ((a + t * delta).norm() <= reach) return true;
+    }
+  }
+  if (mola_map_ == nullptr) return false;
   // Where a roadmap edge is checked (global_graph.cpp edgeStatus): the
   // body's centre, half its planning box across.
   const Eigen::Vector3d box = robot_params_.getPlanningSize();
@@ -2139,14 +2180,61 @@ bool PlannerNode::peerBlocksSegment(const Eigen::Vector3d& from,
       0.5 * std::max(box.x(), box.y()));
 }
 
-void PlannerNode::pinPeerBodies(
-    std::optional<mgg::MolaMap::TransientDiscPin>& pin) {
-  if (mola_map_ == nullptr) return;
-  mgg::MolaMap::TransientDiscSet peers = mola_map_->activeTransientDiscs();
-  pin.emplace(*mola_map_, std::move(peers.centres), peers.radius_m);
+void PlannerNode::onAerialPeerBodies(geometry_msgs::msg::PoseArray::ConstSharedPtr msg) {
+  const std::lock_guard<std::recursive_mutex> lock(planner_mutex_);
+  if (robot_params_.type != mgg::RobotType::kAerialRobot) return;
+  if (msg->header.frame_id != world_frame_) {
+    RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 5000, "ignoring aerial peer bodies in the wrong frame");
+    return;
+  }
+  std::vector<AerialPeerBody> bodies;
+  for (const auto& pose : msg->poses) {
+    const auto& p = pose.position;
+    const auto& q = pose.orientation;
+    if (!std::isfinite(p.x) || !std::isfinite(p.y) || !std::isfinite(p.z) ||
+        !std::isfinite(q.x) || q.x <= 0 || q.y != 0 || q.z != 0 || q.w != 0) {
+      RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 5000,
+          "invalid aerial peer cylinder: need finite XY/top, positive radius, zero y/z/w marker; keeping previous set");
+      return;
+    }
+    bodies.push_back({Eigen::Vector3d(p.x, p.y, p.z), q.x});
+  }
+  aerial_peer_bodies_ = std::move(bodies);
+  aerial_peer_bodies_received_ = std::chrono::steady_clock::now();
+  have_aerial_peer_bodies_ = true;
+  ++peer_generation_;
+  // Once the spec-aware input is available, the legacy unbounded XY discs
+  // must not prevent a drone from flying safely above a peer.
+  if (mola_map_) mola_map_->setTransientDiscs({}, 0, peer_body_ttl_s_);
+}
+
+std::vector<PlannerNode::AerialPeerBody> PlannerNode::activeAerialPeerBodies() const {
+  if (pinned_aerial_peer_bodies_) return *pinned_aerial_peer_bodies_;
+  if (!have_aerial_peer_bodies_ || secondsSince(aerial_peer_bodies_received_) > peer_body_ttl_s_) return {};
+  return aerial_peer_bodies_;
+}
+
+PlannerNode::PeerBodyPin::PeerBodyPin(PlannerNode& owner) : node(owner) {
+  auto bodies = node.activeAerialPeerBodies();
+  previous = std::move(node.pinned_aerial_peer_bodies_);
+  node.pinned_aerial_peer_bodies_ = std::move(bodies);
+  if (node.mola_map_) {
+    auto peers = node.mola_map_->activeTransientDiscs();
+    ground.emplace(*node.mola_map_, std::move(peers.centres), peers.radius_m);
+  }
+}
+
+PlannerNode::PeerBodyPin::~PeerBodyPin() {
+  node.pinned_aerial_peer_bodies_ = std::move(previous);
+}
+
+void PlannerNode::pinPeerBodies(std::optional<PeerBodyPin>& pin) {
+  pin.emplace(*this);
 }
 
 bool PlannerNode::peerAdmissible(const std::vector<mgg::StateVec>& path) const {
+  if (robot_params_.type == mgg::RobotType::kAerialRobot && !path.empty() &&
+      peerBlocksSegment(path.front().head<3>(), path.front().head<3>())) return false;
   for (std::size_t i = 1; i < path.size(); ++i) {
     if (peerBlocksSegment(path[i - 1].head<3>(), path[i].head<3>())) {
       return false;
@@ -2156,6 +2244,7 @@ bool PlannerNode::peerAdmissible(const std::vector<mgg::StateVec>& path) const {
 }
 
 bool PlannerNode::peersInForce() const {
+  if (robot_params_.type == mgg::RobotType::kAerialRobot && !activeAerialPeerBodies().empty()) return true;
   return mola_map_ != nullptr &&
          !mola_map_->activeTransientDiscs().centres.empty();
 }
@@ -2848,7 +2937,7 @@ void PlannerNode::expandGlobalGraphTimerCallback() {
   if (planner_trigger_count_ == 0 || home_state_wait_started_) return;
   if (!have_odometry_ || !map_->getStatus()) return;
   // The pass samples against one peer set, the one its skip key records.
-  std::optional<mgg::MolaMap::TransientDiscPin> peer_pin;
+  std::optional<PeerBodyPin> peer_pin;
   pinPeerBodies(peer_pin);
   refreshPeerGeneration();
   // The sampler draws around the unvisited clusters of the global graph and
@@ -4484,7 +4573,7 @@ void PlannerNode::onPlanRequest(
   const std::lock_guard<std::recursive_mutex> lock(planner_mutex_);
   StandingStartScope standing_scope(*this);
   // One peer set for the whole request (review r0, I5).
-  std::optional<mgg::MolaMap::TransientDiscPin> peer_pin;
+  std::optional<PeerBodyPin> peer_pin;
   pinPeerBodies(peer_pin);
   departure_sent_now_ = false;
   stored_reverse_sent_now_ = false;
@@ -5519,7 +5608,7 @@ void PlannerNode::onObjectiveRequest(
   const std::lock_guard<std::recursive_mutex> lock(planner_mutex_);
   StandingStartScope standing_scope(*this);
   // One peer set for the whole request (review r0, I5).
-  std::optional<mgg::MolaMap::TransientDiscPin> peer_pin;
+  std::optional<PeerBodyPin> peer_pin;
   pinPeerBodies(peer_pin);
   // An objective supersedes exploration's last path.
   turn_back_hysteresis_.reset();

@@ -247,17 +247,18 @@ class PlannerNode : public rclcpp::Node {
   /// Whether a peer body closes the straight segment from `from` to `to`,
   /// driven that way: the sweep the lattice's edges take
   /// (mgg::MolaMap::transientDiscsBlockSweep, the outward departure from a
-  /// peer's reach left open) of the robot's planning box. Never, without
-  /// the mola_snapshot backend (no peer bodies), or while
-  /// peer_edges_open_.
+  /// peer's reach left open) of the robot's planning box. Aerial spec-aware
+  /// cylinders work on every backend. Never while peer_edges_open_.
+  struct PeerBodyPin;
   bool peerBlocksSegment(const Eigen::Vector3d& from,
                          const Eigen::Vector3d& to) const;
+  void onAerialPeerBodies(geometry_msgs::msg::PoseArray::ConstSharedPtr msg);
   /// Pins the peer bodies in force now in `pin`, on this thread, for the
-  /// rest of a plan or objective request (mgg::MolaMap::TransientDiscPin):
+  /// rest of a plan or objective request (PeerBodyPin):
   /// every map query, roadmap search and route check of the request sees
   /// this one set, and onPeerBodies, serialised with planning, publishes
-  /// the next only after it. Left empty without the mola_snapshot backend.
-  void pinPeerBodies(std::optional<mgg::MolaMap::TransientDiscPin>& pin);
+  /// the next only after it. Ground discs still require mola_snapshot.
+  void pinPeerBodies(std::optional<PeerBodyPin>& pin);
   /// Whether `path`, driven from its first pose, keeps clear of the peer
   /// bodies (peerBlocksSegment): the last check on every path and route
   /// sent, as noGoAdmissible is for the zones.
@@ -993,6 +994,24 @@ class PlannerNode : public rclcpp::Node {
   mgg::BoundModeType nominal_bound_mode_ = mgg::BoundModeType::kExtendedBound;
   double reservation_exclusion_ttl_s_ = 3.0;
   double peer_body_radius_m_ = 0.6;
+  double aerial_peer_margin_m_ = 0.35;
+  struct AerialPeerBody {
+    Eigen::Vector3d top;
+    double radius;
+  };
+  std::vector<AerialPeerBody> aerial_peer_bodies_;
+  std::chrono::steady_clock::time_point aerial_peer_bodies_received_;
+  bool have_aerial_peer_bodies_ = false;
+  bool aerial_peer_generation_active_ = false;
+  std::optional<std::vector<AerialPeerBody>> pinned_aerial_peer_bodies_;
+  std::vector<AerialPeerBody> activeAerialPeerBodies() const;
+  struct PeerBodyPin {
+    explicit PeerBodyPin(PlannerNode& node);
+    ~PeerBodyPin();
+    PlannerNode& node;
+    std::optional<std::vector<AerialPeerBody>> previous;
+    std::optional<mgg::MolaMap::TransientDiscPin> ground;
+  };
   double peer_body_ttl_s_ = 3.0;
 
   /// A goal the robot has no known route to yet, in the world frame. While
@@ -1041,6 +1060,7 @@ class PlannerNode : public rclcpp::Node {
       coordination_exclusions_sub_;
   rclcpp::Subscription<geometry_msgs::msg::PoseArray>::SharedPtr
       peer_bodies_sub_;
+  rclcpp::Subscription<geometry_msgs::msg::PoseArray>::SharedPtr aerial_peer_bodies_sub_;
   rclcpp::Subscription<geometry_msgs::msg::PoseArray>::SharedPtr
       no_go_zones_sub_;
   /// The no-go zones' centres, planning frame (onNoGoZones).
