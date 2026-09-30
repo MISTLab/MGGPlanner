@@ -872,6 +872,26 @@ TEST(MolaMap, AerialTakeoffOverPadLinksPastUnknownHomeWithoutPersistingEdge) {
   EXPECT_EQ(graph.getNumEdges(), 0);
 }
 
+TEST(MolaMap, AerialLinkDepartureFallbackRejectsWallButAllowsUnknownOwnBody) {
+  for (bool wall : {false, true}) {
+    SCOPED_TRACE(wall);
+    AerialMolaScene scene;
+    auto free = AerialMolaScene::observedRoom();
+    free.erase(std::remove_if(free.begin(), free.end(), [](const Voxel& v) {
+      return v.x == 0 && v.y == 0 && v.z == 7;
+    }), free.end());
+    scene.load(free, wall ? std::vector<Voxel>{{0, 0, 7}} : std::vector<Voxel>{});
+    mgg::GraphManager graph;
+    auto* anchor = new mgg::Vertex(0, scene.hover + mgg::StateVec(1, 0, 0, 0));
+    graph.addVertex(anchor);
+    const auto link = mgg::linkDeparture(graph, scene.hover, scene.ctx, 1.5);
+    EXPECT_EQ(link.vertex, wall ? nullptr : anchor);
+    EXPECT_EQ(link.query_local, !wall);
+    EXPECT_EQ(graph.getNumVertices(), 1);
+    EXPECT_EQ(graph.getNumEdges(), 0);
+  }
+}
+
 TEST(MolaMap, AerialRebuildDoesNotJoinKeyframesAcrossUnknownAir) {
   AerialMolaScene scene;
   auto free = AerialMolaScene::observedRoom();
