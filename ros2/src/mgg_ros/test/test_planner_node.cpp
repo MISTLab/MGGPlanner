@@ -4408,6 +4408,12 @@ TEST_F(PlannerNodeTest, AerialCylinderAllowsCurrentPoseToLeaveButNotEnterDeeper)
   EXPECT_FALSE(PlannerNodeTestPeer::peerPathClear(*node, {.5,0,1.2}, {-.6,0,1.2}));
   EXPECT_FALSE(PlannerNodeTestPeer::peerPathClear(*node, {.5,0,1.2}, {.5,0,1.1}));
   EXPECT_FALSE(PlannerNodeTestPeer::peerPathClear(*node, {.4,0,1.2}, {2,0,1.2}));
+  // Peer bodies are masked out of lidar: an outward descent can enter
+  // their physical volume even when the static map reports free space.
+  EXPECT_FALSE(PlannerNodeTestPeer::peerPathClear(*node, {.5,0,1.2}, {.7,0,.5}));
+  PlannerNodeTestPeer::acceptOdometryFacing(*node, 0, 0, 0, 2, 1.2);
+  EXPECT_FALSE(PlannerNodeTestPeer::peerPathClear(*node, {0,0,1.2}, {.2,0,.5}));
+  EXPECT_TRUE(PlannerNodeTestPeer::peerPathClear(*node, {0,0,1.2}, {0,0,1.6}));
 }
 
 TEST_F(PlannerNodeTest, AerialCylinderDetourSurvivesPlanAndReturnHomeShortcut) {

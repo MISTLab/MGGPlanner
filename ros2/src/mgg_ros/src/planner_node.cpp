@@ -2216,10 +2216,12 @@ bool PlannerNode::peerBlocksSegment(const Eigen::Vector3d& from,
       const double reach = body.radius + aerial_peer_margin_m_ + .5 * box.head<2>().norm();
       const Eigen::Vector2d at_start = start.head<2>() - body.top.head<2>();
       const Eigen::Vector2d travel = end.head<2>() - start.head<2>();
-      // This is a peer margin, not measured occupancy. Like disc exits,
-      // allow a robot already inside to move monotonically away, or climb
-      // vertically. A point query still reports the volume as blocked.
+      // The cylinder includes the peer's physical body, which can be
+      // masked out of lidar. An inside start may exit monotonically away
+      // or climb, but must never descend into that body. A point query
+      // still reports the volume as blocked.
       if (start.z() <= ceiling && at_start.norm() <= reach &&
+          end.z() >= start.z() - 1e-9 &&
           ((travel.squaredNorm() > 1e-12 && at_start.dot(travel) >= -1e-9) ||
            (travel.squaredNorm() <= 1e-12 && end.z() > start.z() + 1e-9))) continue;
       if ((a + t * delta).norm() <= reach) return true;

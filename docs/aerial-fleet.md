@@ -21,7 +21,7 @@ A message atomically replaces the set. Wrong frames or any malformed/non-finite 
 
 Until the first valid cylinder message, existing aerial `peer_bodies` XY-disc behaviour remains. That first message clears the aerial receiver's legacy discs; subsequent legacy messages cannot override the spec-aware input. The SwarmDeck launch should set the margin and publish this topic at its normal peer-body cadence (0.5 s). No SwarmDeck files are changed here.
 
-Cylinders block local/global searches, shortcutting and final path admission, not stored edges. A robot already inside a margin may leave with horizontal distance never decreasing, or climb vertically; entering deeper or descending vertically remains refused. A path may start inside only at the robot's current pose. These exits relax only peer margins, never the strict static observed-free checks. Moving/expired peers reopen the same edges without rebuilding the roadmap.
+Cylinders block local/global searches, shortcutting and final path admission, not stored edges. The cylinder's core is the peer's own spec volume, which may be masked out of lidar; static observed-free checks cannot replace this protection. A robot already inside the inflated cylinder may leave only with horizontal distance never decreasing and without descending, including a vertical climb. Entering deeper or descending (with any horizontal component) remains refused. A path may start inside only at the robot's current pose. The strict static observed-free checks also remain in force. Moving/expired peers reopen the same edges without rebuilding the roadmap.
 
 ## Deployment boundary: one-drone fleet
 
