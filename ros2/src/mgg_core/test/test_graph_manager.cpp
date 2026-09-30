@@ -35,6 +35,43 @@ class Chain {
   GraphManager gm;
 };
 
+TEST(GraphManager, CuttingPeerEdgesRetiresOwnershipAcrossAllSenders) {
+  GraphManager gm;
+  gm.setRobotId(1);
+  auto* own = new Vertex(0, StateVec(0, 0, 0, 0));
+  gm.addVertex(own);
+  auto* a = new Vertex(1, StateVec(1, 0, 0, 0));
+  a->robot_id = 2;
+  gm.addNeighbourVertex(a, 0);
+  auto* b = new Vertex(2, StateVec(2, 0, 0, 0));
+  b->robot_id = 3;
+  gm.addNeighbourVertex(b, 0);
+  auto* b_next = new Vertex(3, StateVec(3, 0, 0, 0));
+  b_next->robot_id = 3;
+  gm.addNeighbourVertex(b_next, 1);
+  gm.addEdge(own, a, 1);
+  gm.addEdge(a, b, 1);
+  gm.addEdge(b, b_next, 1);
+  // A installed its rendezvous with B; B installed its internal edge.
+  gm.neighbour_placements_[2].merge_owned_edges = {{0, 1}, {1, 2}};
+  gm.neighbour_placements_[3].merge_owned_edges = {{2, 3}};
+  EXPECT_EQ(gm.cutNeighbourEdges(3), 2);
+  EXPECT_EQ(gm.neighbour_placements_[2].merge_owned_edges.count({1, 2}), 0u);
+  EXPECT_EQ(gm.neighbour_placements_[2].merge_owned_edges.count({0, 1}), 1u);
+  EXPECT_TRUE(gm.neighbour_placements_[3].merge_owned_edges.empty());
+  // B's re-merge installs the same pair. A's next refresh must not cut
+  // B's newly owned edge, even if B's unchanged snapshot is cached afterward.
+  gm.addEdge(a, b, 1);
+  gm.neighbour_placements_[3].merge_owned_edges.insert({1, 2});
+  EXPECT_EQ(gm.cutMergeOwnedEdges(2), 1);
+  EXPECT_TRUE(gm.graph_->edgeExists(1, 2));
+  EXPECT_EQ(gm.getNumEdges(), 1);
+  ASSERT_EQ(gm.edge_map_.at(1).size(), 1u);
+  ASSERT_EQ(gm.edge_map_.at(2).size(), 1u);
+  EXPECT_EQ(gm.edge_map_.at(1).front().first, 2);
+  EXPECT_EQ(gm.edge_map_.at(2).front().first, 1);
+}
+
 TEST(GraphManager, TracksVertexAndEdgeCounts) {
   Chain c;
   EXPECT_EQ(c.gm.getNumVertices(), 4);

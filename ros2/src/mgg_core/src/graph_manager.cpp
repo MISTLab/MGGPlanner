@@ -137,9 +137,11 @@ int GraphManager::cutNeighbourEdges(int robot_id) {
   const auto found = vertex_by_robot_id_.find(robot_id);
   if (found == vertex_by_robot_id_.end()) return 0;
   int cut = 0;
+  std::unordered_set<int> cut_vertices;
   for (const auto& entry : found->second) {
     Vertex* vertex = entry.second;
     if (vertex == nullptr) continue;
+    cut_vertices.insert(vertex->id);
     const auto edges = edge_map_.find(vertex->id);
     if (edges == edge_map_.end()) continue;
     for (const auto& [other, weight] : edges->second) {
@@ -155,8 +157,18 @@ int GraphManager::cutNeighbourEdges(int robot_id) {
     }
     edge_map_.erase(vertex->id);
   }
-  const auto placement = neighbour_placements_.find(robot_id);
-  if (placement != neighbour_placements_.end()) placement->second.merge_owned_edges.clear();
+  // A cross-peer rendezvous may belong to a different sender. Retire every
+  // claim touching the cut vertices before another sender can reuse the pair.
+  for (auto& entry : neighbour_placements_) {
+    auto& owned = entry.second.merge_owned_edges;
+    for (auto it = owned.begin(); it != owned.end();) {
+      if (cut_vertices.count(it->first) || cut_vertices.count(it->second)) {
+        it = owned.erase(it);
+      } else {
+        ++it;
+      }
+    }
+  }
   return cut;
 }
 
