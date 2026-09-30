@@ -4294,6 +4294,28 @@ TEST_F(PlannerNodeTest, AerialCylinderDetourSurvivesPlanAndReturnHomeShortcut) {
   }
 }
 
+TEST_F(PlannerNodeTest, AerialCloudObjectiveDiagnosesCylinderWithoutMolaBackend) {
+  auto node = makeNode("cloud_cylinder_diagnosis");
+  PlannerNodeTestPeer::setAerialRobot(*node);
+  PlannerNodeTestPeer::observeFloor(*node, -4, 4, -2, 2);
+  PlannerNodeTestPeer::acceptOdometryFacing(*node, -2.1, .1, 0, 1, .4);
+  PlannerNodeTestPeer::addGlobalChainToFrontier(*node, {{-1.1,.1}, {.1,.1}, {1.1,.1}, {2.1,.1}});
+  PlannerNodeTestPeer::acceptOdometryFacing(*node, 2.1, .1, M_PI, 2, .4);
+  PlannerNodeTestPeer::aerialPeerBodies(*node, .97, .6);
+  // Isolate a null-backend UB/sanitizer failure from the test binary.
+  // Re-exec rather than fork with ROS background threads still running.
+  ::testing::FLAGS_gtest_death_test_style = "threadsafe";
+  EXPECT_EXIT({
+    using Service = mgg_msgs::srv::PlanObjective;
+    auto request = std::make_shared<Service::Request>();
+    request->objective = Service::Request::RETURN_HOME;
+    request->goal.position.x = std::nan("");
+    auto response = std::make_shared<Service::Response>();
+    PlannerNodeTestPeer::objective(*node, request, response);
+    std::_Exit(response->status == Service::Response::BLOCKED ? 0 : 1);
+  }, ::testing::ExitedWithCode(0), "");
+}
+
 TEST_F(PlannerNodeTest, AerialPeerCylinderClosesSearchNotStoredEdges) {
   auto node = makeNode("aerial_peer_search");
   PlannerNodeTestPeer::setAerialRobot(*node);

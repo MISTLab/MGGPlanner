@@ -5787,7 +5787,8 @@ void PlannerNode::onObjectiveRequest(
             reason;
         return;
       }
-      const mgg::MolaMap::TransientDiscPin no_peers(*mola_map_, {}, 0.0);
+      std::optional<mgg::MolaMap::TransientDiscPin> no_peers;
+      if (mola_map_) no_peers.emplace(*mola_map_, std::vector<Eigen::Vector2d>{}, 0.0);
       peer_edges_open_ = true;
       peer_diagnosis_cut_short_ = false;
       peer_diagnosis_deadline_ =
