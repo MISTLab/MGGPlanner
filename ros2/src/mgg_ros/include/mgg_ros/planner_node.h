@@ -219,6 +219,11 @@ class PlannerNode : public rclcpp::Node {
   /// leaving one it starts in excepted), and on every backend the global
   /// graph's searches leave out the edges through it (noGoBlocksEdge).
   void onNoGoZones(geometry_msgs::msg::PoseArray::ConstSharedPtr msg);
+  /// no_go_discs: PoseArray, position.x/y = centre, position.z = already
+  /// body-inflated centre-line reach in metres (NOT altitude). Orientation is
+  /// ignored. Same frame, lifetime and replacement rules as no_go_zones,
+  /// but independent: neither topic clears the other, no extra inflation.
+  void onNoGoDiscs(geometry_msgs::msg::PoseArray::ConstSharedPtr msg);
   /// Sets no_go_ from no_go_zones_, its reach the zone radius plus half
   /// the robot's planning box.
   void refreshNoGoZones();
@@ -1032,6 +1037,9 @@ class PlannerNode : public rclcpp::Node {
       no_go_zones_sub_;
   /// The no-go zones' centres, planning frame (onNoGoZones).
   std::vector<Eigen::Vector2d> no_go_zones_;
+  rclcpp::Subscription<geometry_msgs::msg::PoseArray>::SharedPtr no_go_discs_sub_;
+  std::vector<Eigen::Vector2d> no_go_disc_centres_;
+  std::vector<double> no_go_disc_reaches_;
   /// The same zones with their reach, as every check applies them.
   mgg::NoGoZones no_go_;
   rclcpp::Publisher<mgg_msgs::msg::Graph>::SharedPtr graph_pub_;

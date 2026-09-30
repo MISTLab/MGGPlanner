@@ -207,3 +207,17 @@ TEST(NoGoZones, AStartInsideTwoOverlappingZonesDepartsBoth) {
 }
 
 }  // namespace
+
+TEST(NoGoZones, PerDiscReachPreservesTerrainAndAllowsPadDeparture) {
+  mgg::NoGoZones zones;
+  zones.set({{0.0, 0.0}, {10.0, 0.0}}, std::vector<double>{2.4, 1.6});
+  EXPECT_TRUE(zones.inside({2.3, 0, 0}));
+  EXPECT_FALSE(zones.inside({8.3, 0, 0}));
+  EXPECT_TRUE(zones.pathAdmissible({{0, 0, 0}, {3, 0, 0}}));
+  EXPECT_TRUE(zones.pathAdmissible({{1.1, 0, 0}, {3, 0, 0}}));
+  EXPECT_FALSE(zones.pathAdmissible({{3, 0, 0}, {2, 0, 0}}));
+  EXPECT_FALSE(zones.pathAdmissible({{1.1, 0, 0}, {-3, 0, 0}}));
+  EXPECT_TRUE(zones.blocksEdge({3, 0, 0}, {2, 0, 0}, {3, 0, 0}));
+  zones.set({}, std::vector<double>{});
+  EXPECT_TRUE(zones.empty());
+}

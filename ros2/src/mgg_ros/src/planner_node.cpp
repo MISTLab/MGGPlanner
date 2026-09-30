@@ -441,6 +441,12 @@ PlannerNode::PlannerNode(const rclcpp::NodeOptions& options)
         onNoGoZones(m);
       },
       no_go_opts);
+  no_go_discs_sub_ = create_subscription<geometry_msgs::msg::PoseArray>(
+      "no_go_discs", rclcpp::QoS(1).transient_local(),
+      [this](geometry_msgs::msg::PoseArray::ConstSharedPtr m) {
+        onNoGoDiscs(m);
+      },
+      no_go_opts);
   // Latched: SwarmDeck's adapter publishes the drone's flight state on each
   // change; a planner started later gets the current one. Each state
   // replaces the last, so, as no_go_zones, they are handled one at a time,
@@ -1916,11 +1922,38 @@ void PlannerNode::onNoGoZones(
   }
 }
 
+void PlannerNode::onNoGoDiscs(
+    geometry_msgs::msg::PoseArray::ConstSharedPtr msg) {
+  if (msg->header.frame_id != world_frame_) return;
+  std::vector<Eigen::Vector2d> centres;
+  std::vector<double> reaches;
+  for (const auto& pose : msg->poses) {
+    const auto& p = pose.position;
+    // Reject the whole replacement, never silently drop a malformed margin.
+    if (!std::isfinite(p.x) || !std::isfinite(p.y) ||
+        !std::isfinite(p.z) || p.z <= 0.0) return;
+    centres.emplace_back(p.x, p.y);
+    reaches.push_back(p.z);
+  }
+  const std::lock_guard<std::recursive_mutex> lock(planner_mutex_);
+  if (mola_map_ != nullptr) mola_map_->setNoGoCentreLineDiscs(centres, reaches);
+  if (centres != no_go_disc_centres_ || reaches != no_go_disc_reaches_) {
+    no_go_disc_centres_ = std::move(centres);
+    no_go_disc_reaches_ = std::move(reaches);
+    refreshNoGoZones();
+    ++graph_revision_;
+  }
+}
+
 void PlannerNode::refreshNoGoZones() {
   // A centre line kept out of the reach keeps the body out of the disc.
   const Eigen::Vector3d box = robot_params_.getPlanningSize();
-  no_go_.set(no_go_zones_, planning_params_.no_go_radius_m +
+  auto centres = no_go_zones_;
+  std::vector<double> reaches(centres.size(), planning_params_.no_go_radius_m +
                                0.5 * std::max(box.x(), box.y()));
+  centres.insert(centres.end(), no_go_disc_centres_.begin(), no_go_disc_centres_.end());
+  reaches.insert(reaches.end(), no_go_disc_reaches_.begin(), no_go_disc_reaches_.end());
+  no_go_.set(std::move(centres), std::move(reaches));
 }
 
 bool PlannerNode::noGoAdmissible(const std::vector<mgg::StateVec>& path) {

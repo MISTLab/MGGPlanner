@@ -18,9 +18,13 @@ class NoGoZones {
  public:
   /// Replaces the zones; an empty set clears them.
   void set(std::vector<Eigen::Vector2d> centres, double reach);
+  /// Per-disc centre-line reaches; no additional body inflation.
+  void set(std::vector<Eigen::Vector2d> centres, std::vector<double> reaches);
   bool empty() const { return centres_.empty(); }
   const std::vector<Eigen::Vector2d>& centres() const { return centres_; }
+  /// Largest reach (the common reach for the legacy uniform set).
   double reach() const { return reach_; }
+  const std::vector<double>& reaches() const { return reaches_; }
 
   /// Whether `p` lies within a zone's reach.
   bool inside(const Eigen::Vector3d& p) const;
@@ -59,6 +63,7 @@ class NoGoZones {
 
  private:
   std::vector<Eigen::Vector2d> centres_;
+  std::vector<double> reaches_;
   double reach_ = 0.0;
 };
 

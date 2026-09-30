@@ -3,6 +3,7 @@
 #ifndef MGG_MAP_OCTOMAP_MOLA_MAP_H_
 #define MGG_MAP_OCTOMAP_MOLA_MAP_H_
 
+#include "mgg_core/no_go_zones.h"
 #include <chrono>
 #include <atomic>
 #include <condition_variable>
@@ -166,6 +167,9 @@ class MolaMap : public MapInterface {
   /// call replaces the set, and an empty one clears it; the publisher owns
   /// their lifetime.
   void setNoGoDiscs(std::vector<Eigen::Vector2d> centres, double radius_m);
+  /// Already body-inflated centre-line reaches, independent of terrain discs.
+  void setNoGoCentreLineDiscs(std::vector<Eigen::Vector2d> centres,
+                              std::vector<double> reaches);
   /// dynamicSweepBlocked for the discs of setTransientDiscs alone, the
   /// peer bodies: the same sweep test and outward departure from a disc's
   /// reach, without the no-go discs, which a caller checks on its own terms.
@@ -312,6 +316,7 @@ class MolaMap : public MapInterface {
   };
   std::shared_ptr<const TransientDiscs> transient_discs_;
   std::shared_ptr<const TransientDiscs> no_go_discs_;
+  std::shared_ptr<const NoGoZones> no_go_centre_line_discs_;
   /// The transient discs queries on this thread see: the innermost
   /// TransientDiscPin's, or those published.
   std::shared_ptr<const TransientDiscs> transientDiscs() const;

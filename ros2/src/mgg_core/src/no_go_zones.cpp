@@ -29,25 +29,35 @@ double nearestDistance(const Eigen::Vector2d& a, const Eigen::Vector2d& b,
 }  // namespace
 
 void NoGoZones::set(std::vector<Eigen::Vector2d> centres, double reach) {
+  set(centres, std::vector<double>(centres.size(), reach));
+}
+
+void NoGoZones::set(std::vector<Eigen::Vector2d> centres,
+                    std::vector<double> reaches) {
   centres_.clear();
-  if (!(std::isfinite(reach) && reach > 0.0)) return;
-  for (const Eigen::Vector2d& c : centres) {
-    if (c.allFinite()) centres_.push_back(c);
+  reaches_.clear();
+  reach_ = 0.0;
+  if (centres.size() != reaches.size()) return;
+  for (std::size_t i = 0; i < centres.size(); ++i) {
+    if (centres[i].allFinite() && std::isfinite(reaches[i]) && reaches[i] > 0.0) {
+      centres_.push_back(centres[i]);
+      reaches_.push_back(reaches[i]);
+      reach_ = std::max(reach_, reaches[i]);
+    }
   }
-  reach_ = reach;
 }
 
 bool NoGoZones::inside(const Eigen::Vector3d& p) const {
-  return std::any_of(centres_.begin(), centres_.end(),
-                     [this, &p](const Eigen::Vector2d& c) {
-                       return (p.head<2>() - c).norm() < reach_;
-                     });
+  for (std::size_t z = 0; z < centres_.size(); ++z) {
+    if ((p.head<2>() - centres_[z]).norm() < reaches_[z]) return true;
+  }
+  return false;
 }
 
 NoGoZones::Departing NoGoZones::departing(const Eigen::Vector3d& p) const {
   Departing zones;
   for (std::size_t z = 0; z < centres_.size(); ++z) {
-    if ((p.head<2>() - centres_[z]).norm() < reach_) {
+    if ((p.head<2>() - centres_[z]).norm() < reaches_[z]) {
       zones.push_back(static_cast<int>(z));
     }
   }
@@ -69,7 +79,7 @@ bool NoGoZones::step(const Eigen::Vector3d& a3, const Eigen::Vector3d& b3,
         nearestDistance(a, b, c) < (a - c).norm() - kEps) {
       return false;
     }
-    if ((b - c).norm() < reach_) next.push_back(z);
+    if ((b - c).norm() < reaches_[z]) next.push_back(z);
   }
   // Every other zone is blocked.
   auto leaving = departing.begin();
@@ -78,7 +88,7 @@ bool NoGoZones::step(const Eigen::Vector3d& a3, const Eigen::Vector3d& b3,
       ++leaving;
     }
     if (leaving != departing.end() && *leaving == static_cast<int>(z)) continue;
-    if (nearestDistance(a, b, centres_[z]) < reach_) return false;
+    if (nearestDistance(a, b, centres_[z]) < reaches_[z]) return false;
   }
   departing.swap(next);
   return true;
@@ -97,13 +107,14 @@ bool NoGoZones::blocksEdge(const Eigen::Vector3d& a3, const Eigen::Vector3d& b3,
                            const Eigen::Vector3d& robot) const {
   const Eigen::Vector2d a = a3.head<2>();
   const Eigen::Vector2d b = b3.head<2>();
-  for (const Eigen::Vector2d& c : centres_) {
+  for (std::size_t z = 0; z < centres_.size(); ++z) {
+    const Eigen::Vector2d& c = centres_[z];
     const double t = nearestFraction(a, b, c);
     const double nearest = (c - (a + t * (b - a))).norm();
-    if (nearest >= reach_) continue;
+    if (nearest >= reaches_[z]) continue;
     const double robot_distance = (robot.head<2>() - c).norm();
     const bool at_an_end = t <= kEps || t >= 1.0 - kEps;
-    if (robot_distance < reach_ && at_an_end &&
+    if (robot_distance < reaches_[z] && at_an_end &&
         nearest >= robot_distance - 1e-6) {
       continue;  // only ever driven outward, on the robot's way out
     }

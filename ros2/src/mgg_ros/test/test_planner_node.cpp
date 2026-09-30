@@ -819,6 +819,22 @@ class PlannerNodeTestPeer {
     }
     node.onNoGoZones(msg);
   }
+  static void receiveNoGoDiscs(PlannerNode& node, const std::string& frame,
+                               const std::vector<Eigen::Vector3d>& discs) {
+    auto msg = std::make_shared<geometry_msgs::msg::PoseArray>();
+    msg->header.frame_id = frame;
+    for (const auto& disc : discs) {
+      geometry_msgs::msg::Pose pose;
+      pose.position.x = disc.x();
+      pose.position.y = disc.y();
+      pose.position.z = disc.z();  // centre-line reach, not altitude
+      msg->poses.push_back(pose);
+    }
+    node.onNoGoDiscs(msg);
+  }
+  static bool noGoAdmits(PlannerNode& node, const std::vector<mgg::StateVec>& path) {
+    return node.noGoAdmissible(path);
+  }
   static void setCommunicationRange(PlannerNode& node, double range) {
     const std::lock_guard<std::recursive_mutex> lock(node.planner_mutex_);
     node.communication_range_ = range;
@@ -9793,6 +9809,48 @@ TEST_F(PlannerNodeTest, FlightStatesAreHandledInTheOrderTakenSoTheLatestSeedsHom
   PlannerNodeTestPeer::acceptOdometry(*node, odometryAt(0.0, 0.0, 1.3, 1));
   EXPECT_NEAR(PlannerNodeTestPeer::globalVertexState(*node, 0).z(), 1.3,
               1e-9);
+}
+
+}  // namespace mgg_ros
+
+namespace mgg_ros {
+TEST_F(PlannerNodeTest, PadDiscsHaveIndependentRadiiAndDoNotReplaceTerrain) {
+  auto node = makeNode("pad_discs", "world",
+      {rclcpp::Parameter("PlanningParams.no_go_radius_m", 0.5)});
+  PlannerNodeTestPeer::receiveNoGoZones(*node, "world", {{10, 0}});
+  PlannerNodeTestPeer::receiveNoGoDiscs(*node, "world", {{0, 0, 2.4}});
+  auto admits = [&](double a, double b) {
+    return PlannerNodeTestPeer::noGoAdmits(*node, {{a, 0, 0, 0}, {b, 0, 0, 0}});
+  };
+  EXPECT_TRUE(admits(0, 3));
+  EXPECT_TRUE(admits(1.1, 3));
+  EXPECT_FALSE(admits(3, 2.3));
+  EXPECT_FALSE(admits(9, 10));
+  // Replace the radius without changing the centre; no extra body inflation.
+  PlannerNodeTestPeer::receiveNoGoDiscs(*node, "world", {{0, 0, 1.0}});
+  EXPECT_TRUE(admits(3, 1.05));
+  PlannerNodeTestPeer::receiveNoGoDiscs(*node, "wrong", {});
+  EXPECT_FALSE(admits(3, 0));
+  PlannerNodeTestPeer::receiveNoGoDiscs(*node, "world", {});
+  EXPECT_TRUE(admits(3, 0));
+  EXPECT_FALSE(admits(9, 10));
+}
+
+
+TEST_F(PlannerNodeTest, PadDiscsStartingInsidePlansOutOnBothBackends) {
+  for (const bool mola : {false, true}) {
+    SCOPED_TRACE(mola);
+    std::unique_ptr<MolaFloorProduct> product;
+    auto node = corridorNode(mola ? "pad_depart_mola" : "pad_depart_cloud", mola, product);
+    PlannerNodeTestPeer::acceptOdometry(*node, 1.1, 0.0, 1.0);
+    PlannerNodeTestPeer::receiveNoGoDiscs(*node, "world", {{0.0, 0.0, 2.4}});
+    auto response = std::make_shared<mgg_msgs::srv::PlannerSrv::Response>();
+    PlannerNodeTestPeer::plan(*node, response);
+    ASSERT_EQ(response->status, mgg_msgs::srv::PlannerSrv::Response::FORWARD);
+    ASSERT_GE(response->path.size(), 2u);
+    EXPECT_GE(response->path.back().position.x, 2.4);
+    for (const auto& p : response->path) EXPECT_GE(p.position.x, 1.1 - 1e-3);
+  }
 }
 
 }  // namespace mgg_ros

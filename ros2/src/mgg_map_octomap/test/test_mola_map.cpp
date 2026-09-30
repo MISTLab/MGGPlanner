@@ -3053,3 +3053,19 @@ TEST(ObservedGround, AHoleTheLidarLookedIntoIsNotBridged) {
 }
 
 }  // namespace
+
+TEST(MolaMap, CentreLineDiscsUseTheirOwnReachAndAllowOutwardSweeps) {
+  Publication publication;
+  MolaMap provider(config(publication));
+  provider.setNoGoDiscs({{10, 0}}, 0.5);
+  provider.setNoGoCentreLineDiscs({{0, 0}}, {2.4});
+  EXPECT_TRUE(provider.dynamicBoxBlocked({2.3, 0, 0}, {1, 1, 1}));
+  EXPECT_FALSE(provider.dynamicBoxBlocked({2.5, 0, 0}, {1, 1, 1}));
+  EXPECT_FALSE(provider.dynamicSweepBlocked({0, 0, 0}, {3, 0, 0}, 0.5));
+  EXPECT_FALSE(provider.dynamicSweepBlocked({1.1, 0, 0}, {3, 0, 0}, 0.5));
+  EXPECT_TRUE(provider.dynamicSweepBlocked({3, 0, 0}, {2.3, 0, 0}, 0.5));
+  EXPECT_TRUE(provider.dynamicSweepBlocked({1.1, 0, 0}, {-3, 0, 0}, 0.5));
+  provider.setNoGoCentreLineDiscs({}, {});
+  EXPECT_FALSE(provider.dynamicBoxBlocked({0, 0, 0}, {1, 1, 1}));
+  EXPECT_TRUE(provider.dynamicBoxBlocked({10, 0, 0}, {1, 1, 1}));
+}

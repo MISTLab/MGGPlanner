@@ -1158,6 +1158,14 @@ void MolaMap::setNoGoDiscs(std::vector<Eigen::Vector2d> centres,
                     std::shared_ptr<const TransientDiscs>(std::move(discs)));
 }
 
+void MolaMap::setNoGoCentreLineDiscs(std::vector<Eigen::Vector2d> centres,
+                                      std::vector<double> reaches) {
+  auto discs = std::make_shared<NoGoZones>();
+  discs->set(std::move(centres), std::move(reaches));
+  std::atomic_store(&no_go_centre_line_discs_,
+                    std::shared_ptr<const NoGoZones>(std::move(discs)));
+}
+
 MolaMap::TransientDiscPin::TransientDiscPin(const MolaMap& map,
                                             std::vector<Eigen::Vector2d> centres,
                                             const double radius_m)
@@ -1204,6 +1212,11 @@ MolaMap::TransientDiscSet MolaMap::activeTransientDiscs() const {
 bool MolaMap::discsBlockSweep(const Eigen::Vector3d& start,
                               const Eigen::Vector3d& end,
                               const double half_width) const {
+  const auto discs = std::atomic_load(&no_go_centre_line_discs_);
+  if (discs) {
+    auto leaving = discs->departing(start);
+    if (!discs->step(start, end, leaving)) return true;
+  }
   return discSetBlocksSweep(transientDiscs(), start, end,
                             half_width) ||
          discSetBlocksSweep(std::atomic_load(&no_go_discs_), start, end,
@@ -1254,7 +1267,9 @@ bool MolaMap::discSetBlocksSweep(
 
 bool MolaMap::discsBlockBox(const Eigen::Vector3d& center,
                             const Eigen::Vector3d& size) const {
-  return discSetBlocksBox(transientDiscs(), center, size) ||
+  const auto discs = std::atomic_load(&no_go_centre_line_discs_);
+  return (discs && discs->inside(center)) ||
+         discSetBlocksBox(transientDiscs(), center, size) ||
          discSetBlocksBox(std::atomic_load(&no_go_discs_), center, size);
 }
 
