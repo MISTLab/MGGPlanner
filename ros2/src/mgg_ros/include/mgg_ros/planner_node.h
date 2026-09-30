@@ -544,6 +544,11 @@ class PlannerNode : public rclcpp::Node {
   /// Every frontier cluster of the global graph, other robots' included,
   /// under its stable name (tour-exploration design §2.1).
   std::vector<mgg::FrontierCluster> globalFrontierClusters();
+  /// For valuation only: a lifted target serves the aerial fleet scout,
+  /// without changing the actual cluster's owner or auction identity.
+  mgg::FrontierCluster tourValueCluster(const mgg::FrontierCluster& cluster) const;
+  int capTourValues(mgg::TourCostMatrix& costs,
+                    const std::vector<mgg::FrontierCluster>& clusters) const;
   /// Of `clusters`, those this robot's tour may visit: without fleet
   /// assignment, its own, or every robot's once none of its own is left
   /// (as kGlobalOtherRobotPenalty preferred them), less those a peer's

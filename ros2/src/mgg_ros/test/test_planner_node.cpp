@@ -4139,6 +4139,7 @@ TEST_F(PlannerNodeTest, FiniteAerialReturnHomeUsesTakeoffColumnEvidenceAndOccupi
 TEST_F(PlannerNodeTest, AerialLiftsPeerFrontiersWithoutImportingGroundRoadmap) {
   auto node = makeNode("lift_peer_frontier", "world", {
       rclcpp::Parameter("fleet.enabled", false),
+      rclcpp::Parameter("PlanningParams.unknown_voxel_gain", 60.0),
       rclcpp::Parameter("neighbour_offsets", std::vector<double>{2, 0, 0, 0}),
       rclcpp::Parameter("aerial_frontier_height_m", .4),
       rclcpp::Parameter("aerial_min_height_m", .3),
@@ -4153,7 +4154,7 @@ TEST_F(PlannerNodeTest, AerialLiftsPeerFrontiersWithoutImportingGroundRoadmap) {
   mgg_msgs::msg::Vertex v;
   v.id = 0; v.robot_id = 2; v.pose.position.x = 3.1;
   v.pose.position.y = .1; v.pose.orientation.w = 1;
-  v.is_frontier = true; v.num_unknown_voxels = 1000000;
+  v.is_frontier = true; v.num_unknown_voxels = 300;
   peer.vertices.push_back(v);
   PlannerNodeTestPeer::receiveGraph(*node, peer);
   auto clusters = PlannerNodeTestPeer::frontierClusters(*node);
@@ -4167,9 +4168,19 @@ TEST_F(PlannerNodeTest, AerialLiftsPeerFrontiersWithoutImportingGroundRoadmap) {
   const auto published = PlannerNodeTestPeer::ownGraph(*node);
   EXPECT_EQ(published.vertices.size(), 2u);
   EXPECT_EQ(published.edges.size(), 1u);
-  PlannerNodeTestPeer::setTour(*node, true, 0);
+  // Default value floor, realistic sender evidence. A reachable own
+  // cluster below the distance-discounted floor must not hide the scout's
+  // lifted peer target.
+  mgg::FrontierCluster own;
+  own.id = 123; own.owner_robot_id = 1; own.representative_vertex_id = 1;
+  own.gain = mgg::TourParams().min_cluster_gain;
+  auto both = clusters;
+  both.push_back(own);
+  auto candidates = PlannerNodeTestPeer::tourCandidates(*node, both);
+  EXPECT_EQ(candidates.size(), 1u);
+  if (!candidates.empty()) EXPECT_EQ(candidates.front().owner_robot_id, 2);
   PlannerNodeTestPeer::solveTourOnEveryChange(*node);
-  EXPECT_NE(PlannerNodeTestPeer::refreshTour(*node), mgg::kNoCluster);
+  EXPECT_EQ(PlannerNodeTestPeer::refreshTour(*node), clusters.front().id);
   PlannerNodeTestPeer::setFlightReach(*node, 1.0);
   EXPECT_EQ(PlannerNodeTestPeer::refreshTour(*node), mgg::kNoCluster);
   // A newer map with a wall anywhere on the link withdraws the target.
@@ -4205,6 +4216,7 @@ TEST_F(PlannerNodeTest, AerialReachabilityPrecedesOwnPreferenceGroundUnchanged) 
     mgg::FrontierCluster own, peer;
     own.id = 1; own.owner_robot_id = 1; own.representative_vertex_id = 999;
     peer.id = 2; peer.owner_robot_id = 2; peer.representative_vertex_id = reachable;
+    peer.gain = 1e9;
     const auto candidates = PlannerNodeTestPeer::tourCandidates(*node, {own, peer});
     ASSERT_EQ(candidates.size(), 1u);
     EXPECT_EQ(candidates.front().id, aerial ? 2u : 1u);

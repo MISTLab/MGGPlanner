@@ -1060,6 +1060,24 @@ std::vector<mgg::FrontierCluster> PlannerNode::globalFrontierClusters() {
   return clusters;
 }
 
+mgg::FrontierCluster PlannerNode::tourValueCluster(const mgg::FrontierCluster& cluster) const {
+  auto value_cluster = cluster;
+  const auto* vertex = findGlobalVertex(cluster.representative_vertex_id);
+  if (!fleet_ && robot_params_.type == mgg::RobotType::kAerialRobot &&
+      vertex && vertex->lifted_peer_target) {
+    value_cluster.owner_robot_id = static_cast<int>(planning_params_.robot_id);
+  }
+  return value_cluster;
+}
+
+int PlannerNode::capTourValues(mgg::TourCostMatrix& costs,
+                               const std::vector<mgg::FrontierCluster>& clusters) const {
+  auto value_clusters = clusters;
+  for (auto& cluster : value_clusters) cluster = tourValueCluster(cluster);
+  return mgg::capTourCostsByValue(costs, value_clusters, tour_params_.min_cluster_gain,
+      static_cast<int>(planning_params_.robot_id), mgg::kGlobalOtherRobotPenalty);
+}
+
 std::vector<mgg::FrontierCluster> PlannerNode::tourCandidates(
     std::vector<mgg::FrontierCluster> clusters) {
   const std::vector<Eigen::Vector3d> reserved = selectionExclusions();
@@ -1087,12 +1105,15 @@ std::vector<mgg::FrontierCluster> PlannerNode::tourCandidates(
           link->id, current_state_[3], clusters, tour_params_.heading_weight, peer_generation_);
       const auto before_cap = costs.from_robot;
       mgg::capTourCostsByReach(costs, homeDistances(clusters), flight_reach_m_);
+      const auto before_value_cap = costs.from_robot;
+      capTourValues(costs, clusters);
       std::vector<mgg::FrontierCluster> reachable;
       for (std::size_t i = 0; i < clusters.size(); ++i) {
         if (std::isfinite(costs.from_robot[i])) reachable.push_back(clusters[i]);
         else if (clusters[i].owner_robot_id == own_id) {
           RCLCPP_INFO(get_logger(), "aerial tour: own cluster %016llx unreachable: %s",
               static_cast<unsigned long long>(clusters[i].id),
+              std::isfinite(before_value_cap[i]) ? "below distance-discounted value floor" :
               std::isfinite(before_cap[i]) ? "battery return reach cap" :
               findGlobalVertex(clusters[i].representative_vertex_id) ?
                   "disconnected or search-time blocked" : "representative off graph");
@@ -1233,7 +1254,7 @@ std::optional<mgg::FrontierCluster> PlannerNode::refreshTour(
                         tour_value_distances_.find(cluster.id);
                     if (distance == tour_value_distances_.end()) return false;
                     return mgg::tourClusterWorthItsDistance(
-                               cluster, distance->second,
+                               tourValueCluster(cluster), distance->second,
                                tour_params_.min_cluster_gain, own_id,
                                mgg::kGlobalOtherRobotPenalty) !=
                            (tour_value_worth_.count(cluster.id) > 0);
@@ -1285,9 +1306,7 @@ std::optional<mgg::FrontierCluster> PlannerNode::refreshTour(
               costs.distance_from_robot[i];
         }
       }
-      tour_value_left_out_ = mgg::capTourCostsByValue(
-          costs, clusters, tour_params_.min_cluster_gain, own_id,
-          mgg::kGlobalOtherRobotPenalty);
+      tour_value_left_out_ = capTourValues(costs, clusters);
       for (std::size_t i = 0; i < clusters.size(); ++i) {
         if (std::isfinite(costs.from_robot[i])) {
           tour_value_worth_.insert(clusters[i].id);
