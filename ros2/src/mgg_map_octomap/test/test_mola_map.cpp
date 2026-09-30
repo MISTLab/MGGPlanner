@@ -17,7 +17,11 @@
 #include <iterator>
 #include <limits>
 #include <memory>
+#include <optional>
 #include <sstream>
+#include <set>
+#include <tuple>
+#include <unordered_map>
 #include <string>
 #include <mutex>
 #include <thread>
@@ -27,6 +31,7 @@
 
 #include "mgg_core/departure.h"
 #include "mgg_core/graph_manager.h"
+#include "mgg_core/global_graph.h"
 #include "mgg_core/ground_projection.h"
 #include "mgg_core/grid_graph.h"
 #include "mgg_core/path_selection.h"
@@ -683,6 +688,245 @@ TEST(MolaMap, ViewpointBesideAnOccupiedColumnLacksClearanceThoughItsBoxIsFree) {
   planning.viewpoint_clearance_margin = 0.1;
   EXPECT_TRUE(mgg::viewpointClear(provider, robot, planning,
                                   mgg::StateVec(1.1, 0.45, 0.9, 0.0)));
+}
+
+// Real snapshot provider: exercise authority transforms and dynamic margins,
+// not just the bare native grid used by the first aerial regressions.
+struct AerialMolaScene {
+  AerialMolaScene() : map(config(publication)) {
+    robot.type = mgg::RobotType::kAerialRobot;
+    robot.size = {0.5, 0.5, 0.3};
+    robot.size_extension.setZero();
+    robot.safety_extension.setZero();
+    robot.bound_mode = mgg::BoundModeType::kExactBound;
+    planning.edge_length_min = 0.05;
+    planning.edge_length_max = 1.2;
+    planning.edge_overshoot = 0.0;
+    planning.nearest_range = 1.2;
+    planning.nearest_range_min = 0.05;
+    planning.nearest_range_max = 100;
+    planning.nearest_range_z = 100;
+    planning.path_interpolation_distance = 0.1;
+    planning.num_vertices_max = 1500;
+    planning.num_edges_max = 50000;
+    planning.num_loops_max = 100000;
+    ctx.map = &map;
+    ctx.robot = &robot;
+    ctx.planning = &planning;
+    ctx.robot_box_size = robot.size;
+    ctx.root_is_robot = true;
+    ctx.root_footprint_exempt = true;
+  }
+  static std::vector<Voxel> observedRoom() {
+    std::vector<Voxel> cells;
+    for (int x = -10; x <= 20; ++x)
+      for (int y = -10; y <= 10; ++y)
+        for (int z = 0; z <= 15; ++z) cells.push_back({x, y, z});
+    return cells;
+  }
+  void load(std::vector<Voxel> free, std::vector<Voxel> occupied = {},
+            const Eigen::Isometry3d& transform = Eigen::Isometry3d::Identity()) {
+    map.requestSnapshot(publication.publish(0, occupied, free, true, transform));
+    ASSERT_TRUE(waitFor([&]() { return map.getStatus(); })) << map.lastError();
+  }
+  Publication publication;
+  MolaMap map;
+  mgg::RobotParams robot;
+  mgg::PlanningParams planning;
+  mgg::ExpandContext ctx;
+  const mgg::StateVec hover{0.1, 0.1, 1.5, 0};
+};
+
+TEST(MolaMap, AerialRootDepartsPeerAndNoGoMarginsThroughObservedRoom) {
+  for (int margin = 0; margin < 3; ++margin) {
+    SCOPED_TRACE(margin);
+    AerialMolaScene scene;
+    Eigen::Isometry3d transform = Eigen::Isometry3d::Identity();
+    transform.linear() = Eigen::AngleAxisd(0.2, Eigen::Vector3d::UnitZ()).toRotationMatrix();
+    scene.load(AerialMolaScene::observedRoom(), {}, transform);
+    const Eigen::Vector2d disc = scene.hover.head<2>() +
+        (margin == 1 ? Eigen::Vector2d(-0.2, 0.0) : Eigen::Vector2d::Zero());
+    std::optional<MolaMap::TransientDiscPin> peers;
+    if (margin < 2) peers.emplace(scene.map, std::vector<Eigen::Vector2d>{disc}, 0.6);
+    else scene.map.setNoGoDiscs({disc}, 0.6);
+    mgg::GraphManager graph;
+    graph.addVertex(new mgg::Vertex(0, scene.hover));
+    mgg::Vertex target(1, scene.hover + mgg::StateVec(1.0, 0, 0, 0));
+    mgg::ExpandGraphReport report;
+    mgg::expandGraph(graph, target, report, scene.ctx);
+    EXPECT_EQ(report.num_vertices_added, 1);
+    if (report.vertex_added) EXPECT_NEAR(report.vertex_added->state.x(), 1.1, 1e-9);
+  }
+}
+
+TEST(MolaMap, AerialRoadmapLinkCannotBridgeUnknownAir) {
+  AerialMolaScene scene;
+  auto free = AerialMolaScene::observedRoom();
+  free.erase(std::remove_if(free.begin(), free.end(),
+                            [](const Voxel& v) { return v.x == 2; }), free.end());
+  scene.load(free);
+  scene.ctx.root_is_robot = false;
+  scene.ctx.root_footprint_exempt = false;
+  mgg::GraphManager graph;
+  graph.addVertex(new mgg::Vertex(0, scene.hover));
+  EXPECT_EQ(mgg::connectStateToGraph(graph, scene.hover + mgg::StateVec(1, 0, 0, 0),
+                                     scene.ctx, 1.5, true), nullptr);
+  EXPECT_EQ(graph.getNumEdges(), 0);
+  EXPECT_NE(mgg::connectStateToGraph(graph, scene.hover - mgg::StateVec(1, 0, 0, 0),
+                                     scene.ctx, 1.5, true), nullptr);
+  // A nearby state must not silently snap onto an unobserved old vertex.
+  mgg::GraphManager unknown;
+  unknown.addVertex(new mgg::Vertex(0, mgg::StateVec(0.5, 0.1, 1.5, 0)));
+  EXPECT_EQ(mgg::connectStateToGraph(unknown, mgg::StateVec(0.51, 0.1, 1.5, 0),
+                                     scene.ctx, 1.5, false), nullptr);
+}
+
+TEST(MolaMap, AerialRoadmapLinkDoesNotBorrowPhysicalRootException) {
+  AerialMolaScene scene;
+  auto free = AerialMolaScene::observedRoom();
+  free.erase(std::remove_if(free.begin(), free.end(), [](const Voxel& v) {
+    return v.x == 0 && v.y == 0 && v.z == 7;
+  }), free.end());
+  scene.load(free);
+  // Even a caller with local-root flags must not persist an unknown link
+  // into the roadmap. The blind-hover allowance is for departure, not reuse.
+  mgg::GraphManager graph;
+  graph.addVertex(new mgg::Vertex(0, scene.hover));
+  EXPECT_EQ(mgg::connectStateToGraph(graph, scene.hover + mgg::StateVec(1, 0, 0, 0),
+                                     scene.ctx, 1.5, true), nullptr);
+  EXPECT_EQ(graph.getNumEdges(), 0);
+}
+
+TEST(MolaMap, AerialRebuildDoesNotJoinKeyframesAcrossUnknownAir) {
+  AerialMolaScene scene;
+  auto free = AerialMolaScene::observedRoom();
+  free.erase(std::remove_if(free.begin(), free.end(),
+                            [](const Voxel& v) { return v.x == 2; }), free.end());
+  scene.load(free);
+  mgg::GraphManager graph;
+  mgg::RoadmapRebuildParams params;
+  params.vertex_spacing = 1.0;
+  params.max_offset = 0;
+  const auto result = mgg::rebuildRoadmapFromTrajectory(
+      graph, {{scene.hover}, {scene.hover + mgg::StateVec(1, 0, 0, 0)}},
+      scene.ctx, params);
+  ASSERT_EQ(graph.getNumVertices(), 2);
+  EXPECT_EQ(graph.getNumEdges(), 0);
+  EXPECT_EQ(result.home_component_vertices, 1);
+  EXPECT_EQ(result.chain_edges, 0);
+  EXPECT_EQ(result.link_edges, 0);
+}
+
+TEST(MolaMap, AerialRebuildDoesNotOffsetIntoUnobservedBodyVolume) {
+  AerialMolaScene scene;
+  auto free = AerialMolaScene::observedRoom();
+  free.erase(std::remove_if(free.begin(), free.end(),
+                            [](const Voxel& v) { return v.x >= 3; }), free.end());
+  scene.load(free, {{5, 0, 7}});
+  mgg::GraphManager graph;
+  mgg::RoadmapRebuildParams params;
+  params.vertex_spacing = 1.0;
+  params.max_offset = 0.6;
+  const auto result = mgg::rebuildRoadmapFromTrajectory(
+      graph, {{scene.hover}, {scene.hover + mgg::StateVec(1, 0, 0, 0)}},
+      scene.ctx, params);
+  EXPECT_EQ(graph.getNumVertices(), 1);
+  EXPECT_EQ(result.offset_vertices, 0);
+  EXPECT_EQ(result.boxed_vertices, 1);
+}
+
+TEST(MolaMap, AerialStraightDepartureSkipsOnlyUnknownInsideOriginalRoot) {
+  for (int obstacle = 0; obstacle < 3; ++obstacle) {
+    SCOPED_TRACE(obstacle);
+    AerialMolaScene scene;
+    auto free = AerialMolaScene::observedRoom();
+    // Unknown inside the root is allowed; occupied there never is. Unknown
+    // beside the root must not become a progressively re-rooted exception.
+    free.erase(std::remove_if(free.begin(), free.end(), [&](const Voxel& v) {
+      return v.x == (obstacle == 2 ? 2 : 0) && v.y == 0 && v.z == 7;
+    }), free.end());
+    scene.load(free, obstacle == 1 ? std::vector<Voxel>{{0, 0, 7}}
+                                  : std::vector<Voxel>{});
+    mgg::GroundProjection ground(scene.map, scene.planning);
+    mgg::Departure departure;
+    scene.planning.departure_reverse_allowed = false;
+    const bool found = mgg::findDeparture(
+        scene.map, ground, scene.robot, scene.planning, scene.hover, departure,
+        [](const auto&) { return true; }, 1.0, true);
+    EXPECT_EQ(found, obstacle == 0);
+    if (found) {
+      ASSERT_GE(departure.path.size(), 2u);
+      EXPECT_EQ(scene.map.getStrictBoxStatus(departure.path.back().head<3>(),
+                                             scene.robot.size), VoxelStatus::kFree);
+    }
+  }
+}
+
+TEST(MolaMap, AerialDrone45NearFieldCarvePlansLocally) {
+  AerialMolaScene scene;
+  const mgg::StateVec hover(0.1, 0.1, 1.3, 0);
+  const Eigen::Vector3d sensor = hover.head<3>() + Eigen::Vector3d(0, 0, -0.08);
+  std::set<std::tuple<int, int, int>> occupied_cells, free_cells;
+  const auto cell = [](const Eigen::Vector3d& p) {
+    return std::make_tuple(int(std::floor(p.x() / 0.2)),
+                           int(std::floor(p.y() / 0.2)),
+                           int(std::floor(p.z() / 0.2)));
+  };
+  // drone_45: 17 rings over +/-45 degrees, in a room with walls at
+  // x/y=+/-3, floor z=0 and ceiling z=3. A valid return is >=0.45 m away.
+  // Like planner_map.cpp, sample from the sensor towards the return at
+  // resolution*0.75 spacing, not from a sphere at the minimum return range.
+  for (int az = 0; az < 72; ++az) {
+    const double yaw = 2 * M_PI * az / 72;
+    for (int ring = 0; ring < 17; ++ring) {
+      const double pitch = -M_PI / 4 + ring * (M_PI / 2) / 16;
+      const Eigen::Vector3d direction(std::cos(yaw) * std::cos(pitch),
+                                       std::sin(yaw) * std::cos(pitch),
+                                       std::sin(pitch));
+      double distance = 100;
+      for (int axis = 0; axis < 3; ++axis) {
+        if (std::abs(direction[axis]) < 1e-9) continue;
+        const double wall = direction[axis] > 0 ? 3.0 : (axis == 2 ? 0.0 : -3.0);
+        distance = std::min(distance, (wall - sensor[axis]) / direction[axis]);
+      }
+      ASSERT_GE(distance, 0.45);
+      occupied_cells.insert(cell(sensor + distance * direction));
+      const int steps = int(std::ceil(distance / (0.2 * 0.75)));
+      for (int step = 1; step < steps; ++step)
+        free_cells.insert(cell(sensor + distance * step / steps * direction));
+    }
+  }
+  std::vector<Voxel> free, occupied;
+  for (const auto& [x, y, z] : free_cells) free.push_back({x, y, z});
+  for (const auto& [x, y, z] : occupied_cells) occupied.push_back({x, y, z});
+  scene.load(free, occupied);
+  mgg::GraphManager graph;
+  graph.addVertex(new mgg::Vertex(0, hover));
+  mgg::GridGraphParams grid;
+  grid.min_val = {-1.2, -1.2, 0};
+  grid.max_val = {1.2, 1.2, 0};
+  grid.resolution = {0.4, 0.4, 0.2};
+  mgg::buildGridGraph(graph, hover, grid, scene.ctx, 0);
+  ASSERT_GT(graph.getNumVertices(), 2);
+  mgg::SensorParams lidar;
+  lidar.max_range = 4;
+  lidar.fov = {2 * M_PI, M_PI / 2};
+  lidar.resolution = {M_PI / 36, M_PI / 32};
+  lidar.update();
+  std::unordered_map<std::string, mgg::SensorParams> sensors{{"drone_45", lidar}};
+  scene.planning.exp_sensor_list = {"drone_45"};
+  scene.planning.unknown_voxel_gain = 1;
+  mgg::BoundedSpaceParams bounds;
+  bounds.min_val = {-4, -4, 0}; bounds.max_val = {4, 4, 3};
+  bounds.setCenter(Eigen::Vector3d(0, 0, 0), false);
+  mgg::GainContext gain;
+  gain.map = &scene.map; gain.robot = &scene.robot;
+  gain.planning = &scene.planning; gain.global_space = &bounds; gain.sensors = &sensors;
+  mgg::computeExplorationGain(graph, gain, false, false);
+  const auto chosen = mgg::selectBestPath(graph, scene.planning, scene.robot,
+                                         mgg::EdgeInclinations(), 0.2, 0);
+  ASSERT_GE(chosen.best_path.size(), 2u);
+  EXPECT_GT((chosen.best_path.back()->state - hover).head<2>().norm(), 0.5);
 }
 
 TEST(MolaMap, ExplorationInACorridorNarrowerThanTheClearanceStillHasAPath) {

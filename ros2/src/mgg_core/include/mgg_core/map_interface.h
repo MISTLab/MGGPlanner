@@ -224,6 +224,12 @@ class MapInterface {
                                          const Eigen::Vector3d& size) const {
     return getBoxStatus(center, size, true);
   }
+  /// Strict static occupancy without peer/no-go margins; callers must check
+  /// dynamic obstacles separately with the whole sweep's departure policy.
+  virtual VoxelStatus getStaticStrictBoxStatus(const Eigen::Vector3d& center,
+                                               const Eigen::Vector3d& size) const {
+    return getStrictBoxStatus(center, size);
+  }
   virtual VoxelStatus getStrictPathStatus(
       const Eigen::Vector3d& start, const Eigen::Vector3d& end,
       const Eigen::Vector3d& box_size) const {

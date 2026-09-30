@@ -66,11 +66,15 @@ struct RefPose {
   const Vertex* source = nullptr;
 };
 
-/// `box_size` swept along the straight segment between two driving-height
-/// states runs through space the map knows to be occupied.
-bool throughKnownObstacle(const ExpandContext& ctx, const StateVec& from,
-                          const StateVec& to,
-                          const Eigen::Vector3d& box_size) {
+/// Ground links reject known obstacles; aerial links require observed free
+/// space over the entire swept body, including nearby-state snaps.
+bool linkBlocked(const ExpandContext& ctx, const StateVec& from,
+                 const StateVec& to, const Eigen::Vector3d& box_size) {
+  if (ctx.robot->type == RobotType::kAerialRobot) {
+    return ctx.map->getStrictPathStatus(from.head<3>() + ctx.robot->center_offset,
+                                        to.head<3>() + ctx.robot->center_offset,
+                                        box_size) != VoxelStatus::kFree;
+  }
   return ctx.map->getPathStatus(from.head<3>() + ctx.robot->center_offset,
                                 to.head<3>() + ctx.robot->center_offset,
                                 box_size, false) == VoxelStatus::kOccupied;
@@ -90,6 +94,10 @@ Vertex* linkStateToGraph(GraphManager& graph, const StateVec& state,
   }
   if ((state.head<3>() - nearest_vertex->state.head<3>()).squaredNorm() <=
       (exact_state ? 0.0 : kDeltaLimit * kDeltaLimit)) {
+    if (ctx.robot->type == RobotType::kAerialRobot &&
+        linkBlocked(ctx, nearest_vertex->state, state, ctx.robot_box_size)) {
+      return nullptr;
+    }
     return nearest_vertex;
   }
   // "@TODO: find better way to do this. Blindly add a link/vertex to the
@@ -97,8 +105,8 @@ Vertex* linkStateToGraph(GraphManager& graph, const StateVec& state,
   // verified path starts, a step from a vertex it drove through. Upstream
   // took the geometrically nearest vertex; here the nearest one whose
   // segment is not known to cross an obstacle, so a vertex on the far side
-  // of a thin wall cannot become the link. Unknown space still passes, as
-  // it does for every lattice edge.
+  // of a thin wall cannot become the link. Only ground links retain the
+  // unknown-space allowance.
   const double radius = std::max(blind_radius, ctx.planning->edge_length_min);
   std::vector<Vertex*> candidates;
   if (graph.getNearestVertices(&state, radius, &candidates)) {
@@ -109,8 +117,7 @@ Vertex* linkStateToGraph(GraphManager& graph, const StateVec& state,
               });
     for (Vertex* candidate : candidates) {
       if (candidate == nullptr ||
-          throughKnownObstacle(ctx, candidate->state, state,
-                               ctx.robot_box_size)) {
+          linkBlocked(ctx, candidate->state, state, ctx.robot_box_size)) {
         continue;
       }
       const double direction_norm =
@@ -127,7 +134,15 @@ Vertex* linkStateToGraph(GraphManager& graph, const StateVec& state,
   }
   ExpandGraphReport rep;
   Vertex candidate(-1, state);
-  expandGraph(graph, candidate, rep, ctx);
+  if (ctx.robot->type == RobotType::kAerialRobot) {
+    // A reusable roadmap link is not the physical hover's departure.
+    ExpandContext strict_ctx = ctx;
+    strict_ctx.root_footprint_exempt = false;
+    strict_ctx.root_is_robot = false;
+    expandGraph(graph, candidate, rep, strict_ctx);
+  } else {
+    expandGraph(graph, candidate, rep, ctx);
+  }
   if (rep.status != ExpandGraphStatus::kSuccess) return nullptr;
   // expandGraph may clip a long edge. A partial extension is not an exact
   // objective endpoint, even though it remains useful roadmap geometry.
@@ -331,8 +346,9 @@ DepartureLink linkDeparture(GraphManager& graph, const StateVec& state,
             });
   for (Vertex* candidate : candidates) {
     if (candidate == nullptr || !graph.inService(*candidate) ||
-        throughKnownObstacle(ctx, candidate->state, state,
-                             Eigen::Vector3d::Zero())) {
+        linkBlocked(ctx, candidate->state, state,
+                    ctx.robot->type == RobotType::kAerialRobot
+                        ? ctx.robot_box_size : Eigen::Vector3d::Zero())) {
       continue;
     }
     link.vertex = candidate;
@@ -429,9 +445,9 @@ bool drivenEdgeTraversable(const ExpandContext& ctx, const Vertex& from,
   OrientedBox body;
   body.heading = std::atan2(direction.y(), direction.x());
   body.size = ctx.robot_box_size;
-  if (ctx.robot->type != RobotType::kGroundRobot) {
-    return orientedBoxPathStatus(*ctx.map, start, end, body, false,
-                                 nullptr) == VoxelStatus::kFree;
+  if (ctx.robot->type == RobotType::kAerialRobot) {
+    return ctx.map->getStrictPathStatus(start, end, ctx.robot_box_size) ==
+           VoxelStatus::kFree;
   }
   EdgeBodyCheck check;
   check.sweep = [&ctx, &body](const Eigen::Vector3d& a,
@@ -545,6 +561,10 @@ RoadmapRebuildReport rebuildRoadmapFromTrajectory(
     offsets.push_back(-o);
   }
   const auto has_room = [&ctx](const StateVec& state) {
+    if (ctx.robot->type == RobotType::kAerialRobot) {
+      return ctx.map->getStrictBoxStatus(state.head<3>() + ctx.robot->center_offset,
+                                         ctx.robot_box_size) == VoxelStatus::kFree;
+    }
     return ctx.map->getBoxStatus(state.head<3>() + ctx.robot->center_offset,
                                  ctx.robot_box_size,
                                  false) != VoxelStatus::kOccupied;

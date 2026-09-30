@@ -167,7 +167,8 @@ DepartureLink linkDeparture(GraphManager& graph, const StateVec& state,
 ///
 /// A pose links when the graph reaches it: a vertex within 0.1 m, a link
 /// within 0.5 m not known to cross an obstacle, or a checked expandGraph
-/// edge no longer than edge_length_max. Upstream linked only the first pose
+/// edge no longer than edge_length_max. Aerial links (including nearby-state
+/// snaps) always require an observed-free swept body. Upstream linked only the first pose
 /// and dropped the path when that failed; here the poses before the first
 /// linked one stay out of the graph.
 ///
@@ -286,9 +287,10 @@ RoadmapRebuildReport rebuildRoadmapFromTrajectory(
 
 /// The edge check of a roadmap rebuilt from the robot's trajectory, the
 /// roadmap edge check (roadmapEdgeTraversable) with two differences, both
-/// because the robot drove this trajectory: unobserved space does not
+/// because the ground robot drove this trajectory: unobserved space does not
 /// block, and the body swept is the robot's planning box turned along the
 /// edge (orientedBoxPathStatus), not the map-aligned box grown to hold it.
+/// Aerial edges instead require a strict observed-free axis-aligned body sweep.
 /// A geofence refusal sets rep.status to kErrorGeofenceViolated.
 bool drivenEdgeTraversable(const ExpandContext& ctx, const Vertex& from,
                            const Vertex& to, ExpandGraphReport& rep);

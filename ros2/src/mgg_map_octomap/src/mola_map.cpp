@@ -1368,6 +1368,17 @@ VoxelStatus MolaMap::getStrictBoxStatus(const Eigen::Vector3d& center,
       transform * center, enclosingSize(transform.linear(), size));
 }
 
+VoxelStatus MolaMap::getStaticStrictBoxStatus(
+    const Eigen::Vector3d& center, const Eigen::Vector3d& size) const {
+  const auto snapshot = current();
+  if (snapshot == nullptr) return VoxelStatus::kUnknown;
+  if (!center.allFinite() || !size.allFinite() || (size.array() < 0.0).any())
+    return VoxelStatus::kUnknown;
+  const auto& transform = snapshot->request.component_from_navigation;
+  return snapshot->map->getStrictBoxStatus(
+      transform * center, enclosingSize(transform.linear(), size));
+}
+
 VoxelStatus MolaMap::getStrictPathStatus(
     const Eigen::Vector3d& start, const Eigen::Vector3d& end,
     const Eigen::Vector3d& box_size) const {

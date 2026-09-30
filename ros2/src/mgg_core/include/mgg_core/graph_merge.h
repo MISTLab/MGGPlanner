@@ -49,6 +49,7 @@
 #include <Eigen/Geometry>
 
 #include "mgg_core/graph_manager.h"
+#include "mgg_core/params.h"
 #include "mgg_core/types.h"
 
 namespace mgg {
@@ -150,6 +151,9 @@ struct ReceiverPlatform {
   /// this one cannot.
   double max_step_height = std::numeric_limits<double>::infinity();
   double max_inclination = std::numeric_limits<double>::infinity();
+  /// Aerial receivers revalidate incoming edges on their own observed map;
+  /// a ground neighbour's relaxed unknown policy is not flight evidence.
+  RobotType type = RobotType::kGroundRobot;
 };
 
 /// A merged neighbour's vertices are re-placed once the transform to it moves
@@ -174,7 +178,9 @@ constexpr double kNeighbourRestartToleranceM = 0.05;
 /// the neighbour restarted (kNeighbourRestartToleranceM). A refreshed vertex
 /// takes the neighbour's frontier mark both ways: marked, it is a frontier;
 /// unmarked, a frontier here is demoted to kUnvisited.
-/// `incoming` is a complete snapshot of the neighbour's graph.
+/// `incoming` is a complete snapshot of the neighbour's graph. An aerial
+/// receiver revalidates rendezvous and incoming edges using `is_admissible`
+/// on every snapshot; a ground receiver retains the sender's edge evidence.
 MergeResult mergeNeighbourGraph(GraphManager& global_graph,
                                 const GraphExchange& incoming,
                                 const PoseSource& poses,

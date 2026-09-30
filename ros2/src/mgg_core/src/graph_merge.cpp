@@ -81,8 +81,8 @@ Vertex* findNeighbourVertex(GraphManager& graph, int robot_id, int vertex_id) {
 /// already be in the graph from an earlier snapshot, and GraphManager::addEdge
 /// would append a second adjacency entry for it.
 int addEdges(GraphManager& graph, const GraphExchange& incoming, int robot_id,
-             const ReceiverPlatform& platform, int& unresolved,
-             int& too_steep) {
+             const ReceiverPlatform& platform, const EdgeAdmissibleFn& is_admissible,
+             int& unresolved, int& too_steep) {
   int added = 0;
   for (const GraphExchangeEdge& e : incoming.edges) {
     Vertex* source = findNeighbourVertex(graph, robot_id, e.source_id);
@@ -93,6 +93,10 @@ int addEdges(GraphManager& graph, const GraphExchange& incoming, int robot_id,
     }
     if (!climbable(*source, *target, platform)) {
       ++too_steep;
+      continue;
+    }
+    if (platform.type == RobotType::kAerialRobot &&
+        !is_admissible(source->state.head<3>(), target->state.head<3>())) {
       continue;
     }
     graph.addNeighbourEdge(source, target, e.weight);
@@ -232,11 +236,16 @@ MergeResult mergeNeighbourGraph(GraphManager& global_graph,
 
   const double driving_height = platform.driving_height;
 
+  const bool aerial_refresh = platform.type == RobotType::kAerialRobot &&
+                              global_graph.merged_graphs_[neighbour_id];
   if (placement != global_graph.neighbour_placements_.end()) {
     result.vertices_replaced = replaceNeighbourVertices(
         global_graph, neighbour_id, placement->second, t_ours_theirs,
         driving_height);
-    if (result.vertices_replaced > 0) {
+    if (result.vertices_replaced > 0 || platform.type == RobotType::kAerialRobot) {
+      // Aerial receivers revalidate both rendezvous and incoming edges on
+      // every snapshot: ground peers' edges are not flight evidence. Cut
+      // both adjacency stores before readoption, even without a transform move.
       // Every edge was judged where its vertices stood before: the links
       // joining its roadmap to the rest against this robot's map, its own
       // edges against this robot's step and grade limits, which a tilted
@@ -291,7 +300,7 @@ MergeResult mergeNeighbourGraph(GraphManager& global_graph,
   }
 
   result.merged = global_graph.merged_graphs_[neighbour_id];
-  result.newly_connected = !already_merged && result.merged;
+  result.newly_connected = !already_merged && result.merged && !aerial_refresh;
   if (!result.merged) return result;
   // Joined again with a current transform: a quarantine ends here.
   global_graph.releaseNeighbourGraph(neighbour_id);
@@ -313,7 +322,7 @@ MergeResult mergeNeighbourGraph(GraphManager& global_graph,
   }
 
   result.edges_added =
-      addEdges(global_graph, incoming, neighbour_id, platform,
+      addEdges(global_graph, incoming, neighbour_id, platform, is_admissible,
                result.edges_unresolved, result.edges_too_steep);
 
   if (result.edges_unresolved > 0) {

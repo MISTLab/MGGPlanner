@@ -74,6 +74,15 @@ VoxelStatus orientedBoxPathStatus(const MapInterface& map,
                                   bool stop_at_unknown_voxel,
                                   const OrientedBox* standing);
 
+/// Aerial sweep from the physical root. Only unknown volume inside the
+/// original axis-aligned root body is exempt; occupied cells never are.
+/// Dynamic peer/no-go departure policy is evaluated once over the full sweep.
+/// Arguments are body centres (including RobotParams::center_offset).
+bool aerialRootDepartureTraversable(const MapInterface& map,
+                                     const Eigen::Vector3d& start,
+                                     const Eigen::Vector3d& end,
+                                     const Eigen::Vector3d& size);
+
 /// Validates travel from `from` back to `to`, with the body facing the
 /// opposite direction (the forward entry heading). Uses the forward edge's
 /// oriented sweep and ground predicates, with no root/standing exemptions,
@@ -122,6 +131,9 @@ struct Departure {
 /// ahead and the room to turn count the disk of `ground`'s standing start
 /// (GroundProjection::setStandingStart) as observed ground. Returns false,
 /// with `departure.path` empty, when there is no way out.
+/// For aerial robots the original axis-aligned hover body may contain unknown
+/// (never occupied) cells; all space swept outside it and the final endpoint
+/// must be observed-free. The body uses RobotParams::center_offset.
 bool findDeparture(const MapInterface& map, const GroundProjection& ground,
                    const RobotParams& robot, const PlanningParams& planning,
                    const StateVec& start, Departure& departure,

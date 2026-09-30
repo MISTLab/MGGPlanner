@@ -570,12 +570,12 @@ class PlannerNodeTestPeer {
   }
   /// Odometry at (x, y) facing `yaw`.
   static void acceptOdometryFacing(PlannerNode& node, double x, double y,
-                                   double yaw, double stamp_s) {
+                                   double yaw, double stamp_s, double z = 0.075) {
     auto msg = std::make_shared<nav_msgs::msg::Odometry>();
     msg->header.stamp.sec = static_cast<std::int32_t>(stamp_s);
     msg->pose.pose.position.x = x;
     msg->pose.pose.position.y = y;
-    msg->pose.pose.position.z = 0.075;
+    msg->pose.pose.position.z = z;
     msg->pose.pose.orientation.z = std::sin(yaw / 2.0);
     msg->pose.pose.orientation.w = std::cos(yaw / 2.0);
     node.onOdometry(msg);
@@ -1656,9 +1656,22 @@ class PlannerNodeTestPeer {
     msg->data = state;
     node.onFlightState(msg);
   }
-  static void setAerialRobot(PlannerNode& node) {
+  static void setAerialRobot(
+      PlannerNode& node, const Eigen::Vector3d& center_offset = Eigen::Vector3d::Zero()) {
     const std::lock_guard<std::recursive_mutex> lock(node.planner_mutex_);
     node.robot_params_.type = mgg::RobotType::kAerialRobot;
+    node.robot_params_.center_offset = center_offset;
+  }
+  static mgg::MergeResult mergeRoadmap(PlannerNode& node,
+                                      const mgg::GraphExchange& incoming) {
+    const std::lock_guard<std::recursive_mutex> lock(node.planner_mutex_);
+    node.poses_->setOffset(2, 0, 0);
+    return node.mergeNeighbourRoadmap(incoming);
+  }
+  static bool peerEdgeExists(PlannerNode& node, int from, int to) {
+    const auto& vertices = node.global_graph_->vertex_by_robot_id_.at(2);
+    return node.global_graph_->graph_->edgeExists(vertices.at(from)->id,
+                                                  vertices.at(to)->id);
   }
   static bool rebuildRoadmap(
       PlannerNode& node,
@@ -3958,6 +3971,40 @@ TEST_F(PlannerNodeTest, ARobotRestingInADipStillPlans) {
   PlannerNodeTestPeer::plan(*node, response);
   ASSERT_EQ(response->status, mgg_msgs::srv::PlannerSrv::Response::FORWARD);
   ASSERT_GE(response->path.size(), 2u);
+}
+
+TEST_F(PlannerNodeTest, MolaAerialMergeChecksBodyOffsetAndIncomingEdges) {
+  for (bool offset : {false, true}) {
+    SCOPED_TRACE(offset);
+    auto node = makeNode("mola_aerial_merge");
+    PlannerNodeTestPeer::setAerialRobot(*node, {0, offset ? 0.6 : 0, 0});
+    MolaFloorProduct product(-1, 2, -1, 1, {{-1, 2, 0.6, 0.8}});
+    PlannerNodeTestPeer::useMolaMap(*node, product.serve());
+    const int root = PlannerNodeTestPeer::addGlobalVertex(*node, 1, 0, 0.1, 0.4, {});
+    PlannerNodeTestPeer::addGlobalVertex(*node, 1, 0.5, 0.1, 0.4, {root});
+    mgg::GraphExchange incoming;
+    for (int i = 0; i < 3; ++i) {
+      mgg::GraphExchangeVertex v;
+      v.id = i; v.robot_id = 2;
+      v.state = mgg::StateVec(i == 0 ? 0.7 : i == 1 ? 1.2 : 4.0, 0.1, 0.4, 0);
+      incoming.vertices.push_back(v);
+    }
+    incoming.edges = {{0, 1, 0.5}, {1, 2, 2.8}};
+    const auto result = PlannerNodeTestPeer::mergeRoadmap(*node, incoming);
+    if (offset) {
+      // Reference states miss the wall, but the actual offset body hits it.
+      EXPECT_FALSE(result.merged);
+    } else {
+      ASSERT_TRUE(result.merged);
+      EXPECT_TRUE(PlannerNodeTestPeer::peerEdgeExists(*node, 0, 1));
+      EXPECT_FALSE(PlannerNodeTestPeer::peerEdgeExists(*node, 1, 2));
+      // Re-read already adopted edges against a newly observed wall, too.
+      MolaFloorProduct blocked(-1, 2, -1, 1, {{0.8, 1.0, -1, 1}});
+      PlannerNodeTestPeer::useMolaMap(*node, blocked.serve());
+      PlannerNodeTestPeer::mergeRoadmap(*node, incoming);
+      EXPECT_FALSE(PlannerNodeTestPeer::peerEdgeExists(*node, 0, 1));
+    }
+  }
 }
 
 TEST_F(PlannerNodeTest, AerialShortcutCannotCrossToleratedUnknownVoxel) {
@@ -8174,8 +8221,9 @@ TEST_F(PlannerNodeTest, AParkedPeerOnTheWayHomeCapsADronesReachUntilItLeaves) {
   std::unique_ptr<MolaFloorProduct> product;
   auto node = peerFloorNode("drone_reach_parked_peer", -7.5, 1.5, -1.5, 1.5,
                             product);
-  PlannerNodeTestPeer::acceptOdometryFacing(*node, 0.0, 0.0, M_PI, 1.0);
+  // Airborne in the observed volume, not a ground base intersecting the floor.
   PlannerNodeTestPeer::setAerialRobot(*node);
+  PlannerNodeTestPeer::acceptOdometryFacing(*node, 0.0, 0.0, M_PI, 1.0, 0.4);
   const int frontier = PlannerNodeTestPeer::addGlobalChainToFrontier(
       *node, {{-1.0, 0.0}, {-2.0, 0.0}, {-3.0, 0.0}, {-4.0, 0.0}, {-5.0, 0.0},
               {-6.0, 0.0}},
@@ -8183,7 +8231,7 @@ TEST_F(PlannerNodeTest, AParkedPeerOnTheWayHomeCapsADronesReachUntilItLeaves) {
   // The drone has flown out to (-4, 0): 2 m from the frontier, 6 m from it
   // back home. Flying there marks the roadmap round it visited; the
   // frontier stays one, and is not reached from 2 m off.
-  PlannerNodeTestPeer::acceptOdometryFacing(*node, -4.0, 0.0, M_PI, 2.0);
+  PlannerNodeTestPeer::acceptOdometryFacing(*node, -4.0, 0.0, M_PI, 2.0, 0.4);
   PlannerNodeTestPeer::markGlobalFrontier(*node, frontier);
   PlannerNodeTestPeer::setGlobalFrontierReach(*node, 1.0);
   PlannerNodeTestPeer::setTour(*node, true, 0.0);
@@ -8235,13 +8283,14 @@ TEST_F(PlannerNodeTest, APeerBesideHomeCapsADronesReachOnTheWayBackOnly) {
   std::unique_ptr<MolaFloorProduct> product;
   auto node = peerFloorNode("drone_reach_peer_beside_home", -7.5, 1.5, -1.5,
                             1.5, product);
-  PlannerNodeTestPeer::acceptOdometryFacing(*node, 0.0, 0.0, M_PI, 1.0);
+  // Airborne in the observed volume, not a ground base intersecting the floor.
   PlannerNodeTestPeer::setAerialRobot(*node);
+  PlannerNodeTestPeer::acceptOdometryFacing(*node, 0.0, 0.0, M_PI, 1.0, 0.4);
   const int frontier = PlannerNodeTestPeer::addGlobalChainToFrontier(
       *node, {{-1.0, 0.0}, {-2.0, 0.0}, {-3.0, 0.0}, {-4.0, 0.0}, {-5.0, 0.0},
               {-6.0, 0.0}},
       M_PI);
-  PlannerNodeTestPeer::acceptOdometryFacing(*node, -4.0, 0.0, M_PI, 2.0);
+  PlannerNodeTestPeer::acceptOdometryFacing(*node, -4.0, 0.0, M_PI, 2.0, 0.4);
   PlannerNodeTestPeer::markGlobalFrontier(*node, frontier);
   PlannerNodeTestPeer::setGlobalFrontierReach(*node, 1.0);
   PlannerNodeTestPeer::setTour(*node, true, 0.0);

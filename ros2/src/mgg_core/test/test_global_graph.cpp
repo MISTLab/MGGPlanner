@@ -145,8 +145,8 @@ class ColumnSpace : public OpenSpace {
   double half_width_;
 };
 
-/// An aerial robot keeps ground projection out of the picture; the roadmap
-/// logic under test is the same for both robot types.
+/// An aerial robot keeps ground projection out of most roadmap tests.
+/// Tests of ground-only departure allowances override the type explicitly.
 struct Roadmap {
   explicit Roadmap(double blocked_y = 1e9, bool unknown_instead = false)
       : map(blocked_y, unknown_instead) {
@@ -607,7 +607,7 @@ class BoxSweptSlab : public SlabSpace {
   double y1_;
 };
 
-TEST(LinkDeparture, ARobotAgainstAWallDepartsToAVertexBehindIt) {
+TEST(LinkDeparture, AGroundRobotAgainstAWallDepartsToAVertexBehindIt) {
   // The robot stopped with its box touching a wall (robot_1 on the SubT
   // return, 2026-09-23). Where it stands is not in question; it departs
   // along a centre line to the free vertex behind it, and since the box was
@@ -615,6 +615,11 @@ TEST(LinkDeparture, ARobotAgainstAWallDepartsToAVertexBehindIt) {
   Roadmap fixture;
   BoxSweptSlab wall(0.25, 0.35);
   fixture.ctx.map = &wall;
+  // This occupied-body departure allowance is ground-only; aerial roots
+  // may excuse unknown air, never an occupied part of their body.
+  fixture.robot.type = RobotType::kGroundRobot;
+  mgg::GroundProjection ground(wall, fixture.planning);
+  fixture.ctx.ground = &ground;
   Vertex* root = fixture.global.getVertex(0);
   root->state = StateVec(0.0, -0.9, 0.0, 0.0);
   fixture.global.updateVertexState(0, root->state);
@@ -634,10 +639,15 @@ TEST(LinkDeparture, ARobotAgainstAWallDepartsToAVertexBehindIt) {
   EXPECT_EQ(fixture.global.getNumEdges(), 0);
 }
 
-TEST(LinkDeparture, ARobotAgainstAWallDoesNotDepartThroughIt) {
+TEST(LinkDeparture, AGroundRobotAgainstAWallDoesNotDepartThroughIt) {
   Roadmap fixture;
   BoxSweptSlab wall(0.25, 0.35);
   fixture.ctx.map = &wall;
+  // This occupied-body departure allowance is ground-only; aerial roots
+  // may excuse unknown air, never an occupied part of their body.
+  fixture.robot.type = RobotType::kGroundRobot;
+  mgg::GroundProjection ground(wall, fixture.planning);
+  fixture.ctx.ground = &ground;
   // The only vertex in reach is on the far side of the wall.
   Vertex* root = fixture.global.getVertex(0);
   root->state = StateVec(0.0, 0.6, 0.0, 0.0);
@@ -669,7 +679,7 @@ TEST(LinkDeparture, AClearDepartureIsStoredAsBefore) {
   EXPECT_EQ(fixture.global.getNumVertices(), 2);
 }
 
-TEST(LinkDeparture, ARelaxedDepartureIsNotReusedAsAGoalLink) {
+TEST(LinkDeparture, ARelaxedGroundDepartureIsNotReusedAsAGoalLink) {
   // Depart from against the wall, drive away from it, then ask for that
   // same pose as an exact goal: the goal's link sweeps the box and is
   // refused, as it would be in a graph that never saw the departure
@@ -677,6 +687,11 @@ TEST(LinkDeparture, ARelaxedDepartureIsNotReusedAsAGoalLink) {
   Roadmap fixture;
   BoxSweptSlab wall(0.25, 0.35);
   fixture.ctx.map = &wall;
+  // This occupied-body departure allowance is ground-only; aerial roots
+  // may excuse unknown air, never an occupied part of their body.
+  fixture.robot.type = RobotType::kGroundRobot;
+  mgg::GroundProjection ground(wall, fixture.planning);
+  fixture.ctx.ground = &ground;
   Vertex* root = fixture.global.getVertex(0);
   root->state = StateVec(0.0, -0.9, 0.0, 0.0);
   fixture.global.updateVertexState(0, root->state);

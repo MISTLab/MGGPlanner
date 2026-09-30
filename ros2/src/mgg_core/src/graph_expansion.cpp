@@ -55,45 +55,6 @@ double averageInclination(const std::vector<Eigen::Vector3d>& edge) {
   return total / static_cast<double>(edge.size() - 1);
 }
 
-// Only the physical aerial root may contain unknown air. Check occupied
-// volume over the whole departure, then check the swept volume outside the
-// root AABB strictly. Splitting each swept interval into slabs preserves the
-// unknown check beside the root, not just after the body has left it.
-bool aerialRootDeparture(const ExpandContext& ctx,
-                         const Eigen::Vector3d& start,
-                         const Eigen::Vector3d& end) {
-  const Eigen::Vector3d size = ctx.robot_box_size;
-  if (ctx.map->getOccupiedOnlyPathStatus(start, end, size) !=
-      VoxelStatus::kFree) return false;
-  const double resolution = ctx.map->getResolution();
-  const double steps_d = std::ceil((end - start).norm() / resolution);
-  constexpr int kMaxRootSweepIntervals = 4096;
-  if (!std::isfinite(steps_d) || resolution <= 0.0 ||
-      steps_d > kMaxRootSweepIntervals)
-    return false;
-  const int steps = std::max(1, static_cast<int>(steps_d));
-  const Eigen::Vector3d step = (end - start) / steps;
-  const Eigen::Vector3d root_lo = start - size / 2;
-  const Eigen::Vector3d root_hi = start + size / 2;
-  for (int i = 0; i < steps; ++i) {
-    const Eigen::Vector3d center = start + (i + 0.5) * step;
-    const Eigen::Vector3d half = (size + step.cwiseAbs()) / 2;
-    const Eigen::Vector3d lo = center - half, hi = center + half;
-    for (int axis = 0; axis < 3; ++axis) {
-      for (bool upper : {false, true}) {
-        Eigen::Vector3d slab_lo = lo, slab_hi = hi;
-        if (upper) slab_lo[axis] = std::max(lo[axis], root_hi[axis]);
-        else slab_hi[axis] = std::min(hi[axis], root_lo[axis]);
-        if (slab_hi[axis] <= slab_lo[axis]) continue;
-        if (ctx.map->getStrictBoxStatus((slab_lo + slab_hi) / 2,
-                                        slab_hi - slab_lo) !=
-            VoxelStatus::kFree) return false;
-      }
-    }
-  }
-  return true;
-}
-
 /// Can the robot travel the segment? Fills `projected_edge` for ground robots.
 /// Only ground lattice edges may use the relaxed unknown policy.
 bool edgeTraversable(const ExpandContext& ctx, const Eigen::Vector3d& start,
@@ -263,7 +224,8 @@ void expandGraph(GraphManager& graph, Vertex& new_vertex,
                            ctx.root_footprint_exempt;
   bool admissible_edge =
       aerial_root
-          ? aerialRootDeparture(ctx, start_pos, end_pos)
+          ? aerialRootDepartureTraversable(*ctx.map, start_pos, end_pos,
+                                           ctx.robot_box_size)
           : edgeTraversable(
                 ctx, start_pos, end_pos, is_hanging,
                 ctx.preserve_hanging_root_start_height && nearest_vertex->id == 0,

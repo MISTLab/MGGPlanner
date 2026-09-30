@@ -2117,6 +2117,7 @@ void PlannerNode::withdrawUnplacedNeighbours() {
 
 mgg::ReceiverPlatform PlannerNode::receiverPlatform() const {
   mgg::ReceiverPlatform platform;
+  platform.type = robot_params_.type;
   if (robot_params_.type == mgg::RobotType::kGroundRobot) {
     platform.driving_height = planning_params_.max_ground_height;
     platform.max_step_height = planning_params_.max_step_height;
@@ -2134,7 +2135,9 @@ mgg::MergeResult PlannerNode::mergeNeighbourRoadmap(
   const auto admissible = [this, &ctx](const Eigen::Vector3d& from,
                                        const Eigen::Vector3d& to) {
     if (robot_params_.type == mgg::RobotType::kAerialRobot) {
-      return map_->getPathStatus(from, to, ctx.robot_box_size, true) ==
+      return map_->getStrictPathStatus(from + robot_params_.center_offset,
+                                        to + robot_params_.center_offset,
+                                        ctx.robot_box_size) ==
              mgg::VoxelStatus::kFree;
     }
     std::vector<Eigen::Vector3d> projected;

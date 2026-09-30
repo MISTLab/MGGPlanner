@@ -144,6 +144,45 @@ VoxelStatus orientedBoxPathStatus(const MapInterface& map,
   return unknown ? VoxelStatus::kUnknown : VoxelStatus::kFree;
 }
 
+// Only the physical aerial root may contain unknown air. Check occupied
+// volume over the whole departure, then check the swept volume outside the
+// root AABB strictly. Splitting each swept interval into slabs preserves the
+// unknown check beside the root, not just after the body has left it.
+bool aerialRootDepartureTraversable(const MapInterface& map,
+                                     const Eigen::Vector3d& start,
+                                     const Eigen::Vector3d& end,
+                                     const Eigen::Vector3d& size) {
+  if (map.getOccupiedOnlyPathStatus(start, end, size) !=
+      VoxelStatus::kFree) return false;
+  const double resolution = map.getResolution();
+  const double steps_d = std::ceil((end - start).norm() / resolution);
+  constexpr int kMaxRootSweepIntervals = 4096;
+  if (!std::isfinite(steps_d) || resolution <= 0.0 ||
+      steps_d > kMaxRootSweepIntervals)
+    return false;
+  const int steps = std::max(1, static_cast<int>(steps_d));
+  const Eigen::Vector3d step = (end - start) / steps;
+  const Eigen::Vector3d root_lo = start - size / 2;
+  const Eigen::Vector3d root_hi = start + size / 2;
+  for (int i = 0; i < steps; ++i) {
+    const Eigen::Vector3d center = start + (i + 0.5) * step;
+    const Eigen::Vector3d half = (size + step.cwiseAbs()) / 2;
+    const Eigen::Vector3d lo = center - half, hi = center + half;
+    for (int axis = 0; axis < 3; ++axis) {
+      for (bool upper : {false, true}) {
+        Eigen::Vector3d slab_lo = lo, slab_hi = hi;
+        if (upper) slab_lo[axis] = std::max(lo[axis], root_hi[axis]);
+        else slab_hi[axis] = std::min(hi[axis], root_lo[axis]);
+        if (slab_hi[axis] <= slab_lo[axis]) continue;
+        if (map.getStaticStrictBoxStatus((slab_lo + slab_hi) / 2,
+                                        slab_hi - slab_lo) !=
+            VoxelStatus::kFree) return false;
+      }
+    }
+  }
+  return true;
+}
+
 bool reverseExitEdgeAdmissible(
     const MapInterface& map, const GroundProjection& ground,
     const RobotParams& robot, const PlanningParams& planning,
@@ -213,8 +252,11 @@ bool findDeparture(const MapInterface& map, const GroundProjection& ground,
     const auto step_free = [&](const StateVec& from, const StateVec& to,
                                bool from_start) {
       if (!ground_robot) {
-        return check.sweep(from.head<3>(), to.head<3>()) ==
-               VoxelStatus::kFree;
+        // Always keep the original root: successive interpolation steps
+        // must not move the unknown-volume exemption into unobserved air.
+        return aerialRootDepartureTraversable(
+            map, start.head<3>() + robot.center_offset,
+            to.head<3>() + robot.center_offset, robot.getPlanningSize());
       }
       check.standing_at_start = from_start;
       std::vector<Eigen::Vector3d> projected;
@@ -244,6 +286,9 @@ bool findDeparture(const MapInterface& map, const GroundProjection& ground,
         if (!step_free(departure.path.back(), to, i == 1)) break;
         departure.path.push_back(to);
         if (out >= kDepartureMinM - 1e-9 &&
+            (ground_robot ||
+             map.getStrictBoxStatus(to.head<3>() + robot.center_offset,
+                                     robot.getPlanningSize()) == VoxelStatus::kFree) &&
             (end_admissible ? end_admissible(departure.path)
                             : roomToTurn(map, robot, planning, to,
                                           ground.standingStart()))) {
