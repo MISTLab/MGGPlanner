@@ -3473,6 +3473,15 @@ bool PlannerNode::routeOverGlobalGraph(const mgg::StateVec goal,
     current = physicalAnchorAtDrivingHeight(current_state_);
   }
   const mgg::ExpandContext ctx = makeGlobalContext();
+  // An existing home/goal vertex is not free-space evidence. In particular,
+  // home over the pad must be observed (or supplied as traversed-column
+  // evidence by the map producer), and later occupied evidence wins.
+  if (robot_params_.type == mgg::RobotType::kAerialRobot &&
+      map_->getStrictBoxStatus(goal.head<3>() + robot_params_.center_offset,
+                               ctx.robot_box_size) != mgg::VoxelStatus::kFree) {
+    reason = "aerial goal body is not observed free";
+    return false;
+  }
   const int before = global_graph_->getNumVertices();
   // A departure clear only along its centre line joins this route and
   // nothing else: the route starts at the robot, then that vertex.

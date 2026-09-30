@@ -797,6 +797,42 @@ TEST(MolaMap, AerialRoadmapLinkDoesNotBorrowPhysicalRootException) {
   EXPECT_EQ(graph.getNumEdges(), 0);
 }
 
+TEST(MolaMap, AerialNearbyUnknownVertexDoesNotHideAnotherStrictLink) {
+  AerialMolaScene scene;
+  auto free = AerialMolaScene::observedRoom();
+  free.erase(std::remove_if(free.begin(), free.end(), [](const Voxel& v) {
+    return v.x == -1 && v.y == 0 && v.z == 7;
+  }), free.end());
+  scene.load(free);
+  mgg::GraphManager graph;
+  graph.addVertex(new mgg::Vertex(0, mgg::StateVec(.24, .1, 1.5, 0)));
+  auto* farther = new mgg::Vertex(1, mgg::StateVec(1.33, .1, 1.5, 0));
+  graph.addVertex(farther);
+  const auto* linked = mgg::connectStateToGraph(
+      graph, mgg::StateVec(.33, .1, 1.5, 0), scene.ctx, 1.5, false);
+  ASSERT_NE(linked, nullptr);
+  EXPECT_EQ(linked->parent, farther);
+  EXPECT_NEAR(linked->state.x(), .33, 1e-9);
+}
+
+TEST(MolaMap, AerialTakeoffOverPadLinksPastUnknownHomeWithoutPersistingEdge) {
+  AerialMolaScene scene;
+  auto free = AerialMolaScene::observedRoom();
+  free.erase(std::remove_if(free.begin(), free.end(), [](const Voxel& v) {
+    return v.x == 0 && v.y == 0 && v.z == 7;
+  }), free.end());
+  scene.load(free);
+  mgg::GraphManager graph;
+  graph.addVertex(new mgg::Vertex(0, scene.hover));  // home in the blind column
+  auto* anchor = new mgg::Vertex(1, scene.hover + mgg::StateVec(1, 0, 0, 0));
+  graph.addVertex(anchor);
+  const auto link = mgg::linkDeparture(graph, scene.hover, scene.ctx, 1.5);
+  EXPECT_EQ(link.vertex, anchor);
+  EXPECT_TRUE(link.query_local);
+  EXPECT_EQ(graph.getNumVertices(), 2);
+  EXPECT_EQ(graph.getNumEdges(), 0);
+}
+
 TEST(MolaMap, AerialRebuildDoesNotJoinKeyframesAcrossUnknownAir) {
   AerialMolaScene scene;
   auto free = AerialMolaScene::observedRoom();
@@ -927,6 +963,15 @@ TEST(MolaMap, AerialDrone45NearFieldCarvePlansLocally) {
                                          mgg::EdgeInclinations(), 0.2, 0);
   ASSERT_GE(chosen.best_path.size(), 2u);
   EXPECT_GT((chosen.best_path.back()->state - hover).head<2>().norm(), 0.5);
+  // The same blind near-field hover must also depart into the roadmap.
+  mgg::GraphManager roadmap;
+  auto* anchor = new mgg::Vertex(0, mgg::StateVec(1.1, 0.1, 1.3, 0));
+  roadmap.addVertex(anchor);
+  const auto link = mgg::linkDeparture(roadmap, hover, scene.ctx, 1.5);
+  EXPECT_EQ(link.vertex, anchor);
+  EXPECT_TRUE(link.query_local);
+  EXPECT_EQ(roadmap.getNumVertices(), 1);
+  EXPECT_EQ(roadmap.getNumEdges(), 0);
 }
 
 TEST(MolaMap, ExplorationInACorridorNarrowerThanTheClearanceStillHasAPath) {

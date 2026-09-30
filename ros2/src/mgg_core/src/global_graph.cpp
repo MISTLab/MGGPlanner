@@ -94,11 +94,12 @@ Vertex* linkStateToGraph(GraphManager& graph, const StateVec& state,
   }
   if ((state.head<3>() - nearest_vertex->state.head<3>()).squaredNorm() <=
       (exact_state ? 0.0 : kDeltaLimit * kDeltaLimit)) {
-    if (ctx.robot->type == RobotType::kAerialRobot &&
-        linkBlocked(ctx, nearest_vertex->state, state, ctx.robot_box_size)) {
-      return nullptr;
+    if (ctx.robot->type != RobotType::kAerialRobot ||
+        !linkBlocked(ctx, nearest_vertex->state, state, ctx.robot_box_size)) {
+      return nearest_vertex;
     }
-    return nearest_vertex;
+    // An unobserved nearby aerial vertex is not a snap, but another
+    // candidate can still be reached. Do not stop the candidate search.
   }
   // "@TODO: find better way to do this. Blindly add a link/vertex to the
   // graph." (rrg.cpp:4839). The state is where the robot stands or where a
@@ -345,10 +346,15 @@ DepartureLink linkDeparture(GraphManager& graph, const StateVec& state,
                      (b->state.head<3>() - state.head<3>()).squaredNorm();
             });
   for (Vertex* candidate : candidates) {
-    if (candidate == nullptr || !graph.inService(*candidate) ||
-        linkBlocked(ctx, candidate->state, state,
-                    ctx.robot->type == RobotType::kAerialRobot
-                        ? ctx.robot_box_size : Eigen::Vector3d::Zero())) {
+    if (candidate == nullptr || !graph.inService(*candidate)) continue;
+    if (ctx.robot->type == RobotType::kAerialRobot) {
+      const Eigen::Vector3d target = candidate->state.head<3>() + ctx.robot->center_offset;
+      if (ctx.map->getStrictBoxStatus(target, ctx.robot_box_size) != VoxelStatus::kFree ||
+          !aerialRootDepartureTraversable(*ctx.map,
+              state.head<3>() + ctx.robot->center_offset, target, ctx.robot_box_size)) {
+        continue;
+      }
+    } else if (linkBlocked(ctx, candidate->state, state, Eigen::Vector3d::Zero())) {
       continue;
     }
     link.vertex = candidate;

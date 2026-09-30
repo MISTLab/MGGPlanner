@@ -102,7 +102,8 @@ class CountingBoxMap : public mgg::OctomapMap {
 class MolaFloorProduct {
  public:
   MolaFloorProduct(double x0, double x1, double y0, double y1,
-                   const std::vector<std::array<double, 4>>& walls = {}) {
+                   const std::vector<std::array<double, 4>>& walls = {},
+                   const std::vector<std::array<int, 3>>& unknown = {}) {
     static int sequence = 0;
     root_ = std::filesystem::temp_directory_path() /
             ("mgg-planner-mola-" + std::to_string(::getpid()) + "-" +
@@ -127,6 +128,9 @@ class MolaFloorProduct {
                      y >= index(w[2]) && y < index(w[3]);
             });
         for (std::int64_t z = 0; z <= 3; ++z) {
+          if (!wall && std::any_of(unknown.begin(), unknown.end(), [&](const auto& v) {
+                return v[0] == x && v[1] == y && v[2] == z;
+              })) continue;
           (wall ? occupied : free).push_back({x, y, z});
         }
       }
@@ -1661,6 +1665,9 @@ class PlannerNodeTestPeer {
     const std::lock_guard<std::recursive_mutex> lock(node.planner_mutex_);
     node.robot_params_.type = mgg::RobotType::kAerialRobot;
     node.robot_params_.center_offset = center_offset;
+  }
+  static void setAerialBodySize(PlannerNode& node, const Eigen::Vector3d& size) {
+    node.robot_params_.size = size;
   }
   static mgg::MergeResult mergeRoadmap(PlannerNode& node,
                                       const mgg::GraphExchange& incoming) {
@@ -3971,6 +3978,62 @@ TEST_F(PlannerNodeTest, ARobotRestingInADipStillPlans) {
   PlannerNodeTestPeer::plan(*node, response);
   ASSERT_EQ(response->status, mgg_msgs::srv::PlannerSrv::Response::FORWARD);
   ASSERT_GE(response->path.size(), 2u);
+}
+
+TEST_F(PlannerNodeTest, AerialReturnHomeUsesTakeoffColumnEvidenceAndOccupiedWins) {
+  using Service = mgg_msgs::srv::PlanObjective;
+  for (int evidence = 0; evidence < 3; ++evidence) {
+    SCOPED_TRACE(evidence);
+    auto node = makeNode("aerial_column_home");
+    PlannerNodeTestPeer::setAerialRobot(*node);
+    PlannerNodeTestPeer::setAerialBodySize(*node, {0.5, 0.5, 0.3});
+    // Only cell [0,.2]x[0,.2]x[.2,.4] is missing. It is wholly inside the
+    // .5x.5x.3 body swept from pad (.1,.1,0) to hover (.1,.1,.3).
+    // The authoritative producer supplies this one free cell after takeoff;
+    // an occupied return at the same cell must override that evidence.
+    const std::vector<std::array<int, 3>> unknown = evidence == 0
+        ? std::vector<std::array<int, 3>>{{0, 0, 1}} : std::vector<std::array<int, 3>>{};
+    const std::vector<std::array<double, 4>> walls = evidence == 2
+        ? std::vector<std::array<double, 4>>{{0, .2, 0, .2}}
+        : std::vector<std::array<double, 4>>{};
+    MolaFloorProduct product(-1, 3, -1, 1, walls, unknown);
+    PlannerNodeTestPeer::useMolaMap(*node, product.serve());
+    PlannerNodeTestPeer::serveMap(*node, "component:test", 1);
+    PlannerNodeTestPeer::acceptOdometryFacing(*node, .1, .1, 0, 1, .3);
+    PlannerNodeTestPeer::addGlobalChainToFrontier(*node, {{1.1, .1}, {2.1, .1}});
+    PlannerNodeTestPeer::acceptOdometryFacing(*node, 1.1, .1, M_PI, 2, .3);
+    auto request = std::make_shared<Service::Request>();
+    request->objective = Service::Request::RETURN_HOME;
+    request->component_id = "component:test";
+    request->map_epoch = 1;
+    request->goal.position.x = std::nan("");
+    auto response = std::make_shared<Service::Response>();
+    PlannerNodeTestPeer::objective(*node, request, response);
+    EXPECT_EQ(response->status == Service::Response::SUCCEEDED, evidence == 1)
+        << response->reason;
+    if (evidence == 1) {
+      ASSERT_FALSE(response->path.empty());
+      EXPECT_NEAR(response->path.back().position.x, .1, 1e-6);
+    }
+  }
+}
+
+TEST_F(PlannerNodeTest, AerialFreshHoverCanDepartForTourAndGlobalRoute) {
+  auto node = makeNode("aerial_hover_global");
+  PlannerNodeTestPeer::setAerialRobot(*node);
+  PlannerNodeTestPeer::setAerialBodySize(*node, {0.5, 0.5, 0.3});
+  MolaFloorProduct product(-1, 4, -1, 1, {}, {{0, 0, 1}});
+  PlannerNodeTestPeer::useMolaMap(*node, product.serve());
+  // Observed roadmap anchor; the hover itself remains unobserved in its body.
+  PlannerNodeTestPeer::acceptOdometryFacing(*node, 1.1, .1, 0, 1, .3);
+  const int frontier = PlannerNodeTestPeer::addGlobalChainToFrontier(*node, {{2.1, .1}, {3.1, .1}});
+  PlannerNodeTestPeer::acceptOdometryFacing(*node, .1, .1, 0, 2, .3);
+  PlannerNodeTestPeer::markGlobalFrontier(*node, frontier);
+  PlannerNodeTestPeer::setTour(*node, true, 0);
+  PlannerNodeTestPeer::solveTourOnEveryChange(*node);
+  EXPECT_NE(PlannerNodeTestPeer::refreshTour(*node), mgg::kNoCluster);
+  std::string reason;
+  EXPECT_TRUE(PlannerNodeTestPeer::runGlobalPlanner(*node, reason, frontier)) << reason;
 }
 
 TEST_F(PlannerNodeTest, MolaAerialMergeChecksBodyOffsetAndIncomingEdges) {
