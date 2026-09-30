@@ -45,6 +45,10 @@
 
 namespace mgg {
 
+/// rrg.cpp:4831: maximum pose-to-roadmap snap distance. Route admission
+/// must check the lead-in hop over this same distance.
+inline constexpr double kDeltaLimit = 0.1;
+
 /// Recomputes a vertex's volumetric gain in place, as
 /// Rrg::computeVolumetricGainRayModelNoBound (rrg.cpp:3767) did for global
 /// frontiers. Supplied by the caller, which owns the map, sensors and bounds.

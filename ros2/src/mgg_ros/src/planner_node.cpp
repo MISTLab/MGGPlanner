@@ -2289,9 +2289,19 @@ void PlannerNode::pinPeerBodies(std::optional<PeerBodyPin>& pin) {
 }
 
 bool PlannerNode::peerAdmissible(const std::vector<mgg::StateVec>& path) const {
-  if (robot_params_.type == mgg::RobotType::kAerialRobot && !path.empty() &&
-      (path.front().head<3>() - current_state_.head<3>()).norm() > 1e-6 &&
-      peerBlocksSegment(path.front().head<3>(), path.front().head<3>())) return false;
+  if (robot_params_.type == mgg::RobotType::kAerialRobot && !path.empty()) {
+    const Eigen::Vector3d current = current_state_.head<3>();
+    const Eigen::Vector3d front = path.front().head<3>();
+    const double gap_squared = (front - current).squaredNorm();
+    if (gap_squared <= mgg::kDeltaLimit * mgg::kDeltaLimit) {
+      // Roadmap linking may snap to a nearby vertex. The unrepresented
+      // hop must obey the same outward, non-descending exit rule. An
+      // identical front needs no hop (a point query would block it).
+      if (gap_squared > 0.0 && peerBlocksSegment(current, front)) return false;
+    } else if (peerBlocksSegment(front, front)) {
+      return false;
+    }
+  }
   for (std::size_t i = 1; i < path.size(); ++i) {
     if (peerBlocksSegment(path[i - 1].head<3>(), path[i].head<3>())) {
       return false;

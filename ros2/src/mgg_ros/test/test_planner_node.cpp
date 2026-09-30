@@ -4416,6 +4416,57 @@ TEST_F(PlannerNodeTest, AerialCylinderAllowsCurrentPoseToLeaveButNotEnterDeeper)
   EXPECT_TRUE(PlannerNodeTestPeer::peerPathClear(*node, {0,0,1.2}, {0,0,1.6}));
 }
 
+TEST_F(PlannerNodeTest, AerialCylinderChecksTheHopToASnappedPathFront) {
+  auto node = makeNode("aerial_cylinder_snap_hop");
+  PlannerNodeTestPeer::setAerialRobot(*node);
+  PlannerNodeTestPeer::acceptOdometryFacing(*node, .5, 0, 0, 1, 1.2);
+  PlannerNodeTestPeer::aerialPeerBodies(*node, .97, .6);
+  EXPECT_TRUE(PlannerNodeTestPeer::peerPathClear(*node, {.55,0,1.2}, {2,0,1.2}));
+  EXPECT_TRUE(PlannerNodeTestPeer::peerPathClear(*node, {.5,0,1.25}, {2,0,1.25}));
+  // Each remaining route points away, but its snap hop is unsafe or its
+  // front is too far away to stand for the current pose.
+  EXPECT_FALSE(PlannerNodeTestPeer::peerPathClear(*node, {.45,0,1.2}, {2,0,1.2}));
+  EXPECT_FALSE(PlannerNodeTestPeer::peerPathClear(*node, {.55,0,1.15}, {2,0,1.15}));
+  EXPECT_FALSE(PlannerNodeTestPeer::peerPathClear(*node, {.61,0,1.2}, {2,0,1.2}));
+}
+
+TEST_F(PlannerNodeTest, ReturnHomeFromInsideAerialCylinderChecksSnappedStart) {
+  // Current pose snaps to a roadmap vertex 5 cm away. The whole roadmap
+  // route is outward; only a safe current-to-front hop permits sending it.
+  for (int hop = 0; hop < 3; ++hop) {
+    SCOPED_TRACE(hop);
+    auto node = makeNode("aerial_cylinder_home_snap");
+    PlannerNodeTestPeer::setAerialRobot(*node);
+    MolaFloorProduct product(-1, 3, -1, 1);
+    PlannerNodeTestPeer::useMolaMap(*node, product.serve());
+    PlannerNodeTestPeer::serveMap(*node, "component:test", 1);
+    PlannerNodeTestPeer::acceptOdometryFacing(*node, 2, .1, 0, 1, .4);
+    const double front_x = hop == 1 ? .45 : .55;
+    PlannerNodeTestPeer::addGlobalVertex(*node, 1, front_x, .1, .4, {0});
+    PlannerNodeTestPeer::acceptOdometryFacing(*node, front_x, .1, 0, 2, .4);
+    PlannerNodeTestPeer::acceptOdometryFacing(*node, .5, .1, 0, 3, hop == 2 ? .45 : .4);
+    ASSERT_EQ(PlannerNodeTestPeer::globalVertices(*node), 2);
+    PlannerNodeTestPeer::aerialPeerBodies(*node, .05, .6);
+    auto response = peerObjective(*node, mgg_msgs::srv::PlanObjective::Request::RETURN_HOME,
+                                  std::nan(""), std::nan(""));
+    if (hop != 0) {
+      EXPECT_EQ(response->status, mgg_msgs::srv::PlanObjective::Response::BLOCKED) << response->reason;
+      EXPECT_TRUE(response->path.empty());
+      continue;
+    }
+    EXPECT_EQ(response->status, mgg_msgs::srv::PlanObjective::Response::SUCCEEDED) << response->reason;
+    ASSERT_GE(response->path.size(), 2u);
+    EXPECT_NEAR(response->path.front().position.x, .55, 1e-9);
+    EXPECT_NEAR(response->path.back().position.x, 2, 1e-9);
+    double previous_x = .5;
+    for (const auto& pose : response->path) {
+      EXPECT_GE(pose.position.x, previous_x);
+      EXPECT_NEAR(pose.position.z, .4, 1e-9);
+      previous_x = pose.position.x;
+    }
+  }
+}
+
 TEST_F(PlannerNodeTest, AerialCylinderDetourSurvivesPlanAndReturnHomeShortcut) {
   for (bool home : {false, true}) {
     SCOPED_TRACE(home);

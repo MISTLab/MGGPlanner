@@ -56,8 +56,7 @@ bool RobotStateHistory::getNearestStates(
 
 namespace {
 
-/// rrg.cpp:4831 and 4832.
-constexpr double kDeltaLimit = 0.1;
+/// rrg.cpp:4832.
 constexpr double kRadiusLimit = 0.5;
 
 /// A pose to fold in, with the local vertex it came from when there is one.
