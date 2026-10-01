@@ -1079,6 +1079,8 @@ class PlannerNode : public rclcpp::Node {
   std::unordered_map<mgg::ClusterId, TourAtTargetFailure> tour_at_target_failures_;
   /// Tour targets the robot could not be routed to.
   int tour_routes_failed_ = 0;
+  /// Targets already within tour reach, set aside instead of routed back to.
+  std::uint64_t tour_in_reach_set_aside_ = 0;
 
   /// Frontiers reserved by peers, in the planning frame, and how long a
   /// message stays in force.

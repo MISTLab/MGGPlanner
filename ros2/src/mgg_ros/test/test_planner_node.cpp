@@ -1352,6 +1352,12 @@ class PlannerNodeTestPeer {
     const std::optional<mgg::FrontierCluster> target = node.refreshTour(note);
     return target.has_value() ? target->id : mgg::kNoCluster;
   }
+  static mgg::ClusterId reachedTourCluster(PlannerNode& node) {
+    return node.tour_reached_cluster_;
+  }
+  static bool lowGainPathNow(PlannerNode& node) {
+    return node.low_gain_path_now_;
+  }
   /// The id of the global vertex at (x, y), or -1.
   static int globalVertexAt(PlannerNode& node, double x, double y) {
     const std::lock_guard<std::recursive_mutex> lock(node.planner_mutex_);
@@ -7771,6 +7777,69 @@ TEST_F(PlannerNodeTest, Run12ShortFirstTourGoalDoesNotStopInsideTheBlindArrivalB
   const auto& end = response->path.back().position;
   EXPECT_GT(std::hypot(end.x, end.y) - 0.25, 1.2);
   EXPECT_FALSE(PlannerNodeTestPeer::bestPathFromGlobalGraph(*node));
+}
+
+TEST_F(PlannerNodeTest, AReselectedInReachTourTargetDoesNotReplaceHighGainLocalExploration) {
+  // drone-r4: EGO has arrived at 0.479 m, outside MGG's default 0.3 m
+  // tolerance but inside the tour's 5 m reach. The one-time reached release
+  // reselects the still valuable frontier behind the useful local path.
+  for (bool aerial : {true, false}) {
+    SCOPED_TRACE(aerial ? "aerial" : "ground");
+    auto node = makeNode(aerial ? "reselected_aerial" : "reselected_ground");
+    PlannerNodeTestPeer::setLowGainVoxels(*node, 0.0);
+    PlannerNodeTestPeer::observeFloor(*node, -1.5, 4.0, -1.5, 1.5);
+    if (aerial) {
+      PlannerNodeTestPeer::setAerialRobot(*node);
+    } else {
+      // Ground keeps its tour approach outside the configured controller
+      // tolerance; inside it, the existing no-progress guard sets it aside.
+      PlannerNodeTestPeer::setReachDistance(*node, 0.5);
+    }
+    PlannerNodeTestPeer::acceptOdometryFacing(*node, 0, 0, 0, 1.0,
+                                              aerial ? 0.4 : 0.075);
+    const int frontier = PlannerNodeTestPeer::addGlobalChainToFrontier(
+        *node, {{-0.479, 0.0}}, M_PI);
+    // Preserve a reported frontier across local rescoring, as the stale
+    // but still valuable cluster in the run survived every plan.
+    PlannerNodeTestPeer::setSensorRange(*node, 4.0);
+    PlannerNodeTestPeer::setFrontierOwner(*node, frontier, 2);
+    PlannerNodeTestPeer::setReportedUnknown(*node, frontier, 100000);
+    PlannerNodeTestPeer::setTour(*node, true, 1e5);
+    PlannerNodeTestPeer::setTourRetry(*node, 60.0);
+    PlannerNodeTestPeer::solveTourOnEveryChange(*node);
+    const auto target = PlannerNodeTestPeer::refreshTour(*node);
+    ASSERT_NE(target, mgg::kNoCluster);
+    ASSERT_EQ(PlannerNodeTestPeer::refreshTour(*node), target);
+    ASSERT_EQ(PlannerNodeTestPeer::reachedTourCluster(*node), target);
+
+    double aside_at = 0;
+    for (int cycle = 0; cycle < 3; ++cycle) {
+      SCOPED_TRACE(cycle);
+      auto response = std::make_shared<mgg_msgs::srv::PlannerSrv::Response>();
+      PlannerNodeTestPeer::plan(*node, response);
+      ASSERT_EQ(response->status, mgg_msgs::srv::PlannerSrv::Response::FORWARD);
+      ASSERT_GE(response->path.size(), 2u);
+      ASSERT_FALSE(PlannerNodeTestPeer::lowGainPathNow(*node));
+      EXPECT_GT(response->path.back().position.x, 0.5);
+      EXPECT_FALSE(PlannerNodeTestPeer::bestPathFromGlobalGraph(*node));
+      EXPECT_FALSE(PlannerNodeTestPeer::repositioningOngoing(*node));
+      EXPECT_NE(PlannerNodeTestPeer::tourTarget(*node), target);
+      EXPECT_DOUBLE_EQ(PlannerNodeTestPeer::tourAsideRetry(*node, target), 60.0);
+      if (cycle == 0) aside_at = PlannerNodeTestPeer::tourAsideAt(*node, target);
+      EXPECT_DOUBLE_EQ(PlannerNodeTestPeer::tourAsideAt(*node, target), aside_at);
+      const auto status = nlohmann::json::parse(
+          PlannerNodeTestPeer::aerialStatusJson(*node));
+      EXPECT_EQ(status["tour"]["in_reach_set_aside"], aerial ? 1 : 0);
+    }
+    // Retry expiry alone must not erase the at-target failure history.
+    PlannerNodeTestPeer::expireTourAside(*node, target);
+    ASSERT_EQ(PlannerNodeTestPeer::refreshTour(*node), target);
+    auto response = std::make_shared<mgg_msgs::srv::PlannerSrv::Response>();
+    PlannerNodeTestPeer::plan(*node, response);
+    ASSERT_FALSE(response->path.empty());
+    EXPECT_GT(response->path.back().position.x, 0.5);
+    EXPECT_DOUBLE_EQ(PlannerNodeTestPeer::tourAsideRetry(*node, target), 120.0);
+  }
 }
 
 TEST_F(PlannerNodeTest, ANearHighGainTourTargetKeepsTheMovingLocalPathAndStaysAside) {

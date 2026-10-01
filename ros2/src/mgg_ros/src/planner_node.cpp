@@ -1809,6 +1809,8 @@ std::string PlannerNode::aerialStatusJson() const {
        ",\"last_back_m\":" + jsonNumber(c.last_reach_back_m) +
        ",\"last_budget_m\":" + jsonNumber(c.last_reach_budget_m) +
        ",\"reach_m\":" + jsonNumber(flight_reach_m_) + "}";
+  j += ",\"tour\":{\"in_reach_set_aside\":" +
+       std::to_string(tour_in_reach_set_aside_) + "}";
   const ScoutingExclusionCounters& x = scouting_counters_;
   j += ",\"scouting_exclusions\":{\"in_force\":" +
        std::to_string(scouting_exclusion_centres_.size()) +
@@ -5211,6 +5213,21 @@ void PlannerNode::onPlanRequest(
                               tour_target->position)) {
         tour_decided = true;
         summary += "; exploring locally toward the tour's target";
+      } else if (robot_params_.type == mgg::RobotType::kAerialRobot &&
+                 (tour_target->position - current_state_.head<3>()).norm() <=
+                     global_frontier_reach_m_) {
+        // refreshTour may reselect a reached cluster that still has gain.
+        // drone-r4: EGO had arrived, but its tolerance exceeded MGG's. Do
+        // not replace local exploration with a route back inside reach.
+        // Ground tours retain their closer approach to the representative.
+        setTourClusterAside(*tour_target, tour_params_.route_retry_s, true);
+        ++tour_in_reach_set_aside_;
+        RCLCPP_INFO_THROTTLE(
+            get_logger(), *get_clock(), 10000,
+            "tour: in-reach target set aside (at-target backoff), total %llu",
+            static_cast<unsigned long long>(tour_in_reach_set_aside_));
+        summary += "; in-reach tour target set aside";
+        if (!best_path_.empty()) summary += "; exploring locally";
       } else {
         auto map_read = mapReadLease();
         const std::vector<mgg::StateVec> local_path = best_path_;
