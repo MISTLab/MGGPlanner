@@ -3107,3 +3107,54 @@ TEST(MolaMap, FullPadReachDepartureFromCentreAndNearWall) {
     EXPECT_TRUE(provider.dynamicSweepBlocked(departure.path.back().head<3>(), start.head<3>(), 0.6));
   }
 }
+
+TEST(AerialRootRecovery, SyntheticWallOnlyOutwardDeparture) {
+  Publication publication;
+  std::vector<Voxel> occupied, free;
+  for (int x = -10; x <= 10; ++x)
+    for (int y = -5; y <= 5; ++y)
+      for (int z = 0; z <= 10; ++z)
+        (x == 2 ? occupied : free).push_back({x, y, z});
+  MolaMap map(config(publication));
+  map.requestSnapshot(publication.publish(0, occupied, free));
+  ASSERT_TRUE(waitFor([&] { return map.getStatus(); }));
+  const Eigen::Vector3d start(0.15, 0.1, 1.1), size(0.55, 0.55, 0.3);
+  EXPECT_EQ(map.getStrictBoxStatus(start, size), VoxelStatus::kOccupied);
+  EXPECT_TRUE(mgg::aerialRootDepartureTraversable(map, start, start - Eigen::Vector3d(1,0,0), size));
+  EXPECT_FALSE(mgg::aerialRootDepartureTraversable(map, start, start + Eigen::Vector3d(1,0,0), size));
+  EXPECT_FALSE(mgg::aerialRootDepartureTraversable(map, start, start + Eigen::Vector3d(0,0.8,0), size));
+  // The exemption is not a map mutation or an ordinary edge allowance.
+  EXPECT_EQ(map.getStrictPathStatus(start, start - Eigen::Vector3d(1,0,0), size), VoxelStatus::kOccupied);
+}
+
+TEST(AerialRootRecovery, ArchivedR6GridsAllowAwayButNotIntoPillar) {
+  for (int revision : {39, 40}) {
+    SCOPED_TRACE(revision);
+    const auto fixture = json::parse(readFile(std::filesystem::path(MGG_MAP_TEST_DATA_DIR) /
+        ("aerial_depart_r" + std::to_string(revision) + ".json")));
+    std::vector<Voxel> occupied, free;
+    for (const auto& c : fixture["occupied"]) occupied.push_back({c[0],c[1],c[2]});
+    for (const auto& c : fixture["free"]) free.push_back({c[0],c[1],c[2]});
+    Eigen::Isometry3d transform = Eigen::Isometry3d::Identity();
+    for (int r = 0; r < 4; ++r)
+      for (int c = 0; c < 4; ++c) transform.matrix()(r,c) = fixture["component_from_navigation"][r][c];
+    const Eigen::Vector3d start(8.4509,1.6995,1.6168), size(0.55,0.55,0.3);
+    Publication publication;
+    MolaMap map(config(publication));
+    map.requestSnapshot(publication.publish(0, occupied, free, true, transform));
+    ASSERT_TRUE(waitFor([&] { return map.getStatus(); }));
+    const Eigen::Vector3d root = transform * start;
+    const Eigen::Vector3d half = transform.linear().cwiseAbs() * size / 2;
+    int root_occupied = 0;
+    for (const auto& c : occupied) {
+      const Eigen::Vector3d center = 0.2 * Eigen::Vector3d(c.x + 0.5,c.y + 0.5,c.z + 0.5);
+      if (((center - root).cwiseAbs().array() <= (half.array() + 0.1)).all()) ++root_occupied;
+    }
+    ASSERT_EQ(root_occupied, 13);
+    const Eigen::Vector3d away = transform.linear().transpose() * Eigen::Vector3d(-0.8,0,0);
+    ASSERT_EQ(map.getStrictBoxStatus(start + away, size), VoxelStatus::kFree);
+    EXPECT_TRUE(mgg::aerialRootDepartureTraversable(map, start, start + away, size));
+    EXPECT_FALSE(mgg::aerialRootDepartureTraversable(map, start, start - away, size));
+    EXPECT_EQ(map.getStrictPathStatus(start, start + away, size), VoxelStatus::kOccupied);
+  }
+}
