@@ -13,6 +13,7 @@
 
 #include "mgg_core/graph_expansion.h"
 #include "mgg_core/grid_graph.h"
+#include "mgg_core/planning_cancellation.h"
 #include "terrain_fixture.h"
 
 namespace {
@@ -253,6 +254,14 @@ GridGraphParams smallGrid() {
   g.max_val = Eigen::Vector3d(1.0, 1.0, 0.0);
   g.resolution = Eigen::Vector3d(0.5, 0.5, 0.5);
   return g;
+}
+
+TEST(GridGraph, CancelledRequestStopsAtLatticeCheckpoint) {
+  Fixture f;
+  mgg::PlanningCancellationScope token([] { return true; });
+  EXPECT_THROW(buildGridGraph(f.graph, StateVec(0, 0, 0, 0), smallGrid(),
+                             f.ctx, 0.0), mgg::PlanningInterrupted);
+  EXPECT_EQ(f.graph.getNumVertices(), 1);
 }
 
 TEST(GridGraph, SweepsTheLatticeAndGrowsTheGraph) {
