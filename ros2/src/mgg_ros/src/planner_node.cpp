@@ -1120,6 +1120,7 @@ std::vector<mgg::FrontierCluster> PlannerNode::tourCandidates(
         return {};
       }
       refreshPeerGeneration();
+      relinkAerialHome(link->id);
       auto costs = mgg::computeTourCosts(*global_graph_, graph_revision_, tour_distances_,
           link->id, current_state_[3], clusters, tour_params_.heading_weight, peer_generation_);
       const auto before_cap = costs.from_robot;
@@ -1196,6 +1197,12 @@ std::optional<mgg::FrontierCluster> PlannerNode::refreshTour(
   }
   noteGlobalGraphEdges();
   refreshPeerGeneration();
+  // A home cut off is retried before the tour decides whether to solve: a
+  // map revision alone does not solve it again.
+  if (robot_params_.type == mgg::RobotType::kAerialRobot &&
+      home_link_status_ != "connected") {
+    if (mgg::Vertex* link = linkRobotToGlobalGraph()) relinkAerialHome(link->id);
+  }
   std::vector<mgg::FrontierCluster> clusters = globalFrontierClusters();
   // Keep backoff only for existing clusters, including ones temporarily
   // reserved by peers. New evidence resets even an already-lapsed aside.
@@ -1289,6 +1296,7 @@ std::optional<mgg::FrontierCluster> PlannerNode::refreshTour(
       return std::nullopt;
     }
     noteGlobalGraphEdges();
+    relinkAerialHome(link->id);
     const auto started = std::chrono::steady_clock::now();
     mgg::TourCostMatrix costs = mgg::computeTourCosts(
         *global_graph_, graph_revision_, tour_distances_, link->id,
@@ -1550,6 +1558,63 @@ void PlannerNode::fleetTick(double now_s) {
               out.award->released_robot_ids.size());
 }
 
+void PlannerNode::relinkAerialHome(int robot_vertex_id) {
+  if (robot_params_.type != mgg::RobotType::kAerialRobot) return;
+  mgg::Vertex* home = findGlobalVertex(kHomeVertexId);
+  if (home == nullptr || !global_graph_->inService(*home)) {
+    home_link_status_ = "no home";
+    return;
+  }
+  const auto key = std::make_tuple(
+      static_cast<const mgg::GraphManager*>(global_graph_.get()),
+      graph_revision_, map_revision_, peer_generation_);
+  if (key == home_link_key_) return;
+  home_link_key_ = key;
+  if (robot_vertex_id == kHomeVertexId) {
+    home_link_status_ = "connected";
+    return;
+  }
+  const mgg::ShortestPathsReport* report = tour_distances_.from(
+      *global_graph_, graph_revision_, robot_vertex_id, peer_generation_);
+  if (report != nullptr &&
+      std::isfinite(mgg::reachedDistance(*report, kHomeVertexId))) {
+    home_link_status_ = "connected";
+    return;
+  }
+  auto map_read = mapReadLease();
+  const mgg::ExpandContext ctx = makeGlobalContext();
+  // The same evidence Return Home asks of its goal (routeOverGlobalGraph).
+  if (map_->getStaticStrictBoxStatus(
+          home->state.head<3>() + robot_params_.center_offset,
+          ctx.robot_box_size) != mgg::VoxelStatus::kFree) {
+    home_link_status_ = "unreachable: home body not observed free";
+    return;
+  }
+  ++home_relink_attempts_;
+  mgg::ExpandGraphReport rep;
+  mgg::expandGraphEdges(*global_graph_, home, rep, ctx);
+  if (rep.num_edges_added == 0) {
+    home_link_status_ = "unreachable: no admissible edge from home";
+    return;
+  }
+  ++graph_revision_;
+  ++home_relinks_;
+  home_link_key_ = std::make_tuple(
+      static_cast<const mgg::GraphManager*>(global_graph_.get()),
+      graph_revision_, map_revision_, peer_generation_);
+  const mgg::ShortestPathsReport* after = tour_distances_.from(
+      *global_graph_, graph_revision_, robot_vertex_id, peer_generation_);
+  const bool reached =
+      after != nullptr &&
+      std::isfinite(mgg::reachedDistance(*after, kHomeVertexId));
+  home_link_status_ = reached ? "relinked" : "unreachable: relinked elsewhere";
+  RCLCPP_INFO(get_logger(),
+              "aerial home (%.2f, %.2f, %.2f) relinked: +%d edge(s); %s",
+              home->state.x(), home->state.y(), home->state.z(),
+              rep.num_edges_added,
+              reached ? "reached from the robot" : "still not reached");
+}
+
 std::vector<double> PlannerNode::homeDistances(
     const std::vector<mgg::FrontierCluster>& clusters) {
   // The way back, from each representative to home: a peer body's margin
@@ -1599,6 +1664,7 @@ mgg::TourBidData PlannerNode::ownTourBid() {
   mgg::TourCostMatrix costs;
   refreshPeerGeneration();
   if (mgg::Vertex* link = linkRobotToGlobalGraph()) {
+    relinkAerialHome(link->id);
     costs = mgg::computeTourCosts(*global_graph_, graph_revision_,
                                   tour_distances_, link->id,
                                   current_state_[3], clusters,
@@ -2688,6 +2754,10 @@ void PlannerNode::seedGlobalGraph() {
         robot_params_.type == mgg::RobotType::kAerialRobot &&
         aerial_home_height_m_ > 0.0 &&
         latest_flight_state_ == std::string(kFlightStateLanded);
+    home_seeded_on_timeout_ =
+        robot_params_.type == mgg::RobotType::kAerialRobot &&
+        aerial_home_height_m_ > 0.0 && !latest_flight_state_;
+    home_seed_pose_ = current_state_;
     mgg::StateVec root_state = current_state_;
     if (home_seeded_landed_) root_state[2] += aerial_home_height_m_;
     global_root_supported_ = projectToDrivingHeight(root_state);
@@ -5656,6 +5726,68 @@ void PlannerNode::onFlightState(const std_msgs::msg::String::SharedPtr msg) {
   } else {
     latest_flight_state_ = msg->data;
   }
+  rerootHomeOnLateLandedState();
+}
+
+void PlannerNode::rerootHomeOnLateLandedState() {
+  if (!home_seeded_on_timeout_ || !latest_flight_state_) return;
+  // Decided once, on the first state after the timeout seed: a later
+  // "landed" may be anywhere the drone flew to.
+  home_seeded_on_timeout_ = false;
+  if (*latest_flight_state_ != std::string(kFlightStateLanded)) return;
+  mgg::Vertex* home = findGlobalVertex(kHomeVertexId);
+  if (home == nullptr) return;
+  // drone-r3: SwarmDeck's adapter connected 50 s after the planner's wait
+  // timed out. Home stayed on the pad, its box in the floor, joined to no
+  // edge: every return cost was infinite and the reach cap refused every
+  // cluster, while Return Home to the take-off height routed.
+  const double moved =
+      (current_state_.head<3>() - home_seed_pose_.head<3>()).norm();
+  if (left_standing_start_ || moved >= kStandingStartMoveM) {
+    RCLCPP_WARN(get_logger(),
+                "late flight_state 'landed' after the home was seeded "
+                "unlifted, but the drone moved %.2f m since: home stays at "
+                "(%.2f, %.2f, %.2f)",
+                moved, home->state.x(), home->state.y(), home->state.z());
+    return;
+  }
+  const Eigen::Vector3d was = home->state.head<3>();
+  mgg::StateVec lifted = current_state_;
+  lifted[2] += aerial_home_height_m_;
+  // Its edges were checked where it was.
+  const auto neighbours = global_graph_->edge_map_[kHomeVertexId];
+  for (const auto& [other, cost] : neighbours) {
+    (void)cost;
+    if (auto* u = findGlobalVertex(other)) global_graph_->removeEdge(home, u);
+    auto& edges = global_graph_->edge_map_[other];
+    edges.erase(std::remove_if(edges.begin(), edges.end(),
+                               [](const auto& edge) {
+                                 return edge.first == kHomeVertexId;
+                               }),
+                edges.end());
+  }
+  global_graph_->edge_map_[kHomeVertexId].clear();
+  for (auto& [sender, placement] : global_graph_->neighbour_placements_) {
+    (void)sender;
+    for (auto it = placement.merge_owned_edges.begin();
+         it != placement.merge_owned_edges.end();) {
+      it = it->first == kHomeVertexId || it->second == kHomeVertexId
+               ? placement.merge_owned_edges.erase(it)
+               : std::next(it);
+    }
+  }
+  global_graph_->updateVertexState(kHomeVertexId, lifted);
+  home->is_hanging = false;
+  home_seeded_landed_ = true;
+  // Rebuilds from the same keyframes now lift the first one.
+  for (std::string& inputs : last_roadmap_rebuild_inputs_) inputs.clear();
+  ++graph_revision_;
+  ++home_reroots_;
+  RCLCPP_INFO(get_logger(),
+              "late flight_state 'landed': home re-rooted at take-off height "
+              "(%.2f, %.2f, %.2f), was (%.2f, %.2f, %.2f), %zu edge(s) cut",
+              lifted.x(), lifted.y(), lifted.z(), was.x(), was.y(), was.z(),
+              neighbours.size());
 }
 
 std::vector<mgg::FrontierCluster> PlannerNode::insideExplorationRegion(

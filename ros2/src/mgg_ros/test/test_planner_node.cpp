@@ -919,6 +919,14 @@ class PlannerNodeTestPeer {
     node.cloud_map_->augmentFreeBox(center, size);
     ++node.map_revision_;
   }
+  /// One occupied return at `p`, observed from 1 m below it.
+  static void observeOccupied(PlannerNode& node, const Eigen::Vector3d& p) {
+    const std::lock_guard<std::recursive_mutex> lock(node.planner_mutex_);
+    for (int repeat = 0; repeat < 8; ++repeat) {
+      node.cloud_map_->insertPointCloud({p}, p - Eigen::Vector3d(0, 0, 1.0));
+    }
+    ++node.map_revision_;
+  }
   static bool observedArrivalDisk(PlannerNode& node, const mgg::StateVec& goal) {
     return mgg::observedArrivalDisk(*node.map_, node.robot_params_, node.planning_params_,
                                    goal, node.reach_distance_);
@@ -1697,6 +1705,15 @@ class PlannerNodeTestPeer {
   static std::optional<std::string> latestFlightState(PlannerNode& node) {
     const std::lock_guard<std::recursive_mutex> lock(node.planner_mutex_);
     return node.latest_flight_state_;
+  }
+  static int homeReroots(PlannerNode& node) { return node.home_reroots_; }
+  static int homeRelinks(PlannerNode& node) { return node.home_relinks_; }
+  static std::string homeLinkStatus(PlannerNode& node) {
+    return node.home_link_status_;
+  }
+  static int homeEdges(PlannerNode& node) {
+    const std::lock_guard<std::recursive_mutex> lock(node.planner_mutex_);
+    return static_cast<int>(node.global_graph_->edge_map_[0].size());
   }
   /// The flight state SwarmDeck's adapter publishes on flight_state.
   static void setFlightState(PlannerNode& node, const std::string& state) {
@@ -9248,10 +9265,14 @@ TEST_F(PlannerNodeTest, ADroneSeedsUnliftedAndWarnsOnceWhenFlightStateTimesOut) 
                 1e-9);
     setHomeWaitNodeTime(*node, 110.0);
     executor.spin_some();
+    // drone-r3: the adapter's latched "landed" arrives after the timeout,
+    // the drone still on its pad. Home is re-rooted at take-off height over
+    // the pose then, as a timely state would have seeded it.
     PlannerNodeTestPeer::setFlightState(*node, "landed");
     PlannerNodeTestPeer::acceptOdometry(*node, odometryAt(0, 0, 0.4, 2));
-    EXPECT_NEAR(PlannerNodeTestPeer::globalVertexState(*node, 0).z(), 0.075,
+    EXPECT_NEAR(PlannerNodeTestPeer::globalVertexState(*node, 0).z(), 1.075,
                 1e-9);
+    EXPECT_EQ(PlannerNodeTestPeer::homeReroots(*node), 1);
     const std::string log = testing::internal::GetCapturedStderr();
     const auto warning = log.find("timed out waiting for");
     EXPECT_NE(warning, std::string::npos) << log;
@@ -9348,15 +9369,17 @@ TEST_F(PlannerNodeTest, BackgroundWorkWaitsForFlightStateAndResumesAfterRelease)
   EXPECT_GT(PlannerNodeTestPeer::mergeIntoTwoVertexRoadmap(*node, incoming), 0);
 }
 
-TEST_F(PlannerNodeTest, ALandedStateAfterTheDeadlineCannotBeatTheTimeoutCallback) {
+TEST_F(PlannerNodeTest, ALandedStateAfterTheDeadlineSeedsOnTheTimeoutThenReRoots) {
   auto node = droneOverAFloor("drone_late_state_before_timer", 1.0);
   setHomeWaitNodeTime(*node, 10.0);
   PlannerNodeTestPeer::acceptOdometry(*node, odometryAt(0, 0, 0.4, 1));
   setHomeWaitNodeTime(*node, 15.0);
-  // Deliberately do not spin the executor: the state handler wins the mutex,
-  // but arrived too late to lift home.
+  // Deliberately do not spin the executor: the state handler wins the mutex
+  // after the deadline. Home is seeded on the timeout first, unlifted, and
+  // then re-rooted by the late "landed" over the unmoved drone.
   PlannerNodeTestPeer::setFlightState(*node, "landed");
-  EXPECT_NEAR(PlannerNodeTestPeer::globalVertexState(*node, 0).z(), 0.4, 1e-9);
+  EXPECT_NEAR(PlannerNodeTestPeer::globalVertexState(*node, 0).z(), 1.4, 1e-9);
+  EXPECT_EQ(PlannerNodeTestPeer::homeReroots(*node), 1);
 }
 
 TEST_F(PlannerNodeTest, TheHomeFlightStateWaitMustBeFiniteAndNonNegative) {
@@ -9485,13 +9508,139 @@ TEST_F(PlannerNodeTest, ADronesHomeIsLiftedOnlyWhenSwarmDeckSaysItIsLanded) {
     EXPECT_NEAR(PlannerNodeTestPeer::globalVertexState(*node, 0).z(),
                 c.z + (c.lifted ? 1.0 : 0.0), 1e-9);
   }
-  // Landed reported after home was seeded lifts nothing afterwards.
+  // Landed reported after home was seeded on the timeout, the drone not
+  // moved since: re-rooted once, as a timely state would have seeded it.
   auto late = droneOverAFloor("drone_home_landed_late", 1.0, true, 0.0);
   PlannerNodeTestPeer::acceptOdometry(*late, odometryAt(0.0, 0.0, 0.075, 1));
   PlannerNodeTestPeer::setFlightState(*late, "landed");
   PlannerNodeTestPeer::acceptOdometry(*late, odometryAt(0.0, 0.0, 0.075, 2));
-  EXPECT_NEAR(PlannerNodeTestPeer::globalVertexState(*late, 0).z(), 0.075,
+  EXPECT_NEAR(PlannerNodeTestPeer::globalVertexState(*late, 0).z(), 1.075,
               1e-9);
+  PlannerNodeTestPeer::setFlightState(*late, "flying");
+  PlannerNodeTestPeer::setFlightState(*late, "landed");
+  EXPECT_NEAR(PlannerNodeTestPeer::globalVertexState(*late, 0).z(), 1.075,
+              1e-9);
+  EXPECT_EQ(PlannerNodeTestPeer::homeReroots(*late), 1);
+  // Not when the first state is not "landed", nor when the drone moved
+  // since home was seeded (it may have landed anywhere), nor for a home
+  // seeded with a state (a restart in flight), nor without an anchor.
+  struct Late {
+    const char* name;
+    std::vector<std::string> states;
+    Eigen::Vector3d at_state;
+    bool state_before_seed;
+    double anchor;
+  };
+  for (const Late& c : std::vector<Late>{
+           {"first_flying", {"flying", "landed"}, {0.0, 0.0, 0.075}, false, 1.0},
+           {"moved_across", {"landed"}, {0.6, 0.0, 0.075}, false, 1.0},
+           {"moved_down", {"landed"}, {0.0, 0.0, 0.075}, false, 1.0},
+           {"seeded_flying", {"landed"}, {0.0, 0.0, 1.3}, true, 1.0},
+           {"no_anchor", {"landed"}, {0.0, 0.0, 0.075}, false, 0.0}}) {
+    SCOPED_TRACE(c.name);
+    auto node = droneOverAFloor(std::string("drone_home_not_rerooted_") +
+                                    c.name, c.anchor, true, 0.0);
+    if (c.state_before_seed) PlannerNodeTestPeer::setFlightState(*node, "flying");
+    const double seed_z = std::string(c.name) == "moved_down" ? 1.3 : c.at_state.z();
+    PlannerNodeTestPeer::acceptOdometry(*node, odometryAt(0.0, 0.0, seed_z, 1));
+    PlannerNodeTestPeer::acceptOdometry(
+        *node, odometryAt(c.at_state.x(), c.at_state.y(), c.at_state.z(), 2));
+    for (const std::string& state : c.states) {
+      PlannerNodeTestPeer::setFlightState(*node, state);
+    }
+    EXPECT_NEAR(PlannerNodeTestPeer::globalVertexState(*node, 0).z(), seed_z,
+                1e-9);
+    EXPECT_EQ(PlannerNodeTestPeer::homeReroots(*node), 0);
+  }
+}
+
+TEST_F(PlannerNodeTest, ALateLandedStateReRootsTheTimedOutHomeSoTheTourSelects) {
+  // drone-r3 (mgg.log M:120, 129, 135, 500 to 503): flight_state arrived
+  // after the wait timed out; home stayed on the pad, alone in its
+  // component, and 387 own clusters failed the battery reach cap with the
+  // battery full: 149 of 152 plans had "tour: no cluster". The late
+  // "landed" re-roots home at take-off height, where the flight links.
+  auto node = droneOverAFloor("drone_late_landed_tour", 1.0, true, 0.0);
+  PlannerNodeTestPeer::acceptOdometry(*node, odometryAt(0.0, 0.0, 0.075, 1));
+  EXPECT_NEAR(PlannerNodeTestPeer::globalVertexState(*node, 0).z(), 0.075,
+              1e-9);
+  PlannerNodeTestPeer::setFlightState(*node, "landed");
+  const mgg::StateVec home = PlannerNodeTestPeer::globalVertexState(*node, 0);
+  EXPECT_NEAR(home.x(), 0.0, 1e-9);
+  EXPECT_NEAR(home.z(), 1.075, 1e-9);
+  PlannerNodeTestPeer::setFlightState(*node, "flying");
+  int stamp = 2;
+  PlannerNodeTestPeer::acceptOdometry(*node, odometryAt(0.0, 0.0, 1.075, stamp++));
+  for (double x = 0.5; x <= 4.0 + 1e-9; x += 0.5) {
+    PlannerNodeTestPeer::acceptOdometry(*node, odometryAt(x, 0.0, 1.075, stamp++));
+  }
+  const int far = PlannerNodeTestPeer::globalVertexAt(*node, 4.0, 0.0);
+  ASSERT_GE(far, 0);
+  PlannerNodeTestPeer::markGlobalFrontier(*node, far);
+  PlannerNodeTestPeer::setTour(*node, true, 0.0);
+  PlannerNodeTestPeer::solveTourOnEveryChange(*node);
+  PlannerNodeTestPeer::setFlightReach(*node, 20.0);
+  EXPECT_NE(PlannerNodeTestPeer::refreshTour(*node), mgg::kNoCluster);
+  EXPECT_EQ(PlannerNodeTestPeer::homeLinkStatus(*node), "connected");
+}
+
+TEST_F(PlannerNodeTest, AnAerialHomeCutOffBeforeItsAirWasSeenRelinksForTheReachCap) {
+  // A home linked before its body's air was observed (a pad's take-off
+  // column often is not, drone-r3 M:132 to 467) stays cut off once the
+  // flight's roadmap grows elsewhere: every return is infinite. Return Home
+  // to the same endpoint links it with checked edges once observed; the
+  // reach cap's home does likewise.
+  auto node = droneOverAFloor("drone_home_relink", 1.0, false);
+  // The pad's column is not observed yet: the floor's rays carve the air
+  // over it.
+  PlannerNodeTestPeer::observeFloor(*node, 0.6, 6.0, -1.5, 1.5);
+  PlannerNodeTestPeer::observeFreeBox(*node, {3.3, 0.0, 1.2}, {5.4, 3.0, 1.6});
+  PlannerNodeTestPeer::setFlightState(*node, "landed");
+  PlannerNodeTestPeer::acceptOdometry(*node, odometryAt(0.0, 0.0, 0.075, 1));
+  ASSERT_NEAR(PlannerNodeTestPeer::globalVertexState(*node, 0).z(), 1.075, 1e-9);
+  PlannerNodeTestPeer::setFlightState(*node, "flying");
+  int previous = -1;
+  for (double x = 0.5; x <= 4.0 + 1e-9; x += 0.5) {
+    previous = PlannerNodeTestPeer::addGlobalVertex(
+        *node, 1, x, 0.0, 1.075,
+        previous < 0 ? std::vector<int>{} : std::vector<int>{previous});
+  }
+  PlannerNodeTestPeer::acceptOdometry(*node, odometryAt(3.0, 0.0, 1.075, 2));
+  ASSERT_EQ(PlannerNodeTestPeer::homeEdges(*node), 0);
+  PlannerNodeTestPeer::markGlobalFrontier(*node, previous);
+  PlannerNodeTestPeer::setTour(*node, true, 0.0);
+  PlannerNodeTestPeer::solveTourOnEveryChange(*node);
+  PlannerNodeTestPeer::setFlightReach(*node, 20.0);
+  EXPECT_EQ(PlannerNodeTestPeer::refreshTour(*node), mgg::kNoCluster);
+  EXPECT_EQ(PlannerNodeTestPeer::homeLinkStatus(*node),
+            "unreachable: home body not observed free");
+  EXPECT_EQ(PlannerNodeTestPeer::homeRelinks(*node), 0);
+  PlannerNodeTestPeer::observeFloor(*node, -1.5, 0.6, -1.5, 1.5);
+  PlannerNodeTestPeer::observeFreeBox(*node, {0.0, 0.0, 1.2}, {1.6, 3.0, 1.6});
+  EXPECT_NE(PlannerNodeTestPeer::refreshTour(*node), mgg::kNoCluster);
+  // Relinked, then costed connected under the new revision.
+  EXPECT_EQ(PlannerNodeTestPeer::homeLinkStatus(*node), "connected");
+  EXPECT_EQ(PlannerNodeTestPeer::homeRelinks(*node), 1);
+  EXPECT_GT(PlannerNodeTestPeer::homeEdges(*node), 0);
+  // Occupied evidence in the home body is never linked through.
+  auto walled = droneOverAFloor("drone_home_relink_occupied", 1.0, true);
+  PlannerNodeTestPeer::setFlightState(*walled, "landed");
+  PlannerNodeTestPeer::acceptOdometry(*walled, odometryAt(0.0, 0.0, 0.075, 1));
+  PlannerNodeTestPeer::setFlightState(*walled, "flying");
+  previous = -1;
+  for (double x = 0.5; x <= 4.0 + 1e-9; x += 0.5) {
+    previous = PlannerNodeTestPeer::addGlobalVertex(
+        *walled, 1, x, 0.0, 1.075,
+        previous < 0 ? std::vector<int>{} : std::vector<int>{previous});
+  }
+  PlannerNodeTestPeer::observeOccupied(*walled, {0.0, 0.0, 1.075});
+  PlannerNodeTestPeer::acceptOdometry(*walled, odometryAt(3.0, 0.0, 1.075, 2));
+  PlannerNodeTestPeer::markGlobalFrontier(*walled, previous);
+  PlannerNodeTestPeer::setTour(*walled, true, 0.0);
+  PlannerNodeTestPeer::solveTourOnEveryChange(*walled);
+  PlannerNodeTestPeer::setFlightReach(*walled, 20.0);
+  EXPECT_EQ(PlannerNodeTestPeer::refreshTour(*walled), mgg::kNoCluster);
+  EXPECT_EQ(PlannerNodeTestPeer::homeEdges(*walled), 0);
 }
 
 TEST_F(PlannerNodeTest, ADronesRebuiltHomeIsLiftedAsItsSeedWas) {

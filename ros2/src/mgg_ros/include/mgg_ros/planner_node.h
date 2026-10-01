@@ -32,6 +32,7 @@
 #include <optional>
 #include <set>
 #include <string>
+#include <tuple>
 #include <unordered_map>
 #include <vector>
 
@@ -396,6 +397,12 @@ class PlannerNode : public rclcpp::Node {
   /// terrain once mapped. An aerial anchor waits for flight_state or its
   /// timeout; only "landed" lifts it (home_seeded_landed_).
   void seedGlobalGraph();
+  /// A drone's first flight_state arriving after home was seeded on the
+  /// wait's timeout: "landed" re-roots home aerial_home_height_m over the
+  /// pose, as a timely one would have seeded it, when the drone has not
+  /// moved since (kStandingStartMoveM). Home's old edges are cut; later
+  /// keyframe rebuilds lift their first keyframe (home_seeded_landed_).
+  void rerootHomeOnLateLandedState();
   /// Replaces the global graph with one rebuilt from the robot's keyframe
   /// trajectory (mgg::rebuildRoadmapFromTrajectory), vertex 0 at its home
   /// keyframe, when the trajectory is for the map in service and home has
@@ -563,6 +570,15 @@ class PlannerNode : public rclcpp::Node {
   /// tour's costs: graph revision and peer generation.
   std::vector<double> homeDistances(
       const std::vector<mgg::FrontierCluster>& clusters);
+  /// An aerial robot's home (vertex 0) is the endpoint its return is costed
+  /// to. When the roadmap from `robot_vertex_id` does not reach it, home is
+  /// wired to its reachable neighbours (mgg::expandGraphEdges) once its body
+  /// is observed free, as Return Home links its goal: a home linked before
+  /// its air was seen would otherwise stay cut off, and every cluster fail
+  /// the battery reach cap (drone-r3). At most once per graph, revision, map
+  /// revision and peer generation; records home_link_status_. No-op for
+  /// ground robots.
+  void relinkAerialHome(int robot_vertex_id);
   /// Whether a repositioning to global vertex `vertex_id` still heads for
   /// the tour's target (always, when the tour is off or has no target). A
   /// resumed route skips refreshTour, so the target is checked against the
@@ -910,6 +926,20 @@ class PlannerNode : public rclcpp::Node {
   /// with aerial_home_height_m_ set), so it is that high over the pose. The
   /// keyframe rebuild lifts its first keyframe on this decision alone.
   bool home_seeded_landed_ = false;
+  /// Home was seeded on the flight_state wait's timeout, with no state yet,
+  /// from home_seed_pose_: a late "landed" may still re-root it
+  /// (rerootHomeOnLateLandedState), once.
+  bool home_seeded_on_timeout_ = false;
+  mgg::StateVec home_seed_pose_ = mgg::StateVec::Zero();
+  /// relinkAerialHome's last inputs and outcome, and how often it re-rooted
+  /// or relinked home.
+  std::tuple<const mgg::GraphManager*, std::uint64_t, std::uint64_t,
+             std::uint64_t>
+      home_link_key_{nullptr, 0, 0, 0};
+  std::string home_link_status_ = "unknown";
+  int home_reroots_ = 0;
+  int home_relink_attempts_ = 0;
+  int home_relinks_ = 0;
   /// The last cycle's frontier paths join the global graph before that
   /// graph is rebuilt (rrg.cpp:121 Rrg::reset).
   bool add_frontiers_to_global_graph_ = false;
