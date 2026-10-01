@@ -4,6 +4,7 @@
 #include <gtest/gtest.h>
 
 #include "mgg_core/graph.h"
+#include "mgg_core/planning_cancellation.h"
 
 namespace {
 
@@ -22,6 +23,14 @@ Graph makeTriangle() {
   g.addEdge(1, 2, 1.0);
   g.addEdge(0, 2, 5.0);
   return g;
+}
+
+TEST(Graph, CancellationInterruptsDijkstra) {
+  Graph graph = makeTriangle();
+  ShortestPathsReport report;
+  mgg::PlanningCancellationScope token([] { return true; });
+  EXPECT_THROW(graph.findDijkstraShortestPaths(0, report), mgg::PlanningInterrupted);
+  EXPECT_FALSE(report.status);
 }
 
 TEST(Graph, CountsVerticesAndEdges) {
