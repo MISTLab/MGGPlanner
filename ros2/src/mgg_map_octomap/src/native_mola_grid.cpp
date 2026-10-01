@@ -213,6 +213,105 @@ VoxelStatus NativeMolaGrid::getGroundRayStatus(const Eigen::Vector3d& a,
   return s;
 }
 
+namespace {
+// An OBB translated along a segment, minus a voxel cube, is a zonotope.
+// Its facet normals are the pairwise cross products of its generators:
+// three body axes, three voxel axes and the translation. SAT on these axes
+// is exact for the complete continuous sweep (not sampled poses or AABBs).
+class BoxVoxelSweep {
+ public:
+  BoxVoxelSweep(const Eigen::Matrix3d& rotation, const Eigen::Vector3d& size,
+                const Eigen::Vector3d& delta, double resolution) {
+    std::vector<Eigen::Vector3d> generators;
+    for (int i = 0; i < 3; ++i) {
+      generators.push_back(rotation.col(i) * (size[i] / 2));
+      generators.push_back(Eigen::Vector3d::Unit(i) * (resolution / 2));
+    }
+    generators.push_back(delta / 2);
+    for (std::size_t i = 0; i < generators.size(); ++i) {
+      for (std::size_t j = i + 1; j < generators.size(); ++j) {
+        Eigen::Vector3d axis = generators[i].cross(generators[j]);
+        const double norm = axis.norm();
+        if (norm < 1e-14) continue;
+        axis /= norm;
+        double reach = 0;
+        for (const auto& g : generators) reach += std::abs(axis.dot(g));
+        axes_.push_back({axis, reach});
+      }
+    }
+  }
+  bool meets(const Eigen::Vector3d& offset, bool positive_volume) const {
+    for (const auto& axis : axes_) {
+      const double overlap = axis.second - std::abs(axis.first.dot(offset));
+      if (positive_volume ? overlap <= 1e-9 : overlap < -1e-9) return false;
+    }
+    return true;
+  }
+ private:
+  std::vector<std::pair<Eigen::Vector3d, double>> axes_;
+};
+}  // namespace
+
+bool NativeMolaGrid::aerialRootRecoveryTraversable(
+    const Eigen::Vector3d& start, const Eigen::Vector3d& end,
+    const Eigen::Vector3d& size) const {
+  std::size_t exempted = 0;
+  return aerialRootRecovery(start, end, size, Eigen::Matrix3d::Identity(), exempted);
+}
+
+bool NativeMolaGrid::aerialRootRecovery(
+    const Eigen::Vector3d& start, const Eigen::Vector3d& end,
+    const Eigen::Vector3d& size, const Eigen::Matrix3d& rotation,
+    std::size_t& exempted_cells) const {
+  exempted_cells = 0;
+  if (!start.allFinite() || !end.allFinite() || !size.allFinite() ||
+      (size.array() <= 0).any() || !rotation.allFinite() ||
+      !(rotation.transpose() * rotation).isApprox(Eigen::Matrix3d::Identity(), 1e-9) ||
+      std::abs(rotation.determinant() - 1.0) > 1e-9 ||
+      !std::isfinite(resolution_) || resolution_ <= 0) return false;
+  const Eigen::Vector3d delta = end - start;
+  if (!delta.allFinite() || !std::isfinite(delta.norm()) || delta.norm() < 1e-9)
+    return false;
+  const Eigen::Vector3d aabb = rotation.cwiseAbs() * size;
+  const Eigen::Vector3d lo = start.cwiseMin(end) - aabb / 2;
+  const Eigen::Vector3d hi = start.cwiseMax(end) + aabb / 2;
+  Cell first, last;
+  if (!key(lo - Eigen::Vector3d::Constant(1e-9), first) ||
+      !key(hi + Eigen::Vector3d::Constant(1e-9), last)) return false;
+  // Bound all enumerated cells, including free air, before entering a loop.
+  constexpr long double kMaxRecoveryCells = 65536;
+  const long double work = (static_cast<long double>(last.x) - first.x + 1) *
+                           (static_cast<long double>(last.y) - first.y + 1) *
+                           (static_cast<long double>(last.z) - first.z + 1);
+  if (work <= 0 || work > kMaxRecoveryCells) return false;
+  if (getStrictBoxStatus(end, aabb) != VoxelStatus::kFree) return false;
+  const BoxVoxelSweep root(rotation, size, Eigen::Vector3d::Zero(), resolution_);
+  const BoxVoxelSweep sweep(rotation, size, delta, resolution_);
+  const Eigen::Vector3d midpoint = start + delta / 2;
+  std::size_t exempted = 0;
+  for (auto x = first.x; x <= last.x; ++x)
+    for (auto y = first.y; y <= last.y; ++y)
+      for (auto z = first.z; z <= last.z; ++z) {
+        const Cell cell{x, y, z};
+        const Eigen::Vector3d c = center(cell);
+        if (!sweep.meets(c - midpoint, false)) continue;
+        const auto st = status(cell);
+        if (st == VoxelStatus::kFree) continue;
+        if (st != VoxelStatus::kOccupied || !root.meets(c - start, true))
+          return false;
+        if (++exempted > 16) return false;
+        const Eigen::Vector3d half = Eigen::Vector3d::Constant(resolution_ / 2);
+        const Eigen::Vector3d closest = start.cwiseMax(c - half).cwiseMin(c + half);
+        // Squared distance to a convex voxel is convex along a line. A
+        // positive initial derivative guarantees strictly increasing distance
+        // throughout the segment. Tangential/inward/centre-in-voxel starts fail.
+        if ((start - closest).dot(delta) <= 1e-9) return false;
+      }
+  if (exempted == 0) return false;
+  exempted_cells = exempted;
+  return true;
+}
+
 VoxelStatus NativeMolaGrid::box(const Eigen::Vector3d& c,
                                 const Eigen::Vector3d& s, bool unknown,
                                 bool measured) const {

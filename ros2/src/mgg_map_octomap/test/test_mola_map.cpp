@@ -3156,5 +3156,171 @@ TEST(AerialRootRecovery, ArchivedR6GridsAllowAwayButNotIntoPillar) {
     EXPECT_TRUE(mgg::aerialRootDepartureTraversable(map, start, start + away, size));
     EXPECT_FALSE(mgg::aerialRootDepartureTraversable(map, start, start - away, size));
     EXPECT_EQ(map.getStrictPathStatus(start, start + away, size), VoxelStatus::kOccupied);
+    const auto stats = map.aerialRootRecoveryStats();
+    EXPECT_EQ(stats.uses, 1u);
+    EXPECT_GT(stats.exempted_cells, 0u);
+    EXPECT_LE(stats.exempted_cells, 16u);
+    RecordProperty("r" + std::to_string(revision) + "_exempted_cells", static_cast<int>(stats.exempted_cells));
+
+    mgg::RobotParams robot;
+    robot.type = mgg::RobotType::kAerialRobot;
+    robot.size = size;
+    robot.center_offset.setZero();
+    mgg::PlanningParams planning;
+    planning.edge_length_min = 0.05;
+    planning.edge_length_max = 2.0;
+    planning.edge_overshoot = 0;
+    planning.nearest_range = 2.0;
+    planning.nearest_range_min = 0.05;
+    planning.nearest_range_max = 2.0;
+    planning.nearest_range_z = 1.0;
+    mgg::ExpandContext ctx;
+    ctx.map = &map;
+    ctx.robot = &robot;
+    ctx.planning = &planning;
+    ctx.robot_box_size = size;
+    ctx.root_footprint_exempt = true;
+    const mgg::StateVec root_state(start.x(),start.y(),start.z(),0);
+    const mgg::StateVec target_state(start.x()+away.x(),start.y()+away.y(),start.z()+away.z(),0);
+    for (bool physical_root : {false, true}) {
+      mgg::GraphManager graph;
+      graph.addVertex(new mgg::Vertex(0, root_state));
+      ctx.root_is_robot = physical_root;
+      mgg::Vertex target(1, target_state);
+      mgg::ExpandGraphReport report;
+      mgg::expandGraph(graph, target, report, ctx);
+      EXPECT_EQ(report.num_vertices_added, physical_root ? 1 : 0);
+    }
+    // RETURN_HOME's root link is query-local, never an ordinary roadmap edge.
+    mgg::GraphManager home_graph;
+    home_graph.addVertex(new mgg::Vertex(0, target_state));
+    ctx.root_is_robot = false;
+    const auto link = mgg::linkDeparture(home_graph, root_state, ctx, 2.0);
+    EXPECT_NE(link.vertex, nullptr);
+    EXPECT_TRUE(link.query_local);
+    EXPECT_EQ(home_graph.getNumVertices(), 1);
+    EXPECT_EQ(home_graph.getNumEdges(), 0);
   }
+}
+
+TEST(AerialRootRecovery, StrictSafetyBoundsAndDynamicMargins) {
+  // A finite post lets toward/along endpoints be free: rejection must come
+  // from the sweep, not merely from the ordinary endpoint test.
+  for (int mode = 0; mode < 8; ++mode) {
+    SCOPED_TRACE(mode);
+    Publication publication;
+    std::vector<Voxel> occupied{{2,0,5}}, free;
+    if (mode == 2) occupied.push_back({-2,0,5});  // new swept obstacle
+    if (mode == 4) occupied.push_back({-5,0,5});  // occupied endpoint
+    for (int x = -10; x <= 10; ++x)
+      for (int y = -5; y <= 5; ++y)
+        for (int z = 0; z <= 10; ++z) {
+          if (mode == 1 && x == -2 && y == 0 && z == 5) continue;
+          if (mode == 3 && x == 0 && y == 0 && z == 5) continue; // unknown root
+          free.push_back({x,y,z});
+        }
+    MolaMap map(config(publication));
+    map.requestSnapshot(publication.publish(0, occupied, free));
+    ASSERT_TRUE(waitFor([&] { return map.getStatus(); }));
+    const Eigen::Vector3d start(0.15,0.1,1.1), size(0.55,0.55,0.3);
+    const Eigen::Vector3d away = start - Eigen::Vector3d(1,0,0);
+    if (mode == 5) map.setTransientDiscs({{-0.4,0.1}}, 0.1, 60);
+    if (mode == 6) map.setNoGoDiscs({{-0.4,0.1}}, 0.1);
+    if (mode == 7) map.setNoGoCentreLineDiscs({{-0.4,0.1}}, {0.1});
+    EXPECT_EQ(mgg::aerialRootDepartureTraversable(map, start, away, size), mode == 0);
+    ASSERT_EQ(map.getStrictBoxStatus(start + Eigen::Vector3d(0,0.8,0), size), VoxelStatus::kFree);
+    EXPECT_FALSE(mgg::aerialRootDepartureTraversable(map, start, start + Eigen::Vector3d(0,0.8,0), size));
+    ASSERT_EQ(map.getStrictBoxStatus(start + Eigen::Vector3d(1,0,0), size), VoxelStatus::kFree);
+    EXPECT_FALSE(mgg::aerialRootDepartureTraversable(map, start, start + Eigen::Vector3d(1,0,0), size));
+    EXPECT_FALSE(mgg::aerialRootDepartureTraversable(map, start, start, size));
+    // A short partial departure may not end still overlapping the root post.
+    EXPECT_FALSE(mgg::aerialRootDepartureTraversable(map, start, start - Eigen::Vector3d(0.01,0,0), size));
+    const auto stats = map.aerialRootRecoveryStats();
+    EXPECT_EQ(stats.uses, mode == 0 ? 1u : 0u);
+    if (mode == 0) {
+      EXPECT_EQ(stats.exempted_cells, 1u);
+      EXPECT_TRUE(stats.direction.isApprox(Eigen::Vector3d(-1,0,0)));
+    }
+  }
+}
+
+TEST(AerialRootRecovery, SixteenCellLimitAndInvalidQueriesFailClosed) {
+  using Cell = mgg::NativeMolaGrid::Cell;
+  const Eigen::Vector3d start(0.15,0.4,1.2), size(0.55,0.7,0.7);
+  const Eigen::Vector3d end = start - Eigen::Vector3d(1,0,0);
+  for (int count : {16, 17}) {
+    std::vector<Cell> occupied, free;
+    for (int y = 0; y < 4; ++y)
+      for (int z = 4; z < 8; ++z) occupied.push_back({2,y,z});
+    if (count == 17) occupied.push_back({2,4,5});
+    for (int x = -10; x < 10; ++x)
+      for (int y = -5; y < 10; ++y)
+        for (int z = 0; z < 12; ++z) free.push_back({x,y,z});
+    mgg::NativeMolaGrid map(0.2, occupied, free, {});
+    const Eigen::Vector3d body = count == 16 ? size : Eigen::Vector3d(0.55,0.9,0.7);
+    std::size_t exempted = 99;
+    EXPECT_EQ(map.aerialRootRecovery(start, end, body, Eigen::Matrix3d::Identity(), exempted), count == 16);
+    EXPECT_EQ(exempted, count == 16 ? 16u : 0u);
+    EXPECT_FALSE(map.aerialRootRecovery(start, end, body, 2 * Eigen::Matrix3d::Identity(), exempted));
+    EXPECT_FALSE(map.aerialRootRecovery(start, end, -body, Eigen::Matrix3d::Identity(), exempted));
+    EXPECT_FALSE(map.aerialRootRecovery(start, end, Eigen::Vector3d::Constant(1e9), Eigen::Matrix3d::Identity(), exempted));
+    EXPECT_FALSE(map.aerialRootRecovery(start, Eigen::Vector3d(NAN,0,0), body, Eigen::Matrix3d::Identity(), exempted));
+  }
+}
+
+TEST(AerialRootRecovery, GroundCallSitesNeverUseAerialFallback) {
+  class CountingMap : public MolaMap {
+   public:
+    using MolaMap::MolaMap;
+    mutable int attempts = 0;
+    bool aerialRootRecoveryTraversable(const Eigen::Vector3d& a,
+        const Eigen::Vector3d& b, const Eigen::Vector3d& size) const override {
+      ++attempts;
+      return MolaMap::aerialRootRecoveryTraversable(a, b, size);
+    }
+  };
+  Publication publication;
+  std::vector<Voxel> occupied, free;
+  for (int x = -10; x <= 10; ++x)
+    for (int y = -5; y <= 5; ++y)
+      for (int z = 0; z <= 8; ++z)
+        (z == 0 || x == 2 ? occupied : free).push_back({x,y,z});
+  CountingMap map(config(publication));
+  map.requestSnapshot(publication.publish(0, occupied, free));
+  ASSERT_TRUE(waitFor([&] { return map.getStatus(); }));
+  mgg::RobotParams robot;
+  robot.type = mgg::RobotType::kGroundRobot;
+  robot.size = {0.55,0.55,0.3};
+  robot.center_offset.setZero();
+  mgg::PlanningParams planning;
+  planning.max_ground_height = 0.4;
+  planning.path_interpolation_distance = 0.1;
+  planning.edge_length_min = 0.05;
+  planning.edge_length_max = 2.0;
+  planning.edge_overshoot = 0;
+  planning.nearest_range = 2.0;
+  planning.nearest_range_min = 0.05;
+  planning.nearest_range_max = 2.0;
+  planning.nearest_range_z = 1.0;
+  mgg::GroundProjection ground(map, planning, true);
+  const mgg::StateVec start(0.15,0.1,0.5,M_PI), end(-0.85,0.1,0.5,M_PI);
+  mgg::Departure departure;
+  mgg::findDeparture(map, ground, robot, planning, start, departure);
+  mgg::ExpandContext ctx;
+  ctx.map = &map;
+  ctx.robot = &robot;
+  ctx.planning = &planning;
+  ctx.ground = &ground;
+  ctx.robot_box_size = robot.size;
+  ctx.root_is_robot = ctx.root_footprint_exempt = true;
+  mgg::GraphManager graph;
+  graph.addVertex(new mgg::Vertex(0, start));
+  mgg::Vertex target(1, end);
+  mgg::ExpandGraphReport report;
+  mgg::expandGraph(graph, target, report, ctx);
+  mgg::GraphManager home_graph;
+  home_graph.addVertex(new mgg::Vertex(0, end));
+  mgg::linkDeparture(home_graph, start, ctx, 2.0);
+  EXPECT_EQ(map.attempts, 0);
+  EXPECT_EQ(map.aerialRootRecoveryStats().uses, 0u);
 }

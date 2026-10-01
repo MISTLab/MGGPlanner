@@ -55,6 +55,17 @@ class NativeMolaGrid final : public MapInterface {
   VoxelStatus getStrictPathStatus(const Eigen::Vector3d&,
                                   const Eigen::Vector3d&,
                                   const Eigen::Vector3d&) const override;
+  bool aerialRootRecoveryTraversable(const Eigen::Vector3d&,
+                                      const Eigen::Vector3d&,
+                                      const Eigen::Vector3d&) const override;
+  /// Exact translated OBB/voxel sweep in native coordinates. `rotation` maps
+  /// the navigation planning-box axes into this grid, including pitch/roll.
+  /// At most 16 positively intersecting root occupied cells may be left.
+  bool aerialRootRecovery(const Eigen::Vector3d& start,
+                          const Eigen::Vector3d& end,
+                          const Eigen::Vector3d& size,
+                          const Eigen::Matrix3d& rotation,
+                          std::size_t& exempted_cells) const;
   void getScanStatus(const Eigen::Vector3d&,
                      const std::vector<Eigen::Vector3d>&, GainCounts&,
                      std::vector<std::pair<Eigen::Vector3d, VoxelStatus>>&,

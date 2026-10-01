@@ -47,6 +47,22 @@ wired to its reachable neighbours with the ordinary strict roadmap edge check
 (`expandGraphEdges`), at most once per graph, revision, map revision and peer
 generation. Occupied or unknown home bodies are never linked.
 
+## Occupied-root departure
+
+Only an aerial physical-root/departure query may recover from occupied root
+volume on the native MOLA grid. Ordinary edges and ground checks are unchanged.
+The fallback uses the navigation planning box transformed as an OBB (full SE(3),
+not its enlarged component AABB), and an exact continuous translated-OBB/voxel
+SAT sweep. Up to 16 occupied voxels with positive-volume root OBB intersection
+may be left; for every such voxel the initial derivative of squared
+centre-to-voxel distance must be positive. Convexity makes distance strictly
+increasing for the whole straight departure. Tangential/inward motion and a
+centre inside an occupied voxel fail closed. No other occupied or unknown
+swept voxel is allowed, including unknown root air on this recovery branch.
+The endpoint must pass the unchanged strict enclosing-AABB clearance and all
+dynamic sweep/endpoint checks remain in force. Work is capped at 65,536 cells;
+unsupported backends reject recovery. No map cells are cleared.
+
 ## Observability
 
 After an aerial plan request, at most every 10 s, MGG logs one line
@@ -63,6 +79,10 @@ refused). Counts are per evaluation, not per unique target. Reach-cap
 refusals of own clusters log `out X m + back Y m > reach Z m` (or no way back
 with home's status). The plan summary splits peer-blocked roadmap edges into
 aerial cylinders and legacy discs, and a lifted tour target says so.
+`root_recovery` reports cumulative successful fallback query `uses`,
+`last_exempted_cells`, and the last admitted unit `last_direction` in navigation
+coordinates. It is included in the same throttled log. Revalidation/search
+queries count separately; this is not an executed-flight counter.
 
 ## Scouting exclusions input
 

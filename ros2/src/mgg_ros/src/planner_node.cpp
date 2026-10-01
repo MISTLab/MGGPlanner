@@ -1772,6 +1772,14 @@ std::string PlannerNode::aerialStatusJson() const {
     legacy_discs = mola_map_->activeTransientDiscs().centres.size();
   }
   std::string j = "{\"robot_id\":" + std::to_string(planning_params_.robot_id);
+  const auto recovery = mola_map_ != nullptr
+      ? mola_map_->aerialRootRecoveryStats()
+      : mgg::MolaMap::AerialRootRecoveryStats{};
+  j += ",\"root_recovery\":{\"uses\":" + std::to_string(recovery.uses) +
+       ",\"last_exempted_cells\":" + std::to_string(recovery.exempted_cells) +
+       ",\"last_direction\":[" + jsonNumber(recovery.direction.x()) + "," +
+       jsonNumber(recovery.direction.y()) + "," +
+       jsonNumber(recovery.direction.z()) + "]}";
   j += ",\"home\":{\"status\":" + jsonString(home_link_status_) +
        ",\"x\":" + jsonNumber(home ? home->state.x() : NAN) +
        ",\"y\":" + jsonNumber(home ? home->state.y() : NAN) +

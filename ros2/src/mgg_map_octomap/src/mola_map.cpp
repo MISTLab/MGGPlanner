@@ -1359,6 +1359,32 @@ VoxelStatus MolaMap::getOccupiedOnlyPathStatus(
       enclosingSize(transform.linear(), box_size));
 }
 
+MolaMap::AerialRootRecoveryStats MolaMap::aerialRootRecoveryStats() const {
+  std::lock_guard<std::mutex> lock(aerial_recovery_mutex_);
+  return {aerial_recovery_uses_, aerial_recovery_cells_, aerial_recovery_direction_};
+}
+
+bool MolaMap::aerialRootRecoveryTraversable(
+    const Eigen::Vector3d& start, const Eigen::Vector3d& end,
+    const Eigen::Vector3d& size) const {
+  const auto snapshot = current();
+  if (snapshot == nullptr || !start.allFinite() || !end.allFinite() ||
+      !size.allFinite() || (size.array() <= 0).any()) return false;
+  // No change to peer/no-go departure or endpoint margins.
+  if (discsBlockSweep(start, end, 0.5 * std::max(size.x(), size.y())) ||
+      discsBlockBox(end, size)) return false;
+  const auto& transform = snapshot->request.component_from_navigation;
+  std::size_t exempted = 0;
+  if (!snapshot->map->aerialRootRecovery(transform * start, transform * end,
+                                        size, transform.linear(), exempted))
+    return false;
+  std::lock_guard<std::mutex> lock(aerial_recovery_mutex_);
+  ++aerial_recovery_uses_;
+  aerial_recovery_cells_ = exempted;
+  aerial_recovery_direction_ = (end - start).normalized();
+  return true;
+}
+
 VoxelStatus MolaMap::getOccupiedOnlyCylinderPathStatus(
     const Eigen::Vector3d& start, const Eigen::Vector3d& end,
     const double radius, const double height) const {

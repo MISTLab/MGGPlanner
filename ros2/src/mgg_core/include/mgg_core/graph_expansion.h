@@ -75,8 +75,8 @@ struct ExpandContext {
   bool preserve_hanging_root_start_height = false;
   /// Edges out of vertex zero (the robot) are swept from the edge of the
   /// robot's own footprint: where the robot stands is not an obstacle to it.
-  /// Aerial departures instead allow unknown only inside the physical root's
-  /// body AABB, never occupied cells; root_is_robot must also be true.
+  /// Aerial departures allow root-only unknown volume, or backend-qualified
+  /// outward recovery from occupied root cells; root_is_robot must be true.
   bool root_footprint_exempt = false;
   /// Vertex zero is the robot, where it stands: an edge out of it is only
   /// ever driven outwards, so the ground ahead is checked one way only

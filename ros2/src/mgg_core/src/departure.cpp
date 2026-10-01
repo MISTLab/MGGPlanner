@@ -152,8 +152,10 @@ bool aerialRootDepartureTraversable(const MapInterface& map,
                                      const Eigen::Vector3d& start,
                                      const Eigen::Vector3d& end,
                                      const Eigen::Vector3d& size) {
-  if (map.getOccupiedOnlyPathStatus(start, end, size) !=
-      VoxelStatus::kFree) return false;
+  const auto occupied = map.getOccupiedOnlyPathStatus(start, end, size);
+  if (occupied == VoxelStatus::kOccupied)
+    return map.aerialRootRecoveryTraversable(start, end, size);
+  if (occupied != VoxelStatus::kFree) return false;
   const double resolution = map.getResolution();
   const double steps_d = std::ceil((end - start).norm() / resolution);
   constexpr int kMaxRootSweepIntervals = 4096;

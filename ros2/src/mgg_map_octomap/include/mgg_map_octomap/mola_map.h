@@ -87,6 +87,10 @@ struct MolaSnapshotRequest {
 class MolaMap : public MapInterface {
  private:
   struct Snapshot;
+  mutable std::mutex aerial_recovery_mutex_;
+  mutable std::uint64_t aerial_recovery_uses_ = 0;
+  mutable std::size_t aerial_recovery_cells_ = 0;
+  mutable Eigen::Vector3d aerial_recovery_direction_ = Eigen::Vector3d::Zero();
 
  public:
   /// Keeps one exact immutable snapshot for a bounded group of MapInterface
@@ -144,6 +148,18 @@ class MolaMap : public MapInterface {
   /// Number of heartbeats confirmed against the active snapshot's product
   /// files by stat alone, without a load.
   std::uint64_t statRevalidationCount() const;
+
+  struct AerialRootRecoveryStats {
+    std::uint64_t uses = 0;
+    std::size_t exempted_cells = 0;
+    Eigen::Vector3d direction = Eigen::Vector3d::Zero();
+  };
+  /// Successful fallback query count and latest accepted direction in nav.
+  /// Counts admission queries, not executed motions (a route may be rechecked).
+  AerialRootRecoveryStats aerialRootRecoveryStats() const;
+  bool aerialRootRecoveryTraversable(const Eigen::Vector3d&,
+                                      const Eigen::Vector3d&,
+                                      const Eigen::Vector3d&) const override;
 
   double getResolution() const override;
   bool getCircleIntersectingXYCellCenters(

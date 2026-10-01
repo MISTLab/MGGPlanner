@@ -284,6 +284,17 @@ class MapInterface {
     return VoxelStatus::kFree;
   }
 
+  /// Root-only aerial recovery from measured occupancy. Unsupported backends
+  /// fail closed. Implementations must bound occupied cells to positive-volume
+  /// intersection with the oriented root body, require strictly outward travel
+  /// from each, reject every other occupied/unknown swept cell, and retain the
+  /// ordinary strict endpoint and dynamic checks. Never use for ordinary edges.
+  virtual bool aerialRootRecoveryTraversable(
+      const Eigen::Vector3d&, const Eigen::Vector3d&,
+      const Eigen::Vector3d&) const {
+    return false;
+  }
+
   /// Occupancy of a vertical circular body swept between two centres.
   /// Unknown air is admissible, while invalid/unbounded queries and any known
   /// occupied voxel reject. Backends may override this to enumerate their
