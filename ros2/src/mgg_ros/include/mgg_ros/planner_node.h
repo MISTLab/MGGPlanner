@@ -118,6 +118,8 @@ class PlannerNode : public rclcpp::Node {
  private:
   void loadParameters();
   void applyLatestOdometry();
+  void publishPlanningStatus();
+  void setAcquiringObservations(bool acquiring);
   void onOdometry(nav_msgs::msg::Odometry::ConstSharedPtr msg);
   void onPointCloud(sensor_msgs::msg::PointCloud2::ConstSharedPtr msg);
   void onMappingSnapshot(mgg_msgs::msg::MappingSnapshot::ConstSharedPtr msg);
@@ -766,7 +768,12 @@ class PlannerNode : public rclcpp::Node {
   std::mutex cancellation_mutex_;
   std::atomic<std::uint64_t> request_generation_{0};
   std::atomic<std::uint64_t> cancellations_{0};
+  std::atomic<bool> acquiring_observations_{true};
+  std::atomic<std::int64_t> bootstrap_started_ns_{0};
+  rclcpp::Publisher<std_msgs::msg::String>::SharedPtr planning_status_pub_;
+  rclcpp::TimerBase::SharedPtr planning_status_timer_;
   nav_msgs::msg::Odometry::ConstSharedPtr latest_odometry_;
+  nav_msgs::msg::Odometry::ConstSharedPtr applied_odometry_;
   std::chrono::steady_clock::time_point latest_odometry_received_;
   mgg_msgs::msg::MappingSnapshot::ConstSharedPtr latest_snapshot_;
   std::atomic<std::uint64_t> heartbeats_received_{0};
@@ -1274,6 +1281,7 @@ class PlannerNode : public rclcpp::Node {
   /// concurrently under a MultiThreadedExecutor. See the note in main().
   rclcpp::CallbackGroup::SharedPtr callback_group_;
   rclcpp::CallbackGroup::SharedPtr input_callback_group_;
+  rclcpp::CallbackGroup::SharedPtr snapshot_callback_group_;
   rclcpp::TimerBase::SharedPtr input_timer_;
   /// no_go_zones alone: its messages replace one another, so they are
   /// handled one at a time.

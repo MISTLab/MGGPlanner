@@ -1043,6 +1043,11 @@ std::shared_ptr<const MolaMap::Snapshot> MolaMap::current() const {
         return nullptr;
       std::atomic_store(&active_, std::shared_ptr<const Snapshot>());
       active_generation_.fetch_add(1, std::memory_order_release);
+      ++expiry_count_;
+      {
+        std::lock_guard<std::mutex> error_lock(error_mutex_);
+        last_error_ = "snapshot authority heartbeat TTL expired";
+      }
       return nullptr;
     }
   }
@@ -1138,6 +1143,19 @@ VoxelStatus MolaMap::getRayStatus(const Eigen::Vector3d& view_point,
   return status;
 }
 
+void MolaMap::setFootprintGroundSupport(const Eigen::Vector3d& floor_center,
+                                        const Eigen::Vector2d& size,
+                                        double yaw) {
+  const auto active = activeRequest();
+  std::shared_ptr<const FootprintGroundSupport> support;
+  if (active && floor_center.allFinite() && size.allFinite() &&
+      (size.array() > 0).all() && std::isfinite(yaw)) {
+    support = std::make_shared<FootprintGroundSupport>(
+        FootprintGroundSupport{*active, floor_center, size, yaw});
+  }
+  std::atomic_store(&footprint_ground_, std::move(support));
+}
+
 VoxelStatus MolaMap::getGroundRayStatus(
     const Eigen::Vector3d& view_point,
     const Eigen::Vector3d& voxel_to_test,
@@ -1160,6 +1178,23 @@ VoxelStatus MolaMap::getGroundRayStatus(
       component_start, component_target, stop_at_unknown_voxel,
       component_end);
   end_voxel = transform.inverse() * component_end;
+  const auto support = std::atomic_load(&footprint_ground_);
+  // Only a downward vertical probe through the footprint. An actual return
+  // always wins, including an obstacle above the inferred floor.
+  if (status != VoxelStatus::kOccupied && support &&
+      compatible(support->authority, snapshot->request) &&
+      (view_point.head<2>() - voxel_to_test.head<2>()).norm() < 1e-9 &&
+      view_point.z() >= support->center.z() &&
+      voxel_to_test.z() <= support->center.z()) {
+    const Eigen::Vector2d offset = view_point.head<2>() - support->center.head<2>();
+    const double c = std::cos(support->yaw), sn = std::sin(support->yaw);
+    const Eigen::Vector2d local(c * offset.x() + sn * offset.y(),
+                                -sn * offset.x() + c * offset.y());
+    if ((local.cwiseAbs().array() <= support->size.array() / 2.0).all()) {
+      end_voxel = Eigen::Vector3d(view_point.x(), view_point.y(), support->center.z());
+      return VoxelStatus::kOccupied;
+    }
+  }
   return status;
 }
 

@@ -1559,6 +1559,40 @@ TEST(MolaMap, EachNewGridInstalledIsReportedOnce) {
   EXPECT_EQ(installs[1].source_stamp_ns, second.source_stamp_ns);
 }
 
+TEST(MolaMap, ChangedEpochRevokesAuthorityDuringReadLease) {
+  Publication publication;
+  MolaMap provider(config(publication));
+  auto request = publication.publish(0, {{5, 0, 0}}, freeBlock());
+  provider.requestSnapshot(request);
+  ASSERT_TRUE(waitFor([&] { return provider.getStatus(); }));
+  auto lease = provider.acquireReadLease();
+  ++request.epoch;
+  std::atomic<bool> returned{false};
+  std::thread heartbeat([&] { provider.requestSnapshot(request); returned = true; });
+  const auto end = std::chrono::steady_clock::now() + std::chrono::milliseconds(200);
+  while (!returned && std::chrono::steady_clock::now() < end)
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  EXPECT_TRUE(returned);
+  EXPECT_FALSE(provider.authorityValid());
+  lease.allowPublication();
+  heartbeat.join();
+}
+
+TEST(MolaMap, FootprintSupportDoesNotInventAdjacentGroundOrFreeSpace) {
+  Publication publication;
+  MolaMap provider(config(publication));
+  const auto request = publication.publish(0, {}, {});
+  provider.requestSnapshot(request);
+  ASSERT_TRUE(waitFor([&] { return provider.getStatus(); }));
+  provider.setFootprintGroundSupport({0, 0, -0.6}, {1.0, 0.5}, 0.0);
+  Eigen::Vector3d hit;
+  EXPECT_EQ(provider.getGroundRayStatus({0, 0, 0}, {0, 0, -1}, false, hit), VoxelStatus::kOccupied);
+  EXPECT_DOUBLE_EQ(hit.z(), -0.6);
+  EXPECT_NE(provider.getGroundRayStatus({0.6, 0, 0}, {0.6, 0, -1}, false, hit), VoxelStatus::kOccupied);
+  EXPECT_EQ(provider.getVoxelStatus({0, 0, -0.6}), VoxelStatus::kUnknown);
+  EXPECT_EQ(provider.getBoxStatus({0, 0, 0}, {0.5, 0.5, 0.5}, true), VoxelStatus::kUnknown);
+}
+
 TEST(MolaMap, HeartbeatsRefreshWhilePublicationLeaseIsHeld) {
   Publication publication;
   auto cfg = config(publication);

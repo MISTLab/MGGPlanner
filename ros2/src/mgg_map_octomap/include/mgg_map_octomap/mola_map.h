@@ -145,6 +145,11 @@ class MolaMap : public MapInterface {
   std::uint64_t activeGeneration() const;
   /// Authority validity, unlike getStatus(), is never prolonged by a pin.
   bool authorityValid() const;
+  std::uint64_t expiryCount() const { return expiry_count_.load(); }
+  /// Ground evidence only at the physical, oriented footprint. Does not
+  /// certify free body volume, neighbouring ground, or overwrite a return.
+  void setFootprintGroundSupport(const Eigen::Vector3d& floor_center,
+                                 const Eigen::Vector2d& size, double yaw);
   std::optional<MolaSnapshotRequest> activeRequest() const;
   /// Number of successor loads that ended in a coherence race after the load
   /// budget while a compatible predecessor stayed in service.
@@ -357,10 +362,18 @@ class MolaMap : public MapInterface {
   bool discsBlockSweep(const Eigen::Vector3d& start, const Eigen::Vector3d& end,
                        double half_width) const;
   mutable std::mutex error_mutex_;
-  std::string last_error_;
+  mutable std::string last_error_;
   mutable std::recursive_mutex publication_mutex_;
   mutable std::shared_ptr<const Snapshot> active_;
   mutable std::atomic<std::uint64_t> active_generation_{0};
+  mutable std::atomic<std::uint64_t> expiry_count_{0};
+  struct FootprintGroundSupport {
+    MolaSnapshotRequest authority;
+    Eigen::Vector3d center;
+    Eigen::Vector2d size;
+    double yaw;
+  };
+  std::shared_ptr<const FootprintGroundSupport> footprint_ground_;
   std::atomic<std::uint64_t> retained_predecessor_count_{0};
   std::atomic<std::uint64_t> stat_revalidation_count_{0};
   static thread_local std::vector<ThreadPin> thread_pins_;

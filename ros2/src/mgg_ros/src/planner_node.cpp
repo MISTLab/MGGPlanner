@@ -342,6 +342,11 @@ PlannerNode::PlannerNode(const rclcpp::NodeOptions& options)
       create_callback_group(rclcpp::CallbackGroupType::Reentrant);
   rclcpp::SubscriptionOptions input_opts;
   input_opts.callback_group = input_callback_group_;
+  planning_status_pub_ = create_publisher<std_msgs::msg::String>(
+      "planning_status", rclcpp::QoS(1).transient_local());
+  setAcquiringObservations(true);
+  planning_status_timer_ = create_wall_timer(std::chrono::milliseconds(250),
+      [this]() { publishPlanningStatus(); }, input_callback_group_);
   input_timer_ = create_wall_timer(std::chrono::milliseconds(20), [this]() {
     std::unique_lock<std::recursive_mutex> lock(planner_mutex_, std::try_to_lock);
     if (lock.owns_lock()) applyLatestOdometry();
@@ -365,12 +370,15 @@ PlannerNode::PlannerNode(const rclcpp::NodeOptions& options)
         sub_opts);
   }
   if (mola_map_ != nullptr) {
+    snapshot_callback_group_ = create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
+    rclcpp::SubscriptionOptions snapshot_opts;
+    snapshot_opts.callback_group = snapshot_callback_group_;
     mapping_snapshot_sub_ = create_subscription<mgg_msgs::msg::MappingSnapshot>(
         "mapping_snapshot", rclcpp::QoS(1).transient_local(),
         [this](mgg_msgs::msg::MappingSnapshot::ConstSharedPtr m) {
           onMappingSnapshot(m);
         },
-        input_opts);
+        snapshot_opts);
   }
 
   neighbour_sub_ = create_subscription<mgg_msgs::msg::Graph>(
@@ -2007,6 +2015,32 @@ mgg::MolaMap::ReadLease PlannerNode::mapReadLease() const {
                               : mgg::MolaMap::ReadLease{};
 }
 
+void PlannerNode::setAcquiringObservations(bool acquiring) {
+  const bool was = acquiring_observations_.exchange(acquiring);
+  if (acquiring && (!was || bootstrap_started_ns_.load() == 0)) {
+    bootstrap_started_ns_ = std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+  }
+}
+
+void PlannerNode::publishPlanningStatus() {
+  const auto stamp = std::chrono::duration_cast<std::chrono::nanoseconds>(
+      std::chrono::steady_clock::now().time_since_epoch()).count();
+  std_msgs::msg::String status;
+  const bool acquiring = acquiring_observations_.load();
+  status.data = "{\"bootstrap_state\":" +
+      jsonString(acquiring ? "acquiring observations" : "ready") +
+      ",\"bootstrap_age_s\":" + jsonNumber(acquiring ?
+          (stamp - bootstrap_started_ns_.load()) * 1e-9 : 0.0) +
+      ",\"heartbeats_received\":" + std::to_string(heartbeats_received_.load()) +
+      ",\"heartbeats_validated\":" + std::to_string(mola_map_ ? mola_map_->statRevalidationCount() : 0) +
+      ",\"map_expiries\":" + std::to_string(mola_map_ ? mola_map_->expiryCount() : 0) +
+      ",\"map_error\":" + jsonString(mola_map_ ? mola_map_->lastError() : "") +
+      ",\"odometry_ingest_lag_s\":" + jsonNumber(odometry_ingest_lag_s_.load()) +
+      ",\"cancellations\":" + std::to_string(cancellations_.load()) + "}";
+  planning_status_pub_->publish(status);
+}
+
 void PlannerNode::refreshMapRevision() {
   if (mola_map_ == nullptr) return;
   {
@@ -2030,6 +2064,11 @@ void PlannerNode::refreshMapRevision() {
     t.rotation.x = q.x(); t.rotation.y = q.y();
     t.rotation.z = q.z(); t.rotation.w = q.w();
     have_mapping_snapshot_ = true;
+  }
+  if (have_odometry_ && robot_params_.type == mgg::RobotType::kGroundRobot) {
+    Eigen::Vector3d floor = current_state_.head<3>();
+    floor.z() -= robot_params_.size.z() / 2.0;
+    mola_map_->setFootprintGroundSupport(floor, robot_params_.size.head<2>(), current_state_[3]);
   }
   const std::uint64_t generation = mola_map_->activeGeneration();
   if (generation == observed_map_generation_) return;
@@ -2233,9 +2272,9 @@ void PlannerNode::applyLatestOdometry() {
     msg = latest_odometry_;
     received = latest_odometry_received_;
   }
-  if (!msg) return;
+  if (!msg || msg == applied_odometry_) return;
+  applied_odometry_ = msg;
   const auto stamp_ns = rclcpp::Time(msg->header.stamp).nanoseconds();
-  if (have_odometry_ && stamp_ns <= last_odometry_stamp_ns_) return;
   const mgg::StateVec state = fromPoseMsg(msg->pose.pose);
   last_odometry_stamp_ns_ = stamp_ns;
   current_state_ = state;
@@ -5217,7 +5256,8 @@ void PlannerNode::onPlanRequestImpl(
     response->status = kStatusNotReady;
     RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 5000,
                          "plan request refused: %s",
-                         have_odometry_ ? "no map" : "no odometry");
+                         have_odometry_ ? "acquiring observations" : "no odometry");
+    setAcquiringObservations(true);
     return;
   }
   // The planner's state is its last odometry message; a plan from where the
@@ -5552,9 +5592,17 @@ void PlannerNode::onPlanRequestImpl(
   refreshNoGoZones();
   recordSentPath();
   enforceSafeCompletion(complete);
+  if (mola_map_ && best_path_.empty() && local_graph_->getNumVertices() <= 1) {
+    setAcquiringObservations(true);
+    complete = false;
+    summary += "; acquiring observations";
+  } else if (!best_path_.empty()) {
+    setAcquiringObservations(false);
+  }
   response->status = !best_path_.empty()
                          ? mgg_msgs::srv::PlannerSrv::Response::FORWARD
                      : complete ? kStatusComplete
+                     : mola_map_ && acquiring_observations_.load() ? kStatusNotReady
                                 : kStatusNoPath;
   for (const mgg::StateVec& s : best_path_) {
     response->path.push_back(toPoseMsg(s));
@@ -6398,7 +6446,8 @@ void PlannerNode::onObjectiveRequestImpl(
   }
   if (!have_odometry_ || !map_->getStatus()) {
     response->status = Service::Response::BLOCKED;
-    response->reason = have_odometry_ ? "map unavailable" : "no odometry";
+    response->reason = have_odometry_ ? "acquiring observations" : "no odometry";
+    setAcquiringObservations(true);
     return;
   }
   if (secondsSince(last_odometry_received_) > odometry_stale_s_) {

@@ -6,6 +6,7 @@
 #include <gtest/gtest.h>
 
 #include <algorithm>
+#include <atomic>
 #include <array>
 #include <chrono>
 #include <cmath>
@@ -62,6 +63,21 @@ class PublicationProbeMap : public mgg::MolaMap {
     publication_blocked =
         writer.wait_for(std::chrono::milliseconds(50)) == std::future_status::timeout;
     mgg::MolaMap::getScanStatusIterative(pos, endpoints, gain, log, sensor);
+  }
+};
+
+// Each lattice cell costs 25 ms: 200 cells represent a five-second request.
+class SlowPlanningMap : public mgg::OctomapMap {
+ public:
+  mutable std::atomic<bool> entered{false};
+  std::atomic<bool> slow{false};
+  mgg::VoxelStatus getBoxStatus(const Eigen::Vector3d& c,
+                               const Eigen::Vector3d& size, bool unknown) const override {
+    if (slow) {
+      entered = true;
+      std::this_thread::sleep_for(std::chrono::milliseconds(25));
+    }
+    return mgg::OctomapMap::getBoxStatus(c, size, unknown);
   }
 };
 
@@ -295,6 +311,24 @@ class MolaFloorProduct {
 
 class PlannerNodeTestPeer {
  public:
+  static void cancel(PlannerNode& node) { node.cancelPlanning(); }
+  static bool acquiring(PlannerNode& node) { return node.acquiring_observations_.load(); }
+  static double latestX(PlannerNode& node) {
+    std::lock_guard<std::mutex> lock(node.input_mutex_);
+    return node.latest_odometry_ ? node.latest_odometry_->pose.pose.position.x : -999;
+  }
+  static void holdPlanner(PlannerNode& node, std::atomic<bool>& entered) {
+    std::lock_guard<std::recursive_mutex> lock(node.planner_mutex_);
+    entered = true;
+    std::this_thread::sleep_for(std::chrono::seconds(5));
+  }
+  static double drainLatestX(PlannerNode& node) {
+    std::lock_guard<std::recursive_mutex> lock(node.planner_mutex_);
+    node.applyLatestOdometry();
+    return node.current_state_.x();
+  }
+  static void toward(PlannerNode& node) { node.exploration_target_ = Eigen::Vector3d(2, 0, 0); }
+
   static void enforceSafeCompletion(PlannerNode& node, bool& complete) {
     node.enforceSafeCompletion(complete);
   }
@@ -1955,6 +1989,44 @@ class PlannerNodeTest : public ::testing::Test {
   static void SetUpTestSuite() { rclcpp::init(0, nullptr); }
   static void TearDownTestSuite() { rclcpp::shutdown(); }
 };
+
+TEST_F(PlannerNodeTest, LatestOdometryIngestedDuringFiveSecondPlannerCall) {
+  auto node = makeNode("latest_odom");
+  PlannerNodeTestPeer::acceptOdometry(*node, 0, 0, 1);
+  std::atomic<bool> entered{false};
+  auto work = std::async(std::launch::async, [&] { PlannerNodeTestPeer::holdPlanner(*node, entered); });
+  while (!entered) std::this_thread::yield();
+  const auto start = std::chrono::steady_clock::now();
+  PlannerNodeTestPeer::acceptOdometry(*node, 2, 0, 3);
+  PlannerNodeTestPeer::acceptOdometry(*node, 1, 0, 2); // an older queued sample
+  EXPECT_LT(std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count(), 0.2);
+  EXPECT_EQ(PlannerNodeTestPeer::latestX(*node), 2);
+  work.get();
+  EXPECT_EQ(PlannerNodeTestPeer::drainLatestX(*node), 2);
+}
+
+TEST_F(PlannerNodeTest, CancellationInterruptsSlowPlanWithoutReturningPath) {
+  auto node = makeNode("cancel_slow_plan");
+  auto map = std::make_unique<SlowPlanningMap>();
+  auto* slow = map.get();
+  PlannerNodeTestPeer::useCloudMap(*node, std::move(map));
+  PlannerNodeTestPeer::observeFloor(*node, -1.5, 4, -1.5, 1.5);
+  PlannerNodeTestPeer::acceptOdometry(*node, 0, 0, 1);
+  slow->slow = true;
+  auto response = std::make_shared<mgg_msgs::srv::PlannerSrv::Response>();
+  auto work = std::async(std::launch::async, [&] { PlannerNodeTestPeer::plan(*node, response); });
+  const auto limit = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+  while (!slow->entered && std::chrono::steady_clock::now() < limit)
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  EXPECT_TRUE(slow->entered);
+  const auto start = std::chrono::steady_clock::now();
+  PlannerNodeTestPeer::cancel(*node);
+  EXPECT_EQ(work.wait_for(std::chrono::milliseconds(200)), std::future_status::ready);
+  work.get();
+  EXPECT_LT(std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count(), 0.2);
+  EXPECT_TRUE(response->path.empty());
+  EXPECT_EQ(response->status, PlannerNode::kStatusNotReady);
+}
 
 TEST_F(PlannerNodeTest, ExplorationReturnsTheWholeLatticePath) {
   auto node = makeNode("explore_whole");
