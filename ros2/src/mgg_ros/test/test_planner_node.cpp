@@ -845,6 +845,41 @@ class PlannerNodeTestPeer {
     }
     node.onNoGoDiscs(msg);
   }
+  /// scouting_exclusions as the drone's adapter publishes them: x/y the
+  /// centre, z the centre-line reach.
+  static void receiveScoutingExclusions(PlannerNode& node, const std::string& frame,
+                                        const std::vector<Eigen::Vector3d>& discs) {
+    auto msg = std::make_shared<geometry_msgs::msg::PoseArray>();
+    msg->header.frame_id = frame;
+    for (const auto& disc : discs) {
+      geometry_msgs::msg::Pose pose;
+      pose.position.x = disc.x();
+      pose.position.y = disc.y();
+      pose.position.z = disc.z();
+      msg->poses.push_back(pose);
+    }
+    node.onScoutingExclusions(msg);
+  }
+  /// Whether an exploration path through these XY points keeps to them.
+  static bool scoutingAdmits(PlannerNode& node,
+                             const std::vector<Eigen::Vector2d>& points) {
+    const std::lock_guard<std::recursive_mutex> lock(node.planner_mutex_);
+    node.refreshScoutingExclusions();
+    std::vector<mgg::StateVec> path;
+    for (const auto& p : points) path.emplace_back(p.x(), p.y(), 0.075, 0.0);
+    return node.scoutingPathAdmissible(path);
+  }
+  /// The exclusions were last received `seconds` earlier than they were.
+  static void ageScoutingExclusions(PlannerNode& node, double seconds) {
+    const std::lock_guard<std::recursive_mutex> lock(node.planner_mutex_);
+    node.scouting_exclusions_received_ -=
+        std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+            std::chrono::duration<double>(seconds));
+  }
+  static PlannerNode::ScoutingExclusionCounters scoutingCounters(PlannerNode& node) {
+    const std::lock_guard<std::recursive_mutex> lock(node.planner_mutex_);
+    return node.scouting_counters_;
+  }
   static bool noGoAdmits(PlannerNode& node, const std::vector<mgg::StateVec>& path) {
     return node.noGoAdmissible(path);
   }
@@ -4488,13 +4523,21 @@ TEST_F(PlannerNodeTest, ALiftedTargetIsSelectedUnderDeployedDefaultsWhenOwnClust
   const std::string status = PlannerNodeTestPeer::aerialStatusJson(*node);
   EXPECT_NE(status.find("\"lifted\":{\"proposed\":4,\"admitted\":1,\"rejected\":"
                         "{\"gain\":1,\"cap\":0,\"merged\":0,\"no_anchor\":1,"
-                        "\"link\":1},\"senders_unplaced\":0,\"selected\":1}"),
+                        "\"link\":1,\"scouting\":0},\"senders_unplaced\":0,\"selected\":1}"),
             std::string::npos) << status;
   EXPECT_NE(status.find("\"last_out_m\":3.000,\"last_back_m\":3.000,"
                         "\"last_budget_m\":5.000,\"reach_m\":50.000"),
             std::string::npos) << status;
   EXPECT_NE(status.find("\"home\":{\"status\":\"connected\""), std::string::npos)
       << status;
+  // A scouting exclusion over the lifted target withdraws it.
+  PlannerNodeTestPeer::receiveScoutingExclusions(*node, "world", {{3.1, .1, .5}});
+  for (const auto& cluster : PlannerNodeTestPeer::frontierClusters(*node)) {
+    EXPECT_NE(cluster.owner_robot_id, 2);
+  }
+  counts = PlannerNodeTestPeer::aerialCounters(*node);
+  EXPECT_EQ(counts.lifted_rejected_scouting, 1);
+  EXPECT_EQ(counts.lifted_admitted, 0);
 }
 
 TEST_F(PlannerNodeTest, AerialPeerCountersSeparateCylindersFromLegacyDiscs) {
@@ -10555,6 +10598,137 @@ TEST_F(PlannerNodeTest, FlightStatesAreHandledInTheOrderTakenSoTheLatestSeedsHom
 }  // namespace mgg_ros
 
 namespace mgg_ros {
+TEST_F(PlannerNodeTest, ScoutingExclusionsLetAPathLeaveButNotEnterOrEndInside) {
+  // The drone often stands inside one: after a retreat (1.5 m reach) or at
+  // a failed target (0.75 m). They are soft scouting preferences, XY only.
+  auto node = makeNode("scouting_egress");
+  PlannerNodeTestPeer::receiveScoutingExclusions(
+      *node, "world", {{0.0, 0.0, 1.5}, {5.0, 0.0, 0.75}});
+  const auto admits = [&](const std::vector<Eigen::Vector2d>& path) {
+    return PlannerNodeTestPeer::scoutingAdmits(*node, path);
+  };
+  // From inside, outward until out, then clear of every disc.
+  EXPECT_TRUE(admits({{0.5, 0.0}, {1.0, 0.0}, {2.0, 0.0}, {3.0, 1.0}}));
+  EXPECT_TRUE(admits({{0.5, 0.0}, {0.5, 2.0}}));  // sideways, never nearer
+  // Inward, or out and back in, or into another: refused.
+  EXPECT_FALSE(admits({{0.5, 0.0}, {0.2, 0.0}, {2.0, 0.0}}));
+  EXPECT_FALSE(admits({{0.5, 0.0}, {2.0, 0.0}, {1.0, 0.5}, {3.0, 1.0}}));
+  EXPECT_FALSE(admits({{0.5, 0.0}, {2.0, 0.0}, {4.5, 0.0}, {4.0, 2.0}}));
+  EXPECT_FALSE(admits({{3.0, 0.0}, {1.0, 0.0}, {3.0, -1.0}}));
+  // A target inside is refused even from a start inside, outward or not.
+  EXPECT_FALSE(admits({{0.5, 0.0}, {1.2, 0.0}}));
+  EXPECT_FALSE(admits({{3.0, 0.0}, {5.2, 0.0}}));
+  EXPECT_GE(PlannerNodeTestPeer::scoutingCounters(*node).paths_refused, 6u);
+  // Without exclusions every path is admitted.
+  PlannerNodeTestPeer::receiveScoutingExclusions(*node, "world", {});
+  EXPECT_TRUE(admits({{3.0, 0.0}, {0.0, 0.0}}));
+}
+
+TEST_F(PlannerNodeTest, ScoutingExclusionsRefuseWrongFramesAndMalformedSetsAndLapse) {
+  auto node = makeNode("scouting_input", "world",
+                       {rclcpp::Parameter("scouting_exclusion_ttl_s", 3.0)});
+  const auto refuses_origin = [&]() {
+    return !PlannerNodeTestPeer::scoutingAdmits(*node, {{3.0, 0.0}, {0.0, 0.0}});
+  };
+  EXPECT_FALSE(refuses_origin());
+  PlannerNodeTestPeer::receiveScoutingExclusions(*node, "world", {{0.0, 0.0, 1.0}});
+  EXPECT_TRUE(refuses_origin());
+  // A wrong frame, a non-finite entry or a non-positive reach refuses the
+  // whole message and keeps the set in force.
+  PlannerNodeTestPeer::receiveScoutingExclusions(*node, "map", {});
+  EXPECT_TRUE(refuses_origin());
+  PlannerNodeTestPeer::receiveScoutingExclusions(
+      *node, "world", {{9.0, 0.0, 1.0}, {std::nan(""), 0.0, 1.0}});
+  EXPECT_TRUE(refuses_origin());
+  PlannerNodeTestPeer::receiveScoutingExclusions(*node, "world", {{9.0, 0.0, 0.0}});
+  EXPECT_TRUE(refuses_origin());
+  PlannerNodeTestPeer::receiveScoutingExclusions(
+      *node, "world", {{9.0, 0.0, std::numeric_limits<double>::infinity()}});
+  EXPECT_TRUE(refuses_origin());
+  auto counts = PlannerNodeTestPeer::scoutingCounters(*node);
+  EXPECT_EQ(counts.messages_accepted, 1u);
+  EXPECT_EQ(counts.messages_wrong_frame, 1u);
+  EXPECT_EQ(counts.messages_invalid, 3u);
+  // The producer re-publishes at least every second; the set lapses
+  // scouting_exclusion_ttl_s after MGG received it, stamp or none.
+  PlannerNodeTestPeer::ageScoutingExclusions(*node, 2.5);
+  EXPECT_TRUE(refuses_origin());
+  PlannerNodeTestPeer::ageScoutingExclusions(*node, 1.0);
+  EXPECT_FALSE(refuses_origin());
+  EXPECT_EQ(PlannerNodeTestPeer::scoutingCounters(*node).lapsed, 1u);
+  // A fresh message brings it back; an empty one clears it.
+  PlannerNodeTestPeer::receiveScoutingExclusions(*node, "world", {{0.0, 0.0, 1.0}});
+  EXPECT_TRUE(refuses_origin());
+  PlannerNodeTestPeer::receiveScoutingExclusions(*node, "world", {});
+  EXPECT_FALSE(refuses_origin());
+  EXPECT_THROW(makeNode("scouting_bad_ttl", "world",
+                        {rclcpp::Parameter("scouting_exclusion_ttl_s", 0.0)}),
+               std::invalid_argument);
+}
+
+TEST_F(PlannerNodeTest, ScoutingExclusionsKeepExplorationOffTargetsButNotObjectives) {
+  auto node = makeNode("scouting_exploration_only");
+  PlannerNodeTestPeer::observeFloor(*node, -1.5, 6.0, -1.5, 1.5);
+  PlannerNodeTestPeer::acceptOdometry(*node, 0.0, 0.0, 1.0);
+  double stamp = 2.0;
+  for (double x = 0.5; x <= 4.0 + 1e-9; x += 0.5) {
+    PlannerNodeTestPeer::acceptOdometry(*node, x, 0.0, stamp);
+    stamp += 1.0;
+  }
+  const int target = PlannerNodeTestPeer::globalVertexAt(*node, 0.5, 0.0);
+  ASSERT_GE(target, 0);
+  PlannerNodeTestPeer::markGlobalFrontier(*node, target);
+  PlannerNodeTestPeer::setVertexGain(*node, target, 1e6);
+  std::string reason;
+  ASSERT_TRUE(PlannerNodeTestPeer::runGlobalPlanner(*node, reason, target)) << reason;
+
+  // An exclusion across the only way there: exploration does not route
+  // through it, Return Home and Navigate do.
+  PlannerNodeTestPeer::receiveScoutingExclusions(*node, "world", {{2.0, 0.0, 0.6}});
+  EXPECT_FALSE(PlannerNodeTestPeer::runGlobalPlanner(*node, reason, target));
+  EXPECT_NE(reason.find("scouting exclusion"), std::string::npos) << reason;
+  EXPECT_GE(PlannerNodeTestPeer::scoutingCounters(*node).paths_refused, 1u);
+  for (const auto objective : {mgg_msgs::srv::PlanObjective::Request::RETURN_HOME,
+                               mgg_msgs::srv::PlanObjective::Request::NAVIGATE}) {
+    auto request = std::make_shared<mgg_msgs::srv::PlanObjective::Request>();
+    request->objective = objective;
+    request->goal.position.x = objective == mgg_msgs::srv::PlanObjective::Request::RETURN_HOME
+                                   ? std::nan("") : 0.5;
+    request->goal.position.z = 0.075;
+    request->goal.orientation.w = 1.0;
+    auto response = std::make_shared<mgg_msgs::srv::PlanObjective::Response>();
+    PlannerNodeTestPeer::objective(*node, request, response);
+    ASSERT_EQ(response->status, mgg_msgs::srv::PlanObjective::Response::SUCCEEDED)
+        << response->reason;
+    bool crosses = false;
+    for (const auto& pose : response->path) {
+      crosses = crosses || std::hypot(pose.position.x - 2.0, pose.position.y) < 0.6;
+    }
+    EXPECT_TRUE(crosses);
+  }
+
+  // An excluded target is not chosen: not by the tour, not by the greedy
+  // search, not when resumed.
+  PlannerNodeTestPeer::receiveScoutingExclusions(*node, "world", {{0.5, 0.0, 0.3}});
+  EXPECT_FALSE(PlannerNodeTestPeer::runGlobalPlanner(*node, reason, target));
+  EXPECT_FALSE(PlannerNodeTestPeer::runGlobalPlanner(*node, reason));
+  mgg::FrontierCluster excluded, open;
+  excluded.id = 1; excluded.owner_robot_id = 1;
+  excluded.representative_vertex_id = target;
+  excluded.position = Eigen::Vector3d(0.5, 0.0, 0.075);
+  open.id = 2; open.owner_robot_id = 1;
+  open.representative_vertex_id = PlannerNodeTestPeer::globalVertexAt(*node, 3.0, 0.0);
+  open.position = Eigen::Vector3d(3.0, 0.0, 0.075);
+  const auto candidates = PlannerNodeTestPeer::tourCandidates(*node, {excluded, open});
+  ASSERT_EQ(candidates.size(), 1u);
+  EXPECT_EQ(candidates.front().id, 2u);
+  EXPECT_GE(PlannerNodeTestPeer::scoutingCounters(*node).targets_refused, 2u);
+  // Lapsed or cleared, the target is open again.
+  PlannerNodeTestPeer::ageScoutingExclusions(*node, 60.0);
+  EXPECT_TRUE(PlannerNodeTestPeer::runGlobalPlanner(*node, reason, target)) << reason;
+  EXPECT_EQ(PlannerNodeTestPeer::tourCandidates(*node, {excluded, open}).size(), 2u);
+}
+
 TEST_F(PlannerNodeTest, PadDiscsHaveIndependentRadiiAndDoNotReplaceTerrain) {
   auto node = makeNode("pad_discs", "world",
       {rclcpp::Parameter("PlanningParams.no_go_radius_m", 0.5)});
@@ -10594,6 +10768,25 @@ TEST_F(PlannerNodeTest, PadDiscsStartingInsidePlansOutOnBothBackends) {
   }
 }
 
+
+TEST_F(PlannerNodeTest, AnExplorationPlanStartingInsideAScoutingExclusionLeavesIt) {
+  // A retreat leaves the drone inside a 1.5 m exclusion; its next plan
+  // leads out, and never ends inside.
+  for (const bool mola : {false, true}) {
+    SCOPED_TRACE(mola);
+    std::unique_ptr<MolaFloorProduct> product;
+    auto node = corridorNode(mola ? "scouting_depart_mola" : "scouting_depart_cloud",
+                             mola, product);
+    PlannerNodeTestPeer::acceptOdometry(*node, 1.1, 0.0, 1.0);
+    PlannerNodeTestPeer::receiveScoutingExclusions(*node, "world", {{0.0, 0.0, 2.4}});
+    auto response = std::make_shared<mgg_msgs::srv::PlannerSrv::Response>();
+    PlannerNodeTestPeer::plan(*node, response);
+    ASSERT_EQ(response->status, mgg_msgs::srv::PlannerSrv::Response::FORWARD);
+    ASSERT_GE(response->path.size(), 2u);
+    EXPECT_GE(response->path.back().position.x, 2.4);
+    for (const auto& p : response->path) EXPECT_GE(p.position.x, 1.1 - 1e-3);
+  }
+}
 
 TEST_F(PlannerNodeTest, PadDiscsRejectWithThrottledDiagnostics) {
   auto node = makeNode("pad_diagnostics");

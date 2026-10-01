@@ -225,6 +225,24 @@ class PlannerNode : public rclcpp::Node {
   /// ignored. Same frame, lifetime and replacement rules as no_go_zones,
   /// but independent: neither topic clears the other, no extra inflation.
   void onNoGoDiscs(geometry_msgs::msg::PoseArray::ConstSharedPtr msg);
+  /// scouting_exclusions: soft scouting preferences, not obstacles, encoded
+  /// as no_go_discs (x/y centre, z centre-line reach, orientation ignored),
+  /// in the planning frame. Each message replaces the set; an empty one
+  /// clears it; a wrong frame or any malformed entry refuses the whole
+  /// message (the set in force is kept). The set lapses
+  /// scouting_exclusion_ttl_s after its receipt. Exploration only: tour,
+  /// cluster, lifted and greedy targets, the lattice's viewpoints and
+  /// exploration paths; never objectives (Navigate, Return Home).
+  void onScoutingExclusions(geometry_msgs::msg::PoseArray::ConstSharedPtr msg);
+  /// Drops the set once its TTL has passed since receipt.
+  void refreshScoutingExclusions();
+  /// Whether an exploration path keeps to the exclusions' rule (XY only,
+  /// mgg::NoGoZones::pathAdmissible): from inside one it leaves with the
+  /// distance to its centre never decreasing until out, then never enters
+  /// one, and it does not end inside one. Counts a refusal.
+  bool scoutingPathAdmissible(const std::vector<mgg::StateVec>& path);
+  /// Whether an exploration target at `p` lies inside an exclusion.
+  bool scoutingExcludes(const Eigen::Vector3d& p) const;
   /// Sets no_go_ from no_go_zones_, its reach the zone radius plus half
   /// the robot's planning box.
   void refreshNoGoZones();
@@ -908,6 +926,8 @@ class PlannerNode : public rclcpp::Node {
     int lifted_rejected_merged = 0;
     int lifted_rejected_no_anchor = 0;
     int lifted_rejected_link = 0;
+    /// Inside a scouting exclusion.
+    int lifted_rejected_scouting = 0;
     int lifted_admitted = 0;
     /// Senders whose roadmap had no current transform.
     int lifted_senders_unplaced = 0;
@@ -1163,6 +1183,33 @@ class PlannerNode : public rclcpp::Node {
   rclcpp::Subscription<geometry_msgs::msg::PoseArray>::SharedPtr no_go_discs_sub_;
   std::vector<Eigen::Vector2d> no_go_disc_centres_;
   std::vector<double> no_go_disc_reaches_;
+  rclcpp::Subscription<geometry_msgs::msg::PoseArray>::SharedPtr
+      scouting_exclusions_sub_;
+  /// The scouting exclusions in force (onScoutingExclusions), received at
+  /// scouting_exclusions_received_ (steady clock, MGG's receipt).
+  std::vector<Eigen::Vector2d> scouting_exclusion_centres_;
+  std::vector<double> scouting_exclusion_reaches_;
+  std::chrono::steady_clock::time_point scouting_exclusions_received_;
+  double scouting_exclusion_ttl_s_ = 3.0;
+  mgg::NoGoZones scouting_zones_;
+  /// Set while runGlobalPlanner routes: routeOverGlobalGraph then keeps to
+  /// the scouting exclusions as well as the no-go zones.
+  bool exploration_route_ = false;
+  struct ScoutingExclusionCounters {
+    std::uint64_t messages_accepted = 0;
+    std::uint64_t messages_wrong_frame = 0;
+    std::uint64_t messages_invalid = 0;
+    std::uint64_t lapsed = 0;
+    /// Tour clusters, lifted targets and greedy frontiers refused for
+    /// lying inside one (per evaluation).
+    std::uint64_t targets_refused = 0;
+    /// Lattice vertices left out as viewpoints (per evaluation).
+    std::uint64_t viewpoints_refused = 0;
+    /// Exploration paths refused (lattice candidates, global routes, the
+    /// plan's final check).
+    std::uint64_t paths_refused = 0;
+  };
+  ScoutingExclusionCounters scouting_counters_;
   /// The same zones with their reach, as every check applies them.
   mgg::NoGoZones no_go_;
   rclcpp::Publisher<mgg_msgs::msg::Graph>::SharedPtr graph_pub_;

@@ -163,6 +163,16 @@ std::string rebuildLosesHome(mgg::GraphManager& current,
   return "";
 }
 
+/// Sets a flag for a scope and restores it after.
+struct FlagScope {
+  explicit FlagScope(bool& flag) : flag_(flag), previous_(flag) { flag_ = true; }
+  ~FlagScope() { flag_ = previous_; }
+  FlagScope(const FlagScope&) = delete;
+  FlagScope& operator=(const FlagScope&) = delete;
+  bool& flag_;
+  bool previous_;
+};
+
 double secondsSince(const std::chrono::steady_clock::time_point& then) {
   return std::chrono::duration<double>(std::chrono::steady_clock::now() - then)
       .count();
@@ -414,6 +424,11 @@ PlannerNode::PlannerNode(const rclcpp::NodeOptions& options)
   peer_body_ttl_s_ = std::clamp(
       declareOrGet<double>(this, "peer_body_ttl_s", peer_body_ttl_s_), 0.1,
       30.0);
+  scouting_exclusion_ttl_s_ = declareOrGet<double>(
+      this, "scouting_exclusion_ttl_s", scouting_exclusion_ttl_s_);
+  if (!std::isfinite(scouting_exclusion_ttl_s_) || scouting_exclusion_ttl_s_ <= 0.0) {
+    throw std::invalid_argument("scouting_exclusion_ttl_s must be finite and positive");
+  }
   aerial_peer_margin_m_ = declareOrGet<double>(this, "aerial_peer_margin_m", aerial_peer_margin_m_);
   if (!std::isfinite(aerial_peer_margin_m_) || aerial_peer_margin_m_ < 0) {
     throw std::invalid_argument("aerial_peer_margin_m must be finite and non-negative");
@@ -451,6 +466,15 @@ PlannerNode::PlannerNode(const rclcpp::NodeOptions& options)
       "no_go_zones", rclcpp::QoS(1).transient_local(),
       [this](geometry_msgs::msg::PoseArray::ConstSharedPtr m) {
         onNoGoZones(m);
+      },
+      no_go_opts);
+  // Latched, as the producer publishes it (transient local, re-published
+  // at least every second); in the no-go group, so one set replaces
+  // another in the order taken.
+  scouting_exclusions_sub_ = create_subscription<geometry_msgs::msg::PoseArray>(
+      "scouting_exclusions", rclcpp::QoS(1).transient_local(),
+      [this](geometry_msgs::msg::PoseArray::ConstSharedPtr m) {
+        onScoutingExclusions(m);
       },
       no_go_opts);
   no_go_discs_sub_ = create_subscription<geometry_msgs::msg::PoseArray>(
@@ -953,8 +977,9 @@ std::vector<mgg::FrontierCluster> PlannerNode::liftedPeerFrontiers() {
   AerialCounters& counts = aerial_counters_;
   counts.lifted_proposed = counts.lifted_rejected_gain = counts.lifted_rejected_cap =
       counts.lifted_rejected_merged = counts.lifted_rejected_no_anchor =
-          counts.lifted_rejected_link = counts.lifted_admitted =
-              counts.lifted_senders_unplaced = 0;
+          counts.lifted_rejected_link = counts.lifted_rejected_scouting =
+              counts.lifted_admitted = counts.lifted_senders_unplaced = 0;
+  refreshScoutingExclusions();
   const double height = std::clamp(aerial_frontier_height_m_, aerial_min_height_m_, aerial_max_height_m_);
   for (const auto& [sender, snapshot] : neighbour_roadmaps_) {
     const auto frame = neighbour_frames_.find(sender);
@@ -977,6 +1002,11 @@ std::vector<mgg::FrontierCluster> PlannerNode::liftedPeerFrontiers() {
           std::max(0, v.num_occupied_voxels) * planning_params_.occupied_voxel_gain;
       if (c.gain < tour_params_.min_cluster_gain) {
         ++counts.lifted_rejected_gain;
+        continue;
+      }
+      if (scoutingExcludes(c.position)) {
+        ++counts.lifted_rejected_scouting;
+        ++scouting_counters_.targets_refused;
         continue;
       }
       c.id = mgg::makeClusterId(sender, c.position, tour_params_.cluster_id_cell_m);
@@ -1126,6 +1156,16 @@ int PlannerNode::capTourValues(mgg::TourCostMatrix& costs,
 
 std::vector<mgg::FrontierCluster> PlannerNode::tourCandidates(
     std::vector<mgg::FrontierCluster> clusters) {
+  refreshScoutingExclusions();
+  if (!scouting_zones_.empty()) {
+    const std::size_t before = clusters.size();
+    clusters.erase(std::remove_if(clusters.begin(), clusters.end(),
+                                  [this](const mgg::FrontierCluster& cluster) {
+                                    return scoutingExcludes(cluster.position);
+                                  }),
+                   clusters.end());
+    scouting_counters_.targets_refused += before - clusters.size();
+  }
   const std::vector<Eigen::Vector3d> reserved = selectionExclusions();
   clusters.erase(
       std::remove_if(clusters.begin(), clusters.end(),
@@ -1750,6 +1790,7 @@ std::string PlannerNode::aerialStatusJson() const {
        ",\"merged\":" + std::to_string(c.lifted_rejected_merged) +
        ",\"no_anchor\":" + std::to_string(c.lifted_rejected_no_anchor) +
        ",\"link\":" + std::to_string(c.lifted_rejected_link) +
+       ",\"scouting\":" + std::to_string(c.lifted_rejected_scouting) +
        "},\"senders_unplaced\":" + std::to_string(c.lifted_senders_unplaced) +
        ",\"selected\":" + std::to_string(c.lifted_selected) + "}";
   j += ",\"cylinders\":{\"accepted\":" +
@@ -1768,6 +1809,16 @@ std::string PlannerNode::aerialStatusJson() const {
        ",\"last_back_m\":" + jsonNumber(c.last_reach_back_m) +
        ",\"last_budget_m\":" + jsonNumber(c.last_reach_budget_m) +
        ",\"reach_m\":" + jsonNumber(flight_reach_m_) + "}";
+  const ScoutingExclusionCounters& x = scouting_counters_;
+  j += ",\"scouting_exclusions\":{\"in_force\":" +
+       std::to_string(scouting_exclusion_centres_.size()) +
+       ",\"accepted\":" + std::to_string(x.messages_accepted) +
+       ",\"rejected_frame\":" + std::to_string(x.messages_wrong_frame) +
+       ",\"rejected_invalid\":" + std::to_string(x.messages_invalid) +
+       ",\"lapsed\":" + std::to_string(x.lapsed) +
+       ",\"targets_refused\":" + std::to_string(x.targets_refused) +
+       ",\"viewpoints_refused\":" + std::to_string(x.viewpoints_refused) +
+       ",\"paths_refused\":" + std::to_string(x.paths_refused) + "}";
   return j + "}";
 }
 
@@ -2383,6 +2434,77 @@ void PlannerNode::onNoGoDiscs(
     refreshNoGoZones();
     ++graph_revision_;
   }
+}
+
+void PlannerNode::onScoutingExclusions(
+    geometry_msgs::msg::PoseArray::ConstSharedPtr msg) {
+  const std::lock_guard<std::recursive_mutex> lock(planner_mutex_);
+  if (msg->header.frame_id != world_frame_) {
+    ++scouting_counters_.messages_wrong_frame;
+    RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 5000,
+                         "ignoring scouting exclusions in frame '%s' (expected "
+                         "'%s'); keeping the set in force",
+                         msg->header.frame_id.c_str(), world_frame_.c_str());
+    return;
+  }
+  std::vector<Eigen::Vector2d> centres;
+  std::vector<double> reaches;
+  for (const auto& pose : msg->poses) {
+    const auto& p = pose.position;
+    if (!std::isfinite(p.x) || !std::isfinite(p.y) || !std::isfinite(p.z) ||
+        p.z <= 0.0) {
+      ++scouting_counters_.messages_invalid;
+      RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 5000,
+                           "invalid scouting exclusion: need finite XY and a "
+                           "positive finite centre-line reach in position.z; "
+                           "keeping the set in force");
+      return;
+    }
+    centres.emplace_back(p.x, p.y);
+    reaches.push_back(p.z);
+  }
+  ++scouting_counters_.messages_accepted;
+  scouting_exclusions_received_ = std::chrono::steady_clock::now();
+  if (centres == scouting_exclusion_centres_ &&
+      reaches == scouting_exclusion_reaches_) {
+    return;
+  }
+  scouting_exclusion_centres_ = std::move(centres);
+  scouting_exclusion_reaches_ = std::move(reaches);
+  scouting_zones_.set(scouting_exclusion_centres_, scouting_exclusion_reaches_);
+  // The tour's candidates change: solve again.
+  ++tour_assignment_version_;
+  RCLCPP_INFO(get_logger(), "%zu scouting exclusion(s)",
+              scouting_exclusion_centres_.size());
+}
+
+void PlannerNode::refreshScoutingExclusions() {
+  if (scouting_exclusion_centres_.empty() ||
+      secondsSince(scouting_exclusions_received_) <= scouting_exclusion_ttl_s_) {
+    return;
+  }
+  scouting_exclusion_centres_.clear();
+  scouting_exclusion_reaches_.clear();
+  scouting_zones_.set({}, std::vector<double>{});
+  ++scouting_counters_.lapsed;
+  ++tour_assignment_version_;
+  RCLCPP_WARN(get_logger(),
+              "scouting exclusions lapsed: none received for %.1f s",
+              scouting_exclusion_ttl_s_);
+}
+
+bool PlannerNode::scoutingPathAdmissible(const std::vector<mgg::StateVec>& path) {
+  if (scouting_zones_.empty() || path.empty()) return true;
+  std::vector<Eigen::Vector3d> points;
+  points.reserve(path.size());
+  for (const mgg::StateVec& state : path) points.push_back(state.head<3>());
+  if (scouting_zones_.pathAdmissible(points)) return true;
+  ++scouting_counters_.paths_refused;
+  return false;
+}
+
+bool PlannerNode::scoutingExcludes(const Eigen::Vector3d& p) const {
+  return !scouting_zones_.empty() && scouting_zones_.inside(p);
 }
 
 void PlannerNode::refreshNoGoZones() {
@@ -3475,6 +3597,11 @@ void PlannerNode::shortcutAndResample(std::vector<mgg::StateVec>& path,
     // inclination) as every graph edge does. Nor may it cross a no-go zone
     // the route went round.
     if (noGoBlocksSegment(from, to)) return false;
+    // An exploration path's shortcut keeps to the scouting exclusions too.
+    if (exploration_route_ && !scouting_zones_.empty() &&
+        scouting_zones_.blocksEdge(from, to, current_state_.head<3>())) {
+      return false;
+    }
     if (robot_params_.type == mgg::RobotType::kAerialRobot &&
         peerBlocksSegment(from, to)) return false;
     if (robot_params_.type == mgg::RobotType::kGroundRobot) {
@@ -3565,6 +3692,8 @@ std::string PlannerNode::buildLocalGraph() {
   StandingStartScope standing_scope(*this);
   auto map_read = mapReadLease();
   refreshMapRevision();
+  refreshScoutingExclusions();
+  const FlagScope exploring(exploration_route_);
   best_path_.clear();
   best_path_from_global_graph_ = false;
   boxed_in_without_departure_now_ = false;
@@ -3759,6 +3888,10 @@ std::string PlannerNode::buildLocalGraph() {
       slope_end_retreat,
       [this, &standing, &retention_excluded](const mgg::Vertex& v) {
         if (no_go_.inside(v.state.head<3>())) return true;
+        if (scoutingExcludes(v.state.head<3>())) {
+          ++scouting_counters_.viewpoints_refused;
+          return true;
+        }
         if (reverseExitEndpointExcluded(v.state)) {
           ++retention_excluded;
           return true;
@@ -3767,13 +3900,18 @@ std::string PlannerNode::buildLocalGraph() {
       },
       // A path the final check would refuse is left out, so another is
       // chosen rather than none (review r1, R1-1).
-      no_go_.empty()
+      no_go_.empty() && scouting_zones_.empty()
           ? mgg::PathTurnsFn()
           : mgg::PathTurnsFn([this](const std::vector<mgg::Vertex*>& path) {
               std::vector<Eigen::Vector3d> points;
               points.reserve(path.size());
               for (const mgg::Vertex* v : path) points.push_back(v->state.head<3>());
-              return no_go_.pathAdmissible(points);
+              if (!no_go_.pathAdmissible(points)) return false;
+              if (scouting_zones_.empty() || scouting_zones_.pathAdmissible(points)) {
+                return true;
+              }
+              ++scouting_counters_.paths_refused;
+              return false;
             }));
   for (const mgg::Vertex* v : sel.best_path) {
     if (v != nullptr) best_path_.push_back(v->state);
@@ -4297,18 +4435,43 @@ bool PlannerNode::routeOverGlobalGraph(const mgg::StateVec goal,
   const Eigen::Vector3d route_start =
       departure.query_local ? current.head<3>() : link_vertex->state.head<3>();
   refreshNoGoZones();
-  const auto zones_admit = [this, &path](const std::vector<mgg::Vertex*>& r) {
+  // An exploration route keeps to the scouting exclusions as it does to the
+  // no-go zones; an objective's never does.
+  mgg::NoGoZones exploration_zones;
+  const bool scouting = exploration_route_ && !scouting_zones_.empty();
+  if (scouting) {
+    std::vector<Eigen::Vector2d> centres = no_go_.centres();
+    std::vector<double> reaches = no_go_.reaches();
+    centres.insert(centres.end(), scouting_zones_.centres().begin(),
+                   scouting_zones_.centres().end());
+    reaches.insert(reaches.end(), scouting_zones_.reaches().begin(),
+                   scouting_zones_.reaches().end());
+    exploration_zones.set(std::move(centres), std::move(reaches));
+  }
+  const mgg::NoGoZones& zones = scouting ? exploration_zones : no_go_;
+  const auto zones_admit = [&zones, &path](const std::vector<mgg::Vertex*>& r) {
     std::vector<Eigen::Vector3d> points;
     for (const mgg::StateVec& s : path) points.push_back(s.head<3>());
     for (const mgg::Vertex* v : r) points.push_back(v->state.head<3>());
-    return no_go_.pathAdmissible(points);
+    return zones.pathAdmissible(points);
   };
   // Dijkstra's edges are open either way, so its route may leave a zone
   // the robot stands in and come back: the route that departs outward only
   // and never re-enters is searched for instead (review r1, R1-1).
-  if (!no_go_.empty() && !route.empty() && !zones_admit(route)) {
+  if (!zones.empty() && !route.empty() && !zones_admit(route)) {
     route = mgg::zoneRespectingRoute(*global_graph_, link_vertex->id,
-                                     goal_vertex->id, route_start, no_go_);
+                                     goal_vertex->id, route_start, zones);
+    // Only the exclusions stand in the way: say so (an objective would go).
+    if (route.empty() && scouting &&
+        (no_go_.empty() ||
+         !mgg::zoneRespectingRoute(*global_graph_, link_vertex->id,
+                                   goal_vertex->id, route_start, no_go_)
+              .empty())) {
+      ++scouting_counters_.paths_refused;
+      path.clear();
+      reason = "every exploration route to the goal enters a scouting exclusion";
+      return false;
+    }
   }
   if (!route.empty()) {
     const std::vector<mgg::Vertex*> before_turns = route;
@@ -4317,7 +4480,7 @@ bool PlannerNode::routeOverGlobalGraph(const mgg::StateVec goal,
     // A turn-compliant detour must keep out of the zones too; the route it
     // replaced does. That route turns where it may not, as a fallback does,
     // and its first turn is judged below like a fallback's.
-    if (!no_go_.empty() && !zones_admit(route) && zones_admit(before_turns)) {
+    if (!zones.empty() && !zones_admit(route) && zones_admit(before_turns)) {
       route = before_turns;
       ++route_sharp_turn_fallbacks_;
       RCLCPP_WARN(get_logger(),
@@ -4353,6 +4516,13 @@ bool PlannerNode::routeOverGlobalGraph(const mgg::StateVec goal,
     path.clear();
     turns_ok = nullptr;
     reason = "the route enters a no-go zone";
+    return false;
+  }
+  if (scouting && !scouting_zones_.pathAdmissible(points)) {
+    ++scouting_counters_.paths_refused;
+    path.clear();
+    turns_ok = nullptr;
+    reason = "the exploration route enters a scouting exclusion";
     return false;
   }
   // The searches leave out the edges a peer body closes; the route as it
@@ -4589,6 +4759,8 @@ bool PlannerNode::runGlobalPlanner(int target_id, std::string& reason,
   global_target_refused_by_retention_.reset();
   global_route_at_target_ = false;
   last_route_blocked_by_peer_ = false;
+  refreshScoutingExclusions();
+  const FlagScope exploring(exploration_route_);
   if (global_graph_->getNumVertices() <= 1) {
     // rrg.cpp:5582.
     reason = "the global graph holds no frontier to reposition to";
@@ -4597,6 +4769,10 @@ bool PlannerNode::runGlobalPlanner(int target_id, std::string& reason,
   // A frontier the fleet has covered is neither resumed nor chosen.
   demoteFleetCoveredFrontiers();
   const auto inside_region = [this](const mgg::Vertex& vertex) {
+    if (scoutingExcludes(vertex.state.head<3>())) {
+      ++scouting_counters_.targets_refused;
+      return false;
+    }
     return !reverseExitEndpointExcluded(vertex.state) &&
            (!exploration_region_ || exploration_region_->isInsideSpace(vertex.state.head<3>()));
   };
@@ -4895,6 +5071,7 @@ void PlannerNode::onPlanRequest(
   lattice_path_.clear();
   peer_blocked_edges_.clear();
   peer_cylinder_blocked_edges_.clear();
+  refreshScoutingExclusions();
   withdrawUnplacedNeighbours();
   response->planning_bound_mode = request->bound_mode;
   if (home_state_wait_started_) {
@@ -5257,6 +5434,12 @@ std::string PlannerNode::clearInadmissibleBestPath() {
     // runs with the request's bound mode still applied.
     best_path_.clear();
     return "; the path enters a no-go zone: no path";
+  }
+  if (!scoutingPathAdmissible(best_path_)) {
+    // Exploration only: a plan never takes the robot into a scouting
+    // exclusion, though it may lead it out of one.
+    best_path_.clear();
+    return "; the path enters a scouting exclusion: no path";
   }
   if (!peerAdmissible(best_path_)) {
     // And nothing is sent through a peer body of the set this request
