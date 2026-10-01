@@ -7876,33 +7876,37 @@ TEST_F(PlannerNodeTest, AReselectedInReachTourTargetDoesNotReplaceHighGainLocalE
     ASSERT_EQ(PlannerNodeTestPeer::refreshTour(*node), target);
     ASSERT_EQ(PlannerNodeTestPeer::reachedTourCluster(*node), target);
 
-    double aside_at = 0;
-    for (int cycle = 0; cycle < 3; ++cycle) {
-      SCOPED_TRACE(cycle);
-      auto response = std::make_shared<mgg_msgs::srv::PlannerSrv::Response>();
-      PlannerNodeTestPeer::plan(*node, response);
-      ASSERT_EQ(response->status, mgg_msgs::srv::PlannerSrv::Response::FORWARD);
-      ASSERT_GE(response->path.size(), 2u);
-      ASSERT_FALSE(PlannerNodeTestPeer::lowGainPathNow(*node));
-      EXPECT_GT(response->path.back().position.x, 0.5);
-      EXPECT_FALSE(PlannerNodeTestPeer::bestPathFromGlobalGraph(*node));
-      EXPECT_FALSE(PlannerNodeTestPeer::repositioningOngoing(*node));
-      EXPECT_NE(PlannerNodeTestPeer::tourTarget(*node), target);
-      EXPECT_DOUBLE_EQ(PlannerNodeTestPeer::tourAsideRetry(*node, target), 60.0);
-      if (cycle == 0) aside_at = PlannerNodeTestPeer::tourAsideAt(*node, target);
-      EXPECT_DOUBLE_EQ(PlannerNodeTestPeer::tourAsideAt(*node, target), aside_at);
-      const auto status = nlohmann::json::parse(
-          PlannerNodeTestPeer::aerialStatusJson(*node));
-      EXPECT_EQ(status["tour"]["in_reach_set_aside"], aerial ? 1 : 0);
+    int asides = 0;
+    for (const double retry : {60.0, 120.0, 240.0, 240.0}) {
+      SCOPED_TRACE(retry);
+      if (asides > 0) {
+        // The real request does its own refresh. Preselecting here would
+        // hide a lapse that offers the target as fresh after the reached
+        // marker was cleared by the intervening no-target solve.
+        ASSERT_EQ(PlannerNodeTestPeer::reachedTourCluster(*node), mgg::kNoCluster);
+        PlannerNodeTestPeer::expireTourAside(*node, target);
+      }
+      ++asides;
+      double aside_at = 0;
+      for (int cycle = 0; cycle < 3; ++cycle) {
+        SCOPED_TRACE(cycle);
+        auto response = std::make_shared<mgg_msgs::srv::PlannerSrv::Response>();
+        PlannerNodeTestPeer::plan(*node, response);
+        ASSERT_EQ(response->status, mgg_msgs::srv::PlannerSrv::Response::FORWARD);
+        ASSERT_GE(response->path.size(), 2u);
+        ASSERT_FALSE(PlannerNodeTestPeer::lowGainPathNow(*node));
+        EXPECT_GT(response->path.back().position.x, 0.5);
+        EXPECT_FALSE(PlannerNodeTestPeer::bestPathFromGlobalGraph(*node));
+        EXPECT_FALSE(PlannerNodeTestPeer::repositioningOngoing(*node));
+        EXPECT_NE(PlannerNodeTestPeer::tourTarget(*node), target);
+        EXPECT_DOUBLE_EQ(PlannerNodeTestPeer::tourAsideRetry(*node, target), retry);
+        if (cycle == 0) aside_at = PlannerNodeTestPeer::tourAsideAt(*node, target);
+        EXPECT_DOUBLE_EQ(PlannerNodeTestPeer::tourAsideAt(*node, target), aside_at);
+        const auto status = nlohmann::json::parse(
+            PlannerNodeTestPeer::aerialStatusJson(*node));
+        EXPECT_EQ(status["tour"]["in_reach_set_aside"], aerial ? asides : 0);
+      }
     }
-    // Retry expiry alone must not erase the at-target failure history.
-    PlannerNodeTestPeer::expireTourAside(*node, target);
-    ASSERT_EQ(PlannerNodeTestPeer::refreshTour(*node), target);
-    auto response = std::make_shared<mgg_msgs::srv::PlannerSrv::Response>();
-    PlannerNodeTestPeer::plan(*node, response);
-    ASSERT_FALSE(response->path.empty());
-    EXPECT_GT(response->path.back().position.x, 0.5);
-    EXPECT_DOUBLE_EQ(PlannerNodeTestPeer::tourAsideRetry(*node, target), 120.0);
   }
 }
 
