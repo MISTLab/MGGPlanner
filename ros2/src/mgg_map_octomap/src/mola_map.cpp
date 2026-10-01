@@ -416,6 +416,27 @@ void MolaMap::requestSnapshot(const MolaSnapshotRequest& request) {
     last_error_ = "invalid MOLA snapshot request";
     return;
   }
+  // Authority receipt must not wait for a planner transaction. Serialize it
+  // with installs using request_mutex_, never the publication lock. Geometry
+  // remains immutable and pinned; authority can still revoke that pin's use.
+  {
+    std::lock_guard<std::mutex> lock(request_mutex_);
+    const auto active = std::atomic_load(&active_);
+    if (active && sameIdentity(active->request, request) &&
+        sameTransform(active->request, request) && publicationUnchanged(*active)) {
+      active->markValidated(Clock::now());
+      stat_revalidation_count_.fetch_add(1, std::memory_order_relaxed);
+      return;
+    }
+    if (active && !compatible(active->request, request)) {
+      std::atomic_store(&active_, std::shared_ptr<const Snapshot>());
+      active_generation_.fetch_add(1, std::memory_order_release);
+      pending_ = std::make_unique<PendingRequest>(
+          PendingRequest{request, ++generation_, Clock::now()});
+      request_ready_.notify_one();
+      return;
+    }
+  }
   {
     const std::lock_guard<std::recursive_mutex> publication_lock(
         publication_mutex_);
