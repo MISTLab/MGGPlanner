@@ -5214,12 +5214,14 @@ void PlannerNode::onPlanRequest(
         tour_decided = true;
         summary += "; exploring locally toward the tour's target";
       } else if (robot_params_.type == mgg::RobotType::kAerialRobot &&
+                 tour_target->id == tour_reached_cluster_ &&
                  (tour_target->position - current_state_.head<3>()).norm() <=
                      global_frontier_reach_m_) {
-        // refreshTour may reselect a reached cluster that still has gain.
-        // drone-r4: EGO had arrived, but its tolerance exceeded MGG's. Do
-        // not replace local exploration with a route back inside reach.
-        // Ground tours retain their closer approach to the representative.
+        // refreshTour released this reached cluster once, then reselected
+        // it. drone-r4: EGO had arrived, but its tolerance exceeded MGG's.
+        // Keep local exploration instead of routing back inside reach.
+        // Fresh targets still route at once, even with no local path;
+        // ground tours retain their closer approach to the representative.
         setTourClusterAside(*tour_target, tour_params_.route_retry_s, true);
         ++tour_in_reach_set_aside_;
         RCLCPP_INFO_THROTTLE(

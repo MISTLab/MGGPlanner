@@ -7779,6 +7779,70 @@ TEST_F(PlannerNodeTest, Run12ShortFirstTourGoalDoesNotStopInsideTheBlindArrivalB
   EXPECT_FALSE(PlannerNodeTestPeer::bestPathFromGlobalGraph(*node));
 }
 
+TEST_F(PlannerNodeTest, AFreshInReachAerialTourTargetRoutesWithoutALocalPath) {
+  auto node = makeNode("fresh_in_reach_aerial");
+  PlannerNodeTestPeer::setAerialRobot(*node);
+  PlannerNodeTestPeer::gainFromUnknownVoxelsOnly(*node);
+  PlannerNodeTestPeer::setLattice(*node, {-1.0, 0.0}, {0.5, 0.0});
+  PlannerNodeTestPeer::observeFloor(*node, -3.55, 4.05, -3.05, 3.05);
+  PlannerNodeTestPeer::acceptOdometryFacing(*node, 0, 0, 0, 1.0, 0.4);
+  // The observed lattice has no useful exploration path. Its empty path
+  // must not delay the first route to a fresh target inside the 5 m reach.
+  PlannerNodeTestPeer::buildLocalGraph(*node);
+  ASSERT_TRUE(PlannerNodeTestPeer::bestPath(*node).empty());
+  const int frontier = PlannerNodeTestPeer::addGlobalChainToFrontier(
+      *node, {{-0.5, 0.0}, {-1.0, 0.0}, {-1.5, 0.0}, {-2.0, 0.0}, {-2.5, 0.0}},
+      M_PI);
+  PlannerNodeTestPeer::setFrontierOwner(*node, frontier, 2);
+  PlannerNodeTestPeer::setReportedUnknown(*node, frontier, 100000);
+  PlannerNodeTestPeer::setTour(*node, true, 0.0);
+  ASSERT_EQ(PlannerNodeTestPeer::tourTarget(*node), mgg::kNoCluster);
+  ASSERT_EQ(PlannerNodeTestPeer::reachedTourCluster(*node), mgg::kNoCluster);
+
+  auto response = std::make_shared<mgg_msgs::srv::PlannerSrv::Response>();
+  PlannerNodeTestPeer::plan(*node, response);
+  ASSERT_EQ(response->status, mgg_msgs::srv::PlannerSrv::Response::FORWARD);
+  ASSERT_GE(response->path.size(), 2u);
+  EXPECT_TRUE(PlannerNodeTestPeer::bestPathFromGlobalGraph(*node));
+  EXPECT_TRUE(PlannerNodeTestPeer::repositioningOngoing(*node));
+  EXPECT_NEAR(response->path.back().position.x, -2.5, 1e-6);
+  EXPECT_NE(PlannerNodeTestPeer::tourTarget(*node), mgg::kNoCluster);
+  EXPECT_EQ(PlannerNodeTestPeer::reachedTourCluster(*node), mgg::kNoCluster);
+  const auto status = nlohmann::json::parse(
+      PlannerNodeTestPeer::aerialStatusJson(*node));
+  EXPECT_EQ(status["tour"]["in_reach_set_aside"], 0);
+}
+
+TEST_F(PlannerNodeTest, AReselectedInReachGroundTourTargetStillRoutesOutsideDefaultTolerance) {
+  auto node = makeNode("reselected_ground_default_tolerance");
+  PlannerNodeTestPeer::setLowGainVoxels(*node, 0.0);
+  PlannerNodeTestPeer::observeFloor(*node, -1.5, 4.0, -1.5, 1.5);
+  PlannerNodeTestPeer::acceptOdometry(*node, 0, 0, 1.0);
+  const int frontier = PlannerNodeTestPeer::addGlobalChainToFrontier(
+      *node, {{-0.479, 0.0}}, M_PI);
+  PlannerNodeTestPeer::setSensorRange(*node, 4.0);
+  PlannerNodeTestPeer::setFrontierOwner(*node, frontier, 2);
+  PlannerNodeTestPeer::setReportedUnknown(*node, frontier, 100000);
+  PlannerNodeTestPeer::setTour(*node, true, 1e5);
+  const auto target = PlannerNodeTestPeer::refreshTour(*node);
+  ASSERT_NE(target, mgg::kNoCluster);
+  ASSERT_EQ(PlannerNodeTestPeer::refreshTour(*node), target);
+  ASSERT_EQ(PlannerNodeTestPeer::reachedTourCluster(*node), target);
+
+  auto response = std::make_shared<mgg_msgs::srv::PlannerSrv::Response>();
+  PlannerNodeTestPeer::plan(*node, response);
+  ASSERT_EQ(response->status, mgg_msgs::srv::PlannerSrv::Response::FORWARD);
+  ASSERT_GE(response->path.size(), 2u);
+  EXPECT_TRUE(PlannerNodeTestPeer::bestPathFromGlobalGraph(*node));
+  EXPECT_TRUE(PlannerNodeTestPeer::repositioningOngoing(*node));
+  EXPECT_NEAR(response->path.back().position.x, -0.479, 1e-6);
+  EXPECT_EQ(PlannerNodeTestPeer::tourTarget(*node), target);
+  EXPECT_TRUE(std::isnan(PlannerNodeTestPeer::tourAsideAt(*node, target)));
+  const auto status = nlohmann::json::parse(
+      PlannerNodeTestPeer::aerialStatusJson(*node));
+  EXPECT_EQ(status["tour"]["in_reach_set_aside"], 0);
+}
+
 TEST_F(PlannerNodeTest, AReselectedInReachTourTargetDoesNotReplaceHighGainLocalExploration) {
   // drone-r4: EGO has arrived at 0.479 m, outside MGG's default 0.3 m
   // tolerance but inside the tour's 5 m reach. The one-time reached release
