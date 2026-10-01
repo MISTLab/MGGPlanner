@@ -403,8 +403,6 @@ void MolaMap::requestSnapshot(const MolaSnapshotRequest& request) {
                                       1e-9) ||
       !request.component_from_navigation.linear().isUnitary(1e-5) ||
       request.component_from_navigation.linear().determinant() < 0.9999) {
-    const std::lock_guard<std::recursive_mutex> publication_lock(
-        publication_mutex_);
     std::lock_guard<std::mutex> request_lock(request_mutex_);
     pending_.reset();
     ++generation_;
@@ -438,8 +436,6 @@ void MolaMap::requestSnapshot(const MolaSnapshotRequest& request) {
     }
   }
   {
-    const std::lock_guard<std::recursive_mutex> publication_lock(
-        publication_mutex_);
     std::lock_guard<std::mutex> lock(request_mutex_);
     const auto active = std::atomic_load(&active_);
     if (active != nullptr && pending_ == nullptr &&

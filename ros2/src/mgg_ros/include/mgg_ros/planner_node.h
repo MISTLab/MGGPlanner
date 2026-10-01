@@ -22,6 +22,7 @@
 #define MGG_ROS_PLANNER_NODE_H_
 
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <functional>
@@ -116,6 +117,7 @@ class PlannerNode : public rclcpp::Node {
 
  private:
   void loadParameters();
+  void applyLatestOdometry();
   void onOdometry(nav_msgs::msg::Odometry::ConstSharedPtr msg);
   void onPointCloud(sensor_msgs::msg::PointCloud2::ConstSharedPtr msg);
   void onMappingSnapshot(mgg_msgs::msg::MappingSnapshot::ConstSharedPtr msg);
@@ -753,6 +755,12 @@ class PlannerNode : public rclcpp::Node {
   /// One mutex rather than one per structure, because planning reads the map
   /// and writes the graphs as a single unit and would need both anyway.
   std::recursive_mutex planner_mutex_;
+  std::mutex input_mutex_;
+  nav_msgs::msg::Odometry::ConstSharedPtr latest_odometry_;
+  std::chrono::steady_clock::time_point latest_odometry_received_;
+  mgg_msgs::msg::MappingSnapshot::ConstSharedPtr latest_snapshot_;
+  std::atomic<std::uint64_t> heartbeats_received_{0};
+  std::atomic<double> odometry_ingest_lag_s_{0.0};
 
   std::string map_backend_ = "cloud_octomap";
   mgg::StateVec current_state_ = mgg::StateVec::Zero();
@@ -1254,6 +1262,8 @@ class PlannerNode : public rclcpp::Node {
   /// Reentrant, so the planning service and the subscriptions can run
   /// concurrently under a MultiThreadedExecutor. See the note in main().
   rclcpp::CallbackGroup::SharedPtr callback_group_;
+  rclcpp::CallbackGroup::SharedPtr input_callback_group_;
+  rclcpp::TimerBase::SharedPtr input_timer_;
   /// no_go_zones alone: its messages replace one another, so they are
   /// handled one at a time.
   rclcpp::CallbackGroup::SharedPtr no_go_zones_group_;

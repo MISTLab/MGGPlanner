@@ -337,13 +337,21 @@ PlannerNode::PlannerNode(const rclcpp::NodeOptions& options)
 
   callback_group_ =
       create_callback_group(rclcpp::CallbackGroupType::Reentrant);
+  input_callback_group_ =
+      create_callback_group(rclcpp::CallbackGroupType::Reentrant);
+  rclcpp::SubscriptionOptions input_opts;
+  input_opts.callback_group = input_callback_group_;
+  input_timer_ = create_wall_timer(std::chrono::milliseconds(20), [this]() {
+    std::unique_lock<std::recursive_mutex> lock(planner_mutex_, std::try_to_lock);
+    if (lock.owns_lock()) applyLatestOdometry();
+  }, input_callback_group_);
   rclcpp::SubscriptionOptions sub_opts;
   sub_opts.callback_group = callback_group_;
 
   odom_sub_ = create_subscription<nav_msgs::msg::Odometry>(
       "odometry", rclcpp::QoS(10),
       [this](nav_msgs::msg::Odometry::ConstSharedPtr m) { onOdometry(m); },
-      sub_opts);
+      input_opts);
 
   if (cloud_map_ != nullptr) {
     rclcpp::QoS cloud_qos(rclcpp::KeepLast(10));
@@ -361,7 +369,7 @@ PlannerNode::PlannerNode(const rclcpp::NodeOptions& options)
         [this](mgg_msgs::msg::MappingSnapshot::ConstSharedPtr m) {
           onMappingSnapshot(m);
         },
-        sub_opts);
+        input_opts);
   }
 
   neighbour_sub_ = create_subscription<mgg_msgs::msg::Graph>(
@@ -1992,6 +2000,13 @@ mgg::MolaMap::ReadLease PlannerNode::mapReadLease() const {
 
 void PlannerNode::refreshMapRevision() {
   if (mola_map_ == nullptr) return;
+  {
+    std::lock_guard<std::mutex> lock(input_mutex_);
+    if (latest_snapshot_) {
+      mapping_snapshot_ = *latest_snapshot_;
+      have_mapping_snapshot_ = true;
+    }
+  }
   const std::uint64_t generation = mola_map_->activeGeneration();
   if (generation == observed_map_generation_) return;
   observed_map_generation_ = generation;
@@ -2170,20 +2185,34 @@ void PlannerNode::onOdometry(nav_msgs::msg::Odometry::ConstSharedPtr msg) {
                          "ignoring non-finite odometry");
     return;
   }
-  const std::lock_guard<std::recursive_mutex> lock(planner_mutex_);
-  // The subscription is reentrant and every callback waits on the planner
-  // mutex, so messages can be handled out of order: an older one must not
-  // overwrite a newer state.
-  const std::int64_t stamp_ns =
-      static_cast<std::int64_t>(msg->header.stamp.sec) * 1000000000LL +
-      static_cast<std::int64_t>(msg->header.stamp.nanosec);
-  if (have_odometry_ && stamp_ns < last_odometry_stamp_ns_) {
-    RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 5000,
-                         "ignoring odometry %.3f s older than the current state",
-                         static_cast<double>(last_odometry_stamp_ns_ - stamp_ns) *
-                             1e-9);
-    return;
+  const auto received = std::chrono::steady_clock::now();
+  {
+    std::lock_guard<std::mutex> lock(input_mutex_);
+    if (latest_odometry_ &&
+        rclcpp::Time(msg->header.stamp) < rclcpp::Time(latest_odometry_->header.stamp))
+      return;
+    latest_odometry_ = msg;
+    latest_odometry_received_ = received;
   }
+  odometry_ingest_lag_s_.store(
+      std::chrono::duration<double>(std::chrono::steady_clock::now() - received).count());
+  // Never queue behind planning. Requests and the timer drain the latest slot.
+  std::unique_lock<std::recursive_mutex> lock(planner_mutex_, std::try_to_lock);
+  if (lock.owns_lock()) applyLatestOdometry();
+}
+
+void PlannerNode::applyLatestOdometry() {
+  nav_msgs::msg::Odometry::ConstSharedPtr msg;
+  std::chrono::steady_clock::time_point received;
+  {
+    std::lock_guard<std::mutex> lock(input_mutex_);
+    msg = latest_odometry_;
+    received = latest_odometry_received_;
+  }
+  if (!msg) return;
+  const auto stamp_ns = rclcpp::Time(msg->header.stamp).nanoseconds();
+  if (have_odometry_ && stamp_ns <= last_odometry_stamp_ns_) return;
+  const mgg::StateVec state = fromPoseMsg(msg->pose.pose);
   last_odometry_stamp_ns_ = stamp_ns;
   current_state_ = state;
   current_tilt_ = tiltFromQuaternion(msg->pose.pose.orientation);
@@ -2195,7 +2224,7 @@ void PlannerNode::onOdometry(nav_msgs::msg::Odometry::ConstSharedPtr msg) {
     }
   }
   have_odometry_ = true;
-  last_odometry_received_ = std::chrono::steady_clock::now();
+  last_odometry_received_ = received;
 
   auto map_read = mapReadLease();
   refreshMapRevision();
@@ -2276,14 +2305,15 @@ void PlannerNode::onMappingSnapshot(
                          "ignoring invalid mapping snapshot");
     return;
   }
-  const std::lock_guard<std::recursive_mutex> lock(planner_mutex_);
   Eigen::Isometry3d component_from_navigation = Eigen::Isometry3d::Identity();
   component_from_navigation.linear() =
       Eigen::Quaterniond(q.w, q.x, q.y, q.z).normalized().toRotationMatrix();
   component_from_navigation.translation() = Eigen::Vector3d(t.x, t.y, t.z);
-  mapping_snapshot_ = *msg;
-  have_mapping_snapshot_ = true;
-  refreshMapRevision();
+  {
+    std::lock_guard<std::mutex> lock(input_mutex_);
+    latest_snapshot_ = msg;
+  }
+  ++heartbeats_received_;
   const std::string prior_error = mola_map_->lastError();
   if (!prior_error.empty()) {
     RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 5000,
@@ -5072,6 +5102,8 @@ void PlannerNode::onPlanRequest(
     const std::shared_ptr<mgg_msgs::srv::PlannerSrv::Request> request,
     std::shared_ptr<mgg_msgs::srv::PlannerSrv::Response> response) {
   const std::lock_guard<std::recursive_mutex> lock(planner_mutex_);
+  applyLatestOdometry();
+  refreshMapRevision();
   StandingStartScope standing_scope(*this);
   // One peer set for the whole request (review r0, I5).
   std::optional<PeerBodyPin> peer_pin;
@@ -6207,6 +6239,8 @@ void PlannerNode::onObjectiveRequest(
     std::shared_ptr<mgg_msgs::srv::PlanObjective::Response> response) {
   using Service = mgg_msgs::srv::PlanObjective;
   const std::lock_guard<std::recursive_mutex> lock(planner_mutex_);
+  applyLatestOdometry();
+  refreshMapRevision();
   StandingStartScope standing_scope(*this);
   // One peer set for the whole request (review r0, I5).
   std::optional<PeerBodyPin> peer_pin;

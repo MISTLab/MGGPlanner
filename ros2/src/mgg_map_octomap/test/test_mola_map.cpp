@@ -1613,7 +1613,7 @@ TEST(MolaMap, ReadLeaseKeepsOneSnapshotAcrossAQueryTransaction) {
       return successor_started.load(std::memory_order_acquire);
     }));
     std::this_thread::sleep_for(std::chrono::milliseconds(20));
-    EXPECT_FALSE(successor_returned.load(std::memory_order_acquire));
+    EXPECT_TRUE(successor_returned.load(std::memory_order_acquire));
     EXPECT_EQ(provider.getVoxelStatus({1.1, 0.1, 0.1}),
               VoxelStatus::kOccupied);
     EXPECT_EQ(provider.getVoxelStatus({1.7, 0.1, 0.1}), VoxelStatus::kFree);
