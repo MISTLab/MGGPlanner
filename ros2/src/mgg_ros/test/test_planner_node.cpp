@@ -1737,6 +1737,33 @@ class PlannerNodeTestPeer {
     msg->poses.push_back(pose);
     node.onAerialPeerBodies(msg);
   }
+  /// An aerial cylinder message in `frame`, as aerialPeerBodies.
+  static void aerialPeerBodiesInFrame(PlannerNode& node, const std::string& frame) {
+    auto msg = std::make_shared<geometry_msgs::msg::PoseArray>();
+    msg->header.frame_id = frame;
+    geometry_msgs::msg::Pose pose;
+    pose.position.z = 1.0;
+    pose.orientation.x = 0.5;
+    msg->poses.push_back(pose);
+    node.onAerialPeerBodies(msg);
+  }
+  static PlannerNode::AerialCounters aerialCounters(PlannerNode& node) {
+    const std::lock_guard<std::recursive_mutex> lock(node.planner_mutex_);
+    return node.aerial_counters_;
+  }
+  static std::string aerialStatusJson(PlannerNode& node) {
+    const std::lock_guard<std::recursive_mutex> lock(node.planner_mutex_);
+    return node.aerialStatusJson();
+  }
+  /// Whether the global edge between `a` and `b` is closed, as a search
+  /// sees it; records what closed it.
+  static bool globalEdgeBlocked(PlannerNode& node, int a, int b) {
+    const std::lock_guard<std::recursive_mutex> lock(node.planner_mutex_);
+    return node.globalEdgeBlocked(*node.findGlobalVertex(a), *node.findGlobalVertex(b));
+  }
+  static std::pair<std::size_t, std::size_t> peerBlockedEdgesBySource(PlannerNode& node) {
+    return {node.peer_blocked_edges_.size(), node.peer_cylinder_blocked_edges_.size()};
+  }
   static bool peerPathClear(PlannerNode& node, const Eigen::Vector3d& a, const Eigen::Vector3d& b) {
     return node.peerAdmissible({mgg::StateVec(a.x(), a.y(), a.z(), 0),
                                 mgg::StateVec(b.x(), b.y(), b.z(), 0)});
@@ -4389,6 +4416,136 @@ TEST_F(PlannerNodeTest, AerialReachabilityPrecedesOwnPreferenceGroundUnchanged) 
     ASSERT_EQ(candidates.size(), 1u);
     EXPECT_EQ(candidates.front().id, aerial ? 2u : 1u);
   }
+}
+
+TEST_F(PlannerNodeTest, ALiftedTargetIsSelectedUnderDeployedDefaultsWhenOwnClustersAreUnreachable) {
+  // drone-r3: no lifted target was ever selected, and nothing recorded how
+  // many were offered. Deployed defaults (tour min_cluster_gain, unknown
+  // gain 60), a finite battery reach, own clusters all unreachable.
+  auto node = makeNode("lift_selected_defaults", "world", {
+      rclcpp::Parameter("fleet.enabled", false),
+      rclcpp::Parameter("PlanningParams.unknown_voxel_gain", 60.0),
+      rclcpp::Parameter("neighbour_offsets", std::vector<double>{2, 0, 0, 0}),
+      rclcpp::Parameter("aerial_frontier_height_m", .4),
+      rclcpp::Parameter("aerial_min_height_m", .3),
+      rclcpp::Parameter("aerial_max_height_m", .6)});
+  PlannerNodeTestPeer::setAerialRobot(*node);
+  MolaFloorProduct product(-1, 5, -1, 1);
+  PlannerNodeTestPeer::useMolaMap(*node, product.serve());
+  PlannerNodeTestPeer::acceptOdometryFacing(*node, .1, .1, 0, 1, .4);
+  PlannerNodeTestPeer::addGlobalVertex(*node, 1, 1.1, .1, .4, {0});
+  // The robot's own frontier, of far more gain, on an island of the
+  // roadmap the robot cannot reach (farther from the peer frontier than
+  // vertex 1, which anchors it).
+  const int island = PlannerNodeTestPeer::addGlobalVertex(*node, 1, -.8, -.7, .4, {});
+  PlannerNodeTestPeer::setVertexGain(*node, island, 1e6);
+  PlannerNodeTestPeer::markGlobalFrontier(*node, island);
+  mgg_msgs::msg::Graph peer;
+  peer.header.frame_id = "world";
+  const auto add = [&peer](int id, double x, double y, int unknown) {
+    mgg_msgs::msg::Vertex v;
+    v.id = id; v.robot_id = 2; v.pose.position.x = x;
+    v.pose.position.y = y; v.pose.orientation.w = 1;
+    v.is_frontier = true; v.num_unknown_voxels = unknown;
+    peer.vertices.push_back(v);
+  };
+  add(0, 3.1, .1, 300);   // admitted
+  add(1, 2.0, -.6, 10);   // under the gain floor
+  add(2, 11.0, .1, 300);  // no own vertex within 5 m
+  add(3, 1.1, 3.0, 300);  // its link crosses unobserved space
+  PlannerNodeTestPeer::receiveGraph(*node, peer);
+  PlannerNodeTestPeer::solveTourOnEveryChange(*node);
+  // A reach too short for the way out and back is refused and recorded
+  // with both distances and the budget.
+  PlannerNodeTestPeer::setFlightReach(*node, 5.0);
+  EXPECT_EQ(PlannerNodeTestPeer::refreshTour(*node), mgg::kNoCluster);
+  auto counts = PlannerNodeTestPeer::aerialCounters(*node);
+  EXPECT_GE(counts.reach_cap_rejects, 1u);
+  EXPECT_EQ(counts.reach_cap_home_unreachable, 0u);
+  EXPECT_NEAR(counts.last_reach_out_m, 3.0, 1e-6);
+  EXPECT_NEAR(counts.last_reach_back_m, 3.0, 1e-6);
+  EXPECT_NEAR(counts.last_reach_budget_m, 5.0, 1e-9);
+  PlannerNodeTestPeer::setFlightReach(*node, 50.0);
+  mgg::FrontierCluster lifted;
+  for (const auto& cluster : PlannerNodeTestPeer::frontierClusters(*node)) {
+    if (cluster.owner_robot_id == 2) lifted = cluster;
+  }
+  ASSERT_EQ(lifted.owner_robot_id, 2);
+  EXPECT_EQ(PlannerNodeTestPeer::refreshTour(*node), lifted.id);
+  const std::string note = PlannerNodeTestPeer::refreshTourNote(*node);
+  EXPECT_NE(note.find("lifted from robot 2's frontier"), std::string::npos) << note;
+  counts = PlannerNodeTestPeer::aerialCounters(*node);
+  EXPECT_EQ(counts.lifted_proposed, 4);
+  EXPECT_EQ(counts.lifted_rejected_gain, 1);
+  EXPECT_EQ(counts.lifted_rejected_no_anchor, 1);
+  EXPECT_EQ(counts.lifted_rejected_link, 1);
+  EXPECT_EQ(counts.lifted_rejected_cap, 0);
+  EXPECT_EQ(counts.lifted_rejected_merged, 0);
+  EXPECT_EQ(counts.lifted_admitted, 1);
+  EXPECT_EQ(counts.lifted_senders_unplaced, 0);
+  EXPECT_EQ(counts.lifted_selected, 1u);
+  EXPECT_EQ(PlannerNodeTestPeer::homeLinkStatus(*node), "connected");
+  const std::string status = PlannerNodeTestPeer::aerialStatusJson(*node);
+  EXPECT_NE(status.find("\"lifted\":{\"proposed\":4,\"admitted\":1,\"rejected\":"
+                        "{\"gain\":1,\"cap\":0,\"merged\":0,\"no_anchor\":1,"
+                        "\"link\":1},\"senders_unplaced\":0,\"selected\":1}"),
+            std::string::npos) << status;
+  EXPECT_NE(status.find("\"last_out_m\":3.000,\"last_back_m\":3.000,"
+                        "\"last_budget_m\":5.000,\"reach_m\":50.000"),
+            std::string::npos) << status;
+  EXPECT_NE(status.find("\"home\":{\"status\":\"connected\""), std::string::npos)
+      << status;
+}
+
+TEST_F(PlannerNodeTest, AerialPeerCountersSeparateCylindersFromLegacyDiscs) {
+  // drone-r3 could not tell whether cylinders arrived, nor whether its
+  // 1 to 31 peer-blocked edges per plan were cylinders or legacy discs.
+  auto node = makeNode("aerial_cylinder_counters");
+  PlannerNodeTestPeer::setAerialRobot(*node);
+  PlannerNodeTestPeer::aerialPeerBodies(*node, .97, .6);
+  PlannerNodeTestPeer::aerialPeerBodiesInFrame(*node, "elsewhere");
+  PlannerNodeTestPeer::aerialPeerBodies(*node, .1, .1, 1);  // malformed
+  EXPECT_FALSE(PlannerNodeTestPeer::peerPathClear(*node, {-2, 0, 1.2}, {2, 0, 1.2}));
+  EXPECT_TRUE(PlannerNodeTestPeer::peerPathClear(*node, {-2, 0, 1.6}, {2, 0, 1.6}));
+  PlannerNodeTestPeer::acceptOdometryFacing(*node, -3.0, 0.0, 0, 1, 1.2);
+  const int west = PlannerNodeTestPeer::addGlobalVertex(*node, 1, -2, 0, 1.2, {});
+  const int east = PlannerNodeTestPeer::addGlobalVertex(*node, 1, 2, 0, 1.2, {west});
+  EXPECT_TRUE(PlannerNodeTestPeer::globalEdgeBlocked(*node, west, east));
+  auto counts = PlannerNodeTestPeer::aerialCounters(*node);
+  EXPECT_EQ(counts.cylinder_messages_accepted, 1u);
+  EXPECT_EQ(counts.cylinder_messages_wrong_frame, 1u);
+  EXPECT_EQ(counts.cylinder_messages_invalid, 1u);
+  EXPECT_EQ(counts.cylinder_frame, "world");
+  EXPECT_EQ(counts.cylinder_segment_blocks, 2u);
+  EXPECT_EQ(counts.disc_segment_blocks, 0u);
+  EXPECT_EQ(PlannerNodeTestPeer::peerBlockedEdgesBySource(*node),
+            (std::pair<std::size_t, std::size_t>{1, 1}));
+  const std::string status = PlannerNodeTestPeer::aerialStatusJson(*node);
+  EXPECT_NE(status.find("\"cylinders\":{\"accepted\":1,\"rejected_frame\":1,"
+                        "\"rejected_invalid\":1,\"frame\":\"world\",\"in_force\":1,"
+                        "\"legacy_discs_in_force\":0,\"segments_blocked\":"
+                        "{\"cylinder\":2,\"legacy_disc\":0}}"),
+            std::string::npos) << status;
+
+  // Before any cylinder message a MOLA drone keeps the legacy XY discs.
+  auto legacy = makeNode("aerial_disc_counters", "world", {});
+  PlannerNodeTestPeer::setAerialRobot(*legacy);
+  MolaFloorProduct product(-4, 4, -1, 1);
+  PlannerNodeTestPeer::useMolaMap(*legacy, product.serve());
+  PlannerNodeTestPeer::receivePeerBodies(*legacy, {{0.0, 0.0}});
+  PlannerNodeTestPeer::acceptOdometryFacing(*legacy, -3.0, 0.0, 0, 1, .4);
+  const int a = PlannerNodeTestPeer::addGlobalVertex(*legacy, 1, -2, 0, .4, {});
+  const int b = PlannerNodeTestPeer::addGlobalVertex(*legacy, 1, 2, 0, .4, {a});
+  EXPECT_TRUE(PlannerNodeTestPeer::globalEdgeBlocked(*legacy, a, b));
+  counts = PlannerNodeTestPeer::aerialCounters(*legacy);
+  EXPECT_EQ(counts.cylinder_messages_accepted, 0u);
+  EXPECT_EQ(counts.cylinder_segment_blocks, 0u);
+  EXPECT_EQ(counts.disc_segment_blocks, 1u);
+  EXPECT_EQ(PlannerNodeTestPeer::peerBlockedEdgesBySource(*legacy),
+            (std::pair<std::size_t, std::size_t>{1, 0}));
+  EXPECT_NE(PlannerNodeTestPeer::aerialStatusJson(*legacy).find(
+                "\"legacy_discs_in_force\":1"),
+            std::string::npos);
 }
 
 TEST_F(PlannerNodeTest, AerialPeerCylinderAddsMarginInThreeDimensionsGroundUnchanged) {

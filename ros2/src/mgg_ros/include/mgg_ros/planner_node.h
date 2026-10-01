@@ -253,6 +253,14 @@ class PlannerNode : public rclcpp::Node {
   struct PeerBodyPin;
   bool peerBlocksSegment(const Eigen::Vector3d& from,
                          const Eigen::Vector3d& to) const;
+  /// What closes a segment for peerBlocksSegment, counted in
+  /// aerial_counters_.
+  enum class PeerBlock { kNone, kAerialCylinder, kLegacyDisc };
+  PeerBlock peerBlockingSegment(const Eigen::Vector3d& from,
+                                const Eigen::Vector3d& to) const;
+  /// The aerial features' counters and home status as one JSON object,
+  /// logged as "aerial_status {...}" (throttled) after an aerial plan.
+  std::string aerialStatusJson() const;
   void onAerialPeerBodies(geometry_msgs::msg::PoseArray::ConstSharedPtr msg);
   /// Pins the peer bodies in force now in `pin`, on this thread, for the
   /// rest of a plan or objective request (PeerBodyPin):
@@ -882,6 +890,52 @@ class PlannerNode : public rclcpp::Node {
   /// Global graph edges a peer body closed in the searches of this plan
   /// request (globalEdgeBlocked), as (lower id, higher id).
   std::set<std::pair<int, int>> peer_blocked_edges_;
+  /// Of those, the ones an aerial peer cylinder closed (the rest: legacy
+  /// discs).
+  std::set<std::pair<int, int>> peer_cylinder_blocked_edges_;
+  /// Cheap counters for the aerial features (mgg-home, drone-r3 left them
+  /// unobservable). "last_" values are of the latest evaluation; the rest
+  /// accumulate since start. Counts per evaluation, not per unique target:
+  /// a plan request evaluates the candidates more than once.
+  struct AerialCounters {
+    /// liftedPeerFrontiers, its latest evaluation: peer frontier vertices
+    /// it lifted, those refused (gain floor, the 64-slot cap, within the
+    /// merge radius of a better one, no own vertex within 5 m, no
+    /// observed-free link from one) and those admitted.
+    int lifted_proposed = 0;
+    int lifted_rejected_gain = 0;
+    int lifted_rejected_cap = 0;
+    int lifted_rejected_merged = 0;
+    int lifted_rejected_no_anchor = 0;
+    int lifted_rejected_link = 0;
+    int lifted_admitted = 0;
+    /// Senders whose roadmap had no current transform.
+    int lifted_senders_unplaced = 0;
+    /// Times the tour took a lifted target as its new target (a solve that
+    /// keeps the same one is not counted again).
+    std::uint64_t lifted_selected = 0;
+    mgg::ClusterId lifted_selected_target = mgg::kNoCluster;
+    /// aerial_peer_bodies messages accepted, refused for their frame or a
+    /// malformed entry, and the frame of the last accepted one.
+    std::uint64_t cylinder_messages_accepted = 0;
+    std::uint64_t cylinder_messages_wrong_frame = 0;
+    std::uint64_t cylinder_messages_invalid = 0;
+    std::string cylinder_frame;
+    /// Segment checks (roadmap edges in a search, path segments) a peer
+    /// closed, by what closed them.
+    mutable std::uint64_t cylinder_segment_blocks = 0;
+    mutable std::uint64_t disc_segment_blocks = 0;
+    /// Clusters the battery reach cap refused, those with no way home at
+    /// all, and the last refusal's out and back distances and budget.
+    std::uint64_t reach_cap_rejects = 0;
+    std::uint64_t reach_cap_home_unreachable = 0;
+    double last_reach_out_m = std::numeric_limits<double>::quiet_NaN();
+    double last_reach_back_m = std::numeric_limits<double>::quiet_NaN();
+    double last_reach_budget_m = std::numeric_limits<double>::quiet_NaN();
+  };
+  AerialCounters aerial_counters_;
+  /// The reach-cap note for an aerial cluster refused by it, counted.
+  std::string noteReachCapReject(double out_m, double back_m);
   /// Peer bodies are left out of peerBlocksSegment: set only to ask whether
   /// a failed search would have succeeded without them.
   bool peer_edges_open_ = false;

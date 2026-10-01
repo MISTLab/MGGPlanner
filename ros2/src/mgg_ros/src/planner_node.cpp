@@ -950,15 +950,24 @@ std::vector<mgg::FrontierCluster> PlannerNode::liftedPeerFrontiers() {
     lifted_target_graph_ = global_graph_;
   }
   std::vector<mgg::FrontierCluster> candidates;
+  AerialCounters& counts = aerial_counters_;
+  counts.lifted_proposed = counts.lifted_rejected_gain = counts.lifted_rejected_cap =
+      counts.lifted_rejected_merged = counts.lifted_rejected_no_anchor =
+          counts.lifted_rejected_link = counts.lifted_admitted =
+              counts.lifted_senders_unplaced = 0;
   const double height = std::clamp(aerial_frontier_height_m_, aerial_min_height_m_, aerial_max_height_m_);
   for (const auto& [sender, snapshot] : neighbour_roadmaps_) {
     const auto frame = neighbour_frames_.find(sender);
     Eigen::Isometry3d transform;
     if (frame == neighbour_frames_.end() ||
         !refreshNeighbourTransform(sender, frame->second) ||
-        !poses_->getRobotTransform(sender, transform)) continue;
+        !poses_->getRobotTransform(sender, transform)) {
+      ++counts.lifted_senders_unplaced;
+      continue;
+    }
     for (const auto& v : snapshot.vertices) {
       if (!v.is_frontier || v.visited || !v.state.allFinite()) continue;
+      ++counts.lifted_proposed;
       mgg::FrontierCluster c;
       c.owner_robot_id = sender;
       c.position = transform * v.state.head<3>();
@@ -966,7 +975,10 @@ std::vector<mgg::FrontierCluster> PlannerNode::liftedPeerFrontiers() {
       c.gain = std::max(0, v.num_unknown_voxels) * planning_params_.unknown_voxel_gain +
           std::max(0, v.num_free_voxels) * planning_params_.free_voxel_gain +
           std::max(0, v.num_occupied_voxels) * planning_params_.occupied_voxel_gain;
-      if (c.gain < tour_params_.min_cluster_gain) continue;
+      if (c.gain < tour_params_.min_cluster_gain) {
+        ++counts.lifted_rejected_gain;
+        continue;
+      }
       c.id = mgg::makeClusterId(sender, c.position, tour_params_.cluster_id_cell_m);
       candidates.push_back(c);
     }
@@ -977,18 +989,26 @@ std::vector<mgg::FrontierCluster> PlannerNode::liftedPeerFrontiers() {
   std::vector<LiftedTarget> targets;
   const auto box = robot_params_.getPlanningSize();
   for (auto c : candidates) {
-    if (targets.size() == 64) break;
+    if (targets.size() == 64) {
+      ++counts.lifted_rejected_cap;
+      continue;
+    }
     if (std::any_of(targets.begin(), targets.end(), [&](const auto& other) {
           return (c.position - other.cluster.position).norm() <= fleet_params_.cluster_merge_radius_m;
-        })) continue;
+        })) {
+      ++counts.lifted_rejected_merged;
+      continue;
+    }
     mgg::StateVec state(c.position.x(), c.position.y(), c.position.z(), 0);
     std::vector<mgg::Vertex*> anchors;
     global_graph_->getNearestVertices(&state, 5.0, &anchors);
     mgg::Vertex* anchor = nullptr;
     double best = std::numeric_limits<double>::infinity();
+    bool own_anchor_near = false;
     for (auto* v : anchors) {
       if (!v || v->lifted_peer_target || !global_graph_->inService(*v) ||
           v->robot_id != static_cast<int>(planning_params_.robot_id)) continue;
+      own_anchor_near = true;
       const double distance = (v->state.head<3>() - c.position).norm();
       if (distance >= best || map_->getStaticStrictPathStatus(
           v->state.head<3>() + robot_params_.center_offset,
@@ -996,8 +1016,15 @@ std::vector<mgg::FrontierCluster> PlannerNode::liftedPeerFrontiers() {
       best = distance;
       anchor = v;
     }
-    if (anchor) targets.push_back({c, anchor->id, best});
+    if (anchor) {
+      targets.push_back({c, anchor->id, best});
+    } else if (own_anchor_near) {
+      ++counts.lifted_rejected_link;
+    } else {
+      ++counts.lifted_rejected_no_anchor;
+    }
   }
+  counts.lifted_admitted = static_cast<int>(targets.size());
   const bool changed = targets.size() != lifted_targets_.size() ||
       !std::equal(targets.begin(), targets.end(), lifted_targets_.begin(),
           [](const auto& a, const auto& b) {
@@ -1124,17 +1151,23 @@ std::vector<mgg::FrontierCluster> PlannerNode::tourCandidates(
       auto costs = mgg::computeTourCosts(*global_graph_, graph_revision_, tour_distances_,
           link->id, current_state_[3], clusters, tour_params_.heading_weight, peer_generation_);
       const auto before_cap = costs.from_robot;
-      mgg::capTourCostsByReach(costs, homeDistances(clusters), flight_reach_m_);
+      const std::vector<double> back = homeDistances(clusters);
+      mgg::capTourCostsByReach(costs, back, flight_reach_m_);
       const auto before_value_cap = costs.from_robot;
       capTourValues(costs, clusters);
       std::vector<mgg::FrontierCluster> reachable;
       for (std::size_t i = 0; i < clusters.size(); ++i) {
+        const bool reach_capped =
+            std::isfinite(before_cap[i]) && !std::isfinite(before_value_cap[i]);
+        const std::string reach_note =
+            reach_capped ? noteReachCapReject(costs.distance_from_robot[i], back[i])
+                         : std::string();
         if (std::isfinite(costs.from_robot[i])) reachable.push_back(clusters[i]);
         else if (clusters[i].owner_robot_id == own_id) {
           RCLCPP_INFO(get_logger(), "aerial tour: own cluster %016llx unreachable: %s",
               static_cast<unsigned long long>(clusters[i].id),
               std::isfinite(before_value_cap[i]) ? "below distance-discounted value floor" :
-              std::isfinite(before_cap[i]) ? "battery return reach cap" :
+              reach_capped ? reach_note.c_str() :
               findGlobalVertex(clusters[i].representative_vertex_id) ?
                   "disconnected or search-time blocked" : "representative off graph");
         }
@@ -1303,13 +1336,18 @@ std::optional<mgg::FrontierCluster> PlannerNode::refreshTour(
         current_state_[3], clusters, tour_params_.heading_weight,
         peer_generation_);
     const auto before_reach_cap = costs.from_robot;
-    mgg::capTourCostsByReach(costs, homeDistances(clusters), flight_reach_m_);
+    const std::vector<double> back = homeDistances(clusters);
+    mgg::capTourCostsByReach(costs, back, flight_reach_m_);
     if (fleet_ && robot_params_.type == mgg::RobotType::kAerialRobot) {
       for (std::size_t i = 0; i < clusters.size(); ++i) {
         if (clusters[i].owner_robot_id == own_id && !std::isfinite(costs.from_robot[i])) {
+          const bool reach_capped = std::isfinite(before_reach_cap[i]);
+          const std::string reach_note =
+              reach_capped ? noteReachCapReject(costs.distance_from_robot[i], back[i])
+                           : std::string();
           RCLCPP_INFO(get_logger(), "aerial tour: own cluster %016llx unreachable: %s",
               static_cast<unsigned long long>(clusters[i].id),
-              std::isfinite(before_reach_cap[i]) ? "battery return reach cap" :
+              reach_capped ? reach_note.c_str() :
               findGlobalVertex(clusters[i].representative_vertex_id) ?
                   "disconnected or search-time blocked" : "representative off graph");
         }
@@ -1342,6 +1380,23 @@ std::optional<mgg::FrontierCluster> PlannerNode::refreshTour(
     }
     tour_planner_->solve(clusters, costs, graph_revision_,
                          tour_assignment_version_, now_s, peer_generation_);
+    if (robot_params_.type == mgg::RobotType::kAerialRobot) {
+      mgg::ClusterId lifted_target = mgg::kNoCluster;
+      for (const mgg::FrontierCluster& cluster : clusters) {
+        if (cluster.id != tour_planner_->target()) continue;
+        const mgg::Vertex* representative =
+            findGlobalVertex(cluster.representative_vertex_id);
+        if (representative != nullptr && representative->lifted_peer_target) {
+          lifted_target = cluster.id;
+        }
+        break;
+      }
+      if (lifted_target != mgg::kNoCluster &&
+          lifted_target != aerial_counters_.lifted_selected_target) {
+        ++aerial_counters_.lifted_selected;
+      }
+      aerial_counters_.lifted_selected_target = lifted_target;
+    }
     tour_solve_ms_ = std::chrono::duration<double, std::milli>(
                          std::chrono::steady_clock::now() - started)
                          .count();
@@ -1364,6 +1419,12 @@ std::optional<mgg::FrontierCluster> PlannerNode::refreshTour(
                   cluster.position.x(), cluster.position.y(),
                   cluster.position.z(), tour_solve_ms_);
     note = buf;
+    const mgg::Vertex* representative =
+        findGlobalVertex(cluster.representative_vertex_id);
+    if (representative != nullptr && representative->lifted_peer_target) {
+      note += ", lifted from robot " + std::to_string(cluster.owner_robot_id) +
+              "'s frontier";
+    }
     return cluster;
   }
   if (!tour_clusters_.empty() && tour_value_left_out_ > 0) {
@@ -1375,6 +1436,10 @@ std::optional<mgg::FrontierCluster> PlannerNode::refreshTour(
   }
   note = tour_clusters_.empty() ? "; tour: no cluster"
                                 : "; tour: no reachable cluster";
+  if (robot_params_.type == mgg::RobotType::kAerialRobot &&
+      home_link_status_.rfind("unreachable", 0) == 0) {
+    note += " (home " + home_link_status_ + ")";
+  }
   return std::nullopt;
 }
 
@@ -1613,6 +1678,97 @@ void PlannerNode::relinkAerialHome(int robot_vertex_id) {
               home->state.x(), home->state.y(), home->state.z(),
               rep.num_edges_added,
               reached ? "reached from the robot" : "still not reached");
+}
+
+std::string PlannerNode::noteReachCapReject(double out_m, double back_m) {
+  AerialCounters& counts = aerial_counters_;
+  ++counts.reach_cap_rejects;
+  if (!std::isfinite(back_m)) ++counts.reach_cap_home_unreachable;
+  counts.last_reach_out_m = out_m;
+  counts.last_reach_back_m = back_m;
+  counts.last_reach_budget_m = flight_reach_m_;
+  char note[192];
+  if (std::isfinite(back_m)) {
+    std::snprintf(note, sizeof(note),
+                  "battery return reach cap (out %.1f m + back %.1f m > "
+                  "reach %.1f m)",
+                  out_m, back_m, flight_reach_m_);
+  } else {
+    std::snprintf(note, sizeof(note),
+                  "battery return reach cap (out %.1f m, no way back to home: "
+                  "%s; reach %.1f m)",
+                  out_m, home_link_status_.c_str(), flight_reach_m_);
+  }
+  return note;
+}
+
+namespace {
+/// A JSON number, or null when it is not finite.
+std::string jsonNumber(double value) {
+  if (!std::isfinite(value)) return "null";
+  char buf[48];
+  std::snprintf(buf, sizeof(buf), "%.3f", value);
+  return buf;
+}
+/// `text` as a JSON string, its quotes and backslashes escaped.
+std::string jsonString(const std::string& text) {
+  std::string out = "\"";
+  for (const char c : text) {
+    if (c == '"' || c == '\\') out += '\\';
+    out += c;
+  }
+  return out + "\"";
+}
+}  // namespace
+
+std::string PlannerNode::aerialStatusJson() const {
+  const AerialCounters& c = aerial_counters_;
+  const auto home_it = global_graph_->vertices_map_.find(kHomeVertexId);
+  const mgg::Vertex* home =
+      home_it == global_graph_->vertices_map_.end() ? nullptr : home_it->second;
+  const auto home_edges = global_graph_->edge_map_.find(kHomeVertexId);
+  std::size_t legacy_discs = 0;
+  if (mola_map_ != nullptr) {
+    legacy_discs = mola_map_->activeTransientDiscs().centres.size();
+  }
+  std::string j = "{\"robot_id\":" + std::to_string(planning_params_.robot_id);
+  j += ",\"home\":{\"status\":" + jsonString(home_link_status_) +
+       ",\"x\":" + jsonNumber(home ? home->state.x() : NAN) +
+       ",\"y\":" + jsonNumber(home ? home->state.y() : NAN) +
+       ",\"z\":" + jsonNumber(home ? home->state.z() : NAN) +
+       ",\"lifted\":" + (home_seeded_landed_ ? "true" : "false") +
+       ",\"edges\":" +
+       std::to_string(home_edges == global_graph_->edge_map_.end()
+                          ? 0 : home_edges->second.size()) +
+       ",\"reroots\":" + std::to_string(home_reroots_) +
+       ",\"relink_attempts\":" + std::to_string(home_relink_attempts_) +
+       ",\"relinks\":" + std::to_string(home_relinks_) + "}";
+  j += ",\"lifted\":{\"proposed\":" + std::to_string(c.lifted_proposed) +
+       ",\"admitted\":" + std::to_string(c.lifted_admitted) +
+       ",\"rejected\":{\"gain\":" + std::to_string(c.lifted_rejected_gain) +
+       ",\"cap\":" + std::to_string(c.lifted_rejected_cap) +
+       ",\"merged\":" + std::to_string(c.lifted_rejected_merged) +
+       ",\"no_anchor\":" + std::to_string(c.lifted_rejected_no_anchor) +
+       ",\"link\":" + std::to_string(c.lifted_rejected_link) +
+       "},\"senders_unplaced\":" + std::to_string(c.lifted_senders_unplaced) +
+       ",\"selected\":" + std::to_string(c.lifted_selected) + "}";
+  j += ",\"cylinders\":{\"accepted\":" +
+       std::to_string(c.cylinder_messages_accepted) +
+       ",\"rejected_frame\":" + std::to_string(c.cylinder_messages_wrong_frame) +
+       ",\"rejected_invalid\":" + std::to_string(c.cylinder_messages_invalid) +
+       ",\"frame\":" + jsonString(c.cylinder_frame) +
+       ",\"in_force\":" + std::to_string(activeAerialPeerBodies().size()) +
+       ",\"legacy_discs_in_force\":" + std::to_string(legacy_discs) +
+       ",\"segments_blocked\":{\"cylinder\":" +
+       std::to_string(c.cylinder_segment_blocks) +
+       ",\"legacy_disc\":" + std::to_string(c.disc_segment_blocks) + "}}";
+  j += ",\"reach_cap\":{\"rejects\":" + std::to_string(c.reach_cap_rejects) +
+       ",\"home_unreachable\":" + std::to_string(c.reach_cap_home_unreachable) +
+       ",\"last_out_m\":" + jsonNumber(c.last_reach_out_m) +
+       ",\"last_back_m\":" + jsonNumber(c.last_reach_back_m) +
+       ",\"last_budget_m\":" + jsonNumber(c.last_reach_budget_m) +
+       ",\"reach_m\":" + jsonNumber(flight_reach_m_) + "}";
+  return j + "}";
 }
 
 std::vector<double> PlannerNode::homeDistances(
@@ -2262,7 +2418,12 @@ bool PlannerNode::noGoBlocksSegment(const Eigen::Vector3d& from,
 
 bool PlannerNode::peerBlocksSegment(const Eigen::Vector3d& from,
                                     const Eigen::Vector3d& to) const {
-  if (peer_edges_open_) return false;
+  return peerBlockingSegment(from, to) != PeerBlock::kNone;
+}
+
+PlannerNode::PeerBlock PlannerNode::peerBlockingSegment(
+    const Eigen::Vector3d& from, const Eigen::Vector3d& to) const {
+  if (peer_edges_open_) return PeerBlock::kNone;
   if (robot_params_.type == mgg::RobotType::kAerialRobot) {
     const auto box = robot_params_.getPlanningSize();
     const Eigen::Vector3d start = from + robot_params_.center_offset;
@@ -2290,22 +2451,30 @@ bool PlannerNode::peerBlocksSegment(const Eigen::Vector3d& from,
           end.z() >= start.z() - 1e-9 &&
           ((travel.squaredNorm() > 1e-12 && at_start.dot(travel) >= -1e-9) ||
            (travel.squaredNorm() <= 1e-12 && end.z() > start.z() + 1e-9))) continue;
-      if ((a + t * delta).norm() <= reach) return true;
+      if ((a + t * delta).norm() <= reach) {
+        ++aerial_counters_.cylinder_segment_blocks;
+        return PeerBlock::kAerialCylinder;
+      }
     }
   }
-  if (mola_map_ == nullptr) return false;
+  if (mola_map_ == nullptr) return PeerBlock::kNone;
   // Where a roadmap edge is checked (global_graph.cpp edgeStatus): the
   // body's centre, half its planning box across.
   const Eigen::Vector3d box = robot_params_.getPlanningSize();
-  return mola_map_->transientDiscsBlockSweep(
-      from + robot_params_.center_offset, to + robot_params_.center_offset,
-      0.5 * std::max(box.x(), box.y()));
+  if (!mola_map_->transientDiscsBlockSweep(
+          from + robot_params_.center_offset, to + robot_params_.center_offset,
+          0.5 * std::max(box.x(), box.y()))) {
+    return PeerBlock::kNone;
+  }
+  ++aerial_counters_.disc_segment_blocks;
+  return PeerBlock::kLegacyDisc;
 }
 
 void PlannerNode::onAerialPeerBodies(geometry_msgs::msg::PoseArray::ConstSharedPtr msg) {
   const std::lock_guard<std::recursive_mutex> lock(planner_mutex_);
   if (robot_params_.type != mgg::RobotType::kAerialRobot) return;
   if (msg->header.frame_id != world_frame_) {
+    ++aerial_counters_.cylinder_messages_wrong_frame;
     RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 5000, "ignoring aerial peer bodies in the wrong frame");
     return;
   }
@@ -2315,6 +2484,7 @@ void PlannerNode::onAerialPeerBodies(geometry_msgs::msg::PoseArray::ConstSharedP
     const auto& q = pose.orientation;
     if (!std::isfinite(p.x) || !std::isfinite(p.y) || !std::isfinite(p.z) ||
         !std::isfinite(q.x) || q.x <= 0 || q.y != 0 || q.z != 0 || q.w != 0) {
+      ++aerial_counters_.cylinder_messages_invalid;
       RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 5000,
           "invalid aerial peer cylinder: need finite XY/top, positive radius, zero y/z/w marker; keeping previous set");
       return;
@@ -2324,6 +2494,8 @@ void PlannerNode::onAerialPeerBodies(geometry_msgs::msg::PoseArray::ConstSharedP
   aerial_peer_bodies_ = std::move(bodies);
   aerial_peer_bodies_received_ = std::chrono::steady_clock::now();
   have_aerial_peer_bodies_ = true;
+  ++aerial_counters_.cylinder_messages_accepted;
+  aerial_counters_.cylinder_frame = msg->header.frame_id;
   // Once the spec-aware input is available, the legacy unbounded XY discs
   // must not prevent a drone from flying safely above a peer.
   if (mola_map_) mola_map_->setTransientDiscs({}, 0, peer_body_ttl_s_);
@@ -2406,8 +2578,12 @@ bool PlannerNode::globalEdgeBlocked(const mgg::Vertex& a,
   // Run 10b: roadmap edges laid before a peer parked on them routed
   // robot_1 and robot_3 through robot_2. Closed for the search only, as a
   // no-go zone's are: the peer moves on, and the roadmap keeps the edge.
-  if (!peerBlocksSegment(a.state.head<3>(), b.state.head<3>())) return false;
+  const PeerBlock block = peerBlockingSegment(a.state.head<3>(), b.state.head<3>());
+  if (block == PeerBlock::kNone) return false;
   peer_blocked_edges_.insert(std::minmax(a.id, b.id));
+  if (block == PeerBlock::kAerialCylinder) {
+    peer_cylinder_blocked_edges_.insert(std::minmax(a.id, b.id));
+  }
   return true;
 }
 
@@ -4718,6 +4894,7 @@ void PlannerNode::onPlanRequest(
   stored_reverse_sent_now_ = false;
   lattice_path_.clear();
   peer_blocked_edges_.clear();
+  peer_cylinder_blocked_edges_.clear();
   withdrawUnplacedNeighbours();
   response->planning_bound_mode = request->bound_mode;
   if (home_state_wait_started_) {
@@ -5029,6 +5206,13 @@ void PlannerNode::onPlanRequest(
   if (!peer_blocked_edges_.empty()) {
     summary += "; " + std::to_string(peer_blocked_edges_.size()) +
                " global graph edge(s) blocked by peers";
+    if (robot_params_.type == mgg::RobotType::kAerialRobot) {
+      summary += " (" + std::to_string(peer_cylinder_blocked_edges_.size()) +
+                 " by aerial cylinders, " +
+                 std::to_string(peer_blocked_edges_.size() -
+                                peer_cylinder_blocked_edges_.size()) +
+                 " by legacy discs)";
+    }
   }
   // Capture/recheck the escape for the actual route and bound mode sent.
   {
@@ -5049,6 +5233,10 @@ void PlannerNode::onPlanRequest(
   publishPath();
   publishMarkers();
   RCLCPP_INFO(get_logger(), "plan request: %s", summary.c_str());
+  if (robot_params_.type == mgg::RobotType::kAerialRobot) {
+    RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 10000, "aerial_status %s",
+                         aerialStatusJson().c_str());
+  }
   // A computed answer (including no-path/complete), not an early NOT_READY
   // refusal, establishes which configuration this exploration cycle used.
   // Publish before returning the service response, still under planner_mutex_.
