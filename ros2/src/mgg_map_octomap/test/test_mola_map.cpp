@@ -1559,6 +1559,37 @@ TEST(MolaMap, EachNewGridInstalledIsReportedOnce) {
   EXPECT_EQ(installs[1].source_stamp_ns, second.source_stamp_ns);
 }
 
+TEST(MolaMap, HeartbeatsRefreshWhilePublicationLeaseIsHeld) {
+  Publication publication;
+  auto cfg = config(publication);
+  cfg.snapshot_ttl_sec = 0.12;
+  MolaMap provider(cfg);
+  const auto request = publication.publish(0, {{5, 0, 0}}, freeBlock());
+  provider.requestSnapshot(request);
+  ASSERT_TRUE(waitFor([&]() { return provider.getStatus(); }));
+  std::atomic<bool> stop{false};
+  std::atomic<int> beats{0};
+  std::thread heartbeat;
+  {
+    auto lease = provider.acquireReadLease();
+    heartbeat = std::thread([&]() {
+      while (!stop.load()) {
+        provider.requestSnapshot(request);
+        ++beats;
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+      }
+    });
+    std::this_thread::sleep_for(std::chrono::milliseconds(300));
+    EXPECT_GT(beats.load(), 10) << "heartbeat blocked behind planner lease";
+    EXPECT_TRUE(provider.getStatus());
+    stop = true;
+  }
+  heartbeat.join();
+  EXPECT_TRUE(provider.getStatus());
+  std::this_thread::sleep_for(std::chrono::milliseconds(160));
+  EXPECT_FALSE(provider.getStatus()) << "stopped authority must still expire";
+}
+
 TEST(MolaMap, ReadLeaseKeepsOneSnapshotAcrossAQueryTransaction) {
   Publication publication;
   MolaMap provider(config(publication));
