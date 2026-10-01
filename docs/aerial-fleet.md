@@ -30,3 +30,58 @@ This interface is for a **one-drone fleet** with ground peers. Graph messages do
 The cylinder producer must publish **only ground peers**, never the receiving drone itself. Publish every 0.5 s, including empty arrays, and use the exact planning-frame string (normally `robot_4/odom`, without a leading slash).
 
 The first valid cylinder message, including an empty one, permanently selects the spec-aware input for that planner instance. There is **no automatic fallback** to legacy XY discs if the producer stops. After `peer_body_ttl_s` expires, there is no peer-cylinder avoidance until a fresh valid message arrives (static obstacle checks remain). This is the existing bounded-freshness policy, not a producer-failure safety stop. Deployment must keep the producer alive and monitor its publication; restarting legacy publication alone cannot restore avoidance.
+
+## Drone home and reach costing
+
+Return costs for the battery reach cap go to home, vertex 0. A drone whose
+`flight_state` arrives after `aerial_home_state_wait_s` is seeded at its pose,
+unlifted. The first state after that seed decides once: `landed` with the
+drone less than 0.5 m from the seed pose (and still at its standing start)
+re-roots home `aerial_home_height_m` over the current pose, cuts home's old
+edges, and makes later keyframe rebuilds lift their first keyframe. Any other
+first state, or a drone that has moved, keeps home where it is (warned).
+
+When tour or bid costing finds home unreachable from the robot, and home's
+body is observed free (the evidence Return Home asks of its goal), home is
+wired to its reachable neighbours with the ordinary strict roadmap edge check
+(`expandGraphEdges`), at most once per graph, revision, map revision and peer
+generation. Occupied or unknown home bodies are never linked.
+
+## Observability
+
+After an aerial plan request, at most every 10 s, MGG logs one line
+`aerial_status {json}` with: `home` (status, position, lifted, edges,
+re-roots, relink attempts/successes), `lifted` (latest evaluation: proposed,
+admitted, rejected by gain/cap/merged/no_anchor/link/scouting, senders without
+a transform; cumulative tour selections of a new lifted target), `cylinders`
+(messages accepted / rejected for frame / malformed, last accepted frame,
+cylinders in force, legacy discs in force, segment checks blocked by each),
+`reach_cap` (rejects, those with no way home, last out/back distances and
+budget, current reach) and `scouting_exclusions` (in force, accepted,
+rejected frame/malformed, lapsed, targets, lattice viewpoints and paths
+refused). Counts are per evaluation, not per unique target. Reach-cap
+refusals of own clusters log `out X m + back Y m > reach Z m` (or no way back
+with home's status). The plan summary splits peer-blocked roadmap edges into
+aerial cylinders and legacy discs, and a lifted tour target says so.
+
+## Scouting exclusions input
+
+`scouting_exclusions` (relative: `/<robot>/mgg/scouting_exclusions`),
+`geometry_msgs/PoseArray`, transient-local, at most one message kept.
+Encoding as `no_go_discs`: `position.x/y` centre, `position.z` centre-line
+reach in metres (> 0, finite), orientation ignored. `header.frame_id` must be
+the planning frame (`PlanningParams.global_frame_id`); a wrong frame or any
+malformed entry refuses the whole message with a throttled warning, keeping
+the set in force. Each message replaces the set; an empty array clears it.
+The set lapses `scouting_exclusion_ttl_s` (default 3.0 s, finite, > 0) after
+MGG received it; `header.stamp` is not read. The producer re-publishes at
+least every second.
+
+Exploration only, XY only: tour clusters, lifted peer targets and greedy
+global frontiers inside one are not chosen; lattice viewpoints inside one are
+left out; lattice candidates, global exploration routes (rerouted round them
+where the roadmap allows), their shortcuts, and the plan's final check obey
+the egress rule: a path starting inside one may leave it while its horizontal
+distance to the centre never decreases, must then enter none, and must not
+end inside one. Objectives (Navigate, Return Home) ignore them. Without a
+message, behaviour is unchanged.
