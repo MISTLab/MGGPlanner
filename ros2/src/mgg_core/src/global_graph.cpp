@@ -1,3 +1,4 @@
+#include "mgg_core/planning_cancellation.h"
 #include "mgg_core/global_graph.h"
 
 #include <algorithm>
@@ -47,6 +48,7 @@ bool RobotStateHistory::getNearestStates(
   }
   s_res->clear();
   for (int i = 0; i < neighbors_size; ++i) {
+    planningCheckpoint();
     s_res->push_back(static_cast<const StateVec*>(kd_res_item_data(neighbors)));
     if (kd_res_next(neighbors) <= 0) break;
   }
@@ -116,6 +118,7 @@ Vertex* linkStateToGraph(GraphManager& graph, const StateVec& state,
                        (b->state.head<3>() - state.head<3>()).norm();
               });
     for (Vertex* candidate : candidates) {
+      planningCheckpoint();
       if (candidate == nullptr ||
           linkBlocked(ctx, candidate->state, state, ctx.robot_box_size)) {
         continue;
@@ -202,6 +205,7 @@ bool addRefPath(GraphManager& graph, const std::vector<RefPose>& poses,
   std::size_t first = 0;
   Vertex* parent_vertex = nullptr;
   for (; first < poses.size(); ++first) {
+    planningCheckpoint();
     parent_vertex = linkPathPose(graph, poses[first].state, ctx);
     if (parent_vertex != nullptr) break;
   }
@@ -221,6 +225,7 @@ bool addRefPath(GraphManager& graph, const std::vector<RefPose>& poses,
   std::vector<RefPose> kept;
   kept.push_back(poses[first]);
   for (std::size_t i = first + 1; i < poses.size(); ++i) {
+    planningCheckpoint();
     const double gap =
         (poses[i].state.head<3>() - kept.back().state.head<3>()).norm();
     const bool last = i + 1 == poses.size();
@@ -231,6 +236,7 @@ bool addRefPath(GraphManager& graph, const std::vector<RefPose>& poses,
   std::vector<Vertex*> vertex_list;
   vertex_list.push_back(parent_vertex);
   for (std::size_t i = 1; i < kept.size(); ++i) {
+    planningCheckpoint();
     const double direction_norm =
         (kept[i].state.head<3>() - parent_vertex->state.head<3>()).norm();
     Vertex* new_vertex = ownVertexAt(graph, kept[i].state, ctx.robot_id);
@@ -258,6 +264,7 @@ bool addRefPath(GraphManager& graph, const std::vector<RefPose>& poses,
   // Build edges around vertices if possible to get better paths
   // (rrg.cpp:4895). The path itself is trusted; the extra edges are checked.
   for (Vertex* vertex : vertex_list) {
+    planningCheckpoint();
     ExpandGraphReport rep;
     expandGraphEdges(graph, vertex, rep, ctx);
   }
@@ -269,6 +276,7 @@ bool addRefPath(GraphManager& graph, const std::vector<RefPose>& poses,
   // gain a vertex a few centimetres from its end.
   if (vertex_spacing > 0.0) {
     for (std::size_t i = 0; i + 1 < vertex_list.size(); ++i) {
+      planningCheckpoint();
       const Eigen::Vector3d start = vertex_list[i]->state.head<3>();
       const Eigen::Vector3d end = vertex_list[i + 1]->state.head<3>();
       const double edge_length = (end - start).norm();
@@ -279,6 +287,7 @@ bool addRefPath(GraphManager& graph, const std::vector<RefPose>& poses,
       const Eigen::Vector3d edge_vec = (end - start) / edge_length;
       Vertex* prev_vertex = vertex_list[i];
       for (int j = 1; j < n_intp; ++j) {
+        planningCheckpoint();
         const Eigen::Vector3d new_v = start + j * segment * edge_vec;
         StateVec new_state;
         new_state << new_v[0], new_v[1], new_v[2], vertex_list[i]->state[3];
@@ -345,6 +354,7 @@ DepartureLink linkDeparture(GraphManager& graph, const StateVec& state,
                      (b->state.head<3>() - state.head<3>()).squaredNorm();
             });
   for (Vertex* candidate : candidates) {
+    planningCheckpoint();
     if (candidate == nullptr || !graph.inService(*candidate)) continue;
     if (ctx.robot->type == RobotType::kAerialRobot) {
       const Eigen::Vector3d target = candidate->state.head<3>() + ctx.robot->center_offset;
@@ -380,6 +390,7 @@ bool addRefPathToGraph(GraphManager& graph,
   std::vector<RefPose> poses;
   poses.reserve(path.size());
   for (std::size_t i = 0; i < path.size(); ++i) {
+    planningCheckpoint();
     if (path[i] == nullptr) return false;
     // Don't add the part of the path after the first hanging vertex
     // (rrg.cpp:4868).
@@ -507,6 +518,7 @@ RoadmapRebuildReport rebuildRoadmapFromTrajectory(
   StateVec home_state = StateVec::Zero();
   bool tipped_since = false;
   for (std::size_t i = 0; i < keyframes.size(); ++i) {
+    planningCheckpoint();
     const bool latest = i + 1 == keyframes.size();
     const bool is_tipped = i > 0 && tipped(keyframes[i]);
     if (is_tipped) {
@@ -537,6 +549,7 @@ RoadmapRebuildReport rebuildRoadmapFromTrajectory(
     const Eigen::Vector2d along = b.head<2>() - from;
     const double length_sq = along.squaredNorm();
     for (const Eigen::Vector2d& p : tipped_at) {
+      planningCheckpoint();
       const double t =
           length_sq > 1e-12
               ? std::clamp((p - from).dot(along) / length_sq, 0.0, 1.0)
@@ -591,6 +604,7 @@ RoadmapRebuildReport rebuildRoadmapFromTrajectory(
     StateVec chosen = target;
     ExpandGraphReport first_refusal;
     for (const double offset : offsets) {
+      planningCheckpoint();
       StateVec candidate = target;
       candidate[0] += offset * across.x();
       candidate[1] += offset * across.y();
@@ -656,6 +670,7 @@ RoadmapRebuildReport rebuildRoadmapFromTrajectory(
         ++report.chain_refusals_geofence;
       }
       for (int s = 1; s < 8; ++s) {
+        planningCheckpoint();
         report.chain_refusals_by_status[s] += first_refusal.edge_status[s];
       }
     }
@@ -667,6 +682,7 @@ RoadmapRebuildReport rebuildRoadmapFromTrajectory(
   // after it is placed), nor into the latest keyframe when it is tipped.
   bool break_pending = false;
   for (std::size_t i = 1; i < supported.size(); ++i) {
+    planningCheckpoint();
     const StateVec& state = supported[i].keyframe.pose;
     const bool latest = i + 1 == supported.size();
     if (supported[i].after_tipping) break_pending = true;
@@ -690,6 +706,7 @@ RoadmapRebuildReport rebuildRoadmapFromTrajectory(
     pieces = std::max(1, pieces);
     const StateVec from = previous_base;
     for (int k = 1; k < pieces; ++k) {
+      planningCheckpoint();
       StateVec between = from + (state - from) * (double(k) / pieces);
       between[3] = state[3];
       place(between, true);
@@ -701,6 +718,7 @@ RoadmapRebuildReport rebuildRoadmapFromTrajectory(
   const double reach =
       std::min(params.link_radius, ctx.planning->edge_length_max);
   for (Vertex* vertex : vertices) {
+    planningCheckpoint();
     std::vector<Vertex*> near;
     if (!graph.getNearestVertices(&vertex->state, reach, &near)) continue;
     const Eigen::Vector3d at = vertex->state.head<3>();
@@ -710,6 +728,7 @@ RoadmapRebuildReport rebuildRoadmapFromTrajectory(
                        (b->state.head<3>() - at).squaredNorm();
               });
     for (Vertex* other : near) {
+      planningCheckpoint();
       if (other == nullptr || other == vertex) continue;
       const double d = (other->state.head<3>() - at).norm();
       if (d <= ctx.planning->edge_length_min || d >= reach) continue;
@@ -734,18 +753,21 @@ RoadmapRebuildReport rebuildRoadmapFromTrajectory(
   // Connected parts, by a walk over the edge lists.
   std::unordered_map<int, int> component_of;
   for (Vertex* start : vertices) {
+    planningCheckpoint();
     if (component_of.count(start->id) > 0) continue;
     const int component = report.components++;
     int size = 0;
     std::vector<int> stack{start->id};
     component_of[start->id] = component;
     while (!stack.empty()) {
+      planningCheckpoint();
       const int id = stack.back();
       stack.pop_back();
       ++size;
       const auto edges = graph.edge_map_.find(id);
       if (edges == graph.edge_map_.end()) continue;
       for (const auto& [neighbour, cost] : edges->second) {
+        planningCheckpoint();
         (void)cost;
         if (component_of.emplace(neighbour, component).second) {
           stack.push_back(neighbour);
@@ -789,6 +811,7 @@ Vertex* connectGoalThroughLattice(GraphManager& graph, const StateVec& goal,
   // edge, so each pass only reaches round the next turn. The whole lattice
   // stays within one sweep's num_vertices_max.
   for (int pass = 0; pass < kMaxGoalLatticePasses; ++pass) {
+    planningCheckpoint();
     const GridGraphResult built =
         buildGridGraph(lattice, goal, grid, metric_ctx, heading);
     if (built.status != GridGraphStatus::kOk) return nullptr;
@@ -806,6 +829,7 @@ Vertex* connectGoalThroughLattice(GraphManager& graph, const StateVec& goal,
   if (lattice.getNumVertices() > 1 &&
       lattice.findShortestPaths(0, lattice_paths) && lattice_paths.status) {
     for (const auto& entry : lattice.vertices_map_) {
+      planningCheckpoint();
       Vertex* vertex = entry.second;
       if (vertex == nullptr || vertex->id == 0) continue;
       const auto parent = lattice_paths.parent_id_map.find(vertex->id);
@@ -824,6 +848,7 @@ Vertex* connectGoalThroughLattice(GraphManager& graph, const StateVec& goal,
 
   const double reach = ctx.planning->edge_length_max;
   for (const auto& [lattice_distance, vertex] : reachable) {
+    planningCheckpoint();
     (void)lattice_distance;
     std::vector<Vertex*> candidates;
     if (!graph.getNearestVertices(&vertex->state, reach, &candidates)) continue;
@@ -834,6 +859,7 @@ Vertex* connectGoalThroughLattice(GraphManager& graph, const StateVec& goal,
                        (b->state.head<3>() - at).squaredNorm();
               });
     for (Vertex* candidate : candidates) {
+      planningCheckpoint();
       if (candidate == nullptr || candidate->is_hanging) continue;
       if (usable && !usable(*candidate)) continue;
       const double gap = (candidate->state.head<3>() - at).norm();
@@ -895,10 +921,12 @@ std::vector<int> performShortestPathsClustering(
   std::vector<PathType> cluster_paths;
   std::vector<int> cluster_ids;
   for (Vertex* vertex : vertices) {
+    planningCheckpoint();
     PathType path_cur;
     graph.getShortestPath(vertex->id, rep, true, path_cur);
     bool found_a_neighbour = false;
     for (std::size_t j = 0; j < cluster_paths.size(); ++j) {
+      planningCheckpoint();
       if (computeDistanceBetweenTwoTrajectories(path_cur, cluster_paths[j]) <=
           dist_threshold) {
         vertex->cluster_id = cluster_ids[j];
@@ -920,16 +948,19 @@ std::vector<int> performShortestPathsClustering(
   std::vector<PathType> cluster_paths_refine;
   std::vector<int> cluster_ids_refine;
   for (std::size_t j = 0; j < cluster_paths.size(); ++j) {
+    planningCheckpoint();
     if (getPathLength(cluster_paths[j]) >= principle_path_min_length) {
       cluster_paths_refine.push_back(cluster_paths[j]);
       cluster_ids_refine.push_back(cluster_ids[j]);
     }
   }
   for (Vertex* vertex : vertices) {
+    planningCheckpoint();
     PathType path_cur;
     graph.getShortestPath(vertex->id, rep, true, path_cur);
     double dist_min = std::numeric_limits<double>::infinity();
     for (std::size_t j = 0; j < cluster_paths_refine.size(); ++j) {
+      planningCheckpoint();
       const double dist_score = computeDistanceBetweenTwoTrajectories(
           path_cur, cluster_paths_refine[j]);
       if (dist_score < dist_min) {
@@ -958,6 +989,7 @@ FrontierAdditionReport addFrontiers(GraphManager& global_graph,
   // robot's map, where the peer's explored space is unknown, they were never
   // demoted, and in run 6 their 529 re-checks took robot_3 4.3 s a plan.
   for (auto& entry : global_graph.vertices_map_) {
+    planningCheckpoint();
     Vertex* vertex = entry.second;
     if (vertex == nullptr || vertex->type != VertexType::kFrontier ||
         !global_graph.inService(*vertex)) {
@@ -989,6 +1021,7 @@ FrontierAdditionReport addFrontiers(GraphManager& global_graph,
   local_graph.getLeafVertices(leaf_vertices);
   std::vector<Vertex*> frontier_vertices;
   for (Vertex* vertex : leaf_vertices) {
+    planningCheckpoint();
     if (vertex != nullptr && vertex->type == VertexType::kFrontier) {
       frontier_vertices.push_back(vertex);
     }
@@ -1005,6 +1038,7 @@ FrontierAdditionReport addFrontiers(GraphManager& global_graph,
   // 4) Add each principal path unless the area already has vertices, or the
   // robot has already passed through it (rrg.cpp:2449 to 2471).
   for (const int cluster_id : cluster_ids) {
+    planningCheckpoint();
     Vertex* leaf = local_graph.getVertex(cluster_id);
     if (leaf == nullptr) continue;
     Vertex* nearest_vertex = nullptr;
@@ -1027,6 +1061,7 @@ FrontierAdditionReport addFrontiers(GraphManager& global_graph,
     // Only keep the frontier for the leaf vertex; the rest of the path is
     // ordinary roadmap (rrg.cpp:2463).
     for (auto pa = path.begin(); pa != path.end() - 1; ++pa) {
+      planningCheckpoint();
       (*pa)->type = VertexType::kUnvisited;
     }
     if (addRefPathToGraph(global_graph, path, ctx, vertex_spacing)) {
@@ -1050,6 +1085,7 @@ bool joinedWithin(GraphManager& graph,
   std::priority_queue<Entry, std::vector<Entry>, std::greater<Entry>> open;
   std::unordered_map<int, double> best;
   for (const auto& [id, length] : starts) {
+    planningCheckpoint();
     if (length > max_length_m) continue;
     const auto known = best.find(id);
     if (known != best.end() && known->second <= length) continue;
@@ -1057,6 +1093,7 @@ bool joinedWithin(GraphManager& graph,
     open.push({length, id});
   }
   while (!open.empty()) {
+    planningCheckpoint();
     const auto [length, at] = open.top();
     open.pop();
     if (length > best[at]) continue;
@@ -1064,6 +1101,7 @@ bool joinedWithin(GraphManager& graph,
     const auto edges = graph.edge_map_.find(at);
     if (edges == graph.edge_map_.end()) continue;
     for (const auto& [next, weight] : edges->second) {
+      planningCheckpoint();
       const double next_length = length + weight;
       if (next_length > max_length_m) continue;
       const auto vertex = graph.vertices_map_.find(next);
@@ -1099,6 +1137,7 @@ bool fleetCoverageLinkClear(const MapInterface& map,
   const Eigen::Vector3d step = (to - from) / steps_d;
   const Eigen::Vector3d swept = box + step.cwiseAbs();
   for (int i = 0; i < steps; ++i) {
+    planningCheckpoint();
     if (map.getStaticBoxStatus(from + (i + 0.5) * step, swept, false) ==
         VoxelStatus::kOccupied) {
       return false;
@@ -1132,6 +1171,7 @@ bool joinedByALink(GraphManager& graph, const Vertex& frontier, int robot_id,
   }
   std::vector<std::pair<double, const Vertex*>> candidates;
   for (const Vertex* peer : nearby) {
+    planningCheckpoint();
     if (peer == nullptr || peer->robot_id == robot_id ||
         !graph.inService(*peer)) {
       continue;
@@ -1163,6 +1203,7 @@ bool joinedByALink(GraphManager& graph, const Vertex& frontier, int robot_id,
   }
   const Eigen::Vector3d& offset = links->ctx->robot->center_offset;
   for (const auto& [length, peer] : candidates) {
+    planningCheckpoint();
     ++links->checks;
     if (fleetCoverageLinkClear(*links->ctx->map,
                                frontier.state.head<3>() + offset,
@@ -1184,6 +1225,7 @@ int demoteFleetCoveredFrontiers(GraphManager& graph, int robot_id,
   // This robot's vertices in id order, from the cursor on, wrapping round.
   std::vector<Vertex*> own;
   for (auto& entry : graph.vertices_map_) {
+    planningCheckpoint();
     if (entry.second != nullptr && entry.second->robot_id == robot_id) {
       own.push_back(entry.second);
     }
@@ -1200,6 +1242,7 @@ int demoteFleetCoveredFrontiers(GraphManager& graph, int robot_id,
   int first_deferred = -1;
   int demoted = 0;
   for (Vertex* vertex : own) {
+    planningCheckpoint();
     if (!vertex->fleet_covered) {
       if (vertex->type != VertexType::kFrontier ||
           !graph.inService(*vertex)) {
@@ -1209,6 +1252,7 @@ int demoteFleetCoveredFrontiers(GraphManager& graph, int robot_id,
       if (!graph.getNearestVertices(&vertex->state, reach, &nearby)) continue;
       std::unordered_set<int> covering;
       for (const Vertex* peer : nearby) {
+        planningCheckpoint();
         if (peer != nullptr && peer->robot_id != robot_id &&
             peer->owner_visited && graph.inService(*peer) &&
             (peer->state.head<2>() - vertex->state.head<2>()).norm() <=
@@ -1257,6 +1301,7 @@ GlobalFrontierReport searchGlobalFrontier(
 
   std::vector<Vertex*> global_frontiers;
   for (auto& entry : graph.vertices_map_) {
+    planningCheckpoint();
     Vertex* vertex = entry.second;
     if (vertex == nullptr || vertex->type != VertexType::kFrontier ||
         !graph.inService(*vertex) || (eligible && !eligible(*vertex))) {
@@ -1307,6 +1352,7 @@ GlobalFrontierReport searchGlobalFrontier(
   // gain promises, then every other one (whose re-check only demotes).
   double best_stored = 0.0;
   for (const Vertex* frontier : global_frontiers) {
+    planningCheckpoint();
     best_stored = std::max(best_stored, frontier->vol_gain.gain);
   }
   struct Candidate {
@@ -1319,6 +1365,7 @@ GlobalFrontierReport searchGlobalFrontier(
   std::vector<Candidate> order;
   order.reserve(global_frontiers.size());
   for (Vertex* frontier : global_frontiers) {
+    planningCheckpoint();
     const double distance = distance_to(frontier);
     const bool routable = std::isfinite(distance) && !is_excluded(frontier);
     const bool within_reach = routable && robot_position != nullptr &&
@@ -1341,6 +1388,7 @@ GlobalFrontierReport searchGlobalFrontier(
   double recheck_seconds = 0.0;
   // Re-check (rrg.cpp:5612 to 5625) and rank (rrg.cpp:5766 to 5818).
   for (std::size_t i = 0; i < order.size(); ++i) {
+    planningCheckpoint();
     if (i > 0 && recheck_seconds >= time_budget_s) {
       report.unchecked = static_cast<int>(order.size() - i);
       report.frontiers += report.unchecked;
@@ -1385,6 +1433,7 @@ bool sampleVertex(RandomSampler& sampler, const StateVec& root_state,
 
   int while_thres = 1000;  // magic number (rrg.cpp:461)
   while (!found && while_thres--) {
+    planningCheckpoint();
     hanging = false;
     sampler.generate(root_state, state);
     // rrg.cpp:468 rejected draws outside the world-fixed global bound, less
@@ -1436,6 +1485,7 @@ GlobalGraphExpansionReport expandGlobalGraph(
   // Extract unvisited vertices in the global graph (rrg.cpp:2565).
   std::vector<Vertex*> unvisited_vertices;
   for (auto& entry : global_graph.vertices_map_) {
+    planningCheckpoint();
     Vertex* vertex = entry.second;
     if (vertex != nullptr && !vertex->lifted_peer_target &&
         vertex->type == VertexType::kUnvisited && global_graph.inService(*vertex)) {
@@ -1455,6 +1505,7 @@ GlobalGraphExpansionReport expandGlobalGraph(
   std::vector<Eigen::Vector3d> cluster_centroids;
   std::vector<Vertex*> unvisited_vertices_remain;
   while (!unvisited_vertices.empty()) {
+    planningCheckpoint();
     unvisited_vertices_remain.clear();
     const Eigen::Vector3d seed =
         unvisited_vertices[sampler.index(unvisited_vertices.size())]
@@ -1462,6 +1513,7 @@ GlobalGraphExpansionReport expandGlobalGraph(
     Eigen::Vector3d cluster_center = Eigen::Vector3d::Zero();
     int num_vertices_in_cluster = 0;
     for (Vertex* vertex : unvisited_vertices) {
+      planningCheckpoint();
       if ((vertex->state.head<3>() - seed).squaredNorm() <=
           kLocalBoxRadiusSq) {
         cluster_center += vertex->state.head<3>();
@@ -1478,8 +1530,10 @@ GlobalGraphExpansionReport expandGlobalGraph(
   // Expand the global graph: one sample around each centroid per pass, for
   // as long as the budget lasts (rrg.cpp:2608 to 2668).
   while (elapsed() < time_budget_s) {
+    planningCheckpoint();
     ++report.passes;
     for (const Eigen::Vector3d& centroid : cluster_centroids) {
+      planningCheckpoint();
       const StateVec centroid_state(centroid.x(), centroid.y(), centroid.z(),
                                     0.0);
       Vertex new_vertex(-1, StateVec::Zero());

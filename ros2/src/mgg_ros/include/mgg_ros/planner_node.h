@@ -309,6 +309,13 @@ class PlannerNode : public rclcpp::Node {
       const std::shared_ptr<std_srvs::srv::Trigger::Request> request,
       std::shared_ptr<std_srvs::srv::Trigger::Response> response);
   /// The exploration service: one cycle, the chosen path whole.
+  void cancelPlanning();
+  void onPlanRequestImpl(
+      const std::shared_ptr<mgg_msgs::srv::PlannerSrv::Request> request,
+      std::shared_ptr<mgg_msgs::srv::PlannerSrv::Response> response);
+  void onObjectiveRequestImpl(
+      const std::shared_ptr<mgg_msgs::srv::PlanObjective::Request> request,
+      std::shared_ptr<mgg_msgs::srv::PlanObjective::Response> response);
   void onPlanRequest(
       const std::shared_ptr<mgg_msgs::srv::PlannerSrv::Request> request,
       std::shared_ptr<mgg_msgs::srv::PlannerSrv::Response> response);
@@ -756,6 +763,9 @@ class PlannerNode : public rclcpp::Node {
   /// and writes the graphs as a single unit and would need both anyway.
   std::recursive_mutex planner_mutex_;
   std::mutex input_mutex_;
+  std::mutex cancellation_mutex_;
+  std::atomic<std::uint64_t> request_generation_{0};
+  std::atomic<std::uint64_t> cancellations_{0};
   nav_msgs::msg::Odometry::ConstSharedPtr latest_odometry_;
   std::chrono::steady_clock::time_point latest_odometry_received_;
   mgg_msgs::msg::MappingSnapshot::ConstSharedPtr latest_snapshot_;
@@ -1240,6 +1250,7 @@ class PlannerNode : public rclcpp::Node {
   rclcpp::TimerBase::SharedPtr fleet_timer_;
   static constexpr double kFleetTickPeriodS = 0.1;
   rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr build_srv_;
+  rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr cancel_srv_;
   rclcpp::Service<mgg_msgs::srv::PlannerSrv>::SharedPtr plan_srv_;
   rclcpp::Service<mgg_msgs::srv::PlanObjective>::SharedPtr objective_srv_;
   rclcpp::Service<mgg_msgs::srv::PlannerSetExplorationTarget>::SharedPtr

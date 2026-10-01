@@ -510,6 +510,25 @@ std::uint64_t MolaMap::activeGeneration() const {
   return active_generation_.load(std::memory_order_acquire);
 }
 
+bool MolaMap::authorityValid() const {
+  const auto active = std::atomic_load(&active_);
+  if (!active || active->expired(Clock::now(), config_.snapshot_ttl_sec))
+    return false;
+  for (const auto& pin : thread_pins_) {
+    if (pin.owner == this)
+      return pin.snapshot && sameIdentity(pin.snapshot->request, active->request) &&
+             sameTransform(pin.snapshot->request, active->request);
+  }
+  return true;
+}
+
+std::optional<MolaSnapshotRequest> MolaMap::activeRequest() const {
+  const auto active = std::atomic_load(&active_);
+  if (!active || active->expired(Clock::now(), config_.snapshot_ttl_sec))
+    return std::nullopt;
+  return active->request;
+}
+
 std::uint64_t MolaMap::retainedPredecessorCount() const {
   return retained_predecessor_count_.load(std::memory_order_relaxed);
 }

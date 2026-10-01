@@ -1,3 +1,4 @@
+#include "mgg_core/planning_cancellation.h"
 #include "mgg_core/gain.h"
 
 #include <algorithm>
@@ -16,6 +17,7 @@ namespace {
 bool inNoGainZone(const GainContext& ctx, const Eigen::Vector3d& voxel) {
   if (ctx.no_gain_zones == nullptr) return false;
   for (const BoundedSpaceParams& zone : *ctx.no_gain_zones) {
+    planningCheckpoint();
     if (zone.isInsideSpace(voxel)) return true;
   }
   return false;
@@ -116,6 +118,7 @@ void computeVolumetricGain(
       ctx.robot != nullptr && ctx.robot->type == RobotType::kGroundRobot;
 
   for (const std::string& sensor_name : ctx.planning->exp_sensor_list) {
+    planningCheckpoint();
     auto it = ctx.sensors->find(sensor_name);
     if (it == ctx.sensors->end()) {
       logWarn("gain: no sensor named '" + sensor_name + "'");
@@ -168,6 +171,7 @@ void computeVolumetricGain(
 
     int unknown = 0, free = 0, occupied = 0;
     for (const auto& entry : visited) {
+      planningCheckpoint();
       const Eigen::Vector3d& voxel = entry.first;
       // Only count what lies inside the region the robot may explore, and
       // outside any zone declared uninteresting.
@@ -222,6 +226,7 @@ int computeExplorationGain(GraphManager& graph, const GainContext& ctx,
   // frontiers, so with clustering on they seed the clusters.
   std::list<int> pending;
   for (const auto& entry : graph.vertices_map_) {
+    planningCheckpoint();
     if (entry.second == nullptr) continue;
     if (entry.second->is_leaf_vertex) {
       pending.push_front(entry.first);
@@ -237,6 +242,7 @@ int computeExplorationGain(GraphManager& graph, const GainContext& ctx,
 
   int evaluated = 0;
   while (!pending.empty()) {
+    planningCheckpoint();
     const int v_id = pending.front();
     pending.pop_front();
 
@@ -256,6 +262,7 @@ int computeExplorationGain(GraphManager& graph, const GainContext& ctx,
       if (graph.getNearestVertices(&v->state, ctx.planning->clustering_radius,
                                    &nearby)) {
         for (Vertex* n : nearby) {
+          planningCheckpoint();
           if (n == nullptr || n == v) continue;
           auto pos = std::find(pending.begin(), pending.end(), n->id);
           if (pos != pending.end()) {

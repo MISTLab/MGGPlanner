@@ -1,3 +1,4 @@
+#include "mgg_core/planning_cancellation.h"
 #include "mgg_ros/planner_node.h"
 
 #include <algorithm>
@@ -701,6 +702,14 @@ PlannerNode::PlannerNode(const rclcpp::NodeOptions& options)
         },
         rclcpp::ServicesQoS(), callback_group_);
   }
+  cancel_srv_ = create_service<std_srvs::srv::Trigger>(
+      "cancel_planning",
+      [this](std::shared_ptr<std_srvs::srv::Trigger::Request>,
+             std::shared_ptr<std_srvs::srv::Trigger::Response> response) {
+        cancelPlanning();
+        response->success = true;
+        response->message = "cancellation requested";
+      }, rclcpp::ServicesQoS(), input_callback_group_);
   build_srv_ = create_service<std_srvs::srv::Trigger>(
       "build_local_graph",
       [this](const std::shared_ptr<std_srvs::srv::Trigger::Request> req,
@@ -2006,6 +2015,21 @@ void PlannerNode::refreshMapRevision() {
       mapping_snapshot_ = *latest_snapshot_;
       have_mapping_snapshot_ = true;
     }
+  }
+  if (const auto active = mola_map_->activeRequest()) {
+    mapping_snapshot_.component_id = active->component_id;
+    mapping_snapshot_.epoch = active->epoch;
+    mapping_snapshot_.graph_revision = active->graph_revision;
+    mapping_snapshot_.geometry_revision = active->geometry_revision;
+    mapping_snapshot_.source_stamp = rclcpp::Time(static_cast<int64_t>(active->source_stamp_ns));
+    const Eigen::Quaterniond q(active->component_from_navigation.linear());
+    auto& t = mapping_snapshot_.component_from_navigation;
+    t.translation.x = active->component_from_navigation.translation().x();
+    t.translation.y = active->component_from_navigation.translation().y();
+    t.translation.z = active->component_from_navigation.translation().z();
+    t.rotation.x = q.x(); t.rotation.y = q.y();
+    t.rotation.z = q.z(); t.rotation.w = q.w();
+    have_mapping_snapshot_ = true;
   }
   const std::uint64_t generation = mola_map_->activeGeneration();
   if (generation == observed_map_generation_) return;
@@ -5098,7 +5122,74 @@ void PlannerNode::onBuildRequest(
   RCLCPP_INFO(get_logger(), "%s", response->message.c_str());
 }
 
+void PlannerNode::cancelPlanning() {
+  // Linearizes cancellation with path publication; never takes planner_mutex_.
+  std::lock_guard<std::mutex> lock(cancellation_mutex_);
+  ++request_generation_;
+}
+
 void PlannerNode::onPlanRequest(
+    const std::shared_ptr<mgg_msgs::srv::PlannerSrv::Request> request,
+    std::shared_ptr<mgg_msgs::srv::PlannerSrv::Response> response) {
+  const auto generation = request_generation_.load();
+  const std::lock_guard<std::recursive_mutex> lock(planner_mutex_);
+  const bool admitted = mola_map_ && mola_map_->authorityValid();
+  const auto map_generation = mola_map_ ? mola_map_->activeGeneration() : 0;
+  const auto bound = robot_params_.bound_mode;
+  mgg::PlanningCancellationScope cancellation([this, generation, admitted, map_generation]() {
+    return request_generation_.load() != generation ||
+           (admitted && (!mola_map_->authorityValid() ||
+                         mola_map_->activeGeneration() != map_generation));
+  });
+  try {
+    mgg::planningCheckpoint();
+    onPlanRequestImpl(request, response);
+    std::lock_guard<std::mutex> fence(cancellation_mutex_);
+    mgg::planningCheckpoint();
+  } catch (const mgg::PlanningInterrupted&) {
+    ++cancellations_;
+    best_path_.clear();
+    global_exploration_ongoing_ = false;
+    response->path.clear();
+    response->status = kStatusNotReady;
+    RCLCPP_INFO(get_logger(), "planning cancelled: superseded or map authority expired/changed");
+  }
+  robot_params_.bound_mode = bound;
+}
+
+void PlannerNode::onObjectiveRequest(
+    const std::shared_ptr<mgg_msgs::srv::PlanObjective::Request> request,
+    std::shared_ptr<mgg_msgs::srv::PlanObjective::Response> response) {
+  std::uint64_t generation;
+  {
+    std::lock_guard<std::mutex> fence(cancellation_mutex_);
+    generation = ++request_generation_;
+  }
+  const std::lock_guard<std::recursive_mutex> lock(planner_mutex_);
+  const bool admitted = mola_map_ && mola_map_->authorityValid();
+  const auto map_generation = mola_map_ ? mola_map_->activeGeneration() : 0;
+  mgg::PlanningCancellationScope cancellation([this, generation, admitted, map_generation]() {
+    return request_generation_.load() != generation ||
+           (admitted && (!mola_map_->authorityValid() ||
+                         mola_map_->activeGeneration() != map_generation));
+  });
+  try {
+    mgg::planningCheckpoint();
+    global_exploration_ongoing_ = false;
+    exploration_target_.reset();
+    best_path_.clear();
+    onObjectiveRequestImpl(request, response);
+    std::lock_guard<std::mutex> fence(cancellation_mutex_);
+    mgg::planningCheckpoint();
+  } catch (const mgg::PlanningInterrupted&) {
+    ++cancellations_;
+    response->path.clear();
+    response->status = mgg_msgs::srv::PlanObjective::Response::BLOCKED;
+    response->reason = "planning cancelled: superseded or map authority expired/changed";
+  }
+}
+
+void PlannerNode::onPlanRequestImpl(
     const std::shared_ptr<mgg_msgs::srv::PlannerSrv::Request> request,
     std::shared_ptr<mgg_msgs::srv::PlannerSrv::Response> response) {
   const std::lock_guard<std::recursive_mutex> lock(planner_mutex_);
@@ -6234,7 +6325,7 @@ std::vector<mgg::FrontierCluster> PlannerNode::insideExplorationRegion(
   return clusters;
 }
 
-void PlannerNode::onObjectiveRequest(
+void PlannerNode::onObjectiveRequestImpl(
     const std::shared_ptr<mgg_msgs::srv::PlanObjective::Request> request,
     std::shared_ptr<mgg_msgs::srv::PlanObjective::Response> response) {
   using Service = mgg_msgs::srv::PlanObjective;
@@ -6504,6 +6595,8 @@ void PlannerNode::onObjectiveRequest(
 // Outputs
 
 void PlannerNode::publishPath() {
+  std::lock_guard<std::mutex> fence(cancellation_mutex_);
+  mgg::planningCheckpoint();
   nav_msgs::msg::Path msg;
   msg.header.stamp = now();
   msg.header.frame_id = world_frame_;

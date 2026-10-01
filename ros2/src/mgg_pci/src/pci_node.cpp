@@ -68,6 +68,8 @@ PciNode::PciNode(const rclcpp::NodeOptions& options)
   planner_client_ = create_client<mgg_msgs::srv::PlannerSrv>(
       "mggplanner", rclcpp::ServicesQoS(), callback_group_);
 
+  cancel_client_ = create_client<std_srvs::srv::Trigger>(
+      "cancel_planning", rclcpp::ServicesQoS(), callback_group_);
   trigger_srv_ = create_service<std_srvs::srv::Trigger>(
       "pci_trigger",
       [this](const std::shared_ptr<std_srvs::srv::Trigger::Request> req,
@@ -476,6 +478,9 @@ void PciNode::onStop(const std::shared_ptr<std_srvs::srv::Trigger::Request>,
     ++generation_;
     path_in_progress_ = false;
     waiting_for_plan_ = false;
+  }
+  if (cancel_client_->service_is_ready()) {
+    cancel_client_->async_send_request(std::make_shared<std_srvs::srv::Trigger::Request>());
   }
   publishPath({});
   publishStatus("blocked", "stopped");

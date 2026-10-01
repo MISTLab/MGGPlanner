@@ -79,6 +79,7 @@ class PciNode : public rclcpp::Node {
   bool executeBootstrap();
 
   rclcpp::Client<mgg_msgs::srv::PlannerSrv>::SharedPtr planner_client_;
+  rclcpp::Client<std_srvs::srv::Trigger>::SharedPtr cancel_client_;
   rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr trigger_srv_;
   rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr replan_srv_;
   rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr stop_srv_;

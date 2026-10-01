@@ -1,3 +1,4 @@
+#include "mgg_core/planning_cancellation.h"
 #include "mgg_core/departure.h"
 
 #include <algorithm>
@@ -76,7 +77,9 @@ bool entersBeyondStanding(const Eigen::Vector2d& cell_center,
   constexpr int kSamples = 8;
   const double half = 0.5 * resolution;
   for (int i = 0; i <= kSamples; ++i) {
+    planningCheckpoint();
     for (int j = 0; j <= kSamples; ++j) {
+      planningCheckpoint();
       const Eigen::Vector2d point =
           cell_center + Eigen::Vector2d(-half + resolution * i / kSamples,
                                         -half + resolution * j / kSamples);
@@ -123,12 +126,14 @@ VoxelStatus orientedBoxPathStatus(const MapInterface& map,
   bool unknown = false;
   std::vector<XYCellCenter> cells;
   for (int i = 0; i < steps; ++i) {
+    planningCheckpoint();
     swept.center = start + (i + 0.5) * step;
     if (!map.getCircleIntersectingXYCellCenters(
             swept.center.head<2>(), radius, kMaxSweepCells, cells)) {
       return VoxelStatus::kUnknown;
     }
     for (const XYCellCenter& cell : cells) {
+      planningCheckpoint();
       if (!cellMeetsBox(cell.center, resolution, swept, -1e-9)) continue;
       if (standing != nullptr &&
           !entersBeyondStanding(cell.center, resolution, swept, *standing)) {
@@ -167,11 +172,14 @@ bool aerialRootDepartureTraversable(const MapInterface& map,
   const Eigen::Vector3d root_lo = start - size / 2;
   const Eigen::Vector3d root_hi = start + size / 2;
   for (int i = 0; i < steps; ++i) {
+    planningCheckpoint();
     const Eigen::Vector3d center = start + (i + 0.5) * step;
     const Eigen::Vector3d half = (size + step.cwiseAbs()) / 2;
     const Eigen::Vector3d lo = center - half, hi = center + half;
     for (int axis = 0; axis < 3; ++axis) {
+      planningCheckpoint();
       for (bool upper : {false, true}) {
+        planningCheckpoint();
         Eigen::Vector3d slab_lo = lo, slab_hi = hi;
         if (upper) slab_lo[axis] = std::max(lo[axis], root_hi[axis]);
         else slab_hi[axis] = std::min(hi[axis], root_lo[axis]);
@@ -212,6 +220,7 @@ bool reverseExitEdgeAdmissible(
           body.size, false, projected, false, false, &check,
           EdgeTravel::kForward) != ProjectedEdgeStatus::kAdmissible) return false;
   for (std::size_t i = 1; i < projected.size(); ++i) {
+    planningCheckpoint();
     const Eigen::Vector3d delta = projected[i] - projected[i - 1];
     if (delta.z() < -planning.max_step_height - 1e-6 &&
         std::atan2(-delta.z(), delta.head<2>().norm()) >
@@ -269,6 +278,7 @@ bool findDeparture(const MapInterface& map, const GroundProjection& ground,
              ProjectedEdgeStatus::kAdmissible;
     };
     for (const bool backwards : {false, true}) {
+      planningCheckpoint();
       if (backwards && !planning.departure_reverse_allowed) break;
       const double direction = backwards ? heading + M_PI : heading;
       const Eigen::Vector2d unit(std::cos(direction), std::sin(direction));
@@ -276,6 +286,7 @@ bool findDeparture(const MapInterface& map, const GroundProjection& ground,
       here[3] = heading;
       departure.path.assign(1, here);
       for (int i = 1; i <= steps; ++i) {
+        planningCheckpoint();
         const double out = std::min(i * step, max_distance);
         const Eigen::Vector2d xy = start.head<2>() + out * unit;
         StateVec to(xy.x(), xy.y(), departure.path.back().z(), heading);
@@ -312,7 +323,9 @@ bool findDeparture(const MapInterface& map, const GroundProjection& ground,
       static_cast<int>(std::round(kDepartureMaxTurnRad / kDepartureTurnStepRad));
   bool blocked[2] = {false, false};
   for (int k = 1; k <= turns; ++k) {
+    planningCheckpoint();
     for (int side = 0; side < 2; ++side) {
+      planningCheckpoint();
       if (blocked[side]) continue;
       const double turn = (side == 0 ? 1.0 : -1.0) * k * kDepartureTurnStepRad;
       OrientedBox turned = standing;

@@ -12,6 +12,7 @@
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <thread>
 #include <utility>
@@ -142,6 +143,9 @@ class MolaMap : public MapInterface {
   /// snapshot is served, including one retained across a pending successor.
   std::string lastError() const;
   std::uint64_t activeGeneration() const;
+  /// Authority validity, unlike getStatus(), is never prolonged by a pin.
+  bool authorityValid() const;
+  std::optional<MolaSnapshotRequest> activeRequest() const;
   /// Number of successor loads that ended in a coherence race after the load
   /// budget while a compatible predecessor stayed in service.
   std::uint64_t retainedPredecessorCount() const;

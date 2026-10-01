@@ -1,3 +1,4 @@
+#include "mgg_core/planning_cancellation.h"
 #include "mgg_core/grid_graph.h"
 #include "mgg_core/departure.h"
 
@@ -94,6 +95,7 @@ GridGraphResult buildGridGraph(GraphManager& graph, const StateVec& state,
   // cell before probing it, occupied or not; false, with hit_limit, when a
   // size or loop cap stops the sweep (review r1, R1-4).
   const auto charge = [&]() {
+    planningCheckpoint();
     if (loop_count++ > ctx.planning->num_loops_max ||
         num_vertices >= ctx.planning->num_vertices_max ||
         num_edges >= ctx.planning->num_edges_max) {

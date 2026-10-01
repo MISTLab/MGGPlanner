@@ -1,3 +1,4 @@
+#include "mgg_core/planning_cancellation.h"
 #include "mgg_core/graph.h"
 
 #include <iostream>
@@ -114,6 +115,7 @@ struct DeadlineVisitor : boost::default_dijkstra_visitor {
   std::shared_ptr<int> settled = std::make_shared<int>(0);
   template <class Vertex, class G>
   void examine_vertex(Vertex, const G&) {
+    planningCheckpoint();
     if (deadline == nullptr) return;
     if (++*settled % Graph::kDeadlineCheckVertices == 0 &&
         std::chrono::steady_clock::now() >= *deadline) {
