@@ -100,7 +100,8 @@ VoxelStatus orientedBoxPathStatus(const MapInterface& map,
                                   const OrientedBox& box,
                                   bool stop_at_unknown_voxel,
                                   const OrientedBox* standing,
-                                  bool clearance_prefilter) {
+                                  bool clearance_prefilter,
+                                  std::optional<double> unknown_above_center) {
   const double resolution = map.getResolution();
   if (!start.allFinite() || !end.allFinite() || !box.size.allFinite() ||
       (box.size.array() < 0.0).any() || !std::isfinite(box.heading) ||
@@ -124,7 +125,7 @@ VoxelStatus orientedBoxPathStatus(const MapInterface& map,
   swept.size += Eigen::Vector3d(std::abs(step.head<2>().dot(along)),
                                 std::abs(step.head<2>().dot(across)),
                                 std::abs(step.z()));
-  if (clearance_prefilter && standing == nullptr) {
+  if (clearance_prefilter && standing == nullptr && !unknown_above_center) {
     // Contains every conservative step box below (not an inscribed disc).
     // Padding also contains boundary-touching native XY cells.
     const Eigen::Vector3d span = (end - start).cwiseAbs();
@@ -160,9 +161,24 @@ VoxelStatus orientedBoxPathStatus(const MapInterface& map,
       }
       const VoxelStatus status = map.getStaticBoxStatus(
           Eigen::Vector3d(cell.center.x(), cell.center.y(), swept.center.z()),
-          Eigen::Vector3d(0.0, 0.0, swept.size.z()), stop_at_unknown_voxel);
+          Eigen::Vector3d(0.0, 0.0, swept.size.z()),
+          unknown_above_center ? false : stop_at_unknown_voxel);
       if (status == VoxelStatus::kOccupied) return status;
       if (status == VoxelStatus::kUnknown) unknown = true;
+      if (unknown_above_center) {
+        // Require every voxel up to the higher endpoint's sensor plane.
+        // Occupancy above that plane was checked over the entire body.
+        const double lower = swept.center.z() - swept.size.z() / 2;
+        const double upper = std::min(swept.center.z() + swept.size.z() / 2,
+            swept.center.z() + *unknown_above_center + std::abs(step.z()) / 2);
+        if (upper >= lower) {
+          const auto below = map.getStaticStrictBoxStatus(
+              {cell.center.x(), cell.center.y(), (lower + upper) / 2},
+              {0, 0, upper - lower});
+          if (below == VoxelStatus::kOccupied) return below;
+          if (below == VoxelStatus::kUnknown) unknown = true;
+        }
+      }
     }
   }
   return unknown ? VoxelStatus::kUnknown : VoxelStatus::kFree;

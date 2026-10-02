@@ -351,6 +351,15 @@ class PlannerNodeTestPeer {
     node.grid_params_.min_val.x() = force ? -1 : -6;
     node.grid_params_.max_val.x() = force ? 1 : 6;
   }
+  static void sensorPolicy(PlannerNode& node, double mount = .61) {
+    node.allow_unknown_lattice_body_ = false;
+    node.unknown_body_policy_ = "above_sensor_fov";
+    auto sensor = node.sensors_["VLP16"];
+    sensor.mount_height = mount;
+    sensor.fov = Eigen::Vector2d(2*M_PI, M_PI/2);
+    if (sensor.resolution.minCoeff() > 0) sensor.update();
+    node.sensors_["VLP16"] = sensor;
+  }
   static void hardwarePolicy(PlannerNode& node) { node.allow_unknown_lattice_body_ = false; }
   static void shortcut(PlannerNode& node, std::vector<mgg::StateVec>& path) {
     node.shortcutAndResample(path, {}, {}, true);
@@ -383,6 +392,9 @@ class PlannerNodeTestPeer {
     node.global_graph_->setEdgeBlocked([](const auto&, const auto&) {
       std::this_thread::sleep_for(std::chrono::milliseconds(1)); return false;
     });
+  }
+  static void expireRequest(PlannerNode& node) {
+    node.lattice_deadline_ = std::chrono::steady_clock::now() - std::chrono::seconds(1);
   }
   static bool requestExpired(const PlannerNode& node) {
     return std::chrono::steady_clock::now() >= *node.lattice_deadline_;
@@ -493,7 +505,8 @@ TEST_F(PlannerNavigationTest, BotmanFixtureFullServicesBenchmark) {
   if (!root || !*root) GTEST_SKIP() << "MGG_NAV_BENCH_PRODUCT is not set";
   const int repeat = std::getenv("MGG_SERVICE_BENCH_REPEAT")
       ? std::max(1, std::atoi(std::getenv("MGG_SERVICE_BENCH_REPEAT"))) : 3;
-  for (int run = 0; run < repeat; ++run) for (bool allow_unknown : {false, true}) {
+  for (int run = 0; run < repeat; ++run) for (const std::string policy : {"strict", "above_sensor_fov", "legacy_relaxed"}) {
+    const bool allow_unknown = policy == "legacy_relaxed";
     rclcpp::NodeOptions options;
     options.parameter_overrides({rclcpp::Parameter("map.backend", "mola_snapshot"),
         rclcpp::Parameter("map.resolution", .1),
@@ -505,6 +518,7 @@ TEST_F(PlannerNavigationTest, BotmanFixtureFullServicesBenchmark) {
     PlannerNodeTestPeer::configureBotman(*node);
     if (!allow_unknown) PlannerNodeTestPeer::hardwarePolicy(*node);
     ASSERT_TRUE(PlannerNodeTestPeer::serveFixture(*node, root));
+    if (policy == "above_sensor_fov") PlannerNodeTestPeer::sensorPolicy(*node);
     PlannerNodeTestPeer::standAt(*node, 0, 0, -.61, M_PI, run+1);
     for (const std::string mode : {"navigate_local", "navigate_global_fallback", "navigate_15m", "explore"}) {
       PlannerNodeTestPeer::forceGlobalFallback(*node, mode == "navigate_global_fallback");
@@ -523,7 +537,7 @@ TEST_F(PlannerNavigationTest, BotmanFixtureFullServicesBenchmark) {
       }
       const double elapsed = std::chrono::duration<double, std::milli>(
           std::chrono::steady_clock::now() - started).count();
-      nlohmann::json row{{"service",mode},{"repeat",run},{"allow_unknown_body",allow_unknown},
+      nlohmann::json row{{"service",mode},{"repeat",run},{"unknown_body_policy",policy},{"allow_unknown_body",allow_unknown},
           {"request_budget_ms",500},{"total_ms",elapsed},{"status",status},{"poses",poses},
           {"reason",reason},{"x86_budget_met",elapsed <= (mode=="explore" ? 350 : 300)}};
       std::printf("SERVICE_BENCH %s\n", row.dump().c_str());
@@ -542,6 +556,34 @@ TEST_F(PlannerNavigationTest, HardwareShortcutDoesNotCrossUnknownBodyVolume) {
   for (std::size_t i = 1; i < path.size(); ++i)
     length += (path[i].head<3>() - path[i-1].head<3>()).norm();
   EXPECT_NEAR(length, 4.0, 1e-9);
+}
+
+TEST_F(PlannerNavigationTest, SensorFovPolicyToleratesOnlyUpperUnknownAir) {
+  for (double observed : {.4, .7, 2.0}) {
+    SCOPED_TRACE(observed);
+    MolaTerrainProduct product(.1, -3, 5, -3, 3, flat, {}, observed);
+    auto node = botmanNode("sensor_unknown_air", product);
+    PlannerNodeTestPeer::sensorPolicy(*node);
+    PlannerNodeTestPeer::standAt(*node, 0, 0, 0, 0, 1);
+    const auto response = navigate(*node, 2, 0);
+    EXPECT_EQ(response->status == Service::Response::SUCCEEDED, observed >= .7);
+  }
+}
+
+TEST_F(PlannerNavigationTest, SensorFovPolicyBlocksTableEdgeAt075Metres) {
+  MolaTerrainProduct product(.1, -3, 5, -3, 3, flat, {{1.4, 1.8, -3, 3, .75}}, .9);
+  auto node = botmanNode("sensor_table_edge", product);
+  PlannerNodeTestPeer::sensorPolicy(*node);
+  PlannerNodeTestPeer::standAt(*node, 0, 0, 0, 0, 1);
+  EXPECT_NE(navigate(*node, 2, 0)->status, Service::Response::SUCCEEDED);
+}
+
+TEST_F(PlannerNavigationTest, SensorFovPolicyWithoutConfiguredMountFailsClosed) {
+  MolaTerrainProduct product(.1, -3, 5, -3, 3, flat, {}, .7);
+  auto node = botmanNode("sensor_missing_mount", product);
+  PlannerNodeTestPeer::sensorPolicy(*node, 0);
+  PlannerNodeTestPeer::standAt(*node, 0, 0, 0, 0, 1);
+  EXPECT_NE(navigate(*node, 2, 0)->status, Service::Response::SUCCEEDED);
 }
 
 TEST_F(PlannerNavigationTest, InterruptedPeerDiagnosisRestoresCollisionChecks) {
@@ -592,6 +634,30 @@ TEST_F(PlannerNavigationTest, ObjectiveInterruptionRestoresPeerDiagnosisDeadline
   const auto next = navigate(*node, 0, 0);
   EXPECT_TRUE(PlannerNodeTestPeer::peerBlocks(*node));
   EXPECT_FALSE(PlannerNodeTestPeer::peerDeadlineSet(*node));
+}
+
+TEST_F(PlannerNavigationTest, RequestBudgetDuringPeerDiagnosisIsBlocked) {
+  MolaTerrainProduct product(.1, -3, 5, -3, 3, flat, {{1, 4, -3, 3, 2}});
+  auto node = botmanNode("objective_peer_budget", product);
+  PlannerNodeTestPeer::standAt(*node, 0, 0, 0, 0, 1);
+  PlannerNodeTestPeer::setBudget(*node, 5.0);
+  PlannerNodeTestPeer::installPeerAndGraph(*node);
+  bool expired = false;
+  mgg::PlanningCancellationScope instrument([&] {
+    if (PlannerNodeTestPeer::peerDeadlineSet(*node)) {
+      PlannerNodeTestPeer::expireRequest(*node);
+      expired = true;
+    }
+    return false;  // not external cancellation
+  });
+  const auto response = navigate(*node, 3, 0);
+  EXPECT_TRUE(expired);
+  EXPECT_EQ(response->status, Service::Response::BLOCKED);
+  EXPECT_NE(response->reason.find("budget exceeded"), std::string::npos);
+  EXPECT_TRUE(response->path.empty());
+  EXPECT_FALSE(PlannerNodeTestPeer::peersOpen(*node));
+  EXPECT_FALSE(PlannerNodeTestPeer::peerDeadlineSet(*node));
+  EXPECT_TRUE(PlannerNodeTestPeer::peerBlocks(*node));
 }
 
 TEST_F(PlannerNavigationTest, PeerDiagnosisYieldsBeforeTheRequestDeadline) {

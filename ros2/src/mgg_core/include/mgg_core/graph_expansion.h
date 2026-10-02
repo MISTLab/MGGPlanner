@@ -104,6 +104,12 @@ struct ExpandContext {
   /// mandatory before it can enter the graph. False keeps the hardware and
   /// legacy strict-volume prefilter.
   bool allow_unknown_lattice_body = false;
+  /// Ground local lattice only: unknown air may occur above the configured
+  /// lidar mounting plane, relative to the planning body centre. Below it
+  /// every voxel must be observed. Occupancy and ground support stay strict.
+  /// No value preserves the legacy strict/relaxed policy; global contexts
+  /// must clear this. Validated sensor configuration is required by the node.
+  std::optional<double> unknown_body_above_center;
   /// Unobserved space blocks the candidate's edge and its neighbour edges,
   /// as upstream's expandGraph always had it (stop_at_unknown_voxel true at
   /// rrg.cpp:725, 813 and 820). The local lattice leaves this false and

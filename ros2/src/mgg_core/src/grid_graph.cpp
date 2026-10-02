@@ -295,11 +295,14 @@ GridGraphResult buildGridGraph(GraphManager& graph, const StateVec& state,
       status = known->second;
       if (profile != nullptr) ++profile->precheck_cache_hits;
     } else {
-      status = ctx.robot->type == RobotType::kAerialRobot
+      if (ground_robot && ctx.unknown_body_above_center) {
+        status = orientedBoxPathStatus(*ctx.map, center, center, body, true,
+                                       nullptr, false, ctx.unknown_body_above_center);
+      } else status = ctx.robot->type == RobotType::kAerialRobot
           ? ctx.map->getStrictBoxStatus(center, ctx.robot_box_size)
           : ctx.map->getBoxStatus(center, ctx.robot_box_size,
                                   !ctx.allow_unknown_lattice_body);
-      if (ground_robot && status == VoxelStatus::kOccupied &&
+      if (ground_robot && !ctx.unknown_body_above_center && status == VoxelStatus::kOccupied &&
           !ctx.map->dynamicBoxBlocked(center, ctx.robot_box_size)) {
         status = orientedBoxPathStatus(*ctx.map, center, center, body,
                                        !ctx.allow_unknown_lattice_body,

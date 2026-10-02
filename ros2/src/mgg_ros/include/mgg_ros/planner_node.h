@@ -1013,6 +1013,7 @@ class PlannerNode : public rclcpp::Node {
   std::optional<std::chrono::steady_clock::time_point> peer_diagnosis_deadline_;
   /// A peer diagnosis was cut short since last reset.
   bool peer_diagnosis_cut_short_ = false;
+  bool peer_diagnosis_in_progress_ = false;
   /// Peer diagnoses run since the node started.
   int peer_diagnoses_ = 0;
   /// Changes whenever the peer bodies in force change
@@ -1035,6 +1036,8 @@ class PlannerNode : public rclcpp::Node {
   double reach_distance_ = 0.3;
   /// See the parameter's comment in the constructor.
   bool allow_unknown_lattice_body_ = false;
+  std::string unknown_body_policy_ = "strict";
+  std::string unknown_body_sensor_ = "VLP16";
   /// How long one request's lattice sweeps may take, seconds
   /// (lattice_time_budget_s); 0 is no bound.
   double lattice_time_budget_s_ = 0.5;

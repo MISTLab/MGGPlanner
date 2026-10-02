@@ -196,14 +196,16 @@ struct FlagScope {
 /// restores the one before it.
 struct DeadlineScope {
   DeadlineScope(std::optional<std::chrono::steady_clock::time_point>& deadline,
-                double budget_s)
+                double budget_s, const bool* diagnosing = nullptr)
       : deadline_(deadline), previous_(deadline),
         outer_(mgg::planning_cancelled), started_(std::chrono::steady_clock::now()),
         cancellation_([this] {
           if (outer_ && (*outer_)()) { cancelled_ = true; return true; }
           exhausted_ = deadline_ && std::chrono::steady_clock::now() >= *deadline_;
+          if (exhausted_ && diagnosing_) interrupted_diagnosis_ = *diagnosing_;
           return exhausted_;
         }) {
+    diagnosing_ = diagnosing;
     if (budget_s > 0.0 && !deadline_) {
       deadline_ = std::chrono::steady_clock::now() +
                   std::chrono::duration_cast<std::chrono::steady_clock::duration>(
@@ -217,6 +219,8 @@ struct DeadlineScope {
   std::optional<std::chrono::steady_clock::time_point> previous_;
   const std::function<bool()>* outer_;
   std::chrono::steady_clock::time_point started_;
+  bool interrupted_diagnosis_ = false;
+  const bool* diagnosing_ = nullptr;
   bool exhausted_ = false;
   bool cancelled_ = false;
   mgg::PlanningCancellationScope cancellation_;
@@ -670,6 +674,15 @@ PlannerNode::PlannerNode(const rclcpp::NodeOptions& options)
   // mandatory. Off by default; simulation with a keyframe map turns it on.
   allow_unknown_lattice_body_ = declareOrGet<bool>(
       this, "allow_unknown_lattice_body", allow_unknown_lattice_body_);
+  // Old simulation configurations retain their explicitly relaxed control.
+  // New hardware policy is opt-in and otherwise defaults to strict.
+  unknown_body_policy_ = declareOrGet<std::string>(this, "unknown_body_policy",
+      allow_unknown_lattice_body_ ? "legacy_relaxed" : "strict");
+  unknown_body_sensor_ = declareOrGet<std::string>(this, "unknown_body_sensor", "VLP16");
+  if (unknown_body_policy_ != "strict" && unknown_body_policy_ != "above_sensor_fov" &&
+      unknown_body_policy_ != "legacy_relaxed")
+    throw std::invalid_argument("unknown_body_policy must be strict, above_sensor_fov or legacy_relaxed");
+  allow_unknown_lattice_body_ = unknown_body_policy_ == "legacy_relaxed";
   // The most one request (an objective, a plan request) spends sweeping
   // lattices, seconds: past it a sweep stops and the request plans over
   // what it built, or refuses with the budget named. A planning call longer
@@ -974,6 +987,22 @@ mgg::ExpandContext PlannerNode::makeContext() {
   ctx.robot_id = static_cast<int>(planning_params_.robot_id);
   ctx.robot_box_size = robot_params_.getPlanningSize();
   ctx.allow_unknown_lattice_body = allow_unknown_lattice_body_;
+  if (robot_params_.type == mgg::RobotType::kGroundRobot &&
+      unknown_body_policy_ == "above_sensor_fov") {
+    const auto sensor = sensors_.find(unknown_body_sensor_);
+    if (sensor != sensors_.end()) {
+      const auto& lidar = sensor->second;
+      // Upright lidar geometry only. Missing/invalid configuration fails
+      // closed to the strict body policy; never invent a sensor height/FOV.
+      if (lidar.type == mgg::SensorType::kLidar && std::isfinite(lidar.mount_height) &&
+          lidar.mount_height > 0 && std::isfinite(lidar.fov.y()) &&
+          lidar.fov.y() > 0 && lidar.fov.y() < M_PI &&
+          lidar.rotations.tail<2>().norm() < 1e-9) {
+        ctx.unknown_body_above_center = lidar.mount_height -
+            planning_params_.max_ground_height - robot_params_.center_offset.z();
+      }
+    }
+  }
   ctx.hanging_root_edge_length_max = hanging_root_edge_length_max_;
   // A hanging root sits at the physical driving height by construction;
   // projecting it again onto absent ground would only fail.
@@ -999,6 +1028,7 @@ mgg::ExpandContext PlannerNode::makeContext() {
 
 mgg::ExpandContext PlannerNode::makeGlobalContext() {
   mgg::ExpandContext ctx = makeContext();
+  ctx.unknown_body_above_center.reset();
   // Inclinations are keyed by local lattice ids; the roadmap has its own.
   ctx.inclinations = nullptr;
   // A roadmap edge must have been seen traversable (rrg.cpp:725).
@@ -2951,6 +2981,7 @@ bool PlannerNode::diagnosePeerSearch(int source_id,
   const auto deadline = std::min(
       peer_diagnosis_deadline_.value_or(std::chrono::steady_clock::time_point::max()),
       innerDeadline(lattice_deadline_, planning_params_.global_search_time_budget_s));
+  const FlagScope diagnosing(peer_diagnosis_in_progress_);
   const FlagScope open(peer_edges_open_);
   rep = mgg::ShortestPathsReport();
   global_graph_->findShortestPaths(source_id, rep, deadline);
@@ -3869,6 +3900,7 @@ void PlannerNode::shortcutAndResample(std::vector<mgg::StateVec>& path,
   shortcut_ground.setStandingStart(standingStart());
   mgg::ExpandContext ctx = makeContext();
   ctx.ground = &shortcut_ground;
+  if (!lattice_route) ctx.unknown_body_above_center.reset();
   const bool stop_at_unknown = !lattice_route || ctx.stop_at_unknown ||
                                !ctx.allow_unknown_lattice_body;
   const auto segment_free = [this, &ctx, stop_at_unknown](
@@ -5502,8 +5534,11 @@ void PlannerNode::onObjectiveRequest(
   }
   const bool admitted = map_read.hasSnapshot();
   const auto map_generation = mola_map_ ? mola_map_->activeGeneration() : 0;
-  mgg::PlanningCancellationScope cancellation([this, generation, admitted, map_generation]() {
-    return request_generation_.load() != generation ||
+  const auto* outer_cancel = mgg::planning_cancelled;
+  bool outer_cancelled = false;
+  mgg::PlanningCancellationScope cancellation([this, generation, admitted, map_generation, outer_cancel, &outer_cancelled]() {
+    outer_cancelled = outer_cancelled || (outer_cancel && (*outer_cancel)());
+    return outer_cancelled || request_generation_.load() != generation ||
            (admitted && (!mola_map_->authorityValid() ||
                          mola_map_->activeGeneration() != map_generation));
   });
@@ -5521,7 +5556,8 @@ void PlannerNode::onObjectiveRequest(
     best_path_.clear();
     global_exploration_ongoing_ = false;
     response->path.clear();
-    const bool superseded = request_generation_.load() != generation;
+    const bool superseded = request_generation_.load() != generation ||
+                            outer_cancelled;
     response->status = superseded ? mgg_msgs::srv::PlanObjective::Response::BLOCKED
                                 : mgg_msgs::srv::PlanObjective::Response::STALE_REVISION;
     response->reason = "planning cancelled: superseded or map authority expired/changed";
@@ -6699,15 +6735,8 @@ void PlannerNode::onObjectiveRequestImpl(
   refreshMapRevision();
   StandingStartScope standing_scope(*this);
   const DeadlineScope budget(lattice_deadline_,
-      robot_params_.type == mgg::RobotType::kGroundRobot ? lattice_time_budget_s_ : 0.0);
-  try {
-  local_route_profile_.clear();
-  // One peer set for the whole request (review r0, I5).
-  std::optional<PeerBodyPin> peer_pin;
-  pinPeerBodies(peer_pin);
-  // An objective supersedes exploration's last path.
-  turn_back_hysteresis_.reset();
-  refreshNoGoZones();
+      robot_params_.type == mgg::RobotType::kGroundRobot ? lattice_time_budget_s_ : 0.0,
+      &peer_diagnosis_in_progress_);
   // Every answer is logged with the objective, where the robot is and the
   // goal it asked for: a refusal alone does not say which objective it
   // answered or where it was going (run 5, 2026-09-25).
@@ -6741,6 +6770,14 @@ void PlannerNode::onObjectiveRequestImpl(
                 objective, current_state_.x(), current_state_.y(), g.x, g.y,
                 g.z, status, response->reason.c_str());
   }};
+  try {
+  local_route_profile_.clear();
+  // One peer set for the whole request (review r0, I5).
+  std::optional<PeerBodyPin> peer_pin;
+  pinPeerBodies(peer_pin);
+  // An objective supersedes exploration's last path.
+  turn_back_hysteresis_.reset();
+  refreshNoGoZones();
   withdrawUnplacedNeighbours();
   auto map_read = mapReadLease();
   refreshMapRevision();
@@ -6858,6 +6895,7 @@ void PlannerNode::onObjectiveRequestImpl(
       }
       std::optional<mgg::MolaMap::TransientDiscPin> no_peers;
       if (mola_map_) no_peers.emplace(*mola_map_, std::vector<Eigen::Vector2d>{}, 0.0);
+      const FlagScope diagnosing(peer_diagnosis_in_progress_);
       const FlagScope open(peer_edges_open_);
       const RestoreScope restore_deadline(peer_diagnosis_deadline_);
       peer_diagnosis_cut_short_ = false;
@@ -6870,8 +6908,9 @@ void PlannerNode::onObjectiveRequestImpl(
           (request->objective == Service::Request::NAVIGATE &&
            routeOverLocalLattice(goal, open_route, open_turns_ok,
                                  open_reason)) ||
-          routeOverGlobalGraph(goal, tolerance, open_route, open_turns_ok,
-                               open_reason);
+          (!peer_diagnosis_cut_short_ &&
+           routeOverGlobalGraph(goal, tolerance, open_route, open_turns_ok,
+                                open_reason));
       if (open_routed) {
         response->status = Service::Response::BLOCKED;
         response->reason = "blocked by a peer: " + reason;
@@ -6963,9 +7002,14 @@ void PlannerNode::onObjectiveRequestImpl(
   }
   mgg::planningCheckpoint();
   } catch (const mgg::PlanningInterrupted&) {
-    if (budget.cancelled_) throw;
+    if (budget.cancelled_) {
+      response->path.clear();
+      response->status = Service::Response::BLOCKED;
+      response->reason = budget.reason();
+      throw;
+    }
     response->path.clear();
-    response->status = budget.cancelled_
+    response->status = (budget.cancelled_ || budget.interrupted_diagnosis_)
         ? mgg_msgs::srv::PlanObjective::Response::BLOCKED
         : mgg_msgs::srv::PlanObjective::Response::UNREACHABLE;
     response->reason = budget.reason();

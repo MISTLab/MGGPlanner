@@ -211,6 +211,7 @@ inline std::vector<Scenario> scenarios() {
 
 struct Outcome {
   bool allow_unknown_body = true;
+  std::string unknown_body_policy = "strict";
   double request_budget_ms = 500.0;
   bool routed = false;
   std::string reason;
@@ -259,13 +260,16 @@ inline double maxCornerDeg(const std::vector<Eigen::Vector3d>& p) {
 }
 
 inline Outcome run(const MapInterface& map, const Scenario& scenario,
-                   bool allow_unknown_body = true, double request_budget_ms = 500.0) {
+                   bool allow_unknown_body = true, double request_budget_ms = 500.0,
+                   std::optional<double> sensor_height = std::nullopt) {
   using Clock = std::chrono::steady_clock;
   const auto ms = [](Clock::time_point a, Clock::time_point b) {
     return std::chrono::duration<double, std::milli>(b - a).count();
   };
   Outcome out;
   out.allow_unknown_body = allow_unknown_body;
+  out.unknown_body_policy = sensor_height ? "above_sensor_fov" :
+      (allow_unknown_body ? "legacy_relaxed" : "strict");
   out.request_budget_ms = request_budget_ms;
   const PlanningParams planning = botmanPlanning();
   const RobotParams robot = botmanRobot();
@@ -282,6 +286,8 @@ inline Outcome run(const MapInterface& map, const Scenario& scenario,
   ctx.robot_id = 1;
   ctx.robot_box_size = robot.getPlanningSize();
   ctx.allow_unknown_lattice_body = allow_unknown_body;
+  if (sensor_height) ctx.unknown_body_above_center = *sensor_height -
+      planning.max_ground_height - robot.center_offset.z();
   ctx.hanging_root_edge_length_max = planning.edge_length_max;
   ctx.preserve_hanging_root_start_height = true;
   ctx.root_footprint_exempt = true;
@@ -465,6 +471,7 @@ inline std::string describe(const Scenario& s, const Outcome& o) {
 inline std::string toJson(const Scenario& s, const Outcome& o) {
   nlohmann::json j;
   j["allow_unknown_body"] = o.allow_unknown_body;
+  j["unknown_body_policy"] = o.unknown_body_policy;
   j["request_budget_ms"] = o.request_budget_ms;
   j["scenario"] = s.name;
   j["kind"] = s.navigate ? "navigate" : "explore";

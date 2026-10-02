@@ -1089,6 +1089,7 @@ TEST(GridGraph, CrossNudgesCannotEnterAGapNarrowerThanTheOrientedBody) {
 }
 
 TEST(GridGraph, HardwareUnknownPolicyMatchesEagerInRotatedDoorways) {
+  for (bool narrow : {false, true}) for (bool upper_unknown : {false, true})
   for (double heading : {M_PI / 2, M_PI / 3}) {
     SCOPED_TRACE(heading);
     std::map<std::pair<std::int64_t, std::int64_t>, double> tops;
@@ -1096,9 +1097,21 @@ TEST(GridGraph, HardwareUnknownPolicyMatchesEagerInRotatedDoorways) {
       const double px = (x + .5) * .05, py = (y + .5) * .05;
       const double along = px * std::cos(heading) + py * std::sin(heading);
       const double across = -px * std::sin(heading) + py * std::cos(heading);
-      tops[{x, y}] = along > .8 && std::abs(across) > .48 ? .4 : 0;
+      tops[{x, y}] = along > .8 && std::abs(across) > (narrow ? .20 : .48) ? .4 : 0;
     }
-    mgg_test::TerrainFixture map(.05, tops);
+    class UpperUnknown : public mgg_test::TerrainFixture {
+     public:
+      using mgg_test::TerrainFixture::TerrainFixture;
+      bool upper = false;
+      VoxelStatus getBoxStatus(const Eigen::Vector3d& c, const Eigen::Vector3d& size,
+                               bool stop) const override {
+        const auto status = mgg_test::TerrainFixture::getBoxStatus(c, size, stop);
+        if (status == VoxelStatus::kOccupied) return status;
+        return upper && stop && c.z() + size.z()/2 > .45
+            ? VoxelStatus::kUnknown : status;
+      }
+    } map(.05, tops);
+    map.upper = upper_unknown;
     RobotParams robot;
     robot.type = RobotType::kGroundRobot;
     robot.size = Eigen::Vector3d(1.2, .6, .3);
@@ -1125,8 +1138,10 @@ TEST(GridGraph, HardwareUnknownPolicyMatchesEagerInRotatedDoorways) {
     buildGridGraph(eager, root, grid, ctx, heading);
     const StateVec goal(2.4 * std::cos(heading), 2.4 * std::sin(heading), .4, heading);
     Vertex* reached = nullptr;
-    ASSERT_TRUE(eager.getNearestVertexInRange(&goal, .01, &reached));
-    EXPECT_TRUE(mgg::routeOverLocalLattice(lazy, root, goal, grid, ctx).routed);
+    const bool eager_reaches = eager.getNearestVertexInRange(&goal, .01, &reached);
+    EXPECT_EQ(eager_reaches, !narrow && !upper_unknown);
+    EXPECT_EQ(mgg::routeOverLocalLattice(lazy, root, goal, grid, ctx).routed,
+              eager_reaches);
   }
 }
 

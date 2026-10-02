@@ -101,7 +101,8 @@ bool edgeTraversable(const ExpandContext& ctx, const Eigen::Vector3d& start,
   body.size = ctx.robot_box_size;
   EdgeBodyCheck check;
   check.sweep = [&](const Eigen::Vector3d& a, const Eigen::Vector3d& b) {
-    return orientedBoxPathStatus(*ctx.map, a, b, body, stop_at_unknown, nullptr, true);
+    return orientedBoxPathStatus(*ctx.map, a, b, body, stop_at_unknown, nullptr, true,
+                                  ctx.unknown_body_above_center);
   };
   // Ground robot: the edge has to follow the terrain.
   ProjectedEdgeStatus es = ctx.ground->getProjectedEdgeStatus(

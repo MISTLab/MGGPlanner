@@ -64,6 +64,9 @@ Vertex* lazyGroundLattice(GraphManager& graph, Vertex* root,
     body.heading = std::atan2(to.y() - from.y(), to.x() - from.x());
     body.size = ctx.robot_box_size;
     const Eigen::Vector3d center = to.head<3>() + ctx.robot->offsetForHeading(body.heading);
+    if (ctx.unknown_body_above_center)
+      return orientedBoxPathStatus(*ctx.map, center, center, body, true, nullptr,
+                                    false, ctx.unknown_body_above_center) == VoxelStatus::kFree;
     auto status = ctx.map->getBoxStatus(center, body.size, !ctx.allow_unknown_lattice_body);
     if (status == VoxelStatus::kOccupied && !ctx.map->dynamicBoxBlocked(center, body.size))
       status = orientedBoxPathStatus(*ctx.map, center, center, body,
@@ -351,7 +354,7 @@ bool groundShortcutSegmentAdmissible(const ExpandContext& ctx,
   EdgeBodyCheck check;
   check.sweep = [&](const Eigen::Vector3d& a, const Eigen::Vector3d& b) {
     return orientedBoxPathStatus(*ctx.map, a, b, body, stop_at_unknown,
-                                 nullptr, true);
+                                 nullptr, true, ctx.unknown_body_above_center);
   };
   std::vector<Eigen::Vector3d> projected;
   const Eigen::Vector3d offset = ctx.robot->offsetForHeading(body.heading);

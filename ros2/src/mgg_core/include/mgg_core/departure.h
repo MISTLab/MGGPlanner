@@ -75,7 +75,8 @@ VoxelStatus orientedBoxPathStatus(const MapInterface& map,
                                   const OrientedBox& box,
                                   bool stop_at_unknown_voxel,
                                   const OrientedBox* standing,
-                                  bool clearance_prefilter = false);
+                                  bool clearance_prefilter = false,
+                                  std::optional<double> unknown_above_center = std::nullopt);
 
 /// Aerial sweep from the physical root. The ordinary sweep permits unknown
 /// volume only inside the original root body. On occupied-sweep failure a
