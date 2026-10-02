@@ -313,6 +313,7 @@ class PlannerNode : public rclcpp::Node {
       std::shared_ptr<std_srvs::srv::Trigger::Response> response);
   /// The exploration service: one cycle, the chosen path whole.
   void cancelPlanning();
+  void cancelExplorationPlanning();
   void onPlanRequestImpl(
       const std::shared_ptr<mgg_msgs::srv::PlannerSrv::Request> request,
       std::shared_ptr<mgg_msgs::srv::PlannerSrv::Response> response);
@@ -769,6 +770,8 @@ class PlannerNode : public rclcpp::Node {
   std::mutex input_mutex_;
   std::mutex cancellation_mutex_;
   std::atomic<std::uint64_t> request_generation_{0};
+  // PCI stop cannot revoke NAVIGATE/RETURN_HOME, even when delivered late.
+  std::atomic<std::uint64_t> exploration_generation_{0};
   std::atomic<std::uint64_t> cancellations_{0};
   std::atomic<bool> acquiring_observations_{true};
   std::atomic<std::int64_t> bootstrap_started_ns_{0};
@@ -1266,6 +1269,7 @@ class PlannerNode : public rclcpp::Node {
   static constexpr double kFleetTickPeriodS = 0.1;
   rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr build_srv_;
   rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr cancel_srv_;
+  rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr cancel_exploration_srv_;
   rclcpp::Service<mgg_msgs::srv::PlannerSrv>::SharedPtr plan_srv_;
   rclcpp::Service<mgg_msgs::srv::PlanObjective>::SharedPtr objective_srv_;
   rclcpp::Service<mgg_msgs::srv::PlannerSetExplorationTarget>::SharedPtr

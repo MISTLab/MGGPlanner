@@ -68,8 +68,9 @@ PciNode::PciNode(const rclcpp::NodeOptions& options)
   planner_client_ = create_client<mgg_msgs::srv::PlannerSrv>(
       "mggplanner", rclcpp::ServicesQoS(), callback_group_);
 
+  // This asynchronous stop may arrive after a new operator objective.
   cancel_client_ = create_client<std_srvs::srv::Trigger>(
-      "cancel_planning", rclcpp::ServicesQoS(), callback_group_);
+      "cancel_exploration_planning", rclcpp::ServicesQoS(), callback_group_);
   trigger_srv_ = create_service<std_srvs::srv::Trigger>(
       "pci_trigger",
       [this](const std::shared_ptr<std_srvs::srv::Trigger::Request> req,

@@ -724,6 +724,14 @@ PlannerNode::PlannerNode(const rclcpp::NodeOptions& options)
         response->success = true;
         response->message = "cancellation requested";
       }, rclcpp::ServicesQoS(), input_callback_group_);
+  cancel_exploration_srv_ = create_service<std_srvs::srv::Trigger>(
+      "cancel_exploration_planning",
+      [this](std::shared_ptr<std_srvs::srv::Trigger::Request>,
+             std::shared_ptr<std_srvs::srv::Trigger::Response> response) {
+        cancelExplorationPlanning();
+        response->success = true;
+        response->message = "exploration cancellation requested";
+      }, rclcpp::ServicesQoS(), input_callback_group_);
   build_srv_ = create_service<std_srvs::srv::Trigger>(
       "build_local_graph",
       [this](const std::shared_ptr<std_srvs::srv::Trigger::Request> req,
@@ -5282,10 +5290,18 @@ void PlannerNode::cancelPlanning() {
   }
 }
 
+void PlannerNode::cancelExplorationPlanning() {
+  // Fence only exploration requests (including those waiting for the planner).
+  // Do not clear shared path state: it may belong to a newer operator objective.
+  std::lock_guard<std::mutex> fence(cancellation_mutex_);
+  ++exploration_generation_;
+}
+
 void PlannerNode::onPlanRequest(
     const std::shared_ptr<mgg_msgs::srv::PlannerSrv::Request> request,
     std::shared_ptr<mgg_msgs::srv::PlannerSrv::Response> response) {
   const auto generation = request_generation_.load();
+  const auto exploration_generation = exploration_generation_.load();
   const std::lock_guard<std::recursive_mutex> lock(planner_mutex_);
   RequestActivity activity(request_active_);
   auto map_read = mapReadLease();
@@ -5301,8 +5317,10 @@ void PlannerNode::onPlanRequest(
   const bool admitted = map_read.hasSnapshot();
   const auto map_generation = mola_map_ ? mola_map_->activeGeneration() : 0;
   const auto bound = robot_params_.bound_mode;
-  mgg::PlanningCancellationScope cancellation([this, generation, admitted, map_generation]() {
+  mgg::PlanningCancellationScope cancellation([this, generation, exploration_generation,
+                                               admitted, map_generation]() {
     return request_generation_.load() != generation ||
+           exploration_generation_.load() != exploration_generation ||
            (admitted && (!mola_map_->authorityValid() ||
                          mola_map_->activeGeneration() != map_generation));
   });
@@ -5316,7 +5334,8 @@ void PlannerNode::onPlanRequest(
     ++graph_revision_;
     local_graph_->reset();
     best_path_.clear();
-    if (request_generation_.load() != generation && exploration_target_) {
+    if ((request_generation_.load() != generation ||
+         exploration_generation_.load() != exploration_generation) && exploration_target_) {
       exploration_target_.reset();
       publishPlannerConfigState();
     }

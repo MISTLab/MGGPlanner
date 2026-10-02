@@ -2104,6 +2104,10 @@ TEST_F(PlannerNodeTest, ExplorationCancelInterruptsOnlyExplorationRequests) {
   for (int kind : std::vector<int>{-1, Service::Request::NAVIGATE, Service::Request::RETURN_HOME}) {
     SCOPED_TRACE(kind);
     auto node = makeNode("scoped_cancel");
+    int published = 0;
+    auto subscriber = node->create_subscription<nav_msgs::msg::Path>(
+        "best_path", rclcpp::QoS(1).transient_local(),
+        [&](nav_msgs::msg::Path::ConstSharedPtr) { ++published; });
     auto provider = std::make_unique<SlowPlanningMap>();
     auto* slow = provider.get();
     PlannerNodeTestPeer::useCloudMap(*node, std::move(provider));
@@ -2129,6 +2133,7 @@ TEST_F(PlannerNodeTest, ExplorationCancelInterruptsOnlyExplorationRequests) {
     while (!slow->entered && std::chrono::steady_clock::now() < entered_by)
       std::this_thread::sleep_for(std::chrono::milliseconds(1));
     EXPECT_TRUE(slow->entered);
+    const auto cancel_started = std::chrono::steady_clock::now();
     if (available) {
       auto answer = client->async_send_request(std::make_shared<std_srvs::srv::Trigger::Request>());
       EXPECT_EQ(rclcpp::spin_until_future_complete(node, answer, std::chrono::seconds(1)),
@@ -2141,8 +2146,18 @@ TEST_F(PlannerNodeTest, ExplorationCancelInterruptsOnlyExplorationRequests) {
     slow->slow = false;
     work.get();
     if (kind == -1) {
+      const double elapsed_ms = std::chrono::duration<double, std::milli>(
+          std::chrono::steady_clock::now() - cancel_started).count();
+      EXPECT_LT(elapsed_ms, 200.0);
+      RecordProperty("exploration_cancel_ms", std::to_string(elapsed_ms));
       EXPECT_TRUE(plan->path.empty());
       EXPECT_EQ(plan->status, PlannerNode::kStatusNotReady);
+      const auto receive_until = std::chrono::steady_clock::now() + std::chrono::milliseconds(200);
+      while (std::chrono::steady_clock::now() < receive_until) {
+        rclcpp::spin_some(node);
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+      }
+      EXPECT_EQ(published, 0);
     } else {
       EXPECT_EQ(objective->status, Service::Response::SUCCEEDED) << objective->reason;
       EXPECT_FALSE(objective->path.empty());
