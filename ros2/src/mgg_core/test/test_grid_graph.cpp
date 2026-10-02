@@ -871,7 +871,9 @@ TEST(GridGraph, ADeckOverTheFloorReachedOnlyByGoingOutwardFirstIsJoined) {
 // deliberately outside the unrotated offset footprint.
 class OffsetObstacle : public mgg_test::TerrainFixture {
  public:
-  OffsetObstacle() : TerrainFixture(0.1, floor()) {}
+  explicit OffsetObstacle(double obstacle_y = -0.75)
+      : TerrainFixture(0.1, floor()), obstacle_y_(obstacle_y) {}
+  double obstacle_y_;
   static std::map<std::pair<std::int64_t, std::int64_t>, double> floor() {
     std::map<std::pair<std::int64_t, std::int64_t>, double> cells;
     for (int x = -40; x <= 40; ++x)
@@ -880,8 +882,8 @@ class OffsetObstacle : public mgg_test::TerrainFixture {
   }
   VoxelStatus getBoxStatus(const Eigen::Vector3d& c,
                            const Eigen::Vector3d& size, bool unknown) const override {
-    if (std::abs(c.x() - 0.05) <= 0.01 &&
-        std::abs(c.y() + 0.75) <= 0.01 &&
+    if (std::abs(c.x() - 0.05) <= size.x() / 2 + 0.05 &&
+        std::abs(c.y() - obstacle_y_) <= size.y() / 2 + 0.05 &&
         c.z() + size.z() / 2 >= 0.4) return VoxelStatus::kOccupied;
     return TerrainFixture::getBoxStatus(c, size, unknown);
   }
@@ -901,6 +903,32 @@ TEST(GridGraph, ShortcutRotatesBodyOffsetWithHeading) {
   ctx.ground = &ground; ctx.robot_box_size = robot.getPlanningSize();
   EXPECT_FALSE(mgg::groundShortcutSegmentAdmissible(
       ctx, Eigen::Vector3d(0, 0, 0.5), Eigen::Vector3d(0, 0.4, 0.5), false));
+}
+
+TEST(GridGraph, BidirectionalEdgeChecksTheOppositeOffsetFootprint) {
+  OffsetObstacle map(0.75);
+  PlanningParams planning;
+  planning.max_ground_height = 0.5;
+  planning.min_observed_ground_fraction = 0.0;
+  planning.edge_length_max = 1.0;
+  planning.edge_length_min = 0.0;
+  planning.edge_overshoot = 0.0;
+  RobotParams robot;
+  robot.size = Eigen::Vector3d(0.8, 0.4, 0.4);
+  robot.center_offset = Eigen::Vector3d(-0.8, 0, 0);
+  mgg::GroundProjection ground(map, planning);
+  ExpandContext ctx;
+  ctx.map = &map; ctx.planning = &planning; ctx.robot = &robot;
+  ctx.ground = &ground; ctx.robot_box_size = robot.getPlanningSize();
+  for (bool forward_only : {true, false}) {
+    GraphManager graph;
+    graph.addVertex(new Vertex(0, StateVec(0, 0, 0.5, 0)));
+    ctx.root_is_robot = forward_only;
+    Vertex candidate(-1, StateVec(0, 0.4, 0.5, M_PI_2));
+    mgg::ExpandGraphReport report;
+    mgg::expandGraph(graph, candidate, report, ctx, true);
+    EXPECT_EQ(report.status == mgg::ExpandGraphStatus::kSuccess, forward_only);
+  }
 }
 
 }  // namespace

@@ -137,4 +137,17 @@ TEST(BoundedSpace, ZeroExtensionMakesUseExtensionANoOp) {
   EXPECT_FALSE(s.isInsideSpace(Eigen::Vector3d(15.1, 0, 0)));
 }
 
+TEST(RobotParams, GroundOffsetRotatesButAerialOffsetIsUnchanged) {
+  RobotParams robot;
+  robot.center_offset = Eigen::Vector3d(-0.16, 0.04, 0.2);
+  for (double yaw : {0.0, M_PI_2, M_PI, -M_PI_2}) {
+    robot.type = mgg::RobotType::kGroundRobot;
+    const auto expected = Eigen::AngleAxisd(yaw, Eigen::Vector3d::UnitZ()) *
+                          robot.center_offset;
+    EXPECT_TRUE(robot.offsetForHeading(yaw).isApprox(expected));
+    robot.type = mgg::RobotType::kAerialRobot;
+    EXPECT_EQ(robot.offsetForHeading(yaw), robot.center_offset);
+  }
+}
+
 }  // namespace

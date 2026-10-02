@@ -98,7 +98,8 @@ VoxelStatus orientedBoxPathStatus(const MapInterface& map,
                                   const Eigen::Vector3d& end,
                                   const OrientedBox& box,
                                   bool stop_at_unknown_voxel,
-                                  const OrientedBox* standing) {
+                                  const OrientedBox* standing,
+                                  bool clearance_prefilter) {
   const double resolution = map.getResolution();
   if (!start.allFinite() || !end.allFinite() || !box.size.allFinite() ||
       (box.size.array() < 0.0).any() || !std::isfinite(box.heading) ||
@@ -122,6 +123,18 @@ VoxelStatus orientedBoxPathStatus(const MapInterface& map,
   swept.size += Eigen::Vector3d(std::abs(step.head<2>().dot(along)),
                                 std::abs(step.head<2>().dot(across)),
                                 std::abs(step.z()));
+  if (clearance_prefilter && standing == nullptr) {
+    // Contains every conservative step box below (not an inscribed disc).
+    // Padding also contains boundary-touching native XY cells.
+    const Eigen::Vector3d span = (end - start).cwiseAbs();
+    Eigen::Vector3d bound(
+        std::abs(along.x()) * swept.size.x() + std::abs(across.x()) * swept.size.y(),
+        std::abs(along.y()) * swept.size.x() + std::abs(across.y()) * swept.size.y(),
+        swept.size.z());
+    bound += span + Eigen::Vector3d(2 * resolution, 2 * resolution, 0);
+    if (map.getStaticBoxStatus((start + end) / 2, bound, stop_at_unknown_voxel) ==
+        VoxelStatus::kFree) return VoxelStatus::kFree;
+  }
   const double radius = 0.5 * swept.size.head<2>().norm();
   bool unknown = false;
   std::vector<XYCellCenter> cells;

@@ -66,13 +66,16 @@ bool pointInBox(const Eigen::Vector2d& point, const OrientedBox& box);
 /// the standing body (sampled every resolution / 8), so a post just past
 /// the robot's front is not driven through, while a wall column beside it
 /// does not stop the robot driving along it (review r0, I-1).
-/// `box.center` is ignored.
+/// `box.center` is ignored. With clearance_prefilter, a known-free
+/// circumscribed static AABB may accept early, after the dynamic sweep.
+/// An occupied or unknown bound never decides: the exact sweep follows.
 VoxelStatus orientedBoxPathStatus(const MapInterface& map,
                                   const Eigen::Vector3d& start,
                                   const Eigen::Vector3d& end,
                                   const OrientedBox& box,
                                   bool stop_at_unknown_voxel,
-                                  const OrientedBox* standing);
+                                  const OrientedBox* standing,
+                                  bool clearance_prefilter = false);
 
 /// Aerial sweep from the physical root. The ordinary sweep permits unknown
 /// volume only inside the original root body. On occupied-sweep failure a

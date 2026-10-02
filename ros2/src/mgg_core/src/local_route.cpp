@@ -116,7 +116,7 @@ bool groundShortcutSegmentAdmissible(const ExpandContext& ctx,
   EdgeBodyCheck check;
   check.sweep = [&](const Eigen::Vector3d& a, const Eigen::Vector3d& b) {
     return orientedBoxPathStatus(*ctx.map, a, b, body, stop_at_unknown,
-                                 nullptr);
+                                 nullptr, true);
   };
   std::vector<Eigen::Vector3d> projected;
   const Eigen::Vector3d offset = ctx.robot->offsetForHeading(body.heading);

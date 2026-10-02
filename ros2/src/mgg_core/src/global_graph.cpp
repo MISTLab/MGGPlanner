@@ -470,7 +470,7 @@ bool drivenEdgeTraversable(const ExpandContext& ctx, const Vertex& from,
   EdgeBodyCheck check;
   check.sweep = [&ctx, &body](const Eigen::Vector3d& a,
                               const Eigen::Vector3d& b) {
-    return orientedBoxPathStatus(*ctx.map, a, b, body, false, nullptr);
+    return orientedBoxPathStatus(*ctx.map, a, b, body, false, nullptr, true);
   };
   std::vector<Eigen::Vector3d> projected;
   ProjectedEdgeStatus status = ctx.ground->getProjectedEdgeStatus(
@@ -811,7 +811,9 @@ Vertex* connectGoalThroughLattice(GraphManager& graph, const StateVec& goal,
   EdgeVerdictCache verdicts;
   if (ctx.robot->type == RobotType::kGroundRobot && ctx.ground) {
     cached_ground.emplace(*ctx.map, metric_planning, true);
-    cached_ground->setStandingStart(ctx.ground->standingStart());
+    if (ctx.ground->standingStart()) {
+      cached_ground->setStandingStart(*ctx.ground->standingStart());
+    }
     cached_ground->setProfile(ctx.ground->profile());
     metric_ctx.ground = &*cached_ground;
     metric_ctx.edge_verdicts = &verdicts;
