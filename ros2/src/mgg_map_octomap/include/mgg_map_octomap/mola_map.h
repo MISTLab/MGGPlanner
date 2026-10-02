@@ -164,7 +164,8 @@ class MolaMap : public MapInterface {
   /// never its axis-aligned enclosure of the navigation-frame box. A drone's
   /// box is the square its round footprint circumscribes, so any one
   /// orientation is its body; the grid's makes voxels no wider than they
-  /// are. Peer and no-go discs and root recovery margins are unchanged.
+  /// are. Peer/no-go disc sweep radii follow half the configured box width;
+  /// root recovery departure semantics are unchanged.
   /// Off for ground robots, whose box turns with them.
   void setGridAlignedBody(bool aligned);
   bool gridAlignedBody() const;
