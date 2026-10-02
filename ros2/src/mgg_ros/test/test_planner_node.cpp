@@ -2097,6 +2097,59 @@ TEST_F(PlannerNodeTest, CancellationInterruptsSlowPlanWithoutReturningPath) {
   EXPECT_EQ(published, 0) << "superseded work must not publish even a latched path";
 }
 
+// Exercise the public endpoint: a delayed PCI stop must not share the
+// generation that supersedes operator objectives.
+TEST_F(PlannerNodeTest, ExplorationCancelInterruptsOnlyExplorationRequests) {
+  using Service = mgg_msgs::srv::PlanObjective;
+  for (int kind : std::vector<int>{-1, Service::Request::NAVIGATE, Service::Request::RETURN_HOME}) {
+    SCOPED_TRACE(kind);
+    auto node = makeNode("scoped_cancel");
+    auto provider = std::make_unique<SlowPlanningMap>();
+    auto* slow = provider.get();
+    PlannerNodeTestPeer::useCloudMap(*node, std::move(provider));
+    PlannerNodeTestPeer::observeFloor(*node, -1.5, 4, -1.5, 1.5);
+    PlannerNodeTestPeer::acceptOdometry(*node, 0, 0, 1);
+    PlannerNodeTestPeer::acceptOdometry(*node, 0.5, 0, 2);
+    auto client = node->create_client<std_srvs::srv::Trigger>("cancel_exploration_planning");
+    const bool available = client->wait_for_service(std::chrono::milliseconds(300));
+    EXPECT_TRUE(available) << "PCI requires a distinct exploration-only cancel service";
+    slow->slow = true;
+    auto plan = std::make_shared<mgg_msgs::srv::PlannerSrv::Response>();
+    auto request = std::make_shared<Service::Request>();
+    request->objective = kind == -1 ? Service::Request::NAVIGATE : kind;
+    request->goal.position.x = 1.5;
+    request->goal.position.z = 0.075;
+    request->goal.orientation.w = 1;
+    auto objective = std::make_shared<Service::Response>();
+    auto work = std::async(std::launch::async, [&] {
+      if (kind == -1) PlannerNodeTestPeer::plan(*node, plan);
+      else PlannerNodeTestPeer::objective(*node, request, objective);
+    });
+    const auto entered_by = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (!slow->entered && std::chrono::steady_clock::now() < entered_by)
+      std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    EXPECT_TRUE(slow->entered);
+    if (available) {
+      auto answer = client->async_send_request(std::make_shared<std_srvs::srv::Trigger::Request>());
+      EXPECT_EQ(rclcpp::spin_until_future_complete(node, answer, std::chrono::seconds(1)),
+                rclcpp::FutureReturnCode::SUCCESS);
+      if (answer.wait_for(std::chrono::seconds(0)) == std::future_status::ready)
+        EXPECT_TRUE(answer.get()->success);
+      if (kind == -1)
+        EXPECT_EQ(work.wait_for(std::chrono::milliseconds(200)), std::future_status::ready);
+    }
+    slow->slow = false;
+    work.get();
+    if (kind == -1) {
+      EXPECT_TRUE(plan->path.empty());
+      EXPECT_EQ(plan->status, PlannerNode::kStatusNotReady);
+    } else {
+      EXPECT_EQ(objective->status, Service::Response::SUCCEEDED) << objective->reason;
+      EXPECT_FALSE(objective->path.empty());
+    }
+  }
+}
+
 TEST_F(PlannerNodeTest, NewObjectiveSupersedesSlowPlanAndUsesNewestPose) {
   using Service = mgg_msgs::srv::PlanObjective;
   for (bool old_objective : {false, true})
@@ -2146,9 +2199,13 @@ TEST_F(PlannerNodeTest, NewObjectiveSupersedesSlowPlanAndUsesNewestPose) {
 
 TEST_F(PlannerNodeTest, IncompatibleAuthorityInterruptsPlanButRefinementKeepsPredecessor) {
   using Service = mgg_msgs::srv::PlanObjective;
-  for (int change : {0, 1, 2}) { // refinement, epoch, transform
+  for (int change : {0, 1, 2, 3}) { // refinement, epoch, transform, component
     SCOPED_TRACE(change);
     auto node = makeNode("authority_during_plan");
+    int published = 0;
+    auto subscriber = node->create_subscription<nav_msgs::msg::Path>(
+        "best_path", rclcpp::QoS(1).transient_local(),
+        [&](nav_msgs::msg::Path::ConstSharedPtr) { ++published; });
     MolaFloorProduct initial(-1, 4, -1, 1);
     auto provider = initial.serve<SlowMolaPlanningMap>();
     auto* map = provider.get();
@@ -2175,6 +2232,7 @@ TEST_F(PlannerNodeTest, IncompatibleAuthorityInterruptsPlanButRefinementKeepsPre
     if (change == 0) initial.publishFrom(successor);
     if (change == 1) ++heartbeat.epoch;
     if (change == 2) heartbeat.component_from_navigation.translation().x() = 1;
+    if (change == 3) heartbeat.component_id += "-successor";
     const auto start = std::chrono::steady_clock::now();
     PlannerNodeTestPeer::heartbeat(*node, heartbeat);
     if (change == 0) {
@@ -2187,6 +2245,12 @@ TEST_F(PlannerNodeTest, IncompatibleAuthorityInterruptsPlanButRefinementKeepsPre
     if (change != 0) {
       EXPECT_TRUE(response->path.empty());
       EXPECT_EQ(response->status, Service::Response::STALE_REVISION);
+      const auto receive_until = std::chrono::steady_clock::now() + std::chrono::milliseconds(200);
+      while (std::chrono::steady_clock::now() < receive_until) {
+        rclcpp::spin_some(node);
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+      }
+      EXPECT_EQ(published, 0) << "revoked work must not publish a latched path";
       continue;
     }
     ASSERT_EQ(response->status, Service::Response::SUCCEEDED) << response->reason;
