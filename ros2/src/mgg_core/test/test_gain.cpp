@@ -7,6 +7,8 @@
 #include <gtest/gtest.h>
 
 #include "mgg_core/gain.h"
+#include "mgg_core/path_selection.h"
+#include "mgg_core/global_graph.h"
 
 namespace {
 
@@ -309,6 +311,118 @@ TEST(Gain, NonContiguousVertexIdsAreHandled) {
   graph.addVertex(new Vertex(99, StateVec(4, 0, 0, 0)));
   const int n = computeExplorationGain(graph, f.ctx, false, false);
   EXPECT_EQ(n, 3);
+}
+
+// Deterministic scan fixture: upper hangar air is unknown at every viewpoint;
+// only the doorway (x >= 2) reveals unknown at driving height.
+class TallRoom : public HalfMapped {
+ public:
+  bool corridor = false;
+  bool descending = false;
+  void getScanStatusIterative(
+      const Eigen::Vector3d& pos, const std::vector<Eigen::Vector3d>&,
+      GainCounts& gain,
+      std::vector<std::pair<Eigen::Vector3d, VoxelStatus>>& log,
+      const SensorModel&) override {
+    gain = GainCounts{};
+    for (int i = 0; i < 100; ++i) {
+      log.emplace_back(pos + Eigen::Vector3d(0.2 * i, 0, 4),
+                       VoxelStatus::kUnknown);
+      ++gain.unknown;
+    }
+    for (int i = 0; i < 10; ++i) {
+      const auto status = corridor || descending || pos.x() >= 2.0
+          ? VoxelStatus::kUnknown : VoxelStatus::kFree;
+      log.emplace_back(pos + Eigen::Vector3d(0.2 * i, 0, descending ? -0.8 : 0), status);
+    }
+  }
+};
+
+struct GroundRoom : Fixture {
+  GroundRoom() {
+    robot.type = mgg::RobotType::kGroundRobot;
+    robot.size = Eigen::Vector3d(0.8, 0.5, 0.6);
+    planning.max_ground_height = 0.5;
+    planning.path_length_penalty = planning.path_direction_penalty = 0;
+    ctx.robot = &robot;
+    ctx.map = &room;
+  }
+  TallRoom room;
+  mgg::RobotParams robot;
+};
+
+TEST(Gain, TallExploredRoomHasNoGroundInterestButAerialInterestRemains) {
+  GroundRoom f;
+  VolumetricGain gain;
+  computeVolumetricGain(StateVec(0, 0, 0.5, 0), gain, f.ctx);
+  EXPECT_FALSE(gain.is_frontier);
+  EXPECT_EQ(gain.num_unknown_voxels, 0);
+  EXPECT_DOUBLE_EQ(gain.gain, 0.0);  // even with nonzero free/occupied weights
+  f.robot.type = mgg::RobotType::kAerialRobot;
+  computeVolumetricGain(StateVec(0, 0, 0.5, 0), gain, f.ctx);
+  EXPECT_TRUE(gain.is_frontier);
+  EXPECT_EQ(gain.num_unknown_voxels, 100);
+  EXPECT_GT(gain.gain, 0);
+}
+
+TEST(Gain, DoorFrontierIsNotClusteredIntoTheRoomAndBestPathLeaves) {
+  GroundRoom f;
+  mgg::GraphManager graph;
+  auto* root = new Vertex(0, StateVec(0, 0, 0.5, 0));
+  auto* room = new Vertex(1, StateVec(1, 0, 0.5, 0));
+  auto* door = new Vertex(2, StateVec(2, 0, 0.5, 0));
+  auto* inside = new Vertex(3, StateVec(0, 1, 0.5, 0));
+  for (auto* v : {root, room, door, inside}) graph.addVertex(v);
+  graph.addEdge(root, room, 1); graph.addEdge(room, door, 1);
+  graph.addEdge(root, inside, 1);
+  door->is_leaf_vertex = true;  // clustering would copy this frontier inside
+  room->type = mgg::VertexType::kFrontier;  // stale local frontier
+  EXPECT_EQ(computeExplorationGain(graph, f.ctx, false, true), 4);
+  EXPECT_TRUE(door->vol_gain.is_frontier);
+  EXPECT_FALSE(room->vol_gain.is_frontier);
+  EXPECT_EQ(room->type, mgg::VertexType::kUnvisited);
+  EXPECT_FALSE(inside->vol_gain.is_frontier);
+  const auto selected = mgg::selectBestPath(graph, f.planning, f.robot,
+                                            mgg::EdgeInclinations{}, 0.2, 0);
+  EXPECT_EQ(selected.best_path_id, door->id);
+}
+
+TEST(Gain, Run7CorridorAndDescendingUnknownStillAreGroundFrontiers) {
+  GroundRoom f;
+  for (bool descending : {false, true}) {
+    f.room.corridor = !descending;
+    f.room.descending = descending;
+    VolumetricGain gain;
+    computeVolumetricGain(StateVec(0, 0, 0.5, 0), gain, f.ctx);
+    EXPECT_TRUE(gain.is_frontier);
+    EXPECT_EQ(gain.num_unknown_voxels, 10);
+    EXPECT_GT(gain.gain, 0);
+  }
+}
+
+TEST(Gain, StaleGlobalRoomFrontiersAreDemotedButDoorRemains) {
+  GroundRoom f;
+  mgg::GraphManager local, global;
+  auto* root = new Vertex(0, StateVec(0, 0, 0.5, 0));
+  local.addVertex(root);
+  auto* end = new Vertex(1, StateVec(1, 0, 0.5, 0));
+  local.addVertex(end); local.addEdge(root, end, 1);
+  for (int i = 0; i < 3; ++i) {
+    auto* v = new Vertex(i, StateVec(i, 0, 0.5, 0));
+    v->robot_id = i == 1 ? 2 : 1;  // nearby peer's stale room frontier too
+    v->type = mgg::VertexType::kFrontier;
+    v->vol_gain.is_frontier = true;
+    global.addVertex(v);
+  }
+  mgg::ExpandContext expand;
+  expand.robot_id = 1;
+  const auto report = mgg::addFrontiers(global, local, expand,
+      [&](Vertex& v) { computeVolumetricGain(v.state, v.vol_gain, f.ctx); },
+      1, 1, 3);
+  EXPECT_EQ(report.global_frontiers_demoted, 2);
+  EXPECT_EQ(global.getVertex(0)->type, mgg::VertexType::kUnvisited);
+  EXPECT_EQ(global.getVertex(1)->type, mgg::VertexType::kUnvisited);
+  EXPECT_EQ(global.getVertex(2)->type, mgg::VertexType::kFrontier);
 }
 
 }  // namespace
