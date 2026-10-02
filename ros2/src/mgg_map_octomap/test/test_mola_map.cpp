@@ -1597,6 +1597,33 @@ TEST(MolaMap, FootprintSupportDoesNotInventAdjacentGroundOrFreeSpace) {
   EXPECT_EQ(provider.getBoxStatus({0, 0, 0}, {0.5, 0.5, 0.5}, true), VoxelStatus::kUnknown);
 }
 
+TEST(MolaMap, CompatibleRefinementHeartbeatsKeepPinnedPredecessorAuthoritative) {
+  Publication publication;
+  auto cfg = config(publication);
+  cfg.snapshot_ttl_sec = 0.12;
+  MolaMap provider(cfg);
+  const auto first = publication.publish(0, {{5, 0, 0}}, freeBlock());
+  provider.requestSnapshot(first);
+  ASSERT_TRUE(waitFor([&] { return provider.getStatus(); }));
+  const auto generation = provider.activeGeneration();
+  auto second = publication.publish(1, {{8, 0, 0}}, freeBlock());
+  {
+    auto lease = provider.acquireReadLease();
+    for (int beat = 0; beat < 20; ++beat) {
+      provider.requestSnapshot(second);
+      std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    EXPECT_TRUE(provider.authorityValid());
+    EXPECT_EQ(provider.activeGeneration(), generation);
+    const auto active = provider.activeRequest();
+    EXPECT_TRUE(active.has_value());
+    if (active) EXPECT_EQ(active->geometry_revision, first.geometry_revision);
+    EXPECT_EQ(provider.getVoxelStatus({1.1, 0.1, 0.1}), VoxelStatus::kOccupied);
+  }
+  ASSERT_TRUE(waitFor([&] { return provider.activeGeneration() > generation && provider.getStatus(); }));
+  EXPECT_EQ(provider.activeRequest()->geometry_revision, second.geometry_revision);
+}
+
 TEST(MolaMap, HeartbeatsRefreshWhilePublicationLeaseIsHeld) {
   Publication publication;
   auto cfg = config(publication);
