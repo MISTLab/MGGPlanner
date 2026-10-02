@@ -12,6 +12,7 @@
 #define MGG_CORE_DEPARTURE_H_
 
 #include <vector>
+#include <map>
 #include <functional>
 
 #include <Eigen/Dense>
@@ -39,6 +40,26 @@ struct OrientedBox {
   Eigen::Vector3d center = Eigen::Vector3d::Zero();
   double heading = 0.0;
   Eigen::Vector3d size = Eigen::Vector3d::Zero();
+};
+
+/// Query-only evidence of the robot's own physical volume on one pinned map.
+/// Columns are keyed by the backend's XY cell centres; merged vertical
+/// intervals do not change the map and NEVER exempt occupied voxels.
+class KnownFreeBodyVolumes {
+ public:
+  void add(const MapInterface& map, const OrientedBox& body);
+  /// Poses at driving height, in acquisition order, newest last. Samples
+  /// actual chassis poses (not an enlarged swept AABB), newest 20 metres.
+  void addTrajectory(const MapInterface& map, const RobotParams& robot,
+                     const std::vector<StateVec>& poses);
+  VoxelStatus strictColumnStatus(const MapInterface& map,
+      const Eigen::Vector2d& cell, double lower, double upper) const;
+ private:
+    using ColumnKey = std::pair<long long, long long>;
+  static ColumnKey key(const Eigen::Vector2d& cell) {
+    return {std::llround(cell.x()*1e9), std::llround(cell.y()*1e9)};
+  }
+  std::map<ColumnKey, std::vector<std::pair<double, double>>> columns_;
 };
 
 /// Whether the closed XY square of a map cell, centred on `cell_center`
@@ -80,7 +101,9 @@ VoxelStatus orientedBoxPathStatus(const MapInterface& map,
                                   bool stop_at_unknown_voxel,
                                   const OrientedBox* standing,
                                   bool clearance_prefilter = false,
-                                  std::optional<double> unknown_above_center = std::nullopt);
+                                  std::optional<double> unknown_above_center = std::nullopt,
+                                  const KnownFreeBodyVolumes* known_free = nullptr,
+                                  bool standing_unknown_only = false);
 
 /// Aerial sweep from the physical root. The ordinary sweep permits unknown
 /// volume only inside the original root body. On occupied-sweep failure a

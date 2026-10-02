@@ -80,6 +80,7 @@ int main(int argc, char** argv) {
   std::unique_ptr<mgg::NativeMolaGrid> floor;
   mgg::MolaMap::ReadLease lease;
   const mgg::MapInterface* planning_map = nullptr;
+  std::vector<mgg::StateVec> own_trajectory;
   auto scenarios = mgg::nav_bench::scenarios();
   if (std::strcmp(argv[1], "--synthetic-floor") == 0) {
     std::vector<mgg::NativeMolaGrid::Cell> occupied, free;
@@ -115,6 +116,7 @@ int main(int argc, char** argv) {
     }
     lease = map->acquireReadLease();
     planning_map = map.get();
+    own_trajectory = mgg::nav_bench::ownFixtureTrajectory(argv[1]);
   }
   if (diagnose_body) {
     const auto robot = mgg::nav_bench::botmanRobot();
@@ -174,7 +176,7 @@ int main(int argc, char** argv) {
     if (budget_ms > 0.0) scenario.budget_ms = budget_ms;
     for (int r = 0; r < repeat; ++r) {
       const mgg::nav_bench::Outcome outcome =
-          mgg::nav_bench::run(*planning_map, scenario, allow_unknown_body, request_budget_ms, sensor_height, lattice_budget_ms);
+          mgg::nav_bench::run(*planning_map, scenario, allow_unknown_body, request_budget_ms, sensor_height, lattice_budget_ms, own_trajectory);
       if (!outcome.expectation_met) ++failures;
       // Retain every sample, including the cold first run and slow outliers.
       if (json) {

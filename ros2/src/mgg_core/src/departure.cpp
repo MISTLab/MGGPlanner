@@ -94,6 +94,96 @@ bool entersBeyondStanding(const Eigen::Vector2d& cell_center,
 
 }  // namespace
 
+void KnownFreeBodyVolumes::add(const MapInterface& map, const OrientedBox& body) {
+  if (!body.center.allFinite() || !body.size.allFinite() ||
+      (body.size.array() <= 0).any() || !std::isfinite(body.heading)) return;
+  std::vector<XYCellCenter> cells;
+  if (!map.getCircleIntersectingXYCellCenters(body.center.head<2>(),
+      body.size.head<2>().norm()/2, kMaxSweepCells, cells)) return;
+  for (const auto& cell : cells) {
+    if (!pointInBox(cell.center, body)) continue;
+    auto& intervals = columns_[key(cell.center)];
+    intervals.emplace_back(body.center.z()-body.size.z()/2,
+                           body.center.z()+body.size.z()/2);
+    std::sort(intervals.begin(), intervals.end());
+    std::vector<std::pair<double,double>> merged;
+    for (const auto& interval : intervals) {
+      if (merged.empty() || interval.first > merged.back().second)
+        merged.push_back(interval);
+      else merged.back().second = std::max(merged.back().second, interval.second);
+    }
+    intervals = std::move(merged);
+  }
+}
+
+void KnownFreeBodyVolumes::addTrajectory(const MapInterface& map,
+    const RobotParams& robot, const std::vector<StateVec>& poses) {
+  double remaining = 20.0;
+  std::size_t samples = 0;
+  constexpr std::size_t kMaxHistorySamples = 2048;
+  const auto add_pose = [&](const StateVec& pose) {
+    add(map, {pose.head<3>() + robot.physicalOffsetForHeading(pose[3]),
+              pose[3], robot.physicalSize()});
+  };
+  if (poses.empty()) return;
+  add_pose(poses.back());
+  for (std::size_t i = poses.size()-1; i > 0 && remaining > 0; --i) {
+    planningCheckpoint();
+    const auto& a = poses[i];
+    const auto& b = poses[i-1];
+    if (!a.allFinite() || !b.allFinite()) break;
+    const double length = (a.head<3>()-b.head<3>()).norm();
+    const double yaw = std::remainder(b[3]-a[3], 2*M_PI);
+    const double fraction = length > remaining ? remaining/length : 1.0;
+    const int steps = std::max(1, static_cast<int>(std::ceil(std::max(
+        length*fraction/std::max(.01, map.getResolution()/2),
+        std::abs(yaw)*fraction/(M_PI/36)))));
+    for (int k = 1; k <= steps; ++k) {
+      planningCheckpoint();
+      if (++samples > kMaxHistorySamples) return;
+      const double t = fraction*k/steps;
+      StateVec pose = a + t*(b-a);
+      pose[3] = a[3] + t*yaw;
+      add_pose(pose);
+    }
+    remaining -= length;
+  }
+}
+
+VoxelStatus KnownFreeBodyVolumes::strictColumnStatus(const MapInterface& map,
+    const Eigen::Vector2d& cell, double lower, double upper) const {
+  const auto query = [&](double lo, double hi, bool strict) {
+    const Eigen::Vector3d center(cell.x(), cell.y(), (lo+hi)/2), size(0,0,hi-lo);
+    return strict ? map.getStaticStrictBoxStatus(center, size)
+                  : map.getStaticBoxStatus(center, size, false);
+  };
+  // Known-free evidence is NOT an occupancy override, including when the
+  // complete queried column lies inside an old chassis pose.
+  const auto occupied = query(lower, upper, false);
+  if (occupied != VoxelStatus::kFree) return occupied;
+  const auto found = columns_.find(key(cell));
+  if (found == columns_.end()) return query(lower, upper, true);
+  bool unknown = false;
+  double from = lower;
+  for (const auto& interval : found->second) {
+    if (interval.second < from) continue;
+    if (interval.first > upper) break;
+    if (interval.first > from) {
+      const auto status = query(from, std::min(upper, interval.first), true);
+      if (status == VoxelStatus::kOccupied) return status;
+      unknown |= status == VoxelStatus::kUnknown;
+    }
+    from = std::max(from, interval.second);
+    if (from >= upper) break;
+  }
+  if (from < upper) {
+    const auto status = query(from, upper, true);
+    if (status == VoxelStatus::kOccupied) return status;
+    unknown |= status == VoxelStatus::kUnknown;
+  }
+  return unknown ? VoxelStatus::kUnknown : VoxelStatus::kFree;
+}
+
 VoxelStatus orientedBoxPathStatus(const MapInterface& map,
                                   const Eigen::Vector3d& start,
                                   const Eigen::Vector3d& end,
@@ -101,7 +191,9 @@ VoxelStatus orientedBoxPathStatus(const MapInterface& map,
                                   bool stop_at_unknown_voxel,
                                   const OrientedBox* standing,
                                   bool clearance_prefilter,
-                                  std::optional<double> unknown_above_center) {
+                                  std::optional<double> unknown_above_center,
+                                  const KnownFreeBodyVolumes* known_free,
+                                  bool standing_unknown_only) {
   const double resolution = map.getResolution();
   if (!start.allFinite() || !end.allFinite() || !box.size.allFinite() ||
       (box.size.array() < 0.0).any() || !std::isfinite(box.heading) ||
@@ -109,6 +201,11 @@ VoxelStatus orientedBoxPathStatus(const MapInterface& map,
       (unknown_above_center && !std::isfinite(*unknown_above_center))) {
     return VoxelStatus::kUnknown;
   }
+  // A plane at/below the body bottom must not turn into fully relaxed.
+  if (unknown_above_center && *unknown_above_center <= -box.size.z()/2 + 1e-9)
+    unknown_above_center.reset();
+  KnownFreeBodyVolumes standing_free;
+  if (standing && standing_unknown_only) standing_free.add(map, *standing);
   if (map.dynamicSweepBlocked(start, end,
                               0.5 * std::max(box.size.x(), box.size.y()))) {
     return VoxelStatus::kOccupied;
@@ -126,7 +223,7 @@ VoxelStatus orientedBoxPathStatus(const MapInterface& map,
   swept.size += Eigen::Vector3d(std::abs(step.head<2>().dot(along)),
                                 std::abs(step.head<2>().dot(across)),
                                 std::abs(step.z()));
-  if (clearance_prefilter && standing == nullptr && !unknown_above_center) {
+  if (clearance_prefilter && standing == nullptr && !unknown_above_center && !known_free) {
     // Contains every conservative step box below (not an inscribed disc).
     // Padding also contains boundary-touching native XY cells.
     const Eigen::Vector3d span = (end - start).cwiseAbs();
@@ -156,26 +253,33 @@ VoxelStatus orientedBoxPathStatus(const MapInterface& map,
     for (const XYCellCenter& cell : cells) {
       checkpoint.check();
       if (!cellMeetsBox(cell.center, resolution, swept, -1e-9)) continue;
-      if (standing != nullptr &&
+      if (standing != nullptr && !standing_unknown_only &&
           !entersBeyondStanding(cell.center, resolution, swept, *standing)) {
         continue;
       }
+      const bool masked = known_free || (standing && standing_unknown_only);
       const VoxelStatus status = map.getStaticBoxStatus(
           Eigen::Vector3d(cell.center.x(), cell.center.y(), swept.center.z()),
           Eigen::Vector3d(0.0, 0.0, swept.size.z()),
-          unknown_above_center ? false : stop_at_unknown_voxel);
+          (unknown_above_center || masked) ? false : stop_at_unknown_voxel);
       if (status == VoxelStatus::kOccupied) return status;
       if (status == VoxelStatus::kUnknown) unknown = true;
-      if (unknown_above_center) {
+      if (unknown_above_center || (masked && stop_at_unknown_voxel)) {
         // Require every voxel up to the higher endpoint's sensor plane.
         // Occupancy above that plane was checked over the entire body.
         const double lower = swept.center.z() - swept.size.z() / 2;
-        const double upper = std::min(swept.center.z() + swept.size.z() / 2,
-            swept.center.z() + *unknown_above_center + std::abs(step.z()) / 2);
+        const double upper = unknown_above_center
+            ? std::min(swept.center.z() + swept.size.z() / 2,
+                swept.center.z() + *unknown_above_center + std::abs(step.z()) / 2)
+            : swept.center.z() + swept.size.z()/2;
         if (upper >= lower) {
-          const auto below = map.getStaticStrictBoxStatus(
-              {cell.center.x(), cell.center.y(), (lower + upper) / 2},
-              {0, 0, upper - lower});
+          auto below = known_free
+              ? known_free->strictColumnStatus(map, cell.center, lower, upper)
+              : map.getStaticStrictBoxStatus(
+                  {cell.center.x(), cell.center.y(), (lower + upper) / 2},
+                  {0, 0, upper - lower});
+          if (below == VoxelStatus::kUnknown && standing && standing_unknown_only)
+            below = standing_free.strictColumnStatus(map, cell.center, lower, upper);
           if (below == VoxelStatus::kOccupied) return below;
           if (below == VoxelStatus::kUnknown) unknown = true;
         }

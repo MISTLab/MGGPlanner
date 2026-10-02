@@ -64,9 +64,9 @@ Vertex* lazyGroundLattice(GraphManager& graph, Vertex* root,
     body.heading = std::atan2(to.y() - from.y(), to.x() - from.x());
     body.size = ctx.robot_box_size;
     const Eigen::Vector3d center = to.head<3>() + ctx.robot->offsetForHeading(body.heading);
-    if (ctx.unknown_body_above_center)
-      return orientedBoxPathStatus(*ctx.map, center, center, body, true, nullptr,
-                                    false, ctx.unknown_body_above_center) == VoxelStatus::kFree;
+    if (ctx.unknown_body_above_center || ctx.own_body_known_free)
+      return orientedBoxPathStatus(*ctx.map, center, center, body, !ctx.allow_unknown_lattice_body, nullptr,
+                                    false, ctx.unknown_body_above_center, ctx.own_body_known_free.get()) == VoxelStatus::kFree;
     auto status = ctx.map->getBoxStatus(center, body.size, !ctx.allow_unknown_lattice_body);
     if (status == VoxelStatus::kOccupied && !ctx.map->dynamicBoxBlocked(center, body.size))
       status = orientedBoxPathStatus(*ctx.map, center, center, body,
@@ -283,8 +283,12 @@ LocalRouteResult routeOverLocalLattice(GraphManager& graph,
       const Eigen::Vector3d offset = ctx.robot->offsetForHeading(yaw);
       const auto turns = pathTurns({from, to}, root_state[3],
           std::max(ctx.robot->size.x(), ctx.robot->size.y()));
+      StateVec outgoing = root_state;
+      outgoing[3] = yaw;
       const bool start_turn_ok = turns.empty() || turns.front() <= kSharpTurnRad + 1e-9 ||
           (roomToTurn(*ctx.map, *ctx.robot, *ctx.planning, root_state,
+                      ctx.ground->standingStart()) &&
+           roomToTurn(*ctx.map, *ctx.robot, *ctx.planning, outgoing,
                       ctx.ground->standingStart()) &&
            groundSlope(*ctx.ground, from,
                std::max(ctx.robot->size.x(), ctx.robot->size.y()), &graph) <=
@@ -354,7 +358,7 @@ bool groundShortcutSegmentAdmissible(const ExpandContext& ctx,
   EdgeBodyCheck check;
   check.sweep = [&](const Eigen::Vector3d& a, const Eigen::Vector3d& b) {
     return orientedBoxPathStatus(*ctx.map, a, b, body, stop_at_unknown,
-                                 nullptr, true, ctx.unknown_body_above_center);
+                                 nullptr, true, ctx.unknown_body_above_center, ctx.own_body_known_free.get());
   };
   std::vector<Eigen::Vector3d> projected;
   const Eigen::Vector3d offset = ctx.robot->offsetForHeading(body.heading);

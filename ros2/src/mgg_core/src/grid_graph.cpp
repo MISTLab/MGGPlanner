@@ -1,3 +1,4 @@
+#include <set>
 #include "mgg_core/planning_cancellation.h"
 #include "mgg_core/grid_graph.h"
 #include "mgg_core/departure.h"
@@ -109,6 +110,29 @@ GridGraphResult buildGridGraph(GraphManager& graph, const StateVec& state,
   ProfileScope timed_lattice(profile ? &profile->lattice : nullptr);
   LatticeColumnGround column_ground(ctx.planning->max_step_height);
   if (ground_robot) column_ground.add(i0, j0, state.z());
+
+  // Only offer columns beside a connected vertex. A disconnected column
+  // is deferred, not discarded: connecting around a wall schedules it.
+  // Ground projection/body queries for unreachable space used the entire
+  // soft slice even after the connected component stopped growing.
+  std::set<std::size_t> ready_columns;
+  std::vector<bool> scheduled(columns.size(), false);
+  const auto schedule_near = [&](const Eigen::Vector2d& position, double reach) {
+    for (std::size_t n = 0; n < columns.size(); ++n) {
+      if (scheduled[n]) continue;
+      const auto [distance, i, j] = columns[n];
+      (void)distance;
+      const double x = (i-i0)*grid.resolution.x(), y = (j-j0)*grid.resolution.y();
+      const Eigen::Vector2d world = state.head<2>() +
+          Eigen::Vector2d(cos_h*x-sin_h*y, sin_h*x+cos_h*y);
+      if ((world-position).norm() > reach+1e-9) continue;
+      scheduled[n] = true;
+      ready_columns.insert(n);
+    }
+  };
+  if (ground_robot) schedule_near(state.head<2>(),
+      std::max(ctx.planning->edge_length_max, ctx.hanging_root_edge_length_max));
+  else for (std::size_t n=0; n<columns.size(); ++n) ready_columns.insert(n);
 
   // A cell whose ground was found, more than a step above or below the
   // robot's, but whose edge to its nearest vertex was refused: on another
@@ -244,6 +268,8 @@ GridGraphResult buildGridGraph(GraphManager& graph, const StateVec& state,
       num_vertices += rep.num_vertices_added;
       num_edges += rep.num_edges_added;
       result.vertices_added += rep.num_vertices_added;
+      if (ground_robot && rep.vertex_added)
+        schedule_near(rep.vertex_added->state.head<2>(), ctx.planning->edge_length_max);
       result.edges_added += rep.num_edges_added;
       // A vertex clipped short of its cell stands elsewhere.
       if (ground_robot && rep.vertex_added != nullptr &&
@@ -295,9 +321,9 @@ GridGraphResult buildGridGraph(GraphManager& graph, const StateVec& state,
       status = known->second;
       if (profile != nullptr) ++profile->precheck_cache_hits;
     } else {
-      if (ground_robot && ctx.unknown_body_above_center) {
-        status = orientedBoxPathStatus(*ctx.map, center, center, body, true,
-                                       nullptr, false, ctx.unknown_body_above_center);
+      if (ground_robot && (ctx.unknown_body_above_center || ctx.own_body_known_free)) {
+        status = orientedBoxPathStatus(*ctx.map, center, center, body, !ctx.allow_unknown_lattice_body,
+                                       nullptr, false, ctx.unknown_body_above_center, ctx.own_body_known_free.get());
       } else status = ctx.robot->type == RobotType::kAerialRobot
           ? ctx.map->getStrictBoxStatus(center, ctx.robot_box_size)
           : ctx.map->getBoxStatus(center, ctx.robot_box_size,
@@ -332,7 +358,11 @@ GridGraphResult buildGridGraph(GraphManager& graph, const StateVec& state,
   };
 
   std::vector<Retry> nudges;
-  for (const auto& [unused_distance, i, j] : columns) {
+  do {
+  while (!ready_columns.empty()) {
+    planningCheckpoint();
+    const auto [unused_distance, i, j] = columns[*ready_columns.begin()];
+    ready_columns.erase(ready_columns.begin());
     (void)unused_distance;
     // A ground robot's column is projected from its top level first: the
     // levels below start on that ray's way down and meet the same ground
@@ -420,6 +450,9 @@ GridGraphResult buildGridGraph(GraphManager& graph, const StateVec& state,
       if (added) break;
     }
   }
+  nudges.clear();
+  retries.clear();
+  } while (!ready_columns.empty());
   return result;
 }
 

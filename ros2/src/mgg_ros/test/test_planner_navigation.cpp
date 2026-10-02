@@ -251,6 +251,8 @@ class PlannerNodeTestPeer {
     node.robot_params_.safety_extension.setZero();
     node.robot_params_.bound_mode = mgg::BoundModeType::kExtendedBound;
     node.robot_params_.center_offset.setZero();
+    node.robot_params_.physical_size = Eigen::Vector3d(1.023, .778, 1.22);
+    node.robot_params_.physical_center_offset = Eigen::Vector3d(-.16, 0, 0);
     mgg::PlanningParams& p = node.planning_params_;
     p.rr_mode = mgg::RRModeType::kGraph;
     p.edge_length_min = 0.05;
@@ -363,6 +365,39 @@ class PlannerNodeTestPeer {
   }
   static void explorationSlice(PlannerNode& node, double seconds) {
     node.ground_exploration_lattice_budget_s_ = seconds;
+  }
+  static nlohmann::json globalLinks(PlannerNode& node) {
+    mgg::StateVec goal(-2,0,0,0);
+    node.projectGoalToDrivingHeight(goal);
+    const auto strict = node.makeGlobalContext(), bounded = node.makeContext();
+    nlohmann::json links = nlohmann::json::array();
+    std::vector<mgg::Vertex*> near;
+    node.global_graph_->getNearestVertices(&goal, 1.0, &near);
+    const mgg::Vertex target(-1,goal);
+    for (const auto* v : near) {
+      mgg::ExpandGraphReport a,b;
+      const bool sa = mgg::roadmapEdgeTraversable(strict,*v,target,a);
+      const bool sb = mgg::roadmapEdgeTraversable(bounded,*v,target,b);
+      links.push_back({{"id",v->id},{"position",{v->state.x(),v->state.y(),v->state.z()}},
+        {"strict",sa},{"bounded",sb},{"strict_status",a.edge_status},{"bounded_status",b.edge_status}});
+    }
+    return {{"vertices",node.global_graph_->getNumVertices()},
+      {"edges",node.global_graph_->getNumEdges()},{"goal_links",links}};
+  }
+  static void mappedGlobalPath(PlannerNode& node) {
+    node.global_graph_->reset();
+    auto* a = new mgg::Vertex(0, mgg::StateVec(0,0,.935,M_PI));
+    node.global_graph_->addVertex(a);
+    auto* b = new mgg::Vertex(node.global_graph_->generateVertexID(), mgg::StateVec(-1.2,0,.935,M_PI));
+    node.global_graph_->addVertex(b);
+    node.global_graph_->addEdge(a,b,1.2);
+    node.global_root_supported_ = true;
+  }
+  static std::pair<int,int> globalSize(PlannerNode& node) {
+    return {node.global_graph_->getNumVertices(), node.global_graph_->getNumEdges()};
+  }
+  static bool globalUsesUpperPolicy(PlannerNode& node) {
+    return node.makeGlobalContext().unknown_body_above_center.has_value();
   }
   static void forceGlobalFallback(PlannerNode& node, bool force) {
     node.grid_params_.min_val.x() = force ? -1 : -6;
@@ -565,10 +600,50 @@ TEST_F(PlannerNavigationTest, BotmanFixtureFullServicesBenchmark) {
           {"request_budget_ms",500},{"total_ms",elapsed},{"status",status},{"poses",poses},
           {"reason",reason},{"x86_budget_met",elapsed <= 300}};
       if (exploring) row.update(PlannerNodeTestPeer::explorationMetrics(*node));
+      if (mode == "navigate_global_fallback") row["global_diagnostic"] = PlannerNodeTestPeer::globalLinks(*node);
       std::printf("SERVICE_BENCH %s\n", row.dump().c_str());
       EXPECT_LT(elapsed, 1000);  // hard envelope, not a claim of the x86 target
     }
   }
+}
+
+TEST_F(PlannerNavigationTest, GlobalQueryConnectorUsesUpperAirPolicyWithoutPersisting) {
+  MolaTerrainProduct product(.1,-5,3,-3,3,flat,{},.7);
+  auto node = botmanNode("global_query_upper", product);
+  PlannerNodeTestPeer::sensorPolicy(*node);
+  PlannerNodeTestPeer::standAt(*node,0,0,0,M_PI,1);
+  PlannerNodeTestPeer::mappedGlobalPath(*node);
+  PlannerNodeTestPeer::forceGlobalFallback(*node,true);
+  const auto before = PlannerNodeTestPeer::globalSize(*node);
+  EXPECT_FALSE(PlannerNodeTestPeer::globalUsesUpperPolicy(*node));
+  const auto result = navigate(*node,-2,0);
+  EXPECT_EQ(result->status, Service::Response::SUCCEEDED) << result->reason;
+  EXPECT_NE(result->reason.find("request-only goal connector: above_sensor_fov"), std::string::npos);
+  EXPECT_EQ(PlannerNodeTestPeer::globalSize(*node), before);
+}
+
+TEST_F(PlannerNavigationTest, GlobalQueryConnectorKeepsLowerUnknownAndOccupiedBlocked) {
+  for (bool occupied : {false,true}) {
+    MolaTerrainProduct product(.1,-5,3,-3,3,flat,
+        occupied ? std::vector<Block>{{-2.2,-1.8,-3,3,.75}} : std::vector<Block>{},
+        occupied ? .9 : .5);
+    auto node = botmanNode("global_query_blocked", product);
+    PlannerNodeTestPeer::sensorPolicy(*node);
+    PlannerNodeTestPeer::standAt(*node,0,0,0,M_PI,1);
+    PlannerNodeTestPeer::mappedGlobalPath(*node);
+    PlannerNodeTestPeer::forceGlobalFallback(*node,true);
+    EXPECT_NE(navigate(*node,-2,0)->status, Service::Response::SUCCEEDED);
+  }
+}
+
+TEST_F(PlannerNavigationTest, FullyObservedGoalBeyondLocalLatticeUsesGlobalGraph) {
+  MolaTerrainProduct product(.1,-5,3,-3,3,flat,{},2.0);
+  auto node = botmanNode("global_observed", product);
+  PlannerNodeTestPeer::hardwarePolicy(*node);
+  PlannerNodeTestPeer::standAt(*node,0,0,0,M_PI,1);
+  PlannerNodeTestPeer::mappedGlobalPath(*node);
+  PlannerNodeTestPeer::forceGlobalFallback(*node,true);
+  EXPECT_EQ(navigate(*node,-2,0)->status, Service::Response::SUCCEEDED);
 }
 
 TEST_F(PlannerNavigationTest, HardwareShortcutDoesNotCrossUnknownBodyVolume) {

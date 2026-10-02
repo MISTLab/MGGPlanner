@@ -1089,7 +1089,7 @@ TEST(GridGraph, CrossNudgesCannotEnterAGapNarrowerThanTheOrientedBody) {
 }
 
 TEST(GridGraph, HardwareUnknownPolicyMatchesEagerInRotatedDoorways) {
-  for (bool narrow : {false, true}) for (bool upper_unknown : {false, true})
+  for (bool sensor_policy : {false, true}) for (bool narrow : {false, true}) for (bool upper_unknown : {false, true})
   for (double heading : {M_PI / 2, M_PI / 3}) {
     SCOPED_TRACE(heading);
     std::map<std::pair<std::int64_t, std::int64_t>, double> tops;
@@ -1110,6 +1110,10 @@ TEST(GridGraph, HardwareUnknownPolicyMatchesEagerInRotatedDoorways) {
         return upper && stop && c.z() + size.z()/2 > .45
             ? VoxelStatus::kUnknown : status;
       }
+      VoxelStatus getStaticStrictBoxStatus(const Eigen::Vector3d& c,
+                                           const Eigen::Vector3d& size) const override {
+        return getBoxStatus(c, size, true);
+      }
     } map(.05, tops);
     map.upper = upper_unknown;
     RobotParams robot;
@@ -1128,6 +1132,7 @@ TEST(GridGraph, HardwareUnknownPolicyMatchesEagerInRotatedDoorways) {
     ctx.map = &map; ctx.robot = &robot; ctx.planning = &planning;
     ctx.ground = &ground; ctx.robot_box_size = robot.getPlanningSize();
     ctx.allow_unknown_lattice_body = false;
+    if (sensor_policy) ctx.unknown_body_above_center = .025;
     const StateVec root(0, 0, .4, heading);
     GridGraphParams grid;
     grid.min_val = Eigen::Vector3d::Zero();
@@ -1139,7 +1144,7 @@ TEST(GridGraph, HardwareUnknownPolicyMatchesEagerInRotatedDoorways) {
     const StateVec goal(2.4 * std::cos(heading), 2.4 * std::sin(heading), .4, heading);
     Vertex* reached = nullptr;
     const bool eager_reaches = eager.getNearestVertexInRange(&goal, .01, &reached);
-    EXPECT_EQ(eager_reaches, !narrow && !upper_unknown);
+    EXPECT_EQ(eager_reaches, !narrow && (!upper_unknown || sensor_policy));
     EXPECT_EQ(mgg::routeOverLocalLattice(lazy, root, goal, grid, ctx).routed,
               eager_reaches);
   }

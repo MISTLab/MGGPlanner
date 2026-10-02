@@ -1018,6 +1018,14 @@ mgg::ExpandContext PlannerNode::makeContext() {
       }
     }
   }
+  if (robot_params_.type == mgg::RobotType::kGroundRobot &&
+      have_odometry_ && map_ && ground_ && map_->getStatus()) {
+    const auto root = physicalAnchorAtDrivingHeight(current_state_);
+    ctx.standing_body = mgg::OrientedBox{
+        root.head<3>() + robot_params_.physicalOffsetForHeading(root[3]),
+        root[3], robot_params_.physicalSize()};
+    ctx.own_body_known_free = ownBodyKnownFree();
+  }
   ctx.hanging_root_edge_length_max = hanging_root_edge_length_max_;
   // A hanging root sits at the physical driving height by construction;
   // projecting it again onto absent ground would only fail.
@@ -1041,9 +1049,45 @@ mgg::ExpandContext PlannerNode::makeContext() {
   return ctx;
 }
 
+std::shared_ptr<const mgg::KnownFreeBodyVolumes> PlannerNode::ownBodyKnownFree() {
+  if (standing_start_scope_depth_ && plan_own_body_known_free_)
+    return plan_own_body_known_free_;
+  auto known = std::make_shared<mgg::KnownFreeBodyVolumes>();
+  const auto root = physicalAnchorAtDrivingHeight(current_state_);
+  known->add(*map_, {root.head<3>() + robot_params_.physicalOffsetForHeading(root[3]),
+                    root[3], robot_params_.physicalSize()});
+  KeyframeTrajectory trajectory;
+  std::string error;
+  if (keyframe_source_ && have_mapping_snapshot_ &&
+      readOwnKeyframes(trajectory, error) &&
+      trajectory.component_id == mapping_snapshot_.component_id &&
+      trajectory.epoch == mapping_snapshot_.epoch) {
+    const auto transform = navigationFromComponent();
+    std::vector<mgg::StateVec> poses;
+    // Only the last 20 metres need projection; addTrajectory bounds the
+    // final segment exactly. Never connect the current pose to a stale tail.
+    double distance = 0;
+    for (std::size_t i = trajectory.poses.size(); i > 0; --i) {
+      const auto pose = transform * trajectory.poses[i-1];
+      if (i < trajectory.poses.size())
+        distance += (trajectory.poses[i].translation() -
+                     trajectory.poses[i-1].translation()).norm();
+      mgg::StateVec state(pose.translation().x(), pose.translation().y(),
+          pose.translation().z(), std::atan2(pose.linear()(1,0), pose.linear()(0,0)));
+      poses.push_back(physicalAnchorAtDrivingHeight(state));
+      if (distance >= 20) break;
+    }
+    std::reverse(poses.begin(), poses.end());
+    known->addTrajectory(*map_, robot_params_, poses);
+  }
+  if (standing_start_scope_depth_) plan_own_body_known_free_ = known;
+  return known;
+}
+
 mgg::ExpandContext PlannerNode::makeGlobalContext() {
   mgg::ExpandContext ctx = makeContext();
   ctx.unknown_body_above_center.reset();
+  ctx.standing_body.reset();
   // Inclinations are keyed by local lattice ids; the roadmap has its own.
   ctx.inclinations = nullptr;
   // A roadmap edge must have been seen traversable (rrg.cpp:725).
@@ -2320,6 +2364,7 @@ PlannerNode::StandingStartScope::StandingStartScope(PlannerNode& node) : node(no
 PlannerNode::StandingStartScope::~StandingStartScope() {
   if (--node.standing_start_scope_depth_ == 0) {
     node.plan_standing_start_.reset();
+    node.plan_own_body_known_free_.reset();
     node.plan_reverse_edges_.clear();
   }
 }
@@ -4363,8 +4408,10 @@ std::string PlannerNode::buildLocalGraph() {
   std::string boxed_in;
   const bool zone_escape = best_path_.empty() &&
                            no_go_.inside(root_state.head<3>());
+  std::vector<Eigen::Vector3d> selected_points;
+  for (const auto& pose : best_path_) selected_points.push_back(pose.head<3>());
   const bool is_boxed_in = !boxed_in_without_departure_now_ &&
-                          (zone_escape || (
+                          (zone_escape || routeStartsWithTurnWithoutRoom(selected_points) || (
                            (sel.sharp_turn_fallback || goes_nowhere ||
                             (sel.best_path.empty() &&
                              sel.slope_ends_without_way_back > 0 &&
@@ -4743,6 +4790,37 @@ bool PlannerNode::routeOverGlobalGraph(const mgg::StateVec goal,
     if (global_graph_->getNumVertices() != before_goal) ++graph_revision_;
   }
   search();
+  // A connector is a query edge, not stored-roadmap evidence. The named
+  // local sensor policy can join a mapped endpoint through upper unknown
+  // air while every stored edge and arbitrary global expansion stay strict.
+  // Dijkstra has already established reachability from the current link.
+  bool query_goal_connector = false;
+  if (exact_goal && (goal_vertex == nullptr || !reaches(*goal_vertex)) &&
+      robot_params_.type == mgg::RobotType::kGroundRobot) {
+    const auto local = makeContext();
+    if (local.unknown_body_above_center) {
+      std::vector<mgg::Vertex*> candidates;
+      global_graph_->getNearestVertices(&goal_state, planning_params_.edge_length_max, &candidates);
+      std::sort(candidates.begin(), candidates.end(), [&](const mgg::Vertex* a, const mgg::Vertex* b) {
+        const auto cost = [&](const mgg::Vertex* v) {
+          const auto found = rep.distance_map.find(v->id);
+          return found == rep.distance_map.end() ? INFINITY :
+              found->second + (v->state.head<3>()-goal_state.head<3>()).norm();
+        };
+        return cost(a) < cost(b);
+      });
+      const mgg::Vertex target(-1, goal_state);
+      for (auto* candidate : candidates) {
+        mgg::planningCheckpoint();
+        if (!candidate || !reaches(*candidate)) continue;
+        mgg::ExpandGraphReport checked;
+        if (!mgg::roadmapEdgeTraversable(local, *candidate, target, checked)) continue;
+        goal_vertex = candidate;
+        query_goal_connector = true;
+        break;
+      }
+    }
+  }
   // No single roadmap edge reaches the goal, or the one that does joins a
   // part of the roadmap the robot cannot reach. Known space may still turn
   // or narrow between the two: lay the local planner's lattice out around
@@ -4781,7 +4859,7 @@ bool PlannerNode::routeOverGlobalGraph(const mgg::StateVec goal,
     reason = "goal cannot be linked to the global graph";
     return false;
   }
-  if (goal_vertex->id == link_vertex->id && !departure.query_local) {
+  if (goal_vertex->id == link_vertex->id && !departure.query_local && !query_goal_connector) {
     reason = "already at the goal";
     return false;
   }
@@ -4873,6 +4951,12 @@ bool PlannerNode::routeOverGlobalGraph(const mgg::StateVec goal,
     }
   }
   for (const mgg::Vertex* v : route) path.push_back(v->state);
+  if (query_goal_connector) {
+    path.push_back(goal_state);
+    reason = "request-only goal connector: above_sensor_fov + physical own-body history";
+    RCLCPP_INFO(get_logger(), "%s (vertex %d -> %.2f, %.2f); not stored",
+                reason.c_str(), goal_vertex->id, goal_state.x(), goal_state.y());
+  }
   // Whether the route kept starts with a turn the robot has no room for,
   // judged on that route, whichever branch kept it (review r2, R2-2): the
   // boxed-in guard (depart_instead_of_turning_route) reads it.
@@ -5038,9 +5122,18 @@ bool PlannerNode::routeStartsWithTurnWithoutRoom(
   mgg::StateVec start = current_state_;
   if (!projectToDrivingHeight(start)) start = physicalAnchorAtDrivingHeight(current_state_);
   const std::optional<mgg::StandingStart> standing = standingStart();
-  return !turns.empty() && turns.front() > mgg::kSharpTurnRad + 1e-9 &&
-         !mgg::roomToTurn(*map_, robot_params_, planning_params_, start,
-                          !storedReverseExitApplies(start) && standing ? &*standing : nullptr);
+  if (turns.empty() || turns.front() <= mgg::kSharpTurnRad + 1e-9) return false;
+  const auto* prior = !storedReverseExitApplies(start) && standing ? &*standing : nullptr;
+  if (!mgg::roomToTurn(*map_, robot_params_, planning_params_, start, prior)) return true;
+  double distance = 0;
+  std::size_t ahead = 0;
+  const double window = std::max(robot_params_.size.x(), robot_params_.size.y());
+  while (ahead+1 < points.size() && distance < window) {
+    distance += (points[ahead+1]-points[ahead]).head<2>().norm(); ++ahead;
+  }
+  start[3] = std::atan2(points[ahead].y()-points.front().y(),
+                         points[ahead].x()-points.front().x());
+  return !mgg::roomToTurn(*map_, robot_params_, planning_params_, start, prior);
 }
 
 mgg::PathOkFn PlannerNode::applyRouteTurnRule(
@@ -7011,6 +7104,10 @@ void PlannerNode::onObjectiveRequestImpl(
                 local ? "local lattice" : "global graph",
                 path_shortcut_corners_);
   route_note = note;
+  if (!local && !reason.empty()) {
+    route_note += "; " + reason;
+    response->reason = reason;
+  }
   if (local && !local_route_profile_.empty()) {
     route_note += " [" + local_route_profile_ + "]";
   }

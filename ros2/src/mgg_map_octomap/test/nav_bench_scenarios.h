@@ -98,6 +98,32 @@ inline std::unique_ptr<MolaMap> loadProduct(const std::string& peer_root,
 /// Botman's deployed planning parameters at the 0.10 m planner resolution:
 /// deploy/mgg/config/hardware.yaml overridden as hardware.launch.py does
 /// from adapters/adapter_ros2/config/bunker.yaml.
+inline std::vector<StateVec> ownFixtureTrajectory(const std::string& root) {
+  using nlohmann::json;
+  const auto source = json::parse(readText(root+"/mola/source.json"));
+  const auto solution = json::parse(readText(root+"/graph_solution.json")).at("solution");
+  const auto identity = source.at("manifests").at(0).at("graph_revision");
+  if (identity.at("component_id") != solution.at("revision").at("component_id") ||
+      identity.at("epoch") != solution.at("revision").at("epoch"))
+    throw std::runtime_error("benchmark keyframes do not match map component/epoch");
+  std::map<int,StateVec> ordered;
+  std::string session;
+  for (const auto& entry : solution.at("poses")) {
+    const auto& id = entry.at("keyframe_id");
+    if (id.at("robot_id") != "botman_0") continue;
+    const auto next_session = id.at("session_id").get<std::string>();
+    if (!session.empty() && session != next_session)
+      throw std::runtime_error("benchmark own trajectory spans sessions");
+    session = next_session;
+    const auto& t = entry.at("T_component_keyframe");
+    ordered.emplace(id.at("seq").get<int>(), StateVec(t[0][3],t[1][3],t[2][3],
+        std::atan2(t[1][0].get<double>(),t[0][0].get<double>())));
+  }
+  std::vector<StateVec> poses;
+  for (const auto& entry : ordered) poses.push_back(entry.second);
+  return poses;
+}
+
 inline PlanningParams botmanPlanning() {
   PlanningParams p;
   p.rr_mode = RRModeType::kGraph;
@@ -129,6 +155,8 @@ inline RobotParams botmanRobot() {
   // The box centred on the lidar that reaches the footprint's farthest
   // corner on each axis (hardware.launch.py), 2 x 0.61 m tall.
   r.size = Eigen::Vector3d(1.344, 0.778, 1.22);
+  r.physical_size = Eigen::Vector3d(1.023, .778, 1.22);
+  r.physical_center_offset = Eigen::Vector3d(-.16, 0, 0);
   r.size_extension = Eigen::Vector3d(0.05, 0.05, 0.05);
   r.bound_mode = BoundModeType::kExtendedBound;
   return r;
@@ -262,7 +290,8 @@ inline double maxCornerDeg(const std::vector<Eigen::Vector3d>& p) {
 inline Outcome run(const MapInterface& map, const Scenario& scenario,
                    bool allow_unknown_body = true, double request_budget_ms = 500.0,
                    std::optional<double> sensor_height = std::nullopt,
-                   double lattice_budget_ms = 100.0) {
+                   double lattice_budget_ms = 100.0,
+                   const std::vector<StateVec>& own_trajectory = {}) {
   using Clock = std::chrono::steady_clock;
   const auto ms = [](Clock::time_point a, Clock::time_point b) {
     return std::chrono::duration<double, std::milli>(b - a).count();
@@ -322,6 +351,19 @@ inline Outcome run(const MapInterface& map, const Scenario& scenario,
   });
   if (request_budget_ms > 0) ctx.deadline = deadline;
   try {
+  auto known = std::make_shared<KnownFreeBodyVolumes>();
+  const auto anchor = [&](StateVec pose) {
+    pose[2] += planning.max_ground_height - robot.size.z()/2;
+    return pose;
+  };
+  const auto standing = anchor(scenario.start);
+  ctx.standing_body = OrientedBox{standing.head<3>() + robot.physicalOffsetForHeading(standing[3]),
+      standing[3], robot.physicalSize()};
+  known->add(map,*ctx.standing_body);
+  std::vector<StateVec> driven;
+  for (const auto& pose : own_trajectory) driven.push_back(anchor(pose));
+  known->addTrajectory(map,robot,driven);
+  ctx.own_body_known_free = known;
   if (!scenario.navigate) {
     ctx.deadline = t0 + std::chrono::duration_cast<Clock::duration>(
         std::chrono::duration<double, std::milli>(lattice_budget_ms));

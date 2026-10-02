@@ -88,6 +88,68 @@ class Columns : public mgg::MapInterface {
   std::function<bool(double, double)> wall_;
 };
 
+class OwnVolumeColumns : public Columns {
+ public:
+  OwnVolumeColumns() : Columns([](double, double) { return false; }) {}
+  bool occupied = false;
+  VoxelStatus getBoxStatus(const Eigen::Vector3d& c, const Eigen::Vector3d& s,
+                           bool strict) const override {
+    if (std::abs(c.x()-.1) < .01 && std::abs(c.y()-.1) < .01 &&
+        c.z()+s.z()/2 >= .4 && c.z()-s.z()/2 <= .6)
+      return occupied ? VoxelStatus::kOccupied : strict ? VoxelStatus::kUnknown : VoxelStatus::kFree;
+    return VoxelStatus::kFree;
+  }
+  VoxelStatus getStaticStrictBoxStatus(const Eigen::Vector3d& c,
+                                      const Eigen::Vector3d& s) const override {
+    return getBoxStatus(c, s, true);
+  }
+};
+
+TEST(OwnBodyVolume, UnknownLidarVoxelAllowsDepartureButOccupiedStillBlocks) {
+  OwnVolumeColumns map;
+  OrientedBox physical{{0, 0, .5}, M_PI/4, {1.023, .778, 1.22}};
+  OrientedBox inflated = physical;
+  inflated.size = {1.394, .828, 1.27};
+  mgg::KnownFreeBodyVolumes known;
+  known.add(map, physical);
+  const Eigen::Vector3d end(.8, 0, .5);
+  EXPECT_EQ(mgg::orientedBoxPathStatus(map, physical.center, end, inflated,
+      true, &physical, false, -.2, &known, true), VoxelStatus::kFree);
+  map.occupied = true;
+  EXPECT_EQ(mgg::orientedBoxPathStatus(map, physical.center, end, inflated,
+      true, &physical, false, -.2, &known, true), VoxelStatus::kOccupied);
+}
+
+TEST(OwnBodyVolume, DrivenTrajectoryAllowsReturnAndKeepsOnlyLastTwentyMetres) {
+  OwnVolumeColumns map;
+  mgg::RobotParams robot;
+  robot.size = {1.023,.778,1.22};
+  mgg::KnownFreeBodyVolumes driven;
+  driven.addTrajectory(map,robot,{{-1,0,.5,0},{1,0,.5,0}});
+  OrientedBox body{{1,0,.5},M_PI,{1.394,.828,1.27}};
+  EXPECT_EQ(mgg::orientedBoxPathStatus(map,{1,0,.5},{-1,0,.5},body,
+      true,nullptr,false,-.2,&driven),VoxelStatus::kFree);
+  mgg::KnownFreeBodyVolumes old;
+  old.addTrajectory(map,robot,{{0,0,.5,0},{25,0,.5,0}});
+  EXPECT_EQ(old.strictColumnStatus(map,{.1,.1},.2,.8),VoxelStatus::kUnknown);
+}
+
+TEST(OwnBodyVolume, HistoryOnlyExemptsUnknownInsidePhysicalHeightAndFootprint) {
+  OwnVolumeColumns map;
+  mgg::KnownFreeBodyVolumes known;
+  known.add(map, OrientedBox{{.1, .1, .5}, 0, {.5, .5, .8}});
+  EXPECT_EQ(known.strictColumnStatus(map, {.1,.1}, .2,.8), VoxelStatus::kFree);
+  map.occupied = true;
+  EXPECT_EQ(known.strictColumnStatus(map, {.1,.1}, .2,.8), VoxelStatus::kOccupied);
+  map.occupied = false;
+  mgg::KnownFreeBodyVolumes wrong_height;
+  wrong_height.add(map, OrientedBox{{.1,.1, 2}, 0, {1,1,.5}});
+  EXPECT_EQ(wrong_height.strictColumnStatus(map, {.1,.1}, .2,.8), VoxelStatus::kUnknown);
+  mgg::KnownFreeBodyVolumes elsewhere;
+  elsewhere.add(map, OrientedBox{{2,2,.5}, 0, {1,1,1}});
+  EXPECT_EQ(elsewhere.strictColumnStatus(map, {.1,.1}, .2,.8), VoxelStatus::kUnknown);
+}
+
 /// A Bunker's planning box, 1.073 x 0.828 m and 0.45 m tall, facing
 /// `heading` at (x, y), 0.5 m up.
 OrientedBox bunkerAt(double x, double y, double heading) {

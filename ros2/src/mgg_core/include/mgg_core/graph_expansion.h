@@ -23,6 +23,7 @@
 #include <vector>
 
 #include "mgg_core/geofence_manager.h"
+#include "mgg_core/departure.h"
 #include "mgg_core/graph_base.h"
 #include "mgg_core/graph_manager.h"
 #include "mgg_core/ground_projection.h"
@@ -110,6 +111,9 @@ struct ExpandContext {
   /// No value preserves the legacy strict/relaxed policy; global contexts
   /// must clear this. Validated sensor configuration is required by the node.
   std::optional<double> unknown_body_above_center;
+  /// Pinned-request own-body evidence, never other robots or occupied cells.
+  std::shared_ptr<const KnownFreeBodyVolumes> own_body_known_free;
+  std::optional<OrientedBox> standing_body;
   /// Unobserved space blocks the candidate's edge and its neighbour edges,
   /// as upstream's expandGraph always had it (stop_at_unknown_voxel true at
   /// rrg.cpp:725, 813 and 820). The local lattice leaves this false and

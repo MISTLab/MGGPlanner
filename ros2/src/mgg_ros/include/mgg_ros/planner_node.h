@@ -519,6 +519,8 @@ class PlannerNode : public rclcpp::Node {
   };
   std::optional<mgg::StandingStart> standingStart();
   std::optional<mgg::StandingStart> readStandingStart();
+  std::shared_ptr<const mgg::KnownFreeBodyVolumes> ownBodyKnownFree();
+  std::shared_ptr<const mgg::KnownFreeBodyVolumes> plan_own_body_known_free_;
   int standing_start_scope_depth_ = 0;
   std::optional<std::optional<mgg::StandingStart>> plan_standing_start_;
   // Directed geometry, shared by selection and every shortcut trial. Never

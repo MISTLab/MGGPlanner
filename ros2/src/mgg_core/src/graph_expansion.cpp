@@ -63,7 +63,8 @@ bool edgeTraversable(const ExpandContext& ctx, const Eigen::Vector3d& start,
                      bool preserve_start_height,
                      std::vector<Eigen::Vector3d>& projected_edge,
                      ExpandGraphReport& rep, bool stop_at_unknown = false,
-                     EdgeTravel travel = EdgeTravel::kBothWays) {
+                     EdgeTravel travel = EdgeTravel::kBothWays,
+                     const OrientedBox* standing = nullptr) {
   if (ctx.robot->type == RobotType::kAerialRobot) {
     return ctx.map->getStrictPathStatus(start, end, ctx.robot_box_size) ==
            VoxelStatus::kFree;
@@ -80,7 +81,7 @@ bool edgeTraversable(const ExpandContext& ctx, const Eigen::Vector3d& start,
            exactBits(end.x()),   exactBits(end.y()),   exactBits(end.z()),
            (is_hanging ? 1 : 0) | (preserve_start_height ? 2 : 0) |
                (stop_at_unknown ? 4 : 0) |
-               (travel == EdgeTravel::kForward ? 8 : 0),
+               (travel == EdgeTravel::kForward ? 8 : 0) | (standing ? 16 : 0),
            exactBits(ctx.robot_box_size.x()), exactBits(ctx.robot_box_size.y()),
            exactBits(ctx.robot_box_size.z()), 0, 0};
     if (const EdgeVerdictCache::Verdict* known = ctx.edge_verdicts->find(key)) {
@@ -101,8 +102,9 @@ bool edgeTraversable(const ExpandContext& ctx, const Eigen::Vector3d& start,
   body.size = ctx.robot_box_size;
   EdgeBodyCheck check;
   check.sweep = [&](const Eigen::Vector3d& a, const Eigen::Vector3d& b) {
-    return orientedBoxPathStatus(*ctx.map, a, b, body, stop_at_unknown, nullptr, true,
-                                  ctx.unknown_body_above_center);
+    return orientedBoxPathStatus(*ctx.map, a, b, body, stop_at_unknown, standing, true,
+                                  ctx.unknown_body_above_center,
+                                  ctx.own_body_known_free.get(), true);
   };
   // Ground robot: the edge has to follow the terrain.
   ProjectedEdgeStatus es = ctx.ground->getProjectedEdgeStatus(
@@ -290,7 +292,9 @@ void expandGraphFrom(GraphManager& graph, Vertex& new_vertex,
                 ctx.preserve_hanging_root_start_height && nearest_vertex->id == 0,
                 projected_edge, rep, ctx.stop_at_unknown,
                 nearest_vertex->id == 0 && ctx.root_is_robot
-                    ? EdgeTravel::kForward : EdgeTravel::kBothWays);
+                    ? EdgeTravel::kForward : EdgeTravel::kBothWays,
+                nearest_vertex->id == 0 && ctx.root_is_robot && ctx.standing_body
+                    ? &*ctx.standing_body : nullptr);
   if (admissible_edge && ctx.projected_edge_admissible &&
       !ctx.projected_edge_admissible(projected_edge)) {
     admissible_edge = false;

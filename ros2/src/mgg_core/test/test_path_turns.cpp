@@ -379,6 +379,40 @@ class Walls : public mgg::MapInterface {
   std::function<bool(double, double)> wall_;
 };
 
+TEST(TurnClear, PhysicalChassisCentreRotatesWithIncomingHeading) {
+  class RecordCircle : public Walls {
+   public:
+    RecordCircle() : Walls([](double,double) { return false; }) {}
+    mutable Eigen::Vector3d center;
+    mutable double radius = 0;
+    VoxelStatus getOccupiedOnlyCylinderPathStatus(const Eigen::Vector3d& a,
+        const Eigen::Vector3d&, double r, double) const override {
+      center = a; radius = r; return VoxelStatus::kFree;
+    }
+  } map;
+  RobotParams bot;
+  bot.size = {1.344,.778,1.22};
+  bot.physical_size = Eigen::Vector3d(1.023,.778,1.22);
+  bot.physical_center_offset = Eigen::Vector3d(-.16,0,0);
+  EXPECT_TRUE(mgg::turnClear(map,bot,StateVec(1,2,3,M_PI/2)));
+  EXPECT_NEAR(map.center.x(),1,1e-12);
+  EXPECT_NEAR(map.center.y(),1.84,1e-12);
+  EXPECT_NEAR(map.radius,std::hypot(1.023,.778)/2,1e-12);
+}
+
+TEST(PathTurnCheck, ChecksIncomingAndOutgoingCentresAndCachesByHeading) {
+  GraphManager graph;
+  RobotParams bot;
+  bot.size = {1,.6,.5};
+  std::vector<double> checked;
+  PathTurnCheck check(graph,bot,[&](const StateVec& s) {
+    checked.push_back(s[3]); return std::abs(s[3]-M_PI/2) > .01;
+  }, [](const Eigen::Vector3d&) { return 0.; });
+  EXPECT_FALSE(check.admissible({{0,0,0},{0,2,0}},0));
+  ASSERT_EQ(checked.size(),2u);
+  EXPECT_NEAR(checked[0],0,1e-12); EXPECT_NEAR(checked[1],M_PI/2,1e-12);
+}
+
 TEST(TurnClear, NeedsTheCircleThroughTheRobotsCorners) {
   // The robot is 0.8 by 0.6: its corners reach 0.5 m from its centre.
   // Walls from |y| = 0.4 leave room to drive (0.3 m each side) but not to
