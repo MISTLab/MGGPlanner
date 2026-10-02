@@ -3360,6 +3360,7 @@ struct Wall {
     const Eigen::Vector2d d = p.head<2>() - base;
     const double n = d.dot(normal()), a = d.dot(along());
     if (p.z() < 0.0 || p.z() >= 3.0) return true;  // floor and ceiling
+    if (n < -4.2 || n > 4.2 || std::abs(a) > 2.8) return true;
     if (n < 0.0 || n > depth) return false;
     return !(a > left && a < left + width && p.z() < height);
   }
@@ -3401,6 +3402,8 @@ struct Wall {
 struct Scene {
   explicit Scene(const Wall& wall, double frame_yaw) : aerial(), wall(wall) {
     alignBody(aerial.map);
+    aerial.planning.nearest_range = 0.6;
+    aerial.planning.nearest_range_max = 1.0;
     std::vector<Voxel> occupied, free;
     wall.cells(occupied, free);
     component_from_navigation.linear() =
@@ -3628,5 +3631,23 @@ TEST(AerialDoor, ExplorationRoutesThroughTheDoorToWhatIsUnseenBeyond) {
       ASSERT_TRUE(door::crossesTheWall(scene, path)) << path.size() << " poses";
       door::expectWithinBudget(scene, path);
     }
+  }
+}
+
+TEST(AerialDoor, R7HangarGateFromRecordedHover) {
+  for (double frame : {0.0, 0.3805}) {
+    door::Wall wall;
+    wall.width = 2.5;
+    wall.left = -1.25;
+    wall.height = 2.45;
+    wall.depth = 1.02;
+    door::Scene scene(wall, frame);
+    // Relative to the mesh face x=-10.36: hover x=-10.306, y=.945.
+    const auto route = door::navigate(scene, scene.at(.054, .945, 1.769),
+                                      scene.at(2.36, 0.0, 1.8));
+    ASSERT_GE(route.points.size(), 2u);
+    EXPECT_GT((scene.component_from_navigation * route.points.back()).x(),
+              wall.base.x() + wall.depth);
+    door::expectWithinBudget(scene, route.points);
   }
 }

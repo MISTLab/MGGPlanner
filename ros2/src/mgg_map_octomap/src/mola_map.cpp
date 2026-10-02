@@ -1357,10 +1357,10 @@ VoxelStatus MolaMap::gridStrictBoxStatus(
   const Eigen::Vector3d c = snapshot->request.component_from_navigation * center;
   BoxKey key;
   for (int i = 0; i < 3; ++i) {
-    if (std::abs(c[i]) > 1e9 || std::abs(size[i]) > 1e9)
-      return snapshot->map->getStrictBoxStatus(c, size);
-    key.c[i] = std::llround(c[i] * 1e6);
-    key.s[i] = std::llround(size[i] * 1e6);
+    // Exact coordinates: quantized keys could reuse a free verdict across
+    // a voxel-touch boundary.
+    std::memcpy(&key.c[i], &c[i], sizeof(double));
+    std::memcpy(&key.s[i], &size[i], sizeof(double));
   }
   {
     std::lock_guard<std::mutex> lock(box_cache_mutex_);

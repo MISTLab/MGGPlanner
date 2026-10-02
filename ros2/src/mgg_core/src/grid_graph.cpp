@@ -43,12 +43,11 @@ void aerialNudges(GraphManager& graph, const std::vector<GridGraphRetry>& refuse
   // A refused cell is worth another look next to the graph: on the first
   // pass next to any vertex, then next to one the last pass added.
   const double reach = 1.5 * grid.resolution.head<2>().cwiseAbs().maxCoeff();
-  std::vector<char> joined(refused.size(), 0);
   std::vector<Eigen::Vector3d> added_last;
   for (int pass = 0; pass < kAerialNudgePasses; ++pass) {
     std::vector<Eigen::Vector3d> added_now;
     for (std::size_t n = 0; n < refused.size(); ++n) {
-      if (joined[n]) continue;
+
       const Eigen::Vector3d& cell = refused[n].cell;
       if (pass == 0) {
         StateVec query(cell.x(), cell.y(), cell.z(), heading);
@@ -93,7 +92,8 @@ void aerialNudges(GraphManager& graph, const std::vector<GridGraphRetry>& refuse
         result.vertices_added += rep.num_vertices_added;
         result.edges_added += rep.num_edges_added;
         if ((at - cell).norm() > 1e-9) ++result.aerial_nudged;
-        joined[n] = 1;
+        // Keep the cell eligible: the widest first nudge can sit on the
+        // near side of a jamb; a later pass must still try its central nudge.
         if (rep.vertex_added != nullptr)
           added_now.push_back(rep.vertex_added->state.head<3>());
         break;
