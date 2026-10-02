@@ -28,6 +28,7 @@
 
 #include "mgg_core/map_interface.h"
 #include "mgg_core/params.h"
+#include "mgg_core/plan_profile.h"
 #include "mgg_core/types.h"
 
 namespace mgg {
@@ -303,6 +304,10 @@ class GroundProjection {
     return standing_start_ ? &*standing_start_ : nullptr;
   }
 
+  /// Counts this projection's work into `profile` (null: none) until reset.
+  void setProfile(PlanProfile* profile) { profile_ = profile; }
+  PlanProfile* profile() const { return profile_; }
+
  private:
   using ColumnKey = std::array<std::int64_t, 2>;
   using PlaneKey = std::array<std::int64_t, 6>;
@@ -363,6 +368,7 @@ class GroundProjection {
   const PlanningParams& params_;
   const bool cache_footprint_ground_ = false;
   std::optional<StandingStart> standing_start_;
+  PlanProfile* profile_ = nullptr;
   mutable std::unordered_map<ColumnKey, std::vector<GroundFromHeight>,
                              CacheKeyHash>
       ground_below_column_;

@@ -27,6 +27,7 @@ constexpr int kMaxGoalGroundLayers = 32;
 
 double GroundProjection::projectSample(Eigen::Vector3d& sample,
                                        VoxelStatus& status) const {
+  ProfileScope timed(profile_ ? &profile_->projection : nullptr);
   int unknown_count = 0;
   double central_ray_len = 0.0;
 
@@ -144,6 +145,7 @@ ProjectedEdgeStatus GroundProjection::getProjectedEdgeStatus(
     std::vector<Eigen::Vector3d>& projected_edge_out, bool is_hanging,
     bool preserve_start_height, const EdgeBodyCheck* body,
     EdgeTravel travel) const {
+  ProfileScope timed(profile_ ? &profile_->edge_checks : nullptr);
   const double step_size = 2.0 * map_.getResolution();
   const double max_inclination = params_.max_inclination;
 
@@ -224,6 +226,7 @@ ProjectedEdgeStatus GroundProjection::getProjectedEdgeStatus(
   }
 
   for (size_t i = 1; i < projected_edge.size(); ++i) {
+    ProfileScope timed_sweep(profile_ ? &profile_->body_sweeps : nullptr);
     const VoxelStatus path =
         body != nullptr
             ? body->sweep(projected_edge[i - 1], projected_edge[i])
@@ -236,10 +239,12 @@ ProjectedEdgeStatus GroundProjection::getProjectedEdgeStatus(
   // After the sweep, so the side probes start inside a footprint known not
   // to be occupied rather than inside a wall.
   const bool standing_at_start = body != nullptr && body->standing_at_start;
-  if (params_.max_cross_slope < M_PI_2 &&
-      crossSlope(projected_edge, box_size, standing_at_start) >
-          params_.max_cross_slope) {
-    return ProjectedEdgeStatus::kCrossSlope;
+  if (params_.max_cross_slope < M_PI_2) {
+    ProfileScope timed_slope(profile_ ? &profile_->cross_slope : nullptr);
+    if (crossSlope(projected_edge, box_size, standing_at_start) >
+        params_.max_cross_slope) {
+      return ProjectedEdgeStatus::kCrossSlope;
+    }
   }
 
   // The points the body is checked at: every point of the polyline and
@@ -270,6 +275,7 @@ ProjectedEdgeStatus GroundProjection::getProjectedEdgeStatus(
   const bool check_step = params_.max_footprint_step > 0.0;
   const bool check_rise = params_.max_footprint_cell_rise > 0.0;
   if ((check_tilt || check_step || check_rise) && heading.norm() > 1e-9) {
+    ProfileScope timed_footprint(profile_ ? &profile_->footprint : nullptr);
     for (const Eigen::Vector3d& point : samples) {
       if (check_tilt || check_step) {
         const FootprintPlane plane = footprintPlane(point, heading, box_size);
@@ -299,6 +305,7 @@ ProjectedEdgeStatus GroundProjection::getProjectedEdgeStatus(
   // with the robot's front over a drop (review r2, I-1).
   const double min_ground = params_.min_observed_ground_fraction;
   if (min_ground > 0.0 && heading.norm() > 1e-9) {
+    ProfileScope timed_ahead(profile_ ? &profile_->ground_ahead : nullptr);
     for (std::size_t i = 0; i < samples.size(); ++i) {
       if (is_hanging && i + 1 < samples.size()) continue;
       if (observedGroundAhead(samples[i], heading, box_size) <
@@ -730,6 +737,7 @@ double GroundProjection::clearancePenalty(
 double GroundProjection::clearanceCost(
     const Eigen::Vector3d& start, const Eigen::Vector3d& end,
     const Eigen::Vector3d& box_size) const {
+  ProfileScope timed(profile_ ? &profile_->clearance : nullptr);
   const double length = (end - start).norm();
   if (!(params_.path_clearance_margin > 0.0) || !(length > 0.0)) return length;
   const int samples = std::max(1, std::min(32,
@@ -763,7 +771,10 @@ FootprintPlane GroundProjection::footprintPlane(
                      micro(axis),      micro(box_size.x()),
                      micro(box_size.y())};
   const auto found = footprint_planes_.find(key);
-  if (found != footprint_planes_.end()) return found->second;
+  if (found != footprint_planes_.end()) {
+    if (profile_ != nullptr) ++profile_->footprint_cache_hits;
+    return found->second;
+  }
   const FootprintPlane plane = measureFootprintPlane(point, heading, box_size);
   footprint_planes_.emplace(key, plane);
   return plane;

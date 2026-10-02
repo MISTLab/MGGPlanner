@@ -38,8 +38,10 @@ add_library(${PROJECT_NAME}
   src/params.cpp
   src/geofence_manager.cpp
   src/ground_projection.cpp
+  src/plan_profile.cpp
   src/graph_expansion.cpp
   src/grid_graph.cpp
+  src/local_route.cpp
   src/gain.cpp
   src/trajectory.cpp
   src/path_selection.cpp

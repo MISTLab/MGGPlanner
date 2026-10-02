@@ -82,6 +82,9 @@ if(BUILD_TESTING)
   # A diagnostic, not a test: builds the lattice against a real product.
   add_executable(lattice_probe test/lattice_probe.cpp)
   target_link_libraries(lattice_probe ${PROJECT_NAME})
+  # The navigation benchmark on a real planning product (nav_bench.cpp).
+  add_executable(mgg_nav_bench test/nav_bench.cpp)
+  target_link_libraries(mgg_nav_bench ${PROJECT_NAME})
   find_package(ament_cmake_gtest REQUIRED)
   if(MGG_WITH_OCTOMAP)
     ament_add_gtest(test_octomap_map test/test_octomap_map.cpp)

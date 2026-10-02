@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <optional>
 #include <tuple>
 #include <vector>
 
@@ -76,6 +77,8 @@ GridGraphResult buildGridGraph(GraphManager& graph, const StateVec& state,
 
   const bool ground_robot =
       ctx.robot->type == RobotType::kGroundRobot && ctx.ground != nullptr;
+  PlanProfile* const profile = ctx.ground ? ctx.ground->profile() : nullptr;
+  ProfileScope timed_lattice(profile ? &profile->lattice : nullptr);
   LatticeColumnGround column_ground(ctx.planning->max_step_height);
   if (ground_robot) column_ground.add(i0, j0, state.z());
 
@@ -184,6 +187,8 @@ GridGraphResult buildGridGraph(GraphManager& graph, const StateVec& state,
     }
     body.size = ctx.robot_box_size;
     const Eigen::Vector3d center = candidate + ctx.robot->center_offset;
+    std::optional<ProfileScope> timed_precheck;
+    timed_precheck.emplace(profile ? &profile->cell_prechecks : nullptr);
     VoxelStatus status = ctx.robot->type == RobotType::kAerialRobot
         ? ctx.map->getStrictBoxStatus(center, ctx.robot_box_size)
         : ctx.map->getBoxStatus(center, ctx.robot_box_size,
@@ -193,6 +198,7 @@ GridGraphResult buildGridGraph(GraphManager& graph, const StateVec& state,
       status = orientedBoxPathStatus(*ctx.map, center, center, body,
                                      !ctx.allow_unknown_lattice_body, nullptr);
     }
+    timed_precheck.reset();
     if (status != VoxelStatus::kFree) return status == VoxelStatus::kOccupied;
     if (first_pass) ++result.free_cells;
     return offer(candidate, i, j, first_pass, added);
@@ -230,6 +236,7 @@ GridGraphResult buildGridGraph(GraphManager& graph, const StateVec& state,
     for (const Retry& retry : retries) {
       // Retries are charged to the same budget.
       if (!charge()) return result;
+      if (profile != nullptr) ++profile->retries;
       bool added = false;
       offer(retry.cell, retry.i, retry.j, /*first_pass=*/false, added);
       if (added) {
@@ -247,6 +254,7 @@ GridGraphResult buildGridGraph(GraphManager& graph, const StateVec& state,
   for (const Retry& retry : nudges) {
     for (double offset : {0.1, -0.1, 0.2, -0.2}) {
       if (!charge()) return result;
+      if (profile != nullptr) ++profile->nudges;
       bool added = false;
       const Eigen::Vector3d shifted =
           retry.cell + offset * Eigen::Vector3d(-sin_h, cos_h, 0.0);

@@ -15,6 +15,7 @@
 #include <sensor_msgs/point_cloud2_iterator.hpp>
 #include <tf2/exceptions.hpp>
 
+#include "mgg_core/local_route.h"
 #include "mgg_core/log.h"
 #include "mgg_core/path_turns.h"
 #include "mgg_core/trajectory.h"
@@ -3615,12 +3616,7 @@ void PlannerNode::shortcutAndResample(std::vector<mgg::StateVec>& path,
     if (robot_params_.type == mgg::RobotType::kAerialRobot &&
         peerBlocksSegment(from, to)) return false;
     if (robot_params_.type == mgg::RobotType::kGroundRobot) {
-      std::vector<Eigen::Vector3d> projected;
-      // Driven from `from` to `to`: the shortcut is the path itself.
-      return ground_->getProjectedEdgeStatus(
-                 from, to, ctx.robot_box_size, true, projected, false, false,
-                 nullptr, mgg::EdgeTravel::kForward) ==
-             mgg::ProjectedEdgeStatus::kAdmissible;
+      return mgg::groundShortcutSegmentAdmissible(ctx, from, to);
     }
     return map_->getStrictPathStatus(from + robot_params_.center_offset,
                                       to + robot_params_.center_offset,
@@ -4620,52 +4616,19 @@ bool PlannerNode::routeOverLocalLattice(const mgg::StateVec& goal,
     reason = "goal is outside the local lattice";
     return false;
   }
-  local_graph_->reset();
-  edge_inclinations_.clear();
-  mgg::StateVec root_state = current_state_;
-  const bool root_hanging = !projectToDrivingHeight(root_state);
-  if (root_hanging) root_state = physicalAnchorAtDrivingHeight(current_state_);
-  auto* root = new mgg::Vertex(0, root_state);
-  root->robot_id = static_cast<int>(planning_params_.robot_id);
-  root->is_hanging = root_hanging;
-  local_graph_->addVertex(root);
   // One plan's shared footprint lookups, as in buildLocalGraph.
   mgg::GroundProjection plan_ground(*map_, planning_params_,
                                     /*cache_footprint_ground=*/true);
   plan_ground.setStandingStart(standingStart());
   mgg::ExpandContext ctx = makeContext();
   ctx.ground = &plan_ground;
-  const mgg::GridGraphResult r = buildGridGraph(
-      *local_graph_, root_state, grid_params_, ctx, current_state_[3]);
-  if (r.status == mgg::GridGraphStatus::kInvalidBounds ||
-      local_graph_->getNumVertices() <= 1) {
-    reason = "the local lattice holds no admissible cell";
+  mgg::LocalRouteResult local = mgg::routeOverLocalLattice(
+      *local_graph_, current_state_, goal, grid_params_, ctx);
+  if (!local.routed) {
+    reason = local.reason;
     return false;
   }
-  mgg::StateVec goal_state = goal;
-  if (!projectGoalToDrivingHeight(goal_state)) {
-    reason = "no mapped ground under the goal";
-    return false;
-  }
-  mgg::Vertex* goal_vertex = mgg::connectStateToGraph(
-      *local_graph_, goal_state, ctx, kGoalLinkRadius, /*exact_state=*/true);
-  if (goal_vertex == nullptr) {
-    reason = "goal cannot be linked to the local lattice";
-    return false;
-  }
-  mgg::ShortestPathsReport rep;
-  if (!local_graph_->findShortestPaths(0, rep) || !rep.status ||
-      (goal_vertex->id != 0 &&
-       rep.parent_id_map.find(goal_vertex->id) == rep.parent_id_map.end())) {
-    reason = "no route through the local lattice reaches the goal";
-    return false;
-  }
-  std::vector<mgg::Vertex*> route;
-  local_graph_->getShortestPath(goal_vertex->id, rep, true, route);
-  if (route.size() < 2) {
-    reason = "already at the goal";
-    return false;
-  }
+  std::vector<mgg::Vertex*>& route = local.route;
   turns_ok = applyRouteTurnRule(*local_graph_, /*slope_from_map=*/false, {},
                                 route, "local lattice route");
   for (const mgg::Vertex* v : route) path.push_back(v->state);
