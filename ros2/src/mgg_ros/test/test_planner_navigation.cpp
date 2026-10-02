@@ -584,14 +584,14 @@ TEST_F(PlannerNavigationTest, HardwareShortcutDoesNotCrossUnknownBodyVolume) {
 }
 
 TEST_F(PlannerNavigationTest, SensorFovPolicyToleratesOnlyUpperUnknownAir) {
-  for (double observed : {.4, .5, .6, .7, 2.0}) {
+  for (double observed : {.4, .5, .599, .61, .7, 2.0}) {
     SCOPED_TRACE(observed);
     MolaTerrainProduct product(.1, -3, 5, -3, 3, flat, {}, observed);
     auto node = botmanNode("sensor_unknown_air", product);
     PlannerNodeTestPeer::sensorPolicy(*node);
     PlannerNodeTestPeer::standAt(*node, 0, 0, 0, 0, 1);
     const auto response = navigate(*node, 2, 0);
-    EXPECT_EQ(response->status == Service::Response::SUCCEEDED, observed >= .6);
+    EXPECT_EQ(response->status == Service::Response::SUCCEEDED, observed >= .61);
   }
 }
 

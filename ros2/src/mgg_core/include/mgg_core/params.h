@@ -9,6 +9,7 @@
 
 #include <cstdint>
 #include <limits>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -39,6 +40,13 @@ struct RobotParams {
   Eigen::Vector3d size_extension = Eigen::Vector3d::Zero();
   /// Ground body-frame offset; aerial offsets retain their map-frame convention.
   Eigen::Vector3d center_offset = Eigen::Vector3d::Zero();
+  /// Measured chassis, distinct from legacy lidar-centred planning bounds.
+  /// Unset uses size/center_offset. Never use the inflated planning box for
+  /// own-body unknown-space evidence or the skid-steer spin envelope.
+  std::optional<Eigen::Vector3d> physical_size;
+  std::optional<Eigen::Vector3d> physical_center_offset;
+  Eigen::Vector3d physicalSize() const { return physical_size.value_or(size); }
+  Eigen::Vector3d physicalOffsetForHeading(double heading) const;
   /// Blend factor in [0,1] for kRelaxedBound.
   double relax_ratio = 0.5;
   BoundModeType bound_mode = BoundModeType::kExtendedBound;
@@ -51,7 +59,7 @@ struct RobotParams {
   Eigen::Vector3d getPlanningSize() const;
   /// Radius of the circle the robot's corners sweep turning in place: half
   /// the diagonal of size x and y.
-  double turningRadius() const { return 0.5 * size.head<2>().norm(); }
+  double turningRadius() const { return 0.5 * (type == RobotType::kGroundRobot ? physicalSize() : size).head<2>().norm(); }
 };
 
 enum class BoundedSpaceType { kCuboid = 0, kSphere };

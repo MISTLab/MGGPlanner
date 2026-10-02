@@ -356,7 +356,7 @@ TurnCompliantRoutes findTurnCompliantRoutes(
 bool turnClear(const MapInterface& map, const RobotParams& robot,
                const StateVec& state) {
   const double radius = robot.turningRadius();
-  const Eigen::Vector3d center = state.head<3>() + robot.center_offset;
+  const Eigen::Vector3d center = state.head<3>() + robot.physicalOffsetForHeading(state[3]);
   return map.getOccupiedOnlyCylinderPathStatus(
              center, center, radius, robot.getPlanningSize().z()) !=
          VoxelStatus::kOccupied;
@@ -367,7 +367,7 @@ bool turnSpaceObserved(const MapInterface& map, const RobotParams& robot,
                        const StandingStart* standing) {
   const double min_ground = planning.min_observed_ground_fraction;
   if (!(min_ground > 0.0)) return true;
-  const Eigen::Vector3d center = state.head<3>() + robot.center_offset;
+  const Eigen::Vector3d center = state.head<3>() + robot.physicalOffsetForHeading(state[3]);
   std::vector<XYCellCenter> cells;
   constexpr std::size_t kMaxTurnCells = 1024;
   if (!center.allFinite() ||
@@ -422,7 +422,7 @@ bool observedArrivalDisk(const MapInterface& map, const RobotParams& robot,
                           const PlanningParams& planning, const StateVec& goal,
                           double arrival_tolerance) {
   if (!roomToTurn(map, robot, planning, goal, nullptr)) return false;
-  const Eigen::Vector3d center = goal.head<3>() + robot.center_offset;
+  const Eigen::Vector3d center = goal.head<3>() + robot.physicalOffsetForHeading(goal[3]);
   const double radius = robot.turningRadius() + std::max(0.0, arrival_tolerance);
   std::vector<XYCellCenter> cells;
   if (!map.getCircleIntersectingXYCellCenters(center.head<2>(), radius, 4096, cells) ||
@@ -486,13 +486,14 @@ void PathTurnCheck::setRobotTilt(const Eigen::Vector3d& position,
   slope_at_.erase(robot_tilt_->first);
 }
 
-bool PathTurnCheck::roomAt(const Eigen::Vector3d& position) {
+bool PathTurnCheck::roomAt(const Eigen::Vector3d& position, double heading) {
   if (!room_to_turn_) return true;
-  const PositionKey key = positionKey(position);
+  const auto key = std::make_pair(positionKey(position),
+      std::llround(std::remainder(heading, 2*M_PI)*1e9));
   const auto found = room_at_.find(key);
   if (found != room_at_.end()) return found->second;
   return room_at_[key] = room_to_turn_(
-             StateVec(position.x(), position.y(), position.z(), 0.0));
+             StateVec(position.x(), position.y(), position.z(), heading));
 }
 
 PathTurnCheck::Refusal PathTurnCheck::firstRefusal(
@@ -503,7 +504,22 @@ PathTurnCheck::Refusal PathTurnCheck::firstRefusal(
     if (turns[i] <= kSharpTurnRad + 1e-9) continue;
     const double slope = slopeAt(points[i]);
     const bool on_slope = slope > kLevelGroundSlopeRad;
-    if (on_slope || !roomAt(points[i])) {
+    // Match pathTurns' incoming/outgoing window. The reference translates
+    // as an offset chassis spins: certify both endpoint centre circles.
+    std::size_t back = i, ahead = i;
+    double distance = 0;
+    while (back > 0 && distance < window_) {
+      distance += (points[back] - points[back-1]).head<2>().norm();
+      --back;
+    }
+    distance = 0;
+    while (ahead+1 < points.size() && distance < window_) {
+      distance += (points[ahead+1] - points[ahead]).head<2>().norm();
+      ++ahead;
+    }
+    const double incoming = back == i ? start_heading : headingBetween(points[back], points[i]);
+    const double outgoing = ahead == i ? incoming : headingBetween(points[i], points[ahead]);
+    if (on_slope || !roomAt(points[i], incoming) || !roomAt(points[i], outgoing)) {
       if (record && !first_refused_corner) {
         first_refused_corner = RefusedCorner{points[i], turns[i], slope, on_slope};
       }

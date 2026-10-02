@@ -958,6 +958,14 @@ void PlannerNode::loadParameters() {
   }
   loadTourParams(p, "tour", tour_params_);
   loadFleetParams(p, "fleet", fleet_params_);
+  if (unknown_body_policy_ == "above_sensor_fov" &&
+      !makeContext().unknown_body_above_center) {
+    RCLCPP_ERROR(get_logger(),
+        "unknown_body_policy=above_sensor_fov CANNOT APPLY: sensor '%s' must be an upright "
+        "ground-robot lidar with finite full vertical FOV in (0, pi) and mount_height "
+        "strictly above the planning body bottom; USING STRICT UNKNOWN POLICY",
+        unknown_body_sensor_.c_str());
+  }
   world_frame_ = planning_params_.global_frame_id;
   communication_range_ =
       declareOrGet<double>(this, "communication_range", 15.0);
@@ -1000,7 +1008,9 @@ mgg::ExpandContext PlannerNode::makeContext() {
       // Upright lidar geometry only. Missing/invalid configuration fails
       // closed to the strict body policy; never invent a sensor height/FOV.
       if (lidar.type == mgg::SensorType::kLidar && std::isfinite(lidar.mount_height) &&
-          lidar.mount_height > 0 && std::isfinite(lidar.fov.y()) &&
+          lidar.mount_height > std::max(0.0, planning_params_.max_ground_height +
+              robot_params_.center_offset.z() - ctx.robot_box_size.z()/2) + 1e-9 &&
+          std::isfinite(lidar.fov.y()) &&
           lidar.fov.y() > 0 && lidar.fov.y() < M_PI &&
           lidar.rotations.tail<2>().norm() < 1e-9) {
         ctx.unknown_body_above_center = lidar.mount_height -

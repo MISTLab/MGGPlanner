@@ -244,7 +244,7 @@ class PathTurnCheck {
 
   Refusal firstRefusal(const std::vector<Eigen::Vector3d>& points,
                        double start_heading, bool record = false);
-  bool roomAt(const Eigen::Vector3d& position);
+  bool roomAt(const Eigen::Vector3d& position, double heading = 0.0);
 
   GraphManager& graph_;
   double window_ = 0.0;
@@ -253,7 +253,7 @@ class PathTurnCheck {
   SlopeFn unmeasured_;
   std::map<PositionKey, double> slope_at_;
   std::optional<std::pair<PositionKey, double>> robot_tilt_;
-  std::map<PositionKey, bool> room_at_;
+  std::map<std::pair<PositionKey, long long>, bool> room_at_;
 };
 
 /// What chooseTurnCompliantRoute did with a route.
