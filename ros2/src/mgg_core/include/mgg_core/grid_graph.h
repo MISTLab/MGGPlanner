@@ -57,6 +57,8 @@ struct GridGraphResult {
   /// Nominal cells whose footprint was free: first-pass offers and
   /// merged_duplicates. Retry/nudge attempts do not count again.
   int free_cells = 0;
+  /// One clipped-root-spoke bootstrap retry, only while the graph is root-only.
+  bool root_spoke_retry = false;
   int vertices_added = 0;
   int edges_added = 0;
   /// True when a size or loop cap stopped the sweep early.

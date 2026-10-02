@@ -466,6 +466,7 @@ GridGraphResult buildGridGraph(GraphManager& graph, const StateVec& state,
   // connected, expansion remains restricted to the connected frontier.
   if (ground_robot && graph.getNumVertices() == 1 && !root_spokes_tried) {
     root_spokes_tried = true;
+    result.root_spoke_retry = true;
     for (std::size_t n=0; n<columns.size(); ++n) if (!scheduled[n]) {
       scheduled[n] = true; ready_columns.insert(n);
     }

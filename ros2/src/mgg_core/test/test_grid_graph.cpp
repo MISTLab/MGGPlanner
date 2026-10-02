@@ -301,6 +301,22 @@ TEST(GridGraph, QualifiedPolicyAdmitsUnknownBodyWithMeasuredGround) {
   EXPECT_TRUE(fixture.graph.getNearestVertexInRange(&candidate, 0.11, &found));
 }
 
+TEST(GridGraph, RootSpokeRetryNeverRunsAfterAnEdgeConnects) {
+  for (bool existing_edge : {false, true}) {
+    SparseGroundFixture fixture(/*has_ground=*/true);
+    fixture.ctx.allow_unknown_lattice_body = true;
+    if (existing_edge) {
+      auto* other = new Vertex(fixture.graph.generateVertexID(), StateVec(.5,0,.5,0));
+      fixture.graph.addVertex(other);
+      fixture.graph.addEdge(fixture.graph.getVertex(0),other,.5);
+    }
+    auto grid=fixture.grid(); grid.max_val.x()=5;
+    const auto result=mgg::buildGridGraph(fixture.graph,StateVec(0,0,.5,0),grid,fixture.ctx,0);
+    ASSERT_GT(fixture.graph.getNumEdges(),0);
+    EXPECT_FALSE(result.root_spoke_retry);
+  }
+}
+
 TEST(GridGraph, QualifiedPolicyStillRequiresMeasuredGround) {
   SparseGroundFixture fixture(/*has_ground=*/false);
   fixture.ctx.allow_unknown_lattice_body = true;
