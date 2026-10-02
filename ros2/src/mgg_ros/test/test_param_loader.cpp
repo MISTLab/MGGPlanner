@@ -7,6 +7,7 @@
 #include <rclcpp/rclcpp.hpp>
 
 #include "mgg_ros/param_loader.h"
+#include "mgg_ros/planner_node.h"
 
 namespace {
 
@@ -82,12 +83,59 @@ TEST_F(ParamFixture, RejectsHalfConfiguredPhysicalBody) {
   for (const auto& key : {"physical_size", "physical_center_offset"}) {
     rclcpp::NodeOptions opts;
     opts.automatically_declare_parameters_from_overrides(true);
-    opts.parameter_overrides({{std::string("RobotParams.")+key,
-                               std::vector<double>{1.0, .8, .6}}});
-    auto node=std::make_shared<rclcpp::Node>("half_physical",opts);
+    opts.parameter_overrides({
+        {std::string("RobotParams.") + key, std::vector<double>{1.0, .8, .6}},
+        {"RobotParams.relax_ratio", .25},
+        {"RobotParams.safety_extension", std::vector<double>{.1, .2, .3}},
+        {"RobotParams.bound_mode", std::string("kExactBound")}});
+    auto node = std::make_shared<rclcpp::Node>("half_physical", opts);
     mgg::RobotParams robot;
-    EXPECT_FALSE(mgg_ros::loadRobotParams(ParamLoader(node.get()),"RobotParams",robot));
+    EXPECT_FALSE(mgg_ros::loadRobotParams(ParamLoader(node.get()), "RobotParams", robot));
+    EXPECT_FALSE(robot.physical_size.has_value());
+    EXPECT_FALSE(robot.physical_center_offset.has_value());
+    EXPECT_DOUBLE_EQ(robot.relax_ratio, .25);
+    EXPECT_TRUE(robot.safety_extension.isApprox(Eigen::Vector3d(.1, .2, .3)));
+    EXPECT_EQ(robot.bound_mode, mgg::BoundModeType::kExactBound);
   }
+}
+
+TEST_F(ParamFixture, HalfConfiguredPhysicalBodyRefusesNodeStartup) {
+  for (const auto& key : {"physical_size", "physical_center_offset"}) {
+    SCOPED_TRACE(key);
+    rclcpp::NodeOptions opts;
+    opts.automatically_declare_parameters_from_overrides(true);
+    opts.parameter_overrides({
+        {"map.backend", std::string("mola_snapshot")},
+        {"map.mola.peer_root", std::string("/tmp/mgg-r7-startup-no-product")},
+        {std::string("RobotParams.") + key, std::vector<double>{1.0, .8, .6}}});
+    try {
+      auto node = std::make_shared<mgg_ros::PlannerNode>(opts);
+      FAIL() << "half-set physical geometry must refuse startup";
+    } catch (const std::invalid_argument& error) {
+      const std::string message = error.what();
+      EXPECT_NE(message.find("RobotParams"), std::string::npos);
+      EXPECT_NE(message.find("physical_size"), std::string::npos);
+      EXPECT_NE(message.find("physical_center_offset"), std::string::npos);
+    }
+  }
+}
+
+TEST_F(ParamFixture, FullPhysicalBodyPairLoadsAllRobotFields) {
+  node_->declare_parameter("RobotParams.physical_size", std::vector<double>{1.024, .778, .660});
+  node_->declare_parameter("RobotParams.physical_center_offset", std::vector<double>{-.16, 0, -.605});
+  node_->declare_parameter("RobotParams.relax_ratio", .25);
+  node_->declare_parameter("RobotParams.safety_extension", std::vector<double>{.1, .2, .3});
+  node_->set_parameter(rclcpp::Parameter("RobotParams.bound_mode", "kExactBound"));
+  mgg::RobotParams robot;
+  ASSERT_TRUE(mgg_ros::loadRobotParams(ParamLoader(node_.get()), "RobotParams", robot));
+  ASSERT_TRUE(robot.physical_size.has_value());
+  ASSERT_TRUE(robot.physical_center_offset.has_value());
+  EXPECT_TRUE(robot.physical_size->isApprox(Eigen::Vector3d(1.024, .778, .660)));
+  EXPECT_TRUE(robot.physical_center_offset->isApprox(Eigen::Vector3d(-.16, 0, -.605)));
+  EXPECT_DOUBLE_EQ(robot.relax_ratio, .25);
+  EXPECT_TRUE(robot.safety_extension.isApprox(Eigen::Vector3d(.1, .2, .3)));
+  EXPECT_EQ(robot.bound_mode, mgg::BoundModeType::kExactBound);
+  EXPECT_TRUE(robot.size.isApprox(Eigen::Vector3d(.8, .8, .2)));
 }
 
 TEST_F(ParamFixture, ReadsNestedNamesUsingTheRos1Spelling) {
