@@ -207,6 +207,9 @@ mggplanner_node:
       ground_frontier_height_margin: 0.5
       # Diagnostic reference only: include upper unknown; slower than band scan.
       ground_gain_full_scan: false
+      # Ground ranking model only; 0 inherits the real sensor unchanged.
+      ground_gain_angular_resolution_deg: 0.0
+      ground_gain_max_range: 0.0
       unknown_voxel_gain: 60.0
       nonuniform_ray_cast: true
       ray_cast_step_size_multiplier: 1.0

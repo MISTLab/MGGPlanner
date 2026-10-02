@@ -477,4 +477,66 @@ TEST(Gain, GroundScanRequestsBandTraversalUnlessFullScanIsEnabled) {
   EXPECT_GE(gain.num_total_unknown_voxels, gain.num_unknown_voxels);
 }
 
+TEST(Gain, SparseGroundModelDoesNotChangeRealFovOrAerialRays) {
+  class RayRecorder : public HalfMapped {
+   public:
+    std::size_t count = 0;
+    double range = 0;
+    void getScanStatusIterative(
+        const Eigen::Vector3d& origin, const std::vector<Eigen::Vector3d>& ends,
+        GainCounts&, std::vector<std::pair<Eigen::Vector3d, VoxelStatus>>&,
+        const SensorModel&) override {
+      count = ends.size();
+      range = 0;
+      for (const auto& end : ends) range = std::max(range, (end - origin).norm());
+    }
+  } map;
+  Fixture f;
+  f.ctx.map = &map;
+  mgg::RobotParams robot;
+  f.ctx.robot = &robot;
+  auto& sensor = f.sensors["VLP16"];
+  sensor.max_range = 20;
+  sensor.fov = Eigen::Vector2d(2 * M_PI, M_PI / 3);
+  sensor.resolution = Eigen::Vector2d::Constant(M_PI / 36);
+  sensor.update();
+  const StateVec state(0, 0, 0, 0);
+  VolumetricGain gain;
+  computeVolumetricGain(state, gain, f.ctx);
+  const auto dense_rays = map.count;
+  for (const auto setting : {std::pair<double, double>{10, 0}, {0, 10}, {10, 10}}) {
+    f.planning.ground_gain_angular_resolution_deg = setting.first;
+    f.planning.ground_gain_max_range = setting.second;
+    robot.type = mgg::RobotType::kGroundRobot;
+    computeVolumetricGain(state, gain, f.ctx);
+    if (setting.first) EXPECT_LT(map.count, dense_rays * 0.3);
+    else EXPECT_EQ(map.count, dense_rays);
+    EXPECT_NEAR(map.range, setting.second ? 10 : 20, 1e-9);
+    EXPECT_TRUE(sensor.isInsideFOV(state, Eigen::Vector3d(15, 0, 0)));
+    EXPECT_DOUBLE_EQ(sensor.max_range, 20);
+    EXPECT_DOUBLE_EQ(sensor.resolution.x(), M_PI / 36);
+    robot.type = mgg::RobotType::kAerialRobot;
+    computeVolumetricGain(state, gain, f.ctx);
+    EXPECT_EQ(map.count, dense_rays);
+    EXPECT_NEAR(map.range, 20, 1e-9);
+  }
+  robot.type = mgg::RobotType::kGroundRobot;
+  f.planning.ground_gain_angular_resolution_deg = 2;
+  f.planning.ground_gain_max_range = 30;
+  computeVolumetricGain(state, gain, f.ctx);
+  EXPECT_EQ(map.count, dense_rays);  // cannot densify or extend the real model
+  EXPECT_NEAR(map.range, 20, 1e-9);
+  sensor.fov = Eigen::Vector2d::Constant(M_PI / 18);
+  sensor.resolution.setZero();  // real sensor uses its existing 1-degree fallback
+  sensor.update();
+  f.planning.ground_gain_angular_resolution_deg = 0;
+  f.planning.ground_gain_max_range = 0;
+  computeVolumetricGain(state, gain, f.ctx);
+  const auto fallback_rays = map.count;
+  f.planning.ground_gain_angular_resolution_deg = 0.5;
+  computeVolumetricGain(state, gain, f.ctx);
+  EXPECT_EQ(map.count, fallback_rays);
+
+}
+
 }  // namespace

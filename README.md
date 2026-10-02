@@ -85,6 +85,17 @@ In the ROS 2 port (`ros2/src`), a viewpoint's gain counts the unknown voxels its
 - Native MOLA ground scans stop beyond the height band and conservative gain-region bounds, retaining occlusion before entering the band and exact per-viewpoint voxel counts. `PlanningParams.ground_gain_full_scan: true` disables pruning for diagnostics/reference comparisons (default false); production logs total unknown as `unavailable (pruned)`, not zero. Backends without bounds-aware scanning fall back to full scans.
 - Below the vertex's floor, a voxel counts unless mapped ground lies over it. Ground falling away, such as a ramp down or a stairwell, keeps its gain down to `max(2 max_ground_height, 1 m)` below the vertex.
 
+Optional ground-only ranking parameters, independent of the real sensor/body-FOV geometry:
+
+```yaml
+PlanningParams:
+  ground_gain_angular_resolution_deg: 7.5
+  ground_gain_max_range: 10.0
+  ground_gain_full_scan: false
+```
+
+Both overrides default to **0** (inherit the dense sensor). The measured opt-in recommendation is **7.5 degrees / 10 m with pruning**: it retains the room/door and Scout/Bunker/Spot corridor regressions at 0.1/0.2 m. The worst 0.2 m Scout corridor clears the 9000 path-score floor by only 3.3%; use 5 degrees / 10 m if more score margin is needed. A 10-degree fleet default is **not recommended**: it drops some 0.2 m corridor scores below that floor. Sparse models intentionally change counts and may change tour/path choices; they are not exact substitutes for dense gain. The real sensor FOV/range and aerial gain stay unchanged, and obstacle ray steps remain one voxel. `ground_gain_full_scan` disables pruning of the selected gain model; set both overrides to zero as well for the original dense reference. Orin timings remain to be measured.
+
 Ground receivers must configure `aerial_peer_robot_ids` with an integer array of the aerial senders' **wire IDs** (`PlanningParams.robot_id` / `Vertex.robot_id`), not namespace names. For example, `aerial_peer_robot_ids: [5]` excludes sender ID 5 from ground global repositioning, tour clusters and fleet target offers, including after rebroadcast. The fleet launch must supply this list; it is logged at startup. The default empty list preserves legacy peer behavior: unlisted peers are treated as ground. This avoids changing `Graph.msg` and permits roadmap exchange with older robots. Aerial receivers ignore the exclusion; their own gain is unchanged, but band-only ground-peer counts can put some shared targets below the drone's tour gain floor.
 
 ## Results

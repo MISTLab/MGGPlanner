@@ -17,6 +17,8 @@
 #include <sstream>
 #include <cstdint>
 #include <future>
+#include <functional>
+#include <cstdlib>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -34,6 +36,7 @@
 #include "mgg_map_octomap/mola_map.h"
 #include "mgg_map_octomap/octomap_map.h"
 #include "mgg_ros/planner_node.h"
+#include "../../mgg_core/test/gain_model_benchmark.h"
 #include "mgg_msgs/srv/planner_set_exploration_region.hpp"
 #include "mgg_ros/fleet_conversions.h"
 #include "mgg_ros/conversions.h"
@@ -999,6 +1002,83 @@ class PlannerNodeTestPeer {
   }
   static void setHangingRootReach(PlannerNode& node, double reach) {
     node.hanging_root_edge_length_max_ = reach;
+  }
+  static void benchmarkLocalGain(PlannerNode& node, const std::string& scene) {
+    EXPECT_GT(node.local_graph_->getNumVertices(), 1);
+    for (auto& [name, sensor] : node.sensors_) {
+      sensor.fov.y() = M_PI / 3;
+      sensor.update();
+    }
+    // Selection has now rewritten is_leaf_vertex. The original local request
+    // evaluated all admitted vertices before that rewrite; hold that set fixed.
+    mgg::test::benchmarkGainModels(scene, *node.local_graph_, node.makeGainContext(),
+                                  false, node.current_state_[3]);
+  }
+  // Gain-only comparison on the captured botman map and this branch's fixed
+  // admitted lattice. Nominal planning body/legacy unknown-air admission match
+  // the benchmark's legacy_relaxed policy, not a deployment recommendation.
+  static bool configureBotmanGainFixture(PlannerNode& node, const std::string& root) {
+    node.robot_params_.type = mgg::RobotType::kGroundRobot;
+    node.robot_params_.size = Eigen::Vector3d(1.344, .778, 1.22);
+    node.robot_params_.size_extension = Eigen::Vector3d::Constant(.05);
+    node.robot_params_.size_extension_min.setZero();
+    node.robot_params_.safety_extension.setZero();
+    node.robot_params_.center_offset.setZero();
+    node.robot_params_.bound_mode = mgg::BoundModeType::kExtendedBound;
+    auto& p = node.planning_params_;
+    p.edge_length_min = .05; p.edge_length_max = 1; p.edge_overshoot = 0;
+    p.num_vertices_max = 500; p.num_edges_max = 10000;
+    p.num_loops_cutoff = 2000; p.num_loops_max = 200000;
+    p.nearest_range = .6; p.nearest_range_z = .15;
+    p.nearest_range_min = .05; p.nearest_range_max = 1;
+    p.path_interpolation_distance = .25; p.traverse_length_max = 20;
+    p.max_ground_height = .935; p.max_step_height = .15;
+    p.max_inclination = 27 * M_PI / 180; p.max_footprint_tilt = 20 * M_PI / 180;
+    p.max_footprint_step = .1; p.path_clearance_margin = .6;
+    p.unknown_voxel_gain = 60; p.free_voxel_gain = 0; p.occupied_voxel_gain = 0;
+    p.path_length_penalty = .25; p.path_direction_penalty = 1;
+    p.leafs_only_for_volumetric_gain = true;
+    node.allow_unknown_lattice_body_ = true;
+    node.hanging_root_edge_length_max_ = 1;
+    node.grid_params_.min_val = Eigen::Vector3d(-6, -6, -.2);
+    node.grid_params_.max_val = Eigen::Vector3d(6, 6, .3);
+    node.grid_params_.resolution = Eigen::Vector3d(.4, .4, .1);
+    node.global_space_.setBound(Eigen::Vector3d(-20, -20, -3),
+                                Eigen::Vector3d(20, 20, 5));
+    nlohmann::json source;
+    std::ifstream(root + "/mola/source.json") >> source;
+    const auto& manifest = source.at("manifests").at(0);
+    mgg::MolaSnapshotRequest request;
+    request.component_id = manifest.at("graph_revision").at("component_id");
+    request.epoch = manifest.at("graph_revision").at("epoch");
+    request.graph_revision = manifest.at("graph_revision").at("revision");
+    request.geometry_revision = manifest.at("geometry_revision");
+    for (const auto& submap : manifest.at("submaps"))
+      request.source_stamp_ns = std::max<std::uint64_t>(request.source_stamp_ns,
+          submap.value("observed_at_ns", std::uint64_t{0}));
+    node.mola_map_->requestSnapshot(request);
+    for (int i = 0; i < 400 && !node.mola_map_->getStatus(); ++i)
+      std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    node.mapping_snapshot_.component_id = request.component_id;
+    node.mapping_snapshot_.epoch = request.epoch;
+    node.mapping_snapshot_.component_from_navigation.rotation.w = 1;
+    node.have_mapping_snapshot_ = true;
+    mgg::SensorParams sensor;
+    sensor.max_range = 20; sensor.mount_height = .61;
+    sensor.fov = Eigen::Vector2d(2 * M_PI, M_PI / 3);
+    sensor.resolution = Eigen::Vector2d::Constant(M_PI / 36);
+    sensor.update();
+    node.sensors_["VLP16"] = sensor;
+    p.exp_sensor_list = {"VLP16"};
+    return node.mola_map_->getStatus();
+  }
+  static void setGroundGainModel(PlannerNode& node, double degrees, double range) {
+    node.planning_params_.ground_gain_angular_resolution_deg = degrees;
+    node.planning_params_.ground_gain_max_range = range;
+    for (auto& [name, sensor] : node.sensors_) {
+      sensor.fov.y() = M_PI / 3;
+      sensor.update();
+    }
   }
   static void setGroundGainFullScan(PlannerNode& node, bool enabled) {
     node.planning_params_.ground_gain_full_scan = enabled;
@@ -1996,6 +2076,49 @@ std::shared_ptr<PlannerNode> makeNode(
   return node;
 }
 
+// Full request comparison supplements the fixed-graph gain-phase experiment:
+// the normal turn/clearance/tour policies remain active here.
+void compareGainModelRequests(const std::string& scene,
+    const std::function<std::shared_ptr<PlannerNode>(int)>& make) {
+  std::shared_ptr<mgg_msgs::srv::PlannerSrv::Response> dense;
+  std::vector<std::tuple<int, int, int, int, bool, double>> dense_evidence;
+  int index = 0;
+  for (const auto setting : {std::pair<double, double>{0, 0}, {10, 0}, {0, 10},
+                             {0, 8}, {10, 10}, {10, 8}, {7.5, 10}}) {
+    auto node = make(index++);
+    PlannerNodeTestPeer::setGroundGainModel(*node, setting.first, setting.second);
+    auto response = std::make_shared<mgg_msgs::srv::PlannerSrv::Response>();
+    const auto start = std::chrono::steady_clock::now();
+    PlannerNodeTestPeer::plan(*node, response);
+    const double elapsed = std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - start).count();
+    const auto evidence = PlannerNodeTestPeer::localGainEvidence(*node);
+    if (!dense) { dense = response; dense_evidence = evidence; }
+    int matches = 0;
+    EXPECT_EQ(evidence.size(), dense_evidence.size());
+    for (std::size_t i = 0; i < std::min(evidence.size(), dense_evidence.size()); ++i) {
+      EXPECT_EQ(std::get<0>(evidence[i]), std::get<0>(dense_evidence[i]));
+      matches += std::get<4>(evidence[i]) == std::get<4>(dense_evidence[i]);
+    }
+    std::ostringstream row;
+    row << "SERVICE_MODEL scene=" << scene << " step=" << setting.first
+        << " range=" << setting.second << " total_ms=" << elapsed
+        << " frontier_agree=" << matches << "/" << dense_evidence.size()
+        << " path_agree=" << (response->path == dense->path)
+        << " status_agree=" << (response->status == dense->status)
+        << " status=" << response->status << " poses=" << response->path.size();
+    if (!response->path.empty()) {
+      row << " end_x=" << response->path.back().position.x
+          << " end_y=" << response->path.back().position.y;
+    }
+    if (setting.first == 7.5 && setting.second == 10 && scene == "room_door_grid") {
+      ASSERT_FALSE(response->path.empty());
+      EXPECT_GT(response->path.back().position.x, 6.2);  // actually through the door
+    }
+    std::cout << row.str() << std::endl;
+  }
+}
+
 double pathLength(const std::vector<geometry_msgs::msg::Pose>& path) {
   double length = 0.0;
   for (std::size_t i = 1; i < path.size(); ++i) {
@@ -2140,6 +2263,17 @@ TEST_F(PlannerNodeTest, GroundRoomAndCorridorPlanTiming) {
           for (int z = 0; z < 4; ++z) unknown.push_back({x, y, z});
     }
     MolaFloorProduct product(-6, corridor ? 20 : 7, -6, 6, walls, unknown);
+    if (std::getenv("MGG_GAIN_MODEL_BENCH")) {
+      compareGainModelRequests(corridor ? "corridor_grid" : "room_door_grid",
+          [&](int index) {
+            auto node = makeNode("gain_service_" + std::to_string(index));
+            PlannerNodeTestPeer::useMolaMap(*node, product.serve());
+            PlannerNodeTestPeer::useBistroScoutGain(*node);
+            PlannerNodeTestPeer::setLattice(*node, {-1, -2}, {corridor ? 1.5 : 6.5, 2});
+            PlannerNodeTestPeer::acceptOdometry(*node, 0, 0, 1);
+            return node;
+          });
+    }
     for (int iteration = 0; iteration < 5; ++iteration) {
       std::vector<std::tuple<int, int, int, int, bool, double>> pruned_evidence;
       std::shared_ptr<mgg_msgs::srv::PlannerSrv::Response> pruned_response;
@@ -2163,6 +2297,9 @@ TEST_F(PlannerNodeTest, GroundRoomAndCorridorPlanTiming) {
         if (!full_scan) {
           pruned_evidence = PlannerNodeTestPeer::localGainEvidence(*node);
           pruned_response = response;
+          if (iteration == 0 && std::getenv("MGG_GAIN_MODEL_BENCH"))
+            PlannerNodeTestPeer::benchmarkLocalGain(*node,
+                corridor ? "corridor_grid" : "room_door_grid");
         } else {
           EXPECT_EQ(pruned_evidence, PlannerNodeTestPeer::localGainEvidence(*node));
           EXPECT_EQ(pruned_response->path, response->path);
@@ -2170,6 +2307,37 @@ TEST_F(PlannerNodeTest, GroundRoomAndCorridorPlanTiming) {
         }
       }
     }
+  }
+}
+
+TEST_F(PlannerNodeTest, BotmanFixtureGainModelBenchmark) {
+  const char* root = std::getenv("MGG_NAV_BENCH_PRODUCT");
+  if (!root || !*root) GTEST_SKIP() << "captured botman fixture not supplied";
+  for (const auto pose : {std::array<double, 3>{0, 0, M_PI},
+                         {1.13, .07, -.08}, {-3.17, -.01, 3.10}}) {
+    const auto make_botman = [&](int index) {
+      auto node = makeNode("botman_service_" + std::to_string(index), "world", {
+          rclcpp::Parameter("map.backend", "mola_snapshot"),
+          rclcpp::Parameter("map.resolution", .1),
+          rclcpp::Parameter("map.mola.peer_root", std::string(root)),
+          rclcpp::Parameter("roadmap_rebuild.robot_id", "botman_0"),
+          rclcpp::Parameter("map.mola.snapshot_ttl_sec", 3600.0)});
+      EXPECT_TRUE(PlannerNodeTestPeer::configureBotmanGainFixture(*node, root));
+      PlannerNodeTestPeer::acceptOdometryFacing(*node, pose[0], pose[1], pose[2], 1, 0);
+      return node;
+    };
+    compareGainModelRequests("botman_x" + std::to_string(pose[0]), make_botman);
+    auto node = makeNode("botman_gain_fixture", "world", {
+        rclcpp::Parameter("map.backend", "mola_snapshot"),
+        rclcpp::Parameter("map.resolution", .1),
+        rclcpp::Parameter("map.mola.peer_root", std::string(root)),
+        rclcpp::Parameter("roadmap_rebuild.robot_id", "botman_0"),
+        rclcpp::Parameter("map.mola.snapshot_ttl_sec", 3600.0)});
+    ASSERT_TRUE(PlannerNodeTestPeer::configureBotmanGainFixture(*node, root));
+    PlannerNodeTestPeer::acceptOdometryFacing(*node, pose[0], pose[1], pose[2], 1, 0);
+    const auto lattice = PlannerNodeTestPeer::buildLocalGraph(*node);
+    std::cout << "BOTMAN_LATTICE " << pose[0] << " " << lattice << std::endl;
+    PlannerNodeTestPeer::benchmarkLocalGain(*node, "botman_x" + std::to_string(pose[0]));
   }
 }
 

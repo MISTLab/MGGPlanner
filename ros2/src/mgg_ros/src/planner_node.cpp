@@ -3839,14 +3839,17 @@ std::string PlannerNode::buildLocalGraph() {
   RCLCPP_INFO(get_logger(),
               "gain evidence: %s; band-unknown=%lld total-unknown=%s "
               "free=%lld occupied=%lld frontiers=%d viewpoints=%d "
-              "scan-rays=%llu scan-visits=%llu (summed per viewpoint; work backend-reported)",
+              "scan-rays=%llu scan-visits=%llu ground-model-step-deg=%.2f "
+              "ground-model-range-m=%.2f (0=sensor; summed per viewpoint; work backend-reported)",
               robot_params_.type == mgg::RobotType::kGroundRobot
                   ? "ground reachable-height band" : "aerial full 3D",
               static_cast<long long>(band_unknown),
               (total_available ? std::to_string(total_unknown) : "unavailable (pruned)").c_str(),
               static_cast<long long>(free_voxels), static_cast<long long>(occupied_voxels),
               frontiers, evaluated, static_cast<unsigned long long>(gain_rays),
-              static_cast<unsigned long long>(gain_visits));
+              static_cast<unsigned long long>(gain_visits),
+              planning_params_.ground_gain_angular_resolution_deg,
+              planning_params_.ground_gain_max_range);
   // The graph's frontiers are worth keeping whether or not a path is chosen.
   add_frontiers_to_global_graph_ = local_graph_->getNumVertices() > 1;
 

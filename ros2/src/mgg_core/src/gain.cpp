@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <limits>
 #include <list>
+#include <optional>
 #include <unordered_map>
 #include <utility>
 
@@ -144,7 +145,27 @@ void computeVolumetricGain(
       logWarn("gain: no sensor named '" + sensor_name + "'");
       continue;
     }
-    const SensorParams& sensor = it->second;
+    // A private model for ranking only: never mutate the sensor used by
+    // observed-body/FOV policy. Zero overrides retain its original ray table.
+    std::optional<SensorParams> gain_sensor;
+    const double step_deg = ctx.planning->ground_gain_angular_resolution_deg;
+    const double range = ctx.planning->ground_gain_max_range;
+    if (ground_robot && ((std::isfinite(step_deg) && step_deg > 0) ||
+                         (std::isfinite(range) && range > 0))) {
+      gain_sensor = it->second;
+      if (std::isfinite(step_deg) && step_deg > 0) {
+        const double step = std::min(step_deg, 180.0) * M_PI / 180.0;
+        for (int axis = 0; axis < 2; ++axis) {
+          const double real_step = gain_sensor->resolution[axis] > 0
+              ? gain_sensor->resolution[axis] : M_PI / 180.0;
+          gain_sensor->resolution[axis] = std::max(real_step, step);
+        }
+      }
+      if (std::isfinite(range) && range > 0)
+        gain_sensor->max_range = std::min(gain_sensor->max_range, range);
+      gain_sensor->update();
+    }
+    const SensorParams& sensor = gain_sensor ? *gain_sensor : it->second;
 
     // A ground robot's sensor sees from where it is mounted: rays from the
     // vertex started 0.2 m low for a Bunker's lidar (diag-sensor, run 7).

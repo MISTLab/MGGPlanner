@@ -18,6 +18,7 @@
 #include <vector>
 
 #include "mgg_core/gain.h"
+#include "../../mgg_core/test/gain_model_benchmark.h"
 #include "mgg_core/path_selection.h"
 #include "mgg_core/tour_params.h"
 #include "mgg_map_octomap/native_mola_grid.h"
@@ -315,6 +316,24 @@ TEST(NativeGain, WalledCorridorClearsDeployedInterestThresholds) {
       EXPECT_GE(gain.num_unknown_voxels, setup.planning.low_gain_voxels);
       EXPECT_GE(selected.best_gain, mgg::TourParams{}.min_cluster_gain);
       EXPECT_EQ(selected.best_path_id, 3);
+      for (double vfov : {45.0, 60.0}) {
+        setup.sensors["VLP16"].fov.y() = vfov * M_PI / 180;
+        setup.sensors["VLP16"].update();
+        setup.planning.ground_gain_angular_resolution_deg = 7.5;
+        setup.planning.ground_gain_max_range = 10;
+        mgg::computeExplorationGain(graph, setup.ctx, true, true);
+        const auto sparse_path = mgg::selectBestPath(graph, setup.planning, robot,
+            mgg::EdgeInclinations{}, resolution, 0);
+        EXPECT_GE(graph.getVertex(3)->vol_gain.num_unknown_voxels,
+                  setup.planning.low_gain_voxels);
+        EXPECT_GE(sparse_path.best_gain, mgg::TourParams{}.min_cluster_gain);
+        EXPECT_EQ(sparse_path.best_path_id, 3);
+        setup.planning.ground_gain_angular_resolution_deg = 0;
+        setup.planning.ground_gain_max_range = 0;
+        mgg::test::benchmarkGainModels("corridor_r" + std::to_string(resolution) +
+            "_mount" + std::to_string(platform.first) + "_vfov" + std::to_string(vfov),
+            graph, setup.ctx, true);
+      }
     }
   }
 }
@@ -386,6 +405,24 @@ TEST_P(TallRoomGain, UnknownCeilingDoesNotCompeteWithTheDoor) {
                                 selected.best_path[i]->state.head<3>(),
                                 robot.size, true), VoxelStatus::kFree);
   }
+  // A separate long-range room/door ranking comparison at hardware vertical FOV.
+  setup.sensors["VLP16"].fov.y() = M_PI / 3;
+  setup.sensors["VLP16"].update();
+  setup.planning.ground_gain_angular_resolution_deg = 7.5;
+  setup.planning.ground_gain_max_range = 10;
+  mgg::computeExplorationGain(graph, setup.ctx, false, true);
+  const auto sparse_path = mgg::selectBestPath(graph, setup.planning, robot,
+      mgg::EdgeInclinations{}, kResolution, 0);
+  EXPECT_EQ(sparse_path.best_path_id, 4);
+  if (GetParam() == 3.0) {
+    EXPECT_FALSE(graph.getVertex(0)->vol_gain.is_frontier);
+    EXPECT_FALSE(graph.getVertex(3)->vol_gain.is_frontier);
+  }
+  setup.planning.ground_gain_angular_resolution_deg = 0;
+  setup.planning.ground_gain_max_range = 0;
+  mgg::test::benchmarkGainModels("room_door_range" + std::to_string(GetParam()),
+                                 graph, setup.ctx, false);
+
 }
 
 INSTANTIATE_TEST_SUITE_P(SensorRange, TallRoomGain, ::testing::Values(3.0, 20.0));

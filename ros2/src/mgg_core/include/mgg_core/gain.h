@@ -52,8 +52,11 @@ struct GainContext {
 /// non-frontiers score zero. Below the floor, mapped support suppresses gain;
 /// the lower limit remains max(2 max_ground_height, 1 m) under the vertex.
 /// num_total_unknown_voxels is -1 (unavailable) with production band pruning.
-/// ground_gain_full_scan enables the unpruned diagnostic/reference scan,
-/// recording unknown before the upper cutoff without changing scoring.
+/// ground_gain_full_scan enables the unpruned diagnostic/reference scan of
+/// the configured gain model, recording unknown before the upper cutoff.
+/// Ground-only angular/range overrides coarsen/shorten a private sensor copy;
+/// zero preserves the real sensor. Sparse counts/ranking are approximate;
+/// pruning remains exact for each configured model. Aerial rays are unchanged.
 ///
 /// `voxel_log`, when given, receives every counted voxel for visualisation.
 void computeVolumetricGain(

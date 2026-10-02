@@ -224,6 +224,10 @@ struct PlanningParams {
   double ground_frontier_height_margin = 0.5;
   /// Diagnostic/reference scan including upper volume; disables band pruning.
   bool ground_gain_full_scan = false;
+  /// Gain-only overrides for ground robots. Zero preserves the real sensor.
+  /// Angular step (degrees) can coarsen both axes; range (metres) can shorten.
+  double ground_gain_angular_resolution_deg = 0.0;
+  double ground_gain_max_range = 0.0;
   double unknown_voxel_gain = 10.0;
   double path_length_penalty = 0.0;
   /// How strongly selectBestPath prefers paths along the robot's heading:

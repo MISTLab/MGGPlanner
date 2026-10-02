@@ -40,6 +40,8 @@ class ParamFixture : public ::testing::Test {
         {"PlanningParams.path_direction_min_factor", 0.5},
         {"PlanningParams.ground_frontier_height_margin", 0.75},
         {"PlanningParams.ground_gain_full_scan", true},
+        {"PlanningParams.ground_gain_angular_resolution_deg", 10.0},
+        {"PlanningParams.ground_gain_max_range", 10.0},
         {"PlanningParams.low_gain_voxels", 25.0},
         {"PlanningParams.low_gain_handoff_min_voxels", 12.0},
         {"PlanningParams.global_search_time_budget_s", 0.5},
@@ -119,6 +121,8 @@ TEST_F(ParamFixture, LoadsPlanningParams) {
   EXPECT_DOUBLE_EQ(params.path_direction_min_factor, 0.5);
   EXPECT_DOUBLE_EQ(params.ground_frontier_height_margin, 0.75);
   EXPECT_TRUE(params.ground_gain_full_scan);
+  EXPECT_DOUBLE_EQ(params.ground_gain_angular_resolution_deg, 10.0);
+  EXPECT_DOUBLE_EQ(params.ground_gain_max_range, 10.0);
   EXPECT_DOUBLE_EQ(params.low_gain_voxels, 25.0);
   EXPECT_DOUBLE_EQ(params.low_gain_handoff_min_voxels, 12.0);
   EXPECT_DOUBLE_EQ(params.global_search_time_budget_s, 0.5);
@@ -205,6 +209,28 @@ TEST(ParamLoader, ReverseExitLengthMustBeFiniteAndNonnegative) {
     mgg::PlanningParams params;
     EXPECT_FALSE(mgg_ros::loadPlanningParams(loader, "PlanningParams", params));
   }
+}
+
+TEST(ParamLoader, GroundGainOverridesRejectInvalidValues) {
+  for (const std::string name : {"ground_gain_angular_resolution_deg", "ground_gain_max_range"}) {
+    for (double value : {-1.0, std::numeric_limits<double>::infinity(),
+                         std::numeric_limits<double>::quiet_NaN()}) {
+      rclcpp::NodeOptions options;
+      options.automatically_declare_parameters_from_overrides(true);
+      options.parameter_overrides({{"PlanningParams." + name, value}});
+      auto node = std::make_shared<rclcpp::Node>("invalid_gain_model", options);
+      ParamLoader loader(node.get());
+      mgg::PlanningParams params;
+      EXPECT_FALSE(mgg_ros::loadPlanningParams(loader, "PlanningParams", params));
+    }
+  }
+  rclcpp::NodeOptions options;
+  options.automatically_declare_parameters_from_overrides(true);
+  options.parameter_overrides({{"PlanningParams.ground_gain_angular_resolution_deg", 181.0}});
+  auto node = std::make_shared<rclcpp::Node>("invalid_gain_angle", options);
+  ParamLoader loader(node.get());
+  mgg::PlanningParams params;
+  EXPECT_FALSE(mgg_ros::loadPlanningParams(loader, "PlanningParams", params));
 }
 
 TEST_F(ParamFixture, UnevaluatedAngleExpressionIsRejected) {
