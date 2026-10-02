@@ -1,3 +1,4 @@
+#include "mgg_core/planning_cancellation.h"
 // Time budgets of botman's NAVIGATE and exploration plans on its real
 // planning product (nav_bench_scenarios.h): NAVIGATE within 0.3 s and an
 // exploration lattice within 0.35 s on an x86 desktop. The product is 8 MB
@@ -65,4 +66,17 @@ TEST(NavBench, CircumscribedPrefilterMatchesExactSweeps) {
   const Eigen::Vector3d at(0, 0.1, 0.5);
   EXPECT_EQ(mgg::orientedBoxPathStatus(map, at, at, body, false, nullptr, true),
             mgg::VoxelStatus::kOccupied);
+}
+
+TEST(NavBench, ExpiredBudgetInterruptsNativeGainRaycasts) {
+  mgg::NativeMolaGrid map(0.1, {}, {}, {});
+  mgg::GainCounts gain;
+  std::vector<std::pair<Eigen::Vector3d, mgg::VoxelStatus>> log;
+  const auto deadline = std::chrono::steady_clock::now();
+  mgg::PlanningCancellationScope budget([&] {
+    return std::chrono::steady_clock::now() >= deadline;
+  });
+  EXPECT_THROW(map.getScanStatusIterative(Eigen::Vector3d::Zero(),
+      {Eigen::Vector3d(10, 0, 0)}, gain, log, mgg::SensorModel{}),
+      mgg::PlanningInterrupted);
 }

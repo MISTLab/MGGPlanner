@@ -1,3 +1,4 @@
+#include "mgg_core/planning_cancellation.h"
 #include "mgg_map_octomap/octomap_map.h"
 
 #include <algorithm>
@@ -631,6 +632,7 @@ void OctomapMap::getScanStatus(
     const SensorModel& /*sensor*/) {
   gain = GainCounts{};
   for (const Eigen::Vector3d& endpoint : multiray_endpoints) {
+    planningCheckpoint();
     walkRay(pos, endpoint, [&](const octomap::point3d& centre, VoxelStatus s) {
       voxel_log.emplace_back(toEigen(centre), s);
       switch (s) {
@@ -668,6 +670,7 @@ void OctomapMap::scanUnique(
   gain = GainCounts{};
   octomap::KeySet seen;
   for (const Eigen::Vector3d& endpoint : multiray_endpoints) {
+    planningCheckpoint();
     walkRay(pos, endpoint, [&](const octomap::point3d& centre, VoxelStatus s) {
       octomap::OcTreeKey key;
       const bool keyed = tree_->coordToKeyChecked(centre, key);
@@ -806,6 +809,7 @@ void OctomapMap::getFreeSpacePointCloud(
   points.clear();
   const Eigen::Vector3d origin(state[0], state[1], state[2]);
   for (const Eigen::Vector3d& endpoint : multiray_endpoints) {
+    planningCheckpoint();
     walkRay(origin, endpoint, [&](const octomap::point3d& centre,
                                   VoxelStatus s) {
       if (s == VoxelStatus::kOccupied) return false;

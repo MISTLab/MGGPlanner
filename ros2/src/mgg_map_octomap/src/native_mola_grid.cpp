@@ -1,3 +1,4 @@
+#include "mgg_core/planning_cancellation.h"
 #include "mgg_map_octomap/native_mola_grid.h"
 
 #include <algorithm>
@@ -171,7 +172,9 @@ VoxelStatus NativeMolaGrid::getVoxelStatus(const Eigen::Vector3d& p) const {
 template <class F>
 bool NativeMolaGrid::walk(const Eigen::Vector3d& a, const Eigen::Vector3d& b,
                           F visit) const {
+  std::size_t visited = 0;
   return walkVoxels(a, b, resolution_, kMaxWork, [&](const VoxelIndex& v) {
+    if ((visited++ & 63u) == 0) planningCheckpoint();
     return visit(Cell{v.x, v.y, v.z});
   });
 }
@@ -362,6 +365,7 @@ VoxelStatus NativeMolaGrid::box(const Eigen::Vector3d& c,
   bool saw_unknown = false;
   for (auto x = first.x; x <= last.x; ++x)
     for (auto y = first.y; y <= last.y; ++y) {
+      planningCheckpoint();
       const auto* column = column_index_.find(x, y);
       if (column == nullptr) {
         saw_unknown = true;
@@ -508,6 +512,7 @@ void NativeMolaGrid::getScanStatus(
     const SensorModel&) {
   g = {};
   for (const auto& e : ends) {
+    planningCheckpoint();
     const bool valid = walk(p, e, [&](const Cell& k) {
       const auto s = status(k);
       log.emplace_back(center(k), s);
@@ -545,6 +550,7 @@ void NativeMolaGrid::scanUnique(
   thread_local ScanCells cells;
   cells.reset();
   for (const auto& e : ends) {
+    planningCheckpoint();
     const bool valid = walk(p, e, [&](const Cell& k) {
       std::uint8_t& state = cells[k];
       if (state != kNew) return state == kCounted;
