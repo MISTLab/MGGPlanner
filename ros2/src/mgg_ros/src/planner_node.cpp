@@ -5167,6 +5167,20 @@ bool PlannerNode::startPathAfterChassisSpin(std::vector<mgg::StateVec>& path,
     std::vector<mgg::StateVec> adjusted{post};
     adjusted.insert(adjusted.end(),path.begin()+i,path.end());
     if (!noGoAdmissible(adjusted) || !peerAdmissible(adjusted)) return false;
+    mgg::PathTurnCheck turns(*local_graph_, robot_params_,
+        [this](const auto& pose) {
+          return mgg::roomToTurn(*map_,robot_params_,planning_params_,pose);
+        }, [this](const Eigen::Vector3d& at) {
+          return mgg::groundSlope(*ground_,at,
+              std::max(robot_params_.size.x(),robot_params_.size.y()),local_graph_.get());
+        }, false, [this](const auto& a,const auto& b) {
+          return mgg::turnTransitionClear(*map_,robot_params_,a,b);
+        });
+    mgg::PathType points;
+    for (const auto& pose : adjusted) points.push_back(pose.head<3>());
+    // The stationary start spin was checked above. Check every remaining
+    // corner, including a changed arrival heading at the route join.
+    if (!turns.admissible(points,yaw)) return false;
     path = std::move(adjusted);
     return true;
   }

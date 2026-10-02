@@ -572,7 +572,7 @@ bool PathTurnCheck::operator()(const std::vector<Vertex*>& path) {
   std::vector<Eigen::Vector3d> points;
   points.reserve(path.size());
   for (const Vertex* v : path) points.push_back(v->state.head<3>());
-  switch (firstRefusal(points, path.front()->state[3], true)) {
+  switch (firstRefusal(points, path.front()->state[3] + (reverse_ ? M_PI : 0), true)) {
     case Refusal::kSlope:
       ++refused_on_slope;
       return false;
