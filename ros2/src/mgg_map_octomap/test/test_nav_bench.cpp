@@ -12,6 +12,7 @@
 
 #include "nav_bench_scenarios.h"
 #include "mgg_map_octomap/native_mola_grid.h"
+#include "mgg_core/departure.h"
 
 TEST(NavBench, BotmanPlansMeetTheirTimeBudgets) {
   const char* root = std::getenv("MGG_NAV_BENCH_PRODUCT");

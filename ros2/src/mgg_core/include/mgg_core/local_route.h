@@ -70,10 +70,10 @@ bool groundShortcutSegmentAdmissible(const ExpandContext& ctx,
 inline constexpr int kGoalLinkCandidates = 16;
 
 /// Links `goal_state` (at driving height) into `graph` as an exact
-/// endpoint: connectStateToGraph from its nearest vertex, and failing
-/// that a checked edge (expandGraphFrom) from each vertex within
+/// endpoint through a checked edge (expandGraphFrom) from vertices within
 /// edge_length_max that `reached` says the robot reaches, nearest first, at
-/// most kGoalLinkCandidates. Null when none links.
+/// most kGoalLinkCandidates. Coincident reachable vertices are reused;
+/// aerial robots retain connectStateToGraph. Null when none links.
 Vertex* linkGoalToLattice(GraphManager& graph, const StateVec& goal_state,
                           const ExpandContext& ctx,
                           const std::function<bool(const Vertex&)>& reached);

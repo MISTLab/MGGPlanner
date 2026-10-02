@@ -24,6 +24,7 @@
 #include "mgg_core/grid_graph.h"
 #include "mgg_core/ground_projection.h"
 #include "mgg_core/local_route.h"
+#include "mgg_core/departure.h"
 #include "mgg_core/path_selection.h"
 #include "mgg_core/path_turns.h"
 #include "mgg_core/plan_profile.h"
@@ -218,6 +219,10 @@ struct Outcome {
   int lattice_edges = 0;
   GridGraphResult lattice;
   int route_vertices = 0;
+  int no_room_refusals = 0;
+  bool root_turn_clear = false;
+  bool departure_found = false;
+  double diagnostic_ms = 0.0;
   int corners = 0;           ///< points after shortcutting
   double length_m = 0.0;     ///< sent path length
   double max_corner_deg = 0.0;
@@ -275,6 +280,19 @@ inline Outcome run(const MolaMap& map, const Scenario& scenario) {
   ctx.root_footprint_exempt = true;
   ctx.root_is_robot = true;
   GraphManager graph;
+  const auto diagnostics = [&] {
+    const auto started = Clock::now();
+    GroundProjection diagnostic_ground(map, planning, true);
+    ExpandContext diagnostic_ctx = ctx;
+    diagnostic_ctx.ground = &diagnostic_ground;
+    bool hanging = false;
+    const StateVec root = localRouteRoot(diagnostic_ctx, scenario.start, hanging);
+    out.root_turn_clear = roomToTurn(map, robot, planning, root, nullptr);
+    Departure departure;
+    out.departure_found = findDeparture(map, diagnostic_ground, robot, planning,
+                                         root, departure);
+    out.diagnostic_ms = ms(started, Clock::now());
+  };
   const auto t0 = Clock::now();
   if (!scenario.navigate) {
     bool hanging = false;
@@ -293,6 +311,7 @@ inline Outcome run(const MolaMap& map, const Scenario& scenario) {
     out.expectation_met = out.routed &&
                           (scenario.budget_ms <= 0.0 ||
                            out.total_ms <= scenario.budget_ms);
+    diagnostics();
     return out;
   }
   LocalRouteResult local =
@@ -360,8 +379,10 @@ inline Outcome run(const MolaMap& map, const Scenario& scenario) {
     out.path.assign(points.begin(), points.end());
     out.length_m = polylineLength(out.path);
     out.max_corner_deg = maxCornerDeg(out.path);
+    out.no_room_refusals = check.refused_without_room;
   }
   out.total_ms = ms(t0, Clock::now());
+  diagnostics();
   out.expectation_met =
       (out.routed || !scenario.expect_route) &&
       (scenario.max_length_m <= 0.0 || out.length_m <= scenario.max_length_m) &&
@@ -402,7 +423,12 @@ inline std::string describe(const Scenario& s, const Outcome& o) {
                 r.edge_status[2], r.edge_status[3], r.edge_status[4],
                 r.edge_status[5], r.edge_status[6], r.edge_status[7],
                 r.no_ground);
-  return std::string(buf) + lattice + "\n    " + o.profile.summary();
+  return std::string(buf) + lattice + "\n    " + o.profile.summary() +
+      "\n    diagnostics (outside plan timing): no-room refusals " +
+      std::to_string(o.no_room_refusals) + ", root turn " +
+      (o.root_turn_clear ? "clear" : "refused") + ", departure " +
+      (o.departure_found ? "found" : "refused") + ", " +
+      std::to_string(o.diagnostic_ms) + " ms";
 }
 
 inline std::string toJson(const Scenario& s, const Outcome& o) {
@@ -421,6 +447,11 @@ inline std::string toJson(const Scenario& s, const Outcome& o) {
   j["corners"] = o.corners;
   j["expectation_met"] = o.expectation_met;
   j["profile"] = o.profile.summary();
+  j["no_room_refusals"] = o.no_room_refusals;
+  j["root_turn_clear"] = o.root_turn_clear;
+  j["departure_found"] = o.departure_found;
+  j["diagnostic_ms"] = o.diagnostic_ms;
+  j["occupied_edges"] = o.lattice.edge_status[2];
   return j.dump();
 }
 

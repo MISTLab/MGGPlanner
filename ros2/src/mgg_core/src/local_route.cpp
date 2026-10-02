@@ -130,10 +130,12 @@ bool groundShortcutSegmentAdmissible(const ExpandContext& ctx,
 Vertex* linkGoalToLattice(GraphManager& graph, const StateVec& goal_state,
                           const ExpandContext& ctx,
                           const std::function<bool(const Vertex&)>& reached) {
-  Vertex* linked = connectStateToGraph(graph, goal_state, ctx,
-                                       kLocalGoalLinkRadius,
-                                       /*exact_state=*/true);
-  if (linked != nullptr || ctx.robot->type == RobotType::kAerialRobot) return linked;
+  if (ctx.robot->type == RobotType::kAerialRobot) {
+    return connectStateToGraph(graph, goal_state, ctx, kLocalGoalLinkRadius,
+                               /*exact_state=*/true);
+  }
+  // A point goal is not a previously driven pose: even sub-cell links
+  // require the lattice's complete oriented body and terrain checks.
   std::vector<Vertex*> around;
   if (!graph.getNearestVertices(&goal_state, ctx.planning->edge_length_max,
                                 &around)) {
@@ -148,6 +150,9 @@ Vertex* linkGoalToLattice(GraphManager& graph, const StateVec& goal_state,
   for (Vertex* parent : around) {
     planningCheckpoint();
     if (parent == nullptr || (reached && !reached(*parent))) continue;
+    if ((parent->state.head<3>() - goal_state.head<3>()).squaredNorm() <= 1e-12) {
+      return parent;
+    }
     if (tried++ >= kGoalLinkCandidates) break;
     ExpandGraphReport rep;
     Vertex candidate(-1, goal_state);
