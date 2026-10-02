@@ -305,6 +305,19 @@ PlannerNode::PlannerNode(const rclcpp::NodeOptions& options)
   random_sampler_.setBound(grid_params_.min_val, grid_params_.max_val);
   random_sampler_.reset(std::random_device{}());
 
+  aerial_peer_robot_ids_ = declareOrGet<std::vector<std::int64_t>>(
+      this, "aerial_peer_robot_ids", std::vector<std::int64_t>{});
+  std::string aerial_ids;
+  for (const auto id : aerial_peer_robot_ids_) {
+    if (id < 0 || id > std::numeric_limits<int>::max()) {
+      throw std::invalid_argument("aerial_peer_robot_ids must be non-negative int32 robot IDs");
+    }
+    if (!aerial_ids.empty()) aerial_ids += ", ";
+    aerial_ids += std::to_string(id);
+  }
+  RCLCPP_INFO(get_logger(), "aerial_peer_robot_ids: [%s]; ground receivers exclude these frontier owners",
+              aerial_ids.c_str());
+
   // Inter-robot transforms. `static` reads fixed ones from
   // neighbour_offsets (bring-up with known spawn poses); `topic` takes live
   // estimates on neighbour_transforms, each T_ours_theirs from our planning
@@ -2146,7 +2159,16 @@ mgg::RecomputeGainFn PlannerNode::globalFrontierGain() {
     if (vertex.lifted_peer_target) return;
     if (vertex.robot_id != static_cast<int>(planning_params_.robot_id)) {
       auto& gain = vertex.vol_gain;
-      gain.is_frontier = gain.is_frontier && !vertex.locally_explored;
+      const bool aerial_owner = robot_params_.type == mgg::RobotType::kGroundRobot &&
+          std::find(aerial_peer_robot_ids_.begin(), aerial_peer_robot_ids_.end(),
+                    vertex.robot_id) != aerial_peer_robot_ids_.end();
+      gain.is_frontier = gain.is_frontier && !vertex.locally_explored && !aerial_owner;
+      // The shared scorer feeds greedy repositioning, tour clusters and
+      // fleet offers. Never re-check flight-altitude evidence as a ground
+      // pose: its height band would be measured around the ceiling too.
+      if (aerial_owner && vertex.type == mgg::VertexType::kFrontier) {
+        vertex.type = mgg::VertexType::kUnvisited;
+      }
       gain.gain = gain.is_frontier
           ? std::max(0, gain.num_unknown_voxels) * planning_params_.unknown_voxel_gain +
             std::max(0, gain.num_free_voxels) * planning_params_.free_voxel_gain +

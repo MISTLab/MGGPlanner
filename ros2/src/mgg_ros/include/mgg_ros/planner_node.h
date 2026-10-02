@@ -688,6 +688,9 @@ class PlannerNode : public rclcpp::Node {
   /// The last roadmap received within communication range from each
   /// neighbour, to re-admit it from when its transform returns.
   std::unordered_map<int, mgg::GraphExchange> neighbour_roadmaps_;
+  /// Wire robot IDs whose full-3D frontier evidence is not a ground target.
+  /// Configured by the fleet host; Graph messages carry no platform type.
+  std::vector<std::int64_t> aerial_peer_robot_ids_;
   std::vector<mgg::FrontierCluster> liftedPeerFrontiers();
   // Revalidate on every query; replace slots only when their accepted set
   // changes. Never roadmap anchors, own frontier evidence, or broadcasts.

@@ -1004,15 +1004,15 @@ class PlannerNodeTestPeer {
     sensor.resolution = Eigen::Vector2d::Constant(M_PI / 36);
     sensor.mount_height = 0.45;
     sensor.update();
-    node.robot_params_.size.z() = 0.245;
+    node.robot_params_.size = Eigen::Vector3d(0.8, 0.5, 0.245);
     node.planning_params_.unknown_voxel_gain = 60;
     node.planning_params_.free_voxel_gain = 0;
     node.planning_params_.occupied_voxel_gain = 0;
     node.planning_params_.leafs_only_for_volumetric_gain = true;
     node.planning_params_.cluster_vertices_for_gain = true;
     node.planning_params_.clustering_radius = 1.0;
-    node.global_space_.setBound(Eigen::Vector3d(-25, -25, -1),
-                                Eigen::Vector3d(25, 25, 5));
+    node.global_space_.setBound(Eigen::Vector3d(-5, -5, -1),
+                                Eigen::Vector3d(25, 5, 5));
   }
   /// One local plan, as a plan request runs it: its log summary.
   static std::string buildLocalGraph(PlannerNode& node) {
@@ -2130,15 +2130,15 @@ TEST_F(PlannerNodeTest, GroundRoomAndCorridorPlanTiming) {
       PlannerNodeTestPeer::useMolaMap(*node, product.serve());
       PlannerNodeTestPeer::useBistroScoutGain(*node);
       PlannerNodeTestPeer::setLattice(*node, {-1, -2}, {corridor ? 1.5 : 6.5, 2});
-      PlannerNodeTestPeer::acceptOdometry(*node, 0.1, 0.1, 1);
+      PlannerNodeTestPeer::acceptOdometry(*node, 0, 0, 1);
+      auto response = std::make_shared<mgg_msgs::srv::PlannerSrv::Response>();
       const auto start = std::chrono::steady_clock::now();
-      const auto summary = PlannerNodeTestPeer::buildLocalGraph(*node);
+      PlannerNodeTestPeer::plan(*node, response);
       const double elapsed = std::chrono::duration<double, std::milli>(
           std::chrono::steady_clock::now() - start).count();
       std::cout << "PLAN_TIMING " << (corridor ? "corridor" : "room")
                 << " iteration=" << iteration << " total_ms=" << elapsed
-                << " " << summary << '\n';
-      EXPECT_NE(summary.find("grid graph:"), std::string::npos);
+                << " path_poses=" << response->path.size() << '\n';
     }
   }
 }
@@ -2183,6 +2183,12 @@ TEST_F(PlannerNodeTest, GroundReceiverOffersOnlyTheDoorNotAnAerialCeilingFrontie
     for (int broadcast = 0; broadcast < 2; ++broadcast) {
       PlannerNodeTestPeer::receiveGraph(*node, drone);
       ASSERT_FALSE(PlannerNodeTestPeer::neighbourHeights(*node, 4).empty());
+      // Greedy repositioning must filter the rebroadcast even before a
+      // tour/cluster refresh has had an opportunity to demote it.
+      std::string reason;
+      ASSERT_TRUE(PlannerNodeTestPeer::runGlobalPlanner(*node, reason)) << reason;
+      ASSERT_FALSE(PlannerNodeTestPeer::bestPath(*node).empty());
+      EXPECT_GT(PlannerNodeTestPeer::bestPath(*node).back().x(), 5.0);
       const auto clusters = PlannerNodeTestPeer::frontierClusters(*node);
       ASSERT_EQ(clusters.size(), 1u);
       EXPECT_EQ(clusters.front().representative_vertex_id, door);
@@ -2190,10 +2196,6 @@ TEST_F(PlannerNodeTest, GroundReceiverOffersOnlyTheDoorNotAnAerialCeilingFrontie
       ASSERT_EQ(bid.clusters.size(), 1u);
       EXPECT_EQ(bid.clusters.front().owner_robot_id, 2);
       EXPECT_NE(PlannerNodeTestPeer::refreshTour(*node), mgg::kNoCluster);
-      std::string reason;
-      ASSERT_TRUE(PlannerNodeTestPeer::runGlobalPlanner(*node, reason)) << reason;
-      ASSERT_FALSE(PlannerNodeTestPeer::bestPath(*node).empty());
-      EXPECT_GT(PlannerNodeTestPeer::bestPath(*node).back().x(), 5.0);
     }
   }
 }

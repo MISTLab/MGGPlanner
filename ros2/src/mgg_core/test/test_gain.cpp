@@ -368,19 +368,21 @@ TEST(Gain, TallExploredRoomHasNoGroundInterestButAerialInterestRemains) {
 
 TEST(Gain, DoorFrontierIsNotClusteredIntoTheRoomAndBestPathLeaves) {
   GroundRoom f;
+  f.planning.clustering_radius = 1.0;  // deployed bistro.yaml radius
   mgg::GraphManager graph;
   auto* root = new Vertex(0, StateVec(0, 0, 0.5, 0));
-  auto* room = new Vertex(1, StateVec(1, 0, 0.5, 0));
+  auto* room = new Vertex(1, StateVec(1.25, 0, 0.5, 0));
   auto* door = new Vertex(2, StateVec(2, 0, 0.5, 0));
   auto* inside = new Vertex(3, StateVec(0, 1, 0.5, 0));
   for (auto* v : {root, room, door, inside}) graph.addVertex(v);
-  graph.addEdge(root, room, 1); graph.addEdge(room, door, 1);
+  graph.addEdge(root, room, 1.25); graph.addEdge(room, door, 0.75);
   graph.addEdge(root, inside, 1);
   door->is_leaf_vertex = true;  // clustering would copy this frontier inside
   room->type = mgg::VertexType::kFrontier;  // stale local frontier
   EXPECT_EQ(computeExplorationGain(graph, f.ctx, false, true), 4);
   EXPECT_TRUE(door->vol_gain.is_frontier);
   EXPECT_FALSE(room->vol_gain.is_frontier);
+  EXPECT_DOUBLE_EQ(room->vol_gain.gain, 0);
   EXPECT_EQ(room->type, mgg::VertexType::kUnvisited);
   EXPECT_FALSE(inside->vol_gain.is_frontier);
   const auto selected = mgg::selectBestPath(graph, f.planning, f.robot,

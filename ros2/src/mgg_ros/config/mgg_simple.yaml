@@ -4,6 +4,10 @@
 # that at load time, ROS 2's parameter loader does not.
 mggplanner_node:
   ros__parameters:
+    # Fleet launch must list aerial senders' numeric PlanningParams.robot_id
+    # values so ground robots ignore their full-3D frontier targets. Default:
+    # no exclusions (unlisted peers retain legacy ground-peer semantics).
+    # aerial_peer_robot_ids: [5]
     RobotParams:
       type: kGroundRobot
       size:

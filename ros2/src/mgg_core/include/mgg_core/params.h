@@ -161,9 +161,9 @@ struct PlanningParams {
 
   // Ground robots.
   double max_ground_height = 1.2;
-  /// Unused: it once set the top of a ground robot's gain band,
-  /// max(2.5 robot_height, 1.2 m) over the vertex, which has no top now
-  /// (computeVolumetricGain). Kept as the upstream parameter.
+  /// Legacy upstream parameter; not the gain-band height. Ground gain uses
+  /// RobotParams::size.z() + ground_frontier_height_margin above local floor
+  /// (computeVolumetricGain).
   double robot_height = 1.0;
   double max_inclination = 0.52;
   /// Steepest sideways slope of the ground under an edge, relative to the
