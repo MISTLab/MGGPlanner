@@ -38,6 +38,7 @@
 #include <vector>
 
 #include <geometry_msgs/msg/pose_array.hpp>
+#include <std_msgs/msg/u_int64.hpp>
 #include <nav_msgs/msg/odometry.hpp>
 #include <nav_msgs/msg/path.hpp>
 #include <sensor_msgs/msg/point_cloud2.hpp>
@@ -247,6 +248,7 @@ class PlannerNode : public rclcpp::Node {
   void onScoutingExclusions(geometry_msgs::msg::PoseArray::ConstSharedPtr msg);
   /// Drops the set once its TTL has passed since receipt.
   void refreshScoutingExclusions();
+  void publishScoutingRevision();
   /// Whether an exploration path keeps to the exclusions' rule (XY only,
   /// mgg::NoGoZones::pathAdmissible): from inside one it leaves with the
   /// distance to its centre never decreasing until out, then never enters
@@ -620,6 +622,12 @@ class PlannerNode : public rclcpp::Node {
   /// assignment, its own, or every robot's once none of its own is left
   /// (as kGlobalOtherRobotPenalty preferred them), less those a peer's
   /// reservation excludes.
+  // Home-rooted distance on the aerial graph; infinity means no certified
+  // projection. Never use a ground edge as evidence of aerial traversability.
+  double aerialGraphProgress(const Eigen::Vector3d& position);
+  double aerialPeerProgress(int sender);
+  bool aerialLocalFrontiers() const;
+  std::unordered_map<int, std::chrono::steady_clock::time_point> aerial_peer_received_;
   std::vector<mgg::FrontierCluster> tourCandidates(
       std::vector<mgg::FrontierCluster> clusters);
   /// §2.3: solves the tour again when due and returns its current target,
@@ -1263,6 +1271,8 @@ class PlannerNode : public rclcpp::Node {
   std::vector<double> scouting_exclusion_reaches_;
   std::chrono::steady_clock::time_point scouting_exclusions_received_;
   double scouting_exclusion_ttl_s_ = 3.0;
+  rclcpp::Publisher<std_msgs::msg::UInt64>::SharedPtr scouting_revision_pub_;
+  std::uint64_t scouting_revision_ = 0;
   mgg::NoGoZones scouting_zones_;
   /// Set while runGlobalPlanner routes: routeOverGlobalGraph then keeps to
   /// the scouting exclusions as well as the no-go zones.

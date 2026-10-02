@@ -17,6 +17,8 @@ geometry_msgs/Pose root_pose
 ---
 # Interrupted by an explicit cancel or a newer request (not missing observations).
 int32 CANCELLED = -4
+# No path this cycle; scouting exclusions refused candidate routes.
+int32 SCOUTING_EXCLUDED = -5
 int32 FORWARD = 0
 int32 BACKWARD = 1
 int32 HOMING = 2

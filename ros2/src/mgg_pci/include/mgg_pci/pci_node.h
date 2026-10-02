@@ -27,6 +27,7 @@
 #include <nav_msgs/msg/path.hpp>
 #include <rclcpp/rclcpp.hpp>
 #include <std_msgs/msg/string.hpp>
+#include <std_msgs/msg/u_int64.hpp>
 #include <std_srvs/srv/trigger.hpp>
 
 #include <mgg_msgs/srv/planner_srv.hpp>
@@ -87,6 +88,11 @@ class PciNode : public rclcpp::Node {
   rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr path_pub_;
   rclcpp::TimerBase::SharedPtr auto_timer_;
   rclcpp::CallbackGroup::SharedPtr callback_group_;
+
+  rclcpp::Subscription<std_msgs::msg::UInt64>::SharedPtr scouting_revision_sub_;
+  rclcpp::TimerBase::SharedPtr scouting_retry_timer_;
+  std::uint64_t scouting_revision_ = 0;
+  bool scouting_retry_ = false;
 
   std::mutex mutex_;
   rclcpp::Publisher<std_msgs::msg::String>::SharedPtr status_pub_;

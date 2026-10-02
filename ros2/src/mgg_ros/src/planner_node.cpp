@@ -431,6 +431,7 @@ PlannerNode::PlannerNode(const rclcpp::NodeOptions& options)
     if (lock.owns_lock()) {
       applyPendingCancel();
       applyLatestOdometry();
+      refreshScoutingExclusions();
     }
   }, callback_group_);
   rclcpp::SubscriptionOptions sub_opts;
@@ -570,6 +571,8 @@ PlannerNode::PlannerNode(const rclcpp::NodeOptions& options)
   // Latched, as the producer publishes it (transient local, re-published
   // at least every second); in the no-go group, so one set replaces
   // another in the order taken.
+  scouting_revision_pub_ = create_publisher<std_msgs::msg::UInt64>(
+      "scouting_exclusion_revision", rclcpp::QoS(1).transient_local());
   scouting_exclusions_sub_ = create_subscription<geometry_msgs::msg::PoseArray>(
       "scouting_exclusions", rclcpp::QoS(1).transient_local(),
       [this](geometry_msgs::msg::PoseArray::ConstSharedPtr m) {
@@ -1388,6 +1391,63 @@ int PlannerNode::capTourValues(mgg::TourCostMatrix& costs,
       static_cast<int>(planning_params_.robot_id), mgg::kGlobalOtherRobotPenalty);
 }
 
+bool PlannerNode::aerialLocalFrontiers() const {
+  return std::any_of(local_graph_->vertices_map_.begin(), local_graph_->vertices_map_.end(),
+      [](const auto& entry) {
+        return entry.second && entry.second->type == mgg::VertexType::kFrontier;
+      });
+}
+
+double PlannerNode::aerialGraphProgress(const Eigen::Vector3d& position) {
+  auto map_read = mapReadLease();
+  const auto* report = tour_distances_.from(*global_graph_, graph_revision_,
+                                          kHomeVertexId, peer_generation_);
+  if (!report || !position.allFinite() || !map_->getStatus()) return mgg::kUnreachableCost;
+  mgg::StateVec state(position.x(), position.y(), position.z(), 0);
+  std::vector<mgg::Vertex*> anchors;
+  global_graph_->getNearestVertices(&state, 5.0, &anchors);
+  double nearest = mgg::kUnreachableCost;
+  double progress = mgg::kUnreachableCost;
+  for (const auto* v : anchors) {
+    if (!v || v->lifted_peer_target || !global_graph_->inService(*v) ||
+        v->robot_id != static_cast<int>(planning_params_.robot_id)) continue;
+    const double home = mgg::reachedDistance(*report, v->id);
+    const double link = (v->state.head<3>() - position).norm();
+    if (!std::isfinite(home) || link > nearest + 1e-6) continue;
+    if (map_->getStaticStrictPathStatus(v->state.head<3>() + robot_params_.center_offset,
+          position + robot_params_.center_offset, robot_params_.getPlanningSize()) !=
+        mgg::VoxelStatus::kFree) continue;
+    // Nearest certified anchor, not a straight-line distance from home.
+    // Ties take the smaller progress, conservatively at branches/loops.
+    if (link < nearest - 1e-6) progress = mgg::kUnreachableCost;
+    nearest = link;
+    progress = std::min(progress, home + link);
+  }
+  return progress;
+}
+
+double PlannerNode::aerialPeerProgress(int sender) {
+  const auto received = aerial_peer_received_.find(sender);
+  const auto snapshot = neighbour_roadmaps_.find(sender);
+  const auto frame = neighbour_frames_.find(sender);
+  Eigen::Isometry3d transform;
+  if (received == aerial_peer_received_.end() ||
+      secondsSince(received->second) > neighbour_transform_ttl_s_ ||
+      snapshot == neighbour_roadmaps_.end() || frame == neighbour_frames_.end() ||
+      !refreshNeighbourTransform(sender, frame->second) ||
+      !poses_->getRobotTransform(sender, transform)) return mgg::kUnreachableCost;
+  // Frontier vertices can be appended after trajectory vertices. Only the
+  // latest visited vertex is evidence of peer progress, not vertices.back().
+  const mgg::GraphExchangeVertex* latest = nullptr;
+  for (const auto& v : snapshot->second.vertices) {
+    if (v.visited && v.state.allFinite() && (!latest || v.id > latest->id)) latest = &v;
+  }
+  if (!latest) return mgg::kUnreachableCost;
+  Eigen::Vector3d position = transform * latest->state.head<3>();
+  position.z() += std::clamp(aerial_frontier_height_m_, aerial_min_height_m_, aerial_max_height_m_);
+  return aerialGraphProgress(position);
+}
+
 std::vector<mgg::FrontierCluster> PlannerNode::tourCandidates(
     std::vector<mgg::FrontierCluster> clusters) {
   refreshScoutingExclusions();
@@ -1451,9 +1511,22 @@ std::vector<mgg::FrontierCluster> PlannerNode::tourCandidates(
     const auto others = [own_id](const mgg::FrontierCluster& cluster) {
       return cluster.owner_robot_id != own_id;
     };
-    if (!std::all_of(clusters.begin(), clusters.end(), others)) {
+    const bool aerial = robot_params_.type == mgg::RobotType::kAerialRobot;
+    if (!std::all_of(clusters.begin(), clusters.end(), others) ||
+        (aerial && aerialLocalFrontiers())) {
       clusters.erase(std::remove_if(clusters.begin(), clusters.end(), others),
                      clusters.end());
+    } else if (aerial && !clusters.empty()) {
+      const double drone = aerialGraphProgress(current_state_.head<3>());
+      const auto* home = tour_distances_.from(*global_graph_, graph_revision_,
+                                            kHomeVertexId, peer_generation_);
+      clusters.erase(std::remove_if(clusters.begin(), clusters.end(), [&](const auto& c) {
+        const double peer = aerialPeerProgress(c.owner_robot_id);
+        const double target = home ? mgg::reachedDistance(*home, c.representative_vertex_id)
+                                   : mgg::kUnreachableCost;
+        return !std::isfinite(drone) || !std::isfinite(peer) || !std::isfinite(target) ||
+               target <= peer + 1e-6 || target + 1e-6 < drone;
+      }), clusters.end());
     }
     return insideExplorationRegion(std::move(clusters));
   }
@@ -1710,6 +1783,9 @@ std::optional<mgg::FrontierCluster> PlannerNode::refreshTour(
   }
   note = tour_clusters_.empty() ? "; tour: no cluster"
                                 : "; tour: no reachable cluster";
+  if (!fleet_ && robot_params_.type == mgg::RobotType::kAerialRobot && aerialLocalFrontiers()) {
+    note += "; own local frontiers take priority over lifted fallback";
+  }
   if (robot_params_.type == mgg::RobotType::kAerialRobot &&
       home_link_status_.rfind("unreachable", 0) == 0) {
     note += " (home " + home_link_status_ + ")";
@@ -2851,8 +2927,16 @@ void PlannerNode::onScoutingExclusions(
   scouting_zones_.set(scouting_exclusion_centres_, scouting_exclusion_reaches_);
   // The tour's candidates change: solve again.
   ++tour_assignment_version_;
+  publishScoutingRevision();
   RCLCPP_INFO(get_logger(), "%zu scouting exclusion(s)",
               scouting_exclusion_centres_.size());
+}
+
+void PlannerNode::publishScoutingRevision() {
+  if (robot_params_.type != mgg::RobotType::kAerialRobot) return;
+  std_msgs::msg::UInt64 revision;
+  revision.data = ++scouting_revision_;
+  scouting_revision_pub_->publish(revision);
 }
 
 void PlannerNode::refreshScoutingExclusions() {
@@ -2865,6 +2949,7 @@ void PlannerNode::refreshScoutingExclusions() {
   scouting_zones_.set({}, std::vector<double>{});
   ++scouting_counters_.lapsed;
   ++tour_assignment_version_;
+  publishScoutingRevision();
   RCLCPP_WARN(get_logger(),
               "scouting exclusions lapsed: none received for %.1f s",
               scouting_exclusion_ttl_s_);
@@ -3318,6 +3403,9 @@ void PlannerNode::onNeighbourGraph(mgg_msgs::msg::Graph::ConstSharedPtr msg) {
 
   const mgg::GraphExchange incoming = fromGraphMsg(*msg);
   neighbour_roadmaps_[sender] = incoming;
+  if (robot_params_.type == mgg::RobotType::kAerialRobot) {
+    aerial_peer_received_[sender] = std::chrono::steady_clock::now();
+  }
   // Ground coordinates cannot be aerial rendezvous. Keep their evidence as
   // targets only; never import a sender's edges into the aerial roadmap.
   if (robot_params_.type == mgg::RobotType::kAerialRobot) {
@@ -4224,6 +4312,13 @@ std::string PlannerNode::buildLocalGraph() {
   }
   // The graph's frontiers are worth keeping whether or not a path is chosen.
   add_frontiers_to_global_graph_ = local_graph_->getNumVertices() > 1;
+
+  // The aerial tour must see this lattice's frontiers now, not a plan later
+  // after it has already committed to a lifted target behind the fleet.
+  if (robot_params_.type == mgg::RobotType::kAerialRobot && add_frontiers_to_global_graph_) {
+    addFrontiers();
+    add_frontiers_to_global_graph_ = false;
+  }
 
   const auto t_gain = Clock::now();
   // Paths are penalised for leaving the way the robot faces
@@ -5832,6 +5927,7 @@ bool PlannerNode::onPlanRequestImpl(
                 secondsSince(last_odometry_received_));
     return false;
   }
+  const auto scouting_before = scouting_counters_;
   ++plan_requests_;
   expireReverseExitExclusions();
   for (const ReverseExitExclusion& exclusion : reverse_exit_exclusions_) {
@@ -5860,6 +5956,7 @@ bool PlannerNode::onPlanRequestImpl(
 
   std::string summary;
   std::string reason;
+  std::optional<mgg::FrontierCluster> aerial_chosen_target;
   bool complete = false;
   // rrg.cpp:1229 to 1240: a global repositioning under way is resumed until
   // the robot is within reach of its frontier; then local exploration
@@ -6040,7 +6137,10 @@ bool PlannerNode::onPlanRequestImpl(
     // A tour that decided nothing has no target this cycle: its target was
     // set aside, and the fleet and the greedy planner choose without it
     // (review r0, I1).
-    if (tour_decided) tour_at_target_failures_.erase(tour_target->id);
+    if (tour_decided) {
+      tour_at_target_failures_.erase(tour_target->id);
+      aerial_chosen_target = tour_target;
+    }
     if (!tour_decided) tour_target.reset();
     // A low-gain lattice path, once the low-gain rounds are due and the
     // tour has not decided, is set aside for the fleet and the global
@@ -6168,9 +6268,18 @@ bool PlannerNode::onPlanRequestImpl(
     complete = false;
     summary += "; acquiring observations";
   }
+  const bool scouting_refused = robot_params_.type == mgg::RobotType::kAerialRobot &&
+      !scouting_zones_.empty() && best_path_.empty() &&
+      (scouting_counters_.paths_refused > scouting_before.paths_refused ||
+       scouting_counters_.targets_refused > scouting_before.targets_refused ||
+       scouting_counters_.viewpoints_refused > scouting_before.viewpoints_refused);
+  // Temporary exclusions are neither exhausted exploration nor a reason to
+  // sleep past their expiry. Mixed refusals also get the bounded retry.
+  if (scouting_refused) complete = false;
   response->status = !best_path_.empty()
                          ? mgg_msgs::srv::PlannerSrv::Response::FORWARD
                      : complete ? kStatusComplete
+                     : scouting_refused ? mgg_msgs::srv::PlannerSrv::Response::SCOUTING_EXCLUDED
                      : mola_map_ && robot_params_.type == mgg::RobotType::kGroundRobot &&
                          acquiring_observations_.load() ? kStatusNotReady
                                 : kStatusNoPath;
@@ -6180,6 +6289,21 @@ bool PlannerNode::onPlanRequestImpl(
   publishMarkers();
   RCLCPP_INFO(get_logger(), "plan request: %s", summary.c_str());
   if (robot_params_.type == mgg::RobotType::kAerialRobot) {
+    const auto* representative = aerial_chosen_target
+        ? findGlobalVertex(aerial_chosen_target->representative_vertex_id)
+        : best_path_from_global_graph_ ? findGlobalVertex(current_global_vertex_id_) : nullptr;
+    const bool lifted = representative && representative->lifted_peer_target;
+    const Eigen::Vector3d target = aerial_chosen_target ? aerial_chosen_target->position
+        : representative ? representative->state.head<3>().eval()
+        : best_path_.empty() ? current_state_.head<3>().eval() : best_path_.back().head<3>().eval();
+    const double progress = best_path_.empty() ? mgg::kUnreachableCost : aerialGraphProgress(target);
+    const std::string distance = std::isfinite(progress) ? std::to_string(progress) : "unknown";
+    RCLCPP_INFO(get_logger(), "aerial choice: target=%s graph_front_m=%s reason=%s",
+        best_path_.empty() ? "none" : lifted ? "lifted" : "own",
+        distance.c_str(), complete ? "exploration complete" : best_path_.empty() ? "no admissible path"
+        : aerial_chosen_target ? "tour target, reachable and value-qualified"
+        : best_path_from_global_graph_ ? "global fallback or resumed route"
+        : "local exploration before peer fallback");
     RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 10000, "aerial_status %s",
                          aerialStatusJson().c_str());
   }

@@ -100,6 +100,30 @@ PciNode::PciNode(const rclcpp::NodeOptions& options)
       [this](nav_msgs::msg::Odometry::ConstSharedPtr m) { onOdometry(m); },
       sub_opts);
 
+  if (external_path_execution_) {
+    scouting_revision_sub_ = create_subscription<std_msgs::msg::UInt64>(
+        "scouting_exclusion_revision", rclcpp::QoS(1).transient_local(),
+        [this](std_msgs::msg::UInt64::ConstSharedPtr msg) {
+          std::lock_guard<std::mutex> lock(mutex_);
+          if (msg->data == scouting_revision_) return;
+          scouting_revision_ = msg->data;
+          // Never take over an accepted path, a stopped session or completion.
+          if (!running_ || exploration_completed_ || path_in_progress_) return;
+          scouting_retry_ = true;
+          retry_not_before_ = now();
+        }, sub_opts);
+    // Independent of the normal progress watchdog: expiry must wake even a
+    // ten-second empty-plan backoff, but cannot start a stopped session.
+    scouting_retry_timer_ = create_wall_timer(std::chrono::milliseconds(100),
+        [this]() {
+          {
+            std::lock_guard<std::mutex> lock(mutex_);
+            if (!scouting_retry_) return;
+          }
+          tick();
+        }, callback_group_);
+  }
+
   // Latched: the path is a latest-value topic and a follower may start later.
   status_pub_ = create_publisher<std_msgs::msg::String>(
       "status", rclcpp::QoS(1).transient_local());
@@ -271,10 +295,13 @@ void PciNode::planAndPublish() {
     return;
   }
   uint64_t generation;
+  uint64_t scouting_revision;
   {
     std::lock_guard<std::mutex> lock(mutex_);
     if (planning_in_progress_ || !running_) return;
     generation = generation_;
+    scouting_revision = scouting_revision_;
+    scouting_retry_ = false;
     planning_in_progress_ = true;
   }
 
@@ -318,6 +345,19 @@ void PciNode::planAndPublish() {
     publishPath({});
     publishStatus("complete", "exploration complete");
     RCLCPP_INFO(get_logger(), "exploration complete");
+    return;
+  }
+  if (external_path_execution_ && ok && path.empty() &&
+      (plan_status_ == mgg_msgs::srv::PlannerSrv::Response::SCOUTING_EXCLUDED ||
+       scouting_revision != scouting_revision_)) {
+    path_in_progress_ = false;
+    waiting_for_plan_ = true;
+    scouting_retry_ = true;
+    consecutive_empty_plans_ = 0;
+    const double delay = scouting_revision != scouting_revision_ ? 0.0 : 0.5;
+    retry_not_before_ = now() + rclcpp::Duration::from_seconds(delay);
+    publishStatus("waiting", retryStatusReason(
+        "scouting exclusions changed or refused routes", delay));
     return;
   }
   if (!ok) {
@@ -500,6 +540,7 @@ void PciNode::onStop(const std::shared_ptr<std_srvs::srv::Trigger::Request>,
     ++generation_;
     path_in_progress_ = false;
     waiting_for_plan_ = false;
+    scouting_retry_ = false;
   }
   if (cancel_client_->service_is_ready()) {
     cancel_client_->async_send_request(std::make_shared<std_srvs::srv::Trigger::Request>());
