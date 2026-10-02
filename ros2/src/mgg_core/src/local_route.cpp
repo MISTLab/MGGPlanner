@@ -89,7 +89,7 @@ Vertex* lazyGroundLattice(GraphManager& graph, Vertex* root,
   };
   using Cell = std::pair<int, int>;
   using Entry = std::pair<double, int>;
-  std::map<Cell, Vertex*> cells{{{0, 0}, root}};
+  std::map<Cell, std::vector<Vertex*>> cells{{{0, 0}, {root}}};
   std::unordered_map<int, Cell> cell_of{{root->id, {0, 0}}};
   std::unordered_map<int, double> distance{{root->id, 0.0}};
   std::unordered_set<int> settled;
@@ -168,17 +168,6 @@ Vertex* lazyGroundLattice(GraphManager& graph, Vertex* root,
         const double y = next.second * grid.resolution.y();
         if (x < grid.min_val.x() || x > grid.max_val.x() ||
             y < grid.min_val.y() || y > grid.max_val.y()) continue;
-        const auto found = cells.find(next);
-        if (found != cells.end()) {
-          // A settled destination cannot be improved by a nonnegative edge.
-          if (!settled.count(found->second->id)) connect_existing(at, found->second);
-          continue;
-        }
-        if (graph.getNumVertices() >= planning.num_vertices_max ||
-            graph.getNumEdges() >= planning.num_edges_max) {
-          result.hit_limit = true;
-          continue;
-        }
         StateVec state(root->state.x() + c * x - s * y,
                        root->state.y() + s * x + c * y,
                        at->state.z(), root->state[3]);
@@ -190,13 +179,32 @@ Vertex* lazyGroundLattice(GraphManager& graph, Vertex* root,
         if (support != VoxelStatus::kOccupied) continue;
         state.head<3>() = projected;
         state.z() -= height - planning.max_ground_height;
+        // Like LatticeColumnGround, merge only within max_step_height.
+        // The same XY can be reached later on a ramp/deck above the floor.
+        Vertex* existing = nullptr;
+        const auto found = cells.find(next);
+        if (found != cells.end()) for (Vertex* vertex : found->second) {
+          if (std::abs(vertex->state.z() - state.z()) <= planning.max_step_height) {
+            existing = vertex;
+            break;
+          }
+        }
+        if (existing) {
+          if (!settled.count(existing->id)) connect_existing(at, existing);
+          continue;
+        }
+        if (graph.getNumVertices() >= planning.num_vertices_max ||
+            graph.getNumEdges() >= planning.num_edges_max) {
+          result.hit_limit = true;
+          continue;
+        }
         if (!endpoint_admissible(at->state, state)) continue;
         Vertex candidate(-1, state);
         ExpandGraphReport rep;
         expandGraphFrom(graph, candidate, at, rep, lazy, true);
         count(rep);
         if (rep.vertex_added) {
-          cells.emplace(next, rep.vertex_added);
+          cells[next].push_back(rep.vertex_added);
           cell_of.emplace(rep.vertex_added->id, next);
         }
       }

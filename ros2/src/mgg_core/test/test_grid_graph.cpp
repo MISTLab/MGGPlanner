@@ -871,13 +871,13 @@ TEST(GridGraph, ADeckOverTheFloorReachedOnlyByGoingOutwardFirstIsJoined) {
 // deliberately outside the unrotated offset footprint.
 class OffsetObstacle : public mgg_test::TerrainFixture {
  public:
-  explicit OffsetObstacle(double obstacle_y = -0.75)
-      : TerrainFixture(0.1, floor()), obstacle_y_(obstacle_y) {}
+  explicit OffsetObstacle(double obstacle_y = -0.75, double slope = 0)
+      : TerrainFixture(0.1, floor(slope)), obstacle_y_(obstacle_y) {}
   double obstacle_y_;
-  static std::map<std::pair<std::int64_t, std::int64_t>, double> floor() {
+  static std::map<std::pair<std::int64_t, std::int64_t>, double> floor(double slope = 0) {
     std::map<std::pair<std::int64_t, std::int64_t>, double> cells;
     for (int x = -40; x <= 40; ++x)
-      for (int y = -40; y <= 40; ++y) cells[{x, y}] = 0.0;
+      for (int y = -40; y <= 40; ++y) cells[{x, y}] = slope * (y + .5) * .1;
     return cells;
   }
   VoxelStatus getBoxStatus(const Eigen::Vector3d& c,
@@ -932,8 +932,11 @@ TEST(GridGraph, BidirectionalEdgeChecksTheOppositeOffsetFootprint) {
 }
 
 TEST(GridGraph, LazyGroundDijkstraMatchesFullyEvaluatedEightNeighbourGraph) {
-  OffsetObstacle map(0.75);
+  for (double slope : {0.0, 0.15}) {
+  SCOPED_TRACE(slope);
+  OffsetObstacle map(0.75, slope);
   PlanningParams planning;
+  planning.max_step_height = .1;
   planning.max_ground_height = 0.5;
   planning.min_observed_ground_fraction = 0.0;
   planning.edge_length_max = 1.0;
@@ -956,7 +959,7 @@ TEST(GridGraph, LazyGroundDijkstraMatchesFullyEvaluatedEightNeighbourGraph) {
   grid.resolution = Eigen::Vector3d(0.4, 0.4, 0.1);
   GraphManager lazy;
   const auto route = mgg::routeOverLocalLattice(lazy, StateVec(0, 0, 0.2, 0),
-                                               StateVec(0, 2, 0, 0), grid, ctx);
+                                               StateVec(0, 2, .5 + slope * 2, 0), grid, ctx);
   ASSERT_TRUE(route.routed) << route.reason;
   ASSERT_GT(route.route.size(), 2u);  // the direct route intersects the post
   mgg::ShortestPathsReport lazy_paths;
@@ -964,11 +967,11 @@ TEST(GridGraph, LazyGroundDijkstraMatchesFullyEvaluatedEightNeighbourGraph) {
   const double actual = lazy_paths.distance_map.at(route.route.back()->id);
   GraphManager full;
   std::map<std::pair<int, int>, Vertex*> cells;
-  full.addVertex(new Vertex(0, StateVec(0, 0, 0.5, 0)));
+  full.addVertex(new Vertex(0, StateVec(0, 0, 0.5 + slope * .05, 0)));
   cells[{0, 0}] = full.getVertex(0);
   for (int x = -5; x <= 5; ++x) for (int y = -5; y <= 5; ++y) {
     if (x == 0 && y == 0) continue;
-    auto* v = new Vertex(full.generateVertexID(), StateVec(0.4*x, 0.4*y, 0.5, 0));
+    auto* v = new Vertex(full.generateVertexID(), StateVec(0.4*x, 0.4*y, 0.5 + slope * (0.4*y + .05), 0));
     full.addVertex(v); cells[{x, y}] = v;
   }
   Vertex* goal = cells.at({0, 5});
@@ -984,6 +987,7 @@ TEST(GridGraph, LazyGroundDijkstraMatchesFullyEvaluatedEightNeighbourGraph) {
   mgg::ShortestPathsReport reference;
   ASSERT_TRUE(full.findShortestPaths(0, reference));
   EXPECT_NEAR(actual, reference.distance_map.at(goal->id), 1e-9);
+  }
 }
 
 }  // namespace

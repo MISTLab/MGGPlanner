@@ -80,3 +80,55 @@ TEST(NavBench, ExpiredBudgetInterruptsNativeGainRaycasts) {
       {Eigen::Vector3d(10, 0, 0)}, gain, log, mgg::SensorModel{}),
       mgg::PlanningInterrupted);
 }
+
+TEST(NavBench, LazyLatticeClimbsRampOntoDeckAboveVisitedFloor) {
+  using Grid = mgg::NativeMolaGrid;
+  std::vector<Grid::Cell> occupied, free;
+  std::vector<Grid::Surface> surfaces;
+  for (int x = -30; x < 90; ++x) for (int y = -30; y < 40; ++y) {
+    occupied.push_back({x, y, -1}); surfaces.push_back({{x, y, -1}, 0});
+    const double px = (x + .5) * .1, py = (y + .5) * .1;
+    double top = -1;
+    if (px >= 2 && py >= -.5 && py <= 1.5) top = std::min(2.0, (px - 2) / 3.0);
+    if (py > 1.5 && py < 3.5 && px >= -1) top = 2;
+    if (top >= 0) {
+      const int z = std::floor(top / .1);
+      occupied.push_back({x, y, z}); surfaces.push_back({{x, y, z}, top});
+    }
+    for (int z = 0; z < 35; ++z) free.push_back({x, y, z});
+  }
+  Grid map(.1, occupied, free, surfaces);
+  mgg::RobotParams robot;
+  robot.size = Eigen::Vector3d(.2, .2, .2);
+  mgg::PlanningParams planning;
+  planning.max_ground_height = .4;
+  planning.max_step_height = .15;
+  planning.max_inclination = .6;
+  planning.max_footprint_tilt = .6;
+  planning.max_footprint_step = .15;
+  planning.min_observed_ground_fraction = 0;
+  planning.edge_length_min = 0;
+  planning.edge_length_max = .6;
+  planning.edge_overshoot = 0;
+  planning.num_vertices_max = 5000;
+  planning.num_edges_max = 50000;
+  planning.num_loops_max = 20000;
+  mgg::GroundProjection ground(map, planning, true);
+  mgg::ExpandContext ctx;
+  ctx.map = &map; ctx.robot = &robot; ctx.planning = &planning;
+  ctx.ground = &ground; ctx.robot_box_size = robot.getPlanningSize();
+  ctx.allow_unknown_lattice_body = false;
+  mgg::GridGraphParams grid;
+  grid.min_val = Eigen::Vector3d(-2, -2, 0);
+  grid.max_val = Eigen::Vector3d(8.4, 3.2, 3);
+  grid.resolution = Eigen::Vector3d(.4, .4, .1);
+  mgg::GraphManager graph;
+  const auto result = mgg::routeOverLocalLattice(graph, mgg::StateVec(0,0,.4,0),
+      mgg::StateVec(0,2.4,2.4,0), grid, ctx);
+  EXPECT_TRUE(result.routed) << result.reason;
+  bool overlapping_levels = false;
+  for (const auto& [id, a] : graph.vertices_map_) for (const auto& [other, b] : graph.vertices_map_)
+    if ((a->state.head<2>() - b->state.head<2>()).norm() < 1e-6 &&
+        std::abs(a->state.z() - b->state.z()) > 1) overlapping_levels = true;
+  EXPECT_TRUE(overlapping_levels);
+}
