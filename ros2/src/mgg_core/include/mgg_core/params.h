@@ -172,9 +172,9 @@ struct PlanningParams {
 
   // Ground robots.
   double max_ground_height = 1.2;
-  /// Unused: it once set the top of a ground robot's gain band,
-  /// max(2.5 robot_height, 1.2 m) over the vertex, which has no top now
-  /// (computeVolumetricGain). Kept as the upstream parameter.
+  /// Legacy upstream parameter; not the gain-band height. Ground gain uses
+  /// RobotParams::size.z() + ground_frontier_height_margin above local floor
+  /// (computeVolumetricGain).
   double robot_height = 1.0;
   double max_inclination = 0.52;
   /// Steepest sideways slope of the ground under an edge, relative to the
@@ -230,6 +230,15 @@ struct PlanningParams {
   bool use_ray_model_for_volumetric_gain = false;
   double free_voxel_gain = 1.0;
   double occupied_voxel_gain = 1.0;
+  /// Ground frontier/gain ceiling above the vertex's floor: robot size.z()
+  /// plus this margin (metres). Upper air cannot keep ground exploration local.
+  double ground_frontier_height_margin = 0.5;
+  /// Diagnostic/reference scan including upper volume; disables band pruning.
+  bool ground_gain_full_scan = false;
+  /// Gain-only overrides for ground robots. Zero preserves the real sensor.
+  /// Angular step (degrees) can coarsen both axes; range (metres) can shorten.
+  double ground_gain_angular_resolution_deg = 0.0;
+  double ground_gain_max_range = 0.0;
   double unknown_voxel_gain = 10.0;
   double path_length_penalty = 0.0;
   /// How strongly selectBestPath prefers paths along the robot's heading:

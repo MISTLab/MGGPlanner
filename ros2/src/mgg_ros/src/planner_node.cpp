@@ -381,6 +381,19 @@ PlannerNode::PlannerNode(const rclcpp::NodeOptions& options)
   random_sampler_.setBound(grid_params_.min_val, grid_params_.max_val);
   random_sampler_.reset(std::random_device{}());
 
+  aerial_peer_robot_ids_ = declareOrGet<std::vector<std::int64_t>>(
+      this, "aerial_peer_robot_ids", std::vector<std::int64_t>{});
+  std::string aerial_ids;
+  for (const auto id : aerial_peer_robot_ids_) {
+    if (id < 0 || id > std::numeric_limits<int>::max()) {
+      throw std::invalid_argument("aerial_peer_robot_ids must be non-negative int32 robot IDs");
+    }
+    if (!aerial_ids.empty()) aerial_ids += ", ";
+    aerial_ids += std::to_string(id);
+  }
+  RCLCPP_INFO(get_logger(), "aerial_peer_robot_ids: [%s]; ground receivers exclude these frontier owners",
+              aerial_ids.c_str());
+
   // Inter-robot transforms. `static` reads fixed ones from
   // neighbour_offsets (bring-up with known spawn poses); `topic` takes live
   // estimates on neighbour_transforms, each T_ours_theirs from our planning
@@ -2629,7 +2642,16 @@ mgg::RecomputeGainFn PlannerNode::globalFrontierGain() {
     if (vertex.lifted_peer_target) return;
     if (vertex.robot_id != static_cast<int>(planning_params_.robot_id)) {
       auto& gain = vertex.vol_gain;
-      gain.is_frontier = gain.is_frontier && !vertex.locally_explored;
+      const bool aerial_owner = robot_params_.type == mgg::RobotType::kGroundRobot &&
+          std::find(aerial_peer_robot_ids_.begin(), aerial_peer_robot_ids_.end(),
+                    vertex.robot_id) != aerial_peer_robot_ids_.end();
+      gain.is_frontier = gain.is_frontier && !vertex.locally_explored && !aerial_owner;
+      // The shared scorer feeds greedy repositioning, tour clusters and
+      // fleet offers. Never re-check flight-altitude evidence as a ground
+      // pose: its height band would be measured around the ceiling too.
+      if (aerial_owner && vertex.type == mgg::VertexType::kFrontier) {
+        vertex.type = mgg::VertexType::kUnvisited;
+      }
       gain.gain = gain.is_frontier
           ? std::max(0, gain.num_unknown_voxels) * planning_params_.unknown_voxel_gain +
             std::max(0, gain.num_free_voxels) * planning_params_.free_voxel_gain +
@@ -4393,6 +4415,20 @@ std::string PlannerNode::buildLocalGraph() {
       *local_graph_, gain_ctx, planning_params_.leafs_only_for_volumetric_gain,
       planning_params_.cluster_vertices_for_gain);
   int frontiers = 0;
+  std::int64_t band_unknown = 0, total_unknown = 0;
+  bool total_available = true;
+  std::int64_t free_voxels = 0, occupied_voxels = 0;
+  std::uint64_t gain_rays = 0, gain_visits = 0;
+  for (const auto& entry : local_graph_->vertices_map_) {
+    if (entry.second == nullptr) continue;
+    band_unknown += entry.second->vol_gain.num_unknown_voxels;
+    if (entry.second->vol_gain.num_total_unknown_voxels < 0) total_available = false;
+    else total_unknown += entry.second->vol_gain.num_total_unknown_voxels;
+    free_voxels += entry.second->vol_gain.num_free_voxels;
+    occupied_voxels += entry.second->vol_gain.num_occupied_voxels;
+    gain_rays += entry.second->vol_gain.gain_rays_cast;
+    gain_visits += entry.second->vol_gain.gain_voxel_visits;
+  }
   // Frontiers given up as unreachable from here (retention refused three
   // times) are no local gain remaining: they must not hold completion back
   // (run14 review r2), here or in the fleet's settling.
@@ -4404,6 +4440,20 @@ std::string PlannerNode::buildLocalGraph() {
       if (!reverseExitEndpointGivenUp(entry.second->state)) ++outstanding_frontiers;
     }
   }
+  RCLCPP_INFO(get_logger(),
+              "gain evidence: %s; band-unknown=%lld total-unknown=%s "
+              "free=%lld occupied=%lld frontiers=%d viewpoints=%d "
+              "scan-rays=%llu scan-visits=%llu ground-model-step-deg=%.2f "
+              "ground-model-range-m=%.2f (0=sensor; summed per viewpoint; work backend-reported)",
+              robot_params_.type == mgg::RobotType::kGroundRobot
+                  ? "ground reachable-height band" : "aerial full 3D",
+              static_cast<long long>(band_unknown),
+              (total_available ? std::to_string(total_unknown) : "unavailable (pruned)").c_str(),
+              static_cast<long long>(free_voxels), static_cast<long long>(occupied_voxels),
+              frontiers, evaluated, static_cast<unsigned long long>(gain_rays),
+              static_cast<unsigned long long>(gain_visits),
+              planning_params_.ground_gain_angular_resolution_deg,
+              planning_params_.ground_gain_max_range);
   // The graph's frontiers are worth keeping whether or not a path is chosen.
   add_frontiers_to_global_graph_ = local_graph_->getNumVertices() > 1;
 
@@ -6276,6 +6326,12 @@ bool PlannerNode::onPlanRequestImpl(
       // No leaf with gain for long enough: the global planner routes to the
       // best global frontier (rrg.cpp:2119, mggplanner.cpp:217).
       auto map_read = mapReadLease();
+      RCLCPP_INFO(get_logger(),
+                  "global repositioning triggered: %d low-gain rounds "
+                  "(threshold %d), %s; local frontier interest=%s",
+                  low_gain_rounds_, auto_global_planner_low_gain_rounds_,
+                  low_gain_path.empty() ? "no local path" : "low-gain local path",
+                  local_gain_remains_now_ ? "yes" : "no");
       low_gain_rounds_ = 0;
       std::string departure;
       // A low-gain path set aside is handed over only for a frontier worth

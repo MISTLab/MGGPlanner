@@ -9,6 +9,8 @@
 #include <gtest/gtest.h>
 
 #include "mgg_core/gain.h"
+#include "mgg_core/path_selection.h"
+#include "mgg_core/global_graph.h"
 
 namespace {
 
@@ -322,6 +324,231 @@ TEST(Gain, ExpiredRequestBudgetInterruptsGain) {
   });
   EXPECT_THROW(computeVolumetricGain(StateVec(0, 0, 0, 0), gain, f.ctx),
                mgg::PlanningInterrupted);
+}
+
+// Deterministic scan fixture: upper hangar air is unknown at every viewpoint;
+// only the doorway (x >= 2) reveals unknown at driving height.
+class TallRoom : public HalfMapped {
+ public:
+  bool corridor = false;
+  bool descending = false;
+  void getScanStatusIterative(
+      const Eigen::Vector3d& pos, const std::vector<Eigen::Vector3d>&,
+      GainCounts& gain,
+      std::vector<std::pair<Eigen::Vector3d, VoxelStatus>>& log,
+      const SensorModel&) override {
+    gain = GainCounts{};
+    for (int i = 0; i < 100; ++i) {
+      log.emplace_back(pos + Eigen::Vector3d(0.2 * i, 0, 4),
+                       VoxelStatus::kUnknown);
+      ++gain.unknown;
+    }
+    for (int i = 0; i < 10; ++i) {
+      const auto status = corridor || descending || pos.x() >= 2.0
+          ? VoxelStatus::kUnknown : VoxelStatus::kFree;
+      log.emplace_back(pos + Eigen::Vector3d(0.2 * i, 0, descending ? -0.8 : 0), status);
+    }
+  }
+};
+
+struct GroundRoom : Fixture {
+  GroundRoom() {
+    robot.type = mgg::RobotType::kGroundRobot;
+    robot.size = Eigen::Vector3d(0.8, 0.5, 0.6);
+    planning.max_ground_height = 0.5;
+    planning.path_length_penalty = planning.path_direction_penalty = 0;
+    ctx.robot = &robot;
+    ctx.map = &room;
+  }
+  TallRoom room;
+  mgg::RobotParams robot;
+};
+
+TEST(Gain, TallExploredRoomHasNoGroundInterestButAerialInterestRemains) {
+  GroundRoom f;
+  VolumetricGain gain;
+  computeVolumetricGain(StateVec(0, 0, 0.5, 0), gain, f.ctx);
+  EXPECT_FALSE(gain.is_frontier);
+  EXPECT_EQ(gain.num_unknown_voxels, 0);
+  EXPECT_EQ(gain.num_total_unknown_voxels, -1);
+  f.planning.ground_gain_full_scan = true;
+  computeVolumetricGain(StateVec(0, 0, 0.5, 0), gain, f.ctx);
+  EXPECT_EQ(gain.num_total_unknown_voxels, 100);
+  EXPECT_DOUBLE_EQ(gain.gain, 0.0);  // even with nonzero free/occupied weights
+  f.robot.type = mgg::RobotType::kAerialRobot;
+  computeVolumetricGain(StateVec(0, 0, 0.5, 0), gain, f.ctx);
+  EXPECT_TRUE(gain.is_frontier);
+  EXPECT_EQ(gain.num_unknown_voxels, 100);
+  EXPECT_GT(gain.gain, 0);
+}
+
+TEST(Gain, DoorFrontierIsNotClusteredIntoTheRoomAndBestPathLeaves) {
+  GroundRoom f;
+  f.planning.clustering_radius = 1.0;  // deployed bistro.yaml radius
+  mgg::GraphManager graph;
+  auto* root = new Vertex(0, StateVec(0, 0, 0.5, 0));
+  auto* room = new Vertex(1, StateVec(1.25, 0, 0.5, 0));
+  auto* door = new Vertex(2, StateVec(2, 0, 0.5, 0));
+  auto* inside = new Vertex(3, StateVec(0, 1, 0.5, 0));
+  for (auto* v : {root, room, door, inside}) graph.addVertex(v);
+  graph.addEdge(root, room, 1.25); graph.addEdge(room, door, 0.75);
+  graph.addEdge(root, inside, 1);
+  door->is_leaf_vertex = true;  // clustering would copy this frontier inside
+  room->type = mgg::VertexType::kFrontier;  // stale local frontier
+  EXPECT_EQ(computeExplorationGain(graph, f.ctx, false, true), 4);
+  EXPECT_TRUE(door->vol_gain.is_frontier);
+  EXPECT_FALSE(room->vol_gain.is_frontier);
+  EXPECT_DOUBLE_EQ(room->vol_gain.gain, 0);
+  EXPECT_EQ(room->type, mgg::VertexType::kUnvisited);
+  EXPECT_FALSE(inside->vol_gain.is_frontier);
+  const auto selected = mgg::selectBestPath(graph, f.planning, f.robot,
+                                            mgg::EdgeInclinations{}, 0.2, 0);
+  EXPECT_EQ(selected.best_path_id, door->id);
+}
+
+TEST(Gain, Run7CorridorAndDescendingUnknownStillAreGroundFrontiers) {
+  GroundRoom f;
+  for (bool descending : {false, true}) {
+    f.room.corridor = !descending;
+    f.room.descending = descending;
+    VolumetricGain gain;
+    computeVolumetricGain(StateVec(0, 0, 0.5, 0), gain, f.ctx);
+    EXPECT_TRUE(gain.is_frontier);
+    EXPECT_EQ(gain.num_unknown_voxels, 10);
+    EXPECT_GT(gain.gain, 0);
+  }
+}
+
+TEST(Gain, StaleGlobalRoomFrontiersAreDemotedButDoorRemains) {
+  GroundRoom f;
+  mgg::GraphManager local, global;
+  auto* root = new Vertex(0, StateVec(0, 0, 0.5, 0));
+  local.addVertex(root);
+  auto* end = new Vertex(1, StateVec(1, 0, 0.5, 0));
+  local.addVertex(end); local.addEdge(root, end, 1);
+  for (int i = 0; i < 3; ++i) {
+    auto* v = new Vertex(i, StateVec(i, 0, 0.5, 0));
+    v->robot_id = i == 1 ? 2 : 1;  // nearby peer's stale room frontier too
+    v->type = mgg::VertexType::kFrontier;
+    v->vol_gain.is_frontier = true;
+    global.addVertex(v);
+  }
+  mgg::ExpandContext expand;
+  expand.robot_id = 1;
+  const auto report = mgg::addFrontiers(global, local, expand,
+      [&](Vertex& v) { computeVolumetricGain(v.state, v.vol_gain, f.ctx); },
+      1, 1, 3);
+  EXPECT_EQ(report.global_frontiers_demoted, 2);
+  EXPECT_EQ(global.getVertex(0)->type, mgg::VertexType::kUnvisited);
+  EXPECT_EQ(global.getVertex(1)->type, mgg::VertexType::kUnvisited);
+  EXPECT_EQ(global.getVertex(2)->type, mgg::VertexType::kFrontier);
+}
+
+TEST(Gain, GroundBandMarginIsConfigurableAndSensorThresholdCannotBypassIt) {
+  GroundRoom f;
+  f.sensors["VLP16"].frontier_percentage_threshold = 0.0;
+  VolumetricGain gain;
+  computeVolumetricGain(StateVec(0, 0, 0.5, 0), gain, f.ctx);
+  EXPECT_FALSE(gain.is_frontier);  // even the aerial threshold cannot admit it
+  f.planning.ground_frontier_height_margin = 5.0;
+  computeVolumetricGain(StateVec(0, 0, 0.5, 0), gain, f.ctx);
+  EXPECT_TRUE(gain.is_frontier);
+  EXPECT_EQ(gain.num_unknown_voxels, 100);
+}
+
+// R2: request backend pruning before traversal, retaining the full endpoints
+// for exactly the reference DDA's corner and edge ties.
+TEST(Gain, GroundScanRequestsBandTraversalUnlessFullScanIsEnabled) {
+  class RecordingScan : public HalfMapped {
+   public:
+    int band_calls = 0;
+    void getScanStatusInBounds(
+        const Eigen::Vector3d& origin, const std::vector<Eigen::Vector3d>& ends,
+        GainCounts& counts,
+        std::vector<std::pair<Eigen::Vector3d, VoxelStatus>>& log,
+        const SensorModel& sensor, const mgg::ScanBounds& bounds) override {
+      ++band_calls;
+      EXPECT_TRUE(bounds.bounds_from_map.matrix().isIdentity());
+      EXPECT_DOUBLE_EQ(bounds.low.z(), -0.5);
+      EXPECT_DOUBLE_EQ(bounds.high.z(), 0.945);  // floor 0.2 + Scout height + margin
+      HalfMapped::getScanStatusIterative(origin, ends, counts, log, sensor);
+    }
+  } map;
+  Fixture f;
+  mgg::RobotParams robot;
+  robot.size.z() = 0.245;
+  f.planning.max_ground_height = 0.3;
+  f.ctx.robot = &robot;
+  f.ctx.map = &map;
+  VolumetricGain gain;
+  computeVolumetricGain(StateVec(0.1, 0.1, 0.5, 0), gain, f.ctx);
+  EXPECT_EQ(gain.num_total_unknown_voxels, -1);
+  EXPECT_EQ(map.band_calls, 1);
+  f.planning.ground_gain_full_scan = true;
+  computeVolumetricGain(StateVec(0.1, 0.1, 0.5, 0), gain, f.ctx);
+  EXPECT_EQ(map.band_calls, 1);
+  EXPECT_GE(gain.num_total_unknown_voxels, gain.num_unknown_voxels);
+}
+
+TEST(Gain, SparseGroundModelDoesNotChangeRealFovOrAerialRays) {
+  class RayRecorder : public HalfMapped {
+   public:
+    std::size_t count = 0;
+    double range = 0;
+    void getScanStatusIterative(
+        const Eigen::Vector3d& origin, const std::vector<Eigen::Vector3d>& ends,
+        GainCounts&, std::vector<std::pair<Eigen::Vector3d, VoxelStatus>>&,
+        const SensorModel&) override {
+      count = ends.size();
+      range = 0;
+      for (const auto& end : ends) range = std::max(range, (end - origin).norm());
+    }
+  } map;
+  Fixture f;
+  f.ctx.map = &map;
+  mgg::RobotParams robot;
+  f.ctx.robot = &robot;
+  auto& sensor = f.sensors["VLP16"];
+  sensor.max_range = 20;
+  sensor.fov = Eigen::Vector2d(2 * M_PI, M_PI / 3);
+  sensor.resolution = Eigen::Vector2d::Constant(M_PI / 36);
+  sensor.update();
+  const StateVec state(0, 0, 0, 0);
+  VolumetricGain gain;
+  computeVolumetricGain(state, gain, f.ctx);
+  const auto dense_rays = map.count;
+  for (const auto setting : {std::pair<double, double>{10, 0}, {0, 10}, {10, 10}}) {
+    f.planning.ground_gain_angular_resolution_deg = setting.first;
+    f.planning.ground_gain_max_range = setting.second;
+    robot.type = mgg::RobotType::kGroundRobot;
+    computeVolumetricGain(state, gain, f.ctx);
+    if (setting.first) EXPECT_LT(map.count, dense_rays * 0.3);
+    else EXPECT_EQ(map.count, dense_rays);
+    EXPECT_NEAR(map.range, setting.second ? 10 : 20, 1e-9);
+    EXPECT_TRUE(sensor.isInsideFOV(state, Eigen::Vector3d(15, 0, 0)));
+    EXPECT_DOUBLE_EQ(sensor.max_range, 20);
+    EXPECT_DOUBLE_EQ(sensor.resolution.x(), M_PI / 36);
+    robot.type = mgg::RobotType::kAerialRobot;
+    computeVolumetricGain(state, gain, f.ctx);
+    EXPECT_EQ(map.count, dense_rays);
+    EXPECT_NEAR(map.range, 20, 1e-9);
+  }
+  robot.type = mgg::RobotType::kGroundRobot;
+  f.planning.ground_gain_angular_resolution_deg = 2;
+  f.planning.ground_gain_max_range = 30;
+  computeVolumetricGain(state, gain, f.ctx);
+  EXPECT_EQ(map.count, dense_rays);  // cannot densify or extend the real model
+  EXPECT_NEAR(map.range, 20, 1e-9);
+  sensor.fov = Eigen::Vector2d::Constant(M_PI / 18);
+  sensor.resolution.setZero();  // real sensor uses its existing 1-degree fallback
+  sensor.update();
+  f.planning.ground_gain_angular_resolution_deg = 0;
+  f.planning.ground_gain_max_range = 0;
+  computeVolumetricGain(state, gain, f.ctx);
+  const auto fallback_rays = map.count;
+  f.planning.ground_gain_angular_resolution_deg = 0.5;
+  computeVolumetricGain(state, gain, f.ctx);
+  EXPECT_EQ(map.count, fallback_rays);
 }
 
 }  // namespace

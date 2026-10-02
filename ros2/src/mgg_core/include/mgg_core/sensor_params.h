@@ -40,7 +40,8 @@ class SensorParams {
 
   /// Minimum range for map annotation (zoom camera only).
   double min_range = 0.0;
-  /// Maximum range for volumetric gain.
+  /// Real sensor range, including FOV/body policy. Ground gain can use a
+  /// shorter private model via PlanningParams::ground_gain_max_range.
   double max_range = 5.0;
   /// Offset from the body centre (odometry frame).
   Eigen::Vector3d center_offset = Eigen::Vector3d::Zero();

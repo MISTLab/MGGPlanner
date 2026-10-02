@@ -4,6 +4,10 @@
 # that at load time, ROS 2's parameter loader does not.
 mggplanner_node:
   ros__parameters:
+    # Fleet launch must list aerial senders' numeric PlanningParams.robot_id
+    # values so ground robots ignore their full-3D frontier targets. Default:
+    # no exclusions (unlisted peers retain legacy ground-peer semantics).
+    # aerial_peer_robot_ids: [5]
     RobotParams:
       type: kGroundRobot
       size:
@@ -199,6 +203,13 @@ mggplanner_node:
       exp_gain_voxel_size: 0.8
       occupied_voxel_gain: 0.0
       free_voxel_gain: 0.0
+      # Ground gain/frontiers stop at robot height + this margin above its floor.
+      ground_frontier_height_margin: 0.5
+      # Diagnostic reference only: include upper unknown; slower than band scan.
+      ground_gain_full_scan: false
+      # Ground ranking model only; 0 inherits the real sensor unchanged.
+      ground_gain_angular_resolution_deg: 0.0
+      ground_gain_max_range: 0.0
       unknown_voxel_gain: 60.0
       nonuniform_ray_cast: true
       ray_cast_step_size_multiplier: 1.0

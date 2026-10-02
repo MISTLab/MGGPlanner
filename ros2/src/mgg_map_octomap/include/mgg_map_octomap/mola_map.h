@@ -297,6 +297,11 @@ class MolaMap : public MapInterface {
       const std::vector<Eigen::Vector3d>& multiray_endpoints, GainCounts& gain,
       std::vector<std::pair<Eigen::Vector3d, VoxelStatus>>& voxel_log,
       const SensorModel& sensor) override;
+  void getScanStatusInBounds(
+      const Eigen::Vector3d&, const std::vector<Eigen::Vector3d>&,
+      GainCounts&, std::vector<std::pair<Eigen::Vector3d, VoxelStatus>>&,
+      const SensorModel&, const ScanBounds&) override;
+
   bool augmentFreeBox(const Eigen::Vector3d& position,
                       const Eigen::Vector3d& box_size) override;
   void augmentFreeFrustum() override;

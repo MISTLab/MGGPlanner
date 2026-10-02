@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <limits>
 #include <list>
+#include <optional>
 #include <unordered_map>
 #include <utility>
 
@@ -25,6 +26,29 @@ bool inNoGainZone(const GainContext& ctx, const Eigen::Vector3d& voxel) {
 
 bool outsideGainRegion(const GainContext& ctx, const Eigen::Vector3d& voxel) {
   return ctx.gain_region != nullptr && !ctx.gain_region->isInsideSpace(voxel);
+}
+
+// Bound the existing inclusion region conservatively in navigation axes.
+// This is only traversal pruning; exact rotated/spherical inclusion remains
+// in the scoring loop below, as do no-gain exclusions.
+void intersectGainBounds(const BoundedSpaceParams& space, ScanBounds& bounds) {
+  Eigen::Vector3d low, high;
+  if (space.type == BoundedSpaceType::kSphere) {
+    const double radius = space.radiusTotal() > 0 ? space.radiusTotal() : space.radius;
+    low = space.getCenter() - Eigen::Vector3d::Constant(radius);
+    high = space.getCenter() + Eigen::Vector3d::Constant(radius);
+  } else {
+    const bool totals = space.minValTotal() != space.maxValTotal();
+    const Eigen::Vector3d a = totals ? space.minValTotal() : space.min_val;
+    const Eigen::Vector3d b = totals ? space.maxValTotal() : space.max_val;
+    const Eigen::Matrix3d rotation = space.getRotationMatrix().transpose();
+    const Eigen::Vector3d center = space.getCenter() + rotation * ((a + b) * 0.5);
+    const Eigen::Vector3d half = rotation.cwiseAbs() * ((b - a) * 0.5);
+    low = center - half;
+    high = center + half;
+  }
+  bounds.low = bounds.low.cwiseMax(low);
+  bounds.high = bounds.high.cwiseMin(high);
 }
 
 /// Where the ground under a vertex's surroundings has been mapped. The
@@ -124,7 +148,27 @@ void computeVolumetricGain(
       logWarn("gain: no sensor named '" + sensor_name + "'");
       continue;
     }
-    const SensorParams& sensor = it->second;
+    // A private model for ranking only: never mutate the sensor used by
+    // observed-body/FOV policy. Zero overrides retain its original ray table.
+    std::optional<SensorParams> gain_sensor;
+    const double step_deg = ctx.planning->ground_gain_angular_resolution_deg;
+    const double range = ctx.planning->ground_gain_max_range;
+    if (ground_robot && ((std::isfinite(step_deg) && step_deg > 0) ||
+                         (std::isfinite(range) && range > 0))) {
+      gain_sensor = it->second;
+      if (std::isfinite(step_deg) && step_deg > 0) {
+        const double step = std::min(step_deg, 180.0) * M_PI / 180.0;
+        for (int axis = 0; axis < 2; ++axis) {
+          const double real_step = gain_sensor->resolution[axis] > 0
+              ? gain_sensor->resolution[axis] : M_PI / 180.0;
+          gain_sensor->resolution[axis] = std::max(real_step, step);
+        }
+      }
+      if (std::isfinite(range) && range > 0)
+        gain_sensor->max_range = std::min(gain_sensor->max_range, range);
+      gain_sensor->update();
+    }
+    const SensorParams& sensor = gain_sensor ? *gain_sensor : it->second;
 
     // A ground robot's sensor sees from where it is mounted: rays from the
     // vertex started 0.2 m low for a Bunker's lidar (diag-sensor, run 7).
@@ -143,27 +187,32 @@ void computeVolumetricGain(
       continue;
     }
 
-    // Each voxel once per viewpoint: a voxel is revealed once however many
-    // rays cross it. getScanStatus logs it once per ray, and near the
-    // viewpoint hundreds of rays share a voxel (0.77 of the logged count was
-    // unique on the captured Bistro grids, diag-viewpoint 2026-09-24).
-    GainCounts raw;
-    std::vector<std::pair<Eigen::Vector3d, VoxelStatus>> visited;
-    ctx.map->getScanStatusIterative(ray_origin, endpoints, raw, visited,
-                                    sensor.model());
-    // A ground robot's gain has no top: the sensor's vertical field of view
-    // bounds what it counts. The band once stopped 0.8 m over the floor,
-    // under a Spot's lidar, and dropped 85 % of the unknown ahead in a
-    // corridor, its upper walls and ceiling (diag-sensor, run 7). The run-6
-    // unknown air over an explored hangar it was added for came from the
-    // planner grid dropping rays on a rebuild, not from what a sensor sees.
-    //
-    // Below the vertex, the band reaches max(2 max_ground_height, 1 m). A
-    // vertex rides max_ground_height above its ground, and nothing under
-    // mapped ground can be seen: 0.10 of the count at the captured plan
-    // ends lay under the floor (diag-viewpoint, 2026-09-24).
+    // Interest follows the robot's reachable level, not unknown ceiling air
+    // in a tall room. Keep the downward band: ramps and open stairwells can
+    // reveal useful space below the vertex's own floor.
+    const double band_top = ground_robot
+        ? origin.z() - ctx.planning->max_ground_height + ctx.robot->size.z() +
+              std::max(0.0, ctx.planning->ground_frontier_height_margin)
+        : std::numeric_limits<double>::infinity();
     const double max_h_below =
         std::max(ctx.planning->max_ground_height * 2.0, 1.0);
+    GainCounts raw;
+    std::vector<std::pair<Eigen::Vector3d, VoxelStatus>> visited;
+    if (ground_robot && !ctx.planning->ground_gain_full_scan) {
+      ScanBounds bounds;
+      bounds.low.z() = origin.z() - max_h_below;
+      bounds.high.z() = band_top;
+      intersectGainBounds(*ctx.global_space, bounds);
+      if (ctx.gain_region) intersectGainBounds(*ctx.gain_region, bounds);
+      ctx.map->getScanStatusInBounds(ray_origin, endpoints, raw, visited,
+                                     sensor.model(), bounds);
+      gain.num_total_unknown_voxels = -1;  // unavailable, not zero unknown
+    } else {
+      ctx.map->getScanStatusIterative(ray_origin, endpoints, raw, visited,
+                                      sensor.model());
+    }
+    gain.gain_rays_cast += raw.rays_cast;
+    gain.gain_voxel_visits += raw.voxel_visits;
     const double floor_depth =
         ctx.planning->max_ground_height + ctx.map->getResolution();
     ColumnSupport support(*ctx.map, origin,
@@ -191,6 +240,10 @@ void computeVolumetricGain(
         }
       }
 
+      if (gain.num_total_unknown_voxels >= 0 && entry.second == VoxelStatus::kUnknown)
+        ++gain.num_total_unknown_voxels;
+      if (voxel.z() > band_top) continue;
+
       switch (entry.second) {
         case VoxelStatus::kUnknown: ++unknown; break;
         case VoxelStatus::kFree: ++free; break;
@@ -214,15 +267,24 @@ void computeVolumetricGain(
     // suited a count of every voxel of every ray; against distinct voxels it
     // can deny a frontier even in space that is all unknown.
     const double resolution = ctx.map->getResolution();
-    if ((ground_robot && unknown * resolution >= 0.5) ||
-        sensor.isFrontier(unknown, resolution)) {
+    if (ground_robot ? unknown * resolution >= 0.5
+                     : sensor.isFrontier(unknown, resolution)) {
       gain.is_frontier = true;
     }
   }
+  // Known space (including nonzero free/occupied weights) must not compete
+  // with a door frontier or keep the low-gain/global handoff from firing.
+  if (ground_robot && !gain.is_frontier) gain.gain = 0.0;
 }
 
 int computeExplorationGain(GraphManager& graph, const GainContext& ctx,
                            bool only_leaf_vertices, bool clustering) {
+  const bool ground_robot =
+      ctx.robot != nullptr && ctx.robot->type == RobotType::kGroundRobot;
+  if (ground_robot && clustering) {
+    logInfo("ground gain: clustering skipped; frontier evidence is viewpoint-local");
+    clustering = false;
+  }
   // Leaves first: they sit at the edge of the graph and are the likeliest
   // frontiers, so with clustering on they seed the clusters.
   std::list<int> pending;
@@ -276,6 +338,8 @@ int computeExplorationGain(GraphManager& graph, const GainContext& ctx,
     }
 
     if (v->vol_gain.is_frontier) v->type = VertexType::kFrontier;
+    else if (ground_robot && v->type == VertexType::kFrontier)
+      v->type = VertexType::kUnvisited;
   }
   return evaluated;
 }

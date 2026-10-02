@@ -8,6 +8,7 @@
 #include <vector>
 
 #include "mgg_core/voxel_walk.h"
+#include "mgg_map_octomap/scan_walk.h"
 
 namespace mgg {
 namespace {
@@ -616,19 +617,57 @@ void NativeMolaGrid::getScanStatusIterative(
     const SensorModel&) {
   scanUnique(p, ends, g, log);
 }
+void NativeMolaGrid::getScanStatusInBounds(
+    const Eigen::Vector3d& p, const std::vector<Eigen::Vector3d>& ends,
+    GainCounts& g, std::vector<std::pair<Eigen::Vector3d, VoxelStatus>>& log,
+    const SensorModel&, const ScanBounds& bounds) {
+  scanUnique(p, ends, g, log, &bounds);
+}
 void NativeMolaGrid::scanUnique(
     const Eigen::Vector3d& p, const std::vector<Eigen::Vector3d>& ends,
     GainCounts& g,
-    std::vector<std::pair<Eigen::Vector3d, VoxelStatus>>& log) const {
+    std::vector<std::pair<Eigen::Vector3d, VoxelStatus>>& log,
+    const ScanBounds* bounds) const {
   g = {};
   // A cell's status is decided on its first visit; a later ray only needs
   // to know whether it passes.
   enum : std::uint8_t { kNew = 0, kCounted, kCountedOccupied };
   thread_local ScanCells cells;
   cells.reset();
+  // Preserve original endpoints and DDA arithmetic: shortening a ray changes
+  // floating-point edge/corner ties and can change even in-band counts.
+  // Half a cube diagonal covers the offset from its centre to a touched ray.
+  const double padding = std::sqrt(3.0) * 0.5 * resolution_ + 1e-6;
+  const Eigen::Vector3d start = bounds ? bounds->bounds_from_map * p : p;
   for (const auto& e : ends) {
     planningCheckpoint();
-    const bool valid = walk(p, e, [&](const Cell& k) {
+    const Eigen::Vector3d direction = e - p;
+    double stop_projection = std::numeric_limits<double>::infinity();
+    if (bounds && p.allFinite() && e.allFinite()) {
+      const Eigen::Vector3d delta = bounds->bounds_from_map.linear() * direction;
+      double first = 0, last = 1;
+      for (int axis = 0; axis < 3; ++axis) {
+        const double low = bounds->low[axis] - padding;
+        const double high = bounds->high[axis] + padding;
+        if (delta[axis] == 0) {
+          if (start[axis] < low || start[axis] > high) last = -1;
+        } else {
+          double a = (low - start[axis]) / delta[axis];
+          double b = (high - start[axis]) / delta[axis];
+          if (a > b) std::swap(a, b);
+          first = std::max(first, a);
+          last = std::min(last, b);
+        }
+      }
+      if (first > last) continue;
+      // Retain another half-diagonal for the centre/line offset at the stop
+      // test, including cells visited in any order at a DDA corner tie.
+      stop_projection = last * direction.squaredNorm() + padding * direction.norm();
+    }
+    ++g.rays_cast;
+    auto visit = [&](const Cell& k) {
+      ++g.voxel_visits;
+      if (bounds && direction.dot(center(k) - p) > stop_projection) return false;
       std::uint8_t& state = cells[k];
       if (state != kNew) return state == kCounted;
       const auto s = status(k);
@@ -641,7 +680,16 @@ void NativeMolaGrid::scanUnique(
       else
         ++g.free;
       return s != VoxelStatus::kOccupied;
-    });
+    };
+    // The pruned walk keeps walk()'s throttled per-voxel checkpoint.
+    std::size_t visited = 0;
+    const bool valid = bounds
+        ? walkScanVoxels(p, e, resolution_, kMaxWork,
+                         [&](const VoxelIndex& k) {
+                           if ((visited++ & 63u) == 0) planningCheckpoint();
+                           return visit(Cell{k.x, k.y, k.z});
+                         })
+        : walk(p, e, visit);
     if (!valid) {
       ++g.unknown;
       log.emplace_back(p, VoxelStatus::kUnknown);

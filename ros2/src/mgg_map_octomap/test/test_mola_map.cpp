@@ -337,6 +337,44 @@ TEST(MolaMap, LoadsQualifiedTernaryMapAndAppliesFullSe3) {
                                    Eigen::Vector3d::Ones()));
 }
 
+TEST(MolaMap, BandScanTransformsTheSlabWithItsAuthority) {
+  Publication publication;
+  Eigen::Isometry3d transform = Eigen::Isometry3d::Identity();
+  transform.linear() =
+      (Eigen::AngleAxisd(0.4, Eigen::Vector3d::UnitZ()) *
+       Eigen::AngleAxisd(0.03, Eigen::Vector3d::UnitY())).toRotationMatrix();
+  transform.translation() = Eigen::Vector3d(1.0, -2.0, 0.7);
+  MolaMap map(config(publication));
+  map.requestSnapshot(publication.publish(0, {{4, 2, 3}, {0, 0, 6}},
+                                          freeBlock(), true, transform));
+  ASSERT_TRUE(waitFor([&]() { return map.getStatus(); })) << map.lastError();
+  for (double height : {0.1, 2.1}) {
+    const Eigen::Vector3d origin(0.1, 0.1, height);
+    std::vector<Eigen::Vector3d> ends;
+    for (int x = -3; x <= 3; ++x)
+      for (int y = -3; y <= 3; ++y)
+        for (int z = -3; z <= 3; ++z)
+          ends.push_back(origin + Eigen::Vector3d(x, y, z));
+    mgg::GainCounts full, pruned;
+    std::vector<std::pair<Eigen::Vector3d, VoxelStatus>> a, b;
+    const mgg::SensorModel sensor{};
+    map.getScanStatusIterative(origin, ends, full, a, sensor);
+    mgg::ScanBounds bounds;
+    bounds.low.z() = -0.4;
+    bounds.high.z() = 0.8;
+    map.getScanStatusInBounds(origin, ends, pruned, b, sensor, bounds);
+    auto band = [](const auto& entries) {
+      std::set<std::tuple<double, double, double, int>> cells;
+      for (const auto& e : entries)
+        if (e.first.z() >= -0.4 && e.first.z() <= 0.8)
+          cells.emplace(e.first.x(), e.first.y(), e.first.z(), int(e.second));
+      return cells;
+    };
+    EXPECT_EQ(band(a), band(b));
+    EXPECT_LT(pruned.voxel_visits, full.voxel_visits);
+  }
+}
+
 // Rewrites a published grid's SDMGRID1 metadata and restates the index
 // descriptors, so a test can present one specific contract violation.
 void rewriteGridMetadata(const std::filesystem::path& root,
