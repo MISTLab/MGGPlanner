@@ -1431,7 +1431,9 @@ bool MolaMap::aerialRootRecoveryTraversable(
   const auto snapshot = current();
   if (snapshot == nullptr || !start.allFinite() || !end.allFinite() ||
       !size.allFinite() || (size.array() <= 0).any()) return false;
-  // No change to peer/no-go departure or endpoint margins.
+  // Peer/no-go departure semantics are unchanged, but the sweep radius
+  // follows this aerial size: deployed .55/2 -> .600001/2 m with the
+  // minimum-free-run policy. The explicit aerial peer margin stays .35 m.
   if (discsBlockSweep(start, end, 0.5 * std::max(size.x(), size.y())) ||
       discsBlockBox(end, size)) return false;
   const auto& transform = snapshot->request.component_from_navigation;
