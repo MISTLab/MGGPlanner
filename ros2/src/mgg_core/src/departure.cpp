@@ -216,7 +216,8 @@ bool reverseExitEdgeAdmissible(
   };
   std::vector<Eigen::Vector3d> projected;
   if (ground.getProjectedEdgeStatus(
-          from.head<3>() + robot.center_offset, to.head<3>() + robot.center_offset,
+          from.head<3>() + robot.offsetForHeading(body.heading),
+          to.head<3>() + robot.offsetForHeading(body.heading),
           body.size, false, projected, false, false, &check,
           EdgeTravel::kForward) != ProjectedEdgeStatus::kAdmissible) return false;
   for (std::size_t i = 1; i < projected.size(); ++i) {
@@ -247,7 +248,7 @@ bool findDeparture(const MapInterface& map, const GroundProjection& ground,
       max_distance > 3.0 || !std::isfinite(step) || step <= 0) return false;
   const int steps = static_cast<int>(std::ceil(max_distance / step - 1e-9));
   OrientedBox standing;
-  standing.center = start.head<3>();
+  standing.center = start.head<3>() + robot.offsetForHeading(start[3]);
   standing.heading = start[3];
   standing.size = robot.getPlanningSize();
 
@@ -271,7 +272,9 @@ bool findDeparture(const MapInterface& map, const GroundProjection& ground,
       }
       check.standing_at_start = from_start;
       std::vector<Eigen::Vector3d> projected;
-      return ground.getProjectedEdgeStatus(from.head<3>(), to.head<3>(),
+      return ground.getProjectedEdgeStatus(
+          from.head<3>() + robot.offsetForHeading(heading),
+          to.head<3>() + robot.offsetForHeading(heading),
                                            body.size, true, projected, false,
                                            false, &check,
                                            EdgeTravel::kForward) ==
@@ -330,7 +333,9 @@ bool findDeparture(const MapInterface& map, const GroundProjection& ground,
       const double turn = (side == 0 ? 1.0 : -1.0) * k * kDepartureTurnStepRad;
       OrientedBox turned = standing;
       turned.heading = start[3] + turn;
-      if (orientedBoxPathStatus(map, start.head<3>(), start.head<3>(), turned,
+      if (orientedBoxPathStatus(map,
+          start.head<3>() + robot.offsetForHeading(turned.heading),
+          start.head<3>() + robot.offsetForHeading(turned.heading), turned,
                                 true, &standing) != VoxelStatus::kFree) {
         blocked[side] = true;
         continue;

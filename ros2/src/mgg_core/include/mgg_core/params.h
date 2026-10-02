@@ -37,12 +37,15 @@ struct RobotParams {
   Eigen::Vector3d size_extension_min = Eigen::Vector3d::Zero();
   /// Recommended extension; must be at least size_extension_min.
   Eigen::Vector3d size_extension = Eigen::Vector3d::Zero();
-  /// Cuboid centre = state + center_offset.
+  /// Ground body-frame offset; aerial offsets retain their map-frame convention.
   Eigen::Vector3d center_offset = Eigen::Vector3d::Zero();
   /// Blend factor in [0,1] for kRelaxedBound.
   double relax_ratio = 0.5;
   BoundModeType bound_mode = BoundModeType::kExtendedBound;
   Eigen::Vector3d safety_extension = Eigen::Vector3d::Zero();
+
+  /// Offset in map coordinates for a body facing heading (radians).
+  Eigen::Vector3d offsetForHeading(double heading) const;
 
   /// Planning footprint implied by bound_mode.
   Eigen::Vector3d getPlanningSize() const;

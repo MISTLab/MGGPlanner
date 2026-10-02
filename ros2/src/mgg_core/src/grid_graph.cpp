@@ -277,7 +277,7 @@ GridGraphResult buildGridGraph(GraphManager& graph, const StateVec& state,
                                 candidate.x() - nearest->state.x());
     }
     body.size = ctx.robot_box_size;
-    Eigen::Vector3d center = candidate + ctx.robot->center_offset;
+    Eigen::Vector3d center = candidate + ctx.robot->offsetForHeading(body.heading);
     if (driving_z) center.z() = *driving_z + ctx.robot->center_offset.z();
     std::optional<ProfileScope> timed_precheck;
     timed_precheck.emplace(profile ? &profile->cell_prechecks : nullptr);

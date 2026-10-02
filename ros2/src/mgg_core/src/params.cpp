@@ -1,6 +1,14 @@
 #include "mgg_core/params.h"
+#include <cmath>
 
 namespace mgg {
+
+Eigen::Vector3d RobotParams::offsetForHeading(double heading) const {
+  if (type == RobotType::kAerialRobot) return center_offset;
+  const double c = std::cos(heading), s = std::sin(heading);
+  return {c * center_offset.x() - s * center_offset.y(),
+          s * center_offset.x() + c * center_offset.y(), center_offset.z()};
+}
 
 Eigen::Vector3d RobotParams::getPlanningSize() const {
   switch (bound_mode) {

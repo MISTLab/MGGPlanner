@@ -448,8 +448,10 @@ bool drivenEdgeTraversable(const ExpandContext& ctx, const Vertex& from,
       d_norm > 1e-12
           ? Eigen::Vector3d(direction / d_norm * ctx.planning->edge_overshoot)
           : Eigen::Vector3d::Zero();
-  const Eigen::Vector3d start = origin + ctx.robot->center_offset - overshoot;
-  Eigen::Vector3d end = origin + ctx.robot->center_offset + direction;
+  const Eigen::Vector3d offset = ctx.robot->offsetForHeading(
+      std::atan2(direction.y(), direction.x()));
+  const Eigen::Vector3d start = origin + offset - overshoot;
+  Eigen::Vector3d end = origin + offset + direction;
   if (to.id != 0) end += overshoot;
   if (ctx.planning->geofence_checking_enable && ctx.geofence != nullptr &&
       ctx.geofence->getPathStatus(
@@ -471,9 +473,18 @@ bool drivenEdgeTraversable(const ExpandContext& ctx, const Vertex& from,
     return orientedBoxPathStatus(*ctx.map, a, b, body, false, nullptr);
   };
   std::vector<Eigen::Vector3d> projected;
-  const ProjectedEdgeStatus status = ctx.ground->getProjectedEdgeStatus(
+  ProjectedEdgeStatus status = ctx.ground->getProjectedEdgeStatus(
       start, end, ctx.robot_box_size, false, projected, false, false, &check,
       EdgeTravel::kBothWays);
+  if (status == ProjectedEdgeStatus::kAdmissible &&
+      ctx.robot->center_offset.head<2>().squaredNorm() > 0.0) {
+    const Eigen::Vector3d reverse_shift =
+        ctx.robot->offsetForHeading(body.heading + M_PI) - offset;
+    body.heading += M_PI;
+    status = ctx.ground->getProjectedEdgeStatus(
+        end + reverse_shift, start + reverse_shift, ctx.robot_box_size, false,
+        projected, false, false, &check, EdgeTravel::kBothWays);
+  }
   ++rep.edge_status[static_cast<int>(status)];
   return status == ProjectedEdgeStatus::kAdmissible;
 }
@@ -796,6 +807,15 @@ Vertex* connectGoalThroughLattice(GraphManager& graph, const StateVec& goal,
   ExpandContext metric_ctx = ctx;
   metric_ctx.planning = &metric_planning;
   metric_ctx.edge_cost = {};
+  std::optional<GroundProjection> cached_ground;
+  EdgeVerdictCache verdicts;
+  if (ctx.robot->type == RobotType::kGroundRobot && ctx.ground) {
+    cached_ground.emplace(*ctx.map, metric_planning, true);
+    cached_ground->setStandingStart(ctx.ground->standingStart());
+    cached_ground->setProfile(ctx.ground->profile());
+    metric_ctx.ground = &*cached_ground;
+    metric_ctx.edge_verdicts = &verdicts;
+  }
 
   // The lattice itself is scratch; only the path through it that reaches the
   // roadmap is kept. Rooted at the goal, so every lattice vertex it reaches
@@ -816,7 +836,7 @@ Vertex* connectGoalThroughLattice(GraphManager& graph, const StateVec& goal,
         buildGridGraph(lattice, goal, grid, metric_ctx, heading);
     if (built.status != GridGraphStatus::kOk) return nullptr;
     ++out.passes;
-    if (built.vertices_added == 0 ||
+    if (built.hit_deadline || built.vertices_added == 0 ||
         lattice.getNumVertices() >= ctx.planning->num_vertices_max) {
       break;
     }

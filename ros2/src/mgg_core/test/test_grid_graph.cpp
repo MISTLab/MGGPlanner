@@ -1,3 +1,4 @@
+#include "mgg_core/local_route.h"
 // Tests for the grid local planner, the "grid" in Multi-robot Grid Graph.
 // The ROS 1 version had none: it ran only inside a full planning cycle.
 
@@ -864,6 +865,42 @@ TEST(GridGraph, ADeckOverTheFloorReachedOnlyByGoingOutwardFirstIsJoined) {
   EXPECT_GT(walkway, 0);
   EXPECT_GT(floor_under_deck, 0);
   EXPECT_GT(deck, 0);
+}
+
+// Ground support stays flat; one overhanging occupied body column is
+// deliberately outside the unrotated offset footprint.
+class OffsetObstacle : public mgg_test::TerrainFixture {
+ public:
+  OffsetObstacle() : TerrainFixture(0.1, floor()) {}
+  static std::map<std::pair<std::int64_t, std::int64_t>, double> floor() {
+    std::map<std::pair<std::int64_t, std::int64_t>, double> cells;
+    for (int x = -40; x <= 40; ++x)
+      for (int y = -40; y <= 40; ++y) cells[{x, y}] = 0.0;
+    return cells;
+  }
+  VoxelStatus getBoxStatus(const Eigen::Vector3d& c,
+                           const Eigen::Vector3d& size, bool unknown) const override {
+    if (std::abs(c.x() - 0.05) <= 0.01 &&
+        std::abs(c.y() + 0.75) <= 0.01 &&
+        c.z() + size.z() / 2 >= 0.4) return VoxelStatus::kOccupied;
+    return TerrainFixture::getBoxStatus(c, size, unknown);
+  }
+};
+
+TEST(GridGraph, ShortcutRotatesBodyOffsetWithHeading) {
+  OffsetObstacle map;
+  PlanningParams planning;
+  planning.max_ground_height = 0.5;
+  planning.min_observed_ground_fraction = 0.0;
+  RobotParams robot;
+  robot.size = Eigen::Vector3d(0.8, 0.4, 0.4);
+  robot.center_offset = Eigen::Vector3d(-0.8, 0, 0);
+  mgg::GroundProjection ground(map, planning);
+  ExpandContext ctx;
+  ctx.map = &map; ctx.planning = &planning; ctx.robot = &robot;
+  ctx.ground = &ground; ctx.robot_box_size = robot.getPlanningSize();
+  EXPECT_FALSE(mgg::groundShortcutSegmentAdmissible(
+      ctx, Eigen::Vector3d(0, 0, 0.5), Eigen::Vector3d(0, 0.4, 0.5), false));
 }
 
 }  // namespace

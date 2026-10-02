@@ -100,9 +100,22 @@ bool edgeTraversable(const ExpandContext& ctx, const Eigen::Vector3d& start,
     return orientedBoxPathStatus(*ctx.map, a, b, body, stop_at_unknown, nullptr);
   };
   // Ground robot: the edge has to follow the terrain.
-  const ProjectedEdgeStatus es = ctx.ground->getProjectedEdgeStatus(
+  ProjectedEdgeStatus es = ctx.ground->getProjectedEdgeStatus(
       start, end, ctx.robot_box_size, stop_at_unknown, projected_edge,
       is_hanging, preserve_start_height, &check, travel);
+  // The graph is undirected. Reversing the chassis heading moves a
+  // noncentral footprint; validate that support and swept volume too.
+  if (es == ProjectedEdgeStatus::kAdmissible && travel == EdgeTravel::kBothWays &&
+      ctx.robot->center_offset.head<2>().squaredNorm() > 0.0) {
+    const Eigen::Vector3d reverse_shift =
+        ctx.robot->offsetForHeading(body.heading + M_PI) -
+        ctx.robot->offsetForHeading(body.heading);
+    body.heading += M_PI;
+    std::vector<Eigen::Vector3d> reverse;
+    es = ctx.ground->getProjectedEdgeStatus(
+        end + reverse_shift, start + reverse_shift, ctx.robot_box_size,
+        stop_at_unknown, reverse, is_hanging, false, &check, EdgeTravel::kBothWays);
+  }
   ++rep.edge_status[static_cast<int>(es)];
   if (ctx.edge_verdicts != nullptr) {
     ctx.edge_verdicts->add(
@@ -199,8 +212,8 @@ void expandGraphFrom(GraphManager& graph, Vertex& new_vertex,
     // reject at the projected driving height.
     if (ctx.strict_projected_endpoint) {
       rep.projected_endpoint_status = ctx.map->getStrictBoxStatus(
-          new_state.head<3>() + ctx.robot->center_offset,
-          ctx.robot_box_size);
+          new_state.head<3>() + ctx.robot->offsetForHeading(
+              std::atan2(direction.y(), direction.x())), ctx.robot_box_size);
       if (rep.projected_endpoint_status != VoxelStatus::kFree) {
         rep.status = ExpandGraphStatus::kErrorCollisionEdge;
         return;
@@ -225,10 +238,12 @@ void expandGraphFrom(GraphManager& graph, Vertex& new_vertex,
           ? Eigen::Vector3d(ctx.planning->edge_overshoot * direction.normalized())
           : Eigen::Vector3d::Zero();
 
-  Eigen::Vector3d start_pos = origin + ctx.robot->center_offset;
+  const Eigen::Vector3d offset = ctx.robot->offsetForHeading(
+      std::atan2(direction.y(), direction.x()));
+  Eigen::Vector3d start_pos = origin + offset;
   if (nearest_vertex->id != 0) start_pos -= overshoot;
   const Eigen::Vector3d end_pos =
-      origin + ctx.robot->center_offset + direction + overshoot;
+      origin + offset + direction + overshoot;
   // The root is where the robot stands. The map cannot say the robot cannot
   // be there: a floor mapped a step higher around a robot resting in a dip,
   // or a wall's returns smeared into the footprint of a robot parked against
@@ -348,9 +363,10 @@ void expandGraphFrom(GraphManager& graph, Vertex& new_vertex,
     }
     const Eigen::Vector3d p_overshoot =
         to_neighbour / d_norm * ctx.planning->edge_overshoot;
-    const Eigen::Vector3d p_start =
-        new_origin + ctx.robot->center_offset - p_overshoot;
-    Eigen::Vector3d p_end = new_origin + ctx.robot->center_offset + to_neighbour;
+    const Eigen::Vector3d offset = ctx.robot->offsetForHeading(
+        std::atan2(to_neighbour.y(), to_neighbour.x()));
+    const Eigen::Vector3d p_start = new_origin + offset - p_overshoot;
+    Eigen::Vector3d p_end = new_origin + offset + to_neighbour;
     if (neighbour->id != 0) p_end += p_overshoot;
 
     if (geofenceBlocks(ctx, p_start, p_end)) continue;
@@ -391,9 +407,10 @@ bool roadmapEdgeTraversable(const ExpandContext& ctx, const Vertex& from,
       d_norm > 1e-12
           ? Eigen::Vector3d(direction / d_norm * ctx.planning->edge_overshoot)
           : Eigen::Vector3d::Zero();
-  const Eigen::Vector3d p_start =
-      origin + ctx.robot->center_offset - p_overshoot;
-  Eigen::Vector3d p_end = origin + ctx.robot->center_offset + direction;
+  const Eigen::Vector3d offset = ctx.robot->offsetForHeading(
+      std::atan2(direction.y(), direction.x()));
+  const Eigen::Vector3d p_start = origin + offset - p_overshoot;
+  Eigen::Vector3d p_end = origin + offset + direction;
   if (to.id != 0) p_end += p_overshoot;
   if (geofenceBlocks(ctx, p_start, p_end)) return false;
   std::vector<Eigen::Vector3d> edge;

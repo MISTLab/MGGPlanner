@@ -119,9 +119,10 @@ bool groundShortcutSegmentAdmissible(const ExpandContext& ctx,
                                  nullptr);
   };
   std::vector<Eigen::Vector3d> projected;
+  const Eigen::Vector3d offset = ctx.robot->offsetForHeading(body.heading);
   // Driven from `from` to `to`: the shortcut is the path itself.
   return ctx.ground->getProjectedEdgeStatus(
-             from + ctx.robot->center_offset, to + ctx.robot->center_offset,
+             from + offset, to + offset,
              ctx.robot_box_size, stop_at_unknown, projected, false, false,
              &check, EdgeTravel::kForward) == ProjectedEdgeStatus::kAdmissible;
 }
