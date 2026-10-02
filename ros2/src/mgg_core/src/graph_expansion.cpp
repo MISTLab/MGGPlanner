@@ -67,6 +67,29 @@ bool edgeTraversable(const ExpandContext& ctx, const Eigen::Vector3d& start,
     return ctx.map->getStrictPathStatus(start, end, ctx.robot_box_size) ==
            VoxelStatus::kFree;
   }
+  EdgeVerdictCache::Key key{};
+  if (ctx.edge_verdicts != nullptr) {
+    const auto micro = [](double value) {
+      return static_cast<std::int64_t>(std::llround(value * 1e6));
+    };
+    key = {micro(start.x()), micro(start.y()), micro(start.z()),
+           micro(end.x()),   micro(end.y()),   micro(end.z()),
+           (is_hanging ? 1 : 0) | (preserve_start_height ? 2 : 0) |
+               (stop_at_unknown ? 4 : 0) |
+               (travel == EdgeTravel::kForward ? 8 : 0),
+           micro(ctx.robot_box_size.x()), micro(ctx.robot_box_size.y()),
+           micro(ctx.robot_box_size.z()), 0, 0};
+    if (const EdgeVerdictCache::Verdict* known = ctx.edge_verdicts->find(key)) {
+      if (PlanProfile* profile = ctx.ground->profile()) {
+        ++profile->edge_cache_hits;
+      }
+      ++rep.edge_status[static_cast<int>(known->status)];
+      if (known->status == ProjectedEdgeStatus::kSteep) ++rep.steep_edges;
+      if (known->status != ProjectedEdgeStatus::kAdmissible) return false;
+      projected_edge = known->projected_edge;
+      return true;
+    }
+  }
   // Keep the extended body aligned with travel, as for driven roadmap
   // edges; the terrain and observed-ground checks remain unchanged.
   OrientedBox body;
@@ -81,6 +104,12 @@ bool edgeTraversable(const ExpandContext& ctx, const Eigen::Vector3d& start,
       start, end, ctx.robot_box_size, stop_at_unknown, projected_edge,
       is_hanging, preserve_start_height, &check, travel);
   ++rep.edge_status[static_cast<int>(es)];
+  if (ctx.edge_verdicts != nullptr) {
+    ctx.edge_verdicts->add(
+        key, {es, es == ProjectedEdgeStatus::kAdmissible
+                      ? projected_edge
+                      : std::vector<Eigen::Vector3d>{}});
+  }
   if (es == ProjectedEdgeStatus::kAdmissible) return true;
   if (es == ProjectedEdgeStatus::kSteep) ++rep.steep_edges;
   return false;
@@ -92,11 +121,21 @@ bool edgeTraversable(const ExpandContext& ctx, const Eigen::Vector3d& start,
 void expandGraph(GraphManager& graph, Vertex& new_vertex,
                  ExpandGraphReport& rep, const ExpandContext& ctx,
                  bool allow_short_edge) {
-  StateVec new_state = new_vertex.state;
-
   Vertex* nearest_vertex = nullptr;
-  if (!graph.getNearestVertex(&new_state, &nearest_vertex) ||
+  if (!graph.getNearestVertex(&new_vertex.state, &nearest_vertex) ||
       nearest_vertex == nullptr) {
+    rep.status = ExpandGraphStatus::kErrorKdTree;
+    return;
+  }
+  expandGraphFrom(graph, new_vertex, nearest_vertex, rep, ctx,
+                  allow_short_edge);
+}
+
+void expandGraphFrom(GraphManager& graph, Vertex& new_vertex,
+                     Vertex* nearest_vertex, ExpandGraphReport& rep,
+                     const ExpandContext& ctx, bool allow_short_edge) {
+  StateVec new_state = new_vertex.state;
+  if (nearest_vertex == nullptr) {
     rep.status = ExpandGraphStatus::kErrorKdTree;
     return;
   }

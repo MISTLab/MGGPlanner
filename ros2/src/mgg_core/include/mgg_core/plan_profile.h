@@ -22,8 +22,13 @@ struct ProfileCounter {
 };
 
 struct PlanProfile {
-  /// GroundProjection::projectSample.
+  /// GroundProjection::projectSample, and those answered from the per-plan
+  /// column cache.
   ProfileCounter projection;
+  std::uint64_t projection_cache_hits = 0;
+  /// Ground rays cast down a column (projection probes and footprint
+  /// cells), whatever answered them.
+  ProfileCounter ground_rays;
   /// GroundProjection::getProjectedEdgeStatus, whole.
   ProfileCounter edge_checks;
   /// Body sweeps inside edge checks, one per projected segment.
@@ -40,6 +45,8 @@ struct PlanProfile {
   ProfileCounter clearance;
   /// Lattice cell body prechecks (box, then oriented box).
   ProfileCounter cell_prechecks;
+  /// Lattice cell prechecks answered from the build's own memo.
+  std::uint64_t precheck_cache_hits = 0;
   /// Lattice cells refused by the conservative inscribed-disc pre-filter
   /// before any exact check.
   std::uint64_t prefilter_rejects = 0;
@@ -48,6 +55,8 @@ struct PlanProfile {
   /// Other-level retry offers and lateral nudge offers made.
   std::uint64_t retries = 0;
   std::uint64_t nudges = 0;
+  /// Lattice cells tried from another vertex than their nearest.
+  std::uint64_t alternate_parents = 0;
   /// Lattice build, goal link, graph search and shortcut, whole.
   ProfileCounter lattice;
   ProfileCounter goal_link;

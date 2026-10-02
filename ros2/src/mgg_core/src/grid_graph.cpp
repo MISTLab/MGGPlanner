@@ -2,12 +2,35 @@
 #include "mgg_core/departure.h"
 
 #include <algorithm>
+#include <array>
+#include <chrono>
 #include <cmath>
 #include <optional>
 #include <tuple>
+#include <unordered_map>
 #include <vector>
 
 namespace mgg {
+
+namespace {
+
+/// A length or angle as a whole number of millionths, for a cache key.
+std::int64_t micro(double value) {
+  return static_cast<std::int64_t>(std::llround(value * 1e6));
+}
+
+struct KeyHash {
+  std::size_t operator()(const std::array<std::int64_t, 4>& key) const {
+    std::size_t hash = 0;
+    for (const std::int64_t part : key) {
+      hash ^= std::hash<std::int64_t>()(part) + 0x9e3779b97f4a7c15ULL +
+              (hash << 6) + (hash >> 2);
+    }
+    return hash;
+  }
+};
+
+}  // namespace
 
 bool LatticeColumnGround::holds(int i, int j, double z) const {
   const auto it = heights_.find(key(i, j));
@@ -103,12 +126,22 @@ GridGraphResult buildGridGraph(GraphManager& graph, const StateVec& state,
       result.hit_limit = true;
       return false;
     }
+    if (ctx.deadline && std::chrono::steady_clock::now() >= *ctx.deadline) {
+      result.hit_limit = true;
+      result.hit_deadline = true;
+      if (profile != nullptr) profile->budget_exhausted = true;
+      return false;
+    }
     return true;
   };
 
   // Only lattice routing weights carry clearance; roadmap geometry and the
   // physical tree distance retain metres. GroundProjection is plan-scoped.
   ExpandContext weighted_ctx = ctx;
+  EdgeVerdictCache build_verdicts;
+  if (ground_robot && weighted_ctx.edge_verdicts == nullptr) {
+    weighted_ctx.edge_verdicts = &build_verdicts;
+  }
   if (ground_robot && ctx.planning->path_clearance_margin > 0.0) {
     weighted_ctx.edge_cost =
         [&](const Eigen::Vector3d& a, const Eigen::Vector3d& b) {
@@ -124,6 +157,7 @@ GridGraphResult buildGridGraph(GraphManager& graph, const StateVec& state,
     // a vertex at its column already on that ground makes it the same place
     // again.
     bool other_level = false;
+    std::optional<double> ground_driving_z;
     if (ground_robot) {
       Eigen::Vector3d sample = cell;
       VoxelStatus ground_status;
@@ -136,6 +170,7 @@ GridGraphResult buildGridGraph(GraphManager& graph, const StateVec& state,
         if (first_pass) ++result.merged_duplicates;
         return false;
       }
+      if (ground_status == VoxelStatus::kOccupied) ground_driving_z = driving_z;
       other_level = ground_status == VoxelStatus::kOccupied &&
                     std::abs(driving_z - state.z()) >
                         ctx.planning->max_step_height;
@@ -145,6 +180,41 @@ GridGraphResult buildGridGraph(GraphManager& graph, const StateVec& state,
     candidate.robot_id = ctx.robot_id;
     ExpandGraphReport rep;
     expandGraph(graph, candidate, rep, weighted_ctx);
+    // Refused from its nearest vertex, a ground cell may still join from
+    // another vertex beside it, nearest first: a cell past an obstacle's
+    // corner, or on a level whose vertices the cell's lattice height is
+    // farther from than another level's (kLatticeAlternateParents).
+    ExpandGraphReport alternate;
+    if (ground_robot && rep.status == ExpandGraphStatus::kErrorCollisionEdge &&
+        !rep.no_ground && kLatticeAlternateParents > 0) {
+      // Around where the cell's body will stand, at driving height over its
+      // ground, not its lattice height: on another level the vertices of
+      // that level are the ones it joins.
+      StateVec standing = candidate.state;
+      if (ground_driving_z) standing[2] = *ground_driving_z;
+      std::vector<Vertex*> around;
+      if (graph.getNearestVertices(&standing, ctx.planning->edge_length_max,
+                                   &around)) {
+        Vertex* tried_parent = nullptr;
+        graph.getNearestVertex(&candidate.state, &tried_parent);
+        std::sort(around.begin(), around.end(),
+                  [&standing](const Vertex* a, const Vertex* b) {
+                    return (a->state.head<3>() - standing.head<3>())
+                               .squaredNorm() <
+                           (b->state.head<3>() - standing.head<3>())
+                               .squaredNorm();
+                  });
+        int alternates = 0;
+        for (Vertex* parent : around) {
+          if (parent == nullptr || parent == tried_parent) continue;
+          if (alternates++ >= kLatticeAlternateParents) break;
+          if (profile != nullptr) ++profile->alternate_parents;
+          alternate = ExpandGraphReport();
+          expandGraphFrom(graph, candidate, parent, alternate, weighted_ctx);
+          if (alternate.status == ExpandGraphStatus::kSuccess) break;
+        }
+      }
+    }
     if (first_pass) {
       ++result.rejected[static_cast<int>(rep.status)];
       if (rep.no_ground) ++result.no_ground;
@@ -154,6 +224,14 @@ GridGraphResult buildGridGraph(GraphManager& graph, const StateVec& state,
         ++result.projected_endpoint_unknown;
       }
       for (int e = 0; e < 8; ++e) result.edge_status[e] += rep.edge_status[e];
+    }
+    if (rep.status != ExpandGraphStatus::kSuccess &&
+        alternate.status == ExpandGraphStatus::kSuccess) {
+      rep.status = alternate.status;
+      rep.num_vertices_added = alternate.num_vertices_added;
+      rep.num_edges_added = alternate.num_edges_added;
+      rep.vertex_added = alternate.vertex_added;
+      if (first_pass) ++result.joined_from_alternate;
     }
     if (rep.status == ExpandGraphStatus::kSuccess) {
       added = true;
@@ -173,8 +251,19 @@ GridGraphResult buildGridGraph(GraphManager& graph, const StateVec& state,
     return rep.edge_status[static_cast<int>(ProjectedEdgeStatus::kOccupied)] > 0;
   };
 
+  // Precheck verdicts by where the body stands and how it is turned: the
+  // z levels of a column that drop onto one ground, and its nudges' repeats,
+  // are checked once (exact: the key is every input of the check).
+  std::unordered_map<std::array<std::int64_t, 4>, VoxelStatus, KeyHash>
+      prechecks;
+
+  // A ground robot's cell is checked where its body will stand: at the
+  // driving height over the ground under it (`driving_z`, when found), so
+  // every z level of a column that drops onto the same ground gets the same
+  // verdict, checked once (`prechecks`).
   const auto try_cell = [&](const Eigen::Vector3d& candidate, int i, int j,
-                            bool first_pass, bool& added) {
+                            bool first_pass, bool& added,
+                            std::optional<double> driving_z) {
     OrientedBox body;
     body.heading = heading;
     StateVec query(candidate.x(), candidate.y(), candidate.z(), heading);
@@ -186,17 +275,31 @@ GridGraphResult buildGridGraph(GraphManager& graph, const StateVec& state,
                                 candidate.x() - nearest->state.x());
     }
     body.size = ctx.robot_box_size;
-    const Eigen::Vector3d center = candidate + ctx.robot->center_offset;
+    Eigen::Vector3d center = candidate + ctx.robot->center_offset;
+    if (driving_z) center.z() = *driving_z + ctx.robot->center_offset.z();
     std::optional<ProfileScope> timed_precheck;
     timed_precheck.emplace(profile ? &profile->cell_prechecks : nullptr);
-    VoxelStatus status = ctx.robot->type == RobotType::kAerialRobot
-        ? ctx.map->getStrictBoxStatus(center, ctx.robot_box_size)
-        : ctx.map->getBoxStatus(center, ctx.robot_box_size,
-                                !ctx.allow_unknown_lattice_body);
-    if (ground_robot && status == VoxelStatus::kOccupied &&
-        !ctx.map->dynamicBoxBlocked(center, ctx.robot_box_size)) {
-      status = orientedBoxPathStatus(*ctx.map, center, center, body,
-                                     !ctx.allow_unknown_lattice_body, nullptr);
+    const std::array<std::int64_t, 4> precheck_key{
+        micro(center.x()), micro(center.y()), micro(center.z()),
+        micro(body.heading)};
+    const auto known = ground_robot ? prechecks.find(precheck_key)
+                                    : prechecks.end();
+    VoxelStatus status = VoxelStatus::kUnknown;
+    if (known != prechecks.end()) {
+      status = known->second;
+      if (profile != nullptr) ++profile->precheck_cache_hits;
+    } else {
+      status = ctx.robot->type == RobotType::kAerialRobot
+          ? ctx.map->getStrictBoxStatus(center, ctx.robot_box_size)
+          : ctx.map->getBoxStatus(center, ctx.robot_box_size,
+                                  !ctx.allow_unknown_lattice_body);
+      if (ground_robot && status == VoxelStatus::kOccupied &&
+          !ctx.map->dynamicBoxBlocked(center, ctx.robot_box_size)) {
+        status = orientedBoxPathStatus(*ctx.map, center, center, body,
+                                       !ctx.allow_unknown_lattice_body,
+                                       nullptr);
+      }
+      if (ground_robot) prechecks.emplace(precheck_key, status);
     }
     timed_precheck.reset();
     if (status != VoxelStatus::kFree) return status == VoxelStatus::kOccupied;
@@ -204,9 +307,41 @@ GridGraphResult buildGridGraph(GraphManager& graph, const StateVec& state,
     return offer(candidate, i, j, first_pass, added);
   };
 
+  // The ground a cell drops onto, at driving height; nothing when none is
+  // mapped under it.
+  const auto drivingHeight = [&](const Eigen::Vector3d& cell) {
+    std::optional<double> driving_z;
+    if (!ground_robot) return driving_z;
+    Eigen::Vector3d sample = cell;
+    VoxelStatus ground_status = VoxelStatus::kUnknown;
+    const double ground_height =
+        ctx.ground->projectSample(sample, ground_status);
+    if (ground_status == VoxelStatus::kOccupied) {
+      driving_z = cell.z() - (ground_height - ctx.planning->max_ground_height);
+    }
+    return driving_z;
+  };
+
   std::vector<Retry> nudges;
   for (const auto& [unused_distance, i, j] : columns) {
     (void)unused_distance;
+    // A ground robot's column is projected from its top level first: the
+    // levels below start on that ray's way down and meet the same ground
+    // (projectSample's column cache).
+    if (ground_robot && num_nodes[2] > 1) {
+      double x_val = min_val.x() + i * grid.resolution.x();
+      double y_val = min_val.y() + j * grid.resolution.y();
+      if (heading != 0.0) {
+        const double rx = x_val * cos_h - y_val * sin_h;
+        const double ry = x_val * sin_h + y_val * cos_h;
+        x_val = rx;
+        y_val = ry;
+      }
+      drivingHeight(Eigen::Vector3d(
+          x_val + state.x(), y_val + state.y(),
+          min_val.z() + (num_nodes[2] - 1) * grid.resolution.z() +
+              state.z())).has_value();
+    }
     for (int k = 0; k < num_nodes[2]; ++k) {
       if (!charge()) return result;
       double x_val = min_val.x() + i * grid.resolution.x();
@@ -223,8 +358,10 @@ GridGraphResult buildGridGraph(GraphManager& graph, const StateVec& state,
       const double z_world = z_val + state.z();
 
       const Eigen::Vector3d cell(x_val, y_val, z_world);
+      const std::optional<double> driving_z = drivingHeight(cell);
       bool added = false;
-      const bool refused = try_cell(cell, i, j, /*first_pass=*/true, added);
+      const bool refused =
+          try_cell(cell, i, j, /*first_pass=*/true, added, driving_z);
       if (ground_robot && refused && !added) nudges.push_back({cell, i, j});
     }
   }
@@ -251,14 +388,26 @@ GridGraphResult buildGridGraph(GraphManager& graph, const StateVec& state,
   }
   // Original cells and other-level links get their first chance before
   // nudges spend any of the shared budget or change nearest neighbours.
+  // A nudge is for a cell beside the lattice, that a vertex within an edge
+  // could join where it is; farther out its edge would be clipped to where
+  // the sweep's own cells already were.
+  const double nudge_reach = ctx.planning->edge_length_max + 0.2;
   for (const Retry& retry : nudges) {
+    StateVec query(retry.cell.x(), retry.cell.y(), retry.cell.z(), heading);
+    Vertex* nearest = nullptr;
+    if (!graph.getNearestVertex(&query, &nearest) || nearest == nullptr ||
+        (nearest->state.head<2>() - retry.cell.head<2>()).norm() >
+            nudge_reach) {
+      continue;
+    }
     for (double offset : {0.1, -0.1, 0.2, -0.2}) {
       if (!charge()) return result;
       if (profile != nullptr) ++profile->nudges;
       bool added = false;
       const Eigen::Vector3d shifted =
           retry.cell + offset * Eigen::Vector3d(-sin_h, cos_h, 0.0);
-      try_cell(shifted, retry.i, retry.j, /*first_pass=*/false, added);
+      try_cell(shifted, retry.i, retry.j, /*first_pass=*/false, added,
+               drivingHeight(shifted));
       if (added) break;
     }
   }

@@ -354,6 +354,16 @@ class GroundProjection {
   /// is one.
   bool freeInColumn(const Eigen::Vector2d& cell, double top,
                     double bottom) const;
+  /// projectSample without its per-plan memo.
+  double castProjection(Eigen::Vector3d& sample, VoxelStatus& status) const;
+  using ProjectionKey = std::array<std::int64_t, 3>;
+  struct Projection {
+    double below = 0.0;
+    VoxelStatus status = VoxelStatus::kUnknown;
+    Eigen::Vector3d sample = Eigen::Vector3d::Zero();
+  };
+  mutable std::unordered_map<ProjectionKey, Projection, CacheKeyHash>
+      projections_;
   FootprintPlane measureFootprintPlane(const Eigen::Vector3d& point,
                                        const Eigen::Vector2d& heading,
                                        const Eigen::Vector3d& box_size) const;

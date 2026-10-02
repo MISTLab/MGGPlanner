@@ -13,7 +13,13 @@
 
 #include <Eigen/Dense>
 
+#include <array>
+#include <chrono>
+#include <cstdint>
+#include <unordered_map>
+#include <utility>
 #include <functional>
+#include <optional>
 #include <vector>
 
 #include "mgg_core/geofence_manager.h"
@@ -26,6 +32,42 @@
 #include "mgg_core/types.h"
 
 namespace mgg {
+
+/// Ground edge verdicts of one graph build, keyed by every input of the
+/// check (both ends, hanging, start height, unknown policy, travel and
+/// body size), so the z levels of a lattice column that drop onto the same
+/// ground, from the same vertex, are checked once. Valid while the map,
+/// the context and the GroundProjection stay as they were: one build,
+/// under one map lease. Not thread-safe.
+class EdgeVerdictCache {
+ public:
+  using Key = std::array<std::int64_t, 12>;
+  struct Verdict {
+    ProjectedEdgeStatus status = ProjectedEdgeStatus::kAdmissible;
+    std::vector<Eigen::Vector3d> projected_edge;
+  };
+  const Verdict* find(const Key& key) const {
+    const auto it = verdicts_.find(key);
+    return it == verdicts_.end() ? nullptr : &it->second;
+  }
+  void add(const Key& key, Verdict verdict) {
+    verdicts_.emplace(key, std::move(verdict));
+  }
+  std::size_t size() const { return verdicts_.size(); }
+
+ private:
+  struct KeyHash {
+    std::size_t operator()(const Key& key) const {
+      std::size_t hash = 0;
+      for (const std::int64_t part : key) {
+        hash ^= std::hash<std::int64_t>()(part) + 0x9e3779b97f4a7c15ULL +
+                (hash << 6) + (hash >> 2);
+      }
+      return hash;
+    }
+  };
+  std::unordered_map<Key, Verdict, KeyHash> verdicts_;
+};
 
 /// Everything expandGraph needs from its surroundings.
 struct ExpandContext {
@@ -95,6 +137,12 @@ struct ExpandContext {
   /// admitted. The points use the same coordinates passed to GroundProjection.
   std::function<bool(const std::vector<Eigen::Vector3d>&)>
       projected_edge_admissible;
+  /// Optional: ground edge verdicts shared by the edges this context checks
+  /// (buildGridGraph supplies one per build when none is given).
+  EdgeVerdictCache* edge_verdicts = nullptr;
+  /// When set, a lattice sweep (buildGridGraph) stops adding cells once it
+  /// passes, keeping what it built: the planning call's time budget.
+  std::optional<std::chrono::steady_clock::time_point> deadline;
 };
 
 /// Attaches `new_vertex` to `graph`: finds the nearest existing vertex, checks
@@ -107,6 +155,15 @@ struct ExpandContext {
 void expandGraph(GraphManager& graph, Vertex& new_vertex,
                  ExpandGraphReport& rep, const ExpandContext& ctx,
                  bool allow_short_edge = false);
+
+/// expandGraph with the edge from `parent`, a vertex of `graph`, in place of
+/// the one from the nearest vertex: the same clipping, projection, checks
+/// and graph-mode neighbour edges. A lattice cell whose edge from its
+/// nearest vertex is refused may still join from another vertex beside it
+/// (buildGridGraph), and a goal from any vertex that reaches it.
+void expandGraphFrom(GraphManager& graph, Vertex& new_vertex, Vertex* parent,
+                     ExpandGraphReport& rep, const ExpandContext& ctx,
+                     bool allow_short_edge = false);
 
 /// Adds edges from `new_vertex`, already in `graph`, to every vertex within
 /// nearest_range whose straight connection is between edge_length_min and

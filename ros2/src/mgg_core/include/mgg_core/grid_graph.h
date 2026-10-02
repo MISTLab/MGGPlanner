@@ -57,6 +57,8 @@ struct GridGraphResult {
   int edges_added = 0;
   /// True when a size or loop cap stopped the sweep early.
   bool hit_limit = false;
+  /// True when ExpandContext::deadline stopped it (hit_limit is set too).
+  bool hit_deadline = false;
   /// Free cells not offered to expandGraph because their ground lies within
   /// a step of a vertex already at the same lattice column
   /// (LatticeColumnGround): the same place reached from another z level.
@@ -67,6 +69,9 @@ struct GridGraphResult {
   /// going outward first (a deck over the floor, reached up a ramp further
   /// out).
   int retried_joined = 0;
+  /// First-pass cells joined from another vertex than their nearest
+  /// (kLatticeAlternateParents).
+  int joined_from_alternate = 0;
   /// First-pass candidate verdicts (not retries/nudges), indexed by
   /// ExpandGraphStatus. A sweep that finds plenty of free cells and produces
   /// no vertices is otherwise indistinguishable from one that found nothing,
@@ -104,6 +109,11 @@ class LatticeColumnGround {
   double step_;
   std::unordered_map<std::int64_t, std::vector<double>> heights_;
 };
+
+/// How many other vertices within edge_length_max a ground cell refused
+/// from its nearest vertex is tried from, nearest first
+/// (GridGraphResult::joined_from_alternate).
+inline constexpr int kLatticeAlternateParents = 3;
 
 /// Retry passes over the cells the sweep refused an edge (GridGraphResult::
 /// retried_joined); each stops the retries when it joins nothing.

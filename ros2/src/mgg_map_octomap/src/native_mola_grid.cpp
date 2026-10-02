@@ -128,6 +128,7 @@ NativeMolaGrid::NativeMolaGrid(double r, std::vector<Cell> o,
   std::sort(occupied_.begin(), occupied_.end());
   std::sort(free_.begin(), free_.end());
   cell_index_.build(occupied_, free_);
+  column_index_.build(occupied_, free_);
   for (const auto& v : s)
     if (std::isfinite(v.max_z)) {
       auto it = surface_max_z_.find(v.cell);
@@ -180,13 +181,37 @@ VoxelStatus NativeMolaGrid::getRayStatus(const Eigen::Vector3d& a,
   Eigen::Vector3d e;
   return getRayStatus(a, b, u, e);
 }
+VoxelStatus NativeMolaGrid::columnStatus(const Cell& k,
+                                         ColumnCursor& cursor) const {
+  if (!cursor.valid || cursor.x != k.x || cursor.y != k.y) {
+    cursor.valid = true;
+    cursor.x = k.x;
+    cursor.y = k.y;
+    cursor.span = column_index_.find(k.x, k.y);
+  }
+  if (cursor.span == nullptr) return VoxelStatus::kUnknown;
+  const auto below = [](const Cell& cell, std::int64_t z) { return cell.z < z; };
+  const auto o_end = occupied_.begin() + cursor.span->occupied_end;
+  const auto o = std::lower_bound(occupied_.begin() + cursor.span->occupied_begin,
+                                  o_end, k.z, below);
+  if (o != o_end && o->z == k.z) return VoxelStatus::kOccupied;
+  const auto f_end = free_.begin() + cursor.span->free_end;
+  const auto f =
+      std::lower_bound(free_.begin() + cursor.span->free_begin, f_end, k.z, below);
+  if (f != f_end && f->z == k.z) return VoxelStatus::kFree;
+  return VoxelStatus::kUnknown;
+}
+
 VoxelStatus NativeMolaGrid::getRayStatus(const Eigen::Vector3d& a,
                                          const Eigen::Vector3d& b, bool u,
                                          Eigen::Vector3d& e) const {
   VoxelStatus out = VoxelStatus::kFree;
   e = b;
+  // A ray down a column, as ground rays are, reads one column's sorted cells
+  // rather than hashing each voxel; the status is the same either way.
+  ColumnCursor cursor;
   if (!walk(a, b, [&](const Cell& k) {
-        auto s = status(k);
+        auto s = columnStatus(k, cursor);
         if (s == VoxelStatus::kOccupied || (u && s == VoxelStatus::kUnknown)) {
           out = s;
           e = center(k);
@@ -327,22 +352,57 @@ VoxelStatus NativeMolaGrid::box(const Eigen::Vector3d& c,
                            static_cast<long double>(last.y - first.y + 1) *
                            static_cast<long double>(last.z - first.z + 1);
   if (work > kMaxWork) return VoxelStatus::kUnknown;
+  // Column by column: the cells of a column lie together, sorted by z, in
+  // occupied_ and in free_ (column_index_). The verdict is the voxel-by-
+  // voxel one: any occupied cell not relieved by its measured surface is
+  // kOccupied; otherwise, with `unknown`, any cell in neither list (a z the
+  // column's known cells do not cover) is kUnknown.
+  const std::int64_t span = last.z - first.z + 1;
+  const auto below = [](const Cell& cell, std::int64_t z) { return cell.z < z; };
   bool saw_unknown = false;
   for (auto x = first.x; x <= last.x; ++x)
-    for (auto y = first.y; y <= last.y; ++y)
-      for (auto z = first.z; z <= last.z; ++z) {
-        Cell k{x, y, z};
-        auto st = status(k);
-        if (st == VoxelStatus::kOccupied) {
-          if (measured) {
-            auto it = surface_max_z_.find(k);
-            if (it != surface_max_z_.end() && it->second < lo.z() - 1e-12)
-              continue;
-          }
-          return st;
-        }
-        if (st == VoxelStatus::kUnknown) saw_unknown = true;
+    for (auto y = first.y; y <= last.y; ++y) {
+      const auto* column = column_index_.find(x, y);
+      if (column == nullptr) {
+        saw_unknown = true;
+        continue;
       }
+      auto o = std::lower_bound(occupied_.begin() + column->occupied_begin,
+                                occupied_.begin() + column->occupied_end,
+                                first.z, below);
+      const auto o_end = occupied_.begin() + column->occupied_end;
+      auto f = free_.begin() + column->free_begin;
+      const auto f_end = free_.begin() + column->free_end;
+      if (unknown && !saw_unknown) f = std::lower_bound(f, f_end, first.z, below);
+      else f = f_end;
+      std::int64_t known = 0;
+      std::int64_t last_known = std::numeric_limits<std::int64_t>::min();
+      for (;;) {
+        const bool have_o = o != o_end && o->z <= last.z;
+        const bool have_f = f != f_end && f->z <= last.z;
+        if (!have_o && !have_f) break;
+        std::int64_t z;
+        if (have_o && (!have_f || o->z <= f->z)) {
+          if (measured) {
+            auto it = surface_max_z_.find(*o);
+            if (it == surface_max_z_.end() || !(it->second < lo.z() - 1e-12))
+              return VoxelStatus::kOccupied;
+          } else {
+            return VoxelStatus::kOccupied;
+          }
+          z = o->z;
+          ++o;
+        } else {
+          z = f->z;
+          ++f;
+        }
+        if (z != last_known) {
+          ++known;
+          last_known = z;
+        }
+      }
+      if (unknown && !saw_unknown && known < span) saw_unknown = true;
+    }
   return unknown && saw_unknown ? VoxelStatus::kUnknown : VoxelStatus::kFree;
 }
 VoxelStatus NativeMolaGrid::getBoxStatus(const Eigen::Vector3d& c,

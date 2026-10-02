@@ -99,6 +99,13 @@ class NativeMolaGrid final : public MapInterface {
   bool key(const Eigen::Vector3d&, Cell&) const;
   Eigen::Vector3d center(const Cell&) const;
   VoxelStatus status(const Cell&) const;
+  /// status() through column_index_, remembering the last column looked up.
+  struct ColumnCursor {
+    bool valid = false;
+    std::int64_t x = 0, y = 0;
+    const ColumnIndex<Cell>::Span* span = nullptr;
+  };
+  VoxelStatus columnStatus(const Cell&, ColumnCursor&) const;
   VoxelStatus box(const Eigen::Vector3d&, const Eigen::Vector3d&, bool,
                   bool) const;
   VoxelStatus path(const Eigen::Vector3d&, const Eigen::Vector3d&,
@@ -111,6 +118,8 @@ class NativeMolaGrid final : public MapInterface {
   double resolution_;
   std::vector<Cell> occupied_, free_;
   CellIndex<Cell> cell_index_;
+  /// Each XY column's cells in occupied_ and free_, for box queries.
+  ColumnIndex<Cell> column_index_;
   std::map<Cell, double> surface_max_z_;
 };
 }  // namespace mgg

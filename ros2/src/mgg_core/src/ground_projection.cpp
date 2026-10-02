@@ -23,11 +23,40 @@ constexpr std::size_t kMaxFootprintCells = 1024;
 /// free space above it, so a column this tall is never met in practice.
 constexpr int kMaxGoalGroundLayers = 32;
 
+/// A length or angle as a whole number of millionths, for a cache key.
+std::int64_t micro(double value) {
+  return static_cast<std::int64_t>(std::llround(value * 1e6));
+}
+
 }  // namespace
 
 double GroundProjection::projectSample(Eigen::Vector3d& sample,
                                        VoxelStatus& status) const {
   ProfileScope timed(profile_ ? &profile_->projection : nullptr);
+  // The same sample again in one plan, from the same map: the same answer
+  // (a lattice cell is projected by the sweep, the offer and expandGraph).
+  if (!cache_footprint_ground_ || !sample.allFinite()) {
+    return castProjection(sample, status);
+  }
+  const ProjectionKey key{micro(sample.x()), micro(sample.y()),
+                          micro(sample.z())};
+  const auto known = projections_.find(key);
+  if (known != projections_.end()) {
+    if (profile_ != nullptr) ++profile_->projection_cache_hits;
+    sample = known->second.sample;
+    status = known->second.status;
+    return known->second.below;
+  }
+  Projection projection;
+  projection.below = castProjection(sample, status);
+  projection.sample = sample;
+  projection.status = status;
+  projections_.emplace(key, projection);
+  return projection.below;
+}
+
+double GroundProjection::castProjection(Eigen::Vector3d& sample,
+                                        VoxelStatus& status) const {
   int unknown_count = 0;
   double central_ray_len = 0.0;
 
@@ -41,6 +70,19 @@ double GroundProjection::projectSample(Eigen::Vector3d& sample,
       {0.0, probe_offset, probe_offset},
       {0.0, -probe_offset, probe_offset}};
 
+
+  // With the per-plan column cache, the central ray is the one footprint
+  // checks cast down the same column (footprintGroundBelow): a lattice
+  // column's z levels, an edge's endpoints and a footprint's cells meet the
+  // same ground. Only a found ground is taken from it; otherwise every ray
+  // is cast as below.
+  if (cache_footprint_ground_ && sample.allFinite()) {
+    Eigen::Vector3d ground;
+    if (footprintGroundBelow(sample + extra_samples[0], ground)) {
+      status = VoxelStatus::kOccupied;
+      return sample(2) - ground(2);
+    }
+  }
 
   // The offset probes start slightly higher as well as to the side, so
   // the drop has to be measured from the sample itself rather than from where
@@ -56,6 +98,7 @@ double GroundProjection::projectSample(Eigen::Vector3d& sample,
         start - Eigen::Vector3d(0.0, 0.0, max_projection_length);
 
     Eigen::Vector3d end_voxel;
+    ProfileScope timed_ray(profile_ ? &profile_->ground_rays : nullptr);
     // Ground rays may cross unobserved air above the lidar. Ordinary body and edge
     // collision checks still run; only known occupied ground can support a
     // projected point.
@@ -531,6 +574,7 @@ bool GroundProjection::groundBelow(const Eigen::Vector3d& point,
                                    Eigen::Vector3d& ground) const {
   const Eigen::Vector3d end =
       point - Eigen::Vector3d(0.0, 0.0, max_projection_length);
+  ProfileScope timed_ray(profile_ ? &profile_->ground_rays : nullptr);
   return map_.getGroundRayStatus(point, end, false, ground) ==
          VoxelStatus::kOccupied;
 }
@@ -582,14 +626,6 @@ double GroundProjection::crossSlope(const std::vector<Eigen::Vector3d>& edge,
   return std::atan(steepest);
 }
 
-namespace {
-
-/// A length or angle as a whole number of millionths, for a cache key.
-std::int64_t micro(double value) {
-  return static_cast<std::int64_t>(std::llround(value * 1e6));
-}
-
-}  // namespace
 
 bool GroundProjection::footprintGroundBelow(const Eigen::Vector3d& point,
                                             Eigen::Vector3d& ground) const {
