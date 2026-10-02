@@ -326,6 +326,16 @@ class MolaFloorProduct {
 class PlannerNodeTestPeer {
  public:
   static void cancel(PlannerNode& node) { node.cancelPlanning(); }
+  static void heartbeat(PlannerNode& node, const mgg::MolaSnapshotRequest& request) {
+    auto msg = std::make_shared<mgg_msgs::msg::MappingSnapshot>();
+    msg->component_id = request.component_id;
+    msg->epoch = request.epoch;
+    msg->graph_revision = request.graph_revision;
+    msg->geometry_revision = request.geometry_revision;
+    msg->source_stamp = rclcpp::Time(static_cast<int64_t>(request.source_stamp_ns));
+    msg->component_from_navigation.rotation.w = 1;
+    node.onMappingSnapshot(msg);
+  }
   static bool acquiring(PlannerNode& node) { return node.acquiring_observations_.load(); }
   static double latestX(PlannerNode& node) {
     std::lock_guard<std::mutex> lock(node.input_mutex_);
@@ -2006,14 +2016,23 @@ class PlannerNodeTest : public ::testing::Test {
 
 TEST_F(PlannerNodeTest, LatestOdometryIngestedDuringFiveSecondPlannerCall) {
   auto node = makeNode("latest_odom");
+  MolaFloorProduct product(-1, 4, -1, 1);
+  auto provider = product.serve();
+  auto* map = provider.get();
+  PlannerNodeTestPeer::useMolaMap(*node, std::move(provider));
   PlannerNodeTestPeer::acceptOdometry(*node, 0, 0, 1);
   std::atomic<bool> entered{false};
   auto work = std::async(std::launch::async, [&] { PlannerNodeTestPeer::holdPlanner(*node, entered); });
   while (!entered) std::this_thread::yield();
   const auto start = std::chrono::steady_clock::now();
+  const auto heartbeats = map->statRevalidationCount();
+  PlannerNodeTestPeer::heartbeat(*node, product.request());
+  EXPECT_GT(map->statRevalidationCount(), heartbeats);
   PlannerNodeTestPeer::acceptOdometry(*node, 2, 0, 3);
   PlannerNodeTestPeer::acceptOdometry(*node, 1, 0, 2); // an older queued sample
   EXPECT_LT(std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count(), 0.2);
+  RecordProperty("ingestion_ms", std::to_string(
+      std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count()));
   EXPECT_EQ(PlannerNodeTestPeer::latestX(*node), 2);
   work.get();
   EXPECT_EQ(PlannerNodeTestPeer::drainLatestX(*node), 2);
@@ -2042,6 +2061,8 @@ TEST_F(PlannerNodeTest, CancellationInterruptsSlowPlanWithoutReturningPath) {
   EXPECT_EQ(work.wait_for(std::chrono::milliseconds(200)), std::future_status::ready);
   work.get();
   EXPECT_LT(std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count(), 0.2);
+  RecordProperty("interruption_ms", std::to_string(
+      std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count()));
   EXPECT_TRUE(response->path.empty());
   EXPECT_EQ(response->status, PlannerNode::kStatusNotReady);
   const auto receive_until = std::chrono::steady_clock::now() + std::chrono::milliseconds(200);
@@ -2053,6 +2074,10 @@ TEST_F(PlannerNodeTest, CancellationInterruptsSlowPlanWithoutReturningPath) {
 }
 
 TEST_F(PlannerNodeTest, NewObjectiveSupersedesSlowPlanAndUsesNewestPose) {
+  using Service = mgg_msgs::srv::PlanObjective;
+  for (bool old_objective : {false, true})
+  for (auto kind : {Service::Request::NAVIGATE, Service::Request::RETURN_HOME}) {
+  SCOPED_TRACE(std::to_string(kind) + (old_objective ? " supersedes objective" : " supersedes plan"));
   auto node = makeNode("preempt_slow_plan");
   auto provider = std::make_unique<SlowPlanningMap>();
   auto* slow = provider.get();
@@ -2061,16 +2086,24 @@ TEST_F(PlannerNodeTest, NewObjectiveSupersedesSlowPlanAndUsesNewestPose) {
   PlannerNodeTestPeer::acceptOdometry(*node, 0, 0, 1);
   slow->slow = true;
   auto old_response = std::make_shared<mgg_msgs::srv::PlannerSrv::Response>();
-  auto old_work = std::async(std::launch::async, [&] { PlannerNodeTestPeer::plan(*node, old_response); });
+  auto old_goal = std::make_shared<Service::Request>();
+  old_goal->objective = Service::Request::NAVIGATE;
+  old_goal->goal.position.x = 2.5;
+  old_goal->goal.position.z = 0.075;
+  old_goal->goal.orientation.w = 1;
+  auto old_goal_response = std::make_shared<Service::Response>();
+  auto old_work = std::async(std::launch::async, [&] {
+    if (old_objective) PlannerNodeTestPeer::objective(*node, old_goal, old_goal_response);
+    else PlannerNodeTestPeer::plan(*node, old_response);
+  });
   const auto limit = std::chrono::steady_clock::now() + std::chrono::seconds(2);
   while (!slow->entered && std::chrono::steady_clock::now() < limit)
     std::this_thread::sleep_for(std::chrono::milliseconds(1));
   EXPECT_TRUE(slow->entered);
   PlannerNodeTestPeer::acceptOdometry(*node, 0.5, 0, 2);
   slow->slow = false;
-  using Service = mgg_msgs::srv::PlanObjective;
   auto request = std::make_shared<Service::Request>();
-  request->objective = Service::Request::NAVIGATE;
+  request->objective = kind;
   request->goal.position.x = 1.5;
   request->goal.position.z = 0.075;
   request->goal.orientation.w = 1;
@@ -2080,9 +2113,11 @@ TEST_F(PlannerNodeTest, NewObjectiveSupersedesSlowPlanAndUsesNewestPose) {
   old_work.get();
   objective.get();
   EXPECT_TRUE(old_response->path.empty());
+  EXPECT_TRUE(old_goal_response->path.empty());
   ASSERT_EQ(response->status, Service::Response::SUCCEEDED) << response->reason;
   ASSERT_FALSE(response->path.empty());
   EXPECT_NEAR(response->path.front().position.x, 0.5, 0.1);
+  }
 }
 
 TEST_F(PlannerNodeTest, EmptyAndSparseBootstrapRetriesWhenFirstObservationsArrive) {

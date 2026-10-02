@@ -118,6 +118,7 @@ class PlannerNode : public rclcpp::Node {
  private:
   void loadParameters();
   void applyLatestOdometry();
+  void applyLatestOdometryImpl();
   void publishPlanningStatus();
   void setAcquiringObservations(bool acquiring);
   void onOdometry(nav_msgs::msg::Odometry::ConstSharedPtr msg);
@@ -471,6 +472,7 @@ class PlannerNode : public rclcpp::Node {
   /// rrg.cpp:2535 expandGlobalGraphTimerCallback, idle while its inputs
   /// (graph, map, peer bodies, robot position) are unchanged.
   void expandGlobalGraphTimerCallback();
+  void expandGlobalGraphTimerCallbackImpl();
 
   /// A ground robot's state at driving height above mapped ground. False
   /// when the map shows no ground under it.

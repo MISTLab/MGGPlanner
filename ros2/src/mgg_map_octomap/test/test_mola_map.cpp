@@ -1589,6 +1589,9 @@ TEST(MolaMap, FootprintSupportDoesNotInventAdjacentGroundOrFreeSpace) {
   EXPECT_EQ(provider.getGroundRayStatus({0, 0, 0}, {0, 0, -1}, false, hit), VoxelStatus::kOccupied);
   EXPECT_DOUBLE_EQ(hit.z(), -0.6);
   EXPECT_NE(provider.getGroundRayStatus({0.6, 0, 0}, {0.6, 0, -1}, false, hit), VoxelStatus::kOccupied);
+  provider.setFootprintGroundSupport({0, 0, -0.6}, {1.0, 0.5}, M_PI / 2);
+  EXPECT_EQ(provider.getGroundRayStatus({0, 0.4, 0}, {0, 0.4, -1}, false, hit), VoxelStatus::kOccupied);
+  EXPECT_NE(provider.getGroundRayStatus({0.4, 0, 0}, {0.4, 0, -1}, false, hit), VoxelStatus::kOccupied);
   EXPECT_EQ(provider.getVoxelStatus({0, 0, -0.6}), VoxelStatus::kUnknown);
   EXPECT_EQ(provider.getBoxStatus({0, 0, 0}, {0.5, 0.5, 0.5}, true), VoxelStatus::kUnknown);
 }
@@ -1681,6 +1684,7 @@ TEST(MolaMap, ReadLeasePinsAdmittedSnapshotAcrossTtlAndPublicationWindow) {
     // callback lease replacement. The nested acquisition inherits one pin.
     lease = provider.acquireReadLease();
     std::this_thread::sleep_for(std::chrono::milliseconds(80));
+    EXPECT_FALSE(provider.authorityValid());
     EXPECT_TRUE(provider.getStatus());
     EXPECT_EQ(provider.getVoxelStatus({1.1, 0.1, 0.1}),
               VoxelStatus::kOccupied);

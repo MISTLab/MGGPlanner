@@ -2293,6 +2293,23 @@ void PlannerNode::onOdometry(nav_msgs::msg::Odometry::ConstSharedPtr msg) {
 }
 
 void PlannerNode::applyLatestOdometry() {
+  if (mgg::planning_cancelled) {
+    applyLatestOdometryImpl();
+    return;
+  }
+  const auto generation = request_generation_.load();
+  mgg::PlanningCancellationScope cancellation([this, generation] {
+    return generation != request_generation_.load();
+  });
+  try {
+    applyLatestOdometryImpl();
+  } catch (const mgg::PlanningInterrupted&) {
+    ++cancellations_;
+    ++graph_revision_;
+  }
+}
+
+void PlannerNode::applyLatestOdometryImpl() {
   nav_msgs::msg::Odometry::ConstSharedPtr msg;
   std::chrono::steady_clock::time_point received;
   {
@@ -3499,6 +3516,21 @@ void PlannerNode::ingestOdometryIntoGlobalGraph() {
 }
 
 void PlannerNode::expandGlobalGraphTimerCallback() {
+  const auto generation = request_generation_.load();
+  const std::lock_guard<std::recursive_mutex> lock(planner_mutex_);
+  mgg::PlanningCancellationScope cancellation([this, generation] {
+    return generation != request_generation_.load();
+  });
+  try {
+    mgg::planningCheckpoint();
+    expandGlobalGraphTimerCallbackImpl();
+  } catch (const mgg::PlanningInterrupted&) {
+    ++cancellations_;
+    ++graph_revision_;
+  }
+}
+
+void PlannerNode::expandGlobalGraphTimerCallbackImpl() {
   const std::lock_guard<std::recursive_mutex> lock(planner_mutex_);
   auto map_read = mapReadLease();
   refreshMapRevision();
@@ -5184,11 +5216,30 @@ bool PlannerNode::runGlobalPlanner(int target_id, std::string& reason,
 void PlannerNode::onBuildRequest(
     const std::shared_ptr<std_srvs::srv::Trigger::Request>,
     std::shared_ptr<std_srvs::srv::Trigger::Response> response) {
-  response->message = buildLocalGraph();
-  response->success = local_graph_->getNumVertices() > 1;
-  publishPath();
-  publishMarkers();
-  RCLCPP_INFO(get_logger(), "%s", response->message.c_str());
+  const auto generation = request_generation_.load();
+  const std::lock_guard<std::recursive_mutex> lock(planner_mutex_);
+  const bool admitted = mola_map_ && mola_map_->authorityValid();
+  const auto map_generation = mola_map_ ? mola_map_->activeGeneration() : 0;
+  mgg::PlanningCancellationScope cancellation([this, generation, admitted, map_generation] {
+    return generation != request_generation_.load() ||
+        (admitted && (!mola_map_->authorityValid() ||
+                      mola_map_->activeGeneration() != map_generation));
+  });
+  try {
+    mgg::planningCheckpoint();
+    applyLatestOdometry();
+    response->message = buildLocalGraph();
+    response->success = local_graph_->getNumVertices() > 1;
+    publishPath();
+    publishMarkers();
+    RCLCPP_INFO(get_logger(), "%s", response->message.c_str());
+  } catch (const mgg::PlanningInterrupted&) {
+    ++cancellations_;
+    ++graph_revision_;
+    best_path_.clear();
+    response->success = false;
+    response->message = "planning cancelled";
+  }
 }
 
 void PlannerNode::cancelPlanning() {
@@ -5270,8 +5321,18 @@ void PlannerNode::onObjectiveRequest(
     best_path_.clear();
     global_exploration_ongoing_ = false;
     response->path.clear();
-    response->status = mgg_msgs::srv::PlanObjective::Response::BLOCKED;
+    const bool superseded = request_generation_.load() != generation;
+    response->status = superseded ? mgg_msgs::srv::PlanObjective::Response::BLOCKED
+                                : mgg_msgs::srv::PlanObjective::Response::STALE_REVISION;
     response->reason = "planning cancelled: superseded or map authority expired/changed";
+    refreshMapRevision();
+    if (mola_map_) {
+      response->component_id = mapping_snapshot_.component_id;
+      response->map_epoch = mapping_snapshot_.epoch;
+      response->mapping_graph_revision = mapping_snapshot_.graph_revision;
+      response->geometry_revision = mapping_snapshot_.geometry_revision;
+      response->map_source_stamp = mapping_snapshot_.source_stamp;
+    }
   }
 }
 
