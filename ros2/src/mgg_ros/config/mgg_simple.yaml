@@ -199,6 +199,8 @@ mggplanner_node:
       exp_gain_voxel_size: 0.8
       occupied_voxel_gain: 0.0
       free_voxel_gain: 0.0
+      # Ground gain/frontiers stop at robot height + this margin above its floor.
+      ground_frontier_height_margin: 0.5
       unknown_voxel_gain: 60.0
       nonuniform_ray_cast: true
       ray_cast_step_size_multiplier: 1.0

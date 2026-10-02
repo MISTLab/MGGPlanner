@@ -62,7 +62,11 @@ enum class ConnectStatus {
 struct VolumetricGain {
   double gain = 0.0;
   double accumulative_gain = 0.0;
+  /// For ground robots, only unknown inside the reachable-height band.
   int num_unknown_voxels = 0;
+  /// Diagnostic only: unknown before the ground band's upper cutoff, with
+  /// the same bounds, exclusions and below-floor filtering. Not fleet gain.
+  int num_total_unknown_voxels = 0;
   int num_free_voxels = 0;
   int num_occupied_voxels = 0;
   int num_unknown_surf_voxels = 0;

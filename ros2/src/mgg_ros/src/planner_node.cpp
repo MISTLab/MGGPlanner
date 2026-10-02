@@ -3789,6 +3789,12 @@ std::string PlannerNode::buildLocalGraph() {
       *local_graph_, gain_ctx, planning_params_.leafs_only_for_volumetric_gain,
       planning_params_.cluster_vertices_for_gain);
   int frontiers = 0;
+  std::int64_t band_unknown = 0, total_unknown = 0;
+  for (const auto& entry : local_graph_->vertices_map_) {
+    if (entry.second == nullptr) continue;
+    band_unknown += entry.second->vol_gain.num_unknown_voxels;
+    total_unknown += entry.second->vol_gain.num_total_unknown_voxels;
+  }
   // Frontiers given up as unreachable from here (retention refused three
   // times) are no local gain remaining: they must not hold completion back
   // (run14 review r2), here or in the fleet's settling.
@@ -3800,6 +3806,13 @@ std::string PlannerNode::buildLocalGraph() {
       if (!reverseExitEndpointGivenUp(entry.second->state)) ++outstanding_frontiers;
     }
   }
+  RCLCPP_INFO(get_logger(),
+              "gain evidence: %s; band-unknown=%lld total-unknown=%lld "
+              "frontiers=%d viewpoints=%d (summed per viewpoint, not map-unique)",
+              robot_params_.type == mgg::RobotType::kGroundRobot
+                  ? "ground reachable-height band" : "aerial full 3D",
+              static_cast<long long>(band_unknown),
+              static_cast<long long>(total_unknown), frontiers, evaluated);
   // The graph's frontiers are worth keeping whether or not a path is chosen.
   add_frontiers_to_global_graph_ = local_graph_->getNumVertices() > 1;
 
@@ -5369,6 +5382,12 @@ void PlannerNode::onPlanRequest(
       // No leaf with gain for long enough: the global planner routes to the
       // best global frontier (rrg.cpp:2119, mggplanner.cpp:217).
       auto map_read = mapReadLease();
+      RCLCPP_INFO(get_logger(),
+                  "global repositioning triggered: %d low-gain rounds "
+                  "(threshold %d), %s; local frontier interest=%s",
+                  low_gain_rounds_, auto_global_planner_low_gain_rounds_,
+                  low_gain_path.empty() ? "no local path" : "low-gain local path",
+                  local_gain_remains_now_ ? "yes" : "no");
       low_gain_rounds_ = 0;
       std::string departure;
       // A low-gain path set aside is handed over only for a frontier worth

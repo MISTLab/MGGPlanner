@@ -16,6 +16,7 @@
 #include <vector>
 
 #include "mgg_core/gain.h"
+#include "mgg_core/path_selection.h"
 #include "mgg_map_octomap/native_mola_grid.h"
 
 namespace {
@@ -197,33 +198,72 @@ double highestUnknown(
   return top;
 }
 
-// Diag-sensor (run 7): a ground robot's gain stopped 0.8 m over its floor
-// (gain_max_height_above_ground, run 6), under a Spot's lidar, and cast
-// from the vertex, 0.2 m under a Bunker's lidar. It counts what its sensor
-// sees now: from the sensor, as far up as the field of view reaches. The
-// top ray of the 45 degree table climbs 17.5 degrees, 6.0 m in 20 m.
-TEST(NativeGain, AGroundRobotCountsWhatItsSensorSeesFromItsMount) {
-  // A floor at z = [-0.2, 0) and unknown air over it; the vertex's floor is
-  // at z = 0.05.
+// Run 7: rays still originate at the mount, even above the band; unknown
+// ground ahead keeps the corridor a frontier without rewarding its ceiling.
+TEST(NativeGain, Run7MountedCorridorRetainsGroundBandUnknown) {
   auto floor = terrain([](std::int64_t, std::int64_t)
                            -> std::optional<std::int64_t> { return -1; });
   const Eigen::Vector3d viewpoint(0.1, 0.5, 0.5);
-  const double from_vertex = highestUnknown(groundGain(floor, viewpoint));
-  EXPECT_GT(from_vertex, 6.0);
-  EXPECT_LE(from_vertex, 0.5 + 20.0 * std::sin(17.5 * M_PI / 180.0) + 0.2);
-
-  // Mounted 2.0 m over the floor, 1.55 m over the vertex; center_offset's z,
-  // the offset over the body, plays no part.
+  const auto from_vertex = groundGain(floor, viewpoint);
+  EXPECT_GT(beyondBetween(from_vertex, 0.0, 0.85), 20);
+  EXPECT_LE(highestUnknown(from_vertex), 0.85);
   const auto mounted =
       groundGain(floor, viewpoint, 2.0, Eigen::Vector3d(-0.2, 0.0, 5.0));
-  EXPECT_NEAR(highestUnknown(mounted) - from_vertex, 1.55, 0.25);
+  EXPECT_GT(beyondBetween(mounted, 0.0, 0.85), 20);
+  EXPECT_LE(highestUnknown(mounted), 0.85);
+  EXPECT_NE(mounted.size(), from_vertex.size());
 
-  // An aerial robot casts from its vertex, mount height or not.
-  EXPECT_DOUBLE_EQ(
-      highestUnknown(groundGain(floor, viewpoint, 2.0, Eigen::Vector3d::Zero(),
-                                mgg::RobotType::kAerialRobot)),
+  // An aerial robot retains full 3D gain and ignores ground mount height.
+  const auto aerial = groundGain(floor, viewpoint, 2.0, Eigen::Vector3d::Zero(),
+                                  mgg::RobotType::kAerialRobot);
+  EXPECT_GT(highestUnknown(aerial), 6.0);
+  EXPECT_DOUBLE_EQ(highestUnknown(aerial),
       highestUnknown(groundGain(floor, viewpoint, 0.0, Eigen::Vector3d::Zero(),
                                 mgg::RobotType::kAerialRobot)));
+}
+
+TEST(NativeGain, TallRoomUnknownCeilingDoesNotCompeteWithTheDoor) {
+  std::vector<Cell> occupied, free;
+  // Observed floor, observed air to 1.2 m, upper hangar air unknown.
+  // The wall at x=6 has a 2 m doorway leading to unknown at x>=6.6.
+  for (int x = -100; x < 100; ++x) {
+    for (int y = -100; y < 100; ++y) {
+      occupied.push_back({x, y, -1});
+      if (x >= 33) continue;
+      for (int z = 0; z < 6; ++z) {
+        (x == 30 && (y < -5 || y >= 5) ? occupied : free).push_back({x, y, z});
+      }
+    }
+  }
+  mgg::NativeMolaGrid map(kResolution, occupied, free, {});
+  GainSetup setup(map);
+  mgg::RobotParams robot;
+  robot.size = Eigen::Vector3d(0.8, 0.5, 0.6);
+  setup.ctx.robot = &robot;
+  setup.planning.max_ground_height = 0.5;
+  auto& sensor = setup.sensors["VLP16"];
+  sensor.max_range = 3.0;
+  sensor.update();
+  mgg::GraphManager graph;
+  for (const auto& [id, pos] : std::vector<std::pair<int, Eigen::Vector2d>>{
+           {0, {0.1, 0.1}}, {1, {4.1, 0.1}}, {2, {5.1, 0.1}}, {3, {0.1, 3.1}}}) {
+    graph.addVertex(new mgg::Vertex(id, mgg::StateVec(pos.x(), pos.y(), 0.5, 0)));
+  }
+  graph.addEdge(graph.getVertex(0), graph.getVertex(1), 4);
+  graph.addEdge(graph.getVertex(1), graph.getVertex(2), 1);
+  graph.addEdge(graph.getVertex(0), graph.getVertex(3), 3);
+  mgg::computeExplorationGain(graph, setup.ctx, false, true);
+  for (int id : {0, 3}) {
+    const auto& gain = graph.getVertex(id)->vol_gain;
+    EXPECT_GT(gain.num_total_unknown_voxels, 0);
+    EXPECT_EQ(gain.num_unknown_voxels, 0);
+    EXPECT_FALSE(gain.is_frontier);
+    EXPECT_DOUBLE_EQ(gain.gain, 0);
+  }
+  EXPECT_TRUE(graph.getVertex(2)->vol_gain.is_frontier);
+  const auto selected = mgg::selectBestPath(graph, setup.planning, robot,
+                                            mgg::EdgeInclinations{}, 0.2, 0);
+  EXPECT_EQ(selected.best_path_id, 2);
 }
 
 // Review r0 (P1): with distinct voxels counted, the frontier test still

@@ -38,6 +38,7 @@ class ParamFixture : public ::testing::Test {
         {"PlanningParams.path_clearance_margin", 0.6},
         {"PlanningParams.max_goal_ground_rise", 3.5},
         {"PlanningParams.path_direction_min_factor", 0.5},
+        {"PlanningParams.ground_frontier_height_margin", 0.75},
         {"PlanningParams.low_gain_voxels", 25.0},
         {"PlanningParams.low_gain_handoff_min_voxels", 12.0},
         {"PlanningParams.global_search_time_budget_s", 0.5},
@@ -115,6 +116,7 @@ TEST_F(ParamFixture, LoadsPlanningParams) {
   EXPECT_DOUBLE_EQ(params.path_clearance_margin, 0.6);
   EXPECT_DOUBLE_EQ(params.max_goal_ground_rise, 3.5);
   EXPECT_DOUBLE_EQ(params.path_direction_min_factor, 0.5);
+  EXPECT_DOUBLE_EQ(params.ground_frontier_height_margin, 0.75);
   EXPECT_DOUBLE_EQ(params.low_gain_voxels, 25.0);
   EXPECT_DOUBLE_EQ(params.low_gain_handoff_min_voxels, 12.0);
   EXPECT_DOUBLE_EQ(params.global_search_time_budget_s, 0.5);

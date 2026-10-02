@@ -473,6 +473,18 @@ class PlannerNodeTestPeer {
     node.ground_ = std::make_unique<mgg::GroundProjection>(
         *node.map_, node.planning_params_);
   }
+  static mgg::VolumetricGain tallRoomGainAt(PlannerNode& node, double x) {
+    auto& sensor = node.sensors_["test_lidar"];
+    sensor.max_range = 3.0;
+    sensor.fov.y() = M_PI / 2.0;
+    sensor.resolution.y() = M_PI / 12.0;
+    sensor.update();
+    const mgg::StateVec state(x, 0, 0.35, 0);
+    node.global_space_.setCenter(state, true);
+    mgg::VolumetricGain gain;
+    mgg::computeVolumetricGain(state, gain, node.makeGainContext());
+    return gain;
+  }
   static void recheckFrontiersNear(PlannerNode& node, double x) {
     node.local_graph_->reset();
     auto* a = new mgg::Vertex(0, mgg::StateVec(x - 0.5, 0, 0.35, 0));
@@ -8748,6 +8760,11 @@ TEST_F(PlannerNodeTest, ReceiverExplorationDemotesAPeerDespiteRepeatedUnknownRep
   PlannerNodeTestPeer::receiveGraph(*fleet.a, graph);
   ASSERT_EQ(PlannerNodeTestPeer::frontierClusters(*fleet.a).size(), 1u);
   PlannerNodeTestPeer::observeFloor(*fleet.a, 5.55, 12.55, -3.55, 3.55);
+  // Upper hangar air stays unknown, but the receiver explored driving level.
+  const auto gain = PlannerNodeTestPeer::tallRoomGainAt(*fleet.a, 9.0);
+  ASSERT_GT(gain.num_total_unknown_voxels, 0);
+  ASSERT_EQ(gain.num_unknown_voxels, 0);
+  ASSERT_FALSE(gain.is_frontier);
   PlannerNodeTestPeer::recheckFrontiersNear(*fleet.a, 9.0);
   EXPECT_TRUE(PlannerNodeTestPeer::frontierClusters(*fleet.a).empty());
   for (int broadcast = 0; broadcast < 3; ++broadcast) {

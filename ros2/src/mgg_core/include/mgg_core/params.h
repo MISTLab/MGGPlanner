@@ -219,6 +219,9 @@ struct PlanningParams {
   bool use_ray_model_for_volumetric_gain = false;
   double free_voxel_gain = 1.0;
   double occupied_voxel_gain = 1.0;
+  /// Ground frontier/gain ceiling above the vertex's floor: robot size.z()
+  /// plus this margin (metres). Upper air cannot keep ground exploration local.
+  double ground_frontier_height_margin = 0.5;
   double unknown_voxel_gain = 10.0;
   double path_length_penalty = 0.0;
   /// How strongly selectBestPath prefers paths along the robot's heading:

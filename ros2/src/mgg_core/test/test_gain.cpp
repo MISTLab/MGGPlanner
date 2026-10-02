@@ -357,6 +357,7 @@ TEST(Gain, TallExploredRoomHasNoGroundInterestButAerialInterestRemains) {
   computeVolumetricGain(StateVec(0, 0, 0.5, 0), gain, f.ctx);
   EXPECT_FALSE(gain.is_frontier);
   EXPECT_EQ(gain.num_unknown_voxels, 0);
+  EXPECT_EQ(gain.num_total_unknown_voxels, 100);
   EXPECT_DOUBLE_EQ(gain.gain, 0.0);  // even with nonzero free/occupied weights
   f.robot.type = mgg::RobotType::kAerialRobot;
   computeVolumetricGain(StateVec(0, 0, 0.5, 0), gain, f.ctx);
@@ -423,6 +424,18 @@ TEST(Gain, StaleGlobalRoomFrontiersAreDemotedButDoorRemains) {
   EXPECT_EQ(global.getVertex(0)->type, mgg::VertexType::kUnvisited);
   EXPECT_EQ(global.getVertex(1)->type, mgg::VertexType::kUnvisited);
   EXPECT_EQ(global.getVertex(2)->type, mgg::VertexType::kFrontier);
+}
+
+TEST(Gain, GroundBandMarginIsConfigurableAndSensorThresholdCannotBypassIt) {
+  GroundRoom f;
+  f.sensors["VLP16"].frontier_percentage_threshold = 0.0;
+  VolumetricGain gain;
+  computeVolumetricGain(StateVec(0, 0, 0.5, 0), gain, f.ctx);
+  EXPECT_FALSE(gain.is_frontier);  // even the aerial threshold cannot admit it
+  f.planning.ground_frontier_height_margin = 5.0;
+  computeVolumetricGain(StateVec(0, 0, 0.5, 0), gain, f.ctx);
+  EXPECT_TRUE(gain.is_frontier);
+  EXPECT_EQ(gain.num_unknown_voxels, 100);
 }
 
 }  // namespace

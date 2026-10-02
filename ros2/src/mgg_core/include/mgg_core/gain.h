@@ -47,9 +47,11 @@ struct GainContext {
 /// with the per-type weights. Sets is_frontier when enough unknown volume is
 /// visible. A ground robot's rays start at its sensor, mount_height over
 /// the ground under the vertex when that is set
-/// (SensorParams::getMountedFrustumEndpoints), and it counts everything
-/// they reach but below its floor where mapped ground covers it, or deeper
-/// than max(2 max_ground_height, 1 m) under the vertex.
+/// (SensorParams::getMountedFrustumEndpoints). Ground gain/frontiers count
+/// only up to robot.size.z() + ground_frontier_height_margin above its floor;
+/// non-frontiers score zero. Below the floor, mapped support suppresses gain;
+/// the lower limit remains max(2 max_ground_height, 1 m) under the vertex.
+/// num_total_unknown_voxels records unknown before the upper cutoff.
 ///
 /// `voxel_log`, when given, receives every counted voxel for visualisation.
 void computeVolumetricGain(
@@ -60,7 +62,9 @@ void computeVolumetricGain(
 ///
 /// With `clustering`, a vertex's gain is shared with its neighbours within
 /// clustering_radius instead of being recomputed, which is the expensive part
-/// of a planning cycle. `only_leaf_vertices` skips interior vertices.
+/// of a planning cycle. Ground robots never share gains: a door frontier
+/// must not be copied into an explored room. `only_leaf_vertices` skips
+/// interior vertices.
 ///
 /// Returns how many viewpoints were actually evaluated.
 int computeExplorationGain(GraphManager& graph, const GainContext& ctx,
