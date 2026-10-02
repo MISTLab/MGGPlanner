@@ -5164,6 +5164,11 @@ TEST_F(PlannerNodeTest, UnchangedAerialPeerAndLiftDoNotRetriggerExpansionOrTour)
   v.robot_id = 2; v.pose.position.x = 3.1; v.pose.position.y = .1;
   v.is_frontier = true; v.num_unknown_voxels = 2000;
   peer.vertices.push_back(v);
+  mgg_msgs::msg::Vertex peer_pose;
+  peer_pose.id = 100; peer_pose.robot_id = 2; peer_pose.visited = true;
+  peer_pose.pose.position.x = .1; peer_pose.pose.position.y = .1;
+  peer_pose.pose.orientation.w = 1;
+  peer.vertices.push_back(peer_pose);
   PlannerNodeTestPeer::receiveGraph(*node, peer);
   // The peer is low enough that the drone can fly over it.
   PlannerNodeTestPeer::setGlobalFrontierReach(*node, .5);
@@ -5288,12 +5293,25 @@ TEST_F(PlannerNodeTest, MapRevisionAloneWithdrawsInvalidLiftedTargets) {
 TEST_F(PlannerNodeTest, AerialReachabilityPrecedesOwnPreferenceGroundUnchanged) {
   for (const bool aerial : {false, true}) {
     auto node = makeNode(aerial ? "aerial_reachable_peer" : "ground_own_preference", "world",
-        {rclcpp::Parameter("fleet.enabled", false)});
+        {rclcpp::Parameter("fleet.enabled", false),
+         rclcpp::Parameter("neighbour_offsets", std::vector<double>{2,0,0,0}),
+         rclcpp::Parameter("aerial_frontier_height_m", .4),
+         rclcpp::Parameter("aerial_min_height_m", .3)});
     if (aerial) PlannerNodeTestPeer::setAerialRobot(*node);
     MolaFloorProduct product(-1, 4, -1, 1);
     PlannerNodeTestPeer::useMolaMap(*node, product.serve());
     PlannerNodeTestPeer::acceptOdometryFacing(*node, .1, .1, 0, 1, .4);
     const int reachable = PlannerNodeTestPeer::addGlobalVertex(*node, 1, 1.1, .1, .4, {0});
+    if (aerial) {
+      mgg_msgs::msg::Graph graph;
+      graph.header.frame_id = "world";
+      mgg_msgs::msg::Vertex pose;
+      pose.id = 100; pose.robot_id = 2; pose.visited = true;
+      pose.pose.position.x = .1; pose.pose.position.y = .1;
+      pose.pose.orientation.w = 1;
+      graph.vertices.push_back(pose);
+      PlannerNodeTestPeer::receiveGraph(*node, graph);
+    }
     mgg::FrontierCluster own, peer;
     own.id = 1; own.owner_robot_id = 1; own.representative_vertex_id = 999;
     peer.id = 2; peer.owner_robot_id = 2; peer.representative_vertex_id = reachable;
