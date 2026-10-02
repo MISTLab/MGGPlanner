@@ -1243,7 +1243,6 @@ std::vector<mgg::FrontierCluster> PlannerNode::liftedPeerFrontiers() {
       }
       if (scoutingExcludes(c.position)) {
         ++counts.lifted_rejected_scouting;
-        ++scouting_counters_.targets_refused;
         continue;
       }
       c.id = mgg::makeClusterId(sender, c.position, tour_params_.cluster_id_cell_m);
@@ -1450,10 +1449,18 @@ double PlannerNode::aerialPeerProgress(int sender) {
 
 double PlannerNode::aerialFleetFront() {
   double front = -1.0;
+  aerial_front_peer_ = -1;
+  aerial_front_is_lower_bound_ = false;
   for (const auto& [sender, snapshot] : neighbour_roadmaps_) {
     (void)snapshot;
     const double progress = aerialPeerProgress(sender);
-    if (std::isfinite(progress)) front = std::max(front, progress);
+    if (!std::isfinite(progress)) {
+      aerial_front_is_lower_bound_ = true;
+    } else if (progress > front ||
+               (progress == front && sender < aerial_front_peer_)) {
+      front = progress;
+      aerial_front_peer_ = sender;
+    }
   }
   return front < 0.0 ? mgg::kUnreachableCost : front;
 }
@@ -1478,6 +1485,8 @@ void PlannerNode::biasAerialTourCosts(mgg::TourCostMatrix& costs,
 
 std::vector<mgg::FrontierCluster> PlannerNode::tourCandidates(
     std::vector<mgg::FrontierCluster> clusters) {
+  aerial_fallback_remains_ = false;
+  aerial_unknown_progress_clusters_.clear();
   refreshScoutingExclusions();
   if (!scouting_zones_.empty()) {
     const std::size_t before = clusters.size();
@@ -1542,6 +1551,8 @@ std::vector<mgg::FrontierCluster> PlannerNode::tourCandidates(
     const bool aerial = robot_params_.type == mgg::RobotType::kAerialRobot;
     if (!std::all_of(clusters.begin(), clusters.end(), others) ||
         (aerial && aerialLocalFrontiers())) {
+      if (aerial) aerial_counters_.gate_own_or_local +=
+          std::count_if(clusters.begin(), clusters.end(), others);
       clusters.erase(std::remove_if(clusters.begin(), clusters.end(), others),
                      clusters.end());
     } else if (aerial && !clusters.empty()) {
@@ -1552,11 +1563,26 @@ std::vector<mgg::FrontierCluster> PlannerNode::tourCandidates(
         const double peer = aerialPeerProgress(c.owner_robot_id);
         const double target = home ? mgg::reachedDistance(*home, c.representative_vertex_id)
                                    : mgg::kUnreachableCost;
-        return !std::isfinite(drone) || !std::isfinite(peer) || !std::isfinite(target) ||
-               target <= peer + 1e-6 || target + 1e-6 < drone;
+        const bool behind_peer = std::isfinite(target) && std::isfinite(peer) &&
+                                 target + 1e-6 < peer;
+        const bool behind_drone = std::isfinite(target) && std::isfinite(drone) &&
+                                  target + 1e-6 < drone;
+        aerial_counters_.gate_behind_peer += behind_peer;
+        aerial_counters_.gate_behind_drone += behind_drone;
+        if (behind_peer || behind_drone) return true;
+        if (!std::isfinite(drone) || !std::isfinite(peer) || !std::isfinite(target)) {
+          aerial_unknown_progress_clusters_.insert(c.id);
+          ++aerial_counters_.gate_unknown_progress;
+        } else {
+          ++aerial_counters_.gate_known_forward;
+        }
+        return false;
       }), clusters.end());
     }
-    return insideExplorationRegion(std::move(clusters));
+    clusters = insideExplorationRegion(std::move(clusters));
+    aerial_fallback_remains_ = aerial &&
+        std::any_of(clusters.begin(), clusters.end(), others);
+    return clusters;
   }
   // Tour-exploration design §3.5: never a cluster another robot holds or a
   // peer explored; in a group with an award, the awarded bundle and the
@@ -1598,6 +1624,8 @@ std::vector<mgg::FrontierCluster> PlannerNode::tourCandidates(
 std::optional<mgg::FrontierCluster> PlannerNode::refreshTour(
     std::string& note) {
   note.clear();
+  aerial_fallback_remains_ = false;
+  aerial_unknown_progress_clusters_.clear();
   if (!tour_params_.enabled || global_graph_->getNumVertices() <= 1) {
     if (global_graph_->getNumVertices() <= 1) tour_at_target_failures_.clear();
     tour_clusters_.clear();
@@ -1661,6 +1689,19 @@ std::optional<mgg::FrontierCluster> PlannerNode::refreshTour(
                                          0;
                                 }),
                  clusters.end());
+  // Known-forward targets have priority, but a temporary route set-aside
+  // must not hide the unknown-progress fallback. Feasibility was checked
+  // before this tier preference; it is not a new motion certificate.
+  if (!fleet_ && robot_params_.type == mgg::RobotType::kAerialRobot &&
+      std::any_of(clusters.begin(), clusters.end(), [this](const auto& c) {
+        return aerial_unknown_progress_clusters_.count(c.id) == 0;
+      })) {
+    const auto before = clusters.size();
+    clusters.erase(std::remove_if(clusters.begin(), clusters.end(), [this](const auto& c) {
+      return aerial_unknown_progress_clusters_.count(c.id) != 0;
+    }), clusters.end());
+    aerial_counters_.gate_unknown_deferred += before - clusters.size();
+  }
   // Reached: within global_frontier_reach_m of it, as a repositioning's
   // frontier is (onPlanRequest). The next solve chooses freely. A target
   // released as reached once is not released again (tour_reached_cluster_).
@@ -1833,8 +1874,13 @@ bool PlannerNode::tourKeepsRoute(int vertex_id) {
   if (!tour_params_.enabled) return true;
   const mgg::ClusterId target = tour_planner_->target();
   if (target == mgg::kNoCluster) return true;
-  for (const mgg::FrontierCluster& cluster :
-       tourCandidates(globalFrontierClusters())) {
+  const auto clusters = tourCandidates(globalFrontierClusters());
+  if (!fleet_ && robot_params_.type == mgg::RobotType::kAerialRobot &&
+      aerial_unknown_progress_clusters_.count(target) &&
+      std::any_of(clusters.begin(), clusters.end(), [this](const auto& c) {
+        return !aerial_unknown_progress_clusters_.count(c.id) && !tour_set_aside_.count(c.id);
+      })) return false;
+  for (const mgg::FrontierCluster& cluster : clusters) {
     if (cluster.id != target) continue;
     return std::find(cluster.member_vertex_ids.begin(),
                      cluster.member_vertex_ids.end(),
@@ -2147,6 +2193,14 @@ std::string PlannerNode::aerialStatusJson() const {
        ",\"scouting\":" + std::to_string(c.lifted_rejected_scouting) +
        "},\"senders_unplaced\":" + std::to_string(c.lifted_senders_unplaced) +
        ",\"selected\":" + std::to_string(c.lifted_selected) + "}";
+  j += ",\"progress_gate\":{\"own_or_local\":" + std::to_string(c.gate_own_or_local) +
+       ",\"behind_peer\":" + std::to_string(c.gate_behind_peer) +
+       ",\"behind_drone\":" + std::to_string(c.gate_behind_drone) +
+       ",\"known_forward\":" + std::to_string(c.gate_known_forward) +
+       ",\"unknown_progress\":" + std::to_string(c.gate_unknown_progress) +
+       ",\"unknown_deferred\":" + std::to_string(c.gate_unknown_deferred) + "}";
+  j += ",\"front_peer\":" + std::to_string(aerial_front_peer_) +
+       ",\"front_is_lower_bound\":" + (aerial_front_is_lower_bound_ ? "true" : "false");
   j += ",\"cylinders\":{\"accepted\":" +
        std::to_string(c.cylinder_messages_accepted) +
        ",\"rejected_frame\":" + std::to_string(c.cylinder_messages_wrong_frame) +
@@ -3271,6 +3325,10 @@ void PlannerNode::readmitQuarantinedNeighbours() {
 }
 
 std::string PlannerNode::completionWithheld() const {
+  if (!fleet_ && robot_params_.type == mgg::RobotType::kAerialRobot &&
+      aerial_fallback_remains_) {
+    return "eligible forward or unknown-progress peer frontiers remain";
+  }
   const std::size_t outstanding =
       std::max<std::size_t>(roadmaps_to_readmit_.size(),
                             static_cast<std::size_t>(
@@ -6307,10 +6365,11 @@ bool PlannerNode::onPlanRequestImpl(
   const bool scouting_refused = robot_params_.type == mgg::RobotType::kAerialRobot &&
       !scouting_zones_.empty() && best_path_.empty() &&
       (scouting_counters_.paths_refused > scouting_before.paths_refused ||
-       scouting_counters_.targets_refused > scouting_before.targets_refused ||
        scouting_counters_.viewpoints_refused > scouting_before.viewpoints_refused);
-  // Temporary exclusions are neither exhausted exploration nor a reason to
-  // sleep past their expiry. Mixed refusals also get the bounded retry.
+  // Only actual path/viewpoint refusals trigger the short retry, not lifted
+  // target prefilters (which may be ineligible for other reasons). Mixed
+  // physical refusals still retry: proving exclusion-only would require a
+  // second search with exclusions disabled. Never weaken the real search.
   if (scouting_refused) complete = false;
   response->status = !best_path_.empty()
                          ? mgg_msgs::srv::PlannerSrv::Response::FORWARD
@@ -6336,12 +6395,16 @@ bool PlannerNode::onPlanRequestImpl(
     const std::string distance = std::isfinite(progress) ? std::to_string(progress) : "unknown";
     const double fleet_front = aerialFleetFront();
     const std::string fleet_distance = std::isfinite(fleet_front) ? std::to_string(fleet_front) : "unknown";
-    RCLCPP_INFO(get_logger(), "aerial choice: target=%s graph_front_m=%s fleet_front_m=%s reason=%s",
+    RCLCPP_INFO(get_logger(), "aerial choice: target=%s target_progress_m=%s fleet_front_m=%s "
+        "front_peer=%d front_quality=%s reason=%s",
         best_path_.empty() ? "none" : lifted ? "lifted" : "own",
-        distance.c_str(), fleet_distance.c_str(),
+        distance.c_str(), fleet_distance.c_str(), aerial_front_peer_,
+        !std::isfinite(fleet_front) ? "unknown" : aerial_front_is_lower_bound_ ? "lower_bound" : "placed_peers",
         complete ? "exploration complete" : best_path_.empty() ? "no admissible path"
         : aerial_chosen_target ? (fleet_ ? "fleet-assigned tour target"
-            : lifted ? "ahead of peer and not behind drone; bounded graph-front bias"
+            : lifted ? (aerial_unknown_progress_clusters_.count(aerial_chosen_target->id)
+                ? "unknown-progress fallback; no available known-forward target"
+                : "not behind peer or drone; bounded graph-front bias")
             : std::isfinite(fleet_front) ? "own tour target; bounded graph-front bias"
                                          : "own tour target; no placed fresh peer front")
         : best_path_from_global_graph_ ? "global fallback or resumed route"

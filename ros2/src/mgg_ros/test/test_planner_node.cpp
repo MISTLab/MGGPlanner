@@ -11930,12 +11930,16 @@ TEST_F(PlannerNodeTest, AerialPeerFallbackRequiresProgressPastPeerAndDrone) {
   // Equality is allowed: only known-behind progress is rejected.
   candidate.representative_vertex_id = middle; candidate.position.x() = 4.1;
   EXPECT_EQ(PlannerNodeTestPeer::tourCandidates(*node, {candidate}).size(), 1u);
+  candidate.representative_vertex_id = 0; candidate.position.x() = .1;
+  EXPECT_TRUE(PlannerNodeTestPeer::tourCandidates(*node, {candidate}).empty());
+  EXPECT_GT(PlannerNodeTestPeer::aerialCounters(*node).gate_behind_peer, 0u);
   // Beyond the peer, but behind the drone: still not a scouting target.
   candidate.representative_vertex_id = end; candidate.position.x() = 6.1;
   PlannerNodeTestPeer::addGlobalVertex(*node, 1, 10.8, .1, .4, {end});
   PlannerNodeTestPeer::acceptOdometryFacing(*node, 10.8, .1, 0, 1, .4);
   EXPECT_TRUE(PlannerNodeTestPeer::tourCandidates(*node, {candidate}).empty());
-  // Without a placed visited peer vertex, progress is unknown, not ahead.
+  EXPECT_GT(PlannerNodeTestPeer::aerialCounters(*node).gate_behind_drone, 0u);
+  // Unknown peer progress cannot override a known-behind-drone comparison.
   peer.vertices.front().visited = false;
   PlannerNodeTestPeer::receiveGraph(*node, peer);
   EXPECT_TRUE(PlannerNodeTestPeer::tourCandidates(*node, {candidate}).empty());
@@ -11971,6 +11975,11 @@ TEST_F(PlannerNodeTest, AerialUnknownPeerProgressRemainsEligibleBeforeCompletion
     candidate.position = {6.1,.1,.4}; candidate.gain = 1e12;
     EXPECT_EQ(PlannerNodeTestPeer::tourCandidates(*node, {candidate}).size(), 1u);
     EXPECT_FALSE(PlannerNodeTestPeer::completionWithheld(*node).empty());
+    EXPECT_EQ(PlannerNodeTestPeer::aerialCounters(*node).gate_unknown_progress, 1u);
+    const auto status = PlannerNodeTestPeer::aerialStatusJson(*node);
+    EXPECT_NE(status.find("\"unknown_progress\":1"), std::string::npos) << status;
+    EXPECT_TRUE(PlannerNodeTestPeer::tourCandidates(*node, {}).empty());
+    EXPECT_TRUE(PlannerNodeTestPeer::completionWithheld(*node).empty());
   }
 }
 
@@ -12001,6 +12010,7 @@ TEST_F(PlannerNodeTest, AerialLocalFrontierAloneSuppressesOtherwiseEligiblePeer)
   PlannerNodeTestPeer::setSeenLattice(*node, {{.1,.1,.4,0}, {3.1,.1,.4,0}});
   PlannerNodeTestPeer::markLocalFrontier(*node);
   EXPECT_TRUE(PlannerNodeTestPeer::tourCandidates(*node, {candidate}).empty());
+  EXPECT_EQ(PlannerNodeTestPeer::aerialCounters(*node).gate_own_or_local, 1u);
 }
 
 TEST_F(PlannerNodeTest, AerialKnownForwardTierPrecedesUnknownAndFallsBackWhenSetAside) {
@@ -12036,6 +12046,7 @@ TEST_F(PlannerNodeTest, AerialKnownForwardTierPrecedesUnknownAndFallsBackWhenSet
   const auto known = PlannerNodeTestPeer::refreshTour(*node);
   ASSERT_NE(known, mgg::kNoCluster);
   EXPECT_NEAR(PlannerNodeTestPeer::tourTargetPosition(*node).x(), 8.1, 1e-6);
+  EXPECT_GT(PlannerNodeTestPeer::aerialCounters(*node).gate_unknown_deferred, 0u);
   PlannerNodeTestPeer::setTourAside(*node, known);
   ASSERT_NE(PlannerNodeTestPeer::refreshTour(*node), mgg::kNoCluster);
   EXPECT_NEAR(PlannerNodeTestPeer::tourTargetPosition(*node).x(), 3.1, 1e-6);

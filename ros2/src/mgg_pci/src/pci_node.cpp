@@ -334,19 +334,8 @@ void PciNode::planAndPublish() {
     return;
   }
 
-  // The planner says exploration is complete: the local lattice has no gain
-  // and the global graph holds no reachable frontier (rrg.cpp:5582 and
-  // 5628). Retrying would only ask the same question of the same map.
-  if (ok && path.empty() && plan_status_ == kPlannerStatusComplete) {
-    exploration_completed_ = true;
-    running_ = false;
-    path_in_progress_ = false;
-    waiting_for_plan_ = false;
-    publishPath({});
-    publishStatus("complete", "exploration complete");
-    RCLCPP_INFO(get_logger(), "exploration complete");
-    return;
-  }
+  // A revision arriving during the request invalidates even a completion
+  // answer: the last disc may have lapsed while MGG was finishing the plan.
   if (external_path_execution_ && ok && path.empty() &&
       (plan_status_ == mgg_msgs::srv::PlannerSrv::Response::SCOUTING_EXCLUDED ||
        scouting_revision != scouting_revision_)) {
@@ -358,6 +347,18 @@ void PciNode::planAndPublish() {
     retry_not_before_ = now() + rclcpp::Duration::from_seconds(delay);
     publishStatus("waiting", retryStatusReason(
         "scouting exclusions changed or refused routes", delay));
+    return;
+  }
+  // The planner says exploration is complete on an unchanged exclusion set.
+  if (ok && path.empty() && plan_status_ == kPlannerStatusComplete) {
+    exploration_completed_ = true;
+    running_ = false;
+    path_in_progress_ = false;
+    waiting_for_plan_ = false;
+    scouting_retry_ = false;
+    publishPath({});
+    publishStatus("complete", "exploration complete");
+    RCLCPP_INFO(get_logger(), "exploration complete");
     return;
   }
   if (!ok) {
@@ -421,6 +422,7 @@ void PciNode::planAndPublish() {
 
   consecutive_empty_plans_ = 0;
   waiting_for_plan_ = false;
+  scouting_retry_ = false;
   retry_not_before_ = rclcpp::Time(0, 0, RCL_ROS_TIME);
   has_bootstrapped_ = true;
   publishPath(path);

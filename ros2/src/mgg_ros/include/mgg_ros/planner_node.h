@@ -630,6 +630,12 @@ class PlannerNode : public rclcpp::Node {
   void biasAerialTourCosts(mgg::TourCostMatrix& costs,
                           const std::vector<mgg::FrontierCluster>& clusters);
   double aerial_front_m_ = mgg::kUnreachableCost;
+  int aerial_front_peer_ = -1;
+  bool aerial_front_is_lower_bound_ = false;
+  // Latest candidate evaluation, before temporary route set-asides. These
+  // frontiers are not exhausted merely because their progress is unknown.
+  bool aerial_fallback_remains_ = false;
+  std::set<mgg::ClusterId> aerial_unknown_progress_clusters_;
   bool aerialLocalFrontiers() const;
   std::unordered_map<int, std::chrono::steady_clock::time_point> aerial_peer_received_;
   std::vector<mgg::FrontierCluster> tourCandidates(
@@ -1000,6 +1006,13 @@ class PlannerNode : public rclcpp::Node {
     int lifted_admitted = 0;
     /// Senders whose roadmap had no current transform.
     int lifted_senders_unplaced = 0;
+    /// Progress gate evaluations, cumulative (one candidate may be behind both).
+    std::uint64_t gate_own_or_local = 0;
+    std::uint64_t gate_behind_peer = 0;
+    std::uint64_t gate_behind_drone = 0;
+    std::uint64_t gate_known_forward = 0;
+    std::uint64_t gate_unknown_progress = 0;
+    std::uint64_t gate_unknown_deferred = 0;
     /// Times the tour took a lifted target as its new target (a solve that
     /// keeps the same one is not counted again).
     std::uint64_t lifted_selected = 0;
