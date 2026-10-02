@@ -3123,8 +3123,14 @@ TEST_F(PlannerNodeTest, GroundRoomAndCorridorPlanTiming) {
       std::vector<std::tuple<int, int, int, int, bool, double>> pruned_evidence;
       std::shared_ptr<mgg_msgs::srv::PlannerSrv::Response> pruned_response;
       for (bool full_scan : {false, true}) {
+        // The unpruned reference is a diagnostic mode, ~4x the room's gain
+        // work: keep mgg-astar's 0.5 s request budget for the production
+        // (pruned) request only, so a loaded host cannot cut the reference.
         auto node = makeNode(std::string("timing_") + (corridor ? "corridor" : "room") +
-                             std::to_string(iteration) + (full_scan ? "_full" : "_pruned"));
+                             std::to_string(iteration) + (full_scan ? "_full" : "_pruned"),
+                             "world", full_scan
+                                 ? std::vector<rclcpp::Parameter>{rclcpp::Parameter("lattice_time_budget_s", 5.0)}
+                                 : std::vector<rclcpp::Parameter>{});
         PlannerNodeTestPeer::useMolaMap(*node, product.serve());
         PlannerNodeTestPeer::useBistroScoutGain(*node);
         PlannerNodeTestPeer::setGroundGainFullScan(*node, full_scan);
