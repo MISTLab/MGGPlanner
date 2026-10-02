@@ -114,6 +114,14 @@ TEST(PciExecutor, MultiThreadedExecutorWithAReentrantGroupSucceeds) {
   EXPECT_TRUE(runNestedCall<rclcpp::executors::MultiThreadedExecutor>(true));
 }
 
+TEST(PciConfiguration, BlindBootstrapIsDisabledByDefaultAndExplicitlyOptIn) {
+  auto pci = std::make_shared<mgg_pci::PciNode>(rclcpp::NodeOptions());
+  EXPECT_DOUBLE_EQ(pci->get_parameter("bootstrap_distance").as_double(), 0.0);
+  auto legacy = std::make_shared<mgg_pci::PciNode>(rclcpp::NodeOptions().parameter_overrides(
+      {rclcpp::Parameter("bootstrap_distance", 3.0)}));
+  EXPECT_DOUBLE_EQ(legacy->get_parameter("bootstrap_distance").as_double(), 3.0);
+}
+
 TEST(PciStop, ForwardsOnlyToExplorationCancel) {
   const std::string ns = "/pci_scoped_cancel";
   auto options = rclcpp::NodeOptions().arguments({"--ros-args", "-r", "__ns:=" + ns});
@@ -312,6 +320,14 @@ struct ExternalExecutionRig {
   rclcpp::executors::MultiThreadedExecutor executor;
   std::thread spinner;
 };
+
+TEST(PciExternalExecution, CancelledIsNotAcquiringObservations) {
+  ExternalExecutionRig rig("/cancelled_plan", {{}}, -4);
+  rig.publishOdometry();
+  ASSERT_NE(rig.call("pci_trigger"), nullptr);
+  EXPECT_TRUE(rig.waitForStatus("planning cancelled"));
+  EXPECT_FALSE(rig.waitForStatus("acquiring observations"));
+}
 
 TEST(PciExternalExecution, NearEndpointWaitsForExplicitReplan) {
   ExternalExecutionRig rig("/external_near_endpoint", {{1.0, 0.1}, {1.0}});
