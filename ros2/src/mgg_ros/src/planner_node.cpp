@@ -2075,6 +2075,9 @@ void PlannerNode::refreshMapRevision() {
     if (served_map_identity_ && *served_map_identity_ != identity) {
       global_graph_->reset();
       local_graph_->reset();
+      // Lifted slots are graph vertex IDs, not reusable across an epoch.
+      lifted_target_vertices_.clear();
+      lifted_targets_.clear();
       global_graph_->setRobotId(static_cast<int>(planning_params_.robot_id));
       local_graph_->setRobotId(static_cast<int>(planning_params_.robot_id));
       ++graph_revision_;

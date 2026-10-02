@@ -358,6 +358,8 @@ class PlannerNodeTestPeer {
     out.rotation.z = q.z(); out.rotation.w = q.w();
     node.onMappingSnapshot(msg);
   }
+  static void retainOldLiftedSlot(PlannerNode& node) { node.lifted_target_vertices_.push_back(999); }
+  static bool hasLiftedSlots(PlannerNode& node) { return !node.lifted_target_vertices_.empty(); }
   static bool acquiring(PlannerNode& node) { return node.acquiring_observations_.load(); }
   static double latestX(PlannerNode& node) {
     std::lock_guard<std::mutex> lock(node.input_mutex_);
@@ -2234,6 +2236,7 @@ TEST_F(PlannerNodeTest, EmptyAndSparseBootstrapRetriesWhenFirstObservationsArriv
     EXPECT_FALSE(response->path.empty());
     EXPECT_FALSE(PlannerNodeTestPeer::acquiring(*node));
 
+    PlannerNodeTestPeer::retainOldLiftedSlot(*node);
     MolaFloorProduct reset(2, -2, -1, 1, {}, {}, 2);
     initial.publishFrom(reset);
     map->requestSnapshot(reset.request());
@@ -2248,6 +2251,8 @@ TEST_F(PlannerNodeTest, EmptyAndSparseBootstrapRetriesWhenFirstObservationsArriv
     EXPECT_TRUE(response->path.empty());
     EXPECT_EQ(response->status, PlannerNode::kStatusNotReady);
     EXPECT_TRUE(PlannerNodeTestPeer::acquiring(*node));
+
+    EXPECT_FALSE(PlannerNodeTestPeer::hasLiftedSlots(*node));
 
     MolaFloorProduct reset_observed(-1, 4, -1, 1, {},
         {{-1, -1, -1}, {-1, 0, -1}, {0, -1, -1}, {0, 0, -1}}, 2);
