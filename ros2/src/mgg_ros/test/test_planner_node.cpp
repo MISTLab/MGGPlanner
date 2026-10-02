@@ -69,6 +69,7 @@ class PublicationProbeMap : public mgg::MolaMap {
 // Each lattice cell costs 25 ms: 200 cells represent a five-second request.
 class SlowPlanningMap : public mgg::OctomapMap {
  public:
+  SlowPlanningMap() : mgg::OctomapMap(mgg::OctomapConfig{0.1}) {}
   mutable std::atomic<bool> entered{false};
   std::atomic<bool> slow{false};
   mgg::VoxelStatus getBoxStatus(const Eigen::Vector3d& c,
@@ -2020,6 +2021,10 @@ TEST_F(PlannerNodeTest, LatestOdometryIngestedDuringFiveSecondPlannerCall) {
 
 TEST_F(PlannerNodeTest, CancellationInterruptsSlowPlanWithoutReturningPath) {
   auto node = makeNode("cancel_slow_plan");
+  int published = 0;
+  auto subscriber = node->create_subscription<nav_msgs::msg::Path>(
+      "best_path", rclcpp::QoS(1).transient_local(),
+      [&](nav_msgs::msg::Path::ConstSharedPtr) { ++published; });
   auto map = std::make_unique<SlowPlanningMap>();
   auto* slow = map.get();
   PlannerNodeTestPeer::useCloudMap(*node, std::move(map));
@@ -2039,6 +2044,12 @@ TEST_F(PlannerNodeTest, CancellationInterruptsSlowPlanWithoutReturningPath) {
   EXPECT_LT(std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count(), 0.2);
   EXPECT_TRUE(response->path.empty());
   EXPECT_EQ(response->status, PlannerNode::kStatusNotReady);
+  const auto receive_until = std::chrono::steady_clock::now() + std::chrono::milliseconds(200);
+  while (std::chrono::steady_clock::now() < receive_until) {
+    rclcpp::spin_some(node);
+    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+  }
+  EXPECT_EQ(published, 0) << "superseded work must not publish even a latched path";
 }
 
 TEST_F(PlannerNodeTest, NewObjectiveSupersedesSlowPlanAndUsesNewestPose) {

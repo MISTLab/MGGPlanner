@@ -779,6 +779,9 @@ class PlannerNode : public rclcpp::Node {
   std::optional<std::pair<std::string, std::uint64_t>> served_map_identity_;
   std::atomic<std::uint64_t> map_identity_changes_{0};
   std::atomic<std::uint64_t> heartbeats_received_{0};
+  std::atomic<std::uint64_t> heartbeats_during_planning_{0};
+  std::atomic<bool> request_active_{false};
+  std::atomic<std::int64_t> odometry_sample_stamp_ns_{0};
   std::atomic<double> odometry_ingest_lag_s_{0.0};
 
   std::string map_backend_ = "cloud_octomap";

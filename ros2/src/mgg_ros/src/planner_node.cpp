@@ -164,6 +164,12 @@ std::string rebuildLosesHome(mgg::GraphManager& current,
   return "";
 }
 
+struct RequestActivity {
+  std::atomic<bool>& active;
+  explicit RequestActivity(std::atomic<bool>& flag) : active(flag) { active = true; }
+  ~RequestActivity() { active = false; }
+};
+
 /// Sets a flag for a scope and restores it after.
 struct FlagScope {
   explicit FlagScope(bool& flag) : flag_(flag), previous_(flag) { flag_ = true; }
@@ -2033,11 +2039,14 @@ void PlannerNode::publishPlanningStatus() {
       ",\"bootstrap_age_s\":" + jsonNumber(acquiring ?
           (stamp - bootstrap_started_ns_.load()) * 1e-9 : 0.0) +
       ",\"heartbeats_received\":" + std::to_string(heartbeats_received_.load()) +
+      ",\"heartbeats_during_planning\":" + std::to_string(heartbeats_during_planning_.load()) +
       ",\"heartbeats_validated\":" + std::to_string(mola_map_ ? mola_map_->statRevalidationCount() : 0) +
       ",\"map_identity_changes\":" + std::to_string(map_identity_changes_.load()) +
       ",\"map_authority_valid\":" + (mola_map_ && mola_map_->authorityValid() ? "true" : "false") +
       ",\"map_expiries\":" + std::to_string(mola_map_ ? mola_map_->expiryCount() : 0) +
       ",\"map_error\":" + jsonString(mola_map_ ? mola_map_->lastError() : "") +
+      ",\"odometry_sample_age_s\":" + jsonNumber(odometry_sample_stamp_ns_.load() ?
+          (now().nanoseconds() - odometry_sample_stamp_ns_.load()) * 1e-9 : NAN) +
       ",\"odometry_ingest_lag_s\":" + jsonNumber(odometry_ingest_lag_s_.load()) +
       ",\"cancellations\":" + std::to_string(cancellations_.load()) + "}";
   planning_status_pub_->publish(status);
@@ -2055,8 +2064,10 @@ void PlannerNode::refreshMapRevision() {
   if (const auto active = mola_map_->activeRequest()) {
     const auto identity = std::make_pair(active->component_id, active->epoch);
     if (served_map_identity_ && *served_map_identity_ != identity) {
-      global_graph_ = std::make_shared<mgg::GraphManager>();
-      local_graph_ = std::make_shared<mgg::GraphManager>();
+      global_graph_->reset();
+      local_graph_->reset();
+      global_graph_->setRobotId(static_cast<int>(planning_params_.robot_id));
+      local_graph_->setRobotId(static_cast<int>(planning_params_.robot_id));
       ++graph_revision_;
       best_path_.clear();
       global_exploration_ongoing_ = false;
@@ -2272,6 +2283,7 @@ void PlannerNode::onOdometry(nav_msgs::msg::Odometry::ConstSharedPtr msg) {
       return;
     latest_odometry_ = msg;
     latest_odometry_received_ = received;
+    odometry_sample_stamp_ns_ = rclcpp::Time(msg->header.stamp).nanoseconds();
   }
   odometry_ingest_lag_s_.store(
       std::chrono::duration<double>(std::chrono::steady_clock::now() - received).count());
@@ -2393,6 +2405,7 @@ void PlannerNode::onMappingSnapshot(
     latest_snapshot_ = msg;
   }
   ++heartbeats_received_;
+  if (request_active_.load()) ++heartbeats_during_planning_;
   const std::string prior_error = mola_map_->lastError();
   if (!prior_error.empty()) {
     RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 5000,
@@ -5180,8 +5193,17 @@ void PlannerNode::onBuildRequest(
 
 void PlannerNode::cancelPlanning() {
   // Linearizes cancellation with path publication; never takes planner_mutex_.
-  std::lock_guard<std::mutex> lock(cancellation_mutex_);
-  ++request_generation_;
+  {
+    std::lock_guard<std::mutex> lock(cancellation_mutex_);
+    ++request_generation_;
+  }
+  std::unique_lock<std::recursive_mutex> lock(planner_mutex_, std::try_to_lock);
+  if (lock.owns_lock()) {
+    best_path_.clear();
+    global_exploration_ongoing_ = false;
+    exploration_target_.reset();
+    publishPath();
+  }
 }
 
 void PlannerNode::onPlanRequest(
@@ -5189,6 +5211,7 @@ void PlannerNode::onPlanRequest(
     std::shared_ptr<mgg_msgs::srv::PlannerSrv::Response> response) {
   const auto generation = request_generation_.load();
   const std::lock_guard<std::recursive_mutex> lock(planner_mutex_);
+  RequestActivity activity(request_active_);
   const bool admitted = mola_map_ && mola_map_->authorityValid();
   const auto map_generation = mola_map_ ? mola_map_->activeGeneration() : 0;
   const auto bound = robot_params_.bound_mode;
@@ -5204,7 +5227,10 @@ void PlannerNode::onPlanRequest(
     mgg::planningCheckpoint();
   } catch (const mgg::PlanningInterrupted&) {
     ++cancellations_;
+    ++graph_revision_;
+    local_graph_->reset();
     best_path_.clear();
+    if (request_generation_.load() != generation) exploration_target_.reset();
     global_exploration_ongoing_ = false;
     response->path.clear();
     response->status = kStatusNotReady;
@@ -5222,6 +5248,7 @@ void PlannerNode::onObjectiveRequest(
     generation = ++request_generation_;
   }
   const std::lock_guard<std::recursive_mutex> lock(planner_mutex_);
+  RequestActivity activity(request_active_);
   const bool admitted = mola_map_ && mola_map_->authorityValid();
   const auto map_generation = mola_map_ ? mola_map_->activeGeneration() : 0;
   mgg::PlanningCancellationScope cancellation([this, generation, admitted, map_generation]() {
@@ -5238,6 +5265,10 @@ void PlannerNode::onObjectiveRequest(
     mgg::planningCheckpoint();
   } catch (const mgg::PlanningInterrupted&) {
     ++cancellations_;
+    ++graph_revision_;
+    local_graph_->reset();
+    best_path_.clear();
+    global_exploration_ongoing_ = false;
     response->path.clear();
     response->status = mgg_msgs::srv::PlanObjective::Response::BLOCKED;
     response->reason = "planning cancelled: superseded or map authority expired/changed";
@@ -5608,7 +5639,8 @@ void PlannerNode::onPlanRequestImpl(
   refreshNoGoZones();
   recordSentPath();
   enforceSafeCompletion(complete);
-  if (mola_map_ && acquiring_observations_.load() && best_path_.empty() &&
+  if (mola_map_ && robot_params_.type == mgg::RobotType::kGroundRobot &&
+      acquiring_observations_.load() && best_path_.empty() &&
       local_graph_->getNumVertices() <= 1) {
     setAcquiringObservations(true);
     complete = false;
@@ -5619,7 +5651,8 @@ void PlannerNode::onPlanRequestImpl(
   response->status = !best_path_.empty()
                          ? mgg_msgs::srv::PlannerSrv::Response::FORWARD
                      : complete ? kStatusComplete
-                     : mola_map_ && acquiring_observations_.load() ? kStatusNotReady
+                     : mola_map_ && robot_params_.type == mgg::RobotType::kGroundRobot &&
+                         acquiring_observations_.load() ? kStatusNotReady
                                 : kStatusNoPath;
   for (const mgg::StateVec& s : best_path_) {
     response->path.push_back(toPoseMsg(s));
