@@ -23,14 +23,13 @@ TEST(NavBench, BotmanPlansMeetTheirTimeBudgets) {
   auto lease = map->acquireReadLease();
   for (const auto& scenario : mgg::nav_bench::scenarios()) {
     SCOPED_TRACE(scenario.name);
-    mgg::nav_bench::Outcome best;
     for (int r = 0; r < 3; ++r) {
+      SCOPED_TRACE(r);
       const auto outcome = mgg::nav_bench::run(*map, scenario);
-      if (r == 0 || outcome.total_ms < best.total_ms) best = outcome;
+      std::printf("%s\n", mgg::nav_bench::describe(scenario, outcome).c_str());
+      EXPECT_TRUE(outcome.expectation_met)
+          << mgg::nav_bench::describe(scenario, outcome);
+      EXPECT_LE(outcome.total_ms, scenario.budget_ms);
     }
-    std::printf("%s\n", mgg::nav_bench::describe(scenario, best).c_str());
-    EXPECT_TRUE(best.expectation_met)
-        << mgg::nav_bench::describe(scenario, best);
-    EXPECT_LE(best.total_ms, scenario.budget_ms);
   }
 }

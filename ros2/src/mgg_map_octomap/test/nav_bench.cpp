@@ -53,19 +53,19 @@ int main(int argc, char** argv) {
   auto lease = map->acquireReadLease();
   int failures = 0;
   for (const auto& scenario : mgg::nav_bench::scenarios()) {
-    mgg::nav_bench::Outcome best;
     for (int r = 0; r < repeat; ++r) {
       const mgg::nav_bench::Outcome outcome =
           mgg::nav_bench::run(*map, scenario);
-      if (r == 0 || outcome.total_ms < best.total_ms) best = outcome;
-    }
-    if (!best.expectation_met) ++failures;
-    if (json) {
-      std::printf("%s\n", mgg::nav_bench::toJson(scenario, best).c_str());
-    } else {
-      std::printf("%s\n", mgg::nav_bench::describe(scenario, best).c_str());
+      if (!outcome.expectation_met) ++failures;
+      // Retain every sample, including the cold first run and slow outliers.
+      if (json) {
+        std::printf("%s\n", mgg::nav_bench::toJson(scenario, outcome).c_str());
+      } else {
+        std::printf("repeat %d/%d: %s\n", r + 1, repeat,
+                    mgg::nav_bench::describe(scenario, outcome).c_str());
+      }
     }
   }
-  std::printf("%d scenario(s) missed their expectation\n", failures);
-  return 0;
+  std::fprintf(stderr, "%d run(s) missed their expectation\n", failures);
+  return failures == 0 ? 0 : 1;
 }
