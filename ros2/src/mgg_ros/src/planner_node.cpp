@@ -688,6 +688,14 @@ PlannerNode::PlannerNode(const rclcpp::NodeOptions& options)
       unknown_body_policy_ != "legacy_relaxed")
     throw std::invalid_argument("unknown_body_policy must be strict, above_sensor_fov or legacy_relaxed");
   allow_unknown_lattice_body_ = unknown_body_policy_ == "legacy_relaxed";
+  if (unknown_body_policy_ == "above_sensor_fov" &&
+      !makeContext().unknown_body_above_center) {
+    RCLCPP_ERROR(get_logger(),
+        "unknown_body_policy=above_sensor_fov CANNOT APPLY: sensor '%s' must be an upright "
+        "ground-robot lidar with finite full vertical FOV in (0, pi) and mount_height "
+        "strictly above the planning body bottom; USING STRICT UNKNOWN POLICY",
+        unknown_body_sensor_.c_str());
+  }
   // The most one request (an objective, a plan request) spends sweeping
   // lattices, seconds: past it a sweep stops and the request plans over
   // what it built, or refuses with the budget named. A planning call longer
@@ -958,14 +966,6 @@ void PlannerNode::loadParameters() {
   }
   loadTourParams(p, "tour", tour_params_);
   loadFleetParams(p, "fleet", fleet_params_);
-  if (unknown_body_policy_ == "above_sensor_fov" &&
-      !makeContext().unknown_body_above_center) {
-    RCLCPP_ERROR(get_logger(),
-        "unknown_body_policy=above_sensor_fov CANNOT APPLY: sensor '%s' must be an upright "
-        "ground-robot lidar with finite full vertical FOV in (0, pi) and mount_height "
-        "strictly above the planning body bottom; USING STRICT UNKNOWN POLICY",
-        unknown_body_sensor_.c_str());
-  }
   world_frame_ = planning_params_.global_frame_id;
   communication_range_ =
       declareOrGet<double>(this, "communication_range", 15.0);
@@ -988,7 +988,7 @@ mgg::GainContext PlannerNode::makeGainContext() {
   return ctx;
 }
 
-mgg::ExpandContext PlannerNode::makeContext() {
+mgg::ExpandContext PlannerNode::makeContext(bool include_own_body) {
   mgg::ExpandContext ctx;
   ctx.inclinations = &edge_inclinations_;
   ctx.map = map_.get();
@@ -1018,7 +1018,7 @@ mgg::ExpandContext PlannerNode::makeContext() {
       }
     }
   }
-  if (robot_params_.type == mgg::RobotType::kGroundRobot &&
+  if (include_own_body && robot_params_.type == mgg::RobotType::kGroundRobot &&
       have_odometry_ && map_ && ground_ && map_->getStatus()) {
     const auto root = physicalAnchorAtDrivingHeight(current_state_);
     ctx.standing_body = mgg::OrientedBox{
@@ -1085,7 +1085,7 @@ std::shared_ptr<const mgg::KnownFreeBodyVolumes> PlannerNode::ownBodyKnownFree()
 }
 
 mgg::ExpandContext PlannerNode::makeGlobalContext() {
-  mgg::ExpandContext ctx = makeContext();
+  mgg::ExpandContext ctx = makeContext(false);
   ctx.unknown_body_above_center.reset();
   ctx.standing_body.reset();
   // Inclinations are keyed by local lattice ids; the roadmap has its own.

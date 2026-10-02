@@ -64,10 +64,13 @@ Vertex* lazyGroundLattice(GraphManager& graph, Vertex* root,
     body.heading = std::atan2(to.y() - from.y(), to.x() - from.x());
     body.size = ctx.robot_box_size;
     const Eigen::Vector3d center = to.head<3>() + ctx.robot->offsetForHeading(body.heading);
-    if (ctx.unknown_body_above_center || ctx.own_body_known_free)
+    if (ctx.unknown_body_above_center)
       return orientedBoxPathStatus(*ctx.map, center, center, body, !ctx.allow_unknown_lattice_body, nullptr,
                                     false, ctx.unknown_body_above_center, ctx.own_body_known_free.get()) == VoxelStatus::kFree;
     auto status = ctx.map->getBoxStatus(center, body.size, !ctx.allow_unknown_lattice_body);
+    if (status == VoxelStatus::kUnknown && ctx.own_body_known_free)
+      status = orientedBoxPathStatus(*ctx.map, center, center, body, true,
+          nullptr, false, std::nullopt, ctx.own_body_known_free.get());
     if (status == VoxelStatus::kOccupied && !ctx.map->dynamicBoxBlocked(center, body.size))
       status = orientedBoxPathStatus(*ctx.map, center, center, body,
                                       !ctx.allow_unknown_lattice_body, nullptr);

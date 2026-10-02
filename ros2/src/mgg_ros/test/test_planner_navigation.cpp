@@ -378,13 +378,29 @@ class PlannerNodeTestPeer {
       mgg::ExpandGraphReport a,b;
       const bool sa = mgg::roadmapEdgeTraversable(strict,*v,target,a);
       const bool sb = mgg::roadmapEdgeTraversable(bounded,*v,target,b);
-      links.push_back({{"id",v->id},{"position",{v->state.x(),v->state.y(),v->state.z()}},
+      nlohmann::json upper_unknown = nlohmann::json::array();
+      if (sb && bounded.unknown_body_above_center) {
+        const auto size=node.robot_params_.getPlanningSize();
+        const double yaw=std::atan2(goal.y()-v->state.y(),goal.x()-v->state.x());
+        mgg::OrientedBox body{goal.head<3>(),yaw,size};
+        std::vector<mgg::XYCellCenter> cells;
+        node.map_->getCircleIntersectingXYCellCenters(goal.head<2>(),size.head<2>().norm()/2,4096,cells);
+        const double plane=goal.z()+*bounded.unknown_body_above_center;
+        for (const auto& cell:cells) if(mgg::cellMeetsBox(cell.center,.1,body,-1e-9)) {
+          for (double z=std::floor(plane/.1)*.1+.15; z<goal.z()+size.z()/2;z+=.1) {
+            if(upper_unknown.size()<8 && node.map_->getVoxelStatus({cell.center.x(),cell.center.y(),z})==mgg::VoxelStatus::kUnknown)
+              upper_unknown.push_back({cell.center.x(),cell.center.y(),z});
+          }
+        }
+      }
+      links.push_back({{"upper_unknown_voxels",upper_unknown},{"id",v->id},{"position",{v->state.x(),v->state.y(),v->state.z()}},
         {"strict",sa},{"bounded",sb},{"strict_status",a.edge_status},{"bounded_status",b.edge_status}});
     }
     return {{"vertices",node.global_graph_->getNumVertices()},
       {"edges",node.global_graph_->getNumEdges()},{"goal_links",links}};
   }
   static void mappedGlobalPath(PlannerNode& node) {
+    node.applyLatestOdometry();
     node.global_graph_->reset();
     auto* a = new mgg::Vertex(0, mgg::StateVec(0,0,.935,M_PI));
     node.global_graph_->addVertex(a);
@@ -395,6 +411,25 @@ class PlannerNodeTestPeer {
   }
   static std::pair<int,int> globalSize(PlannerNode& node) {
     return {node.global_graph_->getNumVertices(), node.global_graph_->getNumEdges()};
+  }
+  static void historyIdentity(PlannerNode& node, const std::string& component, int epoch) {
+    class OwnSource : public KeyframeTrajectorySource {
+     public:
+      KeyframeTrajectory trajectory;
+      bool read(KeyframeTrajectory& out, std::string&) override { out=trajectory; return true; }
+    };
+    auto source = std::make_unique<OwnSource>();
+    source->trajectory.component_id=component; source->trajectory.epoch=epoch;
+    auto pose=Eigen::Isometry3d::Identity(); pose.translation()=Eigen::Vector3d(2,0,.61);
+    source->trajectory.poses={pose};
+    node.keyframe_source_=std::move(source);
+  }
+  static mgg::VoxelStatus historicalUnknown(PlannerNode& node) {
+    node.applyLatestOdometry();
+    PlannerNode::StandingStartScope scope(node);
+    const auto ctx=node.makeContext();
+    const Eigen::Vector2d cell(2.05,.05);
+    return ctx.own_body_known_free->strictColumnStatus(*node.map_,cell,.55,.7);
   }
   static bool globalUsesUpperPolicy(PlannerNode& node) {
     return node.makeGlobalContext().unknown_body_above_center.has_value();
@@ -605,6 +640,35 @@ TEST_F(PlannerNavigationTest, BotmanFixtureFullServicesBenchmark) {
       EXPECT_LT(elapsed, 1000);  // hard envelope, not a claim of the x86 target
     }
   }
+}
+
+TEST_F(PlannerNavigationTest, OwnBodyHistoryCannotCrossComponentOrEpoch) {
+  MolaTerrainProduct product(.1,-3,5,-3,3,flat,{},.5);
+  auto node=botmanNode("history_identity",product);
+  PlannerNodeTestPeer::sensorPolicy(*node);
+  PlannerNodeTestPeer::standAt(*node,0,0,0,0,1);
+  PlannerNodeTestPeer::historyIdentity(*node,"component:test",1);
+  EXPECT_EQ(PlannerNodeTestPeer::historicalUnknown(*node),mgg::VoxelStatus::kFree);
+  PlannerNodeTestPeer::historyIdentity(*node,"component:other",1);
+  EXPECT_EQ(PlannerNodeTestPeer::historicalUnknown(*node),mgg::VoxelStatus::kUnknown);
+  PlannerNodeTestPeer::historyIdentity(*node,"component:test",2);
+  EXPECT_EQ(PlannerNodeTestPeer::historicalUnknown(*node),mgg::VoxelStatus::kUnknown);
+}
+
+TEST_F(PlannerNavigationTest, InvalidSensorPolicyWarnsAtParameterLoad) {
+  MolaTerrainProduct product(.1,-1,1,-1,1,flat);
+  rclcpp::NodeOptions options;
+  options.parameter_overrides({rclcpp::Parameter("map.backend","mola_snapshot"),
+      rclcpp::Parameter("map.resolution",.1),
+      rclcpp::Parameter("map.mola.peer_root",product.root().string()),
+      rclcpp::Parameter("unknown_body_policy","above_sensor_fov"),
+      rclcpp::Parameter("unknown_body_sensor","missing_sensor")});
+  options.automatically_declare_parameters_from_overrides(true);
+  testing::internal::CaptureStderr();
+  { auto node=std::make_shared<PlannerNode>(options); }
+  const auto log=testing::internal::GetCapturedStderr();
+  EXPECT_NE(log.find("CANNOT APPLY"),std::string::npos);
+  EXPECT_NE(log.find("USING STRICT UNKNOWN POLICY"),std::string::npos);
 }
 
 TEST_F(PlannerNavigationTest, GlobalQueryConnectorUsesUpperAirPolicyWithoutPersisting) {

@@ -571,7 +571,7 @@ class PlannerNode : public rclcpp::Node {
   void refreshMapRevision();
   mgg::MolaMap::ReadLease mapReadLease() const;
 
-  mgg::ExpandContext makeContext();
+  mgg::ExpandContext makeContext(bool include_own_body = true);
   mgg::GainContext makeGainContext();
   /// makeContext for the roadmap: no lattice inclinations, unknown space
   /// blocks an edge.

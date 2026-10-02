@@ -223,7 +223,7 @@ VoxelStatus orientedBoxPathStatus(const MapInterface& map,
   swept.size += Eigen::Vector3d(std::abs(step.head<2>().dot(along)),
                                 std::abs(step.head<2>().dot(across)),
                                 std::abs(step.z()));
-  if (clearance_prefilter && standing == nullptr && !unknown_above_center && !known_free) {
+  if (clearance_prefilter && standing == nullptr && !unknown_above_center) {
     // Contains every conservative step box below (not an inscribed disc).
     // Padding also contains boundary-touching native XY cells.
     const Eigen::Vector3d span = (end - start).cwiseAbs();
@@ -261,10 +261,10 @@ VoxelStatus orientedBoxPathStatus(const MapInterface& map,
       const VoxelStatus status = map.getStaticBoxStatus(
           Eigen::Vector3d(cell.center.x(), cell.center.y(), swept.center.z()),
           Eigen::Vector3d(0.0, 0.0, swept.size.z()),
-          (unknown_above_center || masked) ? false : stop_at_unknown_voxel);
+          unknown_above_center ? false : stop_at_unknown_voxel);
       if (status == VoxelStatus::kOccupied) return status;
-      if (status == VoxelStatus::kUnknown) unknown = true;
-      if (unknown_above_center || (masked && stop_at_unknown_voxel)) {
+      if (status == VoxelStatus::kUnknown && !masked) unknown = true;
+      if (unknown_above_center || (masked && status == VoxelStatus::kUnknown)) {
         // Require every voxel up to the higher endpoint's sensor plane.
         // Occupancy above that plane was checked over the entire body.
         const double lower = swept.center.z() - swept.size.z() / 2;

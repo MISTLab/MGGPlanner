@@ -508,12 +508,12 @@ PathTurnCheck::Refusal PathTurnCheck::firstRefusal(
     // as an offset chassis spins: certify both endpoint centre circles.
     std::size_t back = i, ahead = i;
     double distance = 0;
-    while (back > 0 && distance < window_) {
+    while (back > 0 && (back == i || distance < window_)) {
       distance += (points[back] - points[back-1]).head<2>().norm();
       --back;
     }
     distance = 0;
-    while (ahead+1 < points.size() && distance < window_) {
+    while (ahead+1 < points.size() && (ahead == i || distance < window_)) {
       distance += (points[ahead+1] - points[ahead]).head<2>().norm();
       ++ahead;
     }

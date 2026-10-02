@@ -113,6 +113,8 @@ GridGraphResult buildGridGraph(GraphManager& graph, const StateVec& state,
 
   // Only offer columns beside a connected vertex. A disconnected column
   // is deferred, not discarded: connecting around a wall schedules it.
+  // One stencil shell beyond the edge limit is required: expandGraph may
+  // clip that sample to a supported endpoint beyond the near-field blind spot.
   // Ground projection/body queries for unreachable space used the entire
   // soft slice even after the connected component stopped growing.
   std::set<std::size_t> ready_columns;
@@ -125,7 +127,7 @@ GridGraphResult buildGridGraph(GraphManager& graph, const StateVec& state,
       const double x = (i-i0)*grid.resolution.x(), y = (j-j0)*grid.resolution.y();
       const Eigen::Vector2d world = state.head<2>() +
           Eigen::Vector2d(cos_h*x-sin_h*y, sin_h*x+cos_h*y);
-      if ((world-position).norm() > reach+1e-9) continue;
+      if ((world-position).norm() > reach+grid.resolution.head<2>().norm()+1e-9) continue;
       scheduled[n] = true;
       ready_columns.insert(n);
     }
@@ -321,13 +323,17 @@ GridGraphResult buildGridGraph(GraphManager& graph, const StateVec& state,
       status = known->second;
       if (profile != nullptr) ++profile->precheck_cache_hits;
     } else {
-      if (ground_robot && (ctx.unknown_body_above_center || ctx.own_body_known_free)) {
+      if (ground_robot && ctx.unknown_body_above_center) {
         status = orientedBoxPathStatus(*ctx.map, center, center, body, !ctx.allow_unknown_lattice_body,
                                        nullptr, false, ctx.unknown_body_above_center, ctx.own_body_known_free.get());
       } else status = ctx.robot->type == RobotType::kAerialRobot
           ? ctx.map->getStrictBoxStatus(center, ctx.robot_box_size)
           : ctx.map->getBoxStatus(center, ctx.robot_box_size,
                                   !ctx.allow_unknown_lattice_body);
+      if (ground_robot && status == VoxelStatus::kUnknown &&
+          !ctx.unknown_body_above_center && ctx.own_body_known_free)
+        status = orientedBoxPathStatus(*ctx.map, center, center, body, true,
+            nullptr, false, std::nullopt, ctx.own_body_known_free.get());
       if (ground_robot && !ctx.unknown_body_above_center && status == VoxelStatus::kOccupied &&
           !ctx.map->dynamicBoxBlocked(center, ctx.robot_box_size)) {
         status = orientedBoxPathStatus(*ctx.map, center, center, body,
@@ -358,6 +364,7 @@ GridGraphResult buildGridGraph(GraphManager& graph, const StateVec& state,
   };
 
   std::vector<Retry> nudges;
+  bool root_spokes_tried = false;
   do {
   while (!ready_columns.empty()) {
     planningCheckpoint();
@@ -452,6 +459,17 @@ GridGraphResult buildGridGraph(GraphManager& graph, const StateVec& state,
   }
   nudges.clear();
   retries.clear();
+  // Preserve the base planner's bootstrap: a distant nominal cell can
+  // define a different heading whose edge clips to observed support right
+  // beside the root. If the adjacent stencil could not leave at all, try
+  // these root spokes once. No unsupported endpoint is admitted, and once
+  // connected, expansion remains restricted to the connected frontier.
+  if (ground_robot && graph.getNumVertices() == 1 && !root_spokes_tried) {
+    root_spokes_tried = true;
+    for (std::size_t n=0; n<columns.size(); ++n) if (!scheduled[n]) {
+      scheduled[n] = true; ready_columns.insert(n);
+    }
+  }
   } while (!ready_columns.empty());
   return result;
 }

@@ -55,7 +55,7 @@ class KnownFreeBodyVolumes {
   VoxelStatus strictColumnStatus(const MapInterface& map,
       const Eigen::Vector2d& cell, double lower, double upper) const;
  private:
-    using ColumnKey = std::pair<long long, long long>;
+  using ColumnKey = std::pair<long long, long long>;
   static ColumnKey key(const Eigen::Vector2d& cell) {
     return {std::llround(cell.x()*1e9), std::llround(cell.y()*1e9)};
   }
@@ -94,6 +94,10 @@ bool pointInBox(const Eigen::Vector2d& point, const OrientedBox& box);
 /// volume below that height relative to each body centre is strictly known
 /// free. Only the ground local-lattice sensor policy supplies this value;
 /// aerial and global checks leave it unset. The pre-filter is disabled.
+/// `known_free` subtracts ONLY unknown physical own-body intervals from the
+/// strict check. With `standing_unknown_only`, `standing` uses this same
+/// bounded-height rule and occupied cells still block. The default retains
+/// the pre-existing boxed-in departure semantics described above.
 VoxelStatus orientedBoxPathStatus(const MapInterface& map,
                                   const Eigen::Vector3d& start,
                                   const Eigen::Vector3d& end,
