@@ -1329,6 +1329,14 @@ class PlannerNodeTestPeer {
     const std::lock_guard<std::recursive_mutex> lock(node.planner_mutex_);
     node.exploration_target_ = target;
   }
+  static std::optional<Eigen::Vector3d> explorationTarget(PlannerNode& node) {
+    const std::lock_guard<std::recursive_mutex> lock(node.planner_mutex_);
+    return node.exploration_target_;
+  }
+  static void applyPendingCancel(PlannerNode& node) {
+    const std::lock_guard<std::recursive_mutex> lock(node.planner_mutex_);
+    node.applyPendingCancel();
+  }
   static void setSensorRange(PlannerNode& node, double range) {
     mgg::SensorParams& sensor = node.sensors_["test_lidar"];
     sensor.max_range = range;
@@ -2202,6 +2210,86 @@ TEST_F(PlannerNodeTest, GeneralCancelEventuallyClearsStateAfterBackgroundLock) {
   EXPECT_TRUE(PlannerNodeTestPeer::explorationCleared(*node));
 }
 
+TEST_F(PlannerNodeTest, NavigateProbePreservesExplorationTargetAndRepositioning) {
+  auto node = makeNode("probe_preserves_target");
+  PlannerNodeTestPeer::observeFloor(*node, -1.5, 4, -1.5, 1.5);
+  PlannerNodeTestPeer::acceptOdometry(*node, 0, 0, 1);
+  PlannerNodeTestPeer::retainExploration(*node);
+  const auto target = PlannerNodeTestPeer::explorationTarget(*node);
+  ASSERT_TRUE(target);
+  auto request = std::make_shared<mgg_msgs::srv::PlanObjective::Request>();
+  request->objective = mgg_msgs::srv::PlanObjective::Request::NAVIGATE;
+  request->goal.position.x = 1;
+  request->goal.position.z = 0.075;
+  request->goal.orientation.w = 1;
+  auto response = std::make_shared<mgg_msgs::srv::PlanObjective::Response>();
+  PlannerNodeTestPeer::objective(*node, request, response);
+  EXPECT_EQ(response->status, mgg_msgs::srv::PlanObjective::Response::SUCCEEDED);
+  const auto after = PlannerNodeTestPeer::explorationTarget(*node);
+  ASSERT_TRUE(after);
+  EXPECT_TRUE(after->isApprox(*target));
+  EXPECT_TRUE(PlannerNodeTestPeer::repositioningOngoing(*node));
+  PlannerNodeTestPeer::cancel(*node);
+  PlannerNodeTestPeer::applyPendingCancel(*node);
+  EXPECT_TRUE(PlannerNodeTestPeer::explorationCleared(*node));
+}
+
+TEST_F(PlannerNodeTest, TargetSetImmediatelyAfterCancelSurvivesDeferredClear) {
+  auto node = makeNode("target_after_cancel");
+  PlannerNodeTestPeer::retainExploration(*node);
+  PlannerNodeTestPeer::cancel(*node);
+  PlannerNodeTestPeer::requestExplorationTarget(*node, true, {-10, 0, 0});
+  PlannerNodeTestPeer::applyPendingCancel(*node);
+  const auto target = PlannerNodeTestPeer::explorationTarget(*node);
+  ASSERT_TRUE(target);
+  EXPECT_TRUE(target->isApprox(Eigen::Vector3d(-10, 0, 0)));
+  EXPECT_FALSE(PlannerNodeTestPeer::repositioningOngoing(*node));
+}
+
+TEST_F(PlannerNodeTest, NavigateProbePreemptsExplorationWithoutLosingTargetBias) {
+  auto node = makeNode("probe_preempts_exploration");
+  auto provider = std::make_unique<SlowPlanningMap>();
+  auto* slow = provider.get();
+  PlannerNodeTestPeer::useCloudMap(*node, std::move(provider));
+  PlannerNodeTestPeer::observeFloor(*node, -2.5, 2.5, -2.5, 2.5);
+  PlannerNodeTestPeer::setLattice(*node, {-2, -2}, {2, 2});
+  PlannerNodeTestPeer::seeAllRound(*node);
+  PlannerNodeTestPeer::acceptOdometry(*node, 0, 0, 1);
+  PlannerNodeTestPeer::requestExplorationTarget(*node, true, {-10, 0, 0});
+  slow->slow = true;
+  auto interrupted = std::make_shared<mgg_msgs::srv::PlannerSrv::Response>();
+  auto work = std::async(std::launch::async, [&] {
+    PlannerNodeTestPeer::plan(*node, interrupted);
+  });
+  const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+  while (!slow->entered && std::chrono::steady_clock::now() < deadline)
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  EXPECT_TRUE(slow->entered);
+  slow->slow = false;
+  auto request = std::make_shared<mgg_msgs::srv::PlanObjective::Request>();
+  request->objective = mgg_msgs::srv::PlanObjective::Request::NAVIGATE;
+  request->goal.position.x = 1;
+  request->goal.position.z = 0.075;
+  request->goal.orientation.w = 1;
+  auto response = std::make_shared<mgg_msgs::srv::PlanObjective::Response>();
+  auto probe = std::async(std::launch::async, [&] {
+    PlannerNodeTestPeer::objective(*node, request, response);
+  });
+  EXPECT_EQ(work.wait_for(std::chrono::milliseconds(200)), std::future_status::ready);
+  work.get();
+  probe.get();
+  EXPECT_EQ(interrupted->status, mgg_msgs::srv::PlannerSrv::Response::CANCELLED);
+  EXPECT_TRUE(interrupted->path.empty());
+  EXPECT_EQ(response->status, mgg_msgs::srv::PlanObjective::Response::SUCCEEDED);
+  const auto target = PlannerNodeTestPeer::explorationTarget(*node);
+  EXPECT_TRUE(target);
+  if (target) EXPECT_TRUE(target->isApprox(Eigen::Vector3d(-10, 0, 0)));
+  auto next = std::make_shared<mgg_msgs::srv::PlannerSrv::Response>();
+  PlannerNodeTestPeer::plan(*node, next);
+  ASSERT_FALSE(next->path.empty());
+  EXPECT_LT(next->path.back().position.x, -1.0) << "the retained target must bias exploration west";
+}
+
 TEST_F(PlannerNodeTest, TransformOnlyChangeRetiresOldGraphSlots) {
   auto node = makeNode("transform_reset");
   MolaFloorProduct product(-1, 4, -1, 1);
@@ -2280,7 +2368,11 @@ TEST_F(PlannerNodeTest, LatestOdometryIngestedDuringFiveSecondPlannerCall) {
   PlannerNodeTestPeer::heartbeat(*node, product.request());
   EXPECT_GT(map->statRevalidationCount(), heartbeats);
   PlannerNodeTestPeer::acceptOdometry(*node, 2, 0, 3);
+  testing::internal::CaptureStderr();
   PlannerNodeTestPeer::acceptOdometry(*node, 1, 0, 2); // an older queued sample
+  const auto warning = testing::internal::GetCapturedStderr();
+  EXPECT_NE(warning.find("ignoring odometry older than latest accepted state"),
+            std::string::npos) << warning;
   EXPECT_LT(std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count(), 0.2);
   RecordProperty("ingestion_ms", std::to_string(
       std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count()));
