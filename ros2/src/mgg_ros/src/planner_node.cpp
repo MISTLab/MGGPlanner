@@ -3656,7 +3656,8 @@ void PlannerNode::shortcutAndResample(std::vector<mgg::StateVec>& path,
   shortcut_ground.setStandingStart(standingStart());
   mgg::ExpandContext ctx = makeContext();
   ctx.ground = &shortcut_ground;
-  const bool stop_at_unknown = !lattice_route || ctx.stop_at_unknown;
+  const bool stop_at_unknown = !lattice_route || ctx.stop_at_unknown ||
+                               !ctx.allow_unknown_lattice_body;
   const auto segment_free = [this, &ctx, stop_at_unknown](
                                 const Eigen::Vector3d& from,
                                 const Eigen::Vector3d& to) {

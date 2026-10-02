@@ -20,6 +20,7 @@
 #include <gtest/gtest.h>
 
 #include "mgg_map_octomap/octomap_map.h"
+#include "mgg_core/departure.h"
 
 namespace {
 
@@ -729,3 +730,20 @@ TEST(OctomapMap, TrackedInsertionPreservesOccupancyUpdates) {
 }
 
 }  // namespace
+
+TEST(OctomapSweep, StrictPrefilterCannotAverageAwayAnUnknownColumn) {
+  mgg::OctomapConfig config;
+  config.resolution = .1;
+  mgg::OctomapMap map(config);
+  for (int x = -15; x <= 30; ++x) for (int y = -15; y <= 15; ++y)
+    for (int z = 0; z <= 20; ++z) {
+      if (x == 8 && y == 0) continue;
+      map.tree()->updateNode(octomap::point3d((x+.5)*.1, (y+.5)*.1, (z+.5)*.1), false);
+    }
+  mgg::OrientedBox body;
+  body.size = Eigen::Vector3d(1.2, .6, .8);
+  const Eigen::Vector3d a(0, 0, 1), b(1.6, 0, 1);
+  const auto exact = mgg::orientedBoxPathStatus(map, a, b, body, true, nullptr, false);
+  ASSERT_EQ(exact, mgg::VoxelStatus::kUnknown);
+  EXPECT_EQ(mgg::orientedBoxPathStatus(map, a, b, body, true, nullptr, true), exact);
+}

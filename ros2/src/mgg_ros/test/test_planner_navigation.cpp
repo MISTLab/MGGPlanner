@@ -306,6 +306,10 @@ class PlannerNodeTestPeer {
     msg->pose.pose.orientation.w = std::cos(yaw / 2.0);
     node.onOdometry(msg);
   }
+  static void hardwarePolicy(PlannerNode& node) { node.allow_unknown_lattice_body_ = false; }
+  static void shortcut(PlannerNode& node, std::vector<mgg::StateVec>& path) {
+    node.shortcutAndResample(path, {}, {}, true);
+  }
   static bool peersOpen(const PlannerNode& node) { return node.peer_edges_open_; }
   static bool peerDeadlineSet(const PlannerNode& node) {
     return node.peer_diagnosis_deadline_.has_value();
@@ -412,6 +416,18 @@ class PlannerNavigationTest : public ::testing::Test {
   static void SetUpTestSuite() { rclcpp::init(0, nullptr); }
   static void TearDownTestSuite() { rclcpp::shutdown(); }
 };
+
+TEST_F(PlannerNavigationTest, HardwareShortcutDoesNotCrossUnknownBodyVolume) {
+  MolaTerrainProduct product(.1, -4, 6, -4, 6, flat);
+  auto node = botmanNode("hardware_shortcut", product);
+  PlannerNodeTestPeer::hardwarePolicy(*node);
+  std::vector<mgg::StateVec> path{{0, 0, .935, 0}, {0, 2, .935, 0}, {2, 2, .935, 0}};
+  PlannerNodeTestPeer::shortcut(*node, path);
+  double length = 0;
+  for (std::size_t i = 1; i < path.size(); ++i)
+    length += (path[i].head<3>() - path[i-1].head<3>()).norm();
+  EXPECT_NEAR(length, 4.0, 1e-9);
+}
 
 TEST_F(PlannerNavigationTest, InterruptedPeerDiagnosisRestoresCollisionChecks) {
   MolaTerrainProduct product(0.1, -3, 4, -3, 3, flat);

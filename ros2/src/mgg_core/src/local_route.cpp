@@ -55,7 +55,19 @@ Vertex* lazyGroundLattice(GraphManager& graph, Vertex* root,
   planning.rr_mode = RRModeType::kTree;  // this loop, not expandGraph, wires neighbours
   ExpandContext lazy = ctx;
   lazy.planning = &planning;
-  lazy.strict_projected_endpoint = !ctx.allow_unknown_lattice_body;
+  // Match buildGridGraph's precheck, including its occupied AABB fallback.
+  // Explicit strict endpoint checks supplied by the caller remain in force.
+  const auto endpoint_admissible = [&](const StateVec& from, const StateVec& to) {
+    OrientedBox body;
+    body.heading = std::atan2(to.y() - from.y(), to.x() - from.x());
+    body.size = ctx.robot_box_size;
+    const Eigen::Vector3d center = to.head<3>() + ctx.robot->offsetForHeading(body.heading);
+    auto status = ctx.map->getBoxStatus(center, body.size, !ctx.allow_unknown_lattice_body);
+    if (status == VoxelStatus::kOccupied && !ctx.map->dynamicBoxBlocked(center, body.size))
+      status = orientedBoxPathStatus(*ctx.map, center, center, body,
+                                      !ctx.allow_unknown_lattice_body, nullptr);
+    return status == VoxelStatus::kFree;
+  };
   EdgeVerdictCache verdicts;
   lazy.edge_verdicts = &verdicts;
   lazy.edge_cost = [&](const Eigen::Vector3d& a, const Eigen::Vector3d& b) {
@@ -123,7 +135,7 @@ Vertex* lazyGroundLattice(GraphManager& graph, Vertex* root,
       ProfileScope link_time(profile ? &profile->goal_link : nullptr);
       if (goal_vertex) {
         connect_existing(at, goal_vertex);
-      } else {
+      } else if (endpoint_admissible(at->state, goal)) {
         Vertex candidate(-1, goal);
         ExpandGraphReport rep;
         expandGraphFrom(graph, candidate, at, rep, lazy, true);
@@ -172,6 +184,13 @@ Vertex* lazyGroundLattice(GraphManager& graph, Vertex* root,
                        at->state.z(), root->state[3]);
         if ((state.head<2>() - at->state.head<2>()).norm() > planning.edge_length_max)
           continue;
+        Eigen::Vector3d projected = state.head<3>();
+        VoxelStatus support;
+        const double height = ctx.ground->projectSample(projected, support);
+        if (support != VoxelStatus::kOccupied) continue;
+        state.head<3>() = projected;
+        state.z() -= height - planning.max_ground_height;
+        if (!endpoint_admissible(at->state, state)) continue;
         Vertex candidate(-1, state);
         ExpandGraphReport rep;
         expandGraphFrom(graph, candidate, at, rep, lazy, true);

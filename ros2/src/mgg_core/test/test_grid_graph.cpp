@@ -1083,3 +1083,45 @@ TEST(GridGraph, CrossNudgesCannotEnterAGapNarrowerThanTheOrientedBody) {
     EXPECT_LE(reach, 0.8);
   }
 }
+
+TEST(GridGraph, HardwareUnknownPolicyMatchesEagerInRotatedDoorways) {
+  for (double heading : {M_PI / 2, M_PI / 3}) {
+    SCOPED_TRACE(heading);
+    std::map<std::pair<std::int64_t, std::int64_t>, double> tops;
+    for (int x = -90; x < 90; ++x) for (int y = -90; y < 90; ++y) {
+      const double px = (x + .5) * .05, py = (y + .5) * .05;
+      const double along = px * std::cos(heading) + py * std::sin(heading);
+      const double across = -px * std::sin(heading) + py * std::cos(heading);
+      tops[{x, y}] = along > .8 && std::abs(across) > .48 ? .4 : 0;
+    }
+    mgg_test::TerrainFixture map(.05, tops);
+    RobotParams robot;
+    robot.type = RobotType::kGroundRobot;
+    robot.size = Eigen::Vector3d(1.2, .6, .3);
+    PlanningParams planning;
+    planning.max_ground_height = .4;
+    planning.max_step_height = .15;
+    planning.edge_length_min = .05;
+    planning.edge_length_max = .6;
+    planning.edge_overshoot = 0;
+    planning.path_clearance_margin = .6;  // direct route cannot skip the doorway
+    planning.min_observed_ground_fraction = 0;
+    mgg::GroundProjection ground(map, planning, true);
+    ExpandContext ctx;
+    ctx.map = &map; ctx.robot = &robot; ctx.planning = &planning;
+    ctx.ground = &ground; ctx.robot_box_size = robot.getPlanningSize();
+    ctx.allow_unknown_lattice_body = false;
+    const StateVec root(0, 0, .4, heading);
+    GridGraphParams grid;
+    grid.min_val = Eigen::Vector3d::Zero();
+    grid.max_val = Eigen::Vector3d(2.8, 0, 0);
+    grid.resolution = Eigen::Vector3d::Constant(.4);
+    GraphManager eager, lazy;
+    eager.addVertex(new Vertex(0, root));
+    buildGridGraph(eager, root, grid, ctx, heading);
+    const StateVec goal(2.4 * std::cos(heading), 2.4 * std::sin(heading), .4, heading);
+    Vertex* reached = nullptr;
+    ASSERT_TRUE(eager.getNearestVertexInRange(&goal, .01, &reached));
+    EXPECT_TRUE(mgg::routeOverLocalLattice(lazy, root, goal, grid, ctx).routed);
+  }
+}
