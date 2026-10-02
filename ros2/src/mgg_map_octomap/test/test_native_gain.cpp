@@ -576,14 +576,18 @@ TEST(NativeGain, ScanWalkMatchesReferenceClosedVoxelSetsAndOcclusion) {
   }
 }
 
-// mgg-integ: the band scan's walker must keep the request deadline's
-// throttled per-voxel checkpoint (mgg-astar), as the full scan's walk()
-// does: one long ray cannot outrun cancellation between rays.
+// mgg-integ: the band scan's walker keeps the request deadline's throttle
+// contract (planning_cancellation.h): a check before the first voxel and
+// at most 64 visits between checks, so one long ray cannot outrun
+// cancellation. Unlike walk(), which checks again at a ray's first voxel,
+// the band walk relies on scanUnique's per-ray check there (the double
+// check cost ~7% of a pruned room request).
 TEST(NativeGain, BandScanWalkKeepsThrottledCancellationCheckpoints) {
   mgg::NativeMolaGrid map(kResolution, {}, {}, {});
   GainSetup setup(map);
   const Eigen::Vector3d origin(0.1, 0.1, 0.1);  // a cell centre: no DDA ties
-  const std::vector<Eigen::Vector3d> ray{origin + Eigen::Vector3d(40, 0, 0)};
+  const std::vector<Eigen::Vector3d> rays{origin + Eigen::Vector3d(40, 0, 0),
+                                          origin + Eigen::Vector3d(0, 40, 0)};
   mgg::ScanBounds bounds;
   bounds.low.z() = -0.4;
   bounds.high.z() = 0.8;
@@ -593,26 +597,35 @@ TEST(NativeGain, BandScanWalkKeepsThrottledCancellationCheckpoints) {
     std::vector<std::pair<Eigen::Vector3d, VoxelStatus>> log;
     auto scan = [&] {
       if (pruned)
-        map.getScanStatusInBounds(origin, ray, counts, log, setup.sensor.model(), bounds);
+        map.getScanStatusInBounds(origin, rays, counts, log, setup.sensor.model(), bounds);
       else
-        map.getScanStatusIterative(origin, ray, counts, log, setup.sensor.model());
+        map.getScanStatusIterative(origin, rays, counts, log, setup.sensor.model());
     };
-    int checks = 0;
+    std::vector<std::uint64_t> checked_at;  // voxel visits made at each check
     {
-      mgg::PlanningCancellationScope count([&] { ++checks; return false; });
+      mgg::PlanningCancellationScope record([&] {
+        checked_at.push_back(counts.voxel_visits);
+        return false;
+      });
       scan();
     }
-    // 201 cells; the scan walker may revisit its end cell (scan_walk.h).
-    EXPECT_GE(counts.voxel_visits, 201u);
-    EXPECT_LE(counts.voxel_visits, 202u);
-    EXPECT_EQ(checks, 1 + 4);  // the ray, then voxels 0, 64, 128 and 192
-    checks = 0;
+    // 201 cells per ray; the scan walker may revisit its end cell.
+    EXPECT_GE(counts.voxel_visits, 2 * 201u);
+    EXPECT_LE(counts.voxel_visits, 2 * 202u);
+    ASSERT_FALSE(checked_at.empty());
+    EXPECT_EQ(checked_at.front(), 0u);  // before the first visit
+    checked_at.push_back(counts.voxel_visits);  // and up to the scan's end
+    for (std::size_t i = 1; i < checked_at.size(); ++i)
+      EXPECT_LE(checked_at[i] - checked_at[i - 1], 64u) << "check " << i;
+    // Per ray: one check before its first voxel, then at visits 64, 128, 192.
+    if (pruned) EXPECT_EQ(checked_at.size() - 1, 2u * (1 + 3));
+    // Expire after the first ray's own check: the walk stops within 64 visits.
+    int checks = 0;
     log.clear();
-    // Expire after the ray's own check: the walk must stop by voxel 64.
-    mgg::PlanningCancellationScope expire([&] { return ++checks > 2; });
+    mgg::PlanningCancellationScope expire([&] { return ++checks > 1; });
     EXPECT_THROW(scan(), mgg::PlanningInterrupted);
-    EXPECT_EQ(checks, 3);
-    EXPECT_LE(log.size(), 65u);
+    EXPECT_EQ(checks, 2);
+    EXPECT_LE(counts.voxel_visits, 64u);
   }
 }
 

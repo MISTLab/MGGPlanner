@@ -681,12 +681,15 @@ void NativeMolaGrid::scanUnique(
         ++g.free;
       return s != VoxelStatus::kOccupied;
     };
-    // The pruned walk keeps walk()'s throttled per-voxel checkpoint.
+    // The pruned walk keeps the throttle contract: the per-ray check above
+    // precedes its first voxel, then one check at most every 64 visits.
+    // Unlike walk(), it does not check again at the first voxel: short band
+    // rays (~24 visits) made that double check ~7% of a room request.
     std::size_t visited = 0;
     const bool valid = bounds
         ? walkScanVoxels(p, e, resolution_, kMaxWork,
                          [&](const VoxelIndex& k) {
-                           if ((visited++ & 63u) == 0) planningCheckpoint();
+                           if ((++visited & 63u) == 0) planningCheckpoint();
                            return visit(Cell{k.x, k.y, k.z});
                          })
         : walk(p, e, visit);
