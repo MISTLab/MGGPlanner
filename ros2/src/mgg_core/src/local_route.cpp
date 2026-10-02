@@ -281,8 +281,11 @@ LocalRouteResult routeOverLocalLattice(GraphManager& graph,
       const auto turns = pathTurns({from, to}, root_state[3],
           std::max(ctx.robot->size.x(), ctx.robot->size.y()));
       const bool start_turn_ok = turns.empty() || turns.front() <= kSharpTurnRad + 1e-9 ||
-          roomToTurn(*ctx.map, *ctx.robot, *ctx.planning, root_state,
-                     ctx.ground->standingStart());
+          (roomToTurn(*ctx.map, *ctx.robot, *ctx.planning, root_state,
+                      ctx.ground->standingStart()) &&
+           groundSlope(*ctx.ground, from,
+               std::max(ctx.robot->size.x(), ctx.robot->size.y()), &graph) <=
+               kLevelGroundSlopeRad);
       if (start_turn_ok && (to - from).norm() > 1e-9 &&
           groundShortcutSegmentAdmissible(ctx, from, to,
               ctx.stop_at_unknown || !ctx.allow_unknown_lattice_body) &&
