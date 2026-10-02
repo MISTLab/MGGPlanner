@@ -931,6 +931,60 @@ TEST(GridGraph, BidirectionalEdgeChecksTheOppositeOffsetFootprint) {
   }
 }
 
+TEST(GridGraph, LazyGroundDijkstraMatchesFullyEvaluatedEightNeighbourGraph) {
+  OffsetObstacle map(0.75);
+  PlanningParams planning;
+  planning.max_ground_height = 0.5;
+  planning.min_observed_ground_fraction = 0.0;
+  planning.edge_length_max = 1.0;
+  planning.edge_length_min = 0.0;
+  planning.edge_overshoot = 0.0;
+  planning.path_clearance_margin = 0.0;
+  planning.num_vertices_max = 1000;
+  planning.num_edges_max = 10000;
+  planning.num_loops_max = 10000;
+  RobotParams robot;
+  robot.size = Eigen::Vector3d(0.4, 0.4, 0.4);
+  mgg::GroundProjection ground(map, planning, true);
+  ExpandContext ctx;
+  ctx.map = &map; ctx.planning = &planning; ctx.robot = &robot;
+  ctx.ground = &ground; ctx.robot_box_size = robot.getPlanningSize();
+  ctx.allow_unknown_lattice_body = true;
+  GridGraphParams grid;
+  grid.min_val = Eigen::Vector3d(-2, -2, -0.2);
+  grid.max_val = Eigen::Vector3d(2, 2, 0.3);
+  grid.resolution = Eigen::Vector3d(0.4, 0.4, 0.1);
+  GraphManager lazy;
+  const auto route = mgg::routeOverLocalLattice(lazy, StateVec(0, 0, 0.2, 0),
+                                               StateVec(0, 2, 0, 0), grid, ctx);
+  ASSERT_TRUE(route.routed) << route.reason;
+  ASSERT_GT(route.route.size(), 2u);  // the direct route intersects the post
+  mgg::ShortestPathsReport lazy_paths;
+  ASSERT_TRUE(lazy.findShortestPaths(0, lazy_paths));
+  const double actual = lazy_paths.distance_map.at(route.route.back()->id);
+  GraphManager full;
+  std::map<std::pair<int, int>, Vertex*> cells;
+  full.addVertex(new Vertex(0, StateVec(0, 0, 0.5, 0)));
+  cells[{0, 0}] = full.getVertex(0);
+  for (int x = -5; x <= 5; ++x) for (int y = -5; y <= 5; ++y) {
+    if (x == 0 && y == 0) continue;
+    auto* v = new Vertex(full.generateVertexID(), StateVec(0.4*x, 0.4*y, 0.5, 0));
+    full.addVertex(v); cells[{x, y}] = v;
+  }
+  Vertex* goal = cells.at({0, 5});
+  for (const auto& [a, from] : cells) for (const auto& [b, to] : cells) {
+    if (from->id >= to->id) continue;
+    const bool stencil = std::abs(a.first-b.first) <= 1 && std::abs(a.second-b.second) <= 1;
+    const double length = (from->state.head<3>()-to->state.head<3>()).norm();
+    if (!stencil && !((from == goal || to == goal) && length <= 1.0)) continue;
+    mgg::ExpandGraphReport rep;
+    if (mgg::latticeEdgeTraversable(ctx, *from, *to, rep)) full.addEdge(from, to, length);
+  }
+  mgg::ShortestPathsReport reference;
+  ASSERT_TRUE(full.findShortestPaths(0, reference));
+  EXPECT_NEAR(actual, reference.distance_map.at(goal->id), 1e-9);
+}
+
 }  // namespace
 
 TEST(GridGraph, HeadingAlignedBodyAndCrossNudgeEnterANarrowNorthPassage) {

@@ -401,9 +401,10 @@ void expandGraphFrom(GraphManager& graph, Vertex& new_vertex,
   rep.status = ExpandGraphStatus::kSuccess;
 }
 
-bool roadmapEdgeTraversable(const ExpandContext& ctx, const Vertex& from,
-                            const Vertex& to, ExpandGraphReport& rep,
-                            std::vector<Eigen::Vector3d>* projected_edge) {
+static bool checkedExistingEdge(const ExpandContext& ctx, const Vertex& from,
+                                const Vertex& to, ExpandGraphReport& rep,
+                                std::vector<Eigen::Vector3d>* projected_edge,
+                                bool stop_at_unknown) {
   const Eigen::Vector3d origin = from.state.head<3>();
   const Eigen::Vector3d direction = to.state.head<3>() - origin;
   const double d_norm = direction.norm();
@@ -419,11 +420,24 @@ bool roadmapEdgeTraversable(const ExpandContext& ctx, const Vertex& from,
   if (geofenceBlocks(ctx, p_start, p_end)) return false;
   std::vector<Eigen::Vector3d> edge;
   if (!edgeTraversable(ctx, p_start, p_end, false, false, edge, rep,
-                       /*stop_at_unknown=*/true)) {
+                       stop_at_unknown)) {
     return false;
   }
   if (projected_edge != nullptr) *projected_edge = std::move(edge);
   return true;
+}
+
+bool roadmapEdgeTraversable(const ExpandContext& ctx, const Vertex& from,
+                            const Vertex& to, ExpandGraphReport& rep,
+                            std::vector<Eigen::Vector3d>* projected_edge) {
+  return checkedExistingEdge(ctx, from, to, rep, projected_edge, true);
+}
+
+bool latticeEdgeTraversable(const ExpandContext& ctx, const Vertex& from,
+                             const Vertex& to, ExpandGraphReport& rep) {
+  std::vector<Eigen::Vector3d> edge;
+  return checkedExistingEdge(ctx, from, to, rep, &edge, ctx.stop_at_unknown) &&
+         (!ctx.projected_edge_admissible || ctx.projected_edge_admissible(edge));
 }
 
 void expandGraphEdges(GraphManager& graph, Vertex* new_vertex,

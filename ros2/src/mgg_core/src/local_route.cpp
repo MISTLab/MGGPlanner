@@ -3,6 +3,10 @@
 
 #include <algorithm>
 #include <cmath>
+#include <map>
+#include <queue>
+#include <unordered_map>
+#include <unordered_set>
 
 #include "mgg_core/departure.h"
 #include "mgg_core/global_graph.h"
@@ -32,6 +36,153 @@ StateVec localRouteRoot(const ExpandContext& ctx, const StateVec& robot_pose,
   return root;
 }
 
+namespace {
+
+// Lazy Dijkstra on the ground-relative eight-neighbour lattice. An edge is
+// evaluated only when its source is popped, and the search ends only when
+// the goal is popped, never when it is first discovered. No heuristic.
+Vertex* lazyGroundLattice(GraphManager& graph, Vertex* root,
+                          const StateVec& goal, const GridGraphParams& grid,
+                          const ExpandContext& ctx, GridGraphResult& result) {
+  if ((grid.resolution.array() <= 0).any() ||
+      (grid.min_val.array() > 0).any() || (grid.max_val.array() < 0).any()) {
+    result.status = GridGraphStatus::kInvalidBounds;
+    return nullptr;
+  }
+  PlanProfile* profile = ctx.ground->profile();
+  ProfileScope timed(profile ? &profile->lattice : nullptr);
+  PlanningParams planning = *ctx.planning;
+  planning.rr_mode = RRModeType::kTree;  // this loop, not expandGraph, wires neighbours
+  ExpandContext lazy = ctx;
+  lazy.planning = &planning;
+  lazy.strict_projected_endpoint = !ctx.allow_unknown_lattice_body;
+  EdgeVerdictCache verdicts;
+  lazy.edge_verdicts = &verdicts;
+  lazy.edge_cost = [&](const Eigen::Vector3d& a, const Eigen::Vector3d& b) {
+    const double yaw = std::atan2(b.y() - a.y(), b.x() - a.x());
+    const Eigen::Vector3d offset = ctx.robot->offsetForHeading(yaw);
+    double cost = ctx.ground->clearanceCost(a + offset, b + offset, ctx.robot_box_size);
+    if (ctx.robot->center_offset.head<2>().squaredNorm() > 0.0) {
+      const Eigen::Vector3d reverse = ctx.robot->offsetForHeading(yaw + M_PI);
+      cost = std::max(cost, ctx.ground->clearanceCost(
+          b + reverse, a + reverse, ctx.robot_box_size));
+    }
+    return cost;
+  };
+  using Cell = std::pair<int, int>;
+  using Entry = std::pair<double, int>;
+  std::map<Cell, Vertex*> cells{{{0, 0}, root}};
+  std::unordered_map<int, Cell> cell_of{{root->id, {0, 0}}};
+  std::unordered_map<int, double> distance{{root->id, 0.0}};
+  std::unordered_set<int> settled;
+  std::priority_queue<Entry, std::vector<Entry>, std::greater<Entry>> open;
+  open.emplace(0.0, root->id);
+  Vertex* goal_vertex = nullptr;
+  const double c = std::cos(root->state[3]), s = std::sin(root->state[3]);
+  int loops = 0;
+  const auto count = [&](const ExpandGraphReport& rep) {
+    result.vertices_added += rep.num_vertices_added;
+    result.edges_added += rep.num_edges_added;
+    result.free_cells += rep.num_vertices_added;
+    if (rep.no_ground) ++result.no_ground;
+    for (int i = 0; i < 8; ++i) result.edge_status[i] += rep.edge_status[i];
+  };
+  const auto connect_existing = [&](Vertex* from, Vertex* to) {
+    if (from == to || graph.graph_->edgeExists(from->id, to->id)) return;
+    ExpandGraphReport rep;
+    if (latticeEdgeTraversable(lazy, *from, *to, rep)) {
+      graph.addEdge(from, to, lazy.edge_cost(from->state.head<3>(), to->state.head<3>()));
+      ++result.edges_added;
+    }
+    count(rep);
+  };
+  while (!open.empty()) {
+    planningCheckpoint();
+    if (ctx.deadline && std::chrono::steady_clock::now() >= *ctx.deadline) {
+      result.hit_limit = result.hit_deadline = true;
+      if (profile) profile->budget_exhausted = true;
+      return nullptr;
+    }
+    const auto [cost, id] = open.top();
+    open.pop();
+    if (cost != distance.at(id) || !settled.insert(id).second) continue;
+    Vertex* at = graph.getVertex(id);
+    if (at == goal_vertex ||
+        (at->state.head<3>() - goal.head<3>()).squaredNorm() <= 1e-12) return at;
+    if (++loops > planning.num_loops_max) { result.hit_limit = true; break; }
+
+    // Any settled reachable vertex within the ordinary edge reach may
+    // link the exact goal. A later cheaper arrival still relaxes its cost.
+    if ((at->state.head<3>() - goal.head<3>()).norm() <= planning.edge_length_max) {
+      ProfileScope link_time(profile ? &profile->goal_link : nullptr);
+      if (goal_vertex) {
+        connect_existing(at, goal_vertex);
+      } else {
+        Vertex candidate(-1, goal);
+        ExpandGraphReport rep;
+        expandGraphFrom(graph, candidate, at, rep, lazy, true);
+        count(rep);
+        if (rep.vertex_added &&
+            (rep.vertex_added->state.head<3>() - goal.head<3>()).squaredNorm() <= 1e-12) {
+          goal_vertex = rep.vertex_added;
+        } else if (rep.vertex_added) {
+          return nullptr;
+        }
+      }
+    }
+    const Cell current = cell_of.at(id);
+    for (int dx = -1; dx <= 1; ++dx) {
+      for (int dy = -1; dy <= 1; ++dy) {
+        planningCheckpoint();
+        if (dx == 0 && dy == 0) continue;
+        const Cell next{current.first + dx, current.second + dy};
+        const double x = next.first * grid.resolution.x();
+        const double y = next.second * grid.resolution.y();
+        if (x < grid.min_val.x() || x > grid.max_val.x() ||
+            y < grid.min_val.y() || y > grid.max_val.y()) continue;
+        const auto found = cells.find(next);
+        if (found != cells.end()) {
+          // A settled destination cannot be improved by a nonnegative edge.
+          if (!settled.count(found->second->id)) connect_existing(at, found->second);
+          continue;
+        }
+        if (graph.getNumVertices() >= planning.num_vertices_max ||
+            graph.getNumEdges() >= planning.num_edges_max) {
+          result.hit_limit = true;
+          continue;
+        }
+        StateVec state(root->state.x() + c * x - s * y,
+                       root->state.y() + s * x + c * y,
+                       at->state.z(), root->state[3]);
+        if ((state.head<2>() - at->state.head<2>()).norm() > planning.edge_length_max)
+          continue;
+        Vertex candidate(-1, state);
+        ExpandGraphReport rep;
+        expandGraphFrom(graph, candidate, at, rep, lazy, true);
+        count(rep);
+        if (rep.vertex_added) {
+          cells.emplace(next, rep.vertex_added);
+          cell_of.emplace(rep.vertex_added->id, next);
+        }
+      }
+    }
+    const auto edges = graph.edge_map_.find(id);
+    if (edges == graph.edge_map_.end()) continue;
+    for (const auto& [to, weight] : edges->second) {
+      if (settled.count(to)) continue;
+      const double proposed = cost + weight;
+      const auto known = distance.find(to);
+      if (known == distance.end() || proposed < known->second) {
+        distance[to] = proposed;
+        open.emplace(proposed, to);
+      }
+    }
+  }
+  return nullptr;
+}
+
+}  // namespace
+
 LocalRouteResult routeOverLocalLattice(GraphManager& graph,
                                        const StateVec& robot_pose,
                                        const StateVec& goal,
@@ -46,12 +197,6 @@ LocalRouteResult routeOverLocalLattice(GraphManager& graph,
   root->robot_id = ctx.robot_id;
   root->is_hanging = root_hanging;
   graph.addVertex(root);
-  result.lattice = buildGridGraph(graph, root_state, grid, ctx, robot_pose[3]);
-  if (result.lattice.status == GridGraphStatus::kInvalidBounds ||
-      graph.getNumVertices() <= 1) {
-    result.reason = "the local lattice holds no admissible cell";
-    return result;
-  }
   PlanProfile* const profile = ctx.ground ? ctx.ground->profile() : nullptr;
   StateVec goal_state = goal;
   if (ctx.robot->type == RobotType::kGroundRobot) {
@@ -67,18 +212,44 @@ LocalRouteResult routeOverLocalLattice(GraphManager& graph,
     goal_state[2] = pos.z() - (ground_height - ctx.planning->max_ground_height);
   }
   Vertex* goal_vertex = nullptr;
-  {
-    ProfileScope timed(profile ? &profile->goal_link : nullptr);
-    // Only vertices the robot reaches can carry the route.
-    ShortestPathsReport from_root;
-    const bool searched = graph.findShortestPaths(0, from_root);
-    goal_vertex = linkGoalToLattice(
-        graph, goal_state, ctx, [&](const Vertex& v) {
-          if (!searched || !from_root.status) return true;
-          if (v.id == 0) return true;
-          const auto it = from_root.parent_id_map.find(v.id);
-          return it != from_root.parent_id_map.end() && it->second != v.id;
-        });
+  if (ctx.robot->type == RobotType::kGroundRobot) {
+    // A lattice-policy shortcut can establish the complete straight route
+    // before spending time on cells unrelated to this point goal. Demand
+    // the configured soft clearance margin, not just absence of collision.
+    {
+      ProfileScope timed(profile ? &profile->goal_link : nullptr);
+      const auto from = root_state.head<3>().eval();
+      const auto to = goal_state.head<3>().eval();
+      const double yaw = std::atan2(to.y() - from.y(), to.x() - from.x());
+      const Eigen::Vector3d offset = ctx.robot->offsetForHeading(yaw);
+      if ((to - from).norm() > 1e-9 &&
+          groundShortcutSegmentAdmissible(ctx, from, to,
+              ctx.stop_at_unknown || !ctx.allow_unknown_lattice_body) &&
+          ctx.ground->segmentClearance(from + offset, to + offset, ctx.robot_box_size) + 1e-9 >=
+              std::min(ctx.planning->path_clearance_margin, 1.0)) {
+        goal_vertex = new Vertex(graph.generateVertexID(), goal_state);
+        goal_vertex->robot_id = ctx.robot_id;
+        goal_vertex->parent = root;
+        goal_vertex->distance = (to - from).norm();
+        root->children.push_back(goal_vertex);
+        graph.addVertex(goal_vertex);
+        graph.addEdge(root, goal_vertex,
+                      ctx.ground->clearanceCost(from + offset, to + offset, ctx.robot_box_size));
+        result.lattice.vertices_added = result.lattice.edges_added = 1;
+      }
+    }
+    if (!goal_vertex) {
+      goal_vertex = lazyGroundLattice(graph, root, goal_state, grid, ctx, result.lattice);
+    }
+  } else {
+    // Aerial planning retains the full 3D lattice and its original linker.
+    result.lattice = buildGridGraph(graph, root_state, grid, ctx, robot_pose[3]);
+    if (result.lattice.status == GridGraphStatus::kInvalidBounds ||
+        graph.getNumVertices() <= 1) {
+      result.reason = "the local lattice holds no admissible cell";
+      return result;
+    }
+    goal_vertex = linkGoalToLattice(graph, goal_state, ctx, {});
   }
   if (goal_vertex == nullptr) {
     result.reason = "goal cannot be linked to the local lattice";
@@ -121,10 +292,15 @@ bool groundShortcutSegmentAdmissible(const ExpandContext& ctx,
   std::vector<Eigen::Vector3d> projected;
   const Eigen::Vector3d offset = ctx.robot->offsetForHeading(body.heading);
   // Driven from `from` to `to`: the shortcut is the path itself.
+  if (ctx.planning->geofence_checking_enable && ctx.geofence &&
+      ctx.geofence->getPathStatus((from + offset).head<2>(),
+          (to + offset).head<2>(), ctx.robot_box_size.head<2>()) ==
+              GeofenceManager::CoordinateStatus::kViolated) return false;
   return ctx.ground->getProjectedEdgeStatus(
              from + offset, to + offset,
              ctx.robot_box_size, stop_at_unknown, projected, false, false,
-             &check, EdgeTravel::kForward) == ProjectedEdgeStatus::kAdmissible;
+             &check, EdgeTravel::kForward) == ProjectedEdgeStatus::kAdmissible &&
+         (!ctx.projected_edge_admissible || ctx.projected_edge_admissible(projected));
 }
 
 Vertex* linkGoalToLattice(GraphManager& graph, const StateVec& goal_state,

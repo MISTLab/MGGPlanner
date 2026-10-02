@@ -165,6 +165,12 @@ void expandGraphFrom(GraphManager& graph, Vertex& new_vertex, Vertex* parent,
                      ExpandGraphReport& rep, const ExpandContext& ctx,
                      bool allow_short_edge = false);
 
+/// Checks an existing lattice edge with the lattice unknown policy (unlike
+/// the strict roadmap check). Used by lazy ground Dijkstra, which creates
+/// and validates neighbours only as their source is settled.
+bool latticeEdgeTraversable(const ExpandContext& ctx, const Vertex& from,
+                             const Vertex& to, ExpandGraphReport& rep);
+
 /// Adds edges from `new_vertex`, already in `graph`, to every vertex within
 /// nearest_range whose straight connection is between edge_length_min and
 /// edge_length_max and runs through space the map knows to be free

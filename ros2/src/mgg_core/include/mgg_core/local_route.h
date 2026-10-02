@@ -1,6 +1,7 @@
-// A ground or aerial NAVIGATE route over the local lattice: the lattice
-// swept round the robot (buildGridGraph), the goal linked into it, and
-// Dijkstra over its clearance-weighted edges. The planner node adds the
+// A NAVIGATE route over MGG's local graph. Ground robots try an exact
+// lattice-policy direct shortcut, then lazily expand an eight-neighbour
+// ground-relative lattice with clearance-weighted Dijkstra. Aerial robots
+// retain the full 3D lattice (buildGridGraph). The planner node adds the
 // turn rule, no-go zones, shortcutting and the peer checks; the navigation
 // benchmark (mgg_map_octomap/test/nav_bench.cpp) runs the same code.
 
@@ -33,7 +34,7 @@ struct LocalRouteResult {
   GridGraphResult lattice;
 };
 
-/// `graph` is reset and rebuilt round `robot_pose` (the robot's odometry
+/// `graph` is reset and expanded round `robot_pose` (the robot's odometry
 /// pose; projected to driving height here, or anchored at the physical
 /// driving height when no ground is mapped under it). `ctx.ground` must be
 /// the plan's GroundProjection. `goal` is projected with projectGoal.
