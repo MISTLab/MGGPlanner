@@ -5233,7 +5233,6 @@ void PlannerNode::onObjectiveRequest(
     mgg::planningCheckpoint();
     global_exploration_ongoing_ = false;
     exploration_target_.reset();
-    best_path_.clear();
     onObjectiveRequestImpl(request, response);
     std::lock_guard<std::mutex> fence(cancellation_mutex_);
     mgg::planningCheckpoint();
@@ -5609,7 +5608,8 @@ void PlannerNode::onPlanRequestImpl(
   refreshNoGoZones();
   recordSentPath();
   enforceSafeCompletion(complete);
-  if (mola_map_ && best_path_.empty() && local_graph_->getNumVertices() <= 1) {
+  if (mola_map_ && acquiring_observations_.load() && best_path_.empty() &&
+      local_graph_->getNumVertices() <= 1) {
     setAcquiringObservations(true);
     complete = false;
     summary += "; acquiring observations";

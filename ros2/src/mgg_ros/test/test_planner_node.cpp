@@ -133,7 +133,8 @@ class MolaFloorProduct {
  public:
   MolaFloorProduct(double x0, double x1, double y0, double y1,
                    const std::vector<std::array<double, 4>>& walls = {},
-                   const std::vector<std::array<int, 3>>& unknown = {}) {
+                   const std::vector<std::array<int, 3>>& unknown = {},
+                   std::uint64_t epoch = 1) {
     static int sequence = 0;
     root_ = std::filesystem::temp_directory_path() /
             ("mgg-planner-mola-" + std::to_string(::getpid()) + "-" +
@@ -184,7 +185,7 @@ class MolaFloorProduct {
                   {"layer_id", "persistent_geometry"},
                   {"frame_id", "component_test"},
                   {"graph_revision", {{"component_id", "component:test"},
-                                      {"epoch", 1}, {"revision", 0}}},
+                                      {"epoch", epoch}, {"revision", 0}}},
                   {"geometry_revision", geometry},
                   {"submaps", json::array({submap})},
                   {"chunks", json::array({chunk})},
@@ -199,7 +200,7 @@ class MolaFloorProduct {
     const std::string source_digest = sha256(source_bytes);
     const json metadata{
         {"schema", "swarmdeck.mola_planner_grid.v2"},
-        {"graph_version", {{"component_id", "component:test"}, {"epoch", 1},
+        {"graph_version", {{"component_id", "component:test"}, {"epoch", epoch},
                            {"revision", 0}, {"digest", std::string(64, 'd')}}},
         {"identity", {{"geometry_revision", geometry},
                       {"native_geometry_digest", std::string(64, 'e')},
@@ -242,7 +243,7 @@ class MolaFloorProduct {
         {"source_sha256", source_digest},
         {"generated_at_ns", stamp},
         {"artifacts",
-         json::array({{{"component_id", "component:test"}, {"epoch", 1},
+         json::array({{{"component_id", "component:test"}, {"epoch", epoch},
                        {"revision", 0}, {"geometry_revision", geometry},
                        {"manifest_sha256", std::string(64, '9')},
                        {"path", "components/native.mola"}, {"size_bytes", 1},
@@ -255,7 +256,7 @@ class MolaFloorProduct {
     write(root_ / "mola" / "components" / "native.sdpg", grid);
     write(root_ / "mola" / "source.json", source_bytes);
     write(root_ / "mola" / "index.json", index_json.dump());
-    request_ = {"component:test", 1, 0, geometry, stamp,
+    request_ = {"component:test", epoch, 0, geometry, stamp,
                 Eigen::Isometry3d::Identity()};
   }
   ~MolaFloorProduct() { std::filesystem::remove_all(root_); }
@@ -2040,6 +2041,39 @@ TEST_F(PlannerNodeTest, CancellationInterruptsSlowPlanWithoutReturningPath) {
   EXPECT_EQ(response->status, PlannerNode::kStatusNotReady);
 }
 
+TEST_F(PlannerNodeTest, NewObjectiveSupersedesSlowPlanAndUsesNewestPose) {
+  auto node = makeNode("preempt_slow_plan");
+  auto provider = std::make_unique<SlowPlanningMap>();
+  auto* slow = provider.get();
+  PlannerNodeTestPeer::useCloudMap(*node, std::move(provider));
+  PlannerNodeTestPeer::observeFloor(*node, -1.5, 4, -1.5, 1.5);
+  PlannerNodeTestPeer::acceptOdometry(*node, 0, 0, 1);
+  slow->slow = true;
+  auto old_response = std::make_shared<mgg_msgs::srv::PlannerSrv::Response>();
+  auto old_work = std::async(std::launch::async, [&] { PlannerNodeTestPeer::plan(*node, old_response); });
+  const auto limit = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+  while (!slow->entered && std::chrono::steady_clock::now() < limit)
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  EXPECT_TRUE(slow->entered);
+  PlannerNodeTestPeer::acceptOdometry(*node, 0.5, 0, 2);
+  slow->slow = false;
+  using Service = mgg_msgs::srv::PlanObjective;
+  auto request = std::make_shared<Service::Request>();
+  request->objective = Service::Request::NAVIGATE;
+  request->goal.position.x = 1.5;
+  request->goal.position.z = 0.075;
+  request->goal.orientation.w = 1;
+  auto response = std::make_shared<Service::Response>();
+  auto objective = std::async(std::launch::async, [&] { PlannerNodeTestPeer::objective(*node, request, response); });
+  EXPECT_EQ(old_work.wait_for(std::chrono::milliseconds(200)), std::future_status::ready);
+  old_work.get();
+  objective.get();
+  EXPECT_TRUE(old_response->path.empty());
+  ASSERT_EQ(response->status, Service::Response::SUCCEEDED) << response->reason;
+  ASSERT_FALSE(response->path.empty());
+  EXPECT_NEAR(response->path.front().position.x, 0.5, 0.1);
+}
+
 TEST_F(PlannerNodeTest, EmptyAndSparseBootstrapRetriesWhenFirstObservationsArrive) {
   for (bool sparse : {false, true}) for (bool toward : {false, true}) {
     SCOPED_TRACE(std::string(sparse ? "sparse" : "empty") + (toward ? " toward" : " explore"));
@@ -2071,6 +2105,36 @@ TEST_F(PlannerNodeTest, EmptyAndSparseBootstrapRetriesWhenFirstObservationsArriv
     ASSERT_GT(map->activeGeneration(), revision) << map->lastError();
     response = std::make_shared<mgg_msgs::srv::PlannerSrv::Response>();
     PlannerNodeTestPeer::plan(*node, response); // no new pose or operator action
+    EXPECT_FALSE(response->path.empty());
+    EXPECT_FALSE(PlannerNodeTestPeer::acquiring(*node));
+
+    MolaFloorProduct reset(2, -2, -1, 1, {}, {}, 2);
+    initial.publishFrom(reset);
+    map->requestSnapshot(reset.request());
+    const auto reset_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while ((!map->activeRequest() || map->activeRequest()->epoch != 2) &&
+           std::chrono::steady_clock::now() < reset_deadline)
+      std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    ASSERT_TRUE(map->activeRequest());
+    ASSERT_EQ(map->activeRequest()->epoch, 2u);
+    response = std::make_shared<mgg_msgs::srv::PlannerSrv::Response>();
+    PlannerNodeTestPeer::plan(*node, response);
+    EXPECT_TRUE(response->path.empty());
+    EXPECT_EQ(response->status, PlannerNode::kStatusNotReady);
+    EXPECT_TRUE(PlannerNodeTestPeer::acquiring(*node));
+
+    MolaFloorProduct reset_observed(-1, 4, -1, 1, {},
+        {{-1, -1, -1}, {-1, 0, -1}, {0, -1, -1}, {0, 0, -1}}, 2);
+    const auto reset_revision = map->activeGeneration();
+    initial.publishFrom(reset_observed);
+    map->requestSnapshot(reset_observed.request());
+    const auto observed_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (map->activeGeneration() == reset_revision &&
+           std::chrono::steady_clock::now() < observed_deadline)
+      std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    ASSERT_GT(map->activeGeneration(), reset_revision);
+    response = std::make_shared<mgg_msgs::srv::PlannerSrv::Response>();
+    PlannerNodeTestPeer::plan(*node, response);
     EXPECT_FALSE(response->path.empty());
     EXPECT_FALSE(PlannerNodeTestPeer::acquiring(*node));
   }
@@ -6312,7 +6376,8 @@ TEST_F(PlannerNodeTest, RetentionRefusalsAccumulateUntilTheRobotMoves) {
   PlannerNodeTestPeer::retainBestPath(*node);
   EXPECT_EQ(PlannerNodeTestPeer::reverseExitExclusions(*node), 1u);
   // A new map epoch re-anchors the coordinates: forgotten too.
-  PlannerNodeTestPeer::serveMap(*node, "component:test", 2);
+  MolaFloorProduct next_epoch(-2, 7, -2, 2, {}, {}, 2);
+  PlannerNodeTestPeer::useMolaMap(*node, next_epoch.serve());
   PlannerNodeTestPeer::acceptOdometryFacing(*node, -0.6, 0, 0, 4);
   EXPECT_EQ(PlannerNodeTestPeer::reverseExitExclusions(*node), 0u);
 }
