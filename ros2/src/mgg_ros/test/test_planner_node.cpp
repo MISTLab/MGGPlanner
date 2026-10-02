@@ -1335,6 +1335,12 @@ class PlannerNodeTestPeer {
     const std::lock_guard<std::recursive_mutex> lock(node.planner_mutex_);
     return node.tourCandidates(std::move(clusters));
   }
+  static void markLocalFrontier(PlannerNode& node) {
+    auto* v = node.local_graph_->vertices_map_.begin()->second;
+    v->type = mgg::VertexType::kFrontier;
+    v->vol_gain.is_frontier = true;
+    v->vol_gain.gain = 1e6;
+  }
   // Cache an empty tour: candidate IDs and graph revision stay unchanged,
   // so only an assignment/region change can require another solve.
   static void solveEmptyTour(PlannerNode& node) {
@@ -11820,4 +11826,30 @@ TEST_F(PlannerNodeTest, PadCentreDepartureClearsFullReachWithAndWithoutFrontWall
   }
 }
 
+}  // namespace mgg_ros
+
+namespace mgg_ros {
+namespace {
+TEST_F(PlannerNodeTest, AerialEmptyOwnTourKeepsForwardLocalFrontiersNotRearPeer) {
+  auto node = makeNode("aerial_local_before_peer", "world", {
+      rclcpp::Parameter("fleet.enabled", false)});
+  PlannerNodeTestPeer::setAerialRobot(*node);
+  MolaFloorProduct product(-1, 15, -1, 1);
+  PlannerNodeTestPeer::useMolaMap(*node, product.serve());
+  PlannerNodeTestPeer::acceptOdometryFacing(*node, .1, .1, 0, 1, .4);
+  const int rear = PlannerNodeTestPeer::addGlobalVertex(*node, 1, 6.1, .1, .4, {0});
+  PlannerNodeTestPeer::addGlobalVertex(*node, 1, 10.8, .1, .4, {rear});
+  PlannerNodeTestPeer::acceptOdometryFacing(*node, 10.8, .1, 0, 1, .4);
+  PlannerNodeTestPeer::setSeenLattice(*node, {{10.8,.1,.4,0}, {13,.1,.4,0}});
+  PlannerNodeTestPeer::markLocalFrontier(*node);
+  mgg::FrontierCluster peer;
+  peer.id = 42; peer.owner_robot_id = 2; peer.representative_vertex_id = rear;
+  peer.position = {6.1,.1,.4}; peer.gain = 1e6;
+  EXPECT_TRUE(PlannerNodeTestPeer::tourCandidates(*node, {peer}).empty());
+  // No own, local or eligible peer frontier is a genuinely empty candidate
+  // set, not a synthetic hold target which could keep PCI retrying forever.
+  PlannerNodeTestPeer::setSeenLattice(*node, {{10.8,.1,.4,0}, {13,.1,.4,0}});
+  EXPECT_TRUE(PlannerNodeTestPeer::tourCandidates(*node, {}).empty());
+}
+}  // namespace
 }  // namespace mgg_ros

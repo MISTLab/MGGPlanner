@@ -21,6 +21,7 @@
 #include <nlohmann/json.hpp>
 #include <rclcpp/rclcpp.hpp>
 #include <std_msgs/msg/string.hpp>
+#include <std_msgs/msg/u_int64.hpp>
 #include <std_srvs/srv/trigger.hpp>
 
 #include "mgg_pci/pci_node.h"
@@ -399,6 +400,45 @@ TEST(PciExternalExecution, ObservationAcquisitionNeverBacksOffOrCompletes) {
   }
   EXPECT_TRUE(rig.waitForStatus("acquiring observations; retrying automatically"));
   EXPECT_TRUE(rig.call("pci_stop")->success);
+}
+
+TEST(PciExternalExecution, ExclusionRevisionWakesTenSecondBackoffWithinOneSecond) {
+  ExternalExecutionRig rig("/exclusion_revision", {{}});
+  rig.publishOdometry();
+  for (const char* service : {"pci_trigger", "pci_replan", "pci_replan",
+                             "pci_replan", "pci_replan"}) {
+    ASSERT_NE(rig.call(service), nullptr);
+  }
+  ASSERT_TRUE(rig.waitForStatus("10.0 s"));
+  auto publisher = rig.caller->create_publisher<std_msgs::msg::UInt64>(
+      "scouting_exclusion_revision", rclcpp::QoS(1).transient_local());
+  std::this_thread::sleep_for(100ms);
+  const int before = rig.planner->calls();
+  const auto start = std::chrono::steady_clock::now();
+  std_msgs::msg::UInt64 revision;
+  revision.data = 3;  // two overlapping discs have both expired
+  publisher->publish(revision);
+  while (rig.planner->calls() == before &&
+         std::chrono::steady_clock::now() - start < 900ms) {
+    std::this_thread::sleep_for(10ms);
+  }
+  EXPECT_GT(rig.planner->calls(), before);
+  ASSERT_NE(rig.call("pci_stop"), nullptr);
+  const int stopped = rig.planner->calls();
+  revision.data = 4;
+  publisher->publish(revision);
+  std::this_thread::sleep_for(300ms);
+  EXPECT_EQ(rig.planner->calls(), stopped);
+}
+
+TEST(PciExternalExecution, ExclusionOnlyRefusalCapsBackoff) {
+  ExternalExecutionRig rig("/exclusion_only", {{}}, -5);
+  rig.publishOdometry();
+  ASSERT_NE(rig.call("pci_trigger"), nullptr);
+  EXPECT_TRUE(rig.waitForStatus("scouting exclusions"));
+  const int before = rig.planner->calls();
+  std::this_thread::sleep_for(900ms);
+  EXPECT_GT(rig.planner->calls(), before);
 }
 
 TEST(PciExternalExecution, RepeatedEmptyPlansRemainWaitingUntilManualStop) {
