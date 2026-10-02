@@ -174,6 +174,25 @@ struct FlagScope {
   bool previous_;
 };
 
+/// Sets a request's lattice deadline `budget_s` from now, 0 none, and
+/// restores the one before it.
+struct DeadlineScope {
+  DeadlineScope(std::optional<std::chrono::steady_clock::time_point>& deadline,
+                double budget_s)
+      : deadline_(deadline), previous_(deadline) {
+    if (budget_s > 0.0 && !deadline_) {
+      deadline_ = std::chrono::steady_clock::now() +
+                  std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+                      std::chrono::duration<double>(budget_s));
+    }
+  }
+  ~DeadlineScope() { deadline_ = previous_; }
+  DeadlineScope(const DeadlineScope&) = delete;
+  DeadlineScope& operator=(const DeadlineScope&) = delete;
+  std::optional<std::chrono::steady_clock::time_point>& deadline_;
+  std::optional<std::chrono::steady_clock::time_point> previous_;
+};
+
 double secondsSince(const std::chrono::steady_clock::time_point& then) {
   return std::chrono::duration<double>(std::chrono::steady_clock::now() - then)
       .count();
@@ -580,6 +599,14 @@ PlannerNode::PlannerNode(const rclcpp::NodeOptions& options)
   // mandatory. Off by default; simulation with a keyframe map turns it on.
   allow_unknown_lattice_body_ = declareOrGet<bool>(
       this, "allow_unknown_lattice_body", allow_unknown_lattice_body_);
+  // The most one request (an objective, a plan request) spends sweeping
+  // lattices, seconds: past it a sweep stops and the request plans over
+  // what it built, or refuses with the budget named. A planning call longer
+  // than the MOLA snapshot TTL (3 s) let the map expire under the next
+  // request (botman, 2026-10-01). 0 is no bound.
+  lattice_time_budget_s_ = std::max(
+      0.0, declareOrGet<double>(this, "lattice_time_budget_s",
+                                lattice_time_budget_s_));
   // A lidar does not see the ground under the robot: within its blind radius
   // a keyframe map holds no floor, so the graph root has no support until
   // the robot has driven away from where it stands. The root then sits at
@@ -855,6 +882,7 @@ mgg::ExpandContext PlannerNode::makeContext() {
   ctx.preserve_hanging_root_start_height = hanging_root_edge_length_max_ > 0.0;
   ctx.root_footprint_exempt = true;
   ctx.root_is_robot = true;
+  ctx.deadline = lattice_deadline_;
   // No-go zones close lattice edges on every backend, the robot's own
   // departure from one it stands in excepted (review r0, I-5).
   if (!no_go_.empty()) {
@@ -3735,6 +3763,7 @@ std::string PlannerNode::buildLocalGraph() {
   // ray-casting through it.
   const std::lock_guard<std::recursive_mutex> lock(planner_mutex_);
   StandingStartScope standing_scope(*this);
+  const DeadlineScope budget(lattice_deadline_, lattice_time_budget_s_);
   auto map_read = mapReadLease();
   refreshMapRevision();
   refreshScoutingExclusions();
@@ -4129,7 +4158,10 @@ std::string PlannerNode::buildLocalGraph() {
       "without room)%s%s%s%s; "
       "heading %.2f rad%s",
       r.free_cells, r.vertices_added, r.edges_added,
-      r.hit_limit ? " (hit a size limit)" : "", why, evaluated, frontiers,
+      r.hit_deadline ? " (stopped at its time budget)"
+      : r.hit_limit  ? " (hit a size limit)"
+                     : "",
+      why, evaluated, frontiers,
       best_path_.size(), path_shortcut_from_, path_shortcut_corners_,
       path_shortcut_to_, sel.best_gain,
       sel.paths_rejected_steep > 0 ? " (some paths too steep)" : "",
@@ -4660,12 +4692,20 @@ bool PlannerNode::routeOverLocalLattice(const mgg::StateVec& goal,
   mgg::GroundProjection plan_ground(*map_, planning_params_,
                                     /*cache_footprint_ground=*/true);
   plan_ground.setStandingStart(standingStart());
+  mgg::PlanProfile profile;
+  plan_ground.setProfile(&profile);
   mgg::ExpandContext ctx = makeContext();
   ctx.ground = &plan_ground;
   mgg::LocalRouteResult local = mgg::routeOverLocalLattice(
       *local_graph_, current_state_, goal, grid_params_, ctx);
+  local_route_profile_ = std::to_string(local.lattice.vertices_added) +
+                         " vertices; " + profile.summary();
   if (!local.routed) {
     reason = local.reason;
+    if (local.lattice.hit_deadline) {
+      reason += " (the lattice stopped at its time budget, " +
+                std::to_string(lattice_time_budget_s_) + " s)";
+    }
     return false;
   }
   std::vector<mgg::Vertex*>& route = local.route;
@@ -6211,6 +6251,8 @@ void PlannerNode::onObjectiveRequest(
   using Service = mgg_msgs::srv::PlanObjective;
   const std::lock_guard<std::recursive_mutex> lock(planner_mutex_);
   StandingStartScope standing_scope(*this);
+  const DeadlineScope budget(lattice_deadline_, lattice_time_budget_s_);
+  local_route_profile_.clear();
   // One peer set for the whole request (review r0, I5).
   std::optional<PeerBodyPin> peer_pin;
   pinPeerBodies(peer_pin);
@@ -6342,6 +6384,9 @@ void PlannerNode::onObjectiveRequest(
   }
   if (!routed) {
     if (!local_reason.empty()) reason += "; local lattice: " + local_reason;
+    if (!local_route_profile_.empty()) {
+      reason += " [" + local_route_profile_ + "]";
+    }
     // A goal only peer bodies keep the robot from, wherever they stop it
     // (linking the goal, the lattice round it, the roadmap search, the
     // route's check), is BLOCKED, which the caller retries until its
@@ -6467,6 +6512,9 @@ void PlannerNode::onObjectiveRequest(
                 local ? "local lattice" : "global graph",
                 path_shortcut_corners_);
   route_note = note;
+  if (local && !local_route_profile_.empty()) {
+    route_note += " [" + local_route_profile_ + "]";
+  }
 }
 
 // ---------------------------------------------------------------------------

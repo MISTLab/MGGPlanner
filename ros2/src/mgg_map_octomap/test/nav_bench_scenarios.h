@@ -174,9 +174,11 @@ inline std::vector<Scenario> scenarios() {
   // body clears the clutter on either side by 0.3 m.
   nav("corridor_west_2m", StateVec(0.0, 0.0, 0.0, M_PI),
       StateVec(-2.0, 0.0, 0.0, 0.0), true, 2.1, 10.0, 300.0);
-  // A goal 4 m away in observed free space.
-  nav("corridor_west_4m", StateVec(0.0, 0.0, 0.0, M_PI),
-      StateVec(-4.0, 0.0, 0.0, 0.0), true, 0.0, 0.0, 300.0);
+  // A goal 3.5 m down that corridor, beside a bin at (-3.7, -0.55) and
+  // short of the cabinet across it at x = -4.6 (4 m out the body's front
+  // would be in it).
+  nav("corridor_west_3.5m", StateVec(0.0, 0.0, 0.0, M_PI),
+      StateVec(-3.5, 0.1, 0.0, 0.0), true, 3.6, 10.0, 300.0);
   // Logged goals botman was refused, "goal cannot be linked to the local
   // lattice". East of x = 2.3 the corridor narrows to 1.25 m beside a
   // cabinet; whether the body fits there is for the exact checks to say,

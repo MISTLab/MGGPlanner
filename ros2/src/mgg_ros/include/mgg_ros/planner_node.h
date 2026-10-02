@@ -993,6 +993,15 @@ class PlannerNode : public rclcpp::Node {
   double reach_distance_ = 0.3;
   /// See the parameter's comment in the constructor.
   bool allow_unknown_lattice_body_ = false;
+  /// How long one request's lattice sweeps may take, seconds
+  /// (lattice_time_budget_s); 0 is no bound.
+  double lattice_time_budget_s_ = 0.5;
+  /// While a request runs, where its lattice sweeps stop (makeContext's
+  /// ExpandContext::deadline): the sweep keeps what it built by then.
+  std::optional<std::chrono::steady_clock::time_point> lattice_deadline_;
+  /// The last local lattice route's work (mgg::PlanProfile::summary), for
+  /// the objective's log line.
+  std::string local_route_profile_;
   double hanging_root_edge_length_max_ = 0.0;
   /// How far over its pad a drone's home is, metres: the height it takes
   /// off to, where its flight links (drone scout Task 17, fix round 1).
