@@ -783,6 +783,7 @@ class PlannerNode : public rclcpp::Node {
   std::atomic<std::uint64_t> heartbeats_received_{0};
   std::atomic<std::uint64_t> heartbeats_during_planning_{0};
   std::atomic<bool> request_active_{false};
+  std::shared_ptr<const mgg::MolaSnapshotRequest> last_planning_snapshot_;
   std::atomic<std::int64_t> odometry_sample_stamp_ns_{0};
   std::atomic<double> odometry_ingest_lag_s_{0.0};
 

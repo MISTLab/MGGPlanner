@@ -41,9 +41,9 @@ struct MolaInstallation {
 struct MolaMapConfig {
   std::string peer_root;
   double resolution = 0.2;
-  /// An active snapshot expires this long after its last on-disk
-  /// confirmation: the load that built it, a same-key reload, or a compatible
-  /// successor heartbeat that found no product for its revision yet.
+  /// Authority expires this long after its last compatible receipt. Waiting
+  /// for a geometry load or publication lease never extends that receipt.
+  /// Compatible refinements renew the verified predecessor while loading.
   double snapshot_ttl_sec = 3.0;
   /// Bound on `<peer_root>/mola/source.json`.
   std::size_t max_snapshot_bytes = 64u * 1024u * 1024u;

@@ -281,18 +281,20 @@ struct MolaMap::Snapshot {
   // when the geometry was built, so nothing is re-read or re-hashed.
   struct stat source_identity {};
   struct stat index_identity {};
-  // Steady-clock nanoseconds of the last on-disk confirmation that this
-  // geometry may be served: set by the load that built it and refreshed in
-  // place when a compatible successor heartbeat ends in a coherence race.
-  // The geometry itself stays immutable.
+  // Last compatible authority receipt, never extended by time spent loading
+  // or waiting behind a reader. Same-identity receipts require unchanged
+  // publication files; successor receipts renew the verified predecessor's
+  // authority while the worker validates the refinement. Geometry is immutable.
   mutable std::atomic<std::int64_t> validated_at_ns{0};
   mutable std::atomic<std::size_t> reader_pins{0};
 
   void markValidated(const Clock::time_point when) const {
-    validated_at_ns.store(
-        std::chrono::duration_cast<std::chrono::nanoseconds>(
-            when.time_since_epoch()).count(),
-        std::memory_order_release);
+    const auto stamp = std::chrono::duration_cast<std::chrono::nanoseconds>(
+        when.time_since_epoch()).count();
+    auto prior = validated_at_ns.load(std::memory_order_acquire);
+    while (prior < stamp && !validated_at_ns.compare_exchange_weak(
+        prior, stamp, std::memory_order_release, std::memory_order_acquire)) {}
+
   }
   bool expired(const Clock::time_point now, const double ttl_sec) const {
     const std::chrono::nanoseconds validated(
@@ -426,6 +428,13 @@ void MolaMap::requestSnapshot(const MolaSnapshotRequest& request) {
       stat_revalidation_count_.fetch_add(1, std::memory_order_relaxed);
       return;
     }
+    if (active && compatible(active->request, request) &&
+        !sameIdentity(active->request, request)) {
+      // A refinement leaves this verified predecessor in the same authority
+      // frame. Receipt, not time spent waiting for its reader, renews that
+      // authority. The new geometry is still validated by the worker.
+      active->markValidated(Clock::now());
+    }
     if (active && !compatible(active->request, request)) {
       std::atomic_store(&active_, std::shared_ptr<const Snapshot>());
       active_generation_.fetch_add(1, std::memory_order_release);
@@ -516,8 +525,7 @@ bool MolaMap::authorityValid() const {
     return false;
   for (const auto& pin : thread_pins_) {
     if (pin.owner == this)
-      return pin.snapshot && sameIdentity(pin.snapshot->request, active->request) &&
-             sameTransform(pin.snapshot->request, active->request);
+      return pin.snapshot && compatible(pin.snapshot->request, active->request);
   }
   return true;
 }
@@ -564,7 +572,7 @@ void MolaMap::retainPredecessorOrFail(const PendingRequest& pending,
     // install was compatible (an incompatible one would have retracted it)
     // and the next attempt may not finish before the clock would run out.
     // last_error_ stays untouched: it is empty whenever a snapshot is active.
-    active->markValidated(Clock::now());
+    active->markValidated(pending.received_at);
     retained_predecessor_count_.fetch_add(1, std::memory_order_relaxed);
     return;
   }
@@ -604,7 +612,10 @@ void MolaMap::workerLoop() {
         if (pending_ == nullptr ||
             !compatible(pending_->request, loaded->request))
           continue;
-        if (sameIdentity(pending_->request, loaded->request)) pending_.reset();
+        loaded->markValidated(pending_->received_at);
+        if (sameIdentity(pending_->request, loaded->request)) {
+          pending_.reset();
+        }
       }
       const auto prior = std::atomic_load(&active_);
       // A retained predecessor is replaced here by its successor: the
@@ -1005,7 +1016,7 @@ std::shared_ptr<const MolaMap::Snapshot> MolaMap::loadOnce(
   result->artifact_digest = expected_grid_digest;
   result->source_identity = source_identity;
   result->index_identity = index_identity;
-  result->markValidated(Clock::now());
+  result->markValidated(pending.received_at);
   return result;
 }
 

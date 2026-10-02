@@ -2039,6 +2039,7 @@ void PlannerNode::publishPlanningStatus() {
       std::chrono::steady_clock::now().time_since_epoch()).count();
   std_msgs::msg::String status;
   const bool acquiring = acquiring_observations_.load();
+  const auto planned = std::atomic_load(&last_planning_snapshot_);
   status.data = "{\"bootstrap_state\":" +
       jsonString(acquiring ? "acquiring observations" : "ready") +
       ",\"bootstrap_age_s\":" + jsonNumber(acquiring ?
@@ -2047,6 +2048,9 @@ void PlannerNode::publishPlanningStatus() {
       ",\"heartbeats_during_planning\":" + std::to_string(heartbeats_during_planning_.load()) +
       ",\"heartbeats_validated\":" + std::to_string(mola_map_ ? mola_map_->statRevalidationCount() : 0) +
       ",\"map_identity_changes\":" + std::to_string(map_identity_changes_.load()) +
+      ",\"last_plan_component_id\":" + jsonString(planned ? planned->component_id : "") +
+      ",\"last_plan_epoch\":" + std::to_string(planned ? planned->epoch : 0) +
+      ",\"last_plan_geometry_revision\":" + jsonString(planned ? planned->geometry_revision : "") +
       ",\"map_authority_valid\":" + (mola_map_ && mola_map_->authorityValid() ? "true" : "false") +
       ",\"map_expiries\":" + std::to_string(mola_map_ ? mola_map_->expiryCount() : 0) +
       ",\"map_error\":" + jsonString(mola_map_ ? mola_map_->lastError() : "") +
@@ -5232,6 +5236,7 @@ void PlannerNode::onBuildRequest(
     std::shared_ptr<std_srvs::srv::Trigger::Response> response) {
   const auto generation = request_generation_.load();
   const std::lock_guard<std::recursive_mutex> lock(planner_mutex_);
+  auto map_read = mapReadLease();
   const bool admitted = mola_map_ && mola_map_->authorityValid();
   const auto map_generation = mola_map_ ? mola_map_->activeGeneration() : 0;
   mgg::PlanningCancellationScope cancellation([this, generation, admitted, map_generation] {
@@ -5280,6 +5285,16 @@ void PlannerNode::onPlanRequest(
   const auto generation = request_generation_.load();
   const std::lock_guard<std::recursive_mutex> lock(planner_mutex_);
   RequestActivity activity(request_active_);
+  auto map_read = mapReadLease();
+  if (mola_map_) {
+    if (const auto snapshot = mola_map_->activeRequest()) {
+      std::atomic_store(&last_planning_snapshot_,
+          std::make_shared<const mgg::MolaSnapshotRequest>(*snapshot));
+      RCLCPP_INFO(get_logger(), "plan identity: component=%s epoch=%llu geometry_revision=%s",
+          snapshot->component_id.c_str(), static_cast<unsigned long long>(snapshot->epoch),
+          snapshot->geometry_revision.c_str());
+    }
+  }
   const bool admitted = mola_map_ && mola_map_->authorityValid();
   const auto map_generation = mola_map_ ? mola_map_->activeGeneration() : 0;
   const auto bound = robot_params_.bound_mode;
@@ -5320,6 +5335,16 @@ void PlannerNode::onObjectiveRequest(
   }
   const std::lock_guard<std::recursive_mutex> lock(planner_mutex_);
   RequestActivity activity(request_active_);
+  auto map_read = mapReadLease();
+  if (mola_map_) {
+    if (const auto snapshot = mola_map_->activeRequest()) {
+      std::atomic_store(&last_planning_snapshot_,
+          std::make_shared<const mgg::MolaSnapshotRequest>(*snapshot));
+      RCLCPP_INFO(get_logger(), "plan identity: component=%s epoch=%llu geometry_revision=%s",
+          snapshot->component_id.c_str(), static_cast<unsigned long long>(snapshot->epoch),
+          snapshot->geometry_revision.c_str());
+    }
+  }
   const bool admitted = mola_map_ && mola_map_->authorityValid();
   const auto map_generation = mola_map_ ? mola_map_->activeGeneration() : 0;
   mgg::PlanningCancellationScope cancellation([this, generation, admitted, map_generation]() {
