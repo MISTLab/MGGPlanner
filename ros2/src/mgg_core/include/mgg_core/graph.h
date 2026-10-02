@@ -79,11 +79,10 @@ class Graph {
   bool edgeExists(int u_id, int v_id);
 
   /// With `deadline`, the search stops once it has passed, checked every
-  /// kDeadlineCheckVertices vertices settled: status false, cut_short.
+  /// vertex settled: status false, cut_short.
   bool findDijkstraShortestPaths(
       int src_id, ShortestPathsReport& rep,
       const std::chrono::steady_clock::time_point* deadline = nullptr);
-  static constexpr int kDeadlineCheckVertices = 64;
   /// Whether the edge between two vertex ids is closed to every search
   /// (findDijkstraShortestPaths), though it stays in the graph.
   using EdgeBlockedFn = std::function<bool(int, int)>;

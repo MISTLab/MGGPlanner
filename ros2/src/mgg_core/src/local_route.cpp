@@ -200,7 +200,12 @@ Vertex* lazyGroundLattice(GraphManager& graph, Vertex* root,
           continue;
         }
         if (!endpoint_admissible(at->state, state)) continue;
-        Vertex candidate(-1, state);
+        // expandGraphFrom clips before projecting. Offer the raw XY step
+        // at the parent's height, as the eager lattice does, so projection
+        // cannot clip a slope edge off the cell whose key we store.
+        StateVec raw = state;
+        raw.z() = at->state.z();
+        Vertex candidate(-1, raw);
         ExpandGraphReport rep;
         expandGraphFrom(graph, candidate, at, rep, lazy, true);
         count(rep);
