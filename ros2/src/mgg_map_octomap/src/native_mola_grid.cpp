@@ -459,6 +459,81 @@ VoxelStatus NativeMolaGrid::getStrictPathStatus(
   return path(a, b, s, true, false);
 }
 
+namespace {
+// An upright box aligned with the grid, swept along a segment, meets a
+// voxel exactly when the segment meets the voxel grown by half the box:
+// the Minkowski sum of two axis-aligned boxes is one. Touching counts.
+bool segmentMeetsBox(const Eigen::Vector3d& a, const Eigen::Vector3d& b,
+                     const Eigen::Vector3d& lo, const Eigen::Vector3d& hi) {
+  double first = 0, last = 1;
+  for (int q = 0; q < 3; ++q) {
+    const double d = b[q] - a[q];
+    if (std::abs(d) <= 1e-15) {
+      if (a[q] < lo[q] || a[q] > hi[q]) return false;
+      continue;
+    }
+    double x = (lo[q] - a[q]) / d, y = (hi[q] - a[q]) / d;
+    if (x > y) std::swap(x, y);
+    first = std::max(first, x);
+    last = std::min(last, y);
+    if (first > last) return false;
+  }
+  return true;
+}
+}  // namespace
+
+VoxelStatus NativeMolaGrid::getSweptBoxStatus(const Eigen::Vector3d& a,
+                                              const Eigen::Vector3d& b,
+                                              const Eigen::Vector3d& s,
+                                              bool unknown,
+                                              bool measured) const {
+  if (!a.allFinite() || !b.allFinite() || !s.allFinite() ||
+      (s.array() < 0).any())
+    return VoxelStatus::kUnknown;
+  const double n_d = std::max(1.0, std::ceil((b - a).norm() / resolution_));
+  if (!std::isfinite(n_d) || n_d > double(kMaxWork)) return VoxelStatus::kUnknown;
+  const Eigen::Vector3d step = (b - a) / n_d;
+  long double cells = 1;
+  for (int axis = 0; axis < 3; ++axis)
+    cells *= std::ceil((s[axis] + std::abs(step[axis])) / resolution_) + 3.0;
+  if (cells * n_d > kMaxWork) return VoxelStatus::kUnknown;
+  const Eigen::Vector3d grow =
+      (s + Eigen::Vector3d::Constant(resolution_)) * .5 +
+      Eigen::Vector3d::Constant(1e-12);
+  for (std::uint64_t i = 0; i < std::uint64_t(n_d); ++i) {
+    // One step of the sweep at a time: the union of the steps' exact
+    // sweeps is the segment's, and each enumerates only its own cells.
+    const Eigen::Vector3d p = a + double(i) * step, q = p + step;
+    const Eigen::Vector3d lo = p.cwiseMin(q) - s * .5;
+    const Eigen::Vector3d hi = p.cwiseMax(q) + s * .5;
+    Cell first, last;
+    if (!key(lo - Eigen::Vector3d::Constant(1e-12), first) ||
+        !key(hi + Eigen::Vector3d::Constant(1e-12), last))
+      return VoxelStatus::kUnknown;
+    bool saw_unknown = false;
+    for (auto x = first.x; x <= last.x; ++x)
+      for (auto y = first.y; y <= last.y; ++y)
+        for (auto z = first.z; z <= last.z; ++z) {
+          const Cell k{x, y, z};
+          const VoxelStatus st = status(k);
+          if (st == VoxelStatus::kFree) continue;
+          const Eigen::Vector3d c = center(k);
+          if (!segmentMeetsBox(p, q, c - grow, c + grow)) continue;
+          if (st == VoxelStatus::kOccupied) {
+            if (measured) {
+              auto it = surface_max_z_.find(k);
+              if (it != surface_max_z_.end() && it->second < lo.z() - 1e-12)
+                continue;
+            }
+            return st;
+          }
+          saw_unknown = true;
+        }
+    if (unknown && saw_unknown) return VoxelStatus::kUnknown;
+  }
+  return VoxelStatus::kFree;
+}
+
 VoxelStatus NativeMolaGrid::getOccupiedOnlyCylinderPathStatus(
     const Eigen::Vector3d& a, const Eigen::Vector3d& b, double radius,
     double height) const {

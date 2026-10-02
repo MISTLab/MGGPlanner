@@ -42,7 +42,8 @@ LocalRouteResult routeOverLocalLattice(GraphManager& graph,
                                        const StateVec& robot_pose,
                                        const StateVec& goal,
                                        const GridGraphParams& grid,
-                                       const ExpandContext& ctx);
+                                       const ExpandContext& ctx,
+                                       std::optional<double> lattice_heading = std::nullopt);
 
 /// The ground robot's driving-height root for `robot_pose`: dropped onto
 /// the ground below it, or, with no ground mapped there, the base's

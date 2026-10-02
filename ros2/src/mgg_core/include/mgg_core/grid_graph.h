@@ -92,6 +92,16 @@ struct GridGraphResult {
   /// Edge verdicts summed over first-pass candidates, indexed by
   /// ProjectedEdgeStatus.
   int edge_status[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+  /// Aerial vertices joined at a nudged position (kAerialNudgePasses), and
+  /// the nudge passes that joined any.
+  int aerial_nudged = 0;
+  int aerial_nudge_passes = 0;
+};
+
+/// A lattice cell refused on the sweep, offered again later.
+struct GridGraphRetry {
+  Eigen::Vector3d cell;
+  int i, j;
 };
 
 /// The driving heights of the vertices a ground lattice holds at each of its
@@ -124,6 +134,19 @@ inline constexpr int kLatticeAlternateParents = 3;
 /// Retry passes over the cells the sweep refused an edge (GridGraphResult::
 /// retried_joined); each stops the retries when it joins nothing.
 inline constexpr int kGridGraphRetryPasses = 4;
+
+/// Aerial nudges (lane drone-door). A drone's lattice is laid out along the
+/// map's grid, 0.4 m apart, but a 0.9 m opening leaves the 0.5 m body a
+/// corridor of +/-0.05 to 0.15 m. After the sweep, an aerial cell it refused
+/// next to the graph is offered again at +/-0.1 and +/-0.2 m along both
+/// lattice axes, the observed-free candidate with the widest clearance
+/// (kAerialClearanceStep up to kAerialClearanceMax beyond the body) first;
+/// the first that joins wins. Passes go on next to what the last one
+/// joined, so the lattice threads the opening. Ground lattices are not
+/// nudged here.
+inline constexpr int kAerialNudgePasses = 8;
+inline constexpr double kAerialClearanceStep = 0.05;
+inline constexpr double kAerialClearanceMax = 0.2;
 
 /// Sweeps the lattice around `state` and grows `graph` through it.
 ///

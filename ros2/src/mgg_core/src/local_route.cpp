@@ -243,7 +243,8 @@ LocalRouteResult routeOverLocalLattice(GraphManager& graph,
                                        const StateVec& robot_pose,
                                        const StateVec& goal,
                                        const GridGraphParams& grid,
-                                       const ExpandContext& ctx) {
+                                       const ExpandContext& ctx,
+                                       std::optional<double> lattice_heading) {
   LocalRouteResult result;
   graph.reset();
   if (ctx.inclinations != nullptr) ctx.inclinations->clear();
@@ -313,7 +314,7 @@ LocalRouteResult routeOverLocalLattice(GraphManager& graph,
     }
   } else {
     // Aerial planning retains the full 3D lattice and its original linker.
-    result.lattice = buildGridGraph(graph, root_state, grid, ctx, robot_pose[3]);
+    result.lattice = buildGridGraph(graph, root_state, grid, ctx, lattice_heading.value_or(robot_pose[3]));
     if (result.lattice.status == GridGraphStatus::kInvalidBounds ||
         graph.getNumVertices() <= 1) {
       result.reason = "the local lattice holds no admissible cell";

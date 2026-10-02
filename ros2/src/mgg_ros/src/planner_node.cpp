@@ -348,6 +348,10 @@ PlannerNode::PlannerNode(const rclcpp::NodeOptions& options)
     };
     auto backend = std::make_unique<mgg::MolaMap>(map_cfg);
     mola_map_ = backend.get();
+    // A drone's box is the square its footprint circumscribes: held along
+    // the map's grid and swept exactly (lane drone-door).
+    mola_map_->setGridAlignedBody(robot_params_.type ==
+                                  mgg::RobotType::kAerialRobot);
     map_ = std::move(backend);
     RCLCPP_INFO(get_logger(),
                 "map backend '%s': source '%s', resolution %.3f m, TTL %.1f s",
@@ -4187,7 +4191,7 @@ std::string PlannerNode::buildLocalGraph() {
   // The lattice is laid out around the root at driving height, where the
   // root vertex is; a ground robot's odometry origin sits lower than that.
   const mgg::GridGraphResult r = buildGridGraph(
-      *local_graph_, root_state, grid_params_, ctx, current_state_[3]);
+      *local_graph_, root_state, grid_params_, ctx, latticeHeading());
   if (r.status == mgg::GridGraphStatus::kInvalidBounds) {
     return "grid bounds invalid: min_val must be <= 0, max_val >= 0 and "
            "resolution non-zero";
@@ -4850,7 +4854,7 @@ bool PlannerNode::routeOverGlobalGraph(const mgg::StateVec goal,
     mgg::GoalLatticeReport lattice;
     const int before_lattice = global_graph_->getNumVertices();
     goal_vertex = mgg::connectGoalThroughLattice(
-        *global_graph_, goal_state, grid_params_, ctx, current_state_[3],
+        *global_graph_, goal_state, grid_params_, ctx, latticeHeading(),
         reaches, &lattice);
     if (global_graph_->getNumVertices() != before_lattice) ++graph_revision_;
     if (goal_vertex == nullptr) {
@@ -5075,6 +5079,17 @@ mgg::Vertex* PlannerNode::attachGoalToNeighbourRoadmap(
   return nullptr;
 }
 
+double PlannerNode::latticeHeading() const {
+  // A ground robot's lattice turns with it. An aerial one runs along the
+  // map's voxels (lane drone-door): its body is held on that grid, and its
+  // edges then cross a grid-aligned opening square-on, not obliquely by the
+  // drone's yaw (a 0.9 m door leaves less than a voxel to spare).
+  if (robot_params_.type != mgg::RobotType::kAerialRobot) return current_state_[3];
+  double heading = 0.0;
+  if (mola_map_ != nullptr && mola_map_->gridHeading(heading)) return heading;
+  return 0.0;
+}
+
 bool PlannerNode::routeOverLocalLattice(const mgg::StateVec& goal,
                                         std::vector<mgg::StateVec>& path,
                                         mgg::PathOkFn& turns_ok,
@@ -5102,7 +5117,7 @@ bool PlannerNode::routeOverLocalLattice(const mgg::StateVec& goal,
   ctx.ground = &plan_ground;
   if (peer_diagnosis_deadline_) ctx.deadline = peer_diagnosis_deadline_;
   mgg::LocalRouteResult local = mgg::routeOverLocalLattice(
-      *local_graph_, current_state_, goal, grid_params_, ctx);
+      *local_graph_, current_state_, goal, grid_params_, ctx, latticeHeading());
   local_route_profile_ = std::to_string(local.lattice.vertices_added) +
                          " vertices; " + profile.summary();
   if (!local.routed) {

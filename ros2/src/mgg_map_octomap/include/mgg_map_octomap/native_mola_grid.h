@@ -55,6 +55,15 @@ class NativeMolaGrid final : public MapInterface {
   VoxelStatus getStrictPathStatus(const Eigen::Vector3d&,
                                   const Eigen::Vector3d&,
                                   const Eigen::Vector3d&) const override;
+  /// The upright box `size`, aligned with this grid, swept exactly from
+  /// `start` to `end` (no sampled poses, no growth by the step): occupied
+  /// when a voxel it meets, touching included, is occupied; unknown when
+  /// `unknown` and it meets an unknown one. `measured` lets a measured
+  /// surface below the box's underside pass, as getBoxStatus does.
+  VoxelStatus getSweptBoxStatus(const Eigen::Vector3d& start,
+                                const Eigen::Vector3d& end,
+                                const Eigen::Vector3d& size, bool unknown,
+                                bool measured) const;
   bool aerialRootRecoveryTraversable(const Eigen::Vector3d&,
                                       const Eigen::Vector3d&,
                                       const Eigen::Vector3d&) const override;

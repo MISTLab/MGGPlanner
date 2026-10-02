@@ -3422,3 +3422,393 @@ TEST(AerialRootRecovery, GroundCallSitesNeverUseAerialFallback) {
   EXPECT_EQ(map.attempts, 0);
   EXPECT_EQ(map.aerialRootRecoveryStats().uses, 0u);
 }
+
+// Lane drone-door (after run drone-r7): the drone's one clearance budget.
+// Its footprint (0.354 m, a 0.71 m disc) holds the safety margin, so MGG's
+// aerial body is the 0.5 m square it circumscribes, with no extension, held
+// along the map's grid and swept exactly; the aerial lattice runs along the
+// grid too, and nudges a refused cell to thread a narrow opening.
+namespace door {
+
+constexpr double kRes = 0.2;
+
+// The planner's settings for a drone (planner_node, lane drone-door).
+void alignBody(MolaMap& map) { map.setGridAlignedBody(true); }
+double latticeHeading(const MolaMap& map) {
+  double heading = 0.0;
+  EXPECT_TRUE(map.gridHeading(heading));
+  return heading;
+}
+
+// A wall in the component frame: its solid is the slab across `normal`
+// from `base` to `base + 0.2 normal`, less a door `width` wide from
+// `left` along the wall, from the floor to `height`; floor and ceiling
+// close the room. The room spans x [-2.4, 6.4), y [-3, 3), z [0, 3) in the
+// wall's own frame, turned by `turn` about z. Cells are occupied when a
+// sample of them lies in the solid (as returns would mark them), observed
+// free otherwise: the far side is observed too, unless `unknown_beyond`
+// leaves cells more than 1.6 m past the wall unknown.
+struct Wall {
+  double width = 0.9, left = 0.05, height = 2.0, depth = 0.2, turn = 0.0;
+  bool unknown_beyond = false, clutter = false;
+  Eigen::Vector2d base{2.0, 0.0};
+  Eigen::Vector2d along() const { return {-std::sin(turn), std::cos(turn)}; }
+  Eigen::Vector2d normal() const { return {std::cos(turn), std::sin(turn)}; }
+  bool solid(const Eigen::Vector3d& p) const {
+    const Eigen::Vector2d d = p.head<2>() - base;
+    const double n = d.dot(normal()), a = d.dot(along());
+    if (p.z() < 0.0 || p.z() >= 3.0) return true;  // floor and ceiling
+    if (clutter && p.z() < 2.5) {
+      for (double post_n : {-2.8, -1.6, 1.8})
+        for (double post_a : {-1.6, 1.8})
+          if (std::abs(n-post_n) < .15 && std::abs(a-post_a) < .15) return true;
+    }
+    if (n < -4.2 || n > 4.2 || std::abs(a) > 2.8) return true;
+    if (n < 0.0 || n > depth) return false;
+    return !(a > left && a < left + width && p.z() < height);
+  }
+  // The wall's solid boxes in its own frame (n, a, z): exact geometry for
+  // the budget check, besides the voxels.
+  std::vector<std::pair<Eigen::Vector3d, Eigen::Vector3d>> boxes() const {
+    return {{{0.0, -10.0, 0.0}, {depth, left, 3.0}},
+            {{0.0, left + width, 0.0}, {depth, 10.0, 3.0}},
+            {{0.0, left, height}, {depth, left + width, 3.0}}};
+  }
+  void cells(std::vector<Voxel>& occupied, std::vector<Voxel>& free) const {
+    for (int x = -20; x < 40; ++x)
+      for (int y = -20; y < 20; ++y)
+        for (int z = -1; z <= 15; ++z) {
+          bool hit = false, room = false;
+          for (int i = 0; i < 4 && !hit; ++i)
+            for (int j = 0; j < 4 && !hit; ++j)
+              for (int k = 0; k < 4 && !hit; ++k) {
+                const Eigen::Vector3d p =
+                    kRes * Eigen::Vector3d(x + (i + 0.5) / 4, y + (j + 0.5) / 4,
+                                           z + (k + 0.5) / 4);
+                const Eigen::Vector2d d = p.head<2>() - base;
+                const double n = d.dot(normal()), a = d.dot(along());
+                room = room || (n > -4.4 && n < 4.4 && std::abs(a) < 3.0);
+                hit = solid(p);
+              }
+          if (!room) continue;
+          const Eigen::Vector3d c = kRes * Eigen::Vector3d(x + .5, y + .5, z + .5);
+          const double n = (c.head<2>() - base).dot(normal());
+          if (hit) {
+            occupied.push_back({x, y, z});
+          } else if (!(unknown_beyond && n > depth + 1.6)) {
+            free.push_back({x, y, z});
+          }
+        }
+  }
+};
+
+struct Scene {
+  explicit Scene(const Wall& wall, double frame_yaw) : aerial(), wall(wall) {
+    alignBody(aerial.map);
+    // drone_config.MIN_AERIAL_FREE_RUN_M=.8: deployed sweep width .600001.
+    const double side = .600001;
+    aerial.robot.size = {side, side, .25};
+    aerial.ctx.robot_box_size = aerial.robot.size;
+    aerial.planning.nearest_range = 0.6;
+    aerial.planning.nearest_range_max = 1.0;
+    std::vector<Voxel> occupied, free;
+    wall.cells(occupied, free);
+    component_from_navigation.linear() =
+        Eigen::AngleAxisd(frame_yaw, Eigen::Vector3d::UnitZ()).toRotationMatrix();
+    component_from_navigation.translation() = Eigen::Vector3d(-3.5, -4.0, -0.1);
+    aerial.load(free, occupied, component_from_navigation);
+  }
+  Eigen::Vector3d nav(const Eigen::Vector3d& component) const {
+    return component_from_navigation.inverse() * component;
+  }
+  // A point `n` before (negative) or past the wall's face, `a` along it,
+  // at height `z`, in navigation coordinates.
+  Eigen::Vector3d at(double n, double a, double z) const {
+    const Eigen::Vector2d p = wall.base + n * wall.normal() + a * wall.along();
+    return nav(Eigen::Vector3d(p.x(), p.y(), z));
+  }
+  AerialMolaScene aerial;
+  Wall wall;
+  Eigen::Isometry3d component_from_navigation = Eigen::Isometry3d::Identity();
+};
+
+mgg::GridGraphParams lattice() {
+  // bistro.yaml's GridGraphLocal.
+  mgg::GridGraphParams grid;
+  grid.min_val = {-6.0, -6.0, -0.2};
+  grid.max_val = {6.0, 6.0, 0.3};
+  grid.resolution = {0.4, 0.4, 0.1};
+  return grid;
+}
+
+// The swept upright box `size`, held along the component grid, meets the
+// box [lo, hi] (component coordinates) exactly when the segment meets the
+// box grown by half of it. Independent of the planner's own sweep.
+bool sweepMeets(const Eigen::Vector3d& a, const Eigen::Vector3d& b,
+                const Eigen::Vector3d& size, Eigen::Vector3d lo,
+                Eigen::Vector3d hi) {
+  lo -= size / 2;
+  hi += size / 2;
+  double first = 0, last = 1;
+  for (int q = 0; q < 3; ++q) {
+    const double d = b[q] - a[q];
+    if (std::abs(d) < 1e-15) {
+      if (a[q] < lo[q] || a[q] > hi[q]) return false;
+      continue;
+    }
+    double x = (lo[q] - a[q]) / d, y = (hi[q] - a[q]) / d;
+    if (x > y) std::swap(x, y);
+    first = std::max(first, x);
+    last = std::min(last, y);
+    if (first > last) return false;
+  }
+  return true;
+}
+
+struct Route {
+  std::vector<Eigen::Vector3d> points;  // navigation coordinates
+  double lattice_s = 0;
+  int vertices = 0;
+  int nudged = 0;
+  int passes = 0;
+  bool hit_limit = false;
+};
+
+// NAVIGATE as planner_node's routeOverLocalLattice lays it out: the lattice
+// round the drone, the goal linked exactly, the shortest path to it.
+Route navigate(Scene& scene, const Eigen::Vector3d& start,
+               const Eigen::Vector3d& goal) {
+  Route route;
+  mgg::GraphManager graph;
+  const mgg::StateVec root(start.x(), start.y(), start.z(), 0);
+  graph.addVertex(new mgg::Vertex(0, root));
+  const auto begin = std::chrono::steady_clock::now();
+  const auto built = mgg::buildGridGraph(graph, root, lattice(), scene.aerial.ctx,
+                                         latticeHeading(scene.aerial.map));
+  route.lattice_s =
+      std::chrono::duration<double>(std::chrono::steady_clock::now() - begin).count();
+  route.vertices = graph.getNumVertices();
+  route.nudged = built.aerial_nudged;
+  route.passes = built.aerial_nudge_passes;
+  route.hit_limit = built.hit_limit;
+  mgg::Vertex* target = mgg::connectStateToGraph(
+      graph, mgg::StateVec(goal.x(), goal.y(), goal.z(), 0), scene.aerial.ctx, 0.1,
+      true);
+  if (target == nullptr) return route;
+  mgg::ShortestPathsReport report;
+  if (!graph.findShortestPaths(0, report) ||
+      report.parent_id_map.find(target->id) == report.parent_id_map.end())
+    return route;
+  std::vector<mgg::Vertex*> path;
+  graph.getShortestPath(target->id, report, true, path);
+  for (const auto* v : path) route.points.push_back(v->state.head<3>());
+  return route;
+}
+
+// Every segment's exact sweep of the 0.5 m body (the budget's square: its
+// corners 0.354 m out) stays off every occupied voxel and, for a wall
+// along the grid, off the wall's exact solid.
+void expectWithinBudget(const Scene& scene, const std::vector<Eigen::Vector3d>& path) {
+  std::vector<Voxel> occupied, free;
+  scene.wall.cells(occupied, free);
+  const Eigen::Vector3d body = scene.aerial.robot.size;
+  for (std::size_t i = 1; i < path.size(); ++i) {
+    const Eigen::Vector3d a = scene.component_from_navigation * path[i - 1];
+    const Eigen::Vector3d b = scene.component_from_navigation * path[i];
+    for (const auto& v : occupied) {
+      const Eigen::Vector3d lo = kRes * Eigen::Vector3d(v.x, v.y, v.z);
+      ASSERT_FALSE(sweepMeets(a, b, body, lo, lo + Eigen::Vector3d::Constant(kRes)))
+          << "segment " << i << " meets voxel " << v.x << "," << v.y << "," << v.z;
+    }
+    if (scene.wall.turn != 0.0) continue;
+    for (const auto& [lo, hi] : scene.wall.boxes()) {
+      const Eigen::Vector3d shift(scene.wall.base.x(), scene.wall.base.y(), 0.0);
+      ASSERT_FALSE(sweepMeets(a, b, body, lo + shift, hi + shift)) << "segment " << i;
+    }
+  }
+}
+
+bool crossesTheWall(const Scene& scene, const std::vector<Eigen::Vector3d>& path) {
+  if (path.size() < 2) return false;
+  const auto side = [&](const Eigen::Vector3d& p) {
+    const Eigen::Vector3d c = scene.component_from_navigation * p;
+    return (c.head<2>() - scene.wall.base).dot(scene.wall.normal());
+  };
+  return side(path.front()) < 0.0 && side(path.back()) > scene.wall.depth;
+}
+
+}  // namespace door
+
+TEST(AerialDoor, A09mDoorPassesOnlyWithFourFreeVoxels) {
+  // 0.9 m at 0.05 m from a voxel boundary leaves 0.6 m of free voxels
+  // between the jambs; at 0.15 m, 0.8 m. The drone starts 1.4 m before the
+  // wall, 0.45-0.6 m off the door's centre line (no lattice row through it).
+  for (const double frame : {0.0, 0.38}) {
+    for (const double left : {0.05, 0.15}) {
+      SCOPED_TRACE(::testing::Message() << "frame " << frame << " left " << left);
+      door::Wall wall;
+      wall.left = left;
+      door::Scene scene(wall, frame);
+      const auto route =
+          door::navigate(scene, scene.at(-1.4, 0.0, 1.3), scene.at(2.2, 0.5, 1.3));
+      std::printf("[timing] frame %.2f left %.2f lattice %.3f ms route %zu poses\n",
+                  frame, left, route.lattice_s*1000, route.points.size());
+      if (left == .05) {
+        EXPECT_FALSE(door::crossesTheWall(scene, route.points));
+        continue;
+      }
+      ASSERT_TRUE(door::crossesTheWall(scene, route.points))
+          << route.vertices << " lattice vertices, " << route.nudged << " nudged, "
+          << route.passes << " passes, hit limit " << route.hit_limit;
+      EXPECT_GT(route.nudged, 0);
+      door::expectWithinBudget(scene, route.points);
+      RecordProperty("lattice_ms_frame" + std::to_string(int(frame * 100)) + "_left" +
+                         std::to_string(int(left * 100)),
+                     std::to_string(route.lattice_s * 1000));
+      std::printf("[door] 0.9 m, frame %.2f rad, left %.2f: lattice %.1f ms, %d vertices, "
+                  "%d nudged, route %zu poses\n",
+                  frame, left, route.lattice_s * 1000, route.vertices, route.nudged,
+                  route.points.size());
+    }
+  }
+}
+
+TEST(AerialDoor, A06mDoorIsRefusedAtEveryVoxelAlignment) {
+  for (const double frame : {0.0, 0.38}) {
+    for (const double left : {0.0, 0.05, 0.1, 0.15, 0.2}) {
+      SCOPED_TRACE(::testing::Message() << "frame " << frame << " left " << left);
+      door::Wall wall;
+      wall.width = 0.6;
+      wall.left = left;
+      door::Scene scene(wall, frame);
+      const auto route =
+          door::navigate(scene, scene.at(-1.4, 0.0, 1.3), scene.at(2.2, 0.35, 1.3));
+      EXPECT_FALSE(door::crossesTheWall(scene, route.points));
+    }
+  }
+}
+
+TEST(AerialDoor, AWiderDoorAt30DegreesToTheGridPasses) {
+  for (const double frame : {0.0, 0.38}) {
+    SCOPED_TRACE(frame);
+    door::Wall wall;
+    wall.width = 1.2;
+    wall.left = -0.6;
+    wall.turn = M_PI / 6;
+    door::Scene scene(wall, frame);
+    const auto route =
+        door::navigate(scene, scene.at(-1.4, 0.0, 1.3), scene.at(2.2, 0.0, 1.3));
+    ASSERT_TRUE(door::crossesTheWall(scene, route.points)) << route.vertices;
+    door::expectWithinBudget(scene, route.points);
+  }
+}
+
+TEST(AerialDoor, ExplorationRoutesThroughTheDoorToWhatIsUnseenBeyond) {
+  for (const double frame : {0.0, 0.38}) {
+    for (const double left : {0.15}) {
+      SCOPED_TRACE(::testing::Message() << "frame " << frame << " left " << left);
+      door::Wall wall;
+      wall.left = left;
+      wall.unknown_beyond = true;
+      door::Scene scene(wall, frame);
+      auto& aerial = scene.aerial;
+      const Eigen::Vector3d start = scene.at(-1.4, 0.0, 1.3);
+      const mgg::StateVec root(start.x(), start.y(), start.z(), 0);
+      mgg::GraphManager graph;
+      graph.addVertex(new mgg::Vertex(0, root));
+      mgg::buildGridGraph(graph, root, door::lattice(), aerial.ctx,
+                          door::latticeHeading(aerial.map));
+      mgg::SensorParams lidar;
+      lidar.max_range = 4;
+      lidar.fov = {2 * M_PI, M_PI / 2};
+      lidar.resolution = {M_PI / 36, M_PI / 32};
+      lidar.update();
+      std::unordered_map<std::string, mgg::SensorParams> sensors{{"drone_45", lidar}};
+      aerial.planning.exp_sensor_list = {"drone_45"};
+      aerial.planning.unknown_voxel_gain = 1;
+      mgg::BoundedSpaceParams bounds;
+      bounds.min_val = {-20, -20, 0};
+      bounds.max_val = {20, 20, 3};
+      bounds.setCenter(Eigen::Vector3d(0, 0, 0), false);
+      mgg::GainContext gain;
+      gain.map = &aerial.map;
+      gain.robot = &aerial.robot;
+      gain.planning = &aerial.planning;
+      gain.global_space = &bounds;
+      gain.sensors = &sensors;
+      mgg::computeExplorationGain(graph, gain, false, false);
+      const auto chosen = mgg::selectBestPath(graph, aerial.planning, aerial.robot,
+                                             mgg::EdgeInclinations(), 0.2, 0);
+      std::vector<Eigen::Vector3d> path;
+      for (const auto* v : chosen.best_path) path.push_back(v->state.head<3>());
+      ASSERT_TRUE(door::crossesTheWall(scene, path)) << path.size() << " poses";
+      door::expectWithinBudget(scene, path);
+    }
+  }
+}
+
+TEST(AerialDoor, R7HangarGateFromRecordedHover) {
+  for (double frame : {0.0, 0.3805}) {
+    door::Wall wall;
+    wall.width = 2.5;
+    wall.left = -1.25;
+    wall.height = 2.45;
+    wall.depth = 1.02;
+    door::Scene scene(wall, frame);
+    // Relative to the mesh face x=-10.36: hover x=-10.306, y=.945.
+    const auto route = door::navigate(scene, scene.at(.054, .945, 1.769),
+                                      scene.at(2.36, 0.0, 1.8));
+    ASSERT_GE(route.points.size(), 2u);
+    EXPECT_GT((scene.component_from_navigation * route.points.back()).x(),
+              wall.base.x() + wall.depth);
+    // The actual pose overlaps the run-policy envelope (not the physical
+    // body). Its first edge uses the existing bounded outward root recovery.
+    EXPECT_TRUE(mgg::aerialRootDepartureTraversable(
+        scene.aerial.map, route.points[0], route.points[1], scene.aerial.robot.size));
+    door::expectWithinBudget(scene, {route.points.begin()+1, route.points.end()});
+    scene.aerial.robot.size = {2*.354/std::sqrt(2.), 2*.354/std::sqrt(2.), .25};
+    door::expectWithinBudget(scene, route.points);
+  }
+}
+
+
+TEST(AerialDoor, A08mDoorExactlyAlignedToFourFreeVoxelsPasses) {
+  for (double frame : {0.0, 0.38}) {
+    door::Wall wall;
+    wall.width = .8;
+    wall.left = .2;
+    door::Scene scene(wall, frame);
+    const auto route = door::navigate(scene, scene.at(-1.4, 0.0, 1.3),
+                                      scene.at(2.2, .6, 1.3));
+    ASSERT_TRUE(door::crossesTheWall(scene, route.points));
+    door::expectWithinBudget(scene, route.points);
+  }
+}
+
+TEST(AerialDoor, A04mFreeRunNeverAdmitsTheBox) {
+  for (double frame : {0.0, 0.38}) {
+    for (double left : {0.0, .05, .1, .15, .2}) {
+      door::Wall wall;
+      wall.width = .4;
+      wall.left = left;
+      door::Scene scene(wall, frame);
+      const auto route = door::navigate(scene, scene.at(-1.4, 0.0, 1.3),
+                                        scene.at(2.2, left+.2, 1.3));
+      EXPECT_FALSE(door::crossesTheWall(scene, route.points));
+    }
+  }
+}
+
+TEST(AerialDoor, ClutteredRoomTiming) {
+  for (double frame : {0.0, .38}) {
+    door::Wall wall;
+    wall.left = .15;
+    wall.clutter = true;
+    door::Scene scene(wall, frame);
+    const auto route = door::navigate(scene, scene.at(-1.4, 0., 1.3), scene.at(2.2, .5, 1.3));
+    std::printf("[clutter] frame %.2f, lattice %.3f ms, %d vertices, route %zu poses\n",
+                frame, route.lattice_s*1000, route.vertices, route.points.size());
+    EXPECT_TRUE(door::crossesTheWall(scene, route.points));
+    door::expectWithinBudget(scene, route.points);
+  }
+}

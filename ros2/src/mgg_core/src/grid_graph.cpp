@@ -49,6 +49,94 @@ void LatticeColumnGround::add(int i, int j, double z) {
   heights_[key(i, j)].push_back(z);
 }
 
+namespace {
+
+/// How far beyond the body a candidate's box can grow and stay observed
+/// free, in steps of kAerialClearanceStep up to kAerialClearanceMax.
+double aerialClearance(const ExpandContext& ctx, const Eigen::Vector3d& center) {
+  for (double m = kAerialClearanceMax; m > 1e-9; m -= kAerialClearanceStep) {
+    const Eigen::Vector3d grown =
+        ctx.robot_box_size + Eigen::Vector3d(2 * m, 2 * m, 0.0);
+    if (ctx.map->getStrictBoxStatus(center, grown) == VoxelStatus::kFree) return m;
+  }
+  return 0.0;
+}
+
+template <class Charge>
+void aerialNudges(GraphManager& graph, const std::vector<GridGraphRetry>& refused,
+                  double heading, const GridGraphParams& grid,
+                  const ExpandContext& ctx, Charge& charge, int& vertex_id,
+                  int& num_vertices, int& num_edges, GridGraphResult& result) {
+  if (refused.empty()) return;
+  const Eigen::Vector3d ex(std::cos(heading), std::sin(heading), 0.0);
+  const Eigen::Vector3d ey(-ex.y(), ex.x(), 0.0);
+  // A refused cell is worth another look next to the graph: on the first
+  // pass next to any vertex, then next to one the last pass added.
+  const double reach = 1.5 * grid.resolution.head<2>().cwiseAbs().maxCoeff();
+  std::vector<Eigen::Vector3d> added_last;
+  for (int pass = 0; pass < kAerialNudgePasses; ++pass) {
+    std::vector<Eigen::Vector3d> added_now;
+    for (std::size_t n = 0; n < refused.size(); ++n) {
+
+      const Eigen::Vector3d& cell = refused[n].cell;
+      if (pass == 0) {
+        StateVec query(cell.x(), cell.y(), cell.z(), heading);
+        Vertex* nearest = nullptr;
+        if (!graph.getNearestVertex(&query, &nearest) || nearest == nullptr ||
+            (nearest->state.head<3>() - cell).norm() > reach)
+          continue;
+      } else if (std::none_of(added_last.begin(), added_last.end(),
+                              [&](const Eigen::Vector3d& v) {
+                                return (v - cell).norm() <= reach;
+                              })) {
+        continue;
+      }
+      if (!charge()) return;
+      // The cell itself (once the graph has changed round it) and its
+      // nudges along both lattice axes, observed free, widest clearance
+      // first: a vertex centres itself in a narrow opening.
+      std::vector<std::pair<double, Eigen::Vector3d>> candidates;
+      for (const double offset : {0.0, 0.1, -0.1, 0.2, -0.2}) {
+        for (int a = 0; a < 2; ++a) {
+          const Eigen::Vector3d& axis = a == 0 ? ex : ey;
+          if (offset == 0.0 && (pass == 0 || a == 1)) continue;
+          const Eigen::Vector3d at = cell + offset * axis;
+          const Eigen::Vector3d center = at + ctx.robot->center_offset;
+          if (ctx.map->getStrictBoxStatus(center, ctx.robot_box_size) !=
+              VoxelStatus::kFree)
+            continue;
+          candidates.emplace_back(aerialClearance(ctx, center), at);
+        }
+      }
+      std::stable_sort(candidates.begin(), candidates.end(),
+                       [](const auto& a, const auto& b) { return a.first > b.first; });
+      for (const auto& [clearance, at] : candidates) {
+        (void)clearance;
+        Vertex candidate(vertex_id++, StateVec(at.x(), at.y(), at.z(), heading));
+        candidate.robot_id = ctx.robot_id;
+        ExpandGraphReport rep;
+        expandGraph(graph, candidate, rep, ctx);
+        if (rep.status != ExpandGraphStatus::kSuccess) continue;
+        num_vertices += rep.num_vertices_added;
+        num_edges += rep.num_edges_added;
+        result.vertices_added += rep.num_vertices_added;
+        result.edges_added += rep.num_edges_added;
+        if ((at - cell).norm() > 1e-9) ++result.aerial_nudged;
+        // Keep the cell eligible: the widest first nudge can sit on the
+        // near side of a jamb; a later pass must still try its central nudge.
+        if (rep.vertex_added != nullptr)
+          added_now.push_back(rep.vertex_added->state.head<3>());
+        break;
+      }
+    }
+    if (added_now.empty()) break;
+    ++result.aerial_nudge_passes;
+    added_last.swap(added_now);
+  }
+}
+
+}  // namespace
+
 GridGraphResult buildGridGraph(GraphManager& graph, const StateVec& state,
                                const GridGraphParams& grid,
                                const ExpandContext& ctx, double heading) {
@@ -108,6 +196,7 @@ GridGraphResult buildGridGraph(GraphManager& graph, const StateVec& state,
       ctx.robot->type == RobotType::kGroundRobot && ctx.ground != nullptr;
   PlanProfile* const profile = ctx.ground ? ctx.ground->profile() : nullptr;
   ProfileScope timed_lattice(profile ? &profile->lattice : nullptr);
+  const bool aerial = ctx.robot->type == RobotType::kAerialRobot;
   LatticeColumnGround column_ground(ctx.planning->max_step_height);
   if (ground_robot) column_ground.add(i0, j0, state.z());
 
@@ -141,10 +230,7 @@ GridGraphResult buildGridGraph(GraphManager& graph, const StateVec& state,
   // level, reached only by going outward first, its way in may not exist
   // yet. Offered again once the sweep is done. Cells on the robot's own
   // level are not, which keeps the lattice as it was where there is one.
-  struct Retry {
-    Eigen::Vector3d cell;
-    int i, j;
-  };
+  using Retry = GridGraphRetry;
   std::vector<Retry> retries;
 
   // Charges one cell to the loop budget, as upstream charged every swept
@@ -364,6 +450,7 @@ GridGraphResult buildGridGraph(GraphManager& graph, const StateVec& state,
   };
 
   std::vector<Retry> nudges;
+  std::vector<Retry> aerial_refused;
   bool root_spokes_tried = false;
   do {
   while (!ready_columns.empty()) {
@@ -409,6 +496,7 @@ GridGraphResult buildGridGraph(GraphManager& graph, const StateVec& state,
       const bool refused =
           try_cell(cell, i, j, /*first_pass=*/true, added, driving_z);
       if (ground_robot && refused && !added) nudges.push_back({cell, i, j});
+      if (aerial && !added) aerial_refused.push_back({cell, i, j});
     }
   }
 
@@ -472,6 +560,8 @@ GridGraphResult buildGridGraph(GraphManager& graph, const StateVec& state,
     }
   }
   } while (!ready_columns.empty());
+  if (aerial) aerialNudges(graph, aerial_refused, heading, grid, weighted_ctx,
+                           charge, vertex_id, num_vertices, num_edges, result);
   return result;
 }
 

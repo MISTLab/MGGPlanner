@@ -564,6 +564,9 @@ class PlannerNode : public rclcpp::Node {
   /// Dijkstra through a fresh local lattice from the robot to a goal inside
   /// the lattice box, the goal linked in with checked edges; under the turn
   /// rule as routeOverGlobalGraph.
+  /// The heading the local and goal lattices are laid out along: the
+  /// robot's yaw for a ground robot, the map grid's for an aerial one.
+  double latticeHeading() const;
   bool routeOverLocalLattice(const mgg::StateVec& goal,
                              std::vector<mgg::StateVec>& path,
                              mgg::PathOkFn& turns_ok, std::string& reason);

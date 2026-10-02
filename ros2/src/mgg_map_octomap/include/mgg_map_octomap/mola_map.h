@@ -15,6 +15,7 @@
 #include <optional>
 #include <string>
 #include <thread>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -170,6 +171,21 @@ class MolaMap : public MapInterface {
   /// Successful fallback query count and latest accepted direction in nav.
   /// Counts admission queries, not executed motions (a route may be rechecked).
   AerialRootRecoveryStats aerialRootRecoveryStats() const;
+  /// An aerial robot's body (lane drone-door): every box and path query
+  /// then holds the box upright and aligned with the map's own grid, as
+  /// given, and sweeps it exactly (NativeMolaGrid::getSweptBoxStatus),
+  /// never its axis-aligned enclosure of the navigation-frame box. A drone's
+  /// box is the square its round footprint circumscribes, so any one
+  /// orientation is its body; the grid's makes voxels no wider than they
+  /// are. Peer/no-go disc sweep radii follow half the configured box width;
+  /// root recovery departure semantics are unchanged.
+  /// Off for ground robots, whose box turns with them.
+  void setGridAlignedBody(bool aligned);
+  bool gridAlignedBody() const;
+  /// The heading, in navigation coordinates, of the current snapshot's
+  /// grid x axis: an aerial lattice laid out along it runs along the
+  /// voxels. False without a snapshot.
+  bool gridHeading(double& heading) const;
   bool aerialRootRecoveryTraversable(const Eigen::Vector3d&,
                                       const Eigen::Vector3d&,
                                       const Eigen::Vector3d&) const override;
@@ -378,6 +394,33 @@ class MolaMap : public MapInterface {
     double yaw;
   };
   std::shared_ptr<const FootprintGroundSupport> footprint_ground_;
+  std::atomic<bool> grid_aligned_body_{false};
+  /// One snapshot's grid-aligned strict box verdicts (aerial lattice cells
+  /// and their nudges, asked again by every plan while the drone holds
+  /// still), keyed by the box's component-frame centre and size in
+  /// micrometres; emptied when the snapshot changes or it grows past a cap.
+  struct BoxKey {
+    std::int64_t c[3], s[3];
+    bool operator==(const BoxKey& o) const {
+      return c[0] == o.c[0] && c[1] == o.c[1] && c[2] == o.c[2] &&
+             s[0] == o.s[0] && s[1] == o.s[1] && s[2] == o.s[2];
+    }
+  };
+  struct BoxKeyHash {
+    std::size_t operator()(const BoxKey& k) const {
+      std::uint64_t h = 1469598103934665603ULL;
+      for (std::int64_t v : {k.c[0], k.c[1], k.c[2], k.s[0], k.s[1], k.s[2]}) {
+        h ^= std::uint64_t(v) + 0x9e3779b97f4a7c15ULL + (h << 6) + (h >> 2);
+      }
+      return std::size_t(h);
+    }
+  };
+  mutable std::mutex box_cache_mutex_;
+  mutable std::weak_ptr<const Snapshot> box_cache_snapshot_;
+  mutable std::unordered_map<BoxKey, VoxelStatus, BoxKeyHash> box_cache_;
+  VoxelStatus gridStrictBoxStatus(const std::shared_ptr<const Snapshot>& snapshot,
+                                  const Eigen::Vector3d& center,
+                                  const Eigen::Vector3d& size) const;
   std::atomic<std::uint64_t> retained_predecessor_count_{0};
   std::atomic<std::uint64_t> stat_revalidation_count_{0};
   static thread_local std::vector<ThreadPin> thread_pins_;
