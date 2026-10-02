@@ -41,6 +41,7 @@ struct PlanProfile {
   std::uint64_t footprint_cache_hits = 0;
   /// observedGroundAhead inside edge checks.
   ProfileCounter ground_ahead;
+  std::uint64_t ground_ahead_cache_hits = 0;
   /// clearanceCost (soft lattice weights and shortcut costs).
   ProfileCounter clearance;
   /// Lattice cell body prechecks (box, then oriented box).

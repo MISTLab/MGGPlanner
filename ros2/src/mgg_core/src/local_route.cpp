@@ -61,13 +61,19 @@ Vertex* lazyGroundLattice(GraphManager& graph, Vertex* root,
   lazy.edge_cost = [&](const Eigen::Vector3d& a, const Eigen::Vector3d& b) {
     const double yaw = std::atan2(b.y() - a.y(), b.x() - a.x());
     const Eigen::Vector3d offset = ctx.robot->offsetForHeading(yaw);
-    double cost = ctx.ground->clearanceCost(a + offset, b + offset, ctx.robot_box_size);
+    double cost = ctx.ground->clearanceCost(a + offset, b + offset, ctx.robot_box_size, 1);
     if (ctx.robot->center_offset.head<2>().squaredNorm() > 0.0) {
       const Eigen::Vector3d reverse = ctx.robot->offsetForHeading(yaw + M_PI);
       cost = std::max(cost, ctx.ground->clearanceCost(
-          b + reverse, a + reverse, ctx.robot_box_size));
+          b + reverse, a + reverse, ctx.robot_box_size, 1));
     }
-    return cost;
+    // NAVIGATE prefers clearance without accepting metre-scale detours for
+    // centimetres of extra gap. Retain a nonnegative weighted Dijkstra
+    // cost (at most 1.1 times length), independently of exploration's weight.
+    // One midpoint per short stencil edge is a soft preference only; hard
+    // sweeps and the shortcut minimum still check their full sample sets.
+    const double length = (b - a).norm();
+    return length + 0.025 * (cost - length);
   };
   using Cell = std::pair<int, int>;
   using Entry = std::pair<double, int>;
@@ -131,8 +137,18 @@ Vertex* lazyGroundLattice(GraphManager& graph, Vertex* root,
       }
     }
     const Cell current = cell_of.at(id);
-    for (int dx = -1; dx <= 1; ++dx) {
-      for (int dy = -1; dy <= 1; ++dy) {
+    // A physical root may overlap old occupied cells: a checked escape
+    // must END clear, so one pitch can be too short even when a longer
+    // edge leaves safely. Preserve ordinary root departure reach; only
+    // non-root cells use the eight-neighbour stencil.
+    const int reach_x = id == 0 ? static_cast<int>(std::ceil(std::min(
+        planning.edge_length_max, std::max(-grid.min_val.x(), grid.max_val.x())) /
+        grid.resolution.x())) : 1;
+    const int reach_y = id == 0 ? static_cast<int>(std::ceil(std::min(
+        planning.edge_length_max, std::max(-grid.min_val.y(), grid.max_val.y())) /
+        grid.resolution.y())) : 1;
+    for (int dx = -reach_x; dx <= reach_x; ++dx) {
+      for (int dy = -reach_y; dy <= reach_y; ++dy) {
         planningCheckpoint();
         if (dx == 0 && dy == 0) continue;
         const Cell next{current.first + dx, current.second + dy};
@@ -213,6 +229,12 @@ LocalRouteResult routeOverLocalLattice(GraphManager& graph,
   }
   Vertex* goal_vertex = nullptr;
   if (ctx.robot->type == RobotType::kGroundRobot) {
+    if ((grid.resolution.array() <= 0).any() ||
+        (grid.min_val.array() > 0).any() || (grid.max_val.array() < 0).any()) {
+      result.lattice.status = GridGraphStatus::kInvalidBounds;
+      result.reason = "invalid local lattice bounds";
+      return result;
+    }
     // A lattice-policy shortcut can establish the complete straight route
     // before spending time on cells unrelated to this point goal. Demand
     // the configured soft clearance margin, not just absence of collision.

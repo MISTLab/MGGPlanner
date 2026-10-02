@@ -191,7 +191,7 @@ inline std::vector<Scenario> scenarios() {
   nav("log_-3.17_to_-8.04", StateVec(-3.17, -0.01, 0.0, 3.10),
       StateVec(-8.04, 0.17, 0.0, 0.0), false, 0.0, 0.0, 300.0);
   nav("log_-3.17_to_floor_0.66", StateVec(-3.17, -0.01, 0.0, 3.10),
-      StateVec(0.66, 0.07, -0.68, 0.0), false, 0.0, 0.0, 300.0);
+      StateVec(0.66, 0.07, -0.68, 0.0), true, 4.2, 10.0, 300.0);
   nav("log_5.49_to_floor_0.20", StateVec(5.49, -0.20, 0.0, 3.12),
       StateVec(0.20, -0.08, -0.65, 0.0), false, 0.0, 0.0, 300.0);
   auto explore = [&](const char* name, StateVec start) {

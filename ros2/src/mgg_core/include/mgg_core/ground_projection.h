@@ -288,8 +288,11 @@ class GroundProjection {
   /// 0.5 m beside a 1.4 x 0.8 m body inside it, so every lattice edge down a
   /// 2 m corridor carried the full penalty and routes wove: botman,
   /// 2026-10-01.)
+  /// maximum_samples bounds only this soft preference, never hard sweeps
+  /// or segmentClearance's shortcut minimum. Clamped to [1, 32].
   double clearanceCost(const Eigen::Vector3d& start, const Eigen::Vector3d& end,
-                       const Eigen::Vector3d& box_size) const;
+                       const Eigen::Vector3d& box_size,
+                       int maximum_samples = 32) const;
 
   /// The least clearance, metres, between the body moved straight from
   /// `start` to `end` and the hazards clearanceCost counts, sampled as
@@ -312,6 +315,7 @@ class GroundProjection {
   /// std::nullopt, once it has moved.
   void setStandingStart(const std::optional<StandingStart>& standing) {
     standing_start_ = standing;
+    ground_ahead_cache_.clear();
   }
   /// Null when the robot is not standing at its start.
   const StandingStart* standingStart() const {
@@ -378,6 +382,11 @@ class GroundProjection {
   };
   mutable std::unordered_map<ProjectionKey, Projection, CacheKeyHash>
       projections_;
+  using GroundAheadKey = std::array<std::int64_t, 9>;
+  mutable std::unordered_map<GroundAheadKey, double, CacheKeyHash> ground_ahead_cache_;
+  double measureObservedGroundAhead(const Eigen::Vector3d& point,
+                                    const Eigen::Vector2d& heading,
+                                    const Eigen::Vector3d& box_size) const;
   FootprintPlane measureFootprintPlane(const Eigen::Vector3d& point,
                                        const Eigen::Vector2d& heading,
                                        const Eigen::Vector3d& box_size) const;
@@ -389,7 +398,8 @@ class GroundProjection {
                           const Eigen::Vector3d& box_size) const;
   /// The points clearanceCost and segmentClearance sample, on the ground.
   std::vector<Eigen::Vector3d> clearanceSamples(const Eigen::Vector3d& start,
-                                                const Eigen::Vector3d& end) const;
+                                                const Eigen::Vector3d& end,
+                                                int maximum_samples = 32) const;
   bool clearanceHazard(const Eigen::Vector3d& cell,
                        const Eigen::Vector3d& box_size) const;
   using ClearanceKey = std::array<std::int64_t, 6>;

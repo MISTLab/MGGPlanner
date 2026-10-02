@@ -109,6 +109,7 @@ int main(int argc, char** argv) {
       }
     }
   }
+  std::fflush(stdout);
   std::fprintf(stderr, "%d run(s) missed their expectation\n", failures);
   return failures == 0 ? 0 : 1;
 }

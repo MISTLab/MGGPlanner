@@ -13,7 +13,7 @@ std::string PlanProfile::summary() const {
       "edge checks %" PRIu64 "/%.0f ms (cached %" PRIu64 "), projections %" PRIu64
       "/%.0f ms (cached %" PRIu64 "), ground rays %" PRIu64 "/%.0f ms, sweeps %" PRIu64 "/%.0f ms, cross slope %" PRIu64
       "/%.0f ms, footprint %" PRIu64 "/%.0f ms (cached %" PRIu64
-      "), ground ahead %" PRIu64 "/%.0f ms, clearance %" PRIu64
+      "), ground ahead %" PRIu64 "/%.0f ms (cached %" PRIu64 "), clearance %" PRIu64
       "/%.0f ms, cell prechecks %" PRIu64 "/%.0f ms (cached %" PRIu64 ", pre-filtered %" PRIu64
       "), retries %" PRIu64 ", nudges %" PRIu64 ", alternate parents %" PRIu64 "%s",
       lattice.ms(), goal_link.ms(), search.ms(), shortcut.ms(),
@@ -21,7 +21,7 @@ std::string PlanProfile::summary() const {
       projection.ms(), projection_cache_hits, ground_rays.calls, ground_rays.ms(),
       body_sweeps.calls, body_sweeps.ms(), cross_slope.calls,
       cross_slope.ms(), footprint.calls, footprint.ms(), footprint_cache_hits,
-      ground_ahead.calls, ground_ahead.ms(), clearance.calls, clearance.ms(),
+      ground_ahead.calls, ground_ahead.ms(), ground_ahead_cache_hits, clearance.calls, clearance.ms(),
       cell_prechecks.calls, cell_prechecks.ms(), precheck_cache_hits, prefilter_rejects, retries,
       nudges, alternate_parents, budget_exhausted ? "; time budget exhausted" : "");
   return buf;

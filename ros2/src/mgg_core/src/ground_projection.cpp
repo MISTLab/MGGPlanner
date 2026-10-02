@@ -445,6 +445,27 @@ struct GroundProjection::BridgeCells {
 double GroundProjection::observedGroundAhead(
     const Eigen::Vector3d& point, const Eigen::Vector2d& heading,
     const Eigen::Vector3d& box_size) const {
+  planningCheckpoint();
+  if (!cache_footprint_ground_ || !point.allFinite() || !heading.allFinite() ||
+      !(heading.norm() > 1e-9)) return measureObservedGroundAhead(point, heading, box_size);
+  const Eigen::Vector2d along = heading.normalized();
+  const GroundAheadKey key{projectionBits(point.x()), projectionBits(point.y()),
+      projectionBits(point.z()), projectionBits(along.x()), projectionBits(along.y()),
+      projectionBits(box_size.x()), projectionBits(box_size.y()),
+      projectionBits(params_.max_ground_height), projectionBits(params_.max_inclination)};
+  const auto found = ground_ahead_cache_.find(key);
+  if (found != ground_ahead_cache_.end()) {
+    if (profile_) ++profile_->ground_ahead_cache_hits;
+    return found->second;
+  }
+  const double fraction = measureObservedGroundAhead(point, heading, box_size);
+  ground_ahead_cache_.emplace(key, fraction);
+  return fraction;
+}
+
+double GroundProjection::measureObservedGroundAhead(
+    const Eigen::Vector3d& point, const Eigen::Vector2d& heading,
+    const Eigen::Vector3d& box_size) const {
   const double half_length = 0.5 * box_size.x();
   const double half_width = 0.5 * box_size.y();
   if (!point.allFinite() || !(heading.norm() > 1e-9) ||
@@ -780,8 +801,11 @@ double GroundProjection::clearancePenalty(
   const double body_radius = 0.5 * box_size.head<2>().norm();
   const double cell_radius = map_.getResolution() / std::sqrt(2.0);
   std::vector<XYCellCenter> cells;
+  // The enumerator bounds visited cells as well as output: botman's 0.1 m
+  // grid needs a padded 35x35 box here. A cap of 1024 silently made every
+  // clear-floor query report zero clearance, defeating direct shortcuts.
   if (!map_.getCircleIntersectingXYCellCenters(
-          point.head<2>(), body_radius + margin + cell_radius, 1024, cells)) {
+          point.head<2>(), body_radius + margin + cell_radius, 2048, cells)) {
     // Unmeasurable clearance is the largest finite preference cost, not a
     // new collision rule. Even a very fine map can still use the passage.
     return 1.0;
@@ -809,10 +833,11 @@ double GroundProjection::clearancePenalty(
 }
 
 std::vector<Eigen::Vector3d> GroundProjection::clearanceSamples(
-    const Eigen::Vector3d& start, const Eigen::Vector3d& end) const {
+    const Eigen::Vector3d& start, const Eigen::Vector3d& end,
+    int maximum_samples) const {
   const double length = (end - start).norm();
-  const int samples = std::max(1, std::min(32,
-      static_cast<int>(std::ceil(std::min(length, 6.4) / 0.2))));
+  const int samples = std::max(1, std::min(std::clamp(maximum_samples, 1, 32),
+      static_cast<int>(std::ceil(std::min(length, 6.4) / 0.2 - 1e-9))));
   std::vector<Eigen::Vector3d> points;
   points.reserve(samples);
   for (int i = 0; i < samples; ++i) {
@@ -830,12 +855,12 @@ std::vector<Eigen::Vector3d> GroundProjection::clearanceSamples(
 
 double GroundProjection::clearanceCost(
     const Eigen::Vector3d& start, const Eigen::Vector3d& end,
-    const Eigen::Vector3d& box_size) const {
+    const Eigen::Vector3d& box_size, int maximum_samples) const {
   ProfileScope timed(profile_ ? &profile_->clearance : nullptr);
   const double length = (end - start).norm();
   if (!(params_.path_clearance_margin > 0.0) || !(length > 0.0)) return length;
   const Eigen::Vector2d heading = (end - start).head<2>();
-  const std::vector<Eigen::Vector3d> points = clearanceSamples(start, end);
+  const std::vector<Eigen::Vector3d> points = clearanceSamples(start, end, maximum_samples);
   double penalty = 0.0;
   for (const Eigen::Vector3d& point : points) {
     penalty += clearancePenalty(point, heading, box_size);

@@ -793,7 +793,7 @@ TEST(GroundProjection, AStandingStartCountsItsDiskAsObservedGround) {
   const Eigen::Vector3d before_ledge(2.4, 0.1, 0.525);
   const mgg::StateVec standing_pose(0.0, 0.1, 0.525, 0.0);
 
-  GroundProjection gp(blind, params);
+  GroundProjection gp(blind, params, true);
   EXPECT_DOUBLE_EQ(gp.observedGroundAhead(here, {1.0, 0.0}, box), 0.0);
   const double ledge_ahead =
       gp.observedGroundAhead(before_ledge, {1.0, 0.0}, box);
@@ -1040,4 +1040,28 @@ TEST(GroundProjection, PlatformCellRiseLimitsKeepSmoothFifteenDegreeRamp) {
         {1,0,slope+params.max_ground_height},{p.length+.05,p.width+.05,2*p.base+.05},
         false,path,false),mgg::ProjectedEdgeStatus::kAdmissible) << p.length;
   }
+}
+
+TEST(GroundProjection, GroundAheadMemoKeepsHeadingHeightLimitAndExactPosition) {
+  std::map<std::pair<std::int64_t, std::int64_t>, double> tops;
+  for (int x = -20; x <= 20; ++x)
+    for (int y = -20; y <= 20; ++y) tops[{x, y}] = x < 0 ? -1.0 : 0.0;
+  const mgg_test::TerrainFixture map(0.1, tops);
+  PlanningParams params = makeParams();
+  params.max_ground_height = 0.5;
+  GroundProjection cached(map, params, true), reference(map, params);
+  mgg::PlanProfile profile;
+  cached.setProfile(&profile);
+  const Eigen::Vector3d body(0.4, 0.4, 0.4), point(0, 0, 0.5);
+  EXPECT_DOUBLE_EQ(cached.observedGroundAhead(point, {-1, 0}, body), 0.0);
+  EXPECT_DOUBLE_EQ(cached.observedGroundAhead(point, {-0.4, 0}, body), 0.0);
+  EXPECT_EQ(profile.ground_ahead_cache_hits, 1u);
+  EXPECT_DOUBLE_EQ(cached.observedGroundAhead(point, {1, 0}, body), 1.0);
+  for (double x : {0.05 - 1e-8, 0.05 + 1e-8}) {
+    const Eigen::Vector3d at(x, 0, 0.5);
+    EXPECT_DOUBLE_EQ(cached.observedGroundAhead(at, {-1, 0}, body),
+                     reference.observedGroundAhead(at, {-1, 0}, body));
+  }
+  params.max_ground_height = 1.0;
+  EXPECT_DOUBLE_EQ(cached.observedGroundAhead(point, {-1, 0}, body), 1.0);
 }

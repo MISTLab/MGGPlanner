@@ -976,7 +976,8 @@ TEST(GridGraph, LazyGroundDijkstraMatchesFullyEvaluatedEightNeighbourGraph) {
     if (from->id >= to->id) continue;
     const bool stencil = std::abs(a.first-b.first) <= 1 && std::abs(a.second-b.second) <= 1;
     const double length = (from->state.head<3>()-to->state.head<3>()).norm();
-    if (!stencil && !((from == goal || to == goal) && length <= 1.0)) continue;
+    const bool endpoint_link = from == goal || to == goal || from->id == 0 || to->id == 0;
+    if (!stencil && !(endpoint_link && length <= 1.0)) continue;
     mgg::ExpandGraphReport rep;
     if (mgg::latticeEdgeTraversable(ctx, *from, *to, rep)) full.addEdge(from, to, length);
   }

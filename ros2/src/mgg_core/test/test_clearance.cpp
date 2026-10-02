@@ -182,9 +182,8 @@ TEST(Clearance, ClearanceIsMeasuredFromTheBodyTurnedToTheSegment) {
   // full margin beside it; the circumscribed circle would have put the
   // wall inside the body (botman, 2026-10-01). Across the wall, end on, it
   // does not.
-  // On a 0.2 m grid: at 0.1 m the 1.5 m circle of cells round a botman
-  // sample is more than clearancePenalty's 1024-cell bound enumerates, and
-  // its clearance is unmeasured (the largest cost, the same everywhere).
+  // This coarse orientation fixture is complemented by the 0.1 m botman
+  // enumeration-bound regression below.
   std::map<std::pair<std::int64_t, std::int64_t>, double> heights;
   for (int x = -20; x <= 20; ++x) {
     for (int y = -20; y <= 20; ++y) {
@@ -236,7 +235,7 @@ class UnenumerableClearance : public mgg_test::TerrainFixture {
       const Eigen::Vector2d&, double radius, std::size_t limit,
       std::vector<mgg::XYCellCenter>&) const override {
     ++calls;
-    EXPECT_EQ(limit, 1024u);
+    EXPECT_EQ(limit, 2048u);
     EXPECT_LT(radius, 2.0);  // margin is capped even if configured enormous
     return false;
   }
@@ -333,6 +332,19 @@ TEST(Clearance, HazardCacheSharesNoisySupportHeightsWithinOneVoxel) {
   EXPECT_LT(map.box_calls - first, first / 2);
   EXPECT_DOUBLE_EQ(cost, plain.clearanceCost(
       {0.3, 0.1, 0.5}, {0.31, 0.1, 0.5}, box));
+}
+
+TEST(Clearance, BotmanOpenFloorReachesTheConfiguredMargin) {
+  std::map<std::pair<std::int64_t, std::int64_t>, double> heights;
+  for (int x = -40; x <= 40; ++x)
+    for (int y = -40; y <= 40; ++y) heights[{x, y}] = 0.0;
+  mgg_test::TerrainFixture map(0.1, heights);
+  auto p = planning(0.6);
+  p.max_ground_height = 0.935;
+  mgg::GroundProjection ground(map, p, true);
+  const Eigen::Vector3d size(1.394, 0.828, 1.27);
+  EXPECT_DOUBLE_EQ(ground.segmentClearance({0, 0, 0.935}, {2, 0, 0.935}, size), 0.6);
+  EXPECT_DOUBLE_EQ(ground.clearanceCost({0, 0, 0.935}, {2, 0, 0.935}, size), 2.0);
 }
 
 }  // namespace
