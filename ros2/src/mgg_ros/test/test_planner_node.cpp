@@ -1205,6 +1205,10 @@ class PlannerNodeTestPeer {
     p.leafs_only_for_volumetric_gain = true;
     node.allow_unknown_lattice_body_ = true;
     node.hanging_root_edge_length_max_ = 1;
+    // Gain models are compared on one lattice per start. mgg-astar's request
+    // budget time-slices lattice growth, which varies with host load; the
+    // production-budget botman measurement is BotmanFixtureFullServicesBenchmark.
+    node.lattice_time_budget_s_ = 0;
     node.grid_params_.min_val = Eigen::Vector3d(-6, -6, -.2);
     node.grid_params_.max_val = Eigen::Vector3d(6, 6, .3);
     node.grid_params_.resolution = Eigen::Vector3d(.4, .4, .1);
