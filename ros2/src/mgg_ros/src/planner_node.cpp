@@ -5266,7 +5266,10 @@ void PlannerNode::cancelPlanning() {
   if (lock.owns_lock()) {
     best_path_.clear();
     global_exploration_ongoing_ = false;
-    exploration_target_.reset();
+    if (exploration_target_) {
+      exploration_target_.reset();
+      publishPlannerConfigState();
+    }
     publishPath();
   }
 }
@@ -5295,7 +5298,10 @@ void PlannerNode::onPlanRequest(
     ++graph_revision_;
     local_graph_->reset();
     best_path_.clear();
-    if (request_generation_.load() != generation) exploration_target_.reset();
+    if (request_generation_.load() != generation && exploration_target_) {
+      exploration_target_.reset();
+      publishPlannerConfigState();
+    }
     global_exploration_ongoing_ = false;
     response->path.clear();
     response->status = kStatusNotReady;
@@ -5324,7 +5330,10 @@ void PlannerNode::onObjectiveRequest(
   try {
     mgg::planningCheckpoint();
     global_exploration_ongoing_ = false;
-    exploration_target_.reset();
+    if (exploration_target_) {
+      exploration_target_.reset();
+      publishPlannerConfigState();
+    }
     onObjectiveRequestImpl(request, response);
     std::lock_guard<std::mutex> fence(cancellation_mutex_);
     mgg::planningCheckpoint();
