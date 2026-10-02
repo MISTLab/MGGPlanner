@@ -134,6 +134,22 @@ TEST(OwnBodyVolume, DrivenTrajectoryAllowsReturnAndKeepsOnlyLastTwentyMetres) {
   EXPECT_EQ(old.strictColumnStatus(map,{.1,.1},.2,.8),VoxelStatus::kUnknown);
 }
 
+TEST(OwnBodyVolume, HistoryDoesNotInterpolateAcrossUnobservedGaps) {
+  OwnVolumeColumns map;
+  mgg::RobotParams robot;
+  robot.size = {1.023,.778,1.22};
+  mgg::KnownFreeBodyVolumes driven;
+  driven.addTrajectory(map,robot,{{-1,0,.5,0},{1,0,.5,0}});
+  EXPECT_EQ(driven.strictColumnStatus(map,{.1,.1},.2,.8),VoxelStatus::kUnknown);
+}
+
+TEST(OwnBodyVolume, PartialCellOutsideChassisIsNotMasked) {
+  OwnVolumeColumns map;
+  mgg::KnownFreeBodyVolumes known;
+  known.add(map, OrientedBox{{.1,.1,.5},0,{.1,.1,1}});
+  EXPECT_EQ(known.strictColumnStatus(map,{.1,.1},.2,.8),VoxelStatus::kUnknown);
+}
+
 TEST(OwnBodyVolume, HistoryOnlyExemptsUnknownInsidePhysicalHeightAndFootprint) {
   OwnVolumeColumns map;
   mgg::KnownFreeBodyVolumes known;

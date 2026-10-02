@@ -431,6 +431,17 @@ class PlannerNodeTestPeer {
     const Eigen::Vector2d cell(2.05,.05);
     return ctx.own_body_known_free->strictColumnStatus(*node.map_,cell,.55,.7);
   }
+  static bool hasOwnBodyMask(PlannerNode& node, bool physical) {
+    node.applyLatestOdometry();
+    if (!physical) {
+      node.robot_params_.physical_size.reset();
+      node.robot_params_.physical_center_offset.reset();
+    }
+    node.unknown_body_policy_ = "strict";
+    node.allow_unknown_lattice_body_ = false;
+    const auto ctx = node.makeContext();
+    return ctx.standing_body.has_value() || bool(ctx.own_body_known_free);
+  }
   static bool globalUsesUpperPolicy(PlannerNode& node) {
     return node.makeGlobalContext().unknown_body_above_center.has_value();
   }
@@ -653,6 +664,14 @@ TEST_F(PlannerNavigationTest, OwnBodyHistoryCannotCrossComponentOrEpoch) {
   EXPECT_EQ(PlannerNodeTestPeer::historicalUnknown(*node),mgg::VoxelStatus::kUnknown);
   PlannerNodeTestPeer::historyIdentity(*node,"component:test",2);
   EXPECT_EQ(PlannerNodeTestPeer::historicalUnknown(*node),mgg::VoxelStatus::kUnknown);
+}
+
+TEST_F(PlannerNavigationTest, StrictPolicyHasNoOwnBodyUnknownExceptions) {
+  MolaTerrainProduct product(.1,-3,5,-3,3,flat,{},.5);
+  auto node=botmanNode("strict_own_body",product);
+  PlannerNodeTestPeer::standAt(*node,0,0,0,0,1);
+  EXPECT_FALSE(PlannerNodeTestPeer::hasOwnBodyMask(*node,true));
+  EXPECT_FALSE(PlannerNodeTestPeer::hasOwnBodyMask(*node,false));
 }
 
 TEST_F(PlannerNavigationTest, InvalidSensorPolicyWarnsAtParameterLoad) {

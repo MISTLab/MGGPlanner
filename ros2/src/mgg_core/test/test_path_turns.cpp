@@ -413,6 +413,27 @@ TEST(PathTurnCheck, ChecksIncomingAndOutgoingCentresAndCachesByHeading) {
   EXPECT_NEAR(checked[0],0,1e-12); EXPECT_NEAR(checked[1],M_PI/2,1e-12);
 }
 
+TEST(PathTurnCheck, StartSpinUsesOnlyIncomingChassisCentre) {
+  GraphManager graph;
+  auto bot = robot();
+  bot.physical_center_offset = Eigen::Vector3d(-.16,0,0);
+  PathTurnCheck check(graph,bot,[](const StateVec& s) {
+    return std::abs(std::remainder(s[3]-M_PI,2*M_PI)) < .01;
+  }, [](const Eigen::Vector3d&) { return 0.; });
+  EXPECT_TRUE(check.admissible({{0,0,0},{2,0,0}},M_PI));
+}
+
+TEST(ViewpointClear, OffsetChassisCoversEveryArrivalHeading) {
+  const Walls wall([](double x,double) { return x > .75; });
+  auto bot = robot();
+  bot.physical_size = Eigen::Vector3d(1.023,.778,.4);
+  bot.physical_center_offset = Eigen::Vector3d(-.16,0,0);
+  mgg::PlanningParams planning;
+  planning.viewpoint_clearance_margin = 0;
+  planning.min_observed_ground_fraction = 0;
+  EXPECT_FALSE(mgg::viewpointClear(wall,bot,planning,StateVec(0,0,.5,0),0));
+}
+
 TEST(TurnClear, NeedsTheCircleThroughTheRobotsCorners) {
   // The robot is 0.8 by 0.6: its corners reach 0.5 m from its centre.
   // Walls from |y| = 0.4 leave room to drive (0.3 m each side) but not to
