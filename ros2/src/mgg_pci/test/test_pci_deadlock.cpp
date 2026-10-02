@@ -114,6 +114,54 @@ TEST(PciExecutor, MultiThreadedExecutorWithAReentrantGroupSucceeds) {
   EXPECT_TRUE(runNestedCall<rclcpp::executors::MultiThreadedExecutor>(true));
 }
 
+TEST(PciConfiguration, BlindBootstrapIsDisabledByDefaultAndExplicitlyOptIn) {
+  auto pci = std::make_shared<mgg_pci::PciNode>(rclcpp::NodeOptions());
+  EXPECT_DOUBLE_EQ(pci->get_parameter("bootstrap_distance").as_double(), 0.0);
+  auto legacy = std::make_shared<mgg_pci::PciNode>(rclcpp::NodeOptions().parameter_overrides(
+      {rclcpp::Parameter("bootstrap_distance", 3.0)}));
+  EXPECT_DOUBLE_EQ(legacy->get_parameter("bootstrap_distance").as_double(), 3.0);
+}
+
+TEST(PciStop, ForwardsOnlyToExplorationCancel) {
+  const std::string ns = "/pci_scoped_cancel";
+  auto options = rclcpp::NodeOptions().arguments({"--ros-args", "-r", "__ns:=" + ns});
+  auto pci = std::make_shared<mgg_pci::PciNode>(options);
+  auto caller = std::make_shared<rclcpp::Node>("cancel_contract", options);
+  std::atomic<int> general{0}, exploration{0};
+  auto general_service = caller->create_service<std_srvs::srv::Trigger>(
+      "cancel_planning", [&](std::shared_ptr<std_srvs::srv::Trigger::Request>,
+                             std::shared_ptr<std_srvs::srv::Trigger::Response> response) {
+        ++general;
+        response->success = true;
+      });
+  auto exploration_service = caller->create_service<std_srvs::srv::Trigger>(
+      "cancel_exploration_planning", [&](std::shared_ptr<std_srvs::srv::Trigger::Request>,
+                                         std::shared_ptr<std_srvs::srv::Trigger::Response> response) {
+        ++exploration;
+        response->success = true;
+      });
+  auto stop = caller->create_client<std_srvs::srv::Trigger>("pci_stop");
+  rclcpp::executors::SingleThreadedExecutor executor;
+  executor.add_node(pci);
+  executor.add_node(caller);
+  ASSERT_TRUE(stop->wait_for_service(2s));
+  // Allow PCI's discovery of the advertised cancel endpoints to settle too.
+  const auto discover_until = std::chrono::steady_clock::now() + 300ms;
+  while (std::chrono::steady_clock::now() < discover_until) {
+    executor.spin_some();
+    std::this_thread::sleep_for(5ms);
+  }
+  auto response = stop->async_send_request(std::make_shared<std_srvs::srv::Trigger::Request>());
+  EXPECT_EQ(executor.spin_until_future_complete(response, 2s), rclcpp::FutureReturnCode::SUCCESS);
+  const auto receive_until = std::chrono::steady_clock::now() + 300ms;
+  while (std::chrono::steady_clock::now() < receive_until) {
+    executor.spin_some();
+    std::this_thread::sleep_for(5ms);
+  }
+  EXPECT_EQ(general.load(), 0);
+  EXPECT_EQ(exploration.load(), 1);
+}
+
 TEST(PciWatchdog, ThreeConsecutiveStallsExhaustTheBudget) {
   mgg_pci::StallBudget budget(3);
   EXPECT_FALSE(budget.noteStall());
@@ -273,6 +321,14 @@ struct ExternalExecutionRig {
   std::thread spinner;
 };
 
+TEST(PciExternalExecution, CancelledIsNotAcquiringObservations) {
+  ExternalExecutionRig rig("/cancelled_plan", {{}}, mgg_msgs::srv::PlannerSrv::Response::CANCELLED);
+  rig.publishOdometry();
+  ASSERT_NE(rig.call("pci_trigger"), nullptr);
+  EXPECT_TRUE(rig.waitForStatus("planning cancelled"));
+  EXPECT_FALSE(rig.waitForStatus("acquiring observations"));
+}
+
 TEST(PciExternalExecution, NearEndpointWaitsForExplicitReplan) {
   ExternalExecutionRig rig("/external_near_endpoint", {{1.0, 0.1}, {1.0}});
   rig.publishOdometry();
@@ -332,6 +388,17 @@ TEST(PciExternalExecution, CompleteStatusEndsExplorationWithoutRetries) {
   const auto rejected = rig.call("pci_replan");
   ASSERT_NE(rejected, nullptr);
   EXPECT_FALSE(rejected->success);
+}
+
+TEST(PciExternalExecution, ObservationAcquisitionNeverBacksOffOrCompletes) {
+  ExternalExecutionRig rig("/external_acquiring", {{}}, -1);
+  for (const char* service : {"pci_trigger", "pci_replan", "pci_replan", "pci_replan"}) {
+    const auto response = rig.call(service);
+    ASSERT_NE(response, nullptr);
+    EXPECT_TRUE(response->success);
+  }
+  EXPECT_TRUE(rig.waitForStatus("acquiring observations; retrying automatically"));
+  EXPECT_TRUE(rig.call("pci_stop")->success);
 }
 
 TEST(PciExternalExecution, RepeatedEmptyPlansRemainWaitingUntilManualStop) {

@@ -1559,6 +1559,103 @@ TEST(MolaMap, EachNewGridInstalledIsReportedOnce) {
   EXPECT_EQ(installs[1].source_stamp_ns, second.source_stamp_ns);
 }
 
+TEST(MolaMap, ChangedEpochRevokesAuthorityDuringReadLease) {
+  Publication publication;
+  MolaMap provider(config(publication));
+  auto request = publication.publish(0, {{5, 0, 0}}, freeBlock());
+  provider.requestSnapshot(request);
+  ASSERT_TRUE(waitFor([&] { return provider.getStatus(); }));
+  auto lease = provider.acquireReadLease();
+  ++request.epoch;
+  std::atomic<bool> returned{false};
+  std::thread heartbeat([&] { provider.requestSnapshot(request); returned = true; });
+  const auto end = std::chrono::steady_clock::now() + std::chrono::milliseconds(200);
+  while (!returned && std::chrono::steady_clock::now() < end)
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  EXPECT_TRUE(returned);
+  EXPECT_FALSE(provider.authorityValid());
+  EXPECT_TRUE(lease.hasSnapshot()) << "revocation must not disable an admitted request's authority checks";
+  lease.allowPublication();
+  heartbeat.join();
+}
+
+TEST(MolaMap, FootprintSupportDoesNotInventAdjacentGroundOrFreeSpace) {
+  Publication publication;
+  MolaMap provider(config(publication));
+  const auto request = publication.publish(0, {}, {});
+  provider.requestSnapshot(request);
+  ASSERT_TRUE(waitFor([&] { return provider.getStatus(); }));
+  provider.setFootprintGroundSupport({0, 0, -0.6}, {1.0, 0.5}, 0.0);
+  Eigen::Vector3d hit;
+  EXPECT_EQ(provider.getGroundRayStatus({0, 0, 0}, {0, 0, -1}, false, hit), VoxelStatus::kOccupied);
+  EXPECT_DOUBLE_EQ(hit.z(), -0.6);
+  EXPECT_EQ(provider.getGroundRayStatus({0, 0, 0}, {0, 0, -1}, true, hit), VoxelStatus::kUnknown);
+  EXPECT_NE(provider.getGroundRayStatus({0.6, 0, 0}, {0.6, 0, -1}, false, hit), VoxelStatus::kOccupied);
+  provider.setFootprintGroundSupport({0, 0, -0.6}, {1.0, 0.5}, M_PI / 2);
+  EXPECT_EQ(provider.getGroundRayStatus({0, 0.4, 0}, {0, 0.4, -1}, false, hit), VoxelStatus::kOccupied);
+  EXPECT_NE(provider.getGroundRayStatus({0.4, 0, 0}, {0.4, 0, -1}, false, hit), VoxelStatus::kOccupied);
+  EXPECT_EQ(provider.getVoxelStatus({0, 0, -0.6}), VoxelStatus::kUnknown);
+  EXPECT_EQ(provider.getBoxStatus({0, 0, 0}, {0.5, 0.5, 0.5}, true), VoxelStatus::kUnknown);
+}
+
+TEST(MolaMap, CompatibleRefinementHeartbeatsKeepPinnedPredecessorAuthoritative) {
+  Publication publication;
+  auto cfg = config(publication);
+  cfg.snapshot_ttl_sec = 0.12;
+  MolaMap provider(cfg);
+  const auto first = publication.publish(0, {{5, 0, 0}}, freeBlock());
+  provider.requestSnapshot(first);
+  ASSERT_TRUE(waitFor([&] { return provider.getStatus(); }));
+  const auto generation = provider.activeGeneration();
+  auto second = publication.publish(1, {{8, 0, 0}}, freeBlock());
+  {
+    auto lease = provider.acquireReadLease();
+    for (int beat = 0; beat < 20; ++beat) {
+      provider.requestSnapshot(second);
+      std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    EXPECT_TRUE(provider.authorityValid());
+    EXPECT_EQ(provider.activeGeneration(), generation);
+    const auto active = provider.activeRequest();
+    EXPECT_TRUE(active.has_value());
+    if (active) EXPECT_EQ(active->geometry_revision, first.geometry_revision);
+    EXPECT_EQ(provider.getVoxelStatus({1.1, 0.1, 0.1}), VoxelStatus::kOccupied);
+  }
+  ASSERT_TRUE(waitFor([&] { return provider.activeGeneration() > generation && provider.getStatus(); }));
+  EXPECT_EQ(provider.activeRequest()->geometry_revision, second.geometry_revision);
+}
+
+TEST(MolaMap, HeartbeatsRefreshWhilePublicationLeaseIsHeld) {
+  Publication publication;
+  auto cfg = config(publication);
+  cfg.snapshot_ttl_sec = 0.12;
+  MolaMap provider(cfg);
+  const auto request = publication.publish(0, {{5, 0, 0}}, freeBlock());
+  provider.requestSnapshot(request);
+  ASSERT_TRUE(waitFor([&]() { return provider.getStatus(); }));
+  std::atomic<bool> stop{false};
+  std::atomic<int> beats{0};
+  std::thread heartbeat;
+  {
+    auto lease = provider.acquireReadLease();
+    heartbeat = std::thread([&]() {
+      while (!stop.load()) {
+        provider.requestSnapshot(request);
+        ++beats;
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+      }
+    });
+    std::this_thread::sleep_for(std::chrono::milliseconds(300));
+    EXPECT_GT(beats.load(), 10) << "heartbeat blocked behind planner lease";
+    EXPECT_TRUE(provider.getStatus());
+    stop = true;
+  }
+  heartbeat.join();
+  EXPECT_TRUE(provider.getStatus());
+  std::this_thread::sleep_for(std::chrono::milliseconds(160));
+  EXPECT_FALSE(provider.getStatus()) << "stopped authority must still expire";
+}
+
 TEST(MolaMap, ReadLeaseKeepsOneSnapshotAcrossAQueryTransaction) {
   Publication publication;
   MolaMap provider(config(publication));
@@ -1582,7 +1679,7 @@ TEST(MolaMap, ReadLeaseKeepsOneSnapshotAcrossAQueryTransaction) {
       return successor_started.load(std::memory_order_acquire);
     }));
     std::this_thread::sleep_for(std::chrono::milliseconds(20));
-    EXPECT_FALSE(successor_returned.load(std::memory_order_acquire));
+    EXPECT_TRUE(successor_returned.load(std::memory_order_acquire));
     EXPECT_EQ(provider.getVoxelStatus({1.1, 0.1, 0.1}),
               VoxelStatus::kOccupied);
     EXPECT_EQ(provider.getVoxelStatus({1.7, 0.1, 0.1}), VoxelStatus::kFree);
@@ -1616,6 +1713,7 @@ TEST(MolaMap, ReadLeasePinsAdmittedSnapshotAcrossTtlAndPublicationWindow) {
     // callback lease replacement. The nested acquisition inherits one pin.
     lease = provider.acquireReadLease();
     std::this_thread::sleep_for(std::chrono::milliseconds(80));
+    EXPECT_FALSE(provider.authorityValid());
     EXPECT_TRUE(provider.getStatus());
     EXPECT_EQ(provider.getVoxelStatus({1.1, 0.1, 0.1}),
               VoxelStatus::kOccupied);

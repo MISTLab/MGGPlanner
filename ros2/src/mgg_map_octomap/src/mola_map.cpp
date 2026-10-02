@@ -281,18 +281,20 @@ struct MolaMap::Snapshot {
   // when the geometry was built, so nothing is re-read or re-hashed.
   struct stat source_identity {};
   struct stat index_identity {};
-  // Steady-clock nanoseconds of the last on-disk confirmation that this
-  // geometry may be served: set by the load that built it and refreshed in
-  // place when a compatible successor heartbeat ends in a coherence race.
-  // The geometry itself stays immutable.
+  // Last compatible authority receipt, never extended by time spent loading
+  // or waiting behind a reader. Same-identity receipts require unchanged
+  // publication files; successor receipts renew the verified predecessor's
+  // authority while the worker validates the refinement. Geometry is immutable.
   mutable std::atomic<std::int64_t> validated_at_ns{0};
   mutable std::atomic<std::size_t> reader_pins{0};
 
   void markValidated(const Clock::time_point when) const {
-    validated_at_ns.store(
-        std::chrono::duration_cast<std::chrono::nanoseconds>(
-            when.time_since_epoch()).count(),
-        std::memory_order_release);
+    const auto stamp = std::chrono::duration_cast<std::chrono::nanoseconds>(
+        when.time_since_epoch()).count();
+    auto prior = validated_at_ns.load(std::memory_order_acquire);
+    while (prior < stamp && !validated_at_ns.compare_exchange_weak(
+        prior, stamp, std::memory_order_release, std::memory_order_acquire)) {}
+
   }
   bool expired(const Clock::time_point now, const double ttl_sec) const {
     const std::chrono::nanoseconds validated(
@@ -403,8 +405,6 @@ void MolaMap::requestSnapshot(const MolaSnapshotRequest& request) {
                                       1e-9) ||
       !request.component_from_navigation.linear().isUnitary(1e-5) ||
       request.component_from_navigation.linear().determinant() < 0.9999) {
-    const std::lock_guard<std::recursive_mutex> publication_lock(
-        publication_mutex_);
     std::lock_guard<std::mutex> request_lock(request_mutex_);
     pending_.reset();
     ++generation_;
@@ -416,9 +416,35 @@ void MolaMap::requestSnapshot(const MolaSnapshotRequest& request) {
     last_error_ = "invalid MOLA snapshot request";
     return;
   }
+  // Authority receipt must not wait for a planner transaction. Serialize it
+  // with installs using request_mutex_, never the publication lock. Geometry
+  // remains immutable and pinned; authority can still revoke that pin's use.
   {
-    const std::lock_guard<std::recursive_mutex> publication_lock(
-        publication_mutex_);
+    std::lock_guard<std::mutex> lock(request_mutex_);
+    const auto active = std::atomic_load(&active_);
+    if (active && sameIdentity(active->request, request) &&
+        sameTransform(active->request, request) && publicationUnchanged(*active)) {
+      active->markValidated(Clock::now());
+      stat_revalidation_count_.fetch_add(1, std::memory_order_relaxed);
+      return;
+    }
+    if (active && compatible(active->request, request) &&
+        !sameIdentity(active->request, request)) {
+      // A refinement leaves this verified predecessor in the same authority
+      // frame. Receipt, not time spent waiting for its reader, renews that
+      // authority. The new geometry is still validated by the worker.
+      active->markValidated(Clock::now());
+    }
+    if (active && !compatible(active->request, request)) {
+      std::atomic_store(&active_, std::shared_ptr<const Snapshot>());
+      active_generation_.fetch_add(1, std::memory_order_release);
+      pending_ = std::make_unique<PendingRequest>(
+          PendingRequest{request, ++generation_, Clock::now()});
+      request_ready_.notify_one();
+      return;
+    }
+  }
+  {
     std::lock_guard<std::mutex> lock(request_mutex_);
     const auto active = std::atomic_load(&active_);
     if (active != nullptr && pending_ == nullptr &&
@@ -493,6 +519,24 @@ std::uint64_t MolaMap::activeGeneration() const {
   return active_generation_.load(std::memory_order_acquire);
 }
 
+bool MolaMap::authorityValid() const {
+  const auto active = std::atomic_load(&active_);
+  if (!active || active->expired(Clock::now(), config_.snapshot_ttl_sec))
+    return false;
+  for (const auto& pin : thread_pins_) {
+    if (pin.owner == this)
+      return pin.snapshot && compatible(pin.snapshot->request, active->request);
+  }
+  return true;
+}
+
+std::optional<MolaSnapshotRequest> MolaMap::activeRequest() const {
+  const auto active = std::atomic_load(&active_);
+  if (!active || active->expired(Clock::now(), config_.snapshot_ttl_sec))
+    return std::nullopt;
+  return active->request;
+}
+
 std::uint64_t MolaMap::retainedPredecessorCount() const {
   return retained_predecessor_count_.load(std::memory_order_relaxed);
 }
@@ -528,7 +572,7 @@ void MolaMap::retainPredecessorOrFail(const PendingRequest& pending,
     // install was compatible (an incompatible one would have retracted it)
     // and the next attempt may not finish before the clock would run out.
     // last_error_ stays untouched: it is empty whenever a snapshot is active.
-    active->markValidated(Clock::now());
+    active->markValidated(pending.received_at);
     retained_predecessor_count_.fetch_add(1, std::memory_order_relaxed);
     return;
   }
@@ -568,7 +612,10 @@ void MolaMap::workerLoop() {
         if (pending_ == nullptr ||
             !compatible(pending_->request, loaded->request))
           continue;
-        if (sameIdentity(pending_->request, loaded->request)) pending_.reset();
+        loaded->markValidated(pending_->received_at);
+        if (sameIdentity(pending_->request, loaded->request)) {
+          pending_.reset();
+        }
       }
       const auto prior = std::atomic_load(&active_);
       // A retained predecessor is replaced here by its successor: the
@@ -969,7 +1016,7 @@ std::shared_ptr<const MolaMap::Snapshot> MolaMap::loadOnce(
   result->artifact_digest = expected_grid_digest;
   result->source_identity = source_identity;
   result->index_identity = index_identity;
-  result->markValidated(Clock::now());
+  result->markValidated(pending.received_at);
   return result;
 }
 
@@ -995,6 +1042,7 @@ std::shared_ptr<const MolaMap::Snapshot> MolaMap::current() const {
   if (value == nullptr) return nullptr;
   if (value->expired(Clock::now(), config_.snapshot_ttl_sec)) {
     const std::lock_guard<std::recursive_mutex> lock(publication_mutex_);
+    const std::lock_guard<std::mutex> authority_lock(request_mutex_);
     value = std::atomic_load(&active_);
     if (value != nullptr &&
         value->expired(Clock::now(), config_.snapshot_ttl_sec)) {
@@ -1007,6 +1055,11 @@ std::shared_ptr<const MolaMap::Snapshot> MolaMap::current() const {
         return nullptr;
       std::atomic_store(&active_, std::shared_ptr<const Snapshot>());
       active_generation_.fetch_add(1, std::memory_order_release);
+      ++expiry_count_;
+      {
+        std::lock_guard<std::mutex> error_lock(error_mutex_);
+        last_error_ = "snapshot authority heartbeat TTL expired";
+      }
       return nullptr;
     }
   }
@@ -1102,6 +1155,19 @@ VoxelStatus MolaMap::getRayStatus(const Eigen::Vector3d& view_point,
   return status;
 }
 
+void MolaMap::setFootprintGroundSupport(const Eigen::Vector3d& floor_center,
+                                        const Eigen::Vector2d& size,
+                                        double yaw) {
+  const auto active = activeRequest();
+  std::shared_ptr<const FootprintGroundSupport> support;
+  if (active && floor_center.allFinite() && size.allFinite() &&
+      (size.array() > 0).all() && std::isfinite(yaw)) {
+    support = std::make_shared<FootprintGroundSupport>(
+        FootprintGroundSupport{*active, floor_center, size, yaw});
+  }
+  std::atomic_store(&footprint_ground_, std::move(support));
+}
+
 VoxelStatus MolaMap::getGroundRayStatus(
     const Eigen::Vector3d& view_point,
     const Eigen::Vector3d& voxel_to_test,
@@ -1124,6 +1190,25 @@ VoxelStatus MolaMap::getGroundRayStatus(
       component_start, component_target, stop_at_unknown_voxel,
       component_end);
   end_voxel = transform.inverse() * component_end;
+  const auto support = std::atomic_load(&footprint_ground_);
+  // Only a downward vertical probe through the footprint. An actual return
+  // always wins, including an obstacle above the inferred floor. A strict
+  // ray keeps its unknown verdict: otherwise an unknown cell could hide an
+  // occupied return that the early-stopping ray never reached.
+  if (!stop_at_unknown_voxel && status != VoxelStatus::kOccupied && support &&
+      compatible(support->authority, snapshot->request) &&
+      (view_point.head<2>() - voxel_to_test.head<2>()).norm() < 1e-9 &&
+      view_point.z() >= support->center.z() &&
+      voxel_to_test.z() <= support->center.z()) {
+    const Eigen::Vector2d offset = view_point.head<2>() - support->center.head<2>();
+    const double c = std::cos(support->yaw), sn = std::sin(support->yaw);
+    const Eigen::Vector2d local(c * offset.x() + sn * offset.y(),
+                                -sn * offset.x() + c * offset.y());
+    if ((local.cwiseAbs().array() <= support->size.array() / 2.0).all()) {
+      end_voxel = Eigen::Vector3d(view_point.x(), view_point.y(), support->center.z());
+      return VoxelStatus::kOccupied;
+    }
+  }
   return status;
 }
 

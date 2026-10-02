@@ -22,6 +22,7 @@
 #define MGG_ROS_PLANNER_NODE_H_
 
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <functional>
@@ -97,6 +98,9 @@ class PlannerNode : public rclcpp::Node {
 
  public:
   explicit PlannerNode(const rclcpp::NodeOptions& options);
+  /// Attach latency-critical inputs to an executor that has its own thread.
+  /// These groups deliberately do not follow add_node() onto the planner pool.
+  void addInputCallbackGroupsTo(rclcpp::Executor& executor);
 
   /// PlannerSrv status values beyond the FORWARD path. Negative so they
   /// cannot collide with the upstream constants.
@@ -116,6 +120,10 @@ class PlannerNode : public rclcpp::Node {
 
  private:
   void loadParameters();
+  void applyLatestOdometry();
+  void applyLatestOdometryImpl();
+  void publishPlanningStatus();
+  void setAcquiringObservations(bool acquiring);
   void onOdometry(nav_msgs::msg::Odometry::ConstSharedPtr msg);
   void onPointCloud(sensor_msgs::msg::PointCloud2::ConstSharedPtr msg);
   void onMappingSnapshot(mgg_msgs::msg::MappingSnapshot::ConstSharedPtr msg);
@@ -307,6 +315,15 @@ class PlannerNode : public rclcpp::Node {
       const std::shared_ptr<std_srvs::srv::Trigger::Request> request,
       std::shared_ptr<std_srvs::srv::Trigger::Response> response);
   /// The exploration service: one cycle, the chosen path whole.
+  void cancelPlanning();
+  void applyPendingCancel();
+  void cancelExplorationPlanning();
+  bool onPlanRequestImpl(
+      const std::shared_ptr<mgg_msgs::srv::PlannerSrv::Request> request,
+      std::shared_ptr<mgg_msgs::srv::PlannerSrv::Response> response);
+  void onObjectiveRequestImpl(
+      const std::shared_ptr<mgg_msgs::srv::PlanObjective::Request> request,
+      std::shared_ptr<mgg_msgs::srv::PlanObjective::Response> response);
   void onPlanRequest(
       const std::shared_ptr<mgg_msgs::srv::PlannerSrv::Request> request,
       std::shared_ptr<mgg_msgs::srv::PlannerSrv::Response> response);
@@ -346,6 +363,7 @@ class PlannerNode : public rclcpp::Node {
   mgg_msgs::msg::Graph ownGraphMessage();
   void publishOwnGraph();
   void publishPath();
+  void publishPathUnderCancellationFence();
   void publishMarkers();
   /// Snapshot the applied configuration and publish it with planner_mutex_
   /// held by the caller. No-op setters retain the last change's version/time.
@@ -467,6 +485,7 @@ class PlannerNode : public rclcpp::Node {
   /// rrg.cpp:2535 expandGlobalGraphTimerCallback, idle while its inputs
   /// (graph, map, peer bodies, robot position) are unchanged.
   void expandGlobalGraphTimerCallback();
+  void expandGlobalGraphTimerCallbackImpl();
 
   /// A ground robot's state at driving height above mapped ground. False
   /// when the map shows no ground under it.
@@ -760,6 +779,29 @@ class PlannerNode : public rclcpp::Node {
   /// One mutex rather than one per structure, because planning reads the map
   /// and writes the graphs as a single unit and would need both anyway.
   std::recursive_mutex planner_mutex_;
+  std::mutex input_mutex_;
+  std::mutex cancellation_mutex_;
+  std::atomic<bool> pending_cancel_clear_{false};
+  std::atomic<std::uint64_t> request_generation_{0};
+  // PCI stop cannot revoke NAVIGATE/RETURN_HOME, even when delivered late.
+  std::atomic<std::uint64_t> exploration_generation_{0};
+  std::atomic<std::uint64_t> cancellations_{0};
+  std::atomic<bool> acquiring_observations_{true};
+  std::atomic<std::int64_t> bootstrap_started_ns_{0};
+  rclcpp::Publisher<std_msgs::msg::String>::SharedPtr planning_status_pub_;
+  rclcpp::TimerBase::SharedPtr planning_status_timer_;
+  nav_msgs::msg::Odometry::ConstSharedPtr latest_odometry_;
+  nav_msgs::msg::Odometry::ConstSharedPtr applied_odometry_;
+  std::chrono::steady_clock::time_point latest_odometry_received_;
+  mgg_msgs::msg::MappingSnapshot::ConstSharedPtr latest_snapshot_;
+  std::optional<mgg::MolaSnapshotRequest> served_map_identity_;
+  std::atomic<std::uint64_t> map_identity_changes_{0};
+  std::atomic<std::uint64_t> heartbeats_received_{0};
+  std::atomic<std::uint64_t> heartbeats_during_planning_{0};
+  std::atomic<bool> request_active_{false};
+  std::shared_ptr<const mgg::MolaSnapshotRequest> last_planning_snapshot_;
+  std::atomic<std::int64_t> odometry_sample_stamp_ns_{0};
+  std::atomic<double> odometry_ingest_lag_s_{0.0};
 
   std::string map_backend_ = "cloud_octomap";
   mgg::StateVec current_state_ = mgg::StateVec::Zero();
@@ -1248,6 +1290,8 @@ class PlannerNode : public rclcpp::Node {
   rclcpp::TimerBase::SharedPtr fleet_timer_;
   static constexpr double kFleetTickPeriodS = 0.1;
   rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr build_srv_;
+  rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr cancel_srv_;
+  rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr cancel_exploration_srv_;
   rclcpp::Service<mgg_msgs::srv::PlannerSrv>::SharedPtr plan_srv_;
   rclcpp::Service<mgg_msgs::srv::PlanObjective>::SharedPtr objective_srv_;
   rclcpp::Service<mgg_msgs::srv::PlannerSetExplorationTarget>::SharedPtr
@@ -1270,6 +1314,9 @@ class PlannerNode : public rclcpp::Node {
   /// Reentrant, so the planning service and the subscriptions can run
   /// concurrently under a MultiThreadedExecutor. See the note in main().
   rclcpp::CallbackGroup::SharedPtr callback_group_;
+  rclcpp::CallbackGroup::SharedPtr input_callback_group_;
+  rclcpp::CallbackGroup::SharedPtr snapshot_callback_group_;
+  rclcpp::TimerBase::SharedPtr input_timer_;
   /// no_go_zones alone: its messages replace one another, so they are
   /// handled one at a time.
   rclcpp::CallbackGroup::SharedPtr no_go_zones_group_;

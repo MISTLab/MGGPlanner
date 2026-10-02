@@ -68,6 +68,9 @@ PciNode::PciNode(const rclcpp::NodeOptions& options)
   planner_client_ = create_client<mgg_msgs::srv::PlannerSrv>(
       "mggplanner", rclcpp::ServicesQoS(), callback_group_);
 
+  // This asynchronous stop may arrive after a new operator objective.
+  cancel_client_ = create_client<std_srvs::srv::Trigger>(
+      "cancel_exploration_planning", rclcpp::ServicesQoS(), callback_group_);
   trigger_srv_ = create_service<std_srvs::srv::Trigger>(
       "pci_trigger",
       [this](const std::shared_ptr<std_srvs::srv::Trigger::Request> req,
@@ -283,6 +286,27 @@ void PciNode::planAndPublish() {
   planning_in_progress_ = false;
   if (!running_ || generation != generation_) return;
 
+  if (ok && plan_status_ == mgg_msgs::srv::PlannerSrv::Response::CANCELLED) {
+    consecutive_empty_plans_ = 0;
+    path_in_progress_ = false;
+    waiting_for_plan_ = true;
+    retry_not_before_ = now() + rclcpp::Duration::from_seconds(0.25);
+    publishStatus("waiting", "planning cancelled; retrying automatically");
+    return;
+  }
+
+  // Missing observations (including a fresh epoch) are retryable forever.
+  // Never replace MGG with the legacy blind bootstrap motion or terminal
+  // empty-plan backoff while it is acquiring its first product.
+  if (ok && path.empty() && plan_status_ == -1) {
+    consecutive_empty_plans_ = 0;
+    path_in_progress_ = false;
+    waiting_for_plan_ = true;
+    retry_not_before_ = now() + rclcpp::Duration::from_seconds(0.25);
+    publishStatus("waiting", "acquiring observations; retrying automatically");
+    return;
+  }
+
   // The planner says exploration is complete: the local lattice has no gain
   // and the global graph holds no reachable frontier (rrg.cpp:5582 and
   // 5628). Retrying would only ask the same question of the same map.
@@ -476,6 +500,9 @@ void PciNode::onStop(const std::shared_ptr<std_srvs::srv::Trigger::Request>,
     ++generation_;
     path_in_progress_ = false;
     waiting_for_plan_ = false;
+  }
+  if (cancel_client_->service_is_ready()) {
+    cancel_client_->async_send_request(std::make_shared<std_srvs::srv::Trigger::Request>());
   }
   publishPath({});
   publishStatus("blocked", "stopped");

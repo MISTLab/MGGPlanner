@@ -1,4 +1,5 @@
 #include <memory>
+#include <thread>
 
 #include <rclcpp/rclcpp.hpp>
 
@@ -27,7 +28,14 @@ int main(int argc, char** argv) {
   // group and the executor has threads to run them.
   rclcpp::executors::MultiThreadedExecutor executor;
   executor.add_node(node);
+  // Planner callbacks may occupy every pool thread waiting for planner_mutex_.
+  // Never share that pool with authority heartbeats, odometry ingestion or cancel.
+  rclcpp::executors::SingleThreadedExecutor inputs;
+  node->addInputCallbackGroupsTo(inputs);
+  std::thread input_thread([&inputs] { inputs.spin(); });
   executor.spin();
+  inputs.cancel();
+  input_thread.join();
 
   rclcpp::shutdown();
   return 0;

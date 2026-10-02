@@ -118,6 +118,8 @@ class PlannerNodeTestPeer {
     msg->pose.pose = pose;
     msg->pose.pose.position.z = 0.075;
     node.onOdometry(msg);
+    const std::lock_guard<std::recursive_mutex> lock(node.planner_mutex_);
+    node.applyLatestOdometry();
   }
 
   static void plan(PlannerNode& node,
