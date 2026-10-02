@@ -20,6 +20,7 @@
 #include "mgg_core/gain.h"
 #include "../../mgg_core/test/gain_model_benchmark.h"
 #include "mgg_core/path_selection.h"
+#include "mgg_core/planning_cancellation.h"
 #include "mgg_core/tour_params.h"
 #include "mgg_map_octomap/native_mola_grid.h"
 #include "mgg_map_octomap/scan_walk.h"
@@ -572,6 +573,46 @@ TEST(NativeGain, ScanWalkMatchesReferenceClosedVoxelSetsAndOcclusion) {
       EXPECT_EQ(full_valid, fast_valid);
       EXPECT_EQ(full, fast) << "trial=" << trial << " blockers=" << blockers;
     }
+  }
+}
+
+// mgg-integ: the band scan's walker must keep the request deadline's
+// throttled per-voxel checkpoint (mgg-astar), as the full scan's walk()
+// does: one long ray cannot outrun cancellation between rays.
+TEST(NativeGain, BandScanWalkKeepsThrottledCancellationCheckpoints) {
+  mgg::NativeMolaGrid map(kResolution, {}, {}, {});
+  GainSetup setup(map);
+  const Eigen::Vector3d origin(0.1, 0.1, 0.1);  // a cell centre: no DDA ties
+  const std::vector<Eigen::Vector3d> ray{origin + Eigen::Vector3d(40, 0, 0)};
+  mgg::ScanBounds bounds;
+  bounds.low.z() = -0.4;
+  bounds.high.z() = 0.8;
+  for (bool pruned : {false, true}) {
+    SCOPED_TRACE(pruned ? "band scan" : "full scan");
+    mgg::GainCounts counts;
+    std::vector<std::pair<Eigen::Vector3d, VoxelStatus>> log;
+    auto scan = [&] {
+      if (pruned)
+        map.getScanStatusInBounds(origin, ray, counts, log, setup.sensor.model(), bounds);
+      else
+        map.getScanStatusIterative(origin, ray, counts, log, setup.sensor.model());
+    };
+    int checks = 0;
+    {
+      mgg::PlanningCancellationScope count([&] { ++checks; return false; });
+      scan();
+    }
+    // 201 cells; the scan walker may revisit its end cell (scan_walk.h).
+    EXPECT_GE(counts.voxel_visits, 201u);
+    EXPECT_LE(counts.voxel_visits, 202u);
+    EXPECT_EQ(checks, 1 + 4);  // the ray, then voxels 0, 64, 128 and 192
+    checks = 0;
+    log.clear();
+    // Expire after the ray's own check: the walk must stop by voxel 64.
+    mgg::PlanningCancellationScope expire([&] { return ++checks > 2; });
+    EXPECT_THROW(scan(), mgg::PlanningInterrupted);
+    EXPECT_EQ(checks, 3);
+    EXPECT_LE(log.size(), 65u);
   }
 }
 
