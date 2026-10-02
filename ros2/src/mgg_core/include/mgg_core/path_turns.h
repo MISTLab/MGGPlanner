@@ -22,6 +22,7 @@
 #include <array>
 #include <functional>
 #include <map>
+#include <limits>
 #include <optional>
 #include <unordered_map>
 #include <utility>
@@ -76,6 +77,8 @@ double groundSlope(const GroundProjection& ground,
                    const Eigen::Vector3d& position, double radius,
                    GraphManager* lattice = nullptr);
 
+/// `state[3]` is chassis yaw; nonfinite means unknown arrival yaw and uses
+/// half-diagonal + physical XY offset about the reference instead.
 /// Whether the robot has room to turn in place at `state`: no occupied voxel
 /// within its turning radius (RobotParams::turningRadius), over the height
 /// of its collision box. A ground robot's viewpointClear asks for more, so
@@ -120,8 +123,17 @@ bool observedArrivalDisk(const MapInterface& map, const RobotParams& robot,
 /// Whether a path turns sharply only where it may.
 using PathTurnsFn = std::function<bool(const std::vector<Vertex*>&)>;
 
+/// Unknown arrival yaw requests the reference-centred circumscribed envelope.
+constexpr double kUnknownTurnHeading = std::numeric_limits<double>::quiet_NaN();
+
 /// Whether the robot has room to turn in place at a pose, e.g. turnClear.
+/// state[3] may be kUnknownTurnHeading for search/lattice probes.
 using TurnRoomFn = std::function<bool(const StateVec&)>;
+using TurnTransitionFn = std::function<bool(const StateVec&, const StateVec&)>;
+
+/// Occupied-only cylinder swept between chassis centres for a translating turn.
+bool turnTransitionClear(const MapInterface& map, const RobotParams& robot,
+                         const StateVec& incoming, const StateVec& outgoing);
 
 /// Whether the robot may turn sharply at a vertex: see
 /// PathTurnCheck::sharpTurnAllowedAt.
@@ -181,11 +193,14 @@ TurnCompliantRoutes findTurnCompliantRoutes(
 class PathTurnCheck {
  public:
   PathTurnCheck(GraphManager& graph, const RobotParams& robot,
-                TurnRoomFn room_to_turn = nullptr, SlopeFn slope = nullptr);
+                TurnRoomFn room_to_turn = nullptr, SlopeFn slope = nullptr,
+                bool reverse = false, TurnTransitionFn transition = nullptr);
 
   /// The distance over which turns are measured, the robot's length.
   double window() const { return window_; }
 
+  /// With reverse=true, admissible's start_heading and segment headings
+  /// are travel directions; chassis yaw is travel + pi.
   /// A candidate path through the graph, turning first from the heading of
   /// its first vertex (the root's is the robot's yaw). Counts refusals.
   bool operator()(const std::vector<Vertex*>& path);
@@ -244,11 +259,13 @@ class PathTurnCheck {
 
   Refusal firstRefusal(const std::vector<Eigen::Vector3d>& points,
                        double start_heading, bool record = false);
-  bool roomAt(const Eigen::Vector3d& position, double heading = 0.0);
+  bool roomAt(const Eigen::Vector3d& position, double heading = kUnknownTurnHeading);
 
   GraphManager& graph_;
   double window_ = 0.0;
   TurnRoomFn room_to_turn_;
+  bool reverse_ = false;
+  TurnTransitionFn transition_;
   SlopeFn slope_;
   SlopeFn unmeasured_;
   std::map<PositionKey, double> slope_at_;

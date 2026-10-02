@@ -1,3 +1,4 @@
+#include "mgg_core/local_route.h"
 #include "mgg_core/planning_cancellation.h"
 // NAVIGATE objectives for a Bunker-sized ground robot (botman) on MOLA
 // planning products at its deployed 0.10 m resolution: what the lattice,
@@ -86,7 +87,8 @@ class MolaTerrainProduct {
   MolaTerrainProduct(double resolution, double x0, double x1, double y0,
                      double y1, const std::function<double(double, double)>& ground,
                      const std::vector<Block>& blocks = {},
-                     double free_above = kObservedFreeAboveM)
+                     double free_above = kObservedFreeAboveM,
+                     const std::function<bool(double,double,double)>& unknown = {})
       : resolution_(resolution) {
     static int sequence = 0;
     root_ = std::filesystem::temp_directory_path() /
@@ -125,7 +127,7 @@ class MolaTerrainProduct {
           const double zc = (z + 0.5) * resolution;
           if (block_top > 0.0 && zc - h <= block_top) {
             occupied_with_top.push_back({{x, y, z}, zc});
-          } else {
+          } else if (!unknown || !unknown(cx,cy,zc)) {
             free.push_back({x, y, z});
           }
         }
@@ -431,6 +433,17 @@ class PlannerNodeTestPeer {
     const Eigen::Vector2d cell(2.05,.05);
     return ctx.own_body_known_free->strictColumnStatus(*node.map_,cell,.55,.7);
   }
+  static bool postSpin(PlannerNode& node, std::vector<mgg::StateVec>& path) {
+    node.applyLatestOdometry();
+    return node.startPathAfterChassisSpin(path,true);
+  }
+  static bool drivenReturn(PlannerNode& node, bool history) {
+    node.applyLatestOdometry();
+    PlannerNode::StandingStartScope scope(node);
+    auto ctx=node.makeContext();
+    if (!history) ctx.own_body_known_free.reset();
+    return mgg::groundShortcutSegmentAdmissible(ctx,{2,0,.935},{1.8,0,.935},true);
+  }
   static bool hasOwnBodyMask(PlannerNode& node, bool physical) {
     node.applyLatestOdometry();
     if (!physical) {
@@ -672,6 +685,32 @@ TEST_F(PlannerNavigationTest, StrictPolicyHasNoOwnBodyUnknownExceptions) {
   PlannerNodeTestPeer::standAt(*node,0,0,0,0,1);
   EXPECT_FALSE(PlannerNodeTestPeer::hasOwnBodyMask(*node,true));
   EXPECT_FALSE(PlannerNodeTestPeer::hasOwnBodyMask(*node,false));
+}
+
+TEST_F(PlannerNavigationTest, StartSpinMovesSentReferenceButNotChassisCentre) {
+  MolaTerrainProduct product(.1,-3,5,-3,3,flat,{},2.0);
+  auto node=botmanNode("post_spin",product);
+  PlannerNodeTestPeer::standAt(*node,0,0,0,M_PI,1);
+  std::vector<mgg::StateVec> path{{0,0,.935,M_PI},{.25,0,.935,0},{1,0,.935,0}};
+  ASSERT_TRUE(PlannerNodeTestPeer::postSpin(*node,path));
+  ASSERT_GE(path.size(),2u);
+  EXPECT_NEAR(path.front().x(),.32,1e-6);
+  EXPECT_NEAR(path.front().y(),0,1e-6);
+  EXPECT_NEAR(path.front()[3],0,1e-6);
+  EXPECT_GT(path[1].x(),path.front().x());
+}
+
+TEST_F(PlannerNavigationTest, OwnDrivenHistoryAdmitsReturnSweepOnlyWithEvidence) {
+  MolaTerrainProduct product(.1,-3,5,-3,3,flat,{},.7,
+      [](double x,double y,double z) {
+        return x > 1.8 && x < 1.9 && y > 0 && y < .1 && z > .4 && z < .5;
+      });
+  auto node=botmanNode("driven_return",product);
+  PlannerNodeTestPeer::sensorPolicy(*node);
+  PlannerNodeTestPeer::standAt(*node,0,0,0,0,1);
+  PlannerNodeTestPeer::historyIdentity(*node,"component:test",1);
+  EXPECT_FALSE(PlannerNodeTestPeer::drivenReturn(*node,false));
+  EXPECT_TRUE(PlannerNodeTestPeer::drivenReturn(*node,true));
 }
 
 TEST_F(PlannerNavigationTest, InvalidSensorPolicyWarnsAtParameterLoad) {

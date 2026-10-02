@@ -12,15 +12,15 @@ namespace mgg {
 bool viewpointClear(const MapInterface& map, const RobotParams& robot,
                     const PlanningParams& planning, const StateVec& viewpoint,
                     double slope) {
-  // A ground robot stops only where it can turn: a clear viewpoint passes
-  // turnClear, which asks for the same cylinder at the turning radius. A
-  // negative margin never takes it below its turning radius (review r0,
-  // M-2), nor an aerial robot's below its circumscribed radius.
+  // Lattice vertices carry a build-time yaw, not an arrival yaw. Ground
+  // viewpoints use the reference-centred envelope covering every spin centre.
+  // This is larger than turnClear's heading-aware chassis-centred circle.
   double radius = 0.0;
   if (robot.type == RobotType::kGroundRobot) {
-    radius = std::max(robot.turningRadius() + kViewpointArrivalSlack +
-                          planning.viewpoint_clearance_margin,
-                      robot.turningRadius());
+    const double envelope = robot.turningRadius() +
+        robot.physicalOffsetForHeading(0).head<2>().norm();
+    radius = std::max(envelope + kViewpointArrivalSlack +
+                          planning.viewpoint_clearance_margin, envelope);
   } else {
     const double drone_radius = 0.5 * robot.size.head<2>().norm();
     radius = drone_radius +
@@ -28,11 +28,14 @@ bool viewpointClear(const MapInterface& map, const RobotParams& robot,
   }
   // Where it can turn, as roomToTurn has it: with the space it would turn
   // in observed (item 7). Not on a measured slope, where it may not turn.
+  StateVec unknown_arrival = viewpoint;
+  unknown_arrival[3] = kUnknownTurnHeading;
   if (robot.type == RobotType::kGroundRobot && !slopeExemptsTurnSpace(slope) &&
-      !turnSpaceObserved(map, robot, planning, viewpoint)) {
+      !turnSpaceObserved(map, robot, planning, unknown_arrival)) {
     return false;
   }
-  const Eigen::Vector3d center = viewpoint.head<3>() + robot.center_offset;
+  Eigen::Vector3d center = viewpoint.head<3>() + robot.center_offset;
+  if (robot.type == RobotType::kGroundRobot) center.head<2>() = viewpoint.head<2>();
   return map.getOccupiedOnlyCylinderPathStatus(
              center, center, radius, robot.getPlanningSize().z()) !=
          VoxelStatus::kOccupied;

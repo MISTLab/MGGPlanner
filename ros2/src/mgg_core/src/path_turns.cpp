@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <climits>
 #include <cstdint>
 #include <functional>
 #include <queue>
@@ -353,10 +354,33 @@ TurnCompliantRoutes findTurnCompliantRoutes(
   return out;
 }
 
+namespace {
+Eigen::Vector3d turnCenter(const RobotParams& robot, const StateVec& state) {
+  Eigen::Vector3d center = state.head<3>();
+  if (std::isfinite(state[3]))
+    center.head<2>() += robot.physicalOffsetForHeading(state[3]).head<2>();
+  // The physical Z band is evidence only; collision checks retain the full
+  // planning band, independently of the chassis' physical vertical centre.
+  center.z() += robot.center_offset.z();
+  return center;
+}
+double turnRadius(const RobotParams& robot, const StateVec& state) {
+  return robot.turningRadius() + (std::isfinite(state[3]) ? 0.0 :
+      robot.physicalOffsetForHeading(0).head<2>().norm());
+}
+}  // namespace
+
+bool turnTransitionClear(const MapInterface& map, const RobotParams& robot,
+                         const StateVec& incoming, const StateVec& outgoing) {
+  return map.getOccupiedOnlyCylinderPathStatus(turnCenter(robot,incoming),
+      turnCenter(robot,outgoing), robot.turningRadius(),
+      robot.getPlanningSize().z()) != VoxelStatus::kOccupied;
+}
+
 bool turnClear(const MapInterface& map, const RobotParams& robot,
                const StateVec& state) {
-  const double radius = robot.turningRadius();
-  const Eigen::Vector3d center = state.head<3>() + robot.physicalOffsetForHeading(state[3]);
+  const double radius = turnRadius(robot, state);
+  const Eigen::Vector3d center = turnCenter(robot, state);
   return map.getOccupiedOnlyCylinderPathStatus(
              center, center, radius, robot.getPlanningSize().z()) !=
          VoxelStatus::kOccupied;
@@ -367,12 +391,12 @@ bool turnSpaceObserved(const MapInterface& map, const RobotParams& robot,
                        const StandingStart* standing) {
   const double min_ground = planning.min_observed_ground_fraction;
   if (!(min_ground > 0.0)) return true;
-  const Eigen::Vector3d center = state.head<3>() + robot.physicalOffsetForHeading(state[3]);
+  const Eigen::Vector3d center = turnCenter(robot, state);
   std::vector<XYCellCenter> cells;
   constexpr std::size_t kMaxTurnCells = 1024;
   if (!center.allFinite() ||
       !map.getCircleIntersectingXYCellCenters(
-          center.head<2>(), robot.turningRadius(), kMaxTurnCells, cells)) {
+          center.head<2>(), turnRadius(robot, state), kMaxTurnCells, cells)) {
     return false;
   }
   const double resolution = map.getResolution();
@@ -422,8 +446,8 @@ bool observedArrivalDisk(const MapInterface& map, const RobotParams& robot,
                           const PlanningParams& planning, const StateVec& goal,
                           double arrival_tolerance) {
   if (!roomToTurn(map, robot, planning, goal, nullptr)) return false;
-  const Eigen::Vector3d center = goal.head<3>() + robot.physicalOffsetForHeading(goal[3]);
-  const double radius = robot.turningRadius() + std::max(0.0, arrival_tolerance);
+  const Eigen::Vector3d center = turnCenter(robot, goal);
+  const double radius = turnRadius(robot, goal) + std::max(0.0, arrival_tolerance);
   std::vector<XYCellCenter> cells;
   if (!map.getCircleIntersectingXYCellCenters(center.head<2>(), radius, 4096, cells) ||
       cells.empty()) return false;
@@ -441,10 +465,12 @@ bool observedArrivalDisk(const MapInterface& map, const RobotParams& robot,
 }
 
 PathTurnCheck::PathTurnCheck(GraphManager& graph, const RobotParams& robot,
-                             TurnRoomFn room_to_turn, SlopeFn slope)
+                             TurnRoomFn room_to_turn, SlopeFn slope, bool reverse,
+                             TurnTransitionFn transition)
     : graph_(graph),
       window_(std::max(robot.size.x(), robot.size.y())),
       room_to_turn_(std::move(room_to_turn)),
+      reverse_(reverse), transition_(std::move(transition)),
       slope_(std::move(slope)) {}
 
 namespace {
@@ -489,7 +515,7 @@ void PathTurnCheck::setRobotTilt(const Eigen::Vector3d& position,
 bool PathTurnCheck::roomAt(const Eigen::Vector3d& position, double heading) {
   if (!room_to_turn_) return true;
   const auto key = std::make_pair(positionKey(position),
-      std::llround(std::remainder(heading, 2*M_PI)*1e9));
+      std::isfinite(heading) ? std::llround(std::remainder(heading, 2*M_PI)*1e9) : LLONG_MAX);
   const auto found = room_at_.find(key);
   if (found != room_at_.end()) return found->second;
   return room_at_[key] = room_to_turn_(
@@ -504,8 +530,8 @@ PathTurnCheck::Refusal PathTurnCheck::firstRefusal(
     if (turns[i] <= kSharpTurnRad + 1e-9) continue;
     const double slope = slopeAt(points[i]);
     const bool on_slope = slope > kLevelGroundSlopeRad;
-    // Match pathTurns' incoming/outgoing window. The reference translates
-    // as an offset chassis spins: certify both endpoint centre circles.
+    // At rest the chassis centre is fixed. Interior corners can translate:
+    // certify their incoming/outgoing circles and the cylinder between them.
     std::size_t back = i, ahead = i;
     double distance = 0;
     while (back > 0 && (back == i || distance < window_)) {
@@ -517,9 +543,12 @@ PathTurnCheck::Refusal PathTurnCheck::firstRefusal(
       distance += (points[ahead+1] - points[ahead]).head<2>().norm();
       ++ahead;
     }
-    const double incoming = back == i ? start_heading : headingBetween(points[back], points[i]);
-    const double outgoing = ahead == i ? incoming : headingBetween(points[i], points[ahead]);
-    if (on_slope || !roomAt(points[i], incoming) || !roomAt(points[i], outgoing)) {
+    const double incoming = (back == i ? start_heading : headingBetween(points[back], points[i])) + (reverse_ ? M_PI : 0);
+    const double outgoing = (ahead == i ? incoming : headingBetween(points[i], points[ahead]) + (reverse_ ? M_PI : 0));
+    const auto pose = [&](double yaw) { return StateVec(points[i].x(),points[i].y(),points[i].z(),yaw); };
+    if (on_slope || !roomAt(points[i], incoming) ||
+        (i > 0 && (!roomAt(points[i], outgoing) ||
+          (transition_ && !transition_(pose(incoming),pose(outgoing)))))) {
       if (record && !first_refused_corner) {
         first_refused_corner = RefusedCorner{points[i], turns[i], slope, on_slope};
       }

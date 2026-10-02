@@ -125,7 +125,7 @@ TEST(OwnBodyVolume, DrivenTrajectoryAllowsReturnAndKeepsOnlyLastTwentyMetres) {
   mgg::RobotParams robot;
   robot.size = {1.023,.778,1.22};
   mgg::KnownFreeBodyVolumes driven;
-  driven.addTrajectory(map,robot,{{-1,0,.5,0},{1,0,.5,0}});
+  driven.addTrajectory(map,robot,{{-1,0,.5,0},{0,0,.5,0},{1,0,.5,0}});
   OrientedBox body{{1,0,.5},M_PI,{1.394,.828,1.27}};
   EXPECT_EQ(mgg::orientedBoxPathStatus(map,{1,0,.5},{-1,0,.5},body,
       true,nullptr,false,-.2,&driven),VoxelStatus::kFree);

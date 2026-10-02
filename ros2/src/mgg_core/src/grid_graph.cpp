@@ -462,8 +462,8 @@ GridGraphResult buildGridGraph(GraphManager& graph, const StateVec& state,
   // Preserve the base planner's bootstrap: a distant nominal cell can
   // define a different heading whose edge clips to observed support right
   // beside the root. If the adjacent stencil could not leave at all, try
-  // these root spokes once. No unsupported endpoint is admitted, and once
-  // connected, expansion remains restricted to the connected frontier.
+  // these root spokes once. This fallback schedules every remaining column;
+  // every resulting edge still needs observed support and exact admission.
   if (ground_robot && graph.getNumVertices() == 1 && !root_spokes_tried) {
     root_spokes_tried = true;
     result.root_spoke_retry = true;

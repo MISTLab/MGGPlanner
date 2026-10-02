@@ -101,7 +101,13 @@ void KnownFreeBodyVolumes::add(const MapInterface& map, const OrientedBox& body)
   if (!map.getCircleIntersectingXYCellCenters(body.center.head<2>(),
       body.size.head<2>().norm()/2, kMaxSweepCells, cells)) return;
   for (const auto& cell : cells) {
-    if (!pointInBox(cell.center, body)) continue;
+    // Unknown evidence covers only complete cells, not a centre-only
+    // half-cell halo outside the actual chassis.
+    const double half = map.getResolution()/2;
+    bool inside = true;
+    for (double dx : {-half, half}) for (double dy : {-half, half})
+      inside &= pointInBox(cell.center + Eigen::Vector2d(dx,dy), body);
+    if (!inside) continue;
     auto& intervals = columns_[key(cell.center)];
     intervals.emplace_back(body.center.z()-body.size.z()/2,
                            body.center.z()+body.size.z()/2);
@@ -133,6 +139,7 @@ void KnownFreeBodyVolumes::addTrajectory(const MapInterface& map,
     const auto& b = poses[i-1];
     if (!a.allFinite() || !b.allFinite()) break;
     const double length = (a.head<3>()-b.head<3>()).norm();
+    if (length > 1.0 + 1e-9) break;  // no chord across a missing track segment
     const double yaw = std::remainder(b[3]-a[3], 2*M_PI);
     const double fraction = length > remaining ? remaining/length : 1.0;
     const int steps = std::max(1, static_cast<int>(std::ceil(std::max(

@@ -1018,7 +1018,11 @@ mgg::ExpandContext PlannerNode::makeContext(bool include_own_body) {
       }
     }
   }
-  if (include_own_body && robot_params_.type == mgg::RobotType::kGroundRobot &&
+  if (include_own_body && robot_params_.physical_size &&
+      robot_params_.physical_center_offset &&
+      (ctx.unknown_body_above_center || allow_unknown_lattice_body_) &&
+      unknown_body_policy_ != "strict" &&
+      robot_params_.type == mgg::RobotType::kGroundRobot &&
       have_odometry_ && map_ && ground_ && map_->getStatus()) {
     const auto root = physicalAnchorAtDrivingHeight(current_state_);
     ctx.standing_body = mgg::OrientedBox{
@@ -1069,9 +1073,12 @@ std::shared_ptr<const mgg::KnownFreeBodyVolumes> PlannerNode::ownBodyKnownFree()
     double distance = 0;
     for (std::size_t i = trajectory.poses.size(); i > 0; --i) {
       const auto pose = transform * trajectory.poses[i-1];
-      if (i < trajectory.poses.size())
-        distance += (trajectory.poses[i].translation() -
-                     trajectory.poses[i-1].translation()).norm();
+      if (i < trajectory.poses.size()) {
+        const double segment = (trajectory.poses[i].translation() -
+                                trajectory.poses[i-1].translation()).norm();
+        if (segment > 1.0 + 1e-9) break;
+        distance += segment;
+      }
       mgg::StateVec state(pose.translation().x(), pose.translation().y(),
           pose.translation().z(), std::atan2(pose.linear()(1,0), pose.linear()(0,0)));
       poses.push_back(physicalAnchorAtDrivingHeight(state));
@@ -2415,9 +2422,11 @@ std::optional<mgg::StandingStart> PlannerNode::readStandingStart() {
 }
 
 bool PlannerNode::standingStartGoalAdmissible(const mgg::StateVec& goal) {
+  auto arrival = goal;
+  arrival[3] = mgg::kUnknownTurnHeading;
   const auto standing = standingStart();
   return !standing || standing->admitsGoal(goal.head<2>(), reach_distance_) ||
-         mgg::observedArrivalDisk(*map_, robot_params_, planning_params_, goal,
+         mgg::observedArrivalDisk(*map_, robot_params_, planning_params_, arrival,
                                   reach_distance_);
 }
 
@@ -3211,7 +3220,7 @@ mgg::ReceiverPlatform PlannerNode::receiverPlatform() const {
 mgg::MergeResult PlannerNode::mergeNeighbourRoadmap(
     const mgg::GraphExchange& incoming) {
   if (home_state_wait_started_) return {};
-  const mgg::ExpandContext ctx = makeContext();
+  const mgg::ExpandContext ctx = makeContext(false);
   const bool aerial = robot_params_.type == mgg::RobotType::kAerialRobot;
   Eigen::Isometry3d peer_transform = Eigen::Isometry3d::Identity();
   int sender = -1;
@@ -3960,7 +3969,11 @@ void PlannerNode::shortcutAndResample(std::vector<mgg::StateVec>& path,
   shortcut_ground.setStandingStart(standingStart());
   mgg::ExpandContext ctx = makeContext();
   ctx.ground = &shortcut_ground;
-  if (!lattice_route) ctx.unknown_body_above_center.reset();
+  if (!lattice_route) {
+    ctx.unknown_body_above_center.reset();
+    ctx.standing_body.reset();
+    ctx.own_body_known_free.reset();
+  }
   const bool stop_at_unknown = !lattice_route || ctx.stop_at_unknown ||
                                !ctx.allow_unknown_lattice_body;
   const auto segment_free = [this, &ctx, stop_at_unknown](
@@ -4231,7 +4244,10 @@ std::string PlannerNode::buildLocalGraph() {
     }
     return true;
   };
-  mgg::PathTurnCheck turn_check(*local_graph_, robot_params_, room_to_turn);
+  mgg::PathTurnCheck turn_check(*local_graph_, robot_params_, room_to_turn,
+      nullptr, false, [this](const auto& a, const auto& b) {
+        return mgg::turnTransitionClear(*map_, robot_params_, a, b);
+      });
   turn_check.setRobotTilt(root_state.head<3>(), current_tilt_);
   // Where the lattice is too sparse to fit the ground, the map measures it.
   turn_check.setUnmeasuredSlope([this](const Eigen::Vector3d& position) {
@@ -4257,12 +4273,14 @@ std::string PlannerNode::buildLocalGraph() {
       return turn_check.sharpTurnAllowedAt(v.state.head<3>());
     };
     slope_end_retreat.admitted_on_slope = [this](const mgg::Vertex& v) {
+      auto arrival = v.state;
+      arrival[3] = mgg::kUnknownTurnHeading;
       return mgg::slopeExemptsTurnSpace(mgg::groundSlope(
                  *ground_, v.state.head<3>(),
                  std::max(robot_params_.size.x(), robot_params_.size.y()),
                  local_graph_.get())) &&
              !mgg::turnSpaceObserved(*map_, robot_params_, planning_params_,
-                                     v.state);
+                                     arrival);
     };
     slope_end_retreat.refuge_admissible = [this](const auto& path, std::size_t end,
                                                 std::size_t refuge) {
@@ -5109,6 +5127,52 @@ bool PlannerNode::routeOverLocalLattice(const mgg::StateVec& goal,
   return true;
 }
 
+bool PlannerNode::startPathAfterChassisSpin(std::vector<mgg::StateVec>& path,
+                                             bool lattice_route) {
+  if (robot_params_.type != mgg::RobotType::kGroundRobot || path.size() < 2 ||
+      robot_params_.physicalOffsetForHeading(0).head<2>().norm() < 1e-9) return true;
+  const double first_yaw = std::atan2(path[1].y()-path[0].y(),path[1].x()-path[0].x());
+  if (std::abs(std::remainder(first_yaw-current_state_[3],2*M_PI)) <=
+      mgg::kSharpTurnRad + 1e-9) return true;
+  mgg::StateVec incoming = current_state_;
+  if (!projectToDrivingHeight(incoming)) incoming = physicalAnchorAtDrivingHeight(current_state_);
+  const auto standing = standingStart();
+  const double slope = mgg::groundSlope(*ground_, incoming.head<3>(),
+      std::max(robot_params_.size.x(),robot_params_.size.y()),local_graph_.get());
+  if (slope > mgg::kLevelGroundSlopeRad && current_tilt_ >= 4*M_PI/180) return false;
+  if (!mgg::roomToTurn(*map_,robot_params_,planning_params_,incoming,
+                       standing ? &*standing : nullptr)) return false;
+  const Eigen::Vector2d centre = incoming.head<2>() +
+      robot_params_.physicalOffsetForHeading(incoming[3]).head<2>();
+  const Eigen::Vector2d offset = robot_params_.physicalOffsetForHeading(0).head<2>();
+  auto ctx = lattice_route ? makeContext() : makeGlobalContext();
+  // The first point is the reference AFTER the stationary spin. Join only
+  // the first forward point on the initial route leg (no unchecked leap
+  // over a corner). The outgoing yaw solves the offset-reference geometry.
+  for (std::size_t i = 1; i < path.size(); ++i) {
+    if (i > 1) {
+      const auto leg = (path[i]-path[0]).head<2>().eval();
+      if (std::abs(std::remainder(std::atan2(leg.y(),leg.x())-first_yaw,2*M_PI)) > 1e-3)
+        return false;
+    }
+    const Eigen::Vector2d delta = path[i].head<2>()-centre;
+    const double length = delta.norm();
+    if (length <= offset.norm()+.01) continue;
+    const double yaw = std::atan2(delta.y(),delta.x()) + std::asin(offset.y()/length);
+    mgg::StateVec post = incoming;
+    post.head<2>() = centre-robot_params_.physicalOffsetForHeading(yaw).head<2>();
+    post[3] = yaw;
+    if (!mgg::groundShortcutSegmentAdmissible(ctx,post.head<3>(),path[i].head<3>(),
+          !lattice_route || ctx.stop_at_unknown || !ctx.allow_unknown_lattice_body)) return false;
+    std::vector<mgg::StateVec> adjusted{post};
+    adjusted.insert(adjusted.end(),path.begin()+i,path.end());
+    if (!noGoAdmissible(adjusted) || !peerAdmissible(adjusted)) return false;
+    path = std::move(adjusted);
+    return true;
+  }
+  return false;
+}
+
 bool PlannerNode::routeStartsWithTurnWithoutRoom(
     const std::vector<Eigen::Vector3d>& points) {
   if (robot_params_.type != mgg::RobotType::kGroundRobot || points.size() < 2) {
@@ -5125,15 +5189,7 @@ bool PlannerNode::routeStartsWithTurnWithoutRoom(
   if (turns.empty() || turns.front() <= mgg::kSharpTurnRad + 1e-9) return false;
   const auto* prior = !storedReverseExitApplies(start) && standing ? &*standing : nullptr;
   if (!mgg::roomToTurn(*map_, robot_params_, planning_params_, start, prior)) return true;
-  double distance = 0;
-  std::size_t ahead = 0;
-  const double window = std::max(robot_params_.size.x(), robot_params_.size.y());
-  while (ahead+1 < points.size() && distance < window) {
-    distance += (points[ahead+1]-points[ahead]).head<2>().norm(); ++ahead;
-  }
-  start[3] = std::atan2(points[ahead].y()-points.front().y(),
-                         points[ahead].x()-points.front().x());
-  return !mgg::roomToTurn(*map_, robot_params_, planning_params_, start, prior);
+  return false;  // start spin keeps the incoming chassis centre fixed
 }
 
 mgg::PathOkFn PlannerNode::applyRouteTurnRule(
@@ -5159,7 +5215,9 @@ mgg::PathOkFn PlannerNode::applyRouteTurnRule(
         return mgg::roomToTurn(*map_, robot_params_, planning_params_, pose,
                                standing ? &*standing : nullptr);
       },
-      slope);
+      slope, false, [this](const auto& a, const auto& b) {
+        return mgg::turnTransitionClear(*map_, robot_params_, a, b);
+      });
   const double start_heading = current_state_[3];
   std::vector<Eigen::Vector3d> lead_in_points;
   for (const mgg::StateVec& s : lead_in) lead_in_points.push_back(s.head<3>());
@@ -5425,6 +5483,8 @@ bool PlannerNode::runGlobalPlanner(int target_id, std::string& reason,
                            local_graph_.get()));
     }
     const auto on_slope = [&](std::size_t i) {
+      auto arrival = best_path_[i];
+      arrival[3] = mgg::kUnknownTurnHeading;
       bool near_slope = false;
       for (std::size_t j = 0; j < best_path_.size() && !near_slope; ++j) {
         near_slope = sloped[j] && std::abs(along[j] - along[i]) <= radius;
@@ -5433,7 +5493,7 @@ bool PlannerNode::runGlobalPlanner(int target_id, std::string& reason,
                                   best_path_[i]) ||
              (near_slope && !mgg::turnSpaceObserved(*map_, robot_params_,
                                                    planning_params_,
-                                                   best_path_[i]));
+                                                   arrival));
     };
     mgg::GroundProjection reverse_ground(*map_, planning_params_, true);
     std::map<std::pair<std::size_t, std::size_t>, bool> reverse_edges;
@@ -6027,6 +6087,11 @@ bool PlannerNode::onPlanRequestImpl(
       }
     }
   }
+  if (!departure_sent_now_ &&
+      !startPathAfterChassisSpin(best_path_, !best_path_from_global_graph_)) {
+    best_path_.clear();
+    summary += "; post-spin reference cannot join the route safely";
+  }
   summary += clearInadmissibleBestPath();
   if (!peer_blocked_edges_.empty()) {
     summary += "; " + std::to_string(peer_blocked_edges_.size()) +
@@ -6124,11 +6189,13 @@ void PlannerNode::enforceSafeCompletion(bool& complete) {
 }
 
 bool PlannerNode::endpointNeedsReverseExit(const mgg::StateVec& pose) const {
+  auto arrival = pose;
+  arrival[3] = mgg::kUnknownTurnHeading;
   const double slope = mgg::groundSlope(*ground_, pose.head<3>(),
       std::max(robot_params_.size.x(), robot_params_.size.y()), local_graph_.get());
   return !mgg::viewpointClear(*map_, robot_params_, planning_params_, pose, slope) ||
          (mgg::slopeExemptsTurnSpace(slope) &&
-          !mgg::turnSpaceObserved(*map_, robot_params_, planning_params_, pose));
+          !mgg::turnSpaceObserved(*map_, robot_params_, planning_params_, arrival));
 }
 
 bool PlannerNode::reverseExitShortcutAdmissible(const mgg::PathType& points) {
@@ -6157,7 +6224,7 @@ bool PlannerNode::refugeArrivalBandAdmissible(const std::vector<mgg::StateVec>& 
         std::max(robot_params_.size.x(), robot_params_.size.y())) <= mgg::kLevelGroundSlopeRad) &&
         mgg::roomToTurn(*map_, robot_params_, planning_params_, pose, nullptr);
   };
-  if (!room(path.back())) return false;
+
   double remaining = reach_distance_ + mgg::kViewpointArrivalSlack;
   for (std::size_t i = path.size() - 1; i > 0 && remaining > 1e-9; --i) {
     const auto delta = (path[i - 1] - path[i]).eval();
@@ -6165,8 +6232,13 @@ bool PlannerNode::refugeArrivalBandAdmissible(const std::vector<mgg::StateVec>& 
     if (length < 1e-9) continue;
     const double checked = std::min(length, remaining);
     const int steps = std::max(1, static_cast<int>(std::ceil(checked / kArrivalBandStepM)));
-    for (int sample = 1; sample <= steps; ++sample) {
-      if (!room(path[i] + delta * (checked * sample / steps / length))) return false;
+    for (int sample = 0; sample <= steps; ++sample) {
+      mgg::StateVec pose = path[i] + delta * (checked * sample / steps / length);
+      // Retreat paths carry lattice/build-time yaws; infer chassis yaw
+      // opposite reverse travel. Straight departures already carry their
+      // actual chassis yaw (and can be forward), so retain it there.
+      if (require_level) pose[3] = std::atan2(delta.y(), delta.x());
+      if (!room(pose)) return false;
     }
     remaining -= checked;
   }
@@ -6567,6 +6639,8 @@ bool PlannerNode::validateStoredReverseExit(const mgg::StateVec& start,
       }, [this, &ground](const Eigen::Vector3d& at) {
         return mgg::groundSlope(ground, at,
             std::max(robot_params_.size.x(), robot_params_.size.y()));
+      }, true, [this](const auto& a, const auto& b) {
+        return mgg::turnTransitionClear(*map_, robot_params_, a, b);
       });
   mgg::PathType points;
   for (const auto& pose : reverse) points.push_back(pose.head<3>());
@@ -7071,6 +7145,11 @@ void PlannerNode::onObjectiveRequestImpl(
       }
     }
     return;  // keep the remaining escape; never command an in-place turn
+  }
+  if (!startPathAfterChassisSpin(route, local)) {
+    response->status = Service::Response::UNREACHABLE;
+    response->reason = "post-spin reference cannot join the route safely";
+    return;
   }
   if (!route.empty() && !standingStartGoalAdmissible(route.back())) {
     response->status = Service::Response::UNREACHABLE;

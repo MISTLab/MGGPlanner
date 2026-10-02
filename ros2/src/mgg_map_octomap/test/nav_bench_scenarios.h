@@ -351,6 +351,8 @@ inline Outcome run(const MapInterface& map, const Scenario& scenario,
   });
   if (request_budget_ms > 0) ctx.deadline = deadline;
   try {
+  if (robot.physical_size && robot.physical_center_offset &&
+      (allow_unknown_body || ctx.unknown_body_above_center)) {
   auto known = std::make_shared<KnownFreeBodyVolumes>();
   const auto anchor = [&](StateVec pose) {
     pose[2] += planning.max_ground_height - robot.size.z()/2;
@@ -364,6 +366,7 @@ inline Outcome run(const MapInterface& map, const Scenario& scenario,
   for (const auto& pose : own_trajectory) driven.push_back(anchor(pose));
   known->addTrajectory(map,robot,driven);
   ctx.own_body_known_free = known;
+  }
   if (!scenario.navigate) {
     ctx.deadline = t0 + std::chrono::duration_cast<Clock::duration>(
         std::chrono::duration<double, std::milli>(lattice_budget_ms));

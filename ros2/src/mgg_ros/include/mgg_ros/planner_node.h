@@ -197,6 +197,8 @@ class PlannerNode : public rclcpp::Node {
   /// (kSharpTurnRad, measured over the robot's length from its heading)
   /// where the robot has no room to turn: the route a boxed-in robot is
   /// not sent.
+  bool startPathAfterChassisSpin(std::vector<mgg::StateVec>& path,
+                                 bool lattice_route);
   bool routeStartsWithTurnWithoutRoom(
       const std::vector<Eigen::Vector3d>& points);
   /// Why exploration may not be declared complete although no frontier is

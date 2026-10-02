@@ -286,12 +286,8 @@ LocalRouteResult routeOverLocalLattice(GraphManager& graph,
       const Eigen::Vector3d offset = ctx.robot->offsetForHeading(yaw);
       const auto turns = pathTurns({from, to}, root_state[3],
           std::max(ctx.robot->size.x(), ctx.robot->size.y()));
-      StateVec outgoing = root_state;
-      outgoing[3] = yaw;
       const bool start_turn_ok = turns.empty() || turns.front() <= kSharpTurnRad + 1e-9 ||
           (roomToTurn(*ctx.map, *ctx.robot, *ctx.planning, root_state,
-                      ctx.ground->standingStart()) &&
-           roomToTurn(*ctx.map, *ctx.robot, *ctx.planning, outgoing,
                       ctx.ground->standingStart()) &&
            groundSlope(*ctx.ground, from,
                std::max(ctx.robot->size.x(), ctx.robot->size.y()), &graph) <=

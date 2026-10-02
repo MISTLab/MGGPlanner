@@ -408,7 +408,7 @@ TEST(PathTurnCheck, ChecksIncomingAndOutgoingCentresAndCachesByHeading) {
   PathTurnCheck check(graph,bot,[&](const StateVec& s) {
     checked.push_back(s[3]); return std::abs(s[3]-M_PI/2) > .01;
   }, [](const Eigen::Vector3d&) { return 0.; });
-  EXPECT_FALSE(check.admissible({{0,0,0},{0,2,0}},0));
+  EXPECT_FALSE(check.admissible({{-2,0,0},{0,0,0},{0,2,0}},0));
   ASSERT_EQ(checked.size(),2u);
   EXPECT_NEAR(checked[0],0,1e-12); EXPECT_NEAR(checked[1],M_PI/2,1e-12);
 }
@@ -432,6 +432,53 @@ TEST(ViewpointClear, OffsetChassisCoversEveryArrivalHeading) {
   planning.viewpoint_clearance_margin = 0;
   planning.min_observed_ground_fraction = 0;
   EXPECT_FALSE(mgg::viewpointClear(wall,bot,planning,StateVec(0,0,.5,0),0));
+}
+
+TEST(PathTurnCheck, ReverseCornerChecksChassisNotTravelHeading) {
+  GraphManager graph;
+  auto bot=robot();
+  bot.physical_center_offset = Eigen::Vector3d(-.16,0,0);
+  class OffsetWall : public Walls {
+   public:
+    OffsetWall() : Walls([](double,double) { return false; }) {}
+    VoxelStatus getOccupiedOnlyCylinderPathStatus(const Eigen::Vector3d& a,
+        const Eigen::Vector3d&, double r, double) const override {
+      return a.x()+r > .6 ? VoxelStatus::kOccupied : VoxelStatus::kFree;
+    }
+  } wall;
+  auto room = [&](const StateVec& pose) { return mgg::turnClear(wall,bot,pose); };
+  auto slope = [](const Eigen::Vector3d&) { return 0.; };
+  PathTurnCheck forward(graph,bot,room,slope);
+  PathTurnCheck reverse(graph,bot,room,slope,true);
+  const std::vector<Eigen::Vector3d> path{{-2,0,.5},{0,0,.5},{0,2,.5}};
+  EXPECT_TRUE(forward.admissible(path,0));
+  EXPECT_FALSE(reverse.admissible(path,0));
+}
+
+TEST(TurnClear, TranslatingTurnSweepsBetweenCentres) {
+  class RecordSweep : public Walls {
+   public:
+    RecordSweep() : Walls([](double,double) { return false; }) {}
+    mutable Eigen::Vector3d from, to;
+    VoxelStatus getOccupiedOnlyCylinderPathStatus(const Eigen::Vector3d& a,
+        const Eigen::Vector3d& b, double, double) const override {
+      from=a; to=b; return VoxelStatus::kFree;
+    }
+  } map;
+  auto bot=robot();
+  bot.physical_center_offset=Eigen::Vector3d(-.16,0,-.3);
+  EXPECT_TRUE(mgg::turnTransitionClear(map,bot,StateVec(0,0,.5,0),StateVec(0,0,.5,M_PI)));
+  EXPECT_NEAR(map.from.x(),-.16,1e-9); EXPECT_NEAR(map.to.x(),.16,1e-9);
+  EXPECT_NEAR(map.from.z(),.5,1e-9); // physical mask Z cannot shrink the collision band
+}
+
+TEST(PathTurnCheck, SearchRequestsYawIndependentEnvelope) {
+  GraphManager graph;
+  bool unknown=false;
+  PathTurnCheck check(graph,robot(),[&](const StateVec& s) {
+    unknown=!std::isfinite(s[3]); return true;
+  },[](const Eigen::Vector3d&) { return 0.; });
+  EXPECT_TRUE(check.sharpTurnAllowedAt({0,0,0})); EXPECT_TRUE(unknown);
 }
 
 TEST(TurnClear, NeedsTheCircleThroughTheRobotsCorners) {
