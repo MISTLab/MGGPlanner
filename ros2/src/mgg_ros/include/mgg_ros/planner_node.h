@@ -405,10 +405,17 @@ class PlannerNode : public rclcpp::Node {
   /// With `turns_ok`, a route that passes it still passes afterwards: the
   /// shortcut takes only leaps that keep it, and a resampled route that
   /// fails it is replaced by the route as it came. `corridor_ok` is mandatory
-  /// even when the original path is a sharp-turn fallback.
+  /// even when the original path is a sharp-turn fallback. A ground
+  /// robot's leap is checked as a lattice edge driven that way
+  /// (mgg::groundShortcutSegmentAdmissible) under the unknown-space policy
+  /// of the graph the route came from: `lattice_route` admits the unknown
+  /// body volume the local lattice admits, otherwise space must be observed
+  /// free as on the roadmap. A leap may not pass closer to a hazard than the
+  /// edges it replaces (mgg::shortcutPathKeepingClearance).
   void shortcutAndResample(std::vector<mgg::StateVec>& path,
                            const mgg::PathOkFn& turns_ok = nullptr,
-                           const mgg::PathOkFn& corridor_ok = nullptr);
+                           const mgg::PathOkFn& corridor_ok = nullptr,
+                           bool lattice_route = false);
 
   /// The roadmap side of the cycle: the accepted exploration path and the
   /// frontier clusters of the local graph join the global graph.

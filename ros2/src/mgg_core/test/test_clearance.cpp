@@ -122,6 +122,10 @@ TEST(Clearance, OneMetrePassageRemainsAvailable) {
 }
 
 TEST(Clearance, GlobalShortcutKeepsClearanceAndNarrowPassage) {
+  // The planner node's shortcut (shortcutPathKeepingClearance): a leap may
+  // not pass closer to a hazard than the edges it replaces, so through the
+  // wide doorway it keeps to the centre the lattice preferred, and the
+  // narrow one stays passable.
   for (double width : {2.5, 1.0}) {
     int vertices = 0, edges = 0;
     const auto path = route(width, 0.6, vertices, edges);
@@ -134,33 +138,68 @@ TEST(Clearance, GlobalShortcutKeepsClearanceAndNarrowPassage) {
       return ground.getProjectedEdgeStatus(a, b, box, true, projected, false) ==
              mgg::ProjectedEdgeStatus::kAdmissible;
     };
-    const auto cost = [&](const auto& a, const auto& b) {
-      return ground.clearanceCost(a, b, box);
+    const auto clearance = [&](const auto& a, const auto& b) {
+      return ground.segmentClearance(a, b, box);
     };
     const auto before = std::chrono::steady_clock::now();
-    const auto shortcut = mgg::shortcutPath(path, admissible, {}, cost);
+    const auto shortcut =
+        mgg::shortcutPathKeepingClearance(path, admissible, {}, clearance);
     const auto ms = std::chrono::duration<double, std::milli>(
         std::chrono::steady_clock::now() - before).count();
-    std::printf("doorway %.1f cost-aware shortcut: %.3f ms\n", width, ms);
+    std::printf("doorway %.1f clearance-keeping shortcut: %.3f ms, %zu -> %zu points\n",
+                width, ms, path.size(), shortcut.size());
     ASSERT_GE(shortcut.size(), 2u);
-    double original_cost = 0, shortcut_cost = 0;
+    EXPECT_LT(shortcut.size(), path.size());
+    double original_clearance = 1e9, shortcut_clearance = 1e9;
     for (size_t i = 1; i < path.size(); ++i) {
-      original_cost += cost(path[i - 1], path[i]);
+      original_clearance = std::min(original_clearance, clearance(path[i - 1], path[i]));
     }
     for (size_t i = 1; i < shortcut.size(); ++i) {
       EXPECT_TRUE(admissible(shortcut[i - 1], shortcut[i]));
-      shortcut_cost += cost(shortcut[i - 1], shortcut[i]);
-      if (width > 2) {
+      shortcut_clearance = std::min(shortcut_clearance,
+                                    clearance(shortcut[i - 1], shortcut[i]));
+    }
+    EXPECT_GE(shortcut_clearance, original_clearance - 1e-9);
+    if (width > 2) {
+      // Through the doorway no nearer its edges (|y| = 1.25 m) than the
+      // route came anywhere: a body half 0.315 m wide, a cell's slack.
+      for (size_t i = 1; i < shortcut.size(); ++i) {
         for (int j = 0; j <= 100; ++j) {
           const Eigen::Vector3d at = shortcut[i - 1] +
               (j / 100.0) * (shortcut[i] - shortcut[i - 1]);
-          if (std::abs(at.x()) <= 0.8) EXPECT_LT(std::abs(at.y()), 0.35);
+          if (std::abs(at.x()) <= 0.8) {
+            EXPECT_LT(std::abs(at.y()), 1.25 - 0.315 - original_clearance + 0.1);
+          }
         }
       }
     }
-    EXPECT_LE(shortcut_cost, original_cost + 1e-9);
     EXPECT_TRUE(shortcut.back().isApprox(path.back()));
   }
+}
+
+TEST(Clearance, ClearanceIsMeasuredFromTheBodyTurnedToTheSegment) {
+  // A long, narrow body driving along a wall 0.5 m to its side keeps the
+  // full margin beside it; the circumscribed circle would have put the
+  // wall inside the body (botman, 2026-10-01). Across the wall, end on, it
+  // does not.
+  // On a 0.2 m grid: at 0.1 m the 1.5 m circle of cells round a botman
+  // sample is more than clearancePenalty's 1024-cell bound enumerates, and
+  // its clearance is unmeasured (the largest cost, the same everywhere).
+  std::map<std::pair<std::int64_t, std::int64_t>, double> heights;
+  for (int x = -20; x <= 20; ++x) {
+    for (int y = -20; y <= 20; ++y) {
+      heights[{x, y}] = (y + 0.5) * 0.2 >= 1.4 ? 0.5 : 0.0;
+    }
+  }
+  const mgg_test::TerrainFixture map(0.2, heights);
+  auto p = planning(0.6);
+  mgg::GroundProjection ground(map, p, true);
+  const Eigen::Vector3d box(1.394, 0.828, 0.295);
+  const double along = ground.segmentClearance({-1, 0, 0.4475}, {1, 0, 0.4475}, box);
+  EXPECT_NEAR(along, 0.6, 1e-9);
+  const double end_on = ground.segmentClearance({0, 0.0, 0.4475}, {0, 0.4, 0.4475}, box);
+  EXPECT_LT(end_on, 0.6);
+  EXPECT_NEAR(ground.clearanceCost({-1, 0, 0.4475}, {1, 0, 0.4475}, box), 2.0, 1e-9);
 }
 
 TEST(Clearance, RubbleBelowBodyStillAddsSoftCost) {

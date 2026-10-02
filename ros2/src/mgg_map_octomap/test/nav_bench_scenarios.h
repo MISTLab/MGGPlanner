@@ -258,8 +258,6 @@ inline Outcome run(const MolaMap& map, const Scenario& scenario) {
   const GridGraphParams grid = botmanGrid();
   GroundProjection ground(map, planning, /*cache_footprint_ground=*/true);
   ground.setProfile(&out.profile);
-  GroundProjection plain_ground(map, planning);
-  plain_ground.setProfile(&out.profile);
   EdgeInclinations inclinations;
   ExpandContext ctx;
   ctx.map = &map;
@@ -318,11 +316,15 @@ inline Outcome run(const MolaMap& map, const Scenario& scenario) {
     // The planner node's shortcutAndResample, ground branch.
     PathType points;
     for (const Vertex* v : local.route) points.push_back(v->state.head<3>());
+    GroundProjection shortcut_ground(map, planning, true);
+    shortcut_ground.setProfile(&out.profile);
     ExpandContext shortcut_ctx = ctx;
-    shortcut_ctx.ground = &plain_ground;
+    shortcut_ctx.ground = &shortcut_ground;
+    // A local lattice route: the lattice's unknown policy.
     const auto segment_free = [&](const Eigen::Vector3d& a,
                                   const Eigen::Vector3d& b) {
-      return groundShortcutSegmentAdmissible(shortcut_ctx, a, b);
+      return groundShortcutSegmentAdmissible(shortcut_ctx, a, b,
+                                             ctx.stop_at_unknown);
     };
     const PathOkFn turns_ok = [&](const PathType& trial) {
       return check.admissible(trial, scenario.start[3]);
@@ -331,16 +333,15 @@ inline Outcome run(const MolaMap& map, const Scenario& scenario) {
     const PathOkFn admissible = [&](const PathType& trial) {
       return !unshortcut_ok || turns_ok(trial);
     };
-    GroundProjection clearance_ground(map, planning, true);
-    clearance_ground.setProfile(&out.profile);
-    const SegmentCostFn cost = [&](const Eigen::Vector3d& a,
-                                   const Eigen::Vector3d& b) {
-      return clearance_ground.clearanceCost(a, b, ctx.robot_box_size);
+    const SegmentClearanceFn clearance = [&](const Eigen::Vector3d& a,
+                                             const Eigen::Vector3d& b) {
+      return shortcut_ground.segmentClearance(a, b, ctx.robot_box_size);
     };
     const PathType unshortcut = points;
     {
       ProfileScope timed(&out.profile.shortcut);
-      points = shortcutPath(points, segment_free, admissible, cost);
+      points = shortcutPathKeepingClearance(points, segment_free, admissible,
+                                            clearance);
     }
     out.corners = static_cast<int>(points.size());
     PathType resampled;

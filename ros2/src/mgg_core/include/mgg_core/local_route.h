@@ -7,6 +7,7 @@
 #ifndef MGG_CORE_LOCAL_ROUTE_H_
 #define MGG_CORE_LOCAL_ROUTE_H_
 
+#include <functional>
 #include <string>
 #include <vector>
 
@@ -49,11 +50,33 @@ StateVec localRouteRoot(const ExpandContext& ctx, const StateVec& robot_pose,
                         bool& hanging);
 
 /// Whether a ground robot may drive the straight shortcut segment from
-/// `from` to `to`, both at driving height: the check the planner node's
-/// shortcut pass applies before its no-go and turn checks.
+/// `from` to `to`, both vertex states at driving height: the check the
+/// planner node's shortcut pass applies before its no-go and turn checks.
+/// It is the check a lattice edge driven that way passes (expandGraph):
+/// the planning body turned to the segment and swept along it
+/// (orientedBoxPathStatus), every ground test of getProjectedEdgeStatus,
+/// and unknown space as `stop_at_unknown` says, the policy of the graph the
+/// route came from (the local lattice admits unknown body volume, the
+/// roadmap does not). The axis-aligned box that once checked it refused a
+/// shortcut whenever its corners met unknown air the lattice had allowed,
+/// so lattice weaves were sent as they came (botman, 2026-10-01).
 bool groundShortcutSegmentAdmissible(const ExpandContext& ctx,
                                      const Eigen::Vector3d& from,
-                                     const Eigen::Vector3d& to);
+                                     const Eigen::Vector3d& to,
+                                     bool stop_at_unknown);
+
+/// How many vertices within edge_length_max of a goal, nearest first, the
+/// goal may be linked from when its nearest vertex cannot reach it.
+inline constexpr int kGoalLinkCandidates = 16;
+
+/// Links `goal_state` (at driving height) into `graph` as an exact
+/// endpoint: connectStateToGraph from its nearest vertex, and failing
+/// that a checked edge (expandGraphFrom) from each vertex within
+/// edge_length_max that `reached` says the robot reaches, nearest first, at
+/// most kGoalLinkCandidates. Null when none links.
+Vertex* linkGoalToLattice(GraphManager& graph, const StateVec& goal_state,
+                          const ExpandContext& ctx,
+                          const std::function<bool(const Vertex&)>& reached);
 
 }  // namespace mgg
 

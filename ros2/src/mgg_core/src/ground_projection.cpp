@@ -744,7 +744,8 @@ bool GroundProjection::clearanceHazard(const Eigen::Vector3d& cell,
 }
 
 double GroundProjection::clearancePenalty(
-    const Eigen::Vector3d& point, const Eigen::Vector3d& box_size) const {
+    const Eigen::Vector3d& point, const Eigen::Vector2d& heading,
+    const Eigen::Vector3d& box_size) const {
   // A cap bounds compute work even for a malformed deployment setting.
   const double margin = std::min(params_.path_clearance_margin, 1.0);
   if (!(margin > 0.0)) return 0.0;
@@ -757,10 +758,18 @@ double GroundProjection::clearancePenalty(
     // new collision rule. Even a very fine map can still use the passage.
     return 1.0;
   }
+  const Eigen::Vector2d along =
+      heading.norm() > 1e-9 ? Eigen::Vector2d(heading.normalized())
+                            : Eigen::Vector2d::UnitX();
+  const Eigen::Vector2d across(-along.y(), along.x());
+  const Eigen::Vector2d half = 0.5 * box_size.head<2>();
   double clearance = margin;
   for (const auto& cell : cells) {
+    const Eigen::Vector2d offset = cell.center - point.head<2>();
+    const Eigen::Vector2d local(std::abs(offset.dot(along)),
+                                std::abs(offset.dot(across)));
     const double distance = std::max(
-        0.0, (cell.center - point.head<2>()).norm() - body_radius - cell_radius);
+        0.0, (local - half).cwiseMax(0.0).norm() - cell_radius);
     if (distance >= clearance) continue;
     if (clearanceHazard({cell.center.x(), cell.center.y(), point.z()}, box_size)) {
       clearance = distance;
@@ -770,15 +779,13 @@ double GroundProjection::clearancePenalty(
   return 1.0 - clearance / margin;
 }
 
-double GroundProjection::clearanceCost(
-    const Eigen::Vector3d& start, const Eigen::Vector3d& end,
-    const Eigen::Vector3d& box_size) const {
-  ProfileScope timed(profile_ ? &profile_->clearance : nullptr);
+std::vector<Eigen::Vector3d> GroundProjection::clearanceSamples(
+    const Eigen::Vector3d& start, const Eigen::Vector3d& end) const {
   const double length = (end - start).norm();
-  if (!(params_.path_clearance_margin > 0.0) || !(length > 0.0)) return length;
   const int samples = std::max(1, std::min(32,
       static_cast<int>(std::ceil(std::min(length, 6.4) / 0.2))));
-  double penalty = 0.0;
+  std::vector<Eigen::Vector3d> points;
+  points.reserve(samples);
   for (int i = 0; i < samples; ++i) {
     Eigen::Vector3d point = start + ((i + 0.5) / samples) * (end - start);
     // Follow the support surface even on a shortcut spanning a ramp crest.
@@ -786,9 +793,39 @@ double GroundProjection::clearanceCost(
     if (footprintGroundBelow(point, ground)) {
       point.z() = ground.z() + params_.max_ground_height;
     }
-    penalty += clearancePenalty(point, box_size);
+    points.push_back(point);
   }
-  return length * (1.0 + 4.0 * penalty / samples);
+  return points;
+}
+
+double GroundProjection::clearanceCost(
+    const Eigen::Vector3d& start, const Eigen::Vector3d& end,
+    const Eigen::Vector3d& box_size) const {
+  ProfileScope timed(profile_ ? &profile_->clearance : nullptr);
+  const double length = (end - start).norm();
+  if (!(params_.path_clearance_margin > 0.0) || !(length > 0.0)) return length;
+  const Eigen::Vector2d heading = (end - start).head<2>();
+  const std::vector<Eigen::Vector3d> points = clearanceSamples(start, end);
+  double penalty = 0.0;
+  for (const Eigen::Vector3d& point : points) {
+    penalty += clearancePenalty(point, heading, box_size);
+  }
+  return length * (1.0 + 4.0 * penalty / static_cast<double>(points.size()));
+}
+
+double GroundProjection::segmentClearance(
+    const Eigen::Vector3d& start, const Eigen::Vector3d& end,
+    const Eigen::Vector3d& box_size) const {
+  ProfileScope timed(profile_ ? &profile_->clearance : nullptr);
+  const double margin = std::min(params_.path_clearance_margin, 1.0);
+  if (!(margin > 0.0)) return 0.0;
+  const Eigen::Vector2d heading = (end - start).head<2>();
+  double worst = 0.0;
+  for (const Eigen::Vector3d& point : clearanceSamples(start, end)) {
+    worst = std::max(worst, clearancePenalty(point, heading, box_size));
+    if (worst >= 1.0) break;
+  }
+  return margin * (1.0 - worst);
 }
 
 FootprintPlane GroundProjection::footprintPlane(

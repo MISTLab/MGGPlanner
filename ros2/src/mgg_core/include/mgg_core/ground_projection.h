@@ -282,10 +282,24 @@ class GroundProjection {
   /// Length-weighted soft clearance cost (between length and 5*length).
   /// Samples at most 32 points and 1024 nearby cells per point. Obstacles
   /// at body height and support cells rising past the enabled cell-rise
-  /// limit are hazards. Their distance beyond the body's circumscribed
-  /// radius is preferred, never required; unknown evidence adds no hazard.
+  /// limit are hazards. Their distance beyond the body's rectangle, turned
+  /// to the segment, is preferred, never required; unknown evidence adds no
+  /// hazard. (The circumscribed circle it was measured from put a wall
+  /// 0.5 m beside a 1.4 x 0.8 m body inside it, so every lattice edge down a
+  /// 2 m corridor carried the full penalty and routes wove: botman,
+  /// 2026-10-01.)
   double clearanceCost(const Eigen::Vector3d& start, const Eigen::Vector3d& end,
                        const Eigen::Vector3d& box_size) const;
+
+  /// The least clearance, metres, between the body moved straight from
+  /// `start` to `end` and the hazards clearanceCost counts, sampled as
+  /// clearanceCost samples (at most 32 points following the ground), up to
+  /// path_clearance_margin: a segment clear by the margin everywhere
+  /// returns the margin. Measured from the body's rectangle turned to the
+  /// segment. 0 with no margin set. A soft measure, never a collision check.
+  double segmentClearance(const Eigen::Vector3d& start,
+                          const Eigen::Vector3d& end,
+                          const Eigen::Vector3d& box_size) const;
 
   /// The ground straight below `point`, false when none is mapped within
   /// max_projection_length.
@@ -368,8 +382,14 @@ class GroundProjection {
                                        const Eigen::Vector2d& heading,
                                        const Eigen::Vector3d& box_size) const;
 
+  /// 1 - clearance / margin at `point`, the body's rectangle turned to
+  /// `heading` (unit, XY); 0 to 1.
   double clearancePenalty(const Eigen::Vector3d& point,
+                          const Eigen::Vector2d& heading,
                           const Eigen::Vector3d& box_size) const;
+  /// The points clearanceCost and segmentClearance sample, on the ground.
+  std::vector<Eigen::Vector3d> clearanceSamples(const Eigen::Vector3d& start,
+                                                const Eigen::Vector3d& end) const;
   bool clearanceHazard(const Eigen::Vector3d& cell,
                        const Eigen::Vector3d& box_size) const;
   using ClearanceKey = std::array<std::int64_t, 6>;

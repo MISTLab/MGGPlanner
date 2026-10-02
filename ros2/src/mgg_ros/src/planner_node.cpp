@@ -3581,7 +3581,8 @@ void PlannerNode::addFrontiers() {
 
 void PlannerNode::shortcutAndResample(std::vector<mgg::StateVec>& path,
                                       const mgg::PathOkFn& turns_ok,
-                                      const mgg::PathOkFn& corridor_ok) {
+                                      const mgg::PathOkFn& corridor_ok,
+                                      bool lattice_route) {
   path_shortcut_from_ = static_cast<int>(path.size());
   path_shortcut_corners_ = path_shortcut_from_;
   path_shortcut_to_ = path_shortcut_from_;
@@ -3594,9 +3595,16 @@ void PlannerNode::shortcutAndResample(std::vector<mgg::StateVec>& path,
   // Shortcut first, then resample. The other order interpolates points that
   // are about to be discarded, and leaves the corners the shortcut removed
   // still bent.
-  const mgg::ExpandContext ctx = makeContext();
-  const auto segment_free = [this, &ctx](const Eigen::Vector3d& from,
-                                         const Eigen::Vector3d& to) {
+  // The plan's own projection, sharing ground lookups between the leaps
+  // the pass tries; the map is held still by the caller's lease.
+  mgg::GroundProjection shortcut_ground(*map_, planning_params_, true);
+  shortcut_ground.setStandingStart(standingStart());
+  mgg::ExpandContext ctx = makeContext();
+  ctx.ground = &shortcut_ground;
+  const bool stop_at_unknown = !lattice_route || ctx.stop_at_unknown;
+  const auto segment_free = [this, &ctx, stop_at_unknown](
+                                const Eigen::Vector3d& from,
+                                const Eigen::Vector3d& to) {
     // stop_at_unknown_voxel is true: a shortcut may only cross space already
     // known to be free. Upstream passes false here (rrg.cpp:4610), which
     // treats unknown space as passable; that is survivable there because its
@@ -3616,7 +3624,8 @@ void PlannerNode::shortcutAndResample(std::vector<mgg::StateVec>& path,
     if (robot_params_.type == mgg::RobotType::kAerialRobot &&
         peerBlocksSegment(from, to)) return false;
     if (robot_params_.type == mgg::RobotType::kGroundRobot) {
-      return mgg::groundShortcutSegmentAdmissible(ctx, from, to);
+      return mgg::groundShortcutSegmentAdmissible(ctx, from, to,
+                                                  stop_at_unknown);
     }
     return map_->getStrictPathStatus(from + robot_params_.center_offset,
                                       to + robot_params_.center_offset,
@@ -3636,31 +3645,61 @@ void PlannerNode::shortcutAndResample(std::vector<mgg::StateVec>& path,
     return (!unshortcut_ok || turns_ok(trial)) &&
            (!corridor_ok || corridor_ok(trial));
   };
-  // The same bounded geometry cost as lattice selection; per-call caching
-  // cannot outlive the map's read lease or retain transient obstacles.
-  mgg::GroundProjection clearance_ground(*map_, planning_params_, true);
-  mgg::SegmentCostFn clearance_cost;
+  // The same bounded clearance measure as lattice selection; per-call
+  // caching cannot outlive the map's read lease or retain transient
+  // obstacles.
+  mgg::SegmentClearanceFn clearance;
   if (robot_params_.type == mgg::RobotType::kGroundRobot &&
       planning_params_.path_clearance_margin > 0.0) {
-    clearance_cost = [&](const Eigen::Vector3d& a, const Eigen::Vector3d& b) {
-      return clearance_ground.clearanceCost(a, b, ctx.robot_box_size);
+    clearance = [&](const Eigen::Vector3d& a, const Eigen::Vector3d& b) {
+      return shortcut_ground.segmentClearance(a, b, ctx.robot_box_size);
     };
   }
-  points = mgg::shortcutPath(points, segment_free, admissible, clearance_cost);
-  path_shortcut_corners_ = static_cast<int>(points.size());
-  mgg::PathType resampled;
-  if (planning_params_.path_interpolation_distance > 0.0 &&
-      mgg::interpolatePath(points, planning_params_.path_interpolation_distance,
-                           resampled) &&
-      resampled.size() >= 2) {
+  // The route as it will be sent: resampled at path_interpolation_distance
+  // and, for a ground robot, each new pose at driving height over the
+  // ground under it, as the leap's check projected it (a straight line
+  // between a floor pose and a deck pose cuts under a ramp's crest).
+  const auto resample = [&](const mgg::PathType& corners) {
+    mgg::PathType resampled;
+    if (!(planning_params_.path_interpolation_distance > 0.0) ||
+        !mgg::interpolatePath(corners,
+                              planning_params_.path_interpolation_distance,
+                              resampled) ||
+        resampled.size() < 2) {
+      return corners;
+    }
     // interpolatePath stops short of the last point by up to one step; the
     // route ends where it was planned to, which for an objective is the
     // exact goal.
-    if ((resampled.back() - points.back()).norm() > 1e-6) {
-      resampled.push_back(points.back());
+    if ((resampled.back() - corners.back()).norm() > 1e-6) {
+      resampled.push_back(corners.back());
     }
-    points = resampled;
-  }
+    if (robot_params_.type == mgg::RobotType::kGroundRobot) {
+      for (std::size_t i = 1; i + 1 < resampled.size(); ++i) {
+        const bool corner = std::any_of(
+            corners.begin(), corners.end(), [&](const Eigen::Vector3d& c) {
+              return (c - resampled[i]).norm() < 1e-9;
+            });
+        if (corner) continue;
+        Eigen::Vector3d probe = resampled[i];
+        mgg::VoxelStatus status = mgg::VoxelStatus::kUnknown;
+        const double below = shortcut_ground.projectSample(probe, status);
+        if (status == mgg::VoxelStatus::kOccupied) {
+          resampled[i].z() -= below - planning_params_.max_ground_height;
+        }
+      }
+    }
+    return resampled;
+  };
+  // Leaps are judged on the route they make as it will be sent: resampling
+  // moves where each turn's measuring window ends.
+  const mgg::PathOkFn sent_admissible = [&](const mgg::PathType& trial) {
+    return admissible(resample(trial));
+  };
+  points = mgg::shortcutPathKeepingClearance(points, segment_free,
+                                             sent_admissible, clearance);
+  path_shortcut_corners_ = static_cast<int>(points.size());
+  points = resample(points);
   // Resampling moves where each turn's measuring window ends, so the route
   // is checked again as it will be sent.
   if (!admissible(points)) {
@@ -4051,7 +4090,8 @@ std::string PlannerNode::buildLocalGraph() {
           }) : mgg::PathOkFn(),
         turns_admissible ? mgg::PathOkFn([&](const mgg::PathType& points) {
             return reverseExitShortcutAdmissible(points);
-          }) : mgg::PathOkFn());
+          }) : mgg::PathOkFn(),
+        /*lattice_route=*/true);
   }
   // Free cells with no vertices is the characteristic bring-up failure: the
   // lattice is finding space but every candidate is being turned away. The
@@ -6360,7 +6400,7 @@ void PlannerNode::onObjectiveRequest(
     response->reason = reason;
     return;
   }
-  shortcutAndResample(route, turns_ok);
+  shortcutAndResample(route, turns_ok, nullptr, /*lattice_route=*/local);
   mgg::PathType objective_points;
   for (const auto& pose : route) objective_points.push_back(pose.head<3>());
   // Check the actual route being sent, even without retained escape memory.

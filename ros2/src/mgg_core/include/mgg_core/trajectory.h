@@ -69,6 +69,25 @@ using SegmentCostFn = std::function<double(const VectorType&, const VectorType&)
 PathType shortcutPath(const PathType& path, const SegmentFreeFn& segment_free,
                       const PathOkFn& path_ok, const SegmentCostFn& cost = {});
 
+/// The least clearance of a straight segment, e.g.
+/// GroundProjection::segmentClearance.
+using SegmentClearanceFn =
+    std::function<double(const VectorType&, const VectorType&)>;
+
+/// shortcutPath, with `path_ok` as above, whose leaps must keep the
+/// clearance the path had there: a leap's `clearance` may not fall below
+/// the least clearance of the edges it replaces. A leap closer to a wall
+/// than the route it straightens is refused; one that is no closer is taken
+/// whatever it costs, so a staircase across open floor, whose edges all
+/// keep the full margin, straightens. (shortcutPath with a cost refused any
+/// leap costing more than the edges it replaced, which kept the lattice's
+/// weave: botman, 2026-10-01.) Leaps span at most 6.4 m of original arc, as
+/// clearance is sampled at most 32 times a segment.
+PathType shortcutPathKeepingClearance(const PathType& path,
+                                      const SegmentFreeFn& segment_free,
+                                      const PathOkFn& path_ok,
+                                      const SegmentClearanceFn& clearance);
+
 /// Dynamic time warping distance between two paths.
 double computeDTWDistance(const PathType& a, const PathType& b);
 

@@ -93,6 +93,11 @@ if(BUILD_TESTING)
   ament_add_gtest(test_map_backend test/test_map_backend.cpp)
   target_link_libraries(test_map_backend ${PROJECT_NAME})
   ament_target_dependencies(test_map_backend rclcpp)
+  # NAVIGATE for a Bunker-sized robot on MOLA products (always built).
+  ament_add_gtest(test_planner_navigation test/test_planner_navigation.cpp
+    TIMEOUT 300)
+  target_link_libraries(test_planner_navigation ${PROJECT_NAME})
+  ament_target_dependencies(test_planner_navigation rclcpp mgg_msgs)
   if(mgg_map_octomap_WITH_OCTOMAP)
     target_compile_definitions(test_map_backend PRIVATE MGG_WITH_OCTOMAP)
     # These scenes are built by inserting points into the OctoMap backend.
