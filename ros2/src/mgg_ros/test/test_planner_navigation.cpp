@@ -437,6 +437,16 @@ class PlannerNodeTestPeer {
     node.applyLatestOdometry();
     return node.startPathAfterChassisSpin(path,true);
   }
+  static bool postSpinRecordsTurnBack(PlannerNode& node) {
+    node.applyLatestOdometry();
+    node.best_path_ = {{0,0,.935,M_PI},{.25,0,.935,0},{1,0,.935,0}};
+    node.lattice_path_ = node.best_path_;
+    node.best_path_from_global_graph_ = false;
+    node.lattice_selection_direction_ = M_PI;
+    if (!node.startPathAfterChassisSpin(node.best_path_,true)) return false;
+    node.recordSentPath();
+    return node.turn_back_hysteresis_.lastTurnedBack();
+  }
   static bool drivenReturn(PlannerNode& node, bool history) {
     node.applyLatestOdometry();
     PlannerNode::StandingStartScope scope(node);
@@ -444,13 +454,13 @@ class PlannerNodeTestPeer {
     if (!history) ctx.own_body_known_free.reset();
     return mgg::groundShortcutSegmentAdmissible(ctx,{2,0,.935},{1.8,0,.935},true);
   }
-  static bool hasOwnBodyMask(PlannerNode& node, bool physical) {
+  static bool hasOwnBodyMask(PlannerNode& node, bool physical, bool strict = true) {
     node.applyLatestOdometry();
     if (!physical) {
       node.robot_params_.physical_size.reset();
       node.robot_params_.physical_center_offset.reset();
     }
-    node.unknown_body_policy_ = "strict";
+    if (strict) node.unknown_body_policy_ = "strict";
     node.allow_unknown_lattice_body_ = false;
     const auto ctx = node.makeContext();
     return ctx.standing_body.has_value() || bool(ctx.own_body_known_free);
@@ -685,6 +695,21 @@ TEST_F(PlannerNavigationTest, StrictPolicyHasNoOwnBodyUnknownExceptions) {
   PlannerNodeTestPeer::standAt(*node,0,0,0,0,1);
   EXPECT_FALSE(PlannerNodeTestPeer::hasOwnBodyMask(*node,true));
   EXPECT_FALSE(PlannerNodeTestPeer::hasOwnBodyMask(*node,false));
+}
+
+TEST_F(PlannerNavigationTest, OffsetStartSpinPreservesTurnBackHysteresis) {
+  MolaTerrainProduct product(.1,-3,5,-3,3,flat,{},2.0);
+  auto node=botmanNode("spin_hysteresis",product);
+  PlannerNodeTestPeer::standAt(*node,0,0,0,M_PI,1);
+  EXPECT_TRUE(PlannerNodeTestPeer::postSpinRecordsTurnBack(*node));
+}
+
+TEST_F(PlannerNavigationTest, BoundedPolicyWithoutPhysicalPairHasNoMask) {
+  MolaTerrainProduct product(.1,-3,5,-3,3,flat,{},.5);
+  auto node=botmanNode("bounded_no_physical",product);
+  PlannerNodeTestPeer::sensorPolicy(*node);
+  PlannerNodeTestPeer::standAt(*node,0,0,0,0,1);
+  EXPECT_FALSE(PlannerNodeTestPeer::hasOwnBodyMask(*node,false,false));
 }
 
 TEST_F(PlannerNavigationTest, StartSpinMovesSentReferenceButNotChassisCentre) {

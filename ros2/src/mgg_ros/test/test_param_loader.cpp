@@ -78,6 +78,18 @@ class ParamFixture : public ::testing::Test {
   std::shared_ptr<rclcpp::Node> node_;
 };
 
+TEST_F(ParamFixture, RejectsHalfConfiguredPhysicalBody) {
+  for (const auto& key : {"physical_size", "physical_center_offset"}) {
+    rclcpp::NodeOptions opts;
+    opts.automatically_declare_parameters_from_overrides(true);
+    opts.parameter_overrides({{std::string("RobotParams.")+key,
+                               std::vector<double>{1.0, .8, .6}}});
+    auto node=std::make_shared<rclcpp::Node>("half_physical",opts);
+    mgg::RobotParams robot;
+    EXPECT_FALSE(mgg_ros::loadRobotParams(ParamLoader(node.get()),"RobotParams",robot));
+  }
+}
+
 TEST_F(ParamFixture, ReadsNestedNamesUsingTheRos1Spelling) {
   ParamLoader p(node_.get());
   double v = 0.0;
