@@ -9,6 +9,7 @@
 #include <cstdint>
 #include <functional>
 #include <optional>
+#include <random>
 #include <set>
 #include <string>
 #include <tuple>
@@ -20,6 +21,7 @@
 #include "mgg_core/path_selection.h"
 #include "mgg_core/tour_params.h"
 #include "mgg_map_octomap/native_mola_grid.h"
+#include "mgg_map_octomap/scan_walk.h"
 
 namespace {
 
@@ -56,6 +58,36 @@ struct GainSetup {
   mgg::BoundedSpaceParams space;
   mgg::GainContext ctx;
 };
+
+// The reference takes the original full frustum through the same backend.
+// Compare every counted voxel as well as all production scoring fields.
+mgg::VolumetricGain expectFullScanEquivalent(
+    const mgg::StateVec& state, GainSetup& setup) {
+  mgg::VolumetricGain pruned, full;
+  std::vector<std::pair<Eigen::Vector3d, VoxelStatus>> a, b;
+  setup.planning.ground_gain_full_scan = false;
+  mgg::computeVolumetricGain(state, pruned, setup.ctx, &a);
+  setup.planning.ground_gain_full_scan = true;
+  mgg::computeVolumetricGain(state, full, setup.ctx, &b);
+  setup.planning.ground_gain_full_scan = false;
+  EXPECT_EQ(pruned.num_unknown_voxels, full.num_unknown_voxels);
+  EXPECT_EQ(pruned.num_free_voxels, full.num_free_voxels);
+  EXPECT_EQ(pruned.num_occupied_voxels, full.num_occupied_voxels);
+  EXPECT_EQ(pruned.is_frontier, full.is_frontier);
+  EXPECT_DOUBLE_EQ(pruned.gain, full.gain);
+  std::cout << "SCAN_WORK rays=" << pruned.gain_rays_cast << "/"
+            << full.gain_rays_cast << " visits=" << pruned.gain_voxel_visits
+            << "/" << full.gain_voxel_visits << '\n';
+  auto sorted = [](const auto& entries) {
+    std::vector<std::tuple<double, double, double, int>> cells;
+    for (const auto& e : entries)
+      cells.emplace_back(e.first.x(), e.first.y(), e.first.z(), int(e.second));
+    std::sort(cells.begin(), cells.end());
+    return cells;
+  };
+  EXPECT_EQ(sorted(a), sorted(b));
+  return full;
+}
 
 std::tuple<long, long, long> cellOf(const Eigen::Vector3d& centre) {
   return {std::lround(std::floor(centre.x() / kResolution)),
@@ -111,6 +143,8 @@ std::vector<std::pair<Eigen::Vector3d, VoxelStatus>> groundGain(
   mgg::computeVolumetricGain(
       mgg::StateVec(viewpoint.x(), viewpoint.y(), viewpoint.z(), 0.0), gain,
       setup.ctx, &counted);
+  expectFullScanEquivalent(
+      mgg::StateVec(viewpoint.x(), viewpoint.y(), viewpoint.z(), 0.0), setup);
   return counted;
 }
 
@@ -276,6 +310,7 @@ TEST(NativeGain, WalledCorridorClearsDeployedInterestThresholds) {
                 << " gain_ms=" << std::chrono::duration<double, std::milli>(scored - start).count()
                 << " selection_ms=" << std::chrono::duration<double, std::milli>(
                      std::chrono::steady_clock::now() - scored).count() << '\n';
+      expectFullScanEquivalent(graph.getVertex(3)->state, setup);
       EXPECT_TRUE(gain.is_frontier);
       EXPECT_GE(gain.num_unknown_voxels, setup.planning.low_gain_voxels);
       EXPECT_GE(selected.best_gain, mgg::TourParams{}.min_cluster_gain);
@@ -323,7 +358,9 @@ TEST_P(TallRoomGain, UnknownCeilingDoesNotCompeteWithTheDoor) {
   const auto scored = std::chrono::steady_clock::now();
   for (int id : {0, 3}) {
     const auto& gain = graph.getVertex(id)->vol_gain;
-    EXPECT_GT(gain.num_total_unknown_voxels, 0);
+    EXPECT_GT(expectFullScanEquivalent(graph.getVertex(id)->state, setup)
+                  .num_total_unknown_voxels, 0);
+    EXPECT_EQ(gain.num_total_unknown_voxels, -1);
     if (GetParam() == 3.0) {
       EXPECT_EQ(gain.num_unknown_voxels, 0);
       EXPECT_FALSE(gain.is_frontier);
@@ -331,13 +368,16 @@ TEST_P(TallRoomGain, UnknownCeilingDoesNotCompeteWithTheDoor) {
     }
     EXPECT_LT(gain.gain, graph.getVertex(4)->vol_gain.gain);
   }
+  for (int id : {1, 2, 4})
+    expectFullScanEquivalent(graph.getVertex(id)->state, setup);
   EXPECT_TRUE(graph.getVertex(2)->vol_gain.is_frontier);
+  const auto selection_start = std::chrono::steady_clock::now();
   const auto selected = mgg::selectBestPath(graph, setup.planning, robot,
                                             mgg::EdgeInclinations{}, 0.2, 0);
   std::cout << "room range=" << GetParam()
             << " gain_ms=" << std::chrono::duration<double, std::milli>(scored - start).count()
             << " selection_ms=" << std::chrono::duration<double, std::milli>(
-                 std::chrono::steady_clock::now() - scored).count() << '\n';
+                 std::chrono::steady_clock::now() - selection_start).count() << '\n';
   EXPECT_EQ(selected.best_path_id, 4);
   ASSERT_FALSE(selected.best_path.empty());
   EXPECT_GT(selected.best_path.back()->state.x(), 6.2);  // outside the room
@@ -416,6 +456,116 @@ TEST(NativeGain, TheFrontierDenominatorIsWhatAnAllUnknownScanCounts) {
               static_cast<int>(sensor.uniqueVoxelsFullFov(kResolution)))
         << s.step * 180.0 / M_PI << " degrees, " << s.range << " m";
   }
+}
+
+// Includes boundary-origin and tied rays, a mount above the band, blockers
+// before band entry, and tilted authority planes. Out-of-band output is
+// permitted, but the complete in-band voxel set must match the reference.
+TEST(NativeGain, BandScanPreservesTiesTiltAndOccludingPrefixes) {
+  std::vector<Cell> occupied;
+  for (int x = -15; x < 15; ++x)
+    for (int y = -15; y < 15; ++y) {
+      if (x > 0) occupied.push_back({x, y, 8});
+      if (y < 0) occupied.push_back({x, y, -3});
+    }
+  mgg::NativeMolaGrid map(0.2, occupied, {}, {});
+  GainSetup setup(map);
+  setup.sensor.fov.y() = M_PI;
+  setup.sensor.resolution = Eigen::Vector2d::Constant(M_PI / 12);
+  setup.sensor.max_range = 8;
+  setup.sensor.update();
+  for (const Eigen::Vector3d origin : {Eigen::Vector3d(0, 0, 0),
+                                      Eigen::Vector3d(0.1, 0.1, 2.1),
+                                      Eigen::Vector3d(0.037, -0.181, -2.1)}) {
+    for (double tilt : {0.0, 0.03, 0.7}) {
+      const Eigen::Vector3d normal = Eigen::AngleAxisd(
+          tilt, Eigen::Vector3d(1, 2, 3).normalized()) * Eigen::Vector3d::UnitZ();
+      std::vector<Eigen::Vector3d> endpoints;
+      setup.sensor.getFrustumEndpoints(
+          mgg::StateVec(origin.x(), origin.y(), origin.z(), 0.0), endpoints);
+      mgg::GainCounts full, pruned;
+      std::vector<std::pair<Eigen::Vector3d, VoxelStatus>> a, b;
+      map.getScanStatusIterative(origin, endpoints, full, a, setup.sensor.model());
+      mgg::ScanBounds bounds;
+      bounds.bounds_from_map.linear() = Eigen::Quaterniond::FromTwoVectors(
+          normal, Eigen::Vector3d::UnitZ()).toRotationMatrix();
+      bounds.low.z() = -0.4;
+      bounds.high.z() = 0.8;
+      map.getScanStatusInBounds(origin, endpoints, pruned, b,
+                                setup.sensor.model(), bounds);
+      auto band = [&](const auto& entries) {
+        std::set<std::tuple<double, double, double, int>> result;
+        for (const auto& e : entries) {
+          const double height = normal.dot(e.first);
+          if (height >= -0.4 && height <= 0.8)
+            result.emplace(e.first.x(), e.first.y(), e.first.z(), int(e.second));
+        }
+        return result;
+      };
+      EXPECT_EQ(band(a), band(b)) << "origin=" << origin.transpose() << " tilt=" << tilt;
+      EXPECT_LT(pruned.voxel_visits, full.voxel_visits);
+    }
+  }
+}
+
+TEST(NativeGain, ScanWalkMatchesReferenceClosedVoxelSetsAndOcclusion) {
+  std::mt19937 random(74823);
+  for (int trial = 0; trial < 1200; ++trial) {
+    auto point = [&]() {
+      Eigen::Vector3d p;
+      for (int axis = 0; axis < 3; ++axis) {
+        p[axis] = (int(random() % 41) - 20) * 0.2;
+        if (trial % 3 == 1) p[axis] += 0.1;
+        if (trial % 3 == 2) p[axis] = std::nextafter(p[axis], 100.0);
+      }
+      return p;
+    };
+    const Eigen::Vector3d a = point();
+    const Eigen::Vector3d b = trial % 17 == 0 ? a : point();
+    for (bool blockers : {false, true}) {
+      std::set<std::tuple<std::int64_t, std::int64_t, std::int64_t>> full, fast;
+      auto visitor = [&](auto& cells, const mgg::VoxelIndex& cell) {
+        cells.emplace(cell.x, cell.y, cell.z);
+        return !blockers || (cell.x * 71 + cell.y * 37 + cell.z * 13) % 23 != 0;
+      };
+      const bool full_valid = mgg::walkVoxels(a, b, 0.2, 1u << 22,
+          [&](const auto& cell) { return visitor(full, cell); });
+      const bool fast_valid = mgg::walkScanVoxels(a, b, 0.2, 1u << 22,
+          [&](const auto& cell) { return visitor(fast, cell); });
+      EXPECT_EQ(full_valid, fast_valid);
+      EXPECT_EQ(full, fast) << "trial=" << trial << " blockers=" << blockers;
+    }
+  }
+}
+
+TEST(NativeGain, RotatedGainRegionsAndExclusionsRemainExact) {
+  auto map = terrain([](std::int64_t, std::int64_t)
+                         -> std::optional<std::int64_t> { return -1; });
+  GainSetup setup(map);
+  mgg::RobotParams robot;
+  robot.size.z() = 0.245;
+  setup.ctx.robot = &robot;
+  setup.planning.max_ground_height = 0.5;
+  setup.planning.free_voxel_gain = 3;
+  setup.planning.occupied_voxel_gain = 7;
+  setup.space.min_val = Eigen::Vector3d(-2, -1, -1);
+  setup.space.max_val = Eigen::Vector3d(5, 2, 3);
+  setup.space.rotations = Eigen::Vector3d(0.37, 0.03, 0.01);
+  setup.space.min_extension = Eigen::Vector3d(-1, -0.4, -0.1);
+  setup.space.max_extension = Eigen::Vector3d(0.5, 1, 0.2);
+  setup.space.setCenter(Eigen::Vector3d(0.1, 0.3, 0), true);
+  std::vector<mgg::BoundedSpaceParams> excluded{setup.space};
+  excluded[0].min_val = Eigen::Vector3d(2, -1, 0);
+  excluded[0].max_val = Eigen::Vector3d(3, 1, 2);
+  excluded[0].setCenter(Eigen::Vector3d::Zero().eval(), false);
+  setup.ctx.no_gain_zones = &excluded;
+  mgg::BoundedSpaceParams interest = setup.space;
+  interest.type = mgg::BoundedSpaceType::kSphere;
+  interest.radius = 4;
+  interest.setCenter(Eigen::Vector3d(1, 0, 0), false);
+  setup.ctx.gain_region = &interest;
+  for (double yaw : {0.0, 0.23, M_PI / 4})
+    expectFullScanEquivalent(mgg::StateVec(0.1, 0.3, 0.5, yaw), setup);
 }
 
 }  // namespace

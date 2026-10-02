@@ -72,6 +72,14 @@ struct XYCellCenter {
   std::int64_t grid_y = 0;
 };
 
+/// Conservative scan-interest box, independent of occupancy. A backend may
+/// stop beyond it but must retain the occluding prefix before entering it.
+struct ScanBounds {
+  Eigen::Isometry3d bounds_from_map = Eigen::Isometry3d::Identity();
+  Eigen::Vector3d low = Eigen::Vector3d::Constant(-std::numeric_limits<double>::infinity());
+  Eigen::Vector3d high = Eigen::Vector3d::Constant(std::numeric_limits<double>::infinity());
+};
+
 class MapInterface {
  public:
   virtual ~MapInterface() = default;
@@ -377,6 +385,18 @@ class MapInterface {
       GainCounts& gain, std::vector<std::pair<Eigen::Vector3d, VoxelStatus>>&
                             voxel_log,
       const SensorModel& sensor) = 0;
+
+  /// Exact scan evidence inside bounds (voxel centres).
+  /// Backends may retain out-of-band voxels, but must preserve occlusion on
+  /// the complete prefix before entering the band. The default is unpruned.
+  virtual void getScanStatusInBounds(
+      const Eigen::Vector3d& pos,
+      const std::vector<Eigen::Vector3d>& endpoints, GainCounts& gain,
+      std::vector<std::pair<Eigen::Vector3d, VoxelStatus>>& voxel_log,
+      const SensorModel& sensor, const ScanBounds& bounds) {
+    (void)bounds;
+    getScanStatusIterative(pos, endpoints, gain, voxel_log, sensor);
+  }
 
   // ----------------------------------------------------------- mutation
 

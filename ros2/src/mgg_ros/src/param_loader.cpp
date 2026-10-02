@@ -276,6 +276,7 @@ bool loadPlanningParams(const ParamLoader& p, const std::string& ns,
   p.get(ns + "/free_voxel_gain", out.free_voxel_gain);
   p.get(ns + "/occupied_voxel_gain", out.occupied_voxel_gain);
   p.get(ns + "/ground_frontier_height_margin", out.ground_frontier_height_margin);
+  p.get(ns + "/ground_gain_full_scan", out.ground_gain_full_scan);
   p.get(ns + "/unknown_voxel_gain", out.unknown_voxel_gain);
   p.get(ns + "/path_length_penalty", out.path_length_penalty);
   p.get(ns + "/path_direction_penalty", out.path_direction_penalty);

@@ -1567,6 +1567,26 @@ void MolaMap::getScanStatusIterative(
   for (auto& item : voxel_log) item.first = inverse * item.first;
 }
 
+void MolaMap::getScanStatusInBounds(
+    const Eigen::Vector3d& pos, const std::vector<Eigen::Vector3d>& rays,
+    GainCounts& gain,
+    std::vector<std::pair<Eigen::Vector3d, VoxelStatus>>& voxel_log,
+    const SensorModel& sensor, const ScanBounds& bounds) {
+  const auto snapshot = current();
+  gain = {};
+  voxel_log.clear();
+  if (snapshot == nullptr) return;
+  const auto& transform = snapshot->request.component_from_navigation;
+  std::vector<Eigen::Vector3d> endpoints = rays;
+  transformPoints(transform, endpoints);
+  const Eigen::Isometry3d inverse = transform.inverse();
+  ScanBounds transformed = bounds;
+  transformed.bounds_from_map = bounds.bounds_from_map * inverse;
+  snapshot->map->getScanStatusInBounds(transform * pos, endpoints, gain, voxel_log,
+                                      sensor, transformed);
+  for (auto& item : voxel_log) item.first = inverse * item.first;
+}
+
 bool MolaMap::augmentFreeBox(const Eigen::Vector3d&, const Eigen::Vector3d&) {
   // Only the qualified free set in SDMGRID1 may establish known free space.
   return false;

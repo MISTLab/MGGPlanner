@@ -3812,10 +3812,18 @@ std::string PlannerNode::buildLocalGraph() {
       planning_params_.cluster_vertices_for_gain);
   int frontiers = 0;
   std::int64_t band_unknown = 0, total_unknown = 0;
+  bool total_available = true;
+  std::int64_t free_voxels = 0, occupied_voxels = 0;
+  std::uint64_t gain_rays = 0, gain_visits = 0;
   for (const auto& entry : local_graph_->vertices_map_) {
     if (entry.second == nullptr) continue;
     band_unknown += entry.second->vol_gain.num_unknown_voxels;
-    total_unknown += entry.second->vol_gain.num_total_unknown_voxels;
+    if (entry.second->vol_gain.num_total_unknown_voxels < 0) total_available = false;
+    else total_unknown += entry.second->vol_gain.num_total_unknown_voxels;
+    free_voxels += entry.second->vol_gain.num_free_voxels;
+    occupied_voxels += entry.second->vol_gain.num_occupied_voxels;
+    gain_rays += entry.second->vol_gain.gain_rays_cast;
+    gain_visits += entry.second->vol_gain.gain_voxel_visits;
   }
   // Frontiers given up as unreachable from here (retention refused three
   // times) are no local gain remaining: they must not hold completion back
@@ -3829,12 +3837,16 @@ std::string PlannerNode::buildLocalGraph() {
     }
   }
   RCLCPP_INFO(get_logger(),
-              "gain evidence: %s; band-unknown=%lld total-unknown=%lld "
-              "frontiers=%d viewpoints=%d (summed per viewpoint, not map-unique)",
+              "gain evidence: %s; band-unknown=%lld total-unknown=%s "
+              "free=%lld occupied=%lld frontiers=%d viewpoints=%d "
+              "scan-rays=%llu scan-visits=%llu (summed per viewpoint; work backend-reported)",
               robot_params_.type == mgg::RobotType::kGroundRobot
                   ? "ground reachable-height band" : "aerial full 3D",
               static_cast<long long>(band_unknown),
-              static_cast<long long>(total_unknown), frontiers, evaluated);
+              (total_available ? std::to_string(total_unknown) : "unavailable (pruned)").c_str(),
+              static_cast<long long>(free_voxels), static_cast<long long>(occupied_voxels),
+              frontiers, evaluated, static_cast<unsigned long long>(gain_rays),
+              static_cast<unsigned long long>(gain_visits));
   // The graph's frontiers are worth keeping whether or not a path is chosen.
   add_frontiers_to_global_graph_ = local_graph_->getNumVertices() > 1;
 

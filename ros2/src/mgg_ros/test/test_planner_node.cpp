@@ -47,11 +47,11 @@ class PublicationProbeMap : public mgg::MolaMap {
       : mgg::MolaMap(mgg::MolaMapConfig{"/tmp/frontier_lease_probe"}) {}
   std::future<void> writer;
   bool publication_blocked = false;
-  void getScanStatusIterative(
+  void getScanStatusInBounds(
       const Eigen::Vector3d& pos,
       const std::vector<Eigen::Vector3d>& endpoints, mgg::GainCounts& gain,
       std::vector<std::pair<Eigen::Vector3d, mgg::VoxelStatus>>& log,
-      const mgg::SensorModel& sensor) override {
+      const mgg::SensorModel& sensor, const mgg::ScanBounds& bounds) override {
     std::promise<void> entered;
     auto ready = entered.get_future();
     writer = std::async(std::launch::async, [this, &entered]() {
@@ -61,7 +61,7 @@ class PublicationProbeMap : public mgg::MolaMap {
     ready.wait();
     publication_blocked =
         writer.wait_for(std::chrono::milliseconds(50)) == std::future_status::timeout;
-    mgg::MolaMap::getScanStatusIterative(pos, endpoints, gain, log, sensor);
+    mgg::MolaMap::getScanStatusInBounds(pos, endpoints, gain, log, sensor, bounds);
   }
 };
 
@@ -482,7 +482,10 @@ class PlannerNodeTestPeer {
     const mgg::StateVec state(x, 0, 0.35, 0);
     node.global_space_.setCenter(state, true);
     mgg::VolumetricGain gain;
+    const bool previous = node.planning_params_.ground_gain_full_scan;
+    node.planning_params_.ground_gain_full_scan = true;
     mgg::computeVolumetricGain(state, gain, node.makeGainContext());
+    node.planning_params_.ground_gain_full_scan = previous;
     return gain;
   }
   static void recheckFrontiersNear(PlannerNode& node, double x) {
@@ -996,6 +999,19 @@ class PlannerNodeTestPeer {
   }
   static void setHangingRootReach(PlannerNode& node, double reach) {
     node.hanging_root_edge_length_max_ = reach;
+  }
+  static void setGroundGainFullScan(PlannerNode& node, bool enabled) {
+    node.planning_params_.ground_gain_full_scan = enabled;
+  }
+  static auto localGainEvidence(PlannerNode& node) {
+    std::vector<std::tuple<int, int, int, int, bool, double>> evidence;
+    for (const auto& [id, vertex] : node.local_graph_->vertices_map_) {
+      const auto& gain = vertex->vol_gain;
+      evidence.emplace_back(id, gain.num_unknown_voxels, gain.num_free_voxels,
+                            gain.num_occupied_voxels, gain.is_frontier, gain.gain);
+    }
+    std::sort(evidence.begin(), evidence.end());
+    return evidence;
   }
   static void useBistroScoutGain(PlannerNode& node) {
     auto& sensor = node.sensors_.at("test_lidar");
@@ -2125,20 +2141,34 @@ TEST_F(PlannerNodeTest, GroundRoomAndCorridorPlanTiming) {
     }
     MolaFloorProduct product(-6, corridor ? 20 : 7, -6, 6, walls, unknown);
     for (int iteration = 0; iteration < 5; ++iteration) {
-      auto node = makeNode(std::string("timing_") + (corridor ? "corridor" : "room") +
-                           std::to_string(iteration));
-      PlannerNodeTestPeer::useMolaMap(*node, product.serve());
-      PlannerNodeTestPeer::useBistroScoutGain(*node);
-      PlannerNodeTestPeer::setLattice(*node, {-1, -2}, {corridor ? 1.5 : 6.5, 2});
-      PlannerNodeTestPeer::acceptOdometry(*node, 0, 0, 1);
-      auto response = std::make_shared<mgg_msgs::srv::PlannerSrv::Response>();
-      const auto start = std::chrono::steady_clock::now();
-      PlannerNodeTestPeer::plan(*node, response);
-      const double elapsed = std::chrono::duration<double, std::milli>(
-          std::chrono::steady_clock::now() - start).count();
-      std::cout << "PLAN_TIMING " << (corridor ? "corridor" : "room")
-                << " iteration=" << iteration << " total_ms=" << elapsed
-                << " path_poses=" << response->path.size() << '\n';
+      std::vector<std::tuple<int, int, int, int, bool, double>> pruned_evidence;
+      std::shared_ptr<mgg_msgs::srv::PlannerSrv::Response> pruned_response;
+      for (bool full_scan : {false, true}) {
+        auto node = makeNode(std::string("timing_") + (corridor ? "corridor" : "room") +
+                             std::to_string(iteration) + (full_scan ? "_full" : "_pruned"));
+        PlannerNodeTestPeer::useMolaMap(*node, product.serve());
+        PlannerNodeTestPeer::useBistroScoutGain(*node);
+        PlannerNodeTestPeer::setGroundGainFullScan(*node, full_scan);
+        PlannerNodeTestPeer::setLattice(*node, {-1, -2}, {corridor ? 1.5 : 6.5, 2});
+        PlannerNodeTestPeer::acceptOdometry(*node, 0, 0, 1);
+        auto response = std::make_shared<mgg_msgs::srv::PlannerSrv::Response>();
+        const auto start = std::chrono::steady_clock::now();
+        PlannerNodeTestPeer::plan(*node, response);
+        const double elapsed = std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - start).count();
+        std::cout << "PLAN_TIMING " << (corridor ? "corridor" : "room")
+                  << " mode=" << (full_scan ? "full" : "pruned")
+                  << " iteration=" << iteration << " total_ms=" << elapsed
+                  << " path_poses=" << response->path.size() << '\n';
+        if (!full_scan) {
+          pruned_evidence = PlannerNodeTestPeer::localGainEvidence(*node);
+          pruned_response = response;
+        } else {
+          EXPECT_EQ(pruned_evidence, PlannerNodeTestPeer::localGainEvidence(*node));
+          EXPECT_EQ(pruned_response->path, response->path);
+          EXPECT_EQ(pruned_response->status, response->status);
+        }
+      }
     }
   }
 }

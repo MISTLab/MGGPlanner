@@ -36,6 +36,9 @@ struct GainCounts {
   int unknown = 0;
   int occupied = 0;
   int free = 0;
+  /// Scan work diagnostics; zero when a backend does not instrument them.
+  std::uint64_t rays_cast = 0;
+  std::uint64_t voxel_visits = 0;
 };
 
 /// What the map layer needs to know about a sensor in order to compute

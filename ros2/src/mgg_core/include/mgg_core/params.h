@@ -222,6 +222,8 @@ struct PlanningParams {
   /// Ground frontier/gain ceiling above the vertex's floor: robot size.z()
   /// plus this margin (metres). Upper air cannot keep ground exploration local.
   double ground_frontier_height_margin = 0.5;
+  /// Diagnostic/reference scan including upper volume; disables band pruning.
+  bool ground_gain_full_scan = false;
   double unknown_voxel_gain = 10.0;
   double path_length_penalty = 0.0;
   /// How strongly selectBestPath prefers paths along the robot's heading:

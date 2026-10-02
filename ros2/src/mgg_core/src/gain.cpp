@@ -25,6 +25,29 @@ bool outsideGainRegion(const GainContext& ctx, const Eigen::Vector3d& voxel) {
   return ctx.gain_region != nullptr && !ctx.gain_region->isInsideSpace(voxel);
 }
 
+// Bound the existing inclusion region conservatively in navigation axes.
+// This is only traversal pruning; exact rotated/spherical inclusion remains
+// in the scoring loop below, as do no-gain exclusions.
+void intersectGainBounds(const BoundedSpaceParams& space, ScanBounds& bounds) {
+  Eigen::Vector3d low, high;
+  if (space.type == BoundedSpaceType::kSphere) {
+    const double radius = space.radiusTotal() > 0 ? space.radiusTotal() : space.radius;
+    low = space.getCenter() - Eigen::Vector3d::Constant(radius);
+    high = space.getCenter() + Eigen::Vector3d::Constant(radius);
+  } else {
+    const bool totals = space.minValTotal() != space.maxValTotal();
+    const Eigen::Vector3d a = totals ? space.minValTotal() : space.min_val;
+    const Eigen::Vector3d b = totals ? space.maxValTotal() : space.max_val;
+    const Eigen::Matrix3d rotation = space.getRotationMatrix().transpose();
+    const Eigen::Vector3d center = space.getCenter() + rotation * ((a + b) * 0.5);
+    const Eigen::Vector3d half = rotation.cwiseAbs() * ((b - a) * 0.5);
+    low = center - half;
+    high = center + half;
+  }
+  bounds.low = bounds.low.cwiseMax(low);
+  bounds.high = bounds.high.cwiseMin(high);
+}
+
 /// Where the ground under a vertex's surroundings has been mapped. The
 /// support of a column is the first occupied voxel below the vertex's
 /// height, as the planner's ground projection would find it, searched down
@@ -140,14 +163,6 @@ void computeVolumetricGain(
       continue;
     }
 
-    // Each voxel once per viewpoint: a voxel is revealed once however many
-    // rays cross it. getScanStatus logs it once per ray, and near the
-    // viewpoint hundreds of rays share a voxel (0.77 of the logged count was
-    // unique on the captured Bistro grids, diag-viewpoint 2026-09-24).
-    GainCounts raw;
-    std::vector<std::pair<Eigen::Vector3d, VoxelStatus>> visited;
-    ctx.map->getScanStatusIterative(ray_origin, endpoints, raw, visited,
-                                    sensor.model());
     // Interest follows the robot's reachable level, not unknown ceiling air
     // in a tall room. Keep the downward band: ramps and open stairwells can
     // reveal useful space below the vertex's own floor.
@@ -157,6 +172,23 @@ void computeVolumetricGain(
         : std::numeric_limits<double>::infinity();
     const double max_h_below =
         std::max(ctx.planning->max_ground_height * 2.0, 1.0);
+    GainCounts raw;
+    std::vector<std::pair<Eigen::Vector3d, VoxelStatus>> visited;
+    if (ground_robot && !ctx.planning->ground_gain_full_scan) {
+      ScanBounds bounds;
+      bounds.low.z() = origin.z() - max_h_below;
+      bounds.high.z() = band_top;
+      intersectGainBounds(*ctx.global_space, bounds);
+      if (ctx.gain_region) intersectGainBounds(*ctx.gain_region, bounds);
+      ctx.map->getScanStatusInBounds(ray_origin, endpoints, raw, visited,
+                                     sensor.model(), bounds);
+      gain.num_total_unknown_voxels = -1;  // unavailable, not zero unknown
+    } else {
+      ctx.map->getScanStatusIterative(ray_origin, endpoints, raw, visited,
+                                      sensor.model());
+    }
+    gain.gain_rays_cast += raw.rays_cast;
+    gain.gain_voxel_visits += raw.voxel_visits;
     const double floor_depth =
         ctx.planning->max_ground_height + ctx.map->getResolution();
     ColumnSupport support(*ctx.map, origin,
@@ -182,7 +214,8 @@ void computeVolumetricGain(
         }
       }
 
-      if (entry.second == VoxelStatus::kUnknown) ++gain.num_total_unknown_voxels;
+      if (gain.num_total_unknown_voxels >= 0 && entry.second == VoxelStatus::kUnknown)
+        ++gain.num_total_unknown_voxels;
       if (voxel.z() > band_top) continue;
 
       switch (entry.second) {

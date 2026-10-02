@@ -357,6 +357,9 @@ TEST(Gain, TallExploredRoomHasNoGroundInterestButAerialInterestRemains) {
   computeVolumetricGain(StateVec(0, 0, 0.5, 0), gain, f.ctx);
   EXPECT_FALSE(gain.is_frontier);
   EXPECT_EQ(gain.num_unknown_voxels, 0);
+  EXPECT_EQ(gain.num_total_unknown_voxels, -1);
+  f.planning.ground_gain_full_scan = true;
+  computeVolumetricGain(StateVec(0, 0, 0.5, 0), gain, f.ctx);
   EXPECT_EQ(gain.num_total_unknown_voxels, 100);
   EXPECT_DOUBLE_EQ(gain.gain, 0.0);  // even with nonzero free/occupied weights
   f.robot.type = mgg::RobotType::kAerialRobot;
@@ -438,6 +441,40 @@ TEST(Gain, GroundBandMarginIsConfigurableAndSensorThresholdCannotBypassIt) {
   computeVolumetricGain(StateVec(0, 0, 0.5, 0), gain, f.ctx);
   EXPECT_TRUE(gain.is_frontier);
   EXPECT_EQ(gain.num_unknown_voxels, 100);
+}
+
+// R2: request backend pruning before traversal, retaining the full endpoints
+// for exactly the reference DDA's corner and edge ties.
+TEST(Gain, GroundScanRequestsBandTraversalUnlessFullScanIsEnabled) {
+  class RecordingScan : public HalfMapped {
+   public:
+    int band_calls = 0;
+    void getScanStatusInBounds(
+        const Eigen::Vector3d& origin, const std::vector<Eigen::Vector3d>& ends,
+        GainCounts& counts,
+        std::vector<std::pair<Eigen::Vector3d, VoxelStatus>>& log,
+        const SensorModel& sensor, const mgg::ScanBounds& bounds) override {
+      ++band_calls;
+      EXPECT_TRUE(bounds.bounds_from_map.matrix().isIdentity());
+      EXPECT_DOUBLE_EQ(bounds.low.z(), -0.5);
+      EXPECT_DOUBLE_EQ(bounds.high.z(), 0.945);  // floor 0.2 + Scout height + margin
+      HalfMapped::getScanStatusIterative(origin, ends, counts, log, sensor);
+    }
+  } map;
+  Fixture f;
+  mgg::RobotParams robot;
+  robot.size.z() = 0.245;
+  f.planning.max_ground_height = 0.3;
+  f.ctx.robot = &robot;
+  f.ctx.map = &map;
+  VolumetricGain gain;
+  computeVolumetricGain(StateVec(0.1, 0.1, 0.5, 0), gain, f.ctx);
+  EXPECT_EQ(gain.num_total_unknown_voxels, -1);
+  EXPECT_EQ(map.band_calls, 1);
+  f.planning.ground_gain_full_scan = true;
+  computeVolumetricGain(StateVec(0.1, 0.1, 0.5, 0), gain, f.ctx);
+  EXPECT_EQ(map.band_calls, 1);
+  EXPECT_GE(gain.num_total_unknown_voxels, gain.num_unknown_voxels);
 }
 
 }  // namespace
