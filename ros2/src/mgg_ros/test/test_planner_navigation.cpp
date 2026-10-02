@@ -327,6 +327,22 @@ class PlannerNodeTestPeer {
     node.global_graph_->addVertex(b);
     node.global_graph_->addEdge(a, b, 2.0);
   }
+  static void nearRequestDeadline(PlannerNode& node) {
+    node.lattice_deadline_ = std::chrono::steady_clock::now() + std::chrono::milliseconds(80);
+    node.global_graph_->reset();
+    for (int i = 0; i < 500; ++i) {
+      node.global_graph_->addVertex(new mgg::Vertex(i, mgg::StateVec(i, 0, .935, 0)));
+      if (i) node.global_graph_->addEdge(node.global_graph_->getVertex(i-1),
+                                       node.global_graph_->getVertex(i), 1);
+    }
+    node.global_graph_->setEdgeBlocked([](const auto&, const auto&) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(1)); return false;
+    });
+  }
+  static bool requestExpired(const PlannerNode& node) {
+    return std::chrono::steady_clock::now() >= *node.lattice_deadline_;
+  }
+  static bool diagnosisCutShort(const PlannerNode& node) { return node.peer_diagnosis_cut_short_; }
   static void diagnose(PlannerNode& node) {
     mgg::ShortestPathsReport report;
     node.diagnosePeerSearch(0, report);
@@ -452,6 +468,16 @@ TEST_F(PlannerNavigationTest, InterruptedPeerDiagnosisRestoresCollisionChecks) {
   EXPECT_TRUE(PlannerNodeTestPeer::peerBlocks(*node));
 }
 
+TEST_F(PlannerNavigationTest, PeerDiagnosisYieldsBeforeTheRequestDeadline) {
+  MolaTerrainProduct product(.1, -3, 4, -3, 3, flat);
+  auto node = botmanNode("nested_budget", product);
+  PlannerNodeTestPeer::nearRequestDeadline(*node);
+  mgg::PlanningCancellationScope hard([&] { return PlannerNodeTestPeer::requestExpired(*node); });
+  EXPECT_NO_THROW(PlannerNodeTestPeer::diagnose(*node));
+  EXPECT_TRUE(PlannerNodeTestPeer::diagnosisCutShort(*node));
+  EXPECT_FALSE(PlannerNodeTestPeer::requestExpired(*node));
+}
+
 TEST_F(PlannerNavigationTest, RequestBudgetRefusesWithoutPublishingAPartialRoute) {
   MolaTerrainProduct product(0.1, -8, 8, -8, 8,
                               [](double, double) { return -0.61; });
@@ -460,7 +486,7 @@ TEST_F(PlannerNavigationTest, RequestBudgetRefusesWithoutPublishingAPartialRoute
   PlannerNodeTestPeer::setBudget(*node, 1e-9);
   const auto started = std::chrono::steady_clock::now();
   const auto response = navigate(*node, 4, 0);
-  EXPECT_EQ(response->status, Service::Response::BLOCKED);
+  EXPECT_EQ(response->status, Service::Response::UNREACHABLE);
   EXPECT_TRUE(response->path.empty());
   EXPECT_NE(response->reason.find("planning budget exceeded"), std::string::npos);
   EXPECT_NE(response->reason.find("ms"), std::string::npos);

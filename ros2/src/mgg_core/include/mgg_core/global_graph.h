@@ -551,7 +551,8 @@ GlobalFrontierReport searchGlobalFrontier(
     double exclusion_radius = 0.0, const Eigen::Vector3d* target = nullptr,
     double time_budget_s = std::numeric_limits<double>::infinity(),
     const Eigen::Vector3d* robot_position = nullptr, double reach_distance = 0.0,
-    const UsableVertexFn& eligible = {});
+    const UsableVertexFn& eligible = {},
+    std::optional<std::chrono::steady_clock::time_point> deadline = std::nullopt);
 
 }  // namespace mgg
 

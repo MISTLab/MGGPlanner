@@ -1318,7 +1318,8 @@ GlobalFrontierReport searchGlobalFrontier(
     const std::vector<Eigen::Vector3d>& excluded, double exclusion_radius,
     const Eigen::Vector3d* target, double time_budget_s,
     const Eigen::Vector3d* robot_position, double reach_distance,
-    const UsableVertexFn& eligible) {
+    const UsableVertexFn& eligible,
+    std::optional<std::chrono::steady_clock::time_point> deadline) {
   GlobalFrontierReport report;
 
   std::vector<Vertex*> global_frontiers;
@@ -1411,14 +1412,35 @@ GlobalFrontierReport searchGlobalFrontier(
   // Re-check (rrg.cpp:5612 to 5625) and rank (rrg.cpp:5766 to 5818).
   for (std::size_t i = 0; i < order.size(); ++i) {
     planningCheckpoint();
-    if (i > 0 && recheck_seconds >= time_budget_s) {
+    if ((deadline && std::chrono::steady_clock::now() >= *deadline) ||
+        (i > 0 && recheck_seconds >= time_budget_s)) {
       report.unchecked = static_cast<int>(order.size() - i);
       report.frontiers += report.unchecked;
       break;
     }
     Vertex* frontier = order[i].frontier;
     const auto started = std::chrono::steady_clock::now();
-    if (recompute_gain) recompute_gain(*frontier);
+    if (recompute_gain) {
+      // A partially recomputed gain is not evidence; retain its previous
+      // value and return only the already-completed candidates.
+      struct FrontierBudgetExpired {};
+      const auto previous_gain = frontier->vol_gain;
+      const auto* outer = planning_cancelled;
+      PlanningCancellationScope soft([&] {
+        if (outer && (*outer)()) return true;  // external cancellation still wins
+        if (deadline && std::chrono::steady_clock::now() >= *deadline)
+          throw FrontierBudgetExpired{};
+        return false;
+      });
+      try {
+        recompute_gain(*frontier);
+      } catch (const FrontierBudgetExpired&) {
+        frontier->vol_gain = previous_gain;
+        report.unchecked = static_cast<int>(order.size() - i);
+        report.frontiers += report.unchecked;
+        break;
+      }
+    }
     if (recompute_gain && frontier->robot_id == robot_id) {
       ++report.rechecked;
       recheck_seconds += std::chrono::duration<double>(

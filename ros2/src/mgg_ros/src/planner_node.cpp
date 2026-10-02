@@ -222,6 +222,23 @@ struct DeadlineScope {
   }
 };
 
+// Inner searches must yield with time left to validate/publish best-so-far.
+// Reserve a fifth of remaining request time (at most 50 ms).
+std::chrono::steady_clock::time_point innerDeadline(
+    const std::optional<std::chrono::steady_clock::time_point>& request,
+    double budget_s) {
+  const auto now = std::chrono::steady_clock::now();
+  auto deadline = now + std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+      std::chrono::duration<double>(std::max(0.0, budget_s)));
+  if (request) {
+    const auto remaining = std::max(*request - now, std::chrono::steady_clock::duration::zero());
+    const auto reserve = std::min(remaining / 5,
+        std::chrono::duration_cast<std::chrono::steady_clock::duration>(std::chrono::milliseconds(50)));
+    deadline = std::min(deadline, *request - reserve);
+  }
+  return deadline;
+}
+
 double secondsSince(const std::chrono::steady_clock::time_point& then) {
   return std::chrono::duration<double>(std::chrono::steady_clock::now() - then)
       .count();
@@ -2748,12 +2765,9 @@ bool PlannerNode::peersInForce() const {
 bool PlannerNode::diagnosePeerSearch(int source_id,
                                      mgg::ShortestPathsReport& rep) {
   ++peer_diagnoses_;
-  const auto deadline =
-      peer_diagnosis_deadline_.value_or(
-          std::chrono::steady_clock::now() +
-          std::chrono::duration_cast<std::chrono::steady_clock::duration>(
-              std::chrono::duration<double>(std::max(
-                  0.0, planning_params_.global_search_time_budget_s))));
+  const auto deadline = std::min(
+      peer_diagnosis_deadline_.value_or(std::chrono::steady_clock::time_point::max()),
+      innerDeadline(lattice_deadline_, planning_params_.global_search_time_budget_s));
   const FlagScope open(peer_edges_open_);
   rep = mgg::ShortestPathsReport();
   global_graph_->findShortestPaths(source_id, rep, deadline);
@@ -4739,6 +4753,7 @@ bool PlannerNode::routeOverLocalLattice(const mgg::StateVec& goal,
   plan_ground.setProfile(&profile);
   mgg::ExpandContext ctx = makeContext();
   ctx.ground = &plan_ground;
+  if (peer_diagnosis_deadline_) ctx.deadline = peer_diagnosis_deadline_;
   mgg::LocalRouteResult local = mgg::routeOverLocalLattice(
       *local_graph_, current_state_, goal, grid_params_, ctx);
   local_route_profile_ = std::to_string(local.lattice.vertices_added) +
@@ -4746,6 +4761,7 @@ bool PlannerNode::routeOverLocalLattice(const mgg::StateVec& goal,
   if (!local.routed) {
     reason = local.reason;
     if (local.lattice.hit_deadline) {
+      if (peer_diagnosis_deadline_) peer_diagnosis_cut_short_ = true;
       reason += " (the lattice stopped at its time budget, " +
                 std::to_string(lattice_time_budget_s_) + " s)";
     }
@@ -4924,7 +4940,9 @@ bool PlannerNode::runGlobalPlanner(int target_id, std::string& reason,
         excluded, exclusion_radius,
         exploration_target_.has_value() ? &*exploration_target_ : nullptr,
         planning_params_.global_search_time_budget_s, &robot_position,
-        reach_distance_, inside_region);
+        reach_distance_, inside_region,
+        lattice_deadline_ ? std::optional(innerDeadline(lattice_deadline_,
+            planning_params_.global_search_time_budget_s)) : std::nullopt);
     global_space_.setCenter(current_state_, /*use_extension=*/true);
     // Cut short, the search is no answer whether or not it found a
     // frontier: the one it found may yet fail to route (review r0, I-6).
@@ -6471,11 +6489,8 @@ void PlannerNode::onObjectiveRequest(
       const FlagScope open(peer_edges_open_);
       const RestoreScope restore_deadline(peer_diagnosis_deadline_);
       peer_diagnosis_cut_short_ = false;
-      peer_diagnosis_deadline_ =
-          std::chrono::steady_clock::now() +
-          std::chrono::duration_cast<std::chrono::steady_clock::duration>(
-              std::chrono::duration<double>(std::max(
-                  0.0, planning_params_.global_search_time_budget_s)));
+      peer_diagnosis_deadline_ = innerDeadline(
+          lattice_deadline_, planning_params_.global_search_time_budget_s);
       std::vector<mgg::StateVec> open_route;
       mgg::PathOkFn open_turns_ok;
       std::string open_reason;
@@ -6577,7 +6592,9 @@ void PlannerNode::onObjectiveRequest(
   mgg::planningCheckpoint();
   } catch (const mgg::PlanningInterrupted&) {
     response->path.clear();
-    response->status = mgg_msgs::srv::PlanObjective::Response::BLOCKED;
+    response->status = budget.cancelled_
+        ? mgg_msgs::srv::PlanObjective::Response::BLOCKED
+        : mgg_msgs::srv::PlanObjective::Response::UNREACHABLE;
     response->reason = budget.reason();
     RCLCPP_WARN(get_logger(), "%s", response->reason.c_str());
   }

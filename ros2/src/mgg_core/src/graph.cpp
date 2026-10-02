@@ -117,8 +117,7 @@ struct DeadlineVisitor : boost::default_dijkstra_visitor {
   void examine_vertex(Vertex, const G&) {
     planningCheckpoint();
     if (deadline == nullptr) return;
-    if (++*settled % Graph::kDeadlineCheckVertices == 0 &&
-        std::chrono::steady_clock::now() >= *deadline) {
+    if (std::chrono::steady_clock::now() >= *deadline) {
       throw SearchDeadlinePassed{};
     }
   }

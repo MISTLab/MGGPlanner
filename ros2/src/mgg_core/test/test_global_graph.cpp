@@ -1643,6 +1643,27 @@ TEST(SearchGlobalFrontier, ATimeBudgetRechecksTheMostPromisingFrontierFirst) {
   EXPECT_EQ(report.best_frontier, graph.far_);
 }
 
+TEST(SearchGlobalFrontier, RequestSoftDeadlineReturnsCompletedBestGain) {
+  FrontierGraph graph;
+  graph.seen_->type = VertexType::kUnvisited;
+  for (auto& entry : graph.fixture.global.vertices_map_) entry.second->vol_gain.gain = 1;
+  graph.far_->vol_gain.gain = 1e6;
+  const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(20);
+  const auto hard = deadline + std::chrono::milliseconds(100);
+  int rechecks = 0;
+  mgg::PlanningCancellationScope request([&] { return std::chrono::steady_clock::now() >= hard; });
+  const auto report = mgg::searchGlobalFrontier(graph.fixture.global, 0, 0,
+      [&](Vertex& v) {
+        if (++rechecks == 1) { graph.recompute()(v); return; }
+        v.vol_gain.gain = 1e9;  // incomplete work must not win
+        while (true) { mgg::planningCheckpoint(); }
+      }, {}, 0, nullptr, 1.0, nullptr, 0, {}, deadline);
+  EXPECT_EQ(report.best_frontier, graph.far_);
+  EXPECT_TRUE(report.cut_short());
+  EXPECT_EQ(report.rechecked, 1);
+  EXPECT_LT(std::chrono::steady_clock::now(), hard);
+}
+
 TEST(SearchGlobalFrontier, NoReachableFrontierReportsNone) {
   Roadmap fixture;
   // Nothing typed as a frontier at all.
