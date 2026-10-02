@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstring>
 #include <utility>
 #include <vector>
 
@@ -69,16 +70,19 @@ bool edgeTraversable(const ExpandContext& ctx, const Eigen::Vector3d& start,
   }
   EdgeVerdictCache::Key key{};
   if (ctx.edge_verdicts != nullptr) {
-    const auto micro = [](double value) {
-      return static_cast<std::int64_t>(std::llround(value * 1e6));
+    const auto exactBits = [](double value) {
+      std::int64_t bits;
+      if (value == 0.0) value = 0.0;  // canonicalize signed zero
+      std::memcpy(&bits, &value, sizeof(bits));
+      return bits;
     };
-    key = {micro(start.x()), micro(start.y()), micro(start.z()),
-           micro(end.x()),   micro(end.y()),   micro(end.z()),
+    key = {exactBits(start.x()), exactBits(start.y()), exactBits(start.z()),
+           exactBits(end.x()),   exactBits(end.y()),   exactBits(end.z()),
            (is_hanging ? 1 : 0) | (preserve_start_height ? 2 : 0) |
                (stop_at_unknown ? 4 : 0) |
                (travel == EdgeTravel::kForward ? 8 : 0),
-           micro(ctx.robot_box_size.x()), micro(ctx.robot_box_size.y()),
-           micro(ctx.robot_box_size.z()), 0, 0};
+           exactBits(ctx.robot_box_size.x()), exactBits(ctx.robot_box_size.y()),
+           exactBits(ctx.robot_box_size.z()), 0, 0};
     if (const EdgeVerdictCache::Verdict* known = ctx.edge_verdicts->find(key)) {
       if (PlanProfile* profile = ctx.ground->profile()) {
         ++profile->edge_cache_hits;

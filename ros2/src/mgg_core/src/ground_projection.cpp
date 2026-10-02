@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstring>
 #include <functional>
 #include <map>
 #include <utility>
@@ -29,6 +30,13 @@ std::int64_t micro(double value) {
   return static_cast<std::int64_t>(std::llround(value * 1e6));
 }
 
+std::int64_t projectionBits(double value) {
+  std::int64_t bits;
+  if (value == 0.0) value = 0.0;
+  std::memcpy(&bits, &value, sizeof(bits));
+  return bits;
+}
+
 }  // namespace
 
 double GroundProjection::projectSample(Eigen::Vector3d& sample,
@@ -39,8 +47,8 @@ double GroundProjection::projectSample(Eigen::Vector3d& sample,
   if (!cache_footprint_ground_ || !sample.allFinite()) {
     return castProjection(sample, status);
   }
-  const ProjectionKey key{micro(sample.x()), micro(sample.y()),
-                          micro(sample.z())};
+  const ProjectionKey key{projectionBits(sample.x()), projectionBits(sample.y()),
+                          projectionBits(sample.z())};
   const auto known = projections_.find(key);
   if (known != projections_.end()) {
     if (profile_ != nullptr) ++profile_->projection_cache_hits;
@@ -649,7 +657,7 @@ bool GroundProjection::footprintGroundBelow(const Eigen::Vector3d& point,
                                             Eigen::Vector3d& ground) const {
   if (!cache_footprint_ground_) return groundBelow(point, ground);
   std::vector<GroundFromHeight>& column =
-      ground_below_column_[ColumnKey{micro(point.x()), micro(point.y())}];
+      ground_below_column_[ColumnKey{projectionBits(point.x()), projectionBits(point.y())}];
   for (const GroundFromHeight& earlier : column) {
     planningCheckpoint();
     // A ray that starts between an earlier ray's start and the ground it

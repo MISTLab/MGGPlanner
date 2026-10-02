@@ -6,6 +6,7 @@
 #include <array>
 #include <chrono>
 #include <cmath>
+#include <cstring>
 #include <optional>
 #include <tuple>
 #include <unordered_map>
@@ -15,9 +16,12 @@ namespace mgg {
 
 namespace {
 
-/// A length or angle as a whole number of millionths, for a cache key.
-std::int64_t micro(double value) {
-  return static_cast<std::int64_t>(std::llround(value * 1e6));
+/// Exact finite input bits: sub-cell rounding can cross a voxel boundary.
+std::int64_t exactBits(double value) {
+  std::int64_t bits;
+  if (value == 0.0) value = 0.0;  // canonicalize signed zero
+  std::memcpy(&bits, &value, sizeof(bits));
+  return bits;
 }
 
 struct KeyHash {
@@ -282,8 +286,8 @@ GridGraphResult buildGridGraph(GraphManager& graph, const StateVec& state,
     std::optional<ProfileScope> timed_precheck;
     timed_precheck.emplace(profile ? &profile->cell_prechecks : nullptr);
     const std::array<std::int64_t, 4> precheck_key{
-        micro(center.x()), micro(center.y()), micro(center.z()),
-        micro(body.heading)};
+        exactBits(center.x()), exactBits(center.y()), exactBits(center.z()),
+        exactBits(body.heading)};
     const auto known = ground_robot ? prechecks.find(precheck_key)
                                     : prechecks.end();
     VoxelStatus status = VoxelStatus::kUnknown;

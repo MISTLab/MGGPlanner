@@ -999,6 +999,21 @@ TEST(GroundProjection, APlanCacheCastsAgainFromInsideAWall) {
   EXPECT_DOUBLE_EQ(cached_low.tilt, plain_low.tilt);
 }
 
+TEST(GroundProjection, ProjectionCacheDoesNotRoundAcrossAVoxelBoundary) {
+  Terrain map;
+  PlanningParams planning;
+  GroundProjection cached(map, planning, true), plain(map, planning, false);
+  Eigen::Vector3d before(8.0 - 1e-7, 0, 0.9);
+  VoxelStatus status;
+  cached.projectSample(before, status);
+  Eigen::Vector3d after(8.0 + 1e-7, 0, 0.9), reference = after;
+  const double expected = plain.projectSample(reference, status);
+  const VoxelStatus expected_status = status;
+  EXPECT_DOUBLE_EQ(cached.projectSample(after, status), expected);
+  EXPECT_EQ(status, expected_status);
+  EXPECT_EQ(after, reference);
+}
+
 }  // namespace
 
 TEST(GroundProjection, PlatformCellRiseLimitsKeepSmoothFifteenDegreeRamp) {
