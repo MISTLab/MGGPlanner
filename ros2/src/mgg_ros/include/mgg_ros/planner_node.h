@@ -1035,6 +1035,7 @@ class PlannerNode : public rclcpp::Node {
   /// exploration path ending this close to the robot goes nowhere.
   double reach_distance_ = 0.3;
   /// See the parameter's comment in the constructor.
+  double ground_exploration_lattice_budget_s_ = 0.1;
   bool allow_unknown_lattice_body_ = false;
   std::string unknown_body_policy_ = "strict";
   std::string unknown_body_sensor_ = "VLP16";

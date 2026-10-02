@@ -347,6 +347,23 @@ class PlannerNodeTestPeer {
     request.component_id = node.mapping_snapshot_.component_id;
     request.map_epoch = node.mapping_snapshot_.epoch;
   }
+  static nlohmann::json explorationMetrics(PlannerNode& node) {
+    double radius = 0, length = 0;
+    for (const auto& entry : node.local_graph_->vertices_map_)
+      radius = std::max(radius, (entry.second->state.head<2>() - node.current_state_.head<2>()).norm());
+    for (std::size_t i = 1; i < node.best_path_.size(); ++i)
+      length += (node.best_path_[i].head<3>() - node.best_path_[i-1].head<3>()).norm();
+    double selected_gain = 0, distance = std::numeric_limits<double>::infinity();
+    if (!node.best_path_.empty()) for (const auto& entry : node.local_graph_->vertices_map_) {
+      const double d = (entry.second->state.head<3>() - node.best_path_.back().head<3>()).norm();
+      if (d < distance) { distance = d; selected_gain = entry.second->vol_gain.gain; }
+    }
+    return {{"lattice_radius_m",radius},{"viewpoints",node.local_graph_->getNumVertices()},
+      {"best_path_length_m",length},{"endpoint_gain",selected_gain}};
+  }
+  static void explorationSlice(PlannerNode& node, double seconds) {
+    node.ground_exploration_lattice_budget_s_ = seconds;
+  }
   static void forceGlobalFallback(PlannerNode& node, bool force) {
     node.grid_params_.min_val.x() = force ? -1 : -6;
     node.grid_params_.max_val.x() = force ? 1 : 6;
@@ -516,17 +533,24 @@ TEST_F(PlannerNavigationTest, BotmanFixtureFullServicesBenchmark) {
     options.automatically_declare_parameters_from_overrides(true);
     auto node = std::make_shared<PlannerNode>(options);
     PlannerNodeTestPeer::configureBotman(*node);
+    if (const char* slice = std::getenv("MGG_SERVICE_LATTICE_MS"))
+      PlannerNodeTestPeer::explorationSlice(*node, std::atof(slice)/1000);
     if (!allow_unknown) PlannerNodeTestPeer::hardwarePolicy(*node);
     ASSERT_TRUE(PlannerNodeTestPeer::serveFixture(*node, root));
     if (policy == "above_sensor_fov") PlannerNodeTestPeer::sensorPolicy(*node);
     PlannerNodeTestPeer::standAt(*node, 0, 0, -.61, M_PI, run+1);
-    for (const std::string mode : {"navigate_local", "navigate_global_fallback", "navigate_15m", "explore"}) {
+    for (const std::string mode : {"navigate_local", "navigate_global_fallback", "navigate_15m", "explore_origin", "explore_1.13", "explore_-3.17"}) {
       PlannerNodeTestPeer::forceGlobalFallback(*node, mode == "navigate_global_fallback");
       const auto started = std::chrono::steady_clock::now();
       int status = 0;
       std::size_t poses = 0;
       std::string reason;
-      if (mode == "explore") {
+      const bool exploring = mode.find("explore_") == 0;
+      if (exploring) {
+        const double x = mode == "explore_1.13" ? 1.13 : mode == "explore_-3.17" ? -3.17 : 0;
+        const double y = mode == "explore_1.13" ? .07 : mode == "explore_-3.17" ? -.01 : 0;
+        const double heading = mode == "explore_1.13" ? -.08 : mode == "explore_-3.17" ? 3.10 : M_PI;
+        PlannerNodeTestPeer::standAt(*node, x, y, -.61, heading, run*10 + (x == 0 ? 2 : x > 0 ? 3 : 4));
         const auto result = PlannerNodeTestPeer::explore(*node);
         status = result->status; poses = result->path.size();
       } else {
@@ -539,7 +563,8 @@ TEST_F(PlannerNavigationTest, BotmanFixtureFullServicesBenchmark) {
           std::chrono::steady_clock::now() - started).count();
       nlohmann::json row{{"service",mode},{"repeat",run},{"unknown_body_policy",policy},{"allow_unknown_body",allow_unknown},
           {"request_budget_ms",500},{"total_ms",elapsed},{"status",status},{"poses",poses},
-          {"reason",reason},{"x86_budget_met",elapsed <= (mode=="explore" ? 350 : 300)}};
+          {"reason",reason},{"x86_budget_met",elapsed <= 300}};
+      if (exploring) row.update(PlannerNodeTestPeer::explorationMetrics(*node));
       std::printf("SERVICE_BENCH %s\n", row.dump().c_str());
       EXPECT_LT(elapsed, 1000);  // hard envelope, not a claim of the x86 target
     }

@@ -43,7 +43,7 @@ struct GridGraphParams {
 
 /// Ground exploration sweeps retain their nearest-first prefix at this
 /// soft slice, leaving request time for gain, selection and the tour.
-inline constexpr double kGroundExplorationLatticeBudgetS = 0.2;
+inline constexpr double kGroundExplorationLatticeBudgetS = 0.1;
 
 enum class GridGraphStatus {
   kOk = 0,

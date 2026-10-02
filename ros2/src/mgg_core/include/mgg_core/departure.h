@@ -69,6 +69,10 @@ bool pointInBox(const Eigen::Vector2d& point, const OrientedBox& box);
 /// `box.center` is ignored. With clearance_prefilter, a known-free
 /// circumscribed static AABB may accept early, after the dynamic sweep.
 /// An occupied or unknown bound never decides: the exact sweep follows.
+/// With unknown_above_center, all occupied volume still blocks, and the
+/// volume below that height relative to each body centre is strictly known
+/// free. Only the ground local-lattice sensor policy supplies this value;
+/// aerial and global checks leave it unset. The pre-filter is disabled.
 VoxelStatus orientedBoxPathStatus(const MapInterface& map,
                                   const Eigen::Vector3d& start,
                                   const Eigen::Vector3d& end,

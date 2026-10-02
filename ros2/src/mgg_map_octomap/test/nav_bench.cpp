@@ -44,6 +44,7 @@ int main(int argc, char** argv) {
   bool diagnose_body = false;
   std::optional<double> sensor_height;
   double sensor_vfov = 0;
+  double lattice_budget_ms = 100.0;
   for (int i = 2; i < argc; ++i) {
     if (std::strcmp(argv[i], "--repeat") == 0 && i + 1 < argc) {
       repeat = std::max(1, std::atoi(argv[++i]));
@@ -55,6 +56,9 @@ int main(int argc, char** argv) {
       char* end = nullptr;
       request_budget_ms = std::strtod(argv[++i], &end);
       if (*end != '\0' || !std::isfinite(request_budget_ms) || request_budget_ms < 0) return 2;
+    } else if (std::strcmp(argv[i], "--lattice-budget-ms") == 0 && i + 1 < argc) {
+      lattice_budget_ms = std::atof(argv[++i]);
+      if (!std::isfinite(lattice_budget_ms) || lattice_budget_ms <= 0) return 2;
     } else if (std::strcmp(argv[i], "--sensor-height") == 0 && i + 1 < argc) {
       sensor_height = std::atof(argv[++i]);
     } else if (std::strcmp(argv[i], "--sensor-vfov") == 0 && i + 1 < argc) {
@@ -132,18 +136,26 @@ int main(int argc, char** argv) {
         planning_map->getCircleIntersectingXYCellCenters(p.head<2>(), size.head<2>().norm()/2, 1024, cells);
         mgg::OrientedBox box; box.size = size; box.center = p; box.heading = root[3];
         nlohmann::json rows = nlohmann::json::array();
+        nlohmann::json occupied_cells = nlohmann::json::array();
         for (double z = std::floor((p.z()-size.z()/2)/.1)*.1+.05; z <= p.z()+size.z()/2+.05; z+=.1) {
           int occupied=0, unknown=0, free=0;
           nlohmann::json witnesses = nlohmann::json::array();
           for (const auto& cell : cells) if (mgg::cellMeetsBox(cell.center, .1, box, -1e-9)) {
             const Eigen::Vector3d voxel(cell.center.x(),cell.center.y(),z);
             const auto status = planning_map->getVoxelStatus(voxel);
-            if (status == mgg::VoxelStatus::kOccupied) ++occupied;
+            if (status == mgg::VoxelStatus::kOccupied) {
+              ++occupied;
+              const Eigen::Vector2d delta = voxel.head<2>() - p.head<2>();
+              const double x = std::cos(root[3])*delta.x() + std::sin(root[3])*delta.y();
+              const double y = -std::sin(root[3])*delta.x() + std::cos(root[3])*delta.y();
+              occupied_cells.push_back({{"world", {voxel.x(),voxel.y(),voxel.z()}},
+                  {"lidar_xy", {x,y}}, {"height_above_projected_ground", z-p.z()+planning.max_ground_height}});
+            }
             else if (status == mgg::VoxelStatus::kUnknown) ++unknown; else ++free;
             if (status != mgg::VoxelStatus::kFree && witnesses.size()<4)
               witnesses.push_back({voxel.x(),voxel.y(),voxel.z(),int(status)});
           }
-          rows.push_back({{"z",z},{"below_sensor",z<=lidar_z},{"occupied",occupied},
+          rows.push_back({{"z",z},{"below_sensor",z-.05<=lidar_z},{"occupied",occupied},
                           {"unknown",unknown},{"free",free},{"witnesses",witnesses}});
         }
         nlohmann::json row{{"scenario",scenario.name},{"dx",dx},{"root_z",root.z()},
@@ -151,7 +163,7 @@ int main(int argc, char** argv) {
           {"strict_box",int(planning_map->getBoxStatus(p,size,true))},
           {"relaxed_box",int(planning_map->getBoxStatus(p,size,false))},
           {"bounded_box",int(mgg::orientedBoxPathStatus(*planning_map,p,p,box,true,nullptr,false,
-                lidar_z-p.z()))},{"slices",rows}};
+                lidar_z-p.z()))},{"slices",rows},{"occupied_cells",occupied_cells}};
         std::printf("%s\n",row.dump().c_str());
       }
     }
@@ -162,7 +174,7 @@ int main(int argc, char** argv) {
     if (budget_ms > 0.0) scenario.budget_ms = budget_ms;
     for (int r = 0; r < repeat; ++r) {
       const mgg::nav_bench::Outcome outcome =
-          mgg::nav_bench::run(*planning_map, scenario, allow_unknown_body, request_budget_ms, sensor_height);
+          mgg::nav_bench::run(*planning_map, scenario, allow_unknown_body, request_budget_ms, sensor_height, lattice_budget_ms);
       if (!outcome.expectation_met) ++failures;
       // Retain every sample, including the cold first run and slow outliers.
       if (json) {

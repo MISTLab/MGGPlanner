@@ -672,6 +672,11 @@ PlannerNode::PlannerNode(const rclcpp::NodeOptions& options)
   // whose body volume is partly unobserved; known occupied volume still
   // rejects it, and mapped ground under it and along the edge stays
   // mandatory. Off by default; simulation with a keyframe map turns it on.
+  ground_exploration_lattice_budget_s_ = declareOrGet<double>(
+      this, "ground_exploration_lattice_budget_s", mgg::kGroundExplorationLatticeBudgetS);
+  if (!std::isfinite(ground_exploration_lattice_budget_s_) ||
+      ground_exploration_lattice_budget_s_ <= 0)
+    throw std::invalid_argument("ground_exploration_lattice_budget_s must be positive");
   allow_unknown_lattice_body_ = declareOrGet<bool>(
       this, "allow_unknown_lattice_body", allow_unknown_lattice_body_);
   // Old simulation configurations retain their explicitly relaxed control.
@@ -4107,8 +4112,7 @@ std::string PlannerNode::buildLocalGraph() {
   mgg::ExpandContext ctx = makeContext();
   ctx.ground = &plan_ground;
   if (robot_params_.type == mgg::RobotType::kGroundRobot && lattice_time_budget_s_ > 0) {
-    const auto slice = Clock::now() + std::chrono::duration_cast<Clock::duration>(
-        std::chrono::duration<double>(mgg::kGroundExplorationLatticeBudgetS));
+    const auto slice = innerDeadline(lattice_deadline_, ground_exploration_lattice_budget_s_);
     if (!ctx.deadline || slice < *ctx.deadline) ctx.deadline = slice;
   }
   const auto t_global = Clock::now();

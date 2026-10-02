@@ -261,7 +261,8 @@ inline double maxCornerDeg(const std::vector<Eigen::Vector3d>& p) {
 
 inline Outcome run(const MapInterface& map, const Scenario& scenario,
                    bool allow_unknown_body = true, double request_budget_ms = 500.0,
-                   std::optional<double> sensor_height = std::nullopt) {
+                   std::optional<double> sensor_height = std::nullopt,
+                   double lattice_budget_ms = 100.0) {
   using Clock = std::chrono::steady_clock;
   const auto ms = [](Clock::time_point a, Clock::time_point b) {
     return std::chrono::duration<double, std::milli>(b - a).count();
@@ -323,7 +324,7 @@ inline Outcome run(const MapInterface& map, const Scenario& scenario,
   try {
   if (!scenario.navigate) {
     ctx.deadline = t0 + std::chrono::duration_cast<Clock::duration>(
-        std::chrono::duration<double>(kGroundExplorationLatticeBudgetS));
+        std::chrono::duration<double, std::milli>(lattice_budget_ms));
     bool hanging = false;
     const StateVec root_state = localRouteRoot(ctx, scenario.start, hanging);
     auto* root = new Vertex(0, root_state);

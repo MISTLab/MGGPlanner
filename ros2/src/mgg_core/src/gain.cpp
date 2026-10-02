@@ -170,8 +170,9 @@ void computeVolumetricGain(
                           max_h_below + ctx.map->getResolution());
 
     int unknown = 0, free = 0, occupied = 0;
+    PlanningCheckpointThrottle checkpoint;
     for (const auto& entry : visited) {
-      planningCheckpoint();
+      checkpoint.check();
       const Eigen::Vector3d& voxel = entry.first;
       // Only count what lies inside the region the robot may explore, and
       // outside any zone declared uninteresting.

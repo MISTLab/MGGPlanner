@@ -26,6 +26,8 @@
 
 #include <Eigen/Dense>
 
+#include "mgg_core/planning_cancellation.h"
+
 #include "mgg_core/map_interface.h"
 #include "mgg_core/params.h"
 #include "mgg_core/plan_profile.h"
@@ -327,6 +329,9 @@ class GroundProjection {
   PlanProfile* profile() const { return profile_; }
 
  private:
+  // Shared by nested per-cell loops of this request-scoped projector: a
+  // short cache lookup must not reset the throttle and check every cell.
+  mutable PlanningCheckpointThrottle checkpoint_;
   using ColumnKey = std::array<std::int64_t, 2>;
   using PlaneKey = std::array<std::int64_t, 6>;
   struct CacheKeyHash {

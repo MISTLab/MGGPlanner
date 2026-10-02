@@ -105,7 +105,8 @@ VoxelStatus orientedBoxPathStatus(const MapInterface& map,
   const double resolution = map.getResolution();
   if (!start.allFinite() || !end.allFinite() || !box.size.allFinite() ||
       (box.size.array() < 0.0).any() || !std::isfinite(box.heading) ||
-      !std::isfinite(resolution) || resolution <= 0.0) {
+      !std::isfinite(resolution) || resolution <= 0.0 ||
+      (unknown_above_center && !std::isfinite(*unknown_above_center))) {
     return VoxelStatus::kUnknown;
   }
   if (map.dynamicSweepBlocked(start, end,
