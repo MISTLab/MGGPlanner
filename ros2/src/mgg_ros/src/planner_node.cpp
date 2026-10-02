@@ -365,7 +365,7 @@ PlannerNode::PlannerNode(const rclcpp::NodeOptions& options)
 
   odom_sub_ = create_subscription<nav_msgs::msg::Odometry>(
       "odometry", rclcpp::QoS(10),
-      [this](nav_msgs::msg::Odometry::ConstSharedPtr m) { onOdometry(m, false); },
+      [this](nav_msgs::msg::Odometry::ConstSharedPtr m) { onOdometry(m); },
       input_opts);
 
   if (cloud_map_ != nullptr) {
@@ -2300,7 +2300,7 @@ mgg::RecomputeGainFn PlannerNode::globalFrontierGain() {
 // ---------------------------------------------------------------------------
 // Inputs
 
-void PlannerNode::onOdometry(nav_msgs::msg::Odometry::ConstSharedPtr msg, bool apply_now) {
+void PlannerNode::onOdometry(nav_msgs::msg::Odometry::ConstSharedPtr msg) {
   const mgg::StateVec state = fromPoseMsg(msg->pose.pose);
   if (!state.allFinite()) {
     RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000,
@@ -2322,11 +2322,8 @@ void PlannerNode::onOdometry(nav_msgs::msg::Odometry::ConstSharedPtr msg, bool a
   }
   odometry_ingest_lag_s_.store(
       std::chrono::duration<double>(std::chrono::steady_clock::now() - received).count());
-  // The dedicated input executor only ingests: applying odometry can expand
-  // the graph and must never occupy its heartbeat/cancel thread.
-  if (!apply_now) return;
-  std::unique_lock<std::recursive_mutex> lock(planner_mutex_, std::try_to_lock);
-  if (lock.owns_lock()) applyLatestOdometry();
+  // Ingestion only: applying odometry can expand the graph. The planner's
+  // maintenance timer and request admission drain this slot on planner threads.
 }
 
 void PlannerNode::applyLatestOdometry() {
@@ -5375,9 +5372,7 @@ void PlannerNode::onPlanRequest(
     }
     global_exploration_ongoing_ = false;
     response->path.clear();
-    response->status = (request_generation_.load() != generation ||
-                        exploration_generation_.load() != exploration_generation)
-        ? mgg_msgs::srv::PlannerSrv::Response::CANCELLED : kStatusNotReady;
+    response->status = mgg_msgs::srv::PlannerSrv::Response::CANCELLED;
     RCLCPP_INFO(get_logger(), "planning cancelled: superseded or map authority expired/changed");
   }
   robot_params_.bound_mode = bound;

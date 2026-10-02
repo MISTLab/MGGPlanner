@@ -124,7 +124,7 @@ class PlannerNode : public rclcpp::Node {
   void applyLatestOdometryImpl();
   void publishPlanningStatus();
   void setAcquiringObservations(bool acquiring);
-  void onOdometry(nav_msgs::msg::Odometry::ConstSharedPtr msg, bool apply_now = true);
+  void onOdometry(nav_msgs::msg::Odometry::ConstSharedPtr msg);
   void onPointCloud(sensor_msgs::msg::PointCloud2::ConstSharedPtr msg);
   void onMappingSnapshot(mgg_msgs::msg::MappingSnapshot::ConstSharedPtr msg);
   void onNeighbourGraph(mgg_msgs::msg::Graph::ConstSharedPtr msg);

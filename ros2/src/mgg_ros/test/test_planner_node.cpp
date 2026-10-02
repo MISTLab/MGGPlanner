@@ -38,6 +38,7 @@
 #include "mgg_msgs/srv/planner_set_exploration_region.hpp"
 #include "mgg_ros/fleet_conversions.h"
 #include "mgg_ros/conversions.h"
+#include "mgg_core/planning_cancellation.h"
 
 namespace mgg_ros {
 
@@ -341,9 +342,10 @@ class MolaFloorProduct {
 class PlannerNodeTestPeer {
  public:
   static void addCriticalGroups(PlannerNode& node, rclcpp::Executor& executor) {
-    for (const auto& group : {node.input_callback_group_, node.snapshot_callback_group_})
-      if (group && !group->automatically_add_to_executor_with_node())
-        executor.add_callback_group(group, node.get_node_base_interface());
+    EXPECT_FALSE(node.input_callback_group_->automatically_add_to_executor_with_node());
+    if (node.snapshot_callback_group_)
+      EXPECT_FALSE(node.snapshot_callback_group_->automatically_add_to_executor_with_node());
+    node.addInputCallbackGroupsTo(executor);
   }
   static void wireSnapshot(PlannerNode& node) {
     if (!node.snapshot_callback_group_)
@@ -377,6 +379,15 @@ class PlannerNodeTestPeer {
   }
   static void refresh(PlannerNode& node) { node.refreshMapRevision(); }
   static void offset(PlannerNode& node, const Eigen::Vector3d& offset) { node.robot_params_.center_offset = offset; }
+  static void prepareUntilFinalCancellation(PlannerNode& node,
+      std::shared_ptr<mgg_msgs::srv::PlannerSrv::Response> response) {
+    auto lock = holdPlannerMutex(node);
+    // Deliver cancellation exactly after the response has been computed,
+    // before the wrapper's final commit checkpoint. No production test hook.
+    mgg::PlanningCancellationScope cancellation([&] { return !response->path.empty(); });
+    node.onPlanRequestImpl(std::make_shared<mgg_msgs::srv::PlannerSrv::Request>(), response);
+    mgg::planningCheckpoint();
+  }
   static void cancel(PlannerNode& node) { node.cancelPlanning(); }
   static void heartbeat(PlannerNode& node, const mgg::MolaSnapshotRequest& request) {
     auto msg = std::make_shared<mgg_msgs::msg::MappingSnapshot>();
@@ -727,6 +738,9 @@ class PlannerNodeTestPeer {
     msg->pose.pose.orientation.z = std::sin(yaw / 2.0);
     msg->pose.pose.orientation.w = std::cos(yaw / 2.0);
     node.onOdometry(msg);
+    // Deterministic substitute for the planner-thread maintenance tick.
+    std::unique_lock<std::recursive_mutex> lock(node.planner_mutex_, std::try_to_lock);
+    if (lock.owns_lock()) node.applyLatestOdometry();
   }
   static void setFrontierOwner(PlannerNode& node, int id, int owner) {
     node.global_graph_->getVertex(id)->robot_id = owner;
@@ -835,11 +849,17 @@ class PlannerNodeTestPeer {
     msg->pose.pose.position.z = 0.075;
     msg->pose.pose.orientation.w = 1.0;
     node.onOdometry(msg);
+    // Deterministic substitute for the planner-thread maintenance tick.
+    std::unique_lock<std::recursive_mutex> lock(node.planner_mutex_, std::try_to_lock);
+    if (lock.owns_lock()) node.applyLatestOdometry();
   }
 
   static void acceptOdometry(
       PlannerNode& node, const nav_msgs::msg::Odometry::SharedPtr& msg) {
     node.onOdometry(msg);
+    // Deterministic substitute for the planner-thread maintenance tick.
+    std::unique_lock<std::recursive_mutex> lock(node.planner_mutex_, std::try_to_lock);
+    if (lock.owns_lock()) node.applyLatestOdometry();
   }
 
   static int globalVertices(PlannerNode& node) {
@@ -2079,7 +2099,7 @@ TEST_F(PlannerNodeTest, CriticalInputsSurviveAllPlannerExecutorThreadsBlocked) {
   using namespace std::chrono_literals;
   auto node = makeNode("saturated_inputs");
   MolaFloorProduct product(-1, 4, -1, 1);
-  auto provider = product.serve(0.35);
+  auto provider = product.serve<SlowMolaPlanningMap>(0.35);
   auto* map = provider.get();
   PlannerNodeTestPeer::useMolaMap(*node, std::move(provider));
   PlannerNodeTestPeer::wireSnapshot(*node);
@@ -2089,23 +2109,29 @@ TEST_F(PlannerNodeTest, CriticalInputsSurviveAllPlannerExecutorThreadsBlocked) {
   auto blocker = PlannerNodeTestPeer::blockingService(*node, entered, release);
   auto caller = std::make_shared<rclcpp::Node>("critical_input_caller");
   auto busy = caller->create_client<std_srvs::srv::Trigger>("busy_planner");
+  auto plan = caller->create_client<mgg_msgs::srv::PlannerSrv>("mggplanner");
   auto cancel = caller->create_client<std_srvs::srv::Trigger>("cancel_planning");
   auto odom = caller->create_publisher<nav_msgs::msg::Odometry>("odometry", 10);
   auto heartbeat = caller->create_publisher<mgg_msgs::msg::MappingSnapshot>(
       "mapping_snapshot", rclcpp::QoS(1).transient_local());
   ASSERT_TRUE(busy->wait_for_service(2s));
   ASSERT_TRUE(cancel->wait_for_service(2s));
+  ASSERT_TRUE(plan->wait_for_service(2s));
   rclcpp::executors::SingleThreadedExecutor critical;
   PlannerNodeTestPeer::addCriticalGroups(*node, critical);
   rclcpp::executors::MultiThreadedExecutor planner(rclcpp::ExecutorOptions(), 2);
   planner.add_node(node);
   std::thread critical_thread([&] { critical.spin(); });
   std::thread planner_thread([&] { planner.spin(); });
-  auto first = busy->async_send_request(std::make_shared<std_srvs::srv::Trigger::Request>());
+  map->slow = true;
+  auto first = plan->async_send_request(std::make_shared<mgg_msgs::srv::PlannerSrv::Request>());
+  const auto planning_by = std::chrono::steady_clock::now() + 2s;
+  while (!map->entered && std::chrono::steady_clock::now() < planning_by) std::this_thread::sleep_for(1ms);
+  EXPECT_TRUE(map->entered);
   auto second = busy->async_send_request(std::make_shared<std_srvs::srv::Trigger::Request>());
   const auto deadline = std::chrono::steady_clock::now() + 2s;
-  while (entered < 2 && std::chrono::steady_clock::now() < deadline) std::this_thread::sleep_for(1ms);
-  EXPECT_EQ(entered.load(), 2);
+  while (entered < 1 && std::chrono::steady_clock::now() < deadline) std::this_thread::sleep_for(1ms);
+  EXPECT_EQ(entered.load(), 1);
   mgg_msgs::msg::MappingSnapshot snapshot;
   snapshot.component_id = product.request().component_id;
   snapshot.epoch = product.request().epoch;
@@ -2129,9 +2155,21 @@ TEST_F(PlannerNodeTest, CriticalInputsSurviveAllPlannerExecutorThreadsBlocked) {
   while (PlannerNodeTestPeer::latestX(*node) != 2 &&
          std::chrono::steady_clock::now() - input_start < 200ms) std::this_thread::sleep_for(1ms);
   EXPECT_EQ(PlannerNodeTestPeer::latestX(*node), 2);
+  const auto cancel_start = std::chrono::steady_clock::now();
   auto answer = cancel->async_send_request(std::make_shared<std_srvs::srv::Trigger::Request>());
   EXPECT_EQ(rclcpp::spin_until_future_complete(caller, answer, 200ms), rclcpp::FutureReturnCode::SUCCESS);
   EXPECT_LT(std::chrono::steady_clock::now() - input_start, 200ms);
+  EXPECT_EQ(rclcpp::spin_until_future_complete(caller, first, 200ms), rclcpp::FutureReturnCode::SUCCESS);
+  if (first.wait_for(0ms) == std::future_status::ready) {
+    const auto response = first.get();
+    EXPECT_TRUE(response->path.empty());
+    EXPECT_EQ(response->status, mgg_msgs::srv::PlannerSrv::Response::CANCELLED);
+  }
+  const double cancel_ms = std::chrono::duration<double, std::milli>(
+      std::chrono::steady_clock::now() - cancel_start).count();
+  EXPECT_LT(cancel_ms, 200.0);
+  RecordProperty("saturated_executor_cancel_ms", cancel_ms);
+  map->slow = false;
   // Heartbeat isolation must not weaken TTL enforcement.
   std::this_thread::sleep_for(400ms);
   EXPECT_FALSE(map->authorityValid());
@@ -2196,7 +2234,35 @@ TEST_F(PlannerNodeTest, FootprintGroundSupportUsesBodyCenterOffset) {
   PlannerNodeTestPeer::refresh(*node);
   Eigen::Vector3d hit;
   EXPECT_EQ(map->getGroundRayStatus({1, 0, 0.4}, {1, 0, -0.4}, false, hit), mgg::VoxelStatus::kOccupied);
+  EXPECT_NEAR(hit.z(), 0.2, 1e-9);
   EXPECT_NE(map->getGroundRayStatus({0, 0, 0.4}, {0, 0, -0.4}, false, hit), mgg::VoxelStatus::kOccupied);
+  PlannerNodeTestPeer::acceptOdometryFacing(*node, 0, 0, M_PI / 2, 2);
+  EXPECT_EQ(map->getGroundRayStatus({1, 0.25, 0.4}, {1, 0.25, -0.4}, false, hit), mgg::VoxelStatus::kOccupied);
+  EXPECT_NE(map->getGroundRayStatus({1.25, 0, 0.4}, {1.25, 0, -0.4}, false, hit), mgg::VoxelStatus::kOccupied);
+}
+
+TEST_F(PlannerNodeTest, FinalCancellationDoesNotCommitObservationStateOrPublishPath) {
+  auto node = makeNode("cancel_at_commit");
+  MolaFloorProduct product(-1, 4, -1, 1);
+  PlannerNodeTestPeer::useMolaMap(*node, product.serve());
+  PlannerNodeTestPeer::setMinObservedGround(*node, 0.75);
+  PlannerNodeTestPeer::acceptOdometry(*node, 0, 0, 1);
+  int published = 0;
+  auto subscriber = node->create_subscription<nav_msgs::msg::Path>(
+      "best_path", rclcpp::QoS(1).transient_local(),
+      [&](nav_msgs::msg::Path::ConstSharedPtr) { ++published; });
+  ASSERT_TRUE(PlannerNodeTestPeer::acquiring(*node));
+  auto response = std::make_shared<mgg_msgs::srv::PlannerSrv::Response>();
+  EXPECT_THROW(PlannerNodeTestPeer::prepareUntilFinalCancellation(*node, response),
+               mgg::PlanningInterrupted);
+  ASSERT_FALSE(response->path.empty()) << "the cancellation must land after path computation";
+  EXPECT_TRUE(PlannerNodeTestPeer::acquiring(*node)) << "unsent computation must not finish bootstrap";
+  const auto end = std::chrono::steady_clock::now() + std::chrono::milliseconds(100);
+  while (std::chrono::steady_clock::now() < end) {
+    rclcpp::spin_some(node);
+    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+  }
+  EXPECT_EQ(published, 0);
 }
 
 TEST_F(PlannerNodeTest, LatestOdometryIngestedDuringFiveSecondPlannerCall) {

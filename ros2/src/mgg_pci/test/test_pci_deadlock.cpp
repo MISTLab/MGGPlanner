@@ -322,7 +322,7 @@ struct ExternalExecutionRig {
 };
 
 TEST(PciExternalExecution, CancelledIsNotAcquiringObservations) {
-  ExternalExecutionRig rig("/cancelled_plan", {{}}, -4);
+  ExternalExecutionRig rig("/cancelled_plan", {{}}, mgg_msgs::srv::PlannerSrv::Response::CANCELLED);
   rig.publishOdometry();
   ASSERT_NE(rig.call("pci_trigger"), nullptr);
   EXPECT_TRUE(rig.waitForStatus("planning cancelled"));
