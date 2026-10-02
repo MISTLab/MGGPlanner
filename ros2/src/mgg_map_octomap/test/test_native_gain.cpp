@@ -225,11 +225,12 @@ TEST(NativeGain, Run7MountedCorridorRetainsGroundBandUnknown) {
 TEST(NativeGain, TallRoomUnknownCeilingDoesNotCompeteWithTheDoor) {
   std::vector<Cell> occupied, free;
   // Observed floor, observed air to 1.2 m, upper hangar air unknown.
-  // The wall at x=6 has a 2 m doorway leading to unknown at x>=6.6.
+  // The wall at x=6 has a 2 m doorway, an observed exit at x=6.5,
+  // then unknown at x>=7. The selected path must actually cross the door.
   for (int x = -100; x < 100; ++x) {
     for (int y = -100; y < 100; ++y) {
       occupied.push_back({x, y, -1});
-      if (x >= 33) continue;
+      if (x >= 35) continue;
       for (int z = 0; z < 6; ++z) {
         (x == 30 && (y < -5 || y >= 5) ? occupied : free).push_back({x, y, z});
       }
@@ -246,12 +247,14 @@ TEST(NativeGain, TallRoomUnknownCeilingDoesNotCompeteWithTheDoor) {
   sensor.update();
   mgg::GraphManager graph;
   for (const auto& [id, pos] : std::vector<std::pair<int, Eigen::Vector2d>>{
-           {0, {0.1, 0.1}}, {1, {4.1, 0.1}}, {2, {5.1, 0.1}}, {3, {0.1, 3.1}}}) {
+           {0, {0.1, 0.1}}, {1, {4.1, 0.1}}, {2, {5.1, 0.1}},
+           {3, {0.1, 3.1}}, {4, {6.5, 0.1}}}) {
     graph.addVertex(new mgg::Vertex(id, mgg::StateVec(pos.x(), pos.y(), 0.5, 0)));
   }
   graph.addEdge(graph.getVertex(0), graph.getVertex(1), 4);
   graph.addEdge(graph.getVertex(1), graph.getVertex(2), 1);
   graph.addEdge(graph.getVertex(0), graph.getVertex(3), 3);
+  graph.addEdge(graph.getVertex(2), graph.getVertex(4), 1.4);
   mgg::computeExplorationGain(graph, setup.ctx, false, true);
   for (int id : {0, 3}) {
     const auto& gain = graph.getVertex(id)->vol_gain;
@@ -263,7 +266,14 @@ TEST(NativeGain, TallRoomUnknownCeilingDoesNotCompeteWithTheDoor) {
   EXPECT_TRUE(graph.getVertex(2)->vol_gain.is_frontier);
   const auto selected = mgg::selectBestPath(graph, setup.planning, robot,
                                             mgg::EdgeInclinations{}, 0.2, 0);
-  EXPECT_EQ(selected.best_path_id, 2);
+  EXPECT_EQ(selected.best_path_id, 4);
+  ASSERT_FALSE(selected.best_path.empty());
+  EXPECT_GT(selected.best_path.back()->state.x(), 6.2);  // outside the room
+  for (std::size_t i = 1; i < selected.best_path.size(); ++i) {
+    EXPECT_EQ(map.getPathStatus(selected.best_path[i - 1]->state.head<3>(),
+                                selected.best_path[i]->state.head<3>(),
+                                robot.size, true), VoxelStatus::kFree);
+  }
 }
 
 // Review r0 (P1): with distinct voxels counted, the frontier test still
