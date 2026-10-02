@@ -368,6 +368,17 @@ class PlannerNodeTestPeer {
   static void explorationSlice(PlannerNode& node, double seconds) {
     node.ground_exploration_lattice_budget_s_ = seconds;
   }
+  /// Ground gain sensor model (PlanningParams ground_gain_*); 0 = real sensor.
+  static void groundGainModel(PlannerNode& node, double degrees, double range) {
+    const std::lock_guard<std::recursive_mutex> lock(node.planner_mutex_);
+    node.planning_params_.ground_gain_angular_resolution_deg = degrees;
+    node.planning_params_.ground_gain_max_range = range;
+  }
+  static nlohmann::json groundGainModel(PlannerNode& node) {
+    const std::lock_guard<std::recursive_mutex> lock(node.planner_mutex_);
+    return {{"ground_gain_step_deg", node.planning_params_.ground_gain_angular_resolution_deg},
+            {"ground_gain_range_m", node.planning_params_.ground_gain_max_range}};
+  }
   static nlohmann::json globalLinks(PlannerNode& node) {
     mgg::StateVec goal(-2,0,0,0);
     node.projectGoalToDrivingHeight(goal);
@@ -735,6 +746,18 @@ TEST_F(PlannerNavigationTest, BotmanFixtureFullServicesBenchmark) {
   if (!root || !*root) GTEST_SKIP() << "MGG_NAV_BENCH_PRODUCT is not set";
   const int repeat = std::getenv("MGG_SERVICE_BENCH_REPEAT")
       ? std::max(1, std::atoi(std::getenv("MGG_SERVICE_BENCH_REPEAT"))) : 3;
+  // Optional ground gain model "degrees,range_m" for the Orin benchmark, as
+  // the PlanningParams overlay would set it (e.g. "7.5,10"); default dense.
+  double gain_step_deg = 0, gain_range_m = 0;
+  if (const char* model = std::getenv("MGG_GROUND_GAIN_MODEL")) {
+    char* end = nullptr;
+    gain_step_deg = std::strtod(model, &end);
+    ASSERT_EQ(*end, ',') << "MGG_GROUND_GAIN_MODEL must be degrees,range_m: " << model;
+    gain_range_m = std::strtod(end + 1, &end);
+    ASSERT_EQ(*end, '\0') << "MGG_GROUND_GAIN_MODEL must be degrees,range_m: " << model;
+    ASSERT_TRUE(std::isfinite(gain_step_deg) && gain_step_deg >= 0 && gain_step_deg <= 180 &&
+                std::isfinite(gain_range_m) && gain_range_m >= 0) << model;
+  }
   for (int run = 0; run < repeat; ++run) for (const std::string policy : {"strict", "above_sensor_fov", "legacy_relaxed"}) {
     const bool allow_unknown = policy == "legacy_relaxed";
     rclcpp::NodeOptions options;
@@ -746,6 +769,7 @@ TEST_F(PlannerNavigationTest, BotmanFixtureFullServicesBenchmark) {
     options.automatically_declare_parameters_from_overrides(true);
     auto node = std::make_shared<PlannerNode>(options);
     PlannerNodeTestPeer::configureBotman(*node);
+    PlannerNodeTestPeer::groundGainModel(*node, gain_step_deg, gain_range_m);
     if (const char* slice = std::getenv("MGG_SERVICE_LATTICE_MS"))
       PlannerNodeTestPeer::explorationSlice(*node, std::atof(slice)/1000);
     if (!allow_unknown) PlannerNodeTestPeer::hardwarePolicy(*node);
@@ -778,6 +802,7 @@ TEST_F(PlannerNavigationTest, BotmanFixtureFullServicesBenchmark) {
           {"request_budget_ms",500},{"total_ms",elapsed},{"status",status},{"poses",poses},
           {"reason",reason},{"x86_budget_met",elapsed <= 300}};
       if (exploring) row.update(PlannerNodeTestPeer::explorationMetrics(*node));
+      row.update(PlannerNodeTestPeer::groundGainModel(*node));
       if (mode == "navigate_global_fallback") row["global_diagnostic"] = PlannerNodeTestPeer::globalLinks(*node);
       std::printf("SERVICE_BENCH %s\n", row.dump().c_str());
       EXPECT_LT(elapsed, 1000);  // hard envelope, not a claim of the x86 target
