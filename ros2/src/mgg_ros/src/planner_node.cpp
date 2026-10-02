@@ -165,6 +165,17 @@ std::string rebuildLosesHome(mgg::GraphManager& current,
   return "";
 }
 
+/// Restore temporary planner state on every exit, including interruption.
+template <typename T>
+struct RestoreScope {
+  explicit RestoreScope(T& value) : value_(value), previous_(value) {}
+  ~RestoreScope() { value_ = previous_; }
+  RestoreScope(const RestoreScope&) = delete;
+  RestoreScope& operator=(const RestoreScope&) = delete;
+  T& value_;
+  T previous_;
+};
+
 /// Sets a flag for a scope and restores it after.
 struct FlagScope {
   explicit FlagScope(bool& flag) : flag_(flag), previous_(flag) { flag_ = true; }
@@ -2201,6 +2212,7 @@ mgg::RecomputeGainFn PlannerNode::globalFrontierGain() {
     // (computeVolumetricGainRayModelNoBound, rrg.cpp:3767). This port centres
     // its gain volume on the robot every cycle, so a frontier a street away
     // would count nothing; centre it on the frontier while it is scored.
+    const RestoreScope restore_space(global_space_);
     global_space_.setCenter(vertex.state, /*use_extension=*/true);
     mgg::computeVolumetricGain(vertex.state, vertex.vol_gain,
                                makeGainContext());
@@ -2742,11 +2754,9 @@ bool PlannerNode::diagnosePeerSearch(int source_id,
           std::chrono::duration_cast<std::chrono::steady_clock::duration>(
               std::chrono::duration<double>(std::max(
                   0.0, planning_params_.global_search_time_budget_s))));
-  const bool open = peer_edges_open_;
-  peer_edges_open_ = true;
+  const FlagScope open(peer_edges_open_);
   rep = mgg::ShortestPathsReport();
   global_graph_->findShortestPaths(source_id, rep, deadline);
-  peer_edges_open_ = open;
   if (rep.cut_short) peer_diagnosis_cut_short_ = true;
   return !rep.cut_short;
 }
@@ -3299,15 +3309,13 @@ bool PlannerNode::rebuildGlobalGraphFromKeyframes(
   // beyond it from the check.
   std::string loses_home;
   if (robot_params_.type == mgg::RobotType::kAerialRobot) {
-    const bool open = peer_edges_open_;
-    peer_edges_open_ = true;
+    const FlagScope open(peer_edges_open_);
     loses_home = rebuildLosesHome(
         *global_graph_, *rebuilt, linked,
         static_cast<int>(planning_params_.robot_id),
         std::min(roadmap_rebuild_params_.link_radius,
                  planning_params_.edge_length_max));
-    peer_edges_open_ = open;
-  }
+    }
   if (!loses_home.empty()) {
     ++roadmap_rebuilds_refused_;
     RCLCPP_WARN(get_logger(),
@@ -3597,6 +3605,7 @@ void PlannerNode::addFrontiers() {
             vertex.locally_explored) return;
         // addFrontiers calls this for peers only near the new local graph,
         // where this robot has fresh observations. Preserve owner counts.
+        const RestoreScope restore_space(global_space_);
         global_space_.setCenter(vertex.state, /*use_extension=*/true);
         mgg::VolumetricGain local_gain;
         mgg::computeVolumetricGain(vertex.state, local_gain, makeGainContext());
@@ -5199,6 +5208,7 @@ void PlannerNode::onPlanRequest(
   }
   // A caller may pin the bound mode for this cycle, e.g. to squeeze through a
   // gap it would normally refuse.
+  const RestoreScope restore_bound_mode(robot_params_.bound_mode);
   const mgg::BoundModeType previous = robot_params_.bound_mode;
   robot_params_.bound_mode =
       static_cast<mgg::BoundModeType>(request->bound_mode);
@@ -5534,6 +5544,7 @@ void PlannerNode::onPlanRequest(
   }
   } catch (const mgg::PlanningInterrupted&) {
     robot_params_.bound_mode = request_bound_mode;
+    refreshNoGoZones();
     best_path_.clear();
     lattice_path_.clear();
     response->path.clear();
@@ -6456,7 +6467,8 @@ void PlannerNode::onObjectiveRequest(
       }
       std::optional<mgg::MolaMap::TransientDiscPin> no_peers;
       if (mola_map_) no_peers.emplace(*mola_map_, std::vector<Eigen::Vector2d>{}, 0.0);
-      peer_edges_open_ = true;
+      const FlagScope open(peer_edges_open_);
+      const RestoreScope restore_deadline(peer_diagnosis_deadline_);
       peer_diagnosis_cut_short_ = false;
       peer_diagnosis_deadline_ =
           std::chrono::steady_clock::now() +
@@ -6472,8 +6484,6 @@ void PlannerNode::onObjectiveRequest(
                                  open_reason)) ||
           routeOverGlobalGraph(goal, tolerance, open_route, open_turns_ok,
                                open_reason);
-      peer_diagnosis_deadline_.reset();
-      peer_edges_open_ = false;
       if (open_routed) {
         response->status = Service::Response::BLOCKED;
         response->reason = "blocked by a peer: " + reason;
