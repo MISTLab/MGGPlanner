@@ -939,7 +939,10 @@ void PlannerNode::addInputCallbackGroupsTo(rclcpp::Executor& executor) {
 void PlannerNode::loadParameters() {
   ParamLoader p(this);
   if (!loadRobotParams(p, "RobotParams", robot_params_)) {
-    RCLCPP_ERROR(get_logger(), "RobotParams failed to load");
+    throw std::invalid_argument(
+        "RobotParams failed to load: physical_size and physical_center_offset "
+        "must be set together, with positive finite dimensions and finite offsets; "
+        "type and bound_mode must also be valid");
   }
   nominal_bound_mode_ = robot_params_.bound_mode;
   const bool planning_loaded =

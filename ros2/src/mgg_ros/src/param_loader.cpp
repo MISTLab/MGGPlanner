@@ -157,20 +157,22 @@ bool loadRobotParams(const ParamLoader& p, const std::string& ns,
   p.get(ns + "/size_extension_min", out.size_extension_min);
   p.get(ns + "/size_extension", out.size_extension);
   p.get(ns + "/center_offset", out.center_offset);
-  Eigen::Vector3d physical;
-  if (p.get(ns + "/physical_size", physical)) {
-    if (!physical.allFinite() || (physical.array() <= 0).any()) return false;
-    out.physical_size = physical;
-  }
-  if (p.get(ns + "/physical_center_offset", physical)) {
-    if (!physical.allFinite()) return false;
-    out.physical_center_offset = physical;
-  }
-  if (out.physical_size.has_value() != out.physical_center_offset.has_value()) return false;
   p.get(ns + "/relax_ratio", out.relax_ratio);
   p.get(ns + "/safety_extension", out.safety_extension);
   if (p.get(ns + "/bound_mode", s) && !parseBoundMode(s, out.bound_mode)) {
     return false;
+  }
+  // Validate the pair before publishing either half. A failed physical load
+  // must neither mix reference frames nor skip the planning bounds above.
+  Eigen::Vector3d physical_size, physical_center_offset;
+  const bool have_size = p.get(ns + "/physical_size", physical_size);
+  const bool have_offset = p.get(ns + "/physical_center_offset", physical_center_offset);
+  if (have_size != have_offset) return false;
+  if (have_size) {
+    if (!physical_size.allFinite() || (physical_size.array() <= 0).any() ||
+        !physical_center_offset.allFinite()) return false;
+    out.physical_size = physical_size;
+    out.physical_center_offset = physical_center_offset;
   }
   return true;
 }
