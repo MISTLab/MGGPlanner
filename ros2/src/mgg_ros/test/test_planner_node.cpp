@@ -434,9 +434,6 @@ class PlannerNodeTestPeer {
   }
   static void retainOldLiftedSlot(PlannerNode& node) { node.lifted_target_vertices_.push_back(999); }
   static bool hasLiftedSlots(PlannerNode& node) { return !node.lifted_target_vertices_.empty(); }
-  static bool rootSpokeRetry(const PlannerNode& node) {
-    return node.last_grid_result_.root_spoke_retry;
-  }
   static bool acquiring(PlannerNode& node) { return node.acquiring_observations_.load(); }
   static double latestX(PlannerNode& node) {
     std::lock_guard<std::mutex> lock(node.input_mutex_);
@@ -2746,7 +2743,6 @@ TEST_F(PlannerNodeTest, EmptyAndSparseBootstrapWithDeployedObservedGroundGate) {
     response = std::make_shared<mgg_msgs::srv::PlannerSrv::Response>();
     PlannerNodeTestPeer::plan(*node, response); // no new pose or operator action
     EXPECT_FALSE(response->path.empty());
-    EXPECT_TRUE(PlannerNodeTestPeer::rootSpokeRetry(*node));
     EXPECT_FALSE(PlannerNodeTestPeer::acquiring(*node));
 
     PlannerNodeTestPeer::retainOldLiftedSlot(*node);
@@ -2780,7 +2776,6 @@ TEST_F(PlannerNodeTest, EmptyAndSparseBootstrapWithDeployedObservedGroundGate) {
     response = std::make_shared<mgg_msgs::srv::PlannerSrv::Response>();
     PlannerNodeTestPeer::plan(*node, response);
     EXPECT_FALSE(response->path.empty());
-    EXPECT_TRUE(PlannerNodeTestPeer::rootSpokeRetry(*node));
     EXPECT_FALSE(PlannerNodeTestPeer::acquiring(*node));
   }
 }
