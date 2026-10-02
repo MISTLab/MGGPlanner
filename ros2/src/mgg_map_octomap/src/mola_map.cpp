@@ -255,6 +255,9 @@ Eigen::Vector3d enclosingSize(const Eigen::Matrix3d& rotation,
   return rotation.cwiseAbs() * size;
 }
 
+// Grid-aligned box verdicts kept for one snapshot, at most.
+constexpr std::size_t kBoxCacheCap = std::size_t(1) << 18;
+
 void transformPoints(const Eigen::Isometry3d& transform,
                      std::vector<Eigen::Vector3d>& points) {
   for (auto& point : points) point = transform * point;
@@ -1321,9 +1324,60 @@ VoxelStatus MolaMap::getStaticBoxStatus(const Eigen::Vector3d& center,
   if (snapshot == nullptr || !center.allFinite() || !size.allFinite() ||
       (size.array() < 0.0).any()) return VoxelStatus::kUnknown;
   const auto& transform = snapshot->request.component_from_navigation;
-  return snapshot->map->getBoxStatus(transform * center,
-                                     enclosingSize(transform.linear(), size),
-                                     stop_at_unknown_voxel);
+  return snapshot->map->getBoxStatus(
+      transform * center,
+      gridAlignedBody() ? size : enclosingSize(transform.linear(), size),
+      stop_at_unknown_voxel);
+}
+
+void MolaMap::setGridAlignedBody(bool aligned) {
+  grid_aligned_body_.store(aligned, std::memory_order_release);
+}
+
+bool MolaMap::gridAlignedBody() const {
+  return grid_aligned_body_.load(std::memory_order_acquire);
+}
+
+bool MolaMap::gridHeading(double& heading) const {
+  const auto snapshot = current();
+  if (snapshot == nullptr) return false;
+  const Eigen::Matrix3d r = snapshot->request.component_from_navigation.linear();
+  // The navigation vector the transform takes onto the grid's x axis is
+  // r^T e_x, the first row of r.
+  if (!std::isfinite(r(0, 0)) || !std::isfinite(r(0, 1)) ||
+      std::hypot(r(0, 0), r(0, 1)) < 1e-9)
+    return false;
+  heading = std::atan2(r(0, 1), r(0, 0));
+  return true;
+}
+
+VoxelStatus MolaMap::gridStrictBoxStatus(
+    const std::shared_ptr<const Snapshot>& snapshot,
+    const Eigen::Vector3d& center, const Eigen::Vector3d& size) const {
+  const Eigen::Vector3d c = snapshot->request.component_from_navigation * center;
+  BoxKey key;
+  for (int i = 0; i < 3; ++i) {
+    if (std::abs(c[i]) > 1e9 || std::abs(size[i]) > 1e9)
+      return snapshot->map->getStrictBoxStatus(c, size);
+    key.c[i] = std::llround(c[i] * 1e6);
+    key.s[i] = std::llround(size[i] * 1e6);
+  }
+  {
+    std::lock_guard<std::mutex> lock(box_cache_mutex_);
+    if (box_cache_snapshot_.lock() != snapshot) {
+      box_cache_.clear();
+      box_cache_snapshot_ = snapshot;
+    }
+    const auto it = box_cache_.find(key);
+    if (it != box_cache_.end()) return it->second;
+  }
+  const VoxelStatus status = snapshot->map->getStrictBoxStatus(c, size);
+  std::lock_guard<std::mutex> lock(box_cache_mutex_);
+  if (box_cache_snapshot_.lock() == snapshot) {
+    if (box_cache_.size() >= kBoxCacheCap) box_cache_.clear();
+    box_cache_.emplace(key, status);
+  }
+  return status;
 }
 
 VoxelStatus MolaMap::getPathStatus(const Eigen::Vector3d& start,
@@ -1338,6 +1392,10 @@ VoxelStatus MolaMap::getPathStatus(const Eigen::Vector3d& start,
   if (discsBlockSweep(start, end, 0.5 * std::max(box_size.x(), box_size.y())))
     return VoxelStatus::kOccupied;
   const auto& transform = snapshot->request.component_from_navigation;
+  if (gridAlignedBody())
+    return snapshot->map->getSweptBoxStatus(transform * start, transform * end,
+                                            box_size, stop_at_unknown_voxel,
+                                            !stop_at_unknown_voxel);
   return snapshot->map->getPathStatus(transform * start, transform * end,
                                       enclosingSize(transform.linear(), box_size),
                                       stop_at_unknown_voxel);
@@ -1354,6 +1412,9 @@ VoxelStatus MolaMap::getOccupiedOnlyPathStatus(
   if (discsBlockSweep(start, end, 0.5 * std::max(box_size.x(), box_size.y())))
     return VoxelStatus::kOccupied;
   const auto& transform = snapshot->request.component_from_navigation;
+  if (gridAlignedBody())
+    return snapshot->map->getSweptBoxStatus(transform * start, transform * end,
+                                            box_size, false, false);
   return snapshot->map->getOccupiedOnlyPathStatus(
       transform * start, transform * end,
       enclosingSize(transform.linear(), box_size));
@@ -1375,8 +1436,12 @@ bool MolaMap::aerialRootRecoveryTraversable(
       discsBlockBox(end, size)) return false;
   const auto& transform = snapshot->request.component_from_navigation;
   std::size_t exempted = 0;
+  // The body as every other query holds it: grid-aligned for a drone.
+  const Eigen::Matrix3d body = gridAlignedBody()
+                                   ? Eigen::Matrix3d::Identity()
+                                   : Eigen::Matrix3d(transform.linear());
   if (!snapshot->map->aerialRootRecovery(transform * start, transform * end,
-                                        size, transform.linear(), exempted))
+                                        size, body, exempted))
     return false;
   std::lock_guard<std::mutex> lock(aerial_recovery_mutex_);
   ++aerial_recovery_uses_;
@@ -1412,6 +1477,7 @@ VoxelStatus MolaMap::getStrictBoxStatus(const Eigen::Vector3d& center,
   if (!center.allFinite() || !size.allFinite() || (size.array() < 0.0).any())
     return VoxelStatus::kUnknown;
   if (discsBlockBox(center, size)) return VoxelStatus::kOccupied;
+  if (gridAlignedBody()) return gridStrictBoxStatus(snapshot, center, size);
   const auto& transform = snapshot->request.component_from_navigation;
   return snapshot->map->getStrictBoxStatus(
       transform * center, enclosingSize(transform.linear(), size));
@@ -1423,6 +1489,7 @@ VoxelStatus MolaMap::getStaticStrictBoxStatus(
   if (snapshot == nullptr) return VoxelStatus::kUnknown;
   if (!center.allFinite() || !size.allFinite() || (size.array() < 0.0).any())
     return VoxelStatus::kUnknown;
+  if (gridAlignedBody()) return gridStrictBoxStatus(snapshot, center, size);
   const auto& transform = snapshot->request.component_from_navigation;
   return snapshot->map->getStrictBoxStatus(
       transform * center, enclosingSize(transform.linear(), size));
@@ -1439,6 +1506,9 @@ VoxelStatus MolaMap::getStrictPathStatus(
   if (discsBlockSweep(start, end, 0.5 * std::max(box_size.x(), box_size.y())))
     return VoxelStatus::kOccupied;
   const auto& transform = snapshot->request.component_from_navigation;
+  if (gridAlignedBody())
+    return snapshot->map->getSweptBoxStatus(transform * start, transform * end,
+                                            box_size, true, false);
   return snapshot->map->getStrictPathStatus(
       transform * start, transform * end,
       enclosingSize(transform.linear(), box_size));
@@ -1452,6 +1522,9 @@ VoxelStatus MolaMap::getStaticStrictPathStatus(
   if (!start.allFinite() || !end.allFinite() || !box_size.allFinite() ||
       (box_size.array() < 0.0).any()) return VoxelStatus::kUnknown;
   const auto& transform = snapshot->request.component_from_navigation;
+  if (gridAlignedBody())
+    return snapshot->map->getSweptBoxStatus(transform * start, transform * end,
+                                            box_size, true, false);
   return snapshot->map->getStrictPathStatus(
       transform * start, transform * end,
       enclosingSize(transform.linear(), box_size));
