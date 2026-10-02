@@ -107,6 +107,10 @@ class MolaMap : public MapInterface {
     ReadLease(const ReadLease&) = delete;
     ReadLease& operator=(const ReadLease&) = delete;
 
+    /// Whether immutable geometry was admitted. This remains true after
+    /// authority revocation, which authorityValid() checks independently.
+    bool hasSnapshot() const { return snapshot_ != nullptr; }
+
     /// Permit snapshot publication while retaining this transaction's exact
     /// immutable snapshot. The lease remains thread-affine.
     void allowPublication();

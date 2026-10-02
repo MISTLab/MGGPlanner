@@ -5237,7 +5237,7 @@ void PlannerNode::onBuildRequest(
   const auto generation = request_generation_.load();
   const std::lock_guard<std::recursive_mutex> lock(planner_mutex_);
   auto map_read = mapReadLease();
-  const bool admitted = mola_map_ && mola_map_->authorityValid();
+  const bool admitted = map_read.hasSnapshot();
   const auto map_generation = mola_map_ ? mola_map_->activeGeneration() : 0;
   mgg::PlanningCancellationScope cancellation([this, generation, admitted, map_generation] {
     return generation != request_generation_.load() ||
@@ -5295,7 +5295,7 @@ void PlannerNode::onPlanRequest(
           snapshot->geometry_revision.c_str());
     }
   }
-  const bool admitted = mola_map_ && mola_map_->authorityValid();
+  const bool admitted = map_read.hasSnapshot();
   const auto map_generation = mola_map_ ? mola_map_->activeGeneration() : 0;
   const auto bound = robot_params_.bound_mode;
   mgg::PlanningCancellationScope cancellation([this, generation, admitted, map_generation]() {
@@ -5345,7 +5345,7 @@ void PlannerNode::onObjectiveRequest(
           snapshot->geometry_revision.c_str());
     }
   }
-  const bool admitted = mola_map_ && mola_map_->authorityValid();
+  const bool admitted = map_read.hasSnapshot();
   const auto map_generation = mola_map_ ? mola_map_->activeGeneration() : 0;
   mgg::PlanningCancellationScope cancellation([this, generation, admitted, map_generation]() {
     return request_generation_.load() != generation ||

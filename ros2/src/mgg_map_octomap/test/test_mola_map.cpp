@@ -1574,6 +1574,7 @@ TEST(MolaMap, ChangedEpochRevokesAuthorityDuringReadLease) {
     std::this_thread::sleep_for(std::chrono::milliseconds(1));
   EXPECT_TRUE(returned);
   EXPECT_FALSE(provider.authorityValid());
+  EXPECT_TRUE(lease.hasSnapshot()) << "revocation must not disable an admitted request's authority checks";
   lease.allowPublication();
   heartbeat.join();
 }
