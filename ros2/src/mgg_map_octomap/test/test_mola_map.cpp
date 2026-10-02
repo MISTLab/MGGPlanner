@@ -3402,6 +3402,10 @@ struct Wall {
 struct Scene {
   explicit Scene(const Wall& wall, double frame_yaw) : aerial(), wall(wall) {
     alignBody(aerial.map);
+    // The deployed half-size r/sqrt(2), not the rounded display value.
+    const double side = 2.0 * .354 / std::sqrt(2.0);
+    aerial.robot.size = {side, side, .25};
+    aerial.ctx.robot_box_size = aerial.robot.size;
     aerial.planning.nearest_range = 0.6;
     aerial.planning.nearest_range_max = 1.0;
     std::vector<Voxel> occupied, free;
