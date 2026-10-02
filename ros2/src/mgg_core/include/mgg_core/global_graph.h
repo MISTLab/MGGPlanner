@@ -26,10 +26,12 @@
 #ifndef MGG_CORE_GLOBAL_GRAPH_H_
 #define MGG_CORE_GLOBAL_GRAPH_H_
 
+#include <chrono>
 #include <cstdint>
 #include <deque>
 #include <functional>
 #include <limits>
+#include <optional>
 #include <vector>
 
 #include <Eigen/Dense>

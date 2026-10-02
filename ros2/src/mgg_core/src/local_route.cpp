@@ -59,6 +59,7 @@ Vertex* lazyGroundLattice(GraphManager& graph, Vertex* root,
   // Match buildGridGraph's precheck, including its occupied AABB fallback.
   // Explicit strict endpoint checks supplied by the caller remain in force.
   const auto endpoint_admissible = [&](const StateVec& from, const StateVec& to) {
+    ProfileScope timed_precheck(profile ? &profile->cell_prechecks : nullptr);
     OrientedBox body;
     body.heading = std::atan2(to.y() - from.y(), to.x() - from.x());
     body.size = ctx.robot_box_size;
