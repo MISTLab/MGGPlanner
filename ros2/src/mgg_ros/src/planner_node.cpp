@@ -431,7 +431,7 @@ PlannerNode::PlannerNode(const rclcpp::NodeOptions& options)
     if (lock.owns_lock()) {
       applyPendingCancel();
       applyLatestOdometry();
-      refreshScoutingExclusions();
+      if (robot_params_.type == mgg::RobotType::kAerialRobot) refreshScoutingExclusions();
     }
   }, callback_group_);
   rclcpp::SubscriptionOptions sub_opts;
@@ -6340,8 +6340,10 @@ bool PlannerNode::onPlanRequestImpl(
         best_path_.empty() ? "none" : lifted ? "lifted" : "own",
         distance.c_str(), fleet_distance.c_str(),
         complete ? "exploration complete" : best_path_.empty() ? "no admissible path"
-        : aerial_chosen_target ? (lifted ? "ahead of peer and not behind drone; bounded graph-front bias"
-                                        : "own tour target; bounded graph-front bias")
+        : aerial_chosen_target ? (fleet_ ? "fleet-assigned tour target"
+            : lifted ? "ahead of peer and not behind drone; bounded graph-front bias"
+            : std::isfinite(fleet_front) ? "own tour target; bounded graph-front bias"
+                                         : "own tour target; no placed fresh peer front")
         : best_path_from_global_graph_ ? "global fallback or resumed route"
         : "local exploration before peer fallback");
     RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 10000, "aerial_status %s",
