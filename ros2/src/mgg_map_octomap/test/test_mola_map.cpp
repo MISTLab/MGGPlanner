@@ -3564,7 +3564,7 @@ TEST(AerialDoor, NavigateThroughA09mDoorAtBothVoxelAlignmentsAndFrames) {
   }
 }
 
-TEST(AerialDoor, ADoorNarrowerThanTheBodyIsRefusedEverywhere) {
+TEST(AerialDoor, A06mDoorWithOnlyTwoFreeVoxelsIsRefused) {
   for (const double frame : {0.0, 0.38}) {
     for (const double left : {0.05, 0.1, 0.15}) {
       SCOPED_TRACE(::testing::Message() << "frame " << frame << " left " << left);
@@ -3653,5 +3653,37 @@ TEST(AerialDoor, R7HangarGateFromRecordedHover) {
     EXPECT_GT((scene.component_from_navigation * route.points.back()).x(),
               wall.base.x() + wall.depth);
     door::expectWithinBudget(scene, route.points);
+  }
+}
+
+
+TEST(AerialDoor, A06mDoorExactlyAlignedToThreeFreeVoxelsPasses) {
+  // Operator ruling after the boundary audit: the approved body is a 0.5 m
+  // grid-aligned square, not a 0.71 m lateral disc. A 0.6 m fully free run
+  // admits it (about 0.05 m from box edge to voxel face). The three offset
+  // placements above rasterize to only 0.4 m and cannot admit this body.
+  for (double frame : {0.0, 0.38}) {
+    door::Wall wall;
+    wall.width = .6;
+    wall.left = .2;
+    door::Scene scene(wall, frame);
+    const auto route = door::navigate(scene, scene.at(-1.4, 0.0, 1.3),
+                                      scene.at(2.2, .5, 1.3));
+    ASSERT_TRUE(door::crossesTheWall(scene, route.points));
+    door::expectWithinBudget(scene, route.points);
+  }
+}
+
+TEST(AerialDoor, A04mFreeRunNeverAdmitsTheBox) {
+  for (double frame : {0.0, 0.38}) {
+    for (double left : {0.0, .05, .1, .15, .2}) {
+      door::Wall wall;
+      wall.width = .4;
+      wall.left = left;
+      door::Scene scene(wall, frame);
+      const auto route = door::navigate(scene, scene.at(-1.4, 0.0, 1.3),
+                                        scene.at(2.2, left+.2, 1.3));
+      EXPECT_FALSE(door::crossesTheWall(scene, route.points));
+    }
   }
 }
