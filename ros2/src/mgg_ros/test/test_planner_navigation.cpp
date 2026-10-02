@@ -321,9 +321,8 @@ class PlannerNodeTestPeer {
     node.mola_map_->requestSnapshot(request);
     for (int i=0; i<400 && !node.mola_map_->getStatus(); ++i)
       std::this_thread::sleep_for(std::chrono::milliseconds(10));
-    // The tests' objective identity, independent of geometry product IDs.
-    node.mapping_snapshot_.component_id = "component:test";
-    node.mapping_snapshot_.epoch = 1;
+    node.mapping_snapshot_.component_id = request.component_id;
+    node.mapping_snapshot_.epoch = request.epoch;
     node.mapping_snapshot_.component_from_navigation.rotation.w = 1;
     node.have_mapping_snapshot_ = true;
     mgg::SensorParams sensor;
@@ -344,7 +343,14 @@ class PlannerNodeTestPeer {
     node.onPlanRequest(request, response);
     return response;
   }
-  static int diagnosisCount(const PlannerNode& node) { return node.peer_diagnoses_; }
+  static void objectiveIdentity(const PlannerNode& node, mgg_msgs::srv::PlanObjective::Request& request) {
+    request.component_id = node.mapping_snapshot_.component_id;
+    request.map_epoch = node.mapping_snapshot_.epoch;
+  }
+  static void forceGlobalFallback(PlannerNode& node, bool force) {
+    node.grid_params_.min_val.x() = force ? -1 : -6;
+    node.grid_params_.max_val.x() = force ? 1 : 6;
+  }
   static void hardwarePolicy(PlannerNode& node) { node.allow_unknown_lattice_body_ = false; }
   static void shortcut(PlannerNode& node, std::vector<mgg::StateVec>& path) {
     node.shortcutAndResample(path, {}, {}, true);
@@ -423,8 +429,7 @@ std::shared_ptr<Service::Response> navigate(PlannerNode& node, double x,
                                             double y, double z = 0.0) {
   auto request = std::make_shared<Service::Request>();
   request->objective = Service::Request::NAVIGATE;
-  request->component_id = "component:test";
-  request->map_epoch = 1;
+  PlannerNodeTestPeer::objectiveIdentity(node, *request);
   request->goal.position.x = x;
   request->goal.position.y = y;
   request->goal.position.z = z;
@@ -500,8 +505,9 @@ TEST_F(PlannerNavigationTest, BotmanFixtureFullServicesBenchmark) {
     PlannerNodeTestPeer::configureBotman(*node);
     if (!allow_unknown) PlannerNodeTestPeer::hardwarePolicy(*node);
     ASSERT_TRUE(PlannerNodeTestPeer::serveFixture(*node, root));
-    PlannerNodeTestPeer::standAt(*node, 0, 0, -.61, 0, run+1);
-    for (const std::string mode : {"navigate_local", "navigate_global_fallback", "explore"}) {
+    PlannerNodeTestPeer::standAt(*node, 0, 0, -.61, M_PI, run+1);
+    for (const std::string mode : {"navigate_local", "navigate_global_fallback", "navigate_15m", "explore"}) {
+      PlannerNodeTestPeer::forceGlobalFallback(*node, mode == "navigate_global_fallback");
       const auto started = std::chrono::steady_clock::now();
       int status = 0;
       std::size_t poses = 0;
@@ -510,9 +516,9 @@ TEST_F(PlannerNavigationTest, BotmanFixtureFullServicesBenchmark) {
         const auto result = PlannerNodeTestPeer::explore(*node);
         status = result->status; poses = result->path.size();
       } else {
-        // 15 m is outside the +/-6 m local box; this necessarily enters
-        // global routing (including its checked refusal if unobserved).
-        const auto result = navigate(*node, mode == "navigate_local" ? -2 : -15, 0);
+        // Force the observed -2 m goal through the global route too;
+        // separately measure the unobserved 15 m goal's clean refusal.
+        const auto result = navigate(*node, mode == "navigate_15m" ? -15 : -2, 0);
         status = result->status; poses = result->path.size(); reason = result->reason;
       }
       const double elapsed = std::chrono::duration<double, std::milli>(

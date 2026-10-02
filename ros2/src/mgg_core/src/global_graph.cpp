@@ -1439,6 +1439,9 @@ GlobalFrontierReport searchGlobalFrontier(
         report.unchecked = static_cast<int>(order.size() - i);
         report.frontiers += report.unchecked;
         break;
+      } catch (...) {
+        frontier->vol_gain = previous_gain;
+        throw;
       }
     }
     if (recompute_gain && frontier->robot_id == robot_id) {

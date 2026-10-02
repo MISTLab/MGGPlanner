@@ -3331,7 +3331,7 @@ bool PlannerNode::rebuildGlobalGraphFromKeyframes(
         static_cast<int>(planning_params_.robot_id),
         std::min(roadmap_rebuild_params_.link_radius,
                  planning_params_.edge_length_max));
-    }
+  }
   if (!loses_home.empty()) {
     ++roadmap_rebuilds_refused_;
     RCLCPP_WARN(get_logger(),

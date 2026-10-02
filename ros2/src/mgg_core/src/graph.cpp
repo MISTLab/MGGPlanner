@@ -109,10 +109,10 @@ namespace {
 struct SearchDeadlinePassed {};
 
 /// Stops a Dijkstra search once `deadline` has passed, checked every
-/// Graph::kDeadlineCheckVertices vertices settled; no deadline, never.
+/// vertex settled; no deadline, never. The request deadline may be only
+/// milliseconds away, so batching can overrun its reserved return time.
 struct DeadlineVisitor : boost::default_dijkstra_visitor {
   const std::chrono::steady_clock::time_point* deadline = nullptr;
-  std::shared_ptr<int> settled = std::make_shared<int>(0);
   template <class Vertex, class G>
   void examine_vertex(Vertex, const G&) {
     planningCheckpoint();
