@@ -306,6 +306,45 @@ class PlannerNodeTestPeer {
     msg->pose.pose.orientation.w = std::cos(yaw / 2.0);
     node.onOdometry(msg);
   }
+  static bool serveFixture(PlannerNode& node, const std::string& root) {
+    nlohmann::json source;
+    std::ifstream(root + "/mola/source.json") >> source;
+    const auto& manifest = source.at("manifests").at(0);
+    mgg::MolaSnapshotRequest request;
+    request.component_id = manifest.at("graph_revision").at("component_id");
+    request.epoch = manifest.at("graph_revision").at("epoch");
+    request.graph_revision = manifest.at("graph_revision").at("revision");
+    request.geometry_revision = manifest.at("geometry_revision");
+    for (const auto& submap : manifest.at("submaps"))
+      request.source_stamp_ns = std::max<std::uint64_t>(request.source_stamp_ns,
+          submap.value("observed_at_ns", std::uint64_t{0}));
+    node.mola_map_->requestSnapshot(request);
+    for (int i=0; i<400 && !node.mola_map_->getStatus(); ++i)
+      std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    // The tests' objective identity, independent of geometry product IDs.
+    node.mapping_snapshot_.component_id = "component:test";
+    node.mapping_snapshot_.epoch = 1;
+    node.mapping_snapshot_.component_from_navigation.rotation.w = 1;
+    node.have_mapping_snapshot_ = true;
+    mgg::SensorParams sensor;
+    sensor.type = mgg::SensorType::kLidar;
+    sensor.max_range = 20;
+    sensor.fov = Eigen::Vector2d(2*M_PI, M_PI/3);
+    sensor.resolution = Eigen::Vector2d(M_PI/36, M_PI/36);
+    sensor.frontier_percentage_threshold = .05;
+    sensor.update();
+    node.sensors_["VLP16"] = sensor;
+    node.planning_params_.exp_sensor_list = {"VLP16"};
+    return node.mola_map_->getStatus();
+  }
+  static std::shared_ptr<mgg_msgs::srv::PlannerSrv::Response> explore(PlannerNode& node) {
+    auto request = std::make_shared<mgg_msgs::srv::PlannerSrv::Request>();
+    request->bound_mode = request->EXTENDED_BOUND;
+    auto response = std::make_shared<mgg_msgs::srv::PlannerSrv::Response>();
+    node.onPlanRequest(request, response);
+    return response;
+  }
+  static int diagnosisCount(const PlannerNode& node) { return node.peer_diagnoses_; }
   static void hardwarePolicy(PlannerNode& node) { node.allow_unknown_lattice_body_ = false; }
   static void shortcut(PlannerNode& node, std::vector<mgg::StateVec>& path) {
     node.shortcutAndResample(path, {}, {}, true);
@@ -433,6 +472,60 @@ class PlannerNavigationTest : public ::testing::Test {
   static void TearDownTestSuite() { rclcpp::shutdown(); }
 };
 
+TEST_F(PlannerNavigationTest, HardwareNavigateFitsNorthDoorwayWithObservedBody) {
+  MolaTerrainProduct product(.1, -5, 5, -3, 7, flat,
+      {{-5, -.6, 1.5, 1.8, 2}, {.6, 5, 1.5, 1.8, 2}}, 2.0);
+  auto node = botmanNode("hardware_doorway", product);
+  PlannerNodeTestPeer::hardwarePolicy(*node);
+  PlannerNodeTestPeer::standAt(*node, 0, 0, 0, M_PI/2, 1);
+  const auto response = navigate(*node, 0, 4);
+  ASSERT_EQ(response->status, Service::Response::SUCCEEDED) << response->reason;
+  EXPECT_LE(pathLength(response->path), 4.2);
+}
+
+TEST_F(PlannerNavigationTest, BotmanFixtureFullServicesBenchmark) {
+  const char* root = std::getenv("MGG_NAV_BENCH_PRODUCT");
+  if (!root || !*root) GTEST_SKIP() << "MGG_NAV_BENCH_PRODUCT is not set";
+  const int repeat = std::getenv("MGG_SERVICE_BENCH_REPEAT")
+      ? std::max(1, std::atoi(std::getenv("MGG_SERVICE_BENCH_REPEAT"))) : 3;
+  for (int run = 0; run < repeat; ++run) for (bool allow_unknown : {false, true}) {
+    rclcpp::NodeOptions options;
+    options.parameter_overrides({rclcpp::Parameter("map.backend", "mola_snapshot"),
+        rclcpp::Parameter("map.resolution", .1),
+        rclcpp::Parameter("map.mola.peer_root", std::string(root)),
+        rclcpp::Parameter("roadmap_rebuild.robot_id", "botman_0"),
+        rclcpp::Parameter("map.mola.snapshot_ttl_sec", 60.0)});
+    options.automatically_declare_parameters_from_overrides(true);
+    auto node = std::make_shared<PlannerNode>(options);
+    PlannerNodeTestPeer::configureBotman(*node);
+    if (!allow_unknown) PlannerNodeTestPeer::hardwarePolicy(*node);
+    ASSERT_TRUE(PlannerNodeTestPeer::serveFixture(*node, root));
+    PlannerNodeTestPeer::standAt(*node, 0, 0, -.61, 0, run+1);
+    for (const std::string mode : {"navigate_local", "navigate_global_fallback", "explore"}) {
+      const auto started = std::chrono::steady_clock::now();
+      int status = 0;
+      std::size_t poses = 0;
+      std::string reason;
+      if (mode == "explore") {
+        const auto result = PlannerNodeTestPeer::explore(*node);
+        status = result->status; poses = result->path.size();
+      } else {
+        // 15 m is outside the +/-6 m local box; this necessarily enters
+        // global routing (including its checked refusal if unobserved).
+        const auto result = navigate(*node, mode == "navigate_local" ? -2 : -15, 0);
+        status = result->status; poses = result->path.size(); reason = result->reason;
+      }
+      const double elapsed = std::chrono::duration<double, std::milli>(
+          std::chrono::steady_clock::now() - started).count();
+      nlohmann::json row{{"service",mode},{"repeat",run},{"allow_unknown_body",allow_unknown},
+          {"request_budget_ms",500},{"total_ms",elapsed},{"status",status},{"poses",poses},
+          {"reason",reason},{"x86_budget_met",elapsed <= (mode=="explore" ? 350 : 300)}};
+      std::printf("SERVICE_BENCH %s\n", row.dump().c_str());
+      EXPECT_LT(elapsed, 1000);  // hard envelope, not a claim of the x86 target
+    }
+  }
+}
+
 TEST_F(PlannerNavigationTest, HardwareShortcutDoesNotCrossUnknownBodyVolume) {
   MolaTerrainProduct product(.1, -4, 6, -4, 6, flat);
   auto node = botmanNode("hardware_shortcut", product);
@@ -466,6 +559,33 @@ TEST_F(PlannerNavigationTest, InterruptedPeerDiagnosisRestoresCollisionChecks) {
   EXPECT_TRUE(PlannerNodeTestPeer::peerBlocks(*node));
   PlannerNodeTestPeer::diagnose(*node);
   EXPECT_TRUE(PlannerNodeTestPeer::peerBlocks(*node));
+}
+
+TEST_F(PlannerNavigationTest, ObjectiveInterruptionRestoresPeerDiagnosisDeadline) {
+  MolaTerrainProduct product(.1, -3, 5, -3, 3, flat, {{1, 4, -3, 3, 2}});
+  auto node = botmanNode("objective_peer_interrupt", product);
+  PlannerNodeTestPeer::standAt(*node, 0, 0, 0, 0, 1);
+  PlannerNodeTestPeer::setBudget(*node, 0);
+  PlannerNodeTestPeer::installPeerAndGraph(*node);
+  bool during_diagnosis = false;
+  {
+    mgg::PlanningCancellationScope interrupt([&] {
+      during_diagnosis = PlannerNodeTestPeer::peerDeadlineSet(*node);
+      return during_diagnosis;
+    });
+    const auto response = navigate(*node, 3, 0);
+    EXPECT_EQ(response->status, Service::Response::BLOCKED);
+    EXPECT_NE(response->reason.find("cancelled"), std::string::npos);
+  }
+  EXPECT_TRUE(during_diagnosis);
+  EXPECT_FALSE(PlannerNodeTestPeer::peersOpen(*node));
+  EXPECT_FALSE(PlannerNodeTestPeer::peerDeadlineSet(*node));
+  EXPECT_TRUE(PlannerNodeTestPeer::peerBlocks(*node));
+  // Another objective must enter ordinary peer handling, not the stale
+  // diagnostic mode left by the interrupted request.
+  const auto next = navigate(*node, 0, 0);
+  EXPECT_TRUE(PlannerNodeTestPeer::peerBlocks(*node));
+  EXPECT_FALSE(PlannerNodeTestPeer::peerDeadlineSet(*node));
 }
 
 TEST_F(PlannerNavigationTest, PeerDiagnosisYieldsBeforeTheRequestDeadline) {
@@ -550,11 +670,10 @@ TEST_F(PlannerNavigationTest, AGoalBehindAWallRoutesAroundIt) {
     EXPECT_GT(std::hypot(dx, dy), 0.414)
         << "pose at " << pose.position.x << ", " << pose.position.y;
   }
-  // Round the wall's end: the shortest way for the body's centre is 5.9 m.
-  // The turn rule keeps the lattice's corners here (a straight leap would
-  // turn sharply within a robot's length of the wall's end, where the
-  // robot has no room to turn), so the route is the lattice's, 7.0 m.
-  EXPECT_LT(pathLength(response->path), 7.2);
+  // Retain the original path-quality bound with the oriented body and
+  // turn rule intact, rather than relaxing it to accommodate the detour.
+  std::printf("wall_path_length_m=%.6f\n", pathLength(response->path));
+  EXPECT_LT(pathLength(response->path), 6.8);
 }
 
 TEST_F(PlannerNavigationTest, ARampRouteStaysWithinTheSlopeLimits) {

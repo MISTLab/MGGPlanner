@@ -21,6 +21,7 @@
 #include <nlohmann/json.hpp>
 
 #include "mgg_core/graph_manager.h"
+#include "mgg_core/planning_cancellation.h"
 #include "mgg_core/grid_graph.h"
 #include "mgg_core/ground_projection.h"
 #include "mgg_core/local_route.h"
@@ -209,6 +210,8 @@ inline std::vector<Scenario> scenarios() {
 }
 
 struct Outcome {
+  bool allow_unknown_body = true;
+  double request_budget_ms = 500.0;
   bool routed = false;
   std::string reason;
   double total_ms = 0.0;
@@ -255,12 +258,15 @@ inline double maxCornerDeg(const std::vector<Eigen::Vector3d>& p) {
   return worst;
 }
 
-inline Outcome run(const MapInterface& map, const Scenario& scenario) {
+inline Outcome run(const MapInterface& map, const Scenario& scenario,
+                   bool allow_unknown_body = true, double request_budget_ms = 500.0) {
   using Clock = std::chrono::steady_clock;
   const auto ms = [](Clock::time_point a, Clock::time_point b) {
     return std::chrono::duration<double, std::milli>(b - a).count();
   };
   Outcome out;
+  out.allow_unknown_body = allow_unknown_body;
+  out.request_budget_ms = request_budget_ms;
   const PlanningParams planning = botmanPlanning();
   const RobotParams robot = botmanRobot();
   const GridGraphParams grid = botmanGrid();
@@ -275,13 +281,15 @@ inline Outcome run(const MapInterface& map, const Scenario& scenario) {
   ctx.inclinations = &inclinations;
   ctx.robot_id = 1;
   ctx.robot_box_size = robot.getPlanningSize();
-  ctx.allow_unknown_lattice_body = true;
+  ctx.allow_unknown_lattice_body = allow_unknown_body;
   ctx.hanging_root_edge_length_max = planning.edge_length_max;
   ctx.preserve_hanging_root_start_height = true;
   ctx.root_footprint_exempt = true;
   ctx.root_is_robot = true;
   GraphManager graph;
   const auto diagnostics = [&] {
+    // Explicitly outside the measured production pipeline.
+    PlanningCancellationScope unbudgeted([] { return false; });
     const auto started = Clock::now();
     for (const auto& entry : graph.vertices_map_) {
       out.graph_radius_m = std::max(out.graph_radius_m,
@@ -299,6 +307,14 @@ inline Outcome run(const MapInterface& map, const Scenario& scenario) {
     out.diagnostic_ms = ms(started, Clock::now());
   };
   const auto t0 = Clock::now();
+  const auto deadline = t0 + std::chrono::duration_cast<Clock::duration>(
+      std::chrono::duration<double, std::milli>(request_budget_ms));
+  const auto* outer = planning_cancelled;
+  PlanningCancellationScope budget([&] {
+    return (outer && (*outer)()) || (request_budget_ms > 0 && Clock::now() >= deadline);
+  });
+  if (request_budget_ms > 0) ctx.deadline = deadline;
+  try {
   if (!scenario.navigate) {
     ctx.deadline = t0 + std::chrono::duration_cast<Clock::duration>(
         std::chrono::duration<double>(kGroundExplorationLatticeBudgetS));
@@ -352,7 +368,7 @@ inline Outcome run(const MapInterface& map, const Scenario& scenario) {
     const auto segment_free = [&](const Eigen::Vector3d& a,
                                   const Eigen::Vector3d& b) {
       return groundShortcutSegmentAdmissible(shortcut_ctx, a, b,
-                                             ctx.stop_at_unknown);
+                                             ctx.stop_at_unknown || !ctx.allow_unknown_lattice_body);
     };
     const PathOkFn turns_ok = [&](const PathType& trial) {
       return check.admissible(trial, scenario.start[3]);
@@ -397,6 +413,14 @@ inline Outcome run(const MapInterface& map, const Scenario& scenario) {
        out.max_corner_deg <= scenario.max_corner_deg) &&
       (scenario.budget_ms <= 0.0 || out.total_ms <= scenario.budget_ms);
   return out;
+  } catch (const PlanningInterrupted&) {
+    out.routed = false;
+    out.path.clear();
+    out.reason = "production request budget interrupted planning";
+    out.total_ms = ms(t0, Clock::now());
+    out.expectation_met = false;
+    return out;
+  }
 }
 
 inline std::string describe(const Scenario& s, const Outcome& o) {
@@ -440,6 +464,8 @@ inline std::string describe(const Scenario& s, const Outcome& o) {
 
 inline std::string toJson(const Scenario& s, const Outcome& o) {
   nlohmann::json j;
+  j["allow_unknown_body"] = o.allow_unknown_body;
+  j["request_budget_ms"] = o.request_budget_ms;
   j["scenario"] = s.name;
   j["kind"] = s.navigate ? "navigate" : "explore";
   j["routed"] = o.routed;

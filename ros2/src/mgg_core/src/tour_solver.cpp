@@ -49,12 +49,13 @@ class LegCost {
 
 /// First improving 2-opt move: reverse order[i..j].
 bool twoOptMove(std::vector<int>& order, const LegCost& leg, std::size_t lo) {
+  PlanningCheckpointThrottle checkpoint;
   const std::size_t n = order.size();
   for (std::size_t i = lo; i + 1 < n; ++i) {
     planningCheckpoint();
     const int before = i == 0 ? kStart : order[i - 1];
     for (std::size_t j = i + 1; j < n; ++j) {
-      planningCheckpoint();
+      checkpoint.check();
       const int after = j + 1 < n ? order[j + 1] : kEnd;
       const double added = leg(before, order[j]) + leg(order[i], after);
       const double removed = leg(before, order[i]) + leg(order[j], after);
@@ -70,6 +71,7 @@ bool twoOptMove(std::vector<int>& order, const LegCost& leg, std::size_t lo) {
 /// First improving Or-opt move: a segment of one to three clusters moved
 /// elsewhere, either way round.
 bool orOptMove(std::vector<int>& order, const LegCost& leg, std::size_t lo) {
+  PlanningCheckpointThrottle checkpoint;
   const std::size_t n = order.size();
   for (std::size_t length = 1; length <= 3; ++length) {
     planningCheckpoint();
@@ -86,7 +88,7 @@ bool orOptMove(std::vector<int>& order, const LegCost& leg, std::size_t lo) {
       rest.insert(rest.end(), order.begin(), order.begin() + i);
       rest.insert(rest.end(), order.begin() + k + 1, order.end());
       for (std::size_t p = lo; p <= rest.size(); ++p) {
-        planningCheckpoint();
+        checkpoint.check();
         if (p == i) continue;  // where the segment came from
         const int u = p == 0 ? kStart : rest[p - 1];
         const int v = p < rest.size() ? rest[p] : kEnd;

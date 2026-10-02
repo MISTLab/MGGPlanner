@@ -3,7 +3,7 @@
 // reports the time each takes and where it goes (mgg::PlanProfile).
 //
 // Usage:
-//   mgg_nav_bench <peer_root|--synthetic-floor> [--repeat N] [--budget-ms N] [--json]
+//   mgg_nav_bench <peer_root|--synthetic-floor> [--repeat N] [--budget-ms N] [--request-budget-ms N] [--allow-unknown-body] [--json]
 //
 // <peer_root> holds mola/source.json, mola/index.json and the planner grid
 // (the robot's maps/<mission>/<robot>/planning directory). The authority
@@ -33,12 +33,14 @@
 int main(int argc, char** argv) {
   if (argc < 2) {
     std::fprintf(stderr,
-                 "usage: mgg_nav_bench <peer_root|--synthetic-floor> [--repeat N] [--budget-ms N] [--json]\n");
+                 "usage: mgg_nav_bench <peer_root|--synthetic-floor> [--repeat N] [--budget-ms N] [--request-budget-ms N] [--allow-unknown-body] [--json]\n");
     return 2;
   }
   int repeat = 3;
   bool json = false;
   double budget_ms = 0.0;
+  double request_budget_ms = 500.0;
+  bool allow_unknown_body = false;
   for (int i = 2; i < argc; ++i) {
     if (std::strcmp(argv[i], "--repeat") == 0 && i + 1 < argc) {
       repeat = std::max(1, std::atoi(argv[++i]));
@@ -46,6 +48,12 @@ int main(int argc, char** argv) {
       char* end = nullptr;
       budget_ms = std::strtod(argv[++i], &end);
       if (*end != '\0' || !std::isfinite(budget_ms) || budget_ms <= 0.0) return 2;
+    } else if (std::strcmp(argv[i], "--request-budget-ms") == 0 && i + 1 < argc) {
+      char* end = nullptr;
+      request_budget_ms = std::strtod(argv[++i], &end);
+      if (*end != '\0' || !std::isfinite(request_budget_ms) || request_budget_ms < 0) return 2;
+    } else if (std::strcmp(argv[i], "--allow-unknown-body") == 0) {
+      allow_unknown_body = true;
     } else if (std::strcmp(argv[i], "--json") == 0) {
       json = true;
     } else {
@@ -98,7 +106,7 @@ int main(int argc, char** argv) {
     if (budget_ms > 0.0) scenario.budget_ms = budget_ms;
     for (int r = 0; r < repeat; ++r) {
       const mgg::nav_bench::Outcome outcome =
-          mgg::nav_bench::run(*planning_map, scenario);
+          mgg::nav_bench::run(*planning_map, scenario, allow_unknown_body, request_budget_ms);
       if (!outcome.expectation_met) ++failures;
       // Retain every sample, including the cold first run and slow outliers.
       if (json) {

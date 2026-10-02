@@ -1129,3 +1129,35 @@ TEST(GridGraph, HardwareUnknownPolicyMatchesEagerInRotatedDoorways) {
     EXPECT_TRUE(mgg::routeOverLocalLattice(lazy, root, goal, grid, ctx).routed);
   }
 }
+
+TEST(GridGraph, DirectShortcutFallsBackWhenTheStartTurnHasNoRoom) {
+  class NoTurnRoom : public OffsetObstacle {
+   public:
+    VoxelStatus getOccupiedOnlyCylinderPathStatus(const Eigen::Vector3d&,
+        const Eigen::Vector3d&, double, double) const override {
+      return VoxelStatus::kOccupied;
+    }
+  } map;
+  PlanningParams planning;
+  planning.max_ground_height = .5;
+  planning.max_step_height = .1;
+  planning.min_observed_ground_fraction = 0;
+  planning.path_clearance_margin = 0;
+  planning.edge_length_max = .6;
+  planning.edge_length_min = 0;
+  planning.edge_overshoot = 0;
+  RobotParams robot;
+  robot.size = Eigen::Vector3d(.2,.2,.2);
+  mgg::GroundProjection ground(map, planning, true);
+  ExpandContext ctx;
+  ctx.map=&map; ctx.ground=&ground; ctx.robot=&robot; ctx.planning=&planning;
+  ctx.robot_box_size=robot.getPlanningSize(); ctx.allow_unknown_lattice_body=true;
+  GridGraphParams grid;
+  grid.min_val=Eigen::Vector3d(-2,-2,0); grid.max_val=Eigen::Vector3d(2,2,0);
+  grid.resolution=Eigen::Vector3d::Constant(.4);
+  GraphManager graph;
+  const auto result = mgg::routeOverLocalLattice(graph, StateVec(0,0,.5,M_PI/2),
+      StateVec(2,0,.5,0), grid, ctx);
+  ASSERT_TRUE(result.routed);
+  EXPECT_GT(graph.getNumVertices(), 2);
+}

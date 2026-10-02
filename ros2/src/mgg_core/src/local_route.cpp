@@ -11,6 +11,7 @@
 #include "mgg_core/departure.h"
 #include "mgg_core/global_graph.h"
 #include "mgg_core/ground_projection.h"
+#include "mgg_core/path_turns.h"
 
 namespace mgg {
 
@@ -271,7 +272,12 @@ LocalRouteResult routeOverLocalLattice(GraphManager& graph,
       const auto to = goal_state.head<3>().eval();
       const double yaw = std::atan2(to.y() - from.y(), to.x() - from.x());
       const Eigen::Vector3d offset = ctx.robot->offsetForHeading(yaw);
-      if ((to - from).norm() > 1e-9 &&
+      const auto turns = pathTurns({from, to}, root_state[3],
+          std::max(ctx.robot->size.x(), ctx.robot->size.y()));
+      const bool start_turn_ok = turns.empty() || turns.front() <= kSharpTurnRad + 1e-9 ||
+          roomToTurn(*ctx.map, *ctx.robot, *ctx.planning, root_state,
+                     ctx.ground->standingStart());
+      if (start_turn_ok && (to - from).norm() > 1e-9 &&
           groundShortcutSegmentAdmissible(ctx, from, to,
               ctx.stop_at_unknown || !ctx.allow_unknown_lattice_body) &&
           ctx.ground->segmentClearance(from + offset, to + offset, ctx.robot_box_size) + 1e-9 >=

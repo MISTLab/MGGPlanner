@@ -74,12 +74,13 @@ bool entersBeyondStanding(const Eigen::Vector2d& cell_center,
                           const OrientedBox& standing) {
   if (pointInBox(cell_center, standing)) return false;
   if (!cellMeetsBox(cell_center, resolution, standing, 1e-6)) return true;
+  PlanningCheckpointThrottle checkpoint;
   constexpr int kSamples = 8;
   const double half = 0.5 * resolution;
   for (int i = 0; i <= kSamples; ++i) {
-    planningCheckpoint();
+    checkpoint.check();
     for (int j = 0; j <= kSamples; ++j) {
-      planningCheckpoint();
+      checkpoint.check();
       const Eigen::Vector2d point =
           cell_center + Eigen::Vector2d(-half + resolution * i / kSamples,
                                         -half + resolution * j / kSamples);
@@ -142,6 +143,7 @@ VoxelStatus orientedBoxPathStatus(const MapInterface& map,
   const double radius = 0.5 * swept.size.head<2>().norm();
   bool unknown = false;
   std::vector<XYCellCenter> cells;
+  PlanningCheckpointThrottle checkpoint;
   for (int i = 0; i < steps; ++i) {
     planningCheckpoint();
     swept.center = start + (i + 0.5) * step;
@@ -150,7 +152,7 @@ VoxelStatus orientedBoxPathStatus(const MapInterface& map,
       return VoxelStatus::kUnknown;
     }
     for (const XYCellCenter& cell : cells) {
-      planningCheckpoint();
+      checkpoint.check();
       if (!cellMeetsBox(cell.center, resolution, swept, -1e-9)) continue;
       if (standing != nullptr &&
           !entersBeyondStanding(cell.center, resolution, swept, *standing)) {

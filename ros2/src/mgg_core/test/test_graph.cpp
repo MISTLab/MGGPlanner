@@ -99,3 +99,37 @@ TEST(Graph, DisconnectedVertexIsReachableOnlyFromItself) {
 }
 
 }  // namespace
+
+TEST(PlanningCheckpoint, ThrottledInnerLoopChecksFirstAndEvery64Iterations) {
+  int calls = 0;
+  bool expired = false;
+  mgg::PlanningCancellationScope request([&] { ++calls; return expired; });
+  mgg::PlanningCheckpointThrottle checkpoint;
+  checkpoint.check();
+  EXPECT_EQ(calls, 1);
+  expired = true;
+  for (int i = 0; i < 63; ++i) EXPECT_NO_THROW(checkpoint.check());
+  EXPECT_EQ(calls, 1);
+  EXPECT_THROW(checkpoint.check(), mgg::PlanningInterrupted);
+  EXPECT_EQ(calls, 2);
+}
+
+TEST(PlanningCheckpoint, ClockPredicateCostMeasurement) {
+  using Clock = std::chrono::steady_clock;
+  int calls = 0;
+  mgg::PlanningCancellationScope request([&] {
+    ++calls; return Clock::now() >= Clock::time_point::max();
+  });
+  const auto start = Clock::now();
+  for (int i = 0; i < 1000000; ++i) mgg::planningCheckpoint();
+  const auto direct = Clock::now();
+  EXPECT_EQ(calls, 1000000);
+  calls = 0;
+  mgg::PlanningCheckpointThrottle checkpoint;
+  for (int i = 0; i < 1000000; ++i) checkpoint.check();
+  const auto throttled = Clock::now();
+  EXPECT_EQ(calls, 15625);
+  std::printf("checkpoint_1M direct_ms=%.3f throttled_ms=%.3f\n",
+      std::chrono::duration<double, std::milli>(direct-start).count(),
+      std::chrono::duration<double, std::milli>(throttled-direct).count());
+}

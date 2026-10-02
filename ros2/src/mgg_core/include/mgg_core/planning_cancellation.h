@@ -28,5 +28,14 @@ class PlanningCancellationScope {
 inline void planningCheckpoint() {
   if (planning_cancelled && (*planning_cancelled)()) throw PlanningInterrupted{};
 }
+// Keep bounded arithmetic-only inner loops cheap while retaining the first
+// checkpoint and a maximum of 63 unchecked iterations. Outer loops still
+// check each work item. Instance-local, so nested calls cannot starve a check.
+class PlanningCheckpointThrottle {
+ public:
+  void check() { if ((iterations_++ & 63u) == 0) planningCheckpoint(); }
+ private:
+  unsigned iterations_ = 0;
+};
 }  // namespace mgg
 #endif

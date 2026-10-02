@@ -929,6 +929,8 @@ mgg::ExpandContext PlannerNode::makeContext() {
   ctx.root_footprint_exempt = true;
   ctx.root_is_robot = true;
   ctx.deadline = lattice_deadline_;
+  if (peer_diagnosis_deadline_ && (!ctx.deadline || *peer_diagnosis_deadline_ < *ctx.deadline))
+    ctx.deadline = peer_diagnosis_deadline_;
   // No-go zones close lattice edges on every backend, the robot's own
   // departure from one it stands in excepted (review r0, I-5).
   if (!no_go_.empty()) {
