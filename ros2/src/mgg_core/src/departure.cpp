@@ -380,6 +380,17 @@ bool reverseExitEdgeAdmissible(
   return true;
 }
 
+StateVec referenceAfterChassisSpin(const RobotParams& robot,
+                                  const StateVec& start, double heading) {
+  StateVec post = start;
+  if (robot.type == RobotType::kGroundRobot) {
+    post.head<2>() += robot.physicalOffsetForHeading(start[3]).head<2>() -
+                     robot.physicalOffsetForHeading(heading).head<2>();
+  }
+  post[3] = heading;
+  return post;
+}
+
 bool findDeparture(const MapInterface& map, const GroundProjection& ground,
                    const RobotParams& robot, const PlanningParams& planning,
                    const StateVec& start, Departure& departure,
@@ -401,6 +412,7 @@ bool findDeparture(const MapInterface& map, const GroundProjection& ground,
 
   // Straight out at `heading`, ahead then back; fills departure.path.
   const auto straight = [&](double heading) {
+    const StateVec post = referenceAfterChassisSpin(robot, start, heading);
     OrientedBox body = standing;
     body.heading = heading;
     EdgeBodyCheck check;
@@ -432,13 +444,13 @@ bool findDeparture(const MapInterface& map, const GroundProjection& ground,
       if (backwards && !planning.departure_reverse_allowed) break;
       const double direction = backwards ? heading + M_PI : heading;
       const Eigen::Vector2d unit(std::cos(direction), std::sin(direction));
-      StateVec here = start;
+      StateVec here = post;
       here[3] = heading;
       departure.path.assign(1, here);
       for (int i = 1; i <= steps; ++i) {
         planningCheckpoint();
         const double out = std::min(i * step, max_distance);
-        const Eigen::Vector2d xy = start.head<2>() + out * unit;
+        const Eigen::Vector2d xy = post.head<2>() + out * unit;
         StateVec to(xy.x(), xy.y(), departure.path.back().z(), heading);
         if (ground_robot && !toDrivingHeight(ground, planning, to)) break;
         // On the line, at the height of the ground found beside it if that
@@ -480,9 +492,10 @@ bool findDeparture(const MapInterface& map, const GroundProjection& ground,
       const double turn = (side == 0 ? 1.0 : -1.0) * k * kDepartureTurnStepRad;
       OrientedBox turned = standing;
       turned.heading = start[3] + turn;
+      const auto post = referenceAfterChassisSpin(robot, start, turned.heading);
       if (orientedBoxPathStatus(map,
-          start.head<3>() + robot.offsetForHeading(turned.heading),
-          start.head<3>() + robot.offsetForHeading(turned.heading), turned,
+          post.head<3>() + robot.offsetForHeading(turned.heading),
+          post.head<3>() + robot.offsetForHeading(turned.heading), turned,
                                 true, &standing) != VoxelStatus::kFree) {
         blocked[side] = true;
         continue;

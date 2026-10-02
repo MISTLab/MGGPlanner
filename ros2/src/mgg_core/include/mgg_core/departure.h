@@ -145,6 +145,11 @@ struct Departure {
   double turn = 0.0;
 };
 
+/// Reference after a stationary ground-robot spin about its physical centre.
+/// The planning vertical band and aerial reference are unchanged.
+StateVec referenceAfterChassisSpin(const RobotParams& robot,
+                                  const StateVec& start, double heading);
+
 /// A departure for a ground robot boxed in at `start`, at driving height,
 /// facing start[3]. Straight ahead along its heading, or else, with
 /// PlanningParams::departure_reverse_allowed, straight back, in steps of

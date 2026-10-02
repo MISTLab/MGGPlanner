@@ -78,6 +78,17 @@ TEST(GraphSolution, TwoSessionsOfTheRobotAreRefused) {
   EXPECT_NE(error.find("sessions"), std::string::npos) << error;
 }
 
+TEST(GraphSolution, NewSessionReplacesRatherThanConcatenatesThePreviousRead) {
+  KeyframeTrajectory trajectory;
+  std::string error;
+  ASSERT_TRUE(parseGraphSolution(solution(pose("robot_1","old",0,2,0)),
+                                "robot_1",trajectory,error));
+  ASSERT_TRUE(parseGraphSolution(solution(pose("robot_1","new",0,5,0)),
+                                "robot_1",trajectory,error));
+  ASSERT_EQ(trajectory.poses.size(),1u);
+  EXPECT_DOUBLE_EQ(trajectory.poses.front().translation().x(),5);
+}
+
 TEST(GraphSolution, MalformedDocumentsAreRefused) {
   KeyframeTrajectory trajectory;
   std::string error;

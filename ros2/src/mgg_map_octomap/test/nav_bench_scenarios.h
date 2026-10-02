@@ -155,8 +155,8 @@ inline RobotParams botmanRobot() {
   // The box centred on the lidar that reaches the footprint's farthest
   // corner on each axis (hardware.launch.py), 2 x 0.61 m tall.
   r.size = Eigen::Vector3d(1.344, 0.778, 1.22);
-  r.physical_size = Eigen::Vector3d(1.023, .778, 1.22);
-  r.physical_center_offset = Eigen::Vector3d(-.16, 0, 0);
+  r.physical_size = Eigen::Vector3d(1.023, .778, .660);
+  r.physical_center_offset = Eigen::Vector3d(-.16, 0, .330 - .935);
   r.size_extension = Eigen::Vector3d(0.05, 0.05, 0.05);
   r.bound_mode = BoundModeType::kExtendedBound;
   return r;

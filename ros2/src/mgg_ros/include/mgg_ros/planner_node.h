@@ -193,12 +193,13 @@ class PlannerNode : public rclcpp::Node {
   /// reverseExitEdge with no peer bodies: whether only a peer blocks it.
   bool reverseExitEdgeWithoutPeers(const mgg::StateVec& from, const mgg::StateVec& to) const;
   void forgetReverseExitIfOffRoute();
+  /// Re-certify the join from the actual reference after a stationary chassis spin.
+  bool startPathAfterChassisSpin(std::vector<mgg::StateVec>& path,
+                                 bool lattice_route);
   /// Whether a route, the robot's pose first, starts with a sharp turn
   /// (kSharpTurnRad, measured over the robot's length from its heading)
   /// where the robot has no room to turn: the route a boxed-in robot is
   /// not sent.
-  bool startPathAfterChassisSpin(std::vector<mgg::StateVec>& path,
-                                 bool lattice_route);
   bool routeStartsWithTurnWithoutRoom(
       const std::vector<Eigen::Vector3d>& points);
   /// Why exploration may not be declared complete although no frontier is

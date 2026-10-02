@@ -253,8 +253,8 @@ class PlannerNodeTestPeer {
     node.robot_params_.safety_extension.setZero();
     node.robot_params_.bound_mode = mgg::BoundModeType::kExtendedBound;
     node.robot_params_.center_offset.setZero();
-    node.robot_params_.physical_size = Eigen::Vector3d(1.023, .778, 1.22);
-    node.robot_params_.physical_center_offset = Eigen::Vector3d(-.16, 0, 0);
+    node.robot_params_.physical_size = Eigen::Vector3d(1.023, .778, .660);
+    node.robot_params_.physical_center_offset = Eigen::Vector3d(-.16, 0, .330 - .935);
     mgg::PlanningParams& p = node.planning_params_;
     p.rr_mode = mgg::RRModeType::kGraph;
     p.edge_length_min = 0.05;
@@ -414,7 +414,7 @@ class PlannerNodeTestPeer {
   static std::pair<int,int> globalSize(PlannerNode& node) {
     return {node.global_graph_->getNumVertices(), node.global_graph_->getNumEdges()};
   }
-  static void historyIdentity(PlannerNode& node, const std::string& component, int epoch) {
+  static void historyIdentity(PlannerNode& node, const std::string& component, int epoch, double x = 2) {
     class OwnSource : public KeyframeTrajectorySource {
      public:
       KeyframeTrajectory trajectory;
@@ -422,20 +422,104 @@ class PlannerNodeTestPeer {
     };
     auto source = std::make_unique<OwnSource>();
     source->trajectory.component_id=component; source->trajectory.epoch=epoch;
-    auto pose=Eigen::Isometry3d::Identity(); pose.translation()=Eigen::Vector3d(2,0,.61);
+    auto pose=Eigen::Isometry3d::Identity(); pose.translation()=Eigen::Vector3d(x,0,.61);
     source->trajectory.poses={pose};
     node.keyframe_source_=std::move(source);
   }
-  static mgg::VoxelStatus historicalUnknown(PlannerNode& node) {
+  static mgg::VoxelStatus historicalUnknown(PlannerNode& node, double low = .55, double high = .6) {
     node.applyLatestOdometry();
     PlannerNode::StandingStartScope scope(node);
     const auto ctx=node.makeContext();
     const Eigen::Vector2d cell(2.05,.05);
-    return ctx.own_body_known_free->strictColumnStatus(*node.map_,cell,.55,.7);
+    return ctx.own_body_known_free->strictColumnStatus(*node.map_,cell,low,high);
+  }
+  static nlohmann::json joinWitness(PlannerNode& node, const Eigen::Vector3d& from,
+                                     const Eigen::Vector3d& to) {
+    node.applyLatestOdometry();
+    PlannerNode::StandingStartScope scope(node);
+    const auto ctx=node.makeContext();
+    nlohmann::json row, sweeps=nlohmann::json::array();
+    mgg::OrientedBox body;
+    body.heading=std::atan2(to.y()-from.y(),to.x()-from.x());
+    body.size=ctx.robot_box_size;
+    mgg::EdgeBodyCheck check;
+    check.sweep=[&](const Eigen::Vector3d& a,const Eigen::Vector3d& b) {
+      const auto status=mgg::orientedBoxPathStatus(*node.map_,a,b,body,true,
+          nullptr,true,ctx.unknown_body_above_center,ctx.own_body_known_free.get());
+      nlohmann::json sweep{{"from",{a.x(),a.y(),a.z()}},{"to",{b.x(),b.y(),b.z()}},
+                            {"body_status",int(status)}};
+      nlohmann::json witnesses=nlohmann::json::array();
+      const double resolution=node.map_->getResolution();
+      const int steps=std::max(1,int(std::ceil((b-a).norm()/resolution)));
+      const Eigen::Vector3d step=(b-a)/steps;
+      const Eigen::Vector2d along(std::cos(body.heading),std::sin(body.heading));
+      mgg::OrientedBox swept=body;
+      swept.size+=Eigen::Vector3d(std::abs(step.head<2>().dot(along)),
+          std::abs(step.head<2>().dot(Eigen::Vector2d(-along.y(),along.x()))),std::abs(step.z()));
+      for(int i=0;i<steps;++i) {
+        swept.center=a+(i+.5)*step;
+        std::vector<mgg::XYCellCenter> cells;
+        node.map_->getCircleIntersectingXYCellCenters(swept.center.head<2>(),
+            swept.size.head<2>().norm()/2,4096,cells);
+        const double lo=swept.center.z()-swept.size.z()/2;
+        const double hi=std::min(swept.center.z()+swept.size.z()/2,
+            swept.center.z()+ctx.unknown_body_above_center.value_or(swept.size.z()/2)+std::abs(step.z())/2);
+        for(const auto& cell:cells) {
+          if(!mgg::cellMeetsBox(cell.center,resolution,swept,-1e-9))continue;
+          if(ctx.own_body_known_free->strictColumnStatus(*node.map_,cell.center,lo,hi)==mgg::VoxelStatus::kFree)continue;
+          for(double z=std::floor(lo/resolution)*resolution+resolution/2;
+              z-resolution/2<=hi;z+=resolution) {
+            const auto voxel=node.map_->getVoxelStatus({cell.center.x(),cell.center.y(),z});
+            if(voxel==mgg::VoxelStatus::kFree)continue;
+            const auto masked=ctx.own_body_known_free->strictColumnStatus(*node.map_,cell.center,
+                std::max(lo,z-resolution/2+1e-7),std::min(hi,z+resolution/2-1e-7));
+            if(masked==mgg::VoxelStatus::kFree)continue;
+            if(witnesses.size()<12) witnesses.push_back({{"voxel",{cell.center.x(),cell.center.y(),z}},
+                {"status",int(voxel)},{"masked_status",int(masked)},{"required_band",{lo,hi}}});
+          }
+        }
+      }
+      sweep["witnesses"]=witnesses; sweeps.push_back(sweep);
+      return status;
+    };
+    std::vector<Eigen::Vector3d> projected;
+    const auto offset=ctx.robot->offsetForHeading(body.heading);
+    row["projected_status"]=int(ctx.ground->getProjectedEdgeStatus(from+offset,to+offset,
+        body.size,true,projected,false,false,&check,mgg::EdgeTravel::kForward));
+    row["sweeps"]=sweeps;
+    return row;
   }
   static bool postSpin(PlannerNode& node, std::vector<mgg::StateVec>& path) {
     node.applyLatestOdometry();
     return node.startPathAfterChassisSpin(path,true);
+  }
+  static mgg::Departure turnedDeparture(PlannerNode& node) {
+    node.applyLatestOdometry();
+    mgg::StateVec start(0,0,.935,M_PI/2);
+    mgg::Departure departure;
+    // Reject endpoints at the original heading; exercise the first small
+    // turned departure without coupling the test to search scoring.
+    EXPECT_TRUE(mgg::findDeparture(*node.map_,*node.ground_,node.robot_params_,
+        node.planning_params_,start,departure,[](const auto& path) {
+          return std::abs(path.front()[3]-M_PI/2)>1e-3;
+        }));
+    return departure;
+  }
+  static std::vector<mgg::StateVec> storedOffsetReverse(PlannerNode& node) {
+    node.applyLatestOdometry();
+    const mgg::StateVec start(0,0,.935,.2);
+    node.stored_reverse_exit_ = {start, {-.5,0,.935,0}, {-1,0,.935,0}, {-2,0,.935,0}};
+    node.reverse_exit_entry_path_ = {node.stored_reverse_exit_.rbegin(),node.stored_reverse_exit_.rend()};
+    std::vector<mgg::StateVec> path;
+    std::string note;
+    EXPECT_TRUE(node.validateStoredReverseExit(start,path,note)) << note;
+    EXPECT_FALSE(path.empty()) << note;
+    return path;
+  }
+  static bool refugeBand(PlannerNode& node, double stored_yaw) {
+    node.applyLatestOdometry();
+    return node.refugeArrivalBandAdmissible({{0,0,.935,stored_yaw},
+                                            {1,0,.935,stored_yaw}});
   }
   static bool postSpinRecordsTurnBack(PlannerNode& node) {
     node.applyLatestOdometry();
@@ -621,6 +705,31 @@ TEST_F(PlannerNavigationTest, HardwareNavigateFitsNorthDoorwayWithObservedBody) 
   EXPECT_LE(pathLength(response->path), 4.2);
 }
 
+TEST_F(PlannerNavigationTest, BotmanPostSpinJoinWitness) {
+  const char* root=std::getenv("MGG_NAV_BENCH_PRODUCT");
+  if(!root || !*root)GTEST_SKIP()<<"MGG_NAV_BENCH_PRODUCT is not set";
+  rclcpp::NodeOptions options;
+  options.parameter_overrides({rclcpp::Parameter("map.backend","mola_snapshot"),
+      rclcpp::Parameter("map.resolution",.1),
+      rclcpp::Parameter("map.mola.peer_root",std::string(root)),
+      rclcpp::Parameter("roadmap_rebuild.robot_id","botman_0"),
+      rclcpp::Parameter("map.mola.snapshot_ttl_sec",60.0)});
+  options.automatically_declare_parameters_from_overrides(true);
+  auto node=std::make_shared<PlannerNode>(options);
+  PlannerNodeTestPeer::configureBotman(*node);
+  ASSERT_TRUE(PlannerNodeTestPeer::serveFixture(*node,root));
+  PlannerNodeTestPeer::sensorPolicy(*node);
+  for(bool east:{true,false}) {
+    PlannerNodeTestPeer::standAt(*node,east?1.13:-3.17,east?.07:-.01,-.61,east?-.08:3.10,east?1:2);
+    const Eigen::Vector3d from=east?Eigen::Vector3d(.811023,.095573,.333106):Eigen::Vector3d(-2.850277,-.023306,.379410);
+    const Eigen::Vector3d to=east?Eigen::Vector3d(.631601,.109957,.366102):Eigen::Vector3d(-2.670572,-.030785,.372892);
+    auto row=PlannerNodeTestPeer::joinWitness(*node,from,to);
+    row["start_x"]=east?1.13:-3.17;
+    std::cout<<"JOIN_WITNESS "<<row.dump()<<'\n';
+    EXPECT_NE(row["projected_status"].get<int>(),int(mgg::ProjectedEdgeStatus::kAdmissible));
+  }
+}
+
 TEST_F(PlannerNavigationTest, BotmanFixtureFullServicesBenchmark) {
   const char* root = std::getenv("MGG_NAV_BENCH_PRODUCT");
   if (!root || !*root) GTEST_SKIP() << "MGG_NAV_BENCH_PRODUCT is not set";
@@ -695,6 +804,65 @@ TEST_F(PlannerNavigationTest, StrictPolicyHasNoOwnBodyUnknownExceptions) {
   PlannerNodeTestPeer::standAt(*node,0,0,0,0,1);
   EXPECT_FALSE(PlannerNodeTestPeer::hasOwnBodyMask(*node,true));
   EXPECT_FALSE(PlannerNodeTestPeer::hasOwnBodyMask(*node,false));
+}
+
+TEST_F(PlannerNavigationTest, PhysicalEvidenceEndsAtLidarHousingNotPlanningCeiling) {
+  MolaTerrainProduct product(.1,-3,5,-3,3,flat,{},.5);
+  auto node=botmanNode("physical_z",product);
+  PlannerNodeTestPeer::sensorPolicy(*node);
+  PlannerNodeTestPeer::standAt(*node,0,0,0,0,1);
+  PlannerNodeTestPeer::historyIdentity(*node,"component:test",1);
+  EXPECT_EQ(PlannerNodeTestPeer::historicalUnknown(*node,.64,.659),mgg::VoxelStatus::kFree);
+  EXPECT_EQ(PlannerNodeTestPeer::historicalUnknown(*node,.661,.69),mgg::VoxelStatus::kUnknown);
+}
+
+TEST_F(PlannerNavigationTest, RequestHistoryNeverConcatenatesSeparateReads) {
+  MolaTerrainProduct product(.1,-3,6,-3,3,flat,{},.5);
+  auto node=botmanNode("fresh_history",product);
+  PlannerNodeTestPeer::sensorPolicy(*node);
+  PlannerNodeTestPeer::standAt(*node,0,0,0,0,1);
+  PlannerNodeTestPeer::historyIdentity(*node,"component:test",1,2);
+  EXPECT_EQ(PlannerNodeTestPeer::historicalUnknown(*node),mgg::VoxelStatus::kFree);
+  PlannerNodeTestPeer::historyIdentity(*node,"component:test",1,5);
+  EXPECT_EQ(PlannerNodeTestPeer::historicalUnknown(*node),mgg::VoxelStatus::kUnknown);
+}
+
+TEST_F(PlannerNavigationTest, TurnedDepartureStartsAtPostSpinReference) {
+  MolaTerrainProduct product(.1,-3,5,-3,3,flat,{},2.0);
+  auto node=botmanNode("turned_departure",product);
+  PlannerNodeTestPeer::standAt(*node,0,0,0,M_PI/2,1);
+  const auto departure=PlannerNodeTestPeer::turnedDeparture(*node);
+  ASSERT_GT(departure.path.size(),1u);
+  ASSERT_NE(departure.turn,0);
+  const double yaw=departure.path.front()[3];
+  const Eigen::Vector2d centre = departure.path.front().head<2>() +
+      Eigen::Vector2d(-.16*std::cos(yaw),-.16*std::sin(yaw));
+  EXPECT_NEAR(centre.x(),0,1e-9);
+  EXPECT_NEAR(centre.y(),-.16,1e-9);
+  EXPECT_GT(departure.path.front().head<2>().norm(),.001);
+}
+
+TEST_F(PlannerNavigationTest, StoredReverseStartsAtRotatedOffsetReference) {
+  MolaTerrainProduct product(.1,-4,2,-2,2,flat,{{0,.1,-.6,-.5,1.5}},2.0);
+  auto node=botmanNode("stored_spin",product);
+  PlannerNodeTestPeer::standAt(*node,0,0,0,.2,1);
+  const auto path=PlannerNodeTestPeer::storedOffsetReverse(*node);
+  ASSERT_GE(path.size(),2u);
+  const auto& post=path.front();
+  EXPECT_NEAR(post.x()-.16*std::cos(post[3]),-.16*std::cos(.2),1e-8);
+  EXPECT_NEAR(post.y()-.16*std::sin(post[3]),-.16*std::sin(.2),1e-8);
+  const double travel=std::atan2(path[1].y()-post.y(),path[1].x()-post.x());
+  EXPECT_NEAR(std::remainder(travel-post[3]-M_PI,2*M_PI),0,1e-8);
+}
+
+TEST_F(PlannerNavigationTest, RefugeBandUsesReverseChassisYawNotStoredYaw) {
+  // Reverse travel is +X, so the chassis centre is +.16 from the reference.
+  // The obstacle behind the arrival lies in a yaw-zero circle, not that circle.
+  MolaTerrainProduct product(.1,-1,3,-2,2,flat,{{.1,.2,.5,.6,1.5}},2.0);
+  auto node=botmanNode("refuge_chassis_yaw",product);
+  PlannerNodeTestPeer::standAt(*node,0,0,0,0,1);
+  EXPECT_TRUE(PlannerNodeTestPeer::refugeBand(*node,0));
+  EXPECT_TRUE(PlannerNodeTestPeer::refugeBand(*node,M_PI));
 }
 
 TEST_F(PlannerNavigationTest, OffsetStartSpinPreservesTurnBackHysteresis) {

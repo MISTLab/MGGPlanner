@@ -1064,6 +1064,8 @@ std::shared_ptr<const mgg::KnownFreeBodyVolumes> PlannerNode::ownBodyKnownFree()
   const auto root = physicalAnchorAtDrivingHeight(current_state_);
   known->add(*map_, {root.head<3>() + robot_params_.physicalOffsetForHeading(root[3]),
                     root[3], robot_params_.physicalSize()});
+  // Each request reads one parser-validated session into a fresh volume.
+  // Never concatenate poses with a prior read/session, even at equal epoch.
   KeyframeTrajectory trajectory;
   std::string error;
   if (keyframe_source_ && have_mapping_snapshot_ &&
@@ -5146,6 +5148,14 @@ bool PlannerNode::startPathAfterChassisSpin(std::vector<mgg::StateVec>& path,
                                              bool lattice_route) {
   if (robot_params_.type != mgg::RobotType::kGroundRobot || path.size() < 2 ||
       robot_params_.physicalOffsetForHeading(0).head<2>().norm() < 1e-9) return true;
+  const auto refused = [&](const char* check, const mgg::StateVec& from,
+                           const mgg::StateVec& to) {
+    RCLCPP_WARN(get_logger(), "post-spin join refused: %s; root=(%.6f,%.6f,%.6f,%.6f) "
+        "from=(%.6f,%.6f,%.6f,%.6f) to=(%.6f,%.6f,%.6f,%.6f)", check,
+        current_state_[0],current_state_[1],current_state_[2],current_state_[3],
+        from[0],from[1],from[2],from[3],to[0],to[1],to[2],to[3]);
+    return false;
+  };
   const double first_yaw = std::atan2(path[1].y()-path[0].y(),path[1].x()-path[0].x());
   if (std::abs(std::remainder(first_yaw-current_state_[3],2*M_PI)) <=
       mgg::kSharpTurnRad + 1e-9) return true;
@@ -5154,9 +5164,9 @@ bool PlannerNode::startPathAfterChassisSpin(std::vector<mgg::StateVec>& path,
   const auto standing = standingStart();
   const double slope = mgg::groundSlope(*ground_, incoming.head<3>(),
       std::max(robot_params_.size.x(),robot_params_.size.y()),local_graph_.get());
-  if (slope > mgg::kLevelGroundSlopeRad && current_tilt_ >= 4*M_PI/180) return false;
+  if (slope > mgg::kLevelGroundSlopeRad && current_tilt_ >= 4*M_PI/180) return refused("start slope",incoming,path[1]);
   if (!mgg::roomToTurn(*map_,robot_params_,planning_params_,incoming,
-                       standing ? &*standing : nullptr)) return false;
+                       standing ? &*standing : nullptr)) return refused("incoming turn room",incoming,path[1]);
   const Eigen::Vector2d centre = incoming.head<2>() +
       robot_params_.physicalOffsetForHeading(incoming[3]).head<2>();
   const Eigen::Vector2d offset = robot_params_.physicalOffsetForHeading(0).head<2>();
@@ -5168,7 +5178,7 @@ bool PlannerNode::startPathAfterChassisSpin(std::vector<mgg::StateVec>& path,
     if (i > 1) {
       const auto leg = (path[i]-path[0]).head<2>().eval();
       if (std::abs(std::remainder(std::atan2(leg.y(),leg.x())-first_yaw,2*M_PI)) > 1e-3)
-        return false;
+        return refused("initial leg corner",incoming,path[i]);
     }
     const Eigen::Vector2d delta = path[i].head<2>()-centre;
     const double length = delta.norm();
@@ -5178,28 +5188,35 @@ bool PlannerNode::startPathAfterChassisSpin(std::vector<mgg::StateVec>& path,
     post.head<2>() = centre-robot_params_.physicalOffsetForHeading(yaw).head<2>();
     post[3] = yaw;
     if (!mgg::groundShortcutSegmentAdmissible(ctx,post.head<3>(),path[i].head<3>(),
-          !lattice_route || ctx.stop_at_unknown || !ctx.allow_unknown_lattice_body)) return false;
+          !lattice_route || ctx.stop_at_unknown || !ctx.allow_unknown_lattice_body))
+      return refused("projected body/terrain sweep",post,path[i]);
     std::vector<mgg::StateVec> adjusted{post};
     adjusted.insert(adjusted.end(),path.begin()+i,path.end());
-    if (!noGoAdmissible(adjusted) || !peerAdmissible(adjusted)) return false;
+    if (!noGoAdmissible(adjusted)) return refused("no-go",post,path[i]);
+    if (!peerAdmissible(adjusted)) return refused("peer",post,path[i]);
     mgg::PathTurnCheck turns(*local_graph_, robot_params_,
-        [this](const auto& pose) {
-          return mgg::roomToTurn(*map_,robot_params_,planning_params_,pose);
+        [this, standing](const auto& pose) {
+          return mgg::roomToTurn(*map_,robot_params_,planning_params_,pose,
+                                 standing ? &*standing : nullptr);
         }, [this](const Eigen::Vector3d& at) {
           return mgg::groundSlope(*ground_,at,
               std::max(robot_params_.size.x(),robot_params_.size.y()),local_graph_.get());
         }, false, [this](const auto& a,const auto& b) {
           return mgg::turnTransitionClear(*map_,robot_params_,a,b);
         });
+    turns.setRobotTilt(post.head<3>(), current_tilt_);
     mgg::PathType points;
     for (const auto& pose : adjusted) points.push_back(pose.head<3>());
     // The stationary start spin was checked above. Check every remaining
     // corner, including a changed arrival heading at the route join.
-    if (!turns.admissible(points,yaw)) return false;
+    if (!turns.admissible(points,yaw)) return refused("remaining corner",post,path[i]);
+    // recordSentPath must still recognise the selected lattice route after
+    // its reference is moved by the stationary chassis spin.
+    if (lattice_route && path == lattice_path_) lattice_path_ = adjusted;
     path = std::move(adjusted);
     return true;
   }
-  return false;
+  return refused("no forward join",incoming,path.back());
 }
 
 bool PlannerNode::routeStartsWithTurnWithoutRoom(
@@ -6624,7 +6641,14 @@ bool PlannerNode::validateStoredReverseExit(const mgg::StateVec& start,
       reverse.push_back(*--refuge);
     }
   }
-  const double heading = std::atan2(start.y() - reverse[1].y(), start.x() - reverse[1].x());
+  const Eigen::Vector2d centre = start.head<2>() +
+      robot_params_.physicalOffsetForHeading(start[3]).head<2>();
+  const Eigen::Vector2d delta = reverse[1].head<2>() - centre;
+  const auto physical_offset = robot_params_.physicalOffsetForHeading(0).head<2>().eval();
+  if (delta.norm() <= physical_offset.norm() + .01)
+    return refused("entry connector is too short for chassis spin", true);
+  const double heading = std::atan2(delta.y(), delta.x()) + M_PI -
+      std::asin(physical_offset.y()/delta.norm());
   const double turn = std::remainder(heading - start[3], 2.0 * M_PI);
   if (std::abs(turn) > mgg::kDepartureMaxTurnRad + 1e-9) {
     return refused("entry heading mismatch", true);
@@ -6636,12 +6660,15 @@ bool PlannerNode::validateStoredReverseExit(const mgg::StateVec& start,
   const int turns = std::max(1, static_cast<int>(std::ceil(std::abs(turn) / mgg::kDepartureTurnStepRad)));
   for (int i = 0; i <= turns; ++i) {
     body.heading = start[3] + turn * i / turns;
-    if (mgg::orientedBoxPathStatus(*map_, start.head<3>() + robot_params_.center_offset,
-        start.head<3>() + robot_params_.center_offset, body, false, nullptr) != mgg::VoxelStatus::kFree) {
+    const auto reference = mgg::referenceAfterChassisSpin(robot_params_, start, body.heading);
+    const Eigen::Vector3d box_center = reference.head<3>() +
+        robot_params_.offsetForHeading(body.heading);
+    if (mgg::orientedBoxPathStatus(*map_, box_center,
+        box_center, body, false, nullptr) != mgg::VoxelStatus::kFree) {
       return refused("entry heading has no swept body clearance", true);
     }
   }
-  reverse.front()[3] = heading;
+  reverse.front() = mgg::referenceAfterChassisSpin(robot_params_, start, heading);
   mgg::GroundProjection ground(*map_, planning_params_, true);
   double length = 0.0;
   const double limit = planning_params_.reverse_exit_max_length > 0.0
@@ -6673,7 +6700,7 @@ bool PlannerNode::validateStoredReverseExit(const mgg::StateVec& start,
       });
   mgg::PathType points;
   for (const auto& pose : reverse) points.push_back(pose.head<3>());
-  if (!reverse_turns.admissible(points, start[3] + M_PI)) {
+  if (!reverse_turns.admissible(points, heading + M_PI)) {
     return refused("reverse corner fails current slope or turn-room checks");
   }
   path = std::move(reverse);

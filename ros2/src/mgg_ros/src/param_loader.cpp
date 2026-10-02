@@ -166,6 +166,7 @@ bool loadRobotParams(const ParamLoader& p, const std::string& ns,
     if (!physical.allFinite()) return false;
     out.physical_center_offset = physical;
   }
+  if (out.physical_size.has_value() != out.physical_center_offset.has_value()) return false;
   p.get(ns + "/relax_ratio", out.relax_ratio);
   p.get(ns + "/safety_extension", out.safety_extension);
   if (p.get(ns + "/bound_mode", s) && !parseBoundMode(s, out.bound_mode)) {
