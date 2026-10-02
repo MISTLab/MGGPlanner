@@ -12031,3 +12031,28 @@ TEST_F(PlannerNodeTest, AerialGraphProgressRejectsWallAndDisconnectedProjection)
   EXPECT_FALSE(std::isfinite(PlannerNodeTestPeer::aerialGraphProgress(*node, {9.1,.1,.4})));
 }
 }  // namespace mgg_ros
+
+namespace mgg_ros {
+TEST_F(PlannerNodeTest, AerialLastExclusionExpiryPublishesWithoutWaitingForAPlan) {
+  auto node = makeNode("aerial_expiry_timer");
+  PlannerNodeTestPeer::setAerialRobot(*node);
+  auto observer = std::make_shared<rclcpp::Node>("aerial_expiry_observer");
+  std::uint64_t revision = 0;
+  auto subscription = observer->create_subscription<std_msgs::msg::UInt64>(
+      "scouting_exclusion_revision", rclcpp::QoS(1).transient_local(),
+      [&](std_msgs::msg::UInt64::ConstSharedPtr msg) { revision = msg->data; });
+  rclcpp::executors::SingleThreadedExecutor executor;
+  executor.add_node(node);
+  executor.add_node(observer);
+  PlannerNodeTestPeer::receiveScoutingExclusions(*node, "world", {{0,0,1.5}, {1,0,1.5}});
+  PlannerNodeTestPeer::receiveScoutingExclusions(*node, "world", {{1,0,1.5}});
+  PlannerNodeTestPeer::ageScoutingExclusions(*node, 60);
+  const auto started = std::chrono::steady_clock::now();
+  while (revision != 3 && std::chrono::steady_clock::now() - started < std::chrono::milliseconds(900)) {
+    executor.spin_some();
+    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+  }
+  EXPECT_EQ(revision, 3u);
+  EXPECT_EQ(PlannerNodeTestPeer::scoutingCounters(*node).lapsed, 1u);
+}
+}  // namespace mgg_ros
