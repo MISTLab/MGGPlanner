@@ -3851,6 +3851,11 @@ std::string PlannerNode::buildLocalGraph() {
   plan_ground.setStandingStart(standing);
   mgg::ExpandContext ctx = makeContext();
   ctx.ground = &plan_ground;
+  if (robot_params_.type == mgg::RobotType::kGroundRobot && lattice_time_budget_s_ > 0) {
+    const auto slice = Clock::now() + std::chrono::duration_cast<Clock::duration>(
+        std::chrono::duration<double>(mgg::kGroundExplorationLatticeBudgetS));
+    if (!ctx.deadline || slice < *ctx.deadline) ctx.deadline = slice;
+  }
   const auto t_global = Clock::now();
   // The lattice is laid out around the root at driving height, where the
   // root vertex is; a ground robot's odometry origin sits lower than that.

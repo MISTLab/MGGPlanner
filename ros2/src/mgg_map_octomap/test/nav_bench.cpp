@@ -3,7 +3,7 @@
 // reports the time each takes and where it goes (mgg::PlanProfile).
 //
 // Usage:
-//   mgg_nav_bench <peer_root> [--repeat N] [--budget-ms N] [--json]
+//   mgg_nav_bench <peer_root|--synthetic-floor> [--repeat N] [--budget-ms N] [--json]
 //
 // <peer_root> holds mola/source.json, mola/index.json and the planner grid
 // (the robot's maps/<mission>/<robot>/planning directory). The authority
@@ -28,11 +28,12 @@
 #include <nlohmann/json.hpp>
 
 #include "nav_bench_scenarios.h"
+#include "mgg_map_octomap/native_mola_grid.h"
 
 int main(int argc, char** argv) {
   if (argc < 2) {
     std::fprintf(stderr,
-                 "usage: mgg_nav_bench <peer_root> [--repeat N] [--budget-ms N] [--json]\n");
+                 "usage: mgg_nav_bench <peer_root|--synthetic-floor> [--repeat N] [--budget-ms N] [--json]\n");
     return 2;
   }
   int repeat = 3;
@@ -52,18 +53,52 @@ int main(int argc, char** argv) {
     }
   }
   std::string error;
-  auto map = mgg::nav_bench::loadProduct(argv[1], error);
-  if (!map) {
-    std::fprintf(stderr, "cannot load %s: %s\n", argv[1], error.c_str());
-    return 1;
+  std::unique_ptr<mgg::MolaMap> map;
+  std::unique_ptr<mgg::NativeMolaGrid> floor;
+  mgg::MolaMap::ReadLease lease;
+  const mgg::MapInterface* planning_map = nullptr;
+  auto scenarios = mgg::nav_bench::scenarios();
+  if (std::strcmp(argv[1], "--synthetic-floor") == 0) {
+    std::vector<mgg::NativeMolaGrid::Cell> occupied, free;
+    std::vector<mgg::NativeMolaGrid::Surface> surfaces;
+    for (int x = -80; x <= 80; ++x) for (int y = -80; y <= 80; ++y) {
+      occupied.push_back({x, y, -7});
+      surfaces.push_back({{x, y, -7}, -0.61});
+      for (int z = -6; z <= 12; ++z) free.push_back({x, y, z});
+    }
+    floor = std::make_unique<mgg::NativeMolaGrid>(0.1, std::move(occupied),
+                                                 std::move(free), std::move(surfaces));
+    planning_map = floor.get();
+    scenarios.clear();
+    for (double length : {2.0, 4.0}) {
+      mgg::nav_bench::Scenario scenario;
+      scenario.name = "synthetic_floor_" + std::to_string(int(length)) + "m";
+      scenario.goal = mgg::StateVec(length, 0, 0, 0);
+      scenario.max_length_m = length + 0.1;
+      scenario.max_corner_deg = 10.0;
+      scenario.budget_ms = 300.0;
+      scenarios.push_back(scenario);
+    }
+    mgg::nav_bench::Scenario explore;
+    explore.name = "synthetic_floor_explore_lattice";
+    explore.navigate = false;
+    explore.budget_ms = 350.0;
+    scenarios.push_back(explore);
+  } else {
+    map = mgg::nav_bench::loadProduct(argv[1], error);
+    if (!map) {
+      std::fprintf(stderr, "cannot load %s: %s\n", argv[1], error.c_str());
+      return 1;
+    }
+    lease = map->acquireReadLease();
+    planning_map = map.get();
   }
-  auto lease = map->acquireReadLease();
   int failures = 0;
-  for (auto scenario : mgg::nav_bench::scenarios()) {
+  for (auto scenario : scenarios) {
     if (budget_ms > 0.0) scenario.budget_ms = budget_ms;
     for (int r = 0; r < repeat; ++r) {
       const mgg::nav_bench::Outcome outcome =
-          mgg::nav_bench::run(*map, scenario);
+          mgg::nav_bench::run(*planning_map, scenario);
       if (!outcome.expectation_met) ++failures;
       // Retain every sample, including the cold first run and slow outliers.
       if (json) {

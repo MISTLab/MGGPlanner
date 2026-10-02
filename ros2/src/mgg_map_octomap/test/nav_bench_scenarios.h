@@ -219,6 +219,7 @@ struct Outcome {
   int lattice_edges = 0;
   GridGraphResult lattice;
   int route_vertices = 0;
+  double graph_radius_m = 0.0;
   int no_room_refusals = 0;
   bool root_turn_clear = false;
   bool departure_found = false;
@@ -254,7 +255,7 @@ inline double maxCornerDeg(const std::vector<Eigen::Vector3d>& p) {
   return worst;
 }
 
-inline Outcome run(const MolaMap& map, const Scenario& scenario) {
+inline Outcome run(const MapInterface& map, const Scenario& scenario) {
   using Clock = std::chrono::steady_clock;
   const auto ms = [](Clock::time_point a, Clock::time_point b) {
     return std::chrono::duration<double, std::milli>(b - a).count();
@@ -282,6 +283,10 @@ inline Outcome run(const MolaMap& map, const Scenario& scenario) {
   GraphManager graph;
   const auto diagnostics = [&] {
     const auto started = Clock::now();
+    for (const auto& entry : graph.vertices_map_) {
+      out.graph_radius_m = std::max(out.graph_radius_m,
+          (entry.second->state.head<2>() - scenario.start.head<2>()).norm());
+    }
     GroundProjection diagnostic_ground(map, planning, true);
     ExpandContext diagnostic_ctx = ctx;
     diagnostic_ctx.ground = &diagnostic_ground;
@@ -295,6 +300,8 @@ inline Outcome run(const MolaMap& map, const Scenario& scenario) {
   };
   const auto t0 = Clock::now();
   if (!scenario.navigate) {
+    ctx.deadline = t0 + std::chrono::duration_cast<Clock::duration>(
+        std::chrono::duration<double>(kGroundExplorationLatticeBudgetS));
     bool hanging = false;
     const StateVec root_state = localRouteRoot(ctx, scenario.start, hanging);
     auto* root = new Vertex(0, root_state);
@@ -446,6 +453,7 @@ inline std::string toJson(const Scenario& s, const Outcome& o) {
   j["max_corner_deg"] = o.max_corner_deg;
   j["corners"] = o.corners;
   j["expectation_met"] = o.expectation_met;
+  j["graph_radius_m"] = o.graph_radius_m;
   j["profile"] = o.profile.summary();
   j["no_room_refusals"] = o.no_room_refusals;
   j["root_turn_clear"] = o.root_turn_clear;

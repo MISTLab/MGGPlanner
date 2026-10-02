@@ -41,6 +41,10 @@ struct GridGraphParams {
   Eigen::Vector3d resolution = Eigen::Vector3d(0.5, 0.5, 0.2);
 };
 
+/// Ground exploration sweeps retain their nearest-first prefix at this
+/// soft slice, leaving request time for gain, selection and the tour.
+inline constexpr double kGroundExplorationLatticeBudgetS = 0.2;
+
 enum class GridGraphStatus {
   kOk = 0,
   /// min_val had a positive component, max_val a negative one, or a resolution
