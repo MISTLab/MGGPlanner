@@ -1031,6 +1031,7 @@ std::shared_ptr<const MolaMap::Snapshot> MolaMap::current() const {
   if (value == nullptr) return nullptr;
   if (value->expired(Clock::now(), config_.snapshot_ttl_sec)) {
     const std::lock_guard<std::recursive_mutex> lock(publication_mutex_);
+    const std::lock_guard<std::mutex> authority_lock(request_mutex_);
     value = std::atomic_load(&active_);
     if (value != nullptr &&
         value->expired(Clock::now(), config_.snapshot_ttl_sec)) {

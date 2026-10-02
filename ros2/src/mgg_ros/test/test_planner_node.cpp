@@ -151,7 +151,9 @@ class MolaFloorProduct {
       for (std::int64_t y = index(y0) - 3; y < index(y1) + 3; ++y) {
         const bool floor = x >= index(x0) && x < index(x1) &&
                            y >= index(y0) && y < index(y1);
-        if (floor) occupied.push_back({x, y, -1});
+        if (floor && !std::any_of(unknown.begin(), unknown.end(), [&](const auto& v) {
+          return v[0] == x && v[1] == y && v[2] == -1;
+        })) occupied.push_back({x, y, -1});
         const bool wall = std::any_of(
             walls.begin(), walls.end(), [&](const std::array<double, 4>& w) {
               return x >= index(w[0]) && x < index(w[1]) &&
@@ -257,6 +259,16 @@ class MolaFloorProduct {
                 Eigen::Isometry3d::Identity()};
   }
   ~MolaFloorProduct() { std::filesystem::remove_all(root_); }
+
+  void publishFrom(const MolaFloorProduct& source) const {
+    for (const auto& name : {"components/native.sdpg", "source.json", "index.json"}) {
+      const auto target = root_ / "mola" / name;
+      std::filesystem::copy_file(source.root_ / "mola" / name,
+                                target.string() + ".next",
+                                std::filesystem::copy_options::overwrite_existing);
+      std::filesystem::rename(target.string() + ".next", target);
+    }
+  }
 
   /// The heartbeat request naming this product.
   const mgg::MolaSnapshotRequest& request() const { return request_; }
@@ -2026,6 +2038,42 @@ TEST_F(PlannerNodeTest, CancellationInterruptsSlowPlanWithoutReturningPath) {
   EXPECT_LT(std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count(), 0.2);
   EXPECT_TRUE(response->path.empty());
   EXPECT_EQ(response->status, PlannerNode::kStatusNotReady);
+}
+
+TEST_F(PlannerNodeTest, EmptyAndSparseBootstrapRetriesWhenFirstObservationsArrive) {
+  for (bool sparse : {false, true}) for (bool toward : {false, true}) {
+    SCOPED_TRACE(std::string(sparse ? "sparse" : "empty") + (toward ? " toward" : " explore"));
+    auto node = makeNode("bootstrap_observations");
+    // Sparse ground is beyond home; the empty product has no voxels at all.
+    MolaFloorProduct initial(sparse ? 2.0 : 2.0, sparse ? 3.0 : -2.0, -1, 1);
+    auto provider = initial.serve();
+    auto* map = provider.get();
+    PlannerNodeTestPeer::useMolaMap(*node, std::move(provider));
+    PlannerNodeTestPeer::serveMap(*node, "component:test", 1);
+    PlannerNodeTestPeer::setMinObservedGround(*node, 0.0);
+    PlannerNodeTestPeer::acceptOdometry(*node, 0, 0, 1);
+    if (toward) PlannerNodeTestPeer::toward(*node);
+    auto response = std::make_shared<mgg_msgs::srv::PlannerSrv::Response>();
+    PlannerNodeTestPeer::plan(*node, response);
+    EXPECT_TRUE(response->path.empty());
+    EXPECT_EQ(response->status, PlannerNode::kStatusNotReady);
+    EXPECT_TRUE(PlannerNodeTestPeer::acquiring(*node));
+    // The first parked keyframe observes adjacent floor but retains the
+    // sensor's blind spot under the physical footprint.
+    MolaFloorProduct observed(-1, 4, -1, 1, {},
+        {{-1, -1, -1}, {-1, 0, -1}, {0, -1, -1}, {0, 0, -1}});
+    const auto revision = map->activeGeneration();
+    initial.publishFrom(observed);
+    map->requestSnapshot(initial.request());
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (map->activeGeneration() == revision && std::chrono::steady_clock::now() < deadline)
+      std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    ASSERT_GT(map->activeGeneration(), revision) << map->lastError();
+    response = std::make_shared<mgg_msgs::srv::PlannerSrv::Response>();
+    PlannerNodeTestPeer::plan(*node, response); // no new pose or operator action
+    EXPECT_FALSE(response->path.empty());
+    EXPECT_FALSE(PlannerNodeTestPeer::acquiring(*node));
+  }
 }
 
 TEST_F(PlannerNodeTest, ExplorationReturnsTheWholeLatticePath) {

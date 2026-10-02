@@ -1,3 +1,4 @@
+#include "mgg_core/planning_cancellation.h"
 #include "mgg_map_octomap/native_mola_grid.h"
 
 #include <algorithm>
@@ -371,6 +372,7 @@ VoxelStatus NativeMolaGrid::path(const Eigen::Vector3d& a,
     cells *= std::ceil(swept[axis] / resolution_) + 3.0;
   if (cells * n_d > kMaxWork) return VoxelStatus::kUnknown;
   for (std::uint64_t i = 0; i < std::uint64_t(n_d); ++i) {
+    planningCheckpoint();
     auto st = box(a + (double(i) + .5) * step, swept, u, measured);
     if (st != VoxelStatus::kFree) return st;
   }
@@ -407,6 +409,7 @@ VoxelStatus NativeMolaGrid::getOccupiedOnlyCylinderPathStatus(
   std::uint64_t work = 0;
   const double half = resolution_ * .5;
   for (std::uint64_t i = 0; i < std::uint64_t(n_d); ++i) {
+    planningCheckpoint();
     const Eigen::Vector3d p = a + double(i) * step;
     const Eigen::Vector3d q = p + step;
     Eigen::Vector3d lo(std::min(p.x(), q.x()) - radius,
@@ -448,6 +451,7 @@ void NativeMolaGrid::getScanStatus(
     const SensorModel&) {
   g = {};
   for (const auto& e : ends) {
+    planningCheckpoint();
     const bool valid = walk(p, e, [&](const Cell& k) {
       const auto s = status(k);
       log.emplace_back(center(k), s);
@@ -485,6 +489,7 @@ void NativeMolaGrid::scanUnique(
   thread_local ScanCells cells;
   cells.reset();
   for (const auto& e : ends) {
+    planningCheckpoint();
     const bool valid = walk(p, e, [&](const Cell& k) {
       std::uint8_t& state = cells[k];
       if (state != kNew) return state == kCounted;

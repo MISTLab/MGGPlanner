@@ -285,6 +285,18 @@ void PciNode::planAndPublish() {
   planning_in_progress_ = false;
   if (!running_ || generation != generation_) return;
 
+  // Missing observations (including a fresh epoch) are retryable forever.
+  // Never replace MGG with the legacy blind bootstrap motion or terminal
+  // empty-plan backoff while it is acquiring its first product.
+  if (ok && path.empty() && plan_status_ == -1) {
+    consecutive_empty_plans_ = 0;
+    path_in_progress_ = false;
+    waiting_for_plan_ = true;
+    retry_not_before_ = now() + rclcpp::Duration::from_seconds(0.25);
+    publishStatus("waiting", "acquiring observations; retrying automatically");
+    return;
+  }
+
   // The planner says exploration is complete: the local lattice has no gain
   // and the global graph holds no reachable frontier (rrg.cpp:5582 and
   // 5628). Retrying would only ask the same question of the same map.

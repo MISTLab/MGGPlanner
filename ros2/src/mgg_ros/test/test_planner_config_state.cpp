@@ -441,7 +441,7 @@ TEST_F(PlannerConfigStateTest, ComputedPlanPublishesItsGenerationBeforeResponseD
     }));
     EXPECT_EQ(responses.spin_until_future_complete(future, 3s),
               rclcpp::FutureReturnCode::SUCCESS);
-    ASSERT_EQ(future.get()->status, PlannerNode::kStatusNoPath);
+    ASSERT_EQ(future.get()->status, PlannerNode::kStatusNotReady);
     const auto& state = observer.states.back();
     EXPECT_EQ(state.last_plan_generation, before.generation);
     EXPECT_EQ(state.generation, before.generation);
@@ -456,7 +456,7 @@ TEST_F(PlannerConfigStateTest, ComputedPlanPublishesItsGenerationBeforeResponseD
   // Same configuration, another real exploration answer: no state publication.
   auto unchanged = observer.call<mgg_msgs::srv::PlannerSrv>(
       "/config_plan/mgg/mggplanner", mgg_msgs::srv::PlannerSrv::Request());
-  EXPECT_EQ(unchanged->status, PlannerNode::kStatusNoPath);
+  EXPECT_EQ(unchanged->status, PlannerNode::kStatusNotReady);
   EXPECT_EQ(PlannerNodeTestPeer::computedPlans(*planner), 2);
   EXPECT_FALSE(observer.waitFor([&] { return observer.states.size() > count; }, 100ms));
 
@@ -508,7 +508,7 @@ TEST_F(PlannerConfigStateTest, APeerPinnedPlanRecordsTheGenerationItUsed) {
   auto response = observer.call<mgg_msgs::srv::PlannerSrv>(
       "/config_plan_peers/mgg/mggplanner",
       mgg_msgs::srv::PlannerSrv::Request());
-  EXPECT_EQ(response->status, PlannerNode::kStatusNoPath);
+  EXPECT_EQ(response->status, PlannerNode::kStatusNotReady);
   EXPECT_EQ(PlannerNodeTestPeer::computedPlans(*planner), 1);
   ASSERT_TRUE(observer.waitFor(
       [&] { return observer.states.back().last_plan_generation == 2u; }));

@@ -776,6 +776,8 @@ class PlannerNode : public rclcpp::Node {
   nav_msgs::msg::Odometry::ConstSharedPtr applied_odometry_;
   std::chrono::steady_clock::time_point latest_odometry_received_;
   mgg_msgs::msg::MappingSnapshot::ConstSharedPtr latest_snapshot_;
+  std::optional<std::pair<std::string, std::uint64_t>> served_map_identity_;
+  std::atomic<std::uint64_t> map_identity_changes_{0};
   std::atomic<std::uint64_t> heartbeats_received_{0};
   std::atomic<double> odometry_ingest_lag_s_{0.0};
 

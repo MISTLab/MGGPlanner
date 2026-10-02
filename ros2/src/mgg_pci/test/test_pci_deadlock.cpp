@@ -334,6 +334,17 @@ TEST(PciExternalExecution, CompleteStatusEndsExplorationWithoutRetries) {
   EXPECT_FALSE(rejected->success);
 }
 
+TEST(PciExternalExecution, ObservationAcquisitionNeverBacksOffOrCompletes) {
+  ExternalExecutionRig rig("/external_acquiring", {{}}, -1);
+  for (const char* service : {"pci_trigger", "pci_replan", "pci_replan", "pci_replan"}) {
+    const auto response = rig.call(service);
+    ASSERT_NE(response, nullptr);
+    EXPECT_TRUE(response->success);
+  }
+  EXPECT_TRUE(rig.waitForStatus("acquiring observations; retrying automatically"));
+  EXPECT_TRUE(rig.call("pci_stop")->success);
+}
+
 TEST(PciExternalExecution, RepeatedEmptyPlansRemainWaitingUntilManualStop) {
   ExternalExecutionRig rig("/external_empty_plan", {{}});
   rig.publishOdometry();

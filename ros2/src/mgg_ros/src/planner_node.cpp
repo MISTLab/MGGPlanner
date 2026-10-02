@@ -2034,6 +2034,8 @@ void PlannerNode::publishPlanningStatus() {
           (stamp - bootstrap_started_ns_.load()) * 1e-9 : 0.0) +
       ",\"heartbeats_received\":" + std::to_string(heartbeats_received_.load()) +
       ",\"heartbeats_validated\":" + std::to_string(mola_map_ ? mola_map_->statRevalidationCount() : 0) +
+      ",\"map_identity_changes\":" + std::to_string(map_identity_changes_.load()) +
+      ",\"map_authority_valid\":" + (mola_map_ && mola_map_->authorityValid() ? "true" : "false") +
       ",\"map_expiries\":" + std::to_string(mola_map_ ? mola_map_->expiryCount() : 0) +
       ",\"map_error\":" + jsonString(mola_map_ ? mola_map_->lastError() : "") +
       ",\"odometry_ingest_lag_s\":" + jsonNumber(odometry_ingest_lag_s_.load()) +
@@ -2051,6 +2053,20 @@ void PlannerNode::refreshMapRevision() {
     }
   }
   if (const auto active = mola_map_->activeRequest()) {
+    const auto identity = std::make_pair(active->component_id, active->epoch);
+    if (served_map_identity_ && *served_map_identity_ != identity) {
+      global_graph_ = std::make_shared<mgg::GraphManager>();
+      local_graph_ = std::make_shared<mgg::GraphManager>();
+      ++graph_revision_;
+      best_path_.clear();
+      global_exploration_ongoing_ = false;
+      standing_start_xy_.reset();
+      left_standing_start_ = false;
+      bootstrap_started_ns_ = 0;
+      setAcquiringObservations(true);
+      ++map_identity_changes_;
+    }
+    served_map_identity_ = identity;
     mapping_snapshot_.component_id = active->component_id;
     mapping_snapshot_.epoch = active->epoch;
     mapping_snapshot_.graph_revision = active->graph_revision;
@@ -2385,6 +2401,7 @@ void PlannerNode::onMappingSnapshot(
   const std::uint64_t source_stamp_ns =
       static_cast<std::uint64_t>(msg->source_stamp.sec) * 1000000000ull +
       msg->source_stamp.nanosec;
+  std::lock_guard<std::mutex> fence(cancellation_mutex_);
   mola_map_->requestSnapshot({msg->component_id, msg->epoch,
                               msg->graph_revision, msg->geometry_revision,
                               source_stamp_ns, component_from_navigation});
