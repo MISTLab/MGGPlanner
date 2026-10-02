@@ -584,14 +584,14 @@ TEST_F(PlannerNavigationTest, HardwareShortcutDoesNotCrossUnknownBodyVolume) {
 }
 
 TEST_F(PlannerNavigationTest, SensorFovPolicyToleratesOnlyUpperUnknownAir) {
-  for (double observed : {.4, .7, 2.0}) {
+  for (double observed : {.4, .5, .6, .7, 2.0}) {
     SCOPED_TRACE(observed);
     MolaTerrainProduct product(.1, -3, 5, -3, 3, flat, {}, observed);
     auto node = botmanNode("sensor_unknown_air", product);
     PlannerNodeTestPeer::sensorPolicy(*node);
     PlannerNodeTestPeer::standAt(*node, 0, 0, 0, 0, 1);
     const auto response = navigate(*node, 2, 0);
-    EXPECT_EQ(response->status == Service::Response::SUCCEEDED, observed >= .7);
+    EXPECT_EQ(response->status == Service::Response::SUCCEEDED, observed >= .6);
   }
 }
 
@@ -609,6 +609,16 @@ TEST_F(PlannerNavigationTest, SensorFovPolicyWithoutConfiguredMountFailsClosed) 
   PlannerNodeTestPeer::sensorPolicy(*node, 0);
   PlannerNodeTestPeer::standAt(*node, 0, 0, 0, 0, 1);
   EXPECT_NE(navigate(*node, 2, 0)->status, Service::Response::SUCCEEDED);
+}
+
+TEST_F(PlannerNavigationTest, SensorFovPolicyBelowBodyBottomFailsClosed) {
+  for (double mount : {.1, .3}) {
+    MolaTerrainProduct product(.1, -3, 5, -3, 3, flat, {}, .7);
+    auto node = botmanNode("sensor_low_mount", product);
+    PlannerNodeTestPeer::sensorPolicy(*node, mount);
+    PlannerNodeTestPeer::standAt(*node, 0, 0, 0, 0, 1);
+    EXPECT_NE(navigate(*node, 2, 0)->status, Service::Response::SUCCEEDED);
+  }
 }
 
 TEST_F(PlannerNavigationTest, InterruptedPeerDiagnosisRestoresCollisionChecks) {
