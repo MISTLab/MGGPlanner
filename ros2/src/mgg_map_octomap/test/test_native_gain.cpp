@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <chrono>
 #include <cstdint>
 #include <functional>
 #include <optional>
@@ -17,6 +18,7 @@
 
 #include "mgg_core/gain.h"
 #include "mgg_core/path_selection.h"
+#include "mgg_core/tour_params.h"
 #include "mgg_map_octomap/native_mola_grid.h"
 
 namespace {
@@ -222,7 +224,68 @@ TEST(NativeGain, Run7MountedCorridorRetainsGroundBandUnknown) {
                                 mgg::RobotType::kAerialRobot)));
 }
 
-TEST(NativeGain, TallRoomUnknownCeilingDoesNotCompeteWithTheDoor) {
+TEST(NativeGain, WalledCorridorClearsDeployedInterestThresholds) {
+  // 1.5 m corridor, rasterized conservatively to 1.4 m at the deployed
+  // 0.2 m resolution; also exercise exactly 1.5 m on a 0.1 m grid.
+  for (double resolution : {0.1, 0.2}) {
+    std::vector<Cell> occupied, free;
+    const int half_width = static_cast<int>(0.75 / resolution);
+    const int upper = half_width + 1;
+    for (int x = -int(22 / resolution); x < int(22 / resolution); ++x) {
+      for (int y = -half_width - 1; y <= upper; ++y) {
+        occupied.push_back({x, y, -1});
+        for (int z = 0; z < int(4 / resolution); ++z) {
+          if (y == -half_width - 1 || y == upper)
+            occupied.push_back({x, y, z});
+          else if (x * resolution < 2.0)
+            free.push_back({x, y, z});
+        }
+      }
+    }
+    mgg::NativeMolaGrid map(resolution, occupied, free, {});
+    for (const auto& platform : std::vector<std::pair<double, double>>{
+             {0.45, 0.245}, {0.72, 0.40}, {0.97, 1.0}}) {
+      SCOPED_TRACE(::testing::Message() << "resolution=" << resolution
+                   << " mount=" << platform.first);
+      GainSetup setup(map);
+      mgg::RobotParams robot;
+      robot.size = Eigen::Vector3d(0.8, 0.5, platform.second);
+      setup.ctx.robot = &robot;
+      setup.planning.max_ground_height = 0.5;
+      setup.planning.unknown_voxel_gain = 60;
+      setup.planning.path_length_penalty = 0.25;
+      setup.planning.path_direction_penalty = 1.0;
+      setup.sensors["VLP16"].mount_height = platform.first;
+      setup.sensors["VLP16"].update();
+      mgg::GraphManager graph;
+      for (int id = 0; id < 4; ++id) {
+        auto* v = new mgg::Vertex(id, mgg::StateVec(0.1 + 0.5 * id, 0.05, 0.5, 0));
+        v->is_leaf_vertex = id == 3;
+        graph.addVertex(v);
+        if (id) graph.addEdge(graph.getVertex(id - 1), v, 0.5);
+      }
+      const auto start = std::chrono::steady_clock::now();
+      mgg::computeExplorationGain(graph, setup.ctx, true, true);
+      const auto scored = std::chrono::steady_clock::now();
+      const auto& gain = graph.getVertex(3)->vol_gain;
+      const auto selected = mgg::selectBestPath(graph, setup.planning, robot,
+                                                mgg::EdgeInclinations{}, resolution, 0);
+      std::cout << "corridor resolution=" << resolution << " mount=" << platform.first
+                << " band=" << gain.num_unknown_voxels << " total="
+                << gain.num_total_unknown_voxels << " path_gain=" << selected.best_gain
+                << " gain_ms=" << std::chrono::duration<double, std::milli>(scored - start).count()
+                << " selection_ms=" << std::chrono::duration<double, std::milli>(
+                     std::chrono::steady_clock::now() - scored).count() << '\n';
+      EXPECT_TRUE(gain.is_frontier);
+      EXPECT_GE(gain.num_unknown_voxels, setup.planning.low_gain_voxels);
+      EXPECT_GE(selected.best_gain, mgg::TourParams{}.min_cluster_gain);
+      EXPECT_EQ(selected.best_path_id, 3);
+    }
+  }
+}
+
+class TallRoomGain : public ::testing::TestWithParam<double> {};
+TEST_P(TallRoomGain, UnknownCeilingDoesNotCompeteWithTheDoor) {
   std::vector<Cell> occupied, free;
   // Observed floor, observed air to 1.2 m, upper hangar air unknown.
   // The wall at x=6 has a 2 m doorway, an observed exit at x=6.5,
@@ -243,7 +306,7 @@ TEST(NativeGain, TallRoomUnknownCeilingDoesNotCompeteWithTheDoor) {
   setup.ctx.robot = &robot;
   setup.planning.max_ground_height = 0.5;
   auto& sensor = setup.sensors["VLP16"];
-  sensor.max_range = 3.0;
+  sensor.max_range = GetParam();
   sensor.update();
   mgg::GraphManager graph;
   for (const auto& [id, pos] : std::vector<std::pair<int, Eigen::Vector2d>>{
@@ -255,17 +318,26 @@ TEST(NativeGain, TallRoomUnknownCeilingDoesNotCompeteWithTheDoor) {
   graph.addEdge(graph.getVertex(1), graph.getVertex(2), 1);
   graph.addEdge(graph.getVertex(0), graph.getVertex(3), 3);
   graph.addEdge(graph.getVertex(2), graph.getVertex(4), 1.4);
+  const auto start = std::chrono::steady_clock::now();
   mgg::computeExplorationGain(graph, setup.ctx, false, true);
+  const auto scored = std::chrono::steady_clock::now();
   for (int id : {0, 3}) {
     const auto& gain = graph.getVertex(id)->vol_gain;
     EXPECT_GT(gain.num_total_unknown_voxels, 0);
-    EXPECT_EQ(gain.num_unknown_voxels, 0);
-    EXPECT_FALSE(gain.is_frontier);
-    EXPECT_DOUBLE_EQ(gain.gain, 0);
+    if (GetParam() == 3.0) {
+      EXPECT_EQ(gain.num_unknown_voxels, 0);
+      EXPECT_FALSE(gain.is_frontier);
+      EXPECT_DOUBLE_EQ(gain.gain, 0);
+    }
+    EXPECT_LT(gain.gain, graph.getVertex(4)->vol_gain.gain);
   }
   EXPECT_TRUE(graph.getVertex(2)->vol_gain.is_frontier);
   const auto selected = mgg::selectBestPath(graph, setup.planning, robot,
                                             mgg::EdgeInclinations{}, 0.2, 0);
+  std::cout << "room range=" << GetParam()
+            << " gain_ms=" << std::chrono::duration<double, std::milli>(scored - start).count()
+            << " selection_ms=" << std::chrono::duration<double, std::milli>(
+                 std::chrono::steady_clock::now() - scored).count() << '\n';
   EXPECT_EQ(selected.best_path_id, 4);
   ASSERT_FALSE(selected.best_path.empty());
   EXPECT_GT(selected.best_path.back()->state.x(), 6.2);  // outside the room
@@ -275,6 +347,8 @@ TEST(NativeGain, TallRoomUnknownCeilingDoesNotCompeteWithTheDoor) {
                                 robot.size, true), VoxelStatus::kFree);
   }
 }
+
+INSTANTIATE_TEST_SUITE_P(SensorRange, TallRoomGain, ::testing::Values(3.0, 20.0));
 
 // Review r0 (P1): with distinct voxels counted, the frontier test still
 // divided by rays x range. At 0.5 degree steps and 1 m range that is 64800,

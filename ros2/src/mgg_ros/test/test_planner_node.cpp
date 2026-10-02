@@ -997,6 +997,23 @@ class PlannerNodeTestPeer {
   static void setHangingRootReach(PlannerNode& node, double reach) {
     node.hanging_root_edge_length_max_ = reach;
   }
+  static void useBistroScoutGain(PlannerNode& node) {
+    auto& sensor = node.sensors_.at("test_lidar");
+    sensor.max_range = 20;
+    sensor.fov = Eigen::Vector2d(2 * M_PI, M_PI / 4);
+    sensor.resolution = Eigen::Vector2d::Constant(M_PI / 36);
+    sensor.mount_height = 0.45;
+    sensor.update();
+    node.robot_params_.size.z() = 0.245;
+    node.planning_params_.unknown_voxel_gain = 60;
+    node.planning_params_.free_voxel_gain = 0;
+    node.planning_params_.occupied_voxel_gain = 0;
+    node.planning_params_.leafs_only_for_volumetric_gain = true;
+    node.planning_params_.cluster_vertices_for_gain = true;
+    node.planning_params_.clustering_radius = 1.0;
+    node.global_space_.setBound(Eigen::Vector3d(-25, -25, -1),
+                                Eigen::Vector3d(25, 25, 5));
+  }
   /// One local plan, as a plan request runs it: its log summary.
   static std::string buildLocalGraph(PlannerNode& node) {
     return node.buildLocalGraph();
@@ -2047,6 +2064,137 @@ TEST_F(PlannerNodeTest, FullyMappedGroundFixtureCompletesWithoutAnExplorationSpi
     EXPECT_TRUE(response->path.empty());
     EXPECT_EQ(response->status, PlannerNode::kStatusComplete);
     EXPECT_TRUE(PlannerNodeTestPeer::localGainVertices(*node).empty());
+  }
+}
+
+TEST_F(PlannerNodeTest, FullyMappedRoomWithoutTurnSpaceDoesNotLoop) {
+  MolaFloorProduct mapped(-5, 8, -5, 5,
+      {{-5, 8, -0.6, -0.4}, {-5, 8, 0.4, 0.6}});
+  auto node = makeNode("mapped_roomless_no_spin");
+  PlannerNodeTestPeer::useMolaMap(*node, mapped.serve());
+  PlannerNodeTestPeer::setRobotFootprint(*node, 1.0, 0.3);
+  PlannerNodeTestPeer::setLattice(*node, {-1, -1}, {3, 1});
+  PlannerNodeTestPeer::acceptOdometry(*node, 0, 0, 1);
+  PlannerNodeTestPeer::consultGlobalPlannerAtOnce(*node);
+  ASSERT_FALSE(PlannerNodeTestPeer::roomToTurnObserved(*node,
+      PlannerNodeTestPeer::drivingState(*node, 0, 0, 0)));
+  for (int request = 0; request < 3; ++request) {
+    auto response = std::make_shared<mgg_msgs::srv::PlannerSrv::Response>();
+    PlannerNodeTestPeer::plan(*node, response);
+    EXPECT_TRUE(response->path.empty());
+    EXPECT_EQ(response->status, PlannerNode::kStatusComplete);
+    EXPECT_TRUE(PlannerNodeTestPeer::localGainVertices(*node).empty());
+  }
+}
+
+TEST_F(PlannerNodeTest, MappedRoomWithoutTurnSpaceStillTakesAStraightGlobalRoute) {
+  MolaFloorProduct mapped(-5, 8, -5, 5,
+      {{-5, 4, -0.6, -0.4}, {-5, 4, 0.4, 0.6}});
+  auto node = makeNode("mapped_roomless_route");
+  PlannerNodeTestPeer::useMolaMap(*node, mapped.serve());
+  PlannerNodeTestPeer::setRobotFootprint(*node, 1.0, 0.3);
+  PlannerNodeTestPeer::setLattice(*node, {-1, -1}, {2, 1});
+  PlannerNodeTestPeer::acceptOdometry(*node, 0, 0, 1);
+  PlannerNodeTestPeer::consultGlobalPlannerAtOnce(*node);
+  const int door = PlannerNodeTestPeer::addGlobalChainToFrontier(
+      *node, {{2, 0}, {4, 0}, {6, 0}});
+  PlannerNodeTestPeer::setFrontierOwner(*node, door, 2);
+  PlannerNodeTestPeer::setReportedUnknown(*node, door, 1000);
+  ASSERT_FALSE(PlannerNodeTestPeer::roomToTurnObserved(*node,
+      PlannerNodeTestPeer::drivingState(*node, 0, 0, 0)));
+  for (int request = 0; request < 3; ++request) {
+    auto response = std::make_shared<mgg_msgs::srv::PlannerSrv::Response>();
+    PlannerNodeTestPeer::plan(*node, response);
+    ASSERT_FALSE(response->path.empty());
+    EXPECT_EQ(response->status, mgg_msgs::srv::PlannerSrv::Response::FORWARD);
+    EXPECT_GT(response->path.back().position.x, 5);
+    EXPECT_TRUE(PlannerNodeTestPeer::bestPathFromGlobalGraph(*node));
+  }
+}
+
+TEST_F(PlannerNodeTest, GroundRoomAndCorridorPlanTiming) {
+  for (bool corridor : {false, true}) {
+    std::vector<std::array<double, 4>> walls = corridor
+        ? std::vector<std::array<double, 4>>{{-6, 20, -1, -0.6}, {-6, 20, 0.8, 1.2}}
+        : std::vector<std::array<double, 4>>{{6, 6.2, -6, -1}, {6, 6.2, 1, 6}};
+    std::vector<std::array<int, 3>> unknown;
+    if (corridor) {
+      for (int x = 10; x < 100; ++x)
+        for (int y = -3; y < 4; ++y)
+          for (int z = 0; z < 4; ++z) unknown.push_back({x, y, z});
+    }
+    MolaFloorProduct product(-6, corridor ? 20 : 7, -6, 6, walls, unknown);
+    for (int iteration = 0; iteration < 5; ++iteration) {
+      auto node = makeNode(std::string("timing_") + (corridor ? "corridor" : "room") +
+                           std::to_string(iteration));
+      PlannerNodeTestPeer::useMolaMap(*node, product.serve());
+      PlannerNodeTestPeer::useBistroScoutGain(*node);
+      PlannerNodeTestPeer::setLattice(*node, {-1, -2}, {corridor ? 1.5 : 6.5, 2});
+      PlannerNodeTestPeer::acceptOdometry(*node, 0.1, 0.1, 1);
+      const auto start = std::chrono::steady_clock::now();
+      const auto summary = PlannerNodeTestPeer::buildLocalGraph(*node);
+      const double elapsed = std::chrono::duration<double, std::milli>(
+          std::chrono::steady_clock::now() - start).count();
+      std::cout << "PLAN_TIMING " << (corridor ? "corridor" : "room")
+                << " iteration=" << iteration << " total_ms=" << elapsed
+                << " " << summary << '\n';
+      EXPECT_NE(summary.find("grid graph:"), std::string::npos);
+    }
+  }
+}
+
+TEST_F(PlannerNodeTest, GroundReceiverOffersOnlyTheDoorNotAnAerialCeilingFrontier) {
+  MolaFloorProduct mapped(-5, 8, -5, 5);
+  auto node = makeNode("ground_not_ceiling", "world", {
+      rclcpp::Parameter("aerial_peer_robot_ids", std::vector<int64_t>{4}),
+      rclcpp::Parameter("neighbour_offsets", std::vector<double>{4, 0, 0, 0})});
+  PlannerNodeTestPeer::useMolaMap(*node, mapped.serve());
+  PlannerNodeTestPeer::acceptOdometry(*node, 0, 0, 1);
+  // A ground peer knows the continuation through the door; its roadmap
+  // is traversable here. A drone broadcasts a much larger score in the room,
+  // both at ground level and high enough to miss the 3D local re-check.
+  const int door = PlannerNodeTestPeer::addGlobalChainToFrontier(
+      *node, {{2, 0}, {4, 0}, {6, 0}});
+  PlannerNodeTestPeer::setFrontierOwner(*node, door, 2);
+  PlannerNodeTestPeer::setReportedUnknown(*node, door, 1000);
+  PlannerNodeTestPeer::setTour(*node, true, 1.0);
+  for (double altitude : {0.0, 4.0}) {
+    mgg_msgs::msg::Graph drone;
+    drone.header.frame_id = "world";
+    mgg_msgs::msg::Vertex v;
+    v.id = 0;
+    v.robot_id = 4;
+    v.pose.position.x = 1;
+    v.pose.position.z = -0.1;  // MOLA floor voxel centre; receiver adds 0.3
+    v.pose.orientation.w = 1;
+    v.is_frontier = false;  // low rendezvous anchors the flight roadmap
+    drone.vertices.push_back(v);
+    v.id = 1;
+    v.pose.position.x = 1.5;
+    v.pose.position.z += altitude;
+    v.is_frontier = true;
+    v.num_unknown_voxels = 1000000;
+    drone.vertices.push_back(v);
+    mgg_msgs::msg::Edge edge;
+    edge.source_id = 0;
+    edge.target_id = 1;
+    edge.weight = 0.5;
+    drone.edges.push_back(edge);
+    for (int broadcast = 0; broadcast < 2; ++broadcast) {
+      PlannerNodeTestPeer::receiveGraph(*node, drone);
+      ASSERT_FALSE(PlannerNodeTestPeer::neighbourHeights(*node, 4).empty());
+      const auto clusters = PlannerNodeTestPeer::frontierClusters(*node);
+      ASSERT_EQ(clusters.size(), 1u);
+      EXPECT_EQ(clusters.front().representative_vertex_id, door);
+      const auto bid = PlannerNodeTestPeer::ownTourBidMsg(*node);
+      ASSERT_EQ(bid.clusters.size(), 1u);
+      EXPECT_EQ(bid.clusters.front().owner_robot_id, 2);
+      EXPECT_NE(PlannerNodeTestPeer::refreshTour(*node), mgg::kNoCluster);
+      std::string reason;
+      ASSERT_TRUE(PlannerNodeTestPeer::runGlobalPlanner(*node, reason)) << reason;
+      ASSERT_FALSE(PlannerNodeTestPeer::bestPath(*node).empty());
+      EXPECT_GT(PlannerNodeTestPeer::bestPath(*node).back().x(), 5.0);
+    }
   }
 }
 
