@@ -8,6 +8,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -223,6 +224,7 @@ class FakePlanner : public rclcpp::Node {
         [this](const std::shared_ptr<mgg_msgs::srv::PlannerSrv::Request>,
                std::shared_ptr<mgg_msgs::srv::PlannerSrv::Response> response) {
           const int call = calls_.fetch_add(1);
+          if (before_response) before_response(call);
           response->status = status_;
           const auto& points = path_x_.at(
               std::min(static_cast<size_t>(call), path_x_.size() - 1));
@@ -236,6 +238,7 @@ class FakePlanner : public rclcpp::Node {
   }
 
   int calls() const { return calls_.load(); }
+  std::function<void(int)> before_response;
 
  private:
   std::atomic<int> calls_{0};
@@ -429,6 +432,25 @@ TEST(PciExternalExecution, ExclusionRevisionWakesTenSecondBackoffWithinOneSecond
   publisher->publish(revision);
   std::this_thread::sleep_for(300ms);
   EXPECT_EQ(rig.planner->calls(), stopped);
+}
+
+TEST(PciExternalExecution, ExclusionExpiryDuringCompleteResponseRetriesBeforeLatching) {
+  ExternalExecutionRig rig("/exclusion_complete_race", {{}, {0.0, 3.0}}, -3);
+  auto publisher = rig.caller->create_publisher<std_msgs::msg::UInt64>(
+      "scouting_exclusion_revision", rclcpp::QoS(1).transient_local());
+  rig.planner->before_response = [publisher](int call) {
+    if (call != 0) return;
+    std_msgs::msg::UInt64 revision;
+    revision.data = 3;
+    publisher->publish(revision);
+    std::this_thread::sleep_for(300ms);
+  };
+  rig.publishOdometry();
+  ASSERT_NE(rig.call("pci_trigger"), nullptr);
+  EXPECT_TRUE(rig.waitForStatus("\"state\":\"exploring\""));
+  EXPECT_EQ(rig.planner->calls(), 2);
+  std::this_thread::sleep_for(300ms);
+  EXPECT_EQ(rig.planner->calls(), 2) << "accepted controller path must not be replaced";
 }
 
 TEST(PciExternalExecution, ExclusionOnlyRefusalCapsBackoff) {

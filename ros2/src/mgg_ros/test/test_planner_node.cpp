@@ -1338,6 +1338,9 @@ class PlannerNodeTestPeer {
   static double aerialGraphProgress(PlannerNode& node, const Eigen::Vector3d& position) {
     return node.aerialGraphProgress(position);
   }
+  static double aerialFleetFront(PlannerNode& node) {
+    return node.aerialFleetFront();
+  }
   static void ageAerialPeer(PlannerNode& node, int sender) {
     node.aerial_peer_received_[sender] -= std::chrono::seconds(60);
   }
@@ -5412,6 +5415,8 @@ TEST_F(PlannerNodeTest, ALiftedTargetIsSelectedUnderDeployedDefaultsWhenOwnClust
   counts = PlannerNodeTestPeer::aerialCounters(*node);
   EXPECT_EQ(counts.lifted_rejected_scouting, 1);
   EXPECT_EQ(counts.lifted_admitted, 0);
+  EXPECT_EQ(PlannerNodeTestPeer::scoutingCounters(*node).targets_refused, 0u)
+      << "lifted prefilter refusals must not trigger exclusion-only retry";
 }
 
 TEST_F(PlannerNodeTest, AerialPeerCountersSeparateCylindersFromLegacyDiscs) {
@@ -11920,11 +11925,11 @@ TEST_F(PlannerNodeTest, AerialPeerFallbackRequiresProgressPastPeerAndDrone) {
   candidate.position = {6.1,.1,.4}; candidate.gain = 1e12;
   ASSERT_EQ(PlannerNodeTestPeer::tourCandidates(*node, {candidate}).size(), 1u);
   PlannerNodeTestPeer::ageAerialPeer(*node, 2);
-  EXPECT_TRUE(PlannerNodeTestPeer::tourCandidates(*node, {candidate}).empty());
+  EXPECT_EQ(PlannerNodeTestPeer::tourCandidates(*node, {candidate}).size(), 1u);
   PlannerNodeTestPeer::receiveGraph(*node, peer);
-  // A frontier level with its peer is not ahead.
+  // Equality is allowed: only known-behind progress is rejected.
   candidate.representative_vertex_id = middle; candidate.position.x() = 4.1;
-  EXPECT_TRUE(PlannerNodeTestPeer::tourCandidates(*node, {candidate}).empty());
+  EXPECT_EQ(PlannerNodeTestPeer::tourCandidates(*node, {candidate}).size(), 1u);
   // Beyond the peer, but behind the drone: still not a scouting target.
   candidate.representative_vertex_id = end; candidate.position.x() = 6.1;
   PlannerNodeTestPeer::addGlobalVertex(*node, 1, 10.8, .1, .4, {end});
@@ -11934,6 +11939,139 @@ TEST_F(PlannerNodeTest, AerialPeerFallbackRequiresProgressPastPeerAndDrone) {
   peer.vertices.front().visited = false;
   PlannerNodeTestPeer::receiveGraph(*node, peer);
   EXPECT_TRUE(PlannerNodeTestPeer::tourCandidates(*node, {candidate}).empty());
+}
+
+TEST_F(PlannerNodeTest, AerialUnknownPeerProgressRemainsEligibleBeforeCompletion) {
+  for (const std::string cause : {"stale", "no_link", "off_graph"}) {
+    SCOPED_TRACE(cause);
+    auto node = makeNode("aerial_unknown_progress", "world", {
+        rclcpp::Parameter("fleet.enabled", false),
+        rclcpp::Parameter("neighbour_offsets", std::vector<double>{2,0,0,0}),
+        rclcpp::Parameter("aerial_frontier_height_m", .4),
+        rclcpp::Parameter("aerial_min_height_m", .3),
+        rclcpp::Parameter("aerial_max_height_m", .6)});
+    PlannerNodeTestPeer::setAerialRobot(*node);
+    MolaFloorProduct product(-1, 15, -1, 4, {{-1,15,1.5,1.7}});
+    PlannerNodeTestPeer::useMolaMap(*node, product.serve());
+    PlannerNodeTestPeer::acceptOdometryFacing(*node, .1, .1, 0, 1, .4);
+    const int end = PlannerNodeTestPeer::addGlobalVertex(*node, 1, 6.1, .1, .4, {0});
+    mgg_msgs::msg::Graph peer;
+    peer.header.frame_id = "world";
+    mgg_msgs::msg::Vertex pose;
+    pose.id = 10; pose.robot_id = 2; pose.visited = true;
+    pose.pose.position.x = cause == "off_graph" ? 30.1 : 2.1;
+    pose.pose.position.y = cause == "no_link" ? 2.1 : .1;
+    pose.pose.orientation.w = 1;
+    peer.vertices.push_back(pose);
+    PlannerNodeTestPeer::receiveGraph(*node, peer);
+    if (cause == "stale") PlannerNodeTestPeer::ageAerialPeer(*node, 2);
+    mgg::FrontierCluster candidate;
+    candidate.id = 42; candidate.owner_robot_id = 2;
+    candidate.representative_vertex_id = end;
+    candidate.position = {6.1,.1,.4}; candidate.gain = 1e12;
+    EXPECT_EQ(PlannerNodeTestPeer::tourCandidates(*node, {candidate}).size(), 1u);
+    EXPECT_FALSE(PlannerNodeTestPeer::completionWithheld(*node).empty());
+  }
+}
+
+TEST_F(PlannerNodeTest, AerialLocalFrontierAloneSuppressesOtherwiseEligiblePeer) {
+  auto node = makeNode("aerial_local_rule", "world", {
+      rclcpp::Parameter("fleet.enabled", false),
+      rclcpp::Parameter("neighbour_offsets", std::vector<double>{2,0,0,0}),
+      rclcpp::Parameter("aerial_frontier_height_m", .4),
+      rclcpp::Parameter("aerial_min_height_m", .3),
+      rclcpp::Parameter("aerial_max_height_m", .6)});
+  PlannerNodeTestPeer::setAerialRobot(*node);
+  MolaFloorProduct product(-1, 15, -1, 1);
+  PlannerNodeTestPeer::useMolaMap(*node, product.serve());
+  PlannerNodeTestPeer::acceptOdometryFacing(*node, .1, .1, 0, 1, .4);
+  const int end = PlannerNodeTestPeer::addGlobalVertex(*node, 1, 6.1, .1, .4, {0});
+  mgg_msgs::msg::Graph peer;
+  peer.header.frame_id = "world";
+  mgg_msgs::msg::Vertex pose;
+  pose.id = 10; pose.robot_id = 2; pose.visited = true;
+  pose.pose.position.x = 2.1; pose.pose.position.y = .1; pose.pose.orientation.w = 1;
+  peer.vertices.push_back(pose);
+  PlannerNodeTestPeer::receiveGraph(*node, peer);
+  mgg::FrontierCluster candidate;
+  candidate.id = 42; candidate.owner_robot_id = 2;
+  candidate.representative_vertex_id = end;
+  candidate.position = {6.1,.1,.4}; candidate.gain = 1e12;
+  ASSERT_EQ(PlannerNodeTestPeer::tourCandidates(*node, {candidate}).size(), 1u);
+  PlannerNodeTestPeer::setSeenLattice(*node, {{.1,.1,.4,0}, {3.1,.1,.4,0}});
+  PlannerNodeTestPeer::markLocalFrontier(*node);
+  EXPECT_TRUE(PlannerNodeTestPeer::tourCandidates(*node, {candidate}).empty());
+}
+
+TEST_F(PlannerNodeTest, AerialKnownForwardTierPrecedesUnknownAndFallsBackWhenSetAside) {
+  auto node = makeNode("aerial_tiers", "world", {
+      rclcpp::Parameter("fleet.enabled", false),
+      rclcpp::Parameter("fleet.cluster_merge_radius_m", .5),
+      rclcpp::Parameter("neighbour_offsets", std::vector<double>{2,0,0,0,3,0,0,0}),
+      rclcpp::Parameter("aerial_frontier_height_m", .4),
+      rclcpp::Parameter("aerial_min_height_m", .3),
+      rclcpp::Parameter("aerial_max_height_m", .6)});
+  PlannerNodeTestPeer::setAerialRobot(*node);
+  MolaFloorProduct product(-1, 20, -1, 1);
+  PlannerNodeTestPeer::useMolaMap(*node, product.serve());
+  PlannerNodeTestPeer::acceptOdometryFacing(*node, .1, .1, 0, 1, .4);
+  const int middle = PlannerNodeTestPeer::addGlobalVertex(*node, 1, 4.1, .1, .4, {0});
+  PlannerNodeTestPeer::addGlobalVertex(*node, 1, 8.1, .1, .4, {middle});
+  for (const int sender : {2, 3}) {
+    mgg_msgs::msg::Graph peer;
+    peer.header.frame_id = "world";
+    mgg_msgs::msg::Vertex pose;
+    pose.id = 10; pose.robot_id = sender; pose.visited = true;
+    pose.pose.position.x = sender == 2 ? 2.1 : 30.1;
+    pose.pose.position.y = .1; pose.pose.orientation.w = 1;
+    peer.vertices.push_back(pose);
+    pose.id = 11; pose.visited = false; pose.is_frontier = true;
+    pose.num_unknown_voxels = 1000000;
+    pose.pose.position.x = sender == 2 ? 8.1 : 3.1;
+    peer.vertices.push_back(pose);
+    PlannerNodeTestPeer::receiveGraph(*node, peer);
+  }
+  PlannerNodeTestPeer::solveTourOnEveryChange(*node);
+  PlannerNodeTestPeer::setTourRetry(*node, 60);
+  const auto known = PlannerNodeTestPeer::refreshTour(*node);
+  ASSERT_NE(known, mgg::kNoCluster);
+  EXPECT_NEAR(PlannerNodeTestPeer::tourTargetPosition(*node).x(), 8.1, 1e-6);
+  PlannerNodeTestPeer::setTourAside(*node, known);
+  ASSERT_NE(PlannerNodeTestPeer::refreshTour(*node), mgg::kNoCluster);
+  EXPECT_NEAR(PlannerNodeTestPeer::tourTargetPosition(*node).x(), 3.1, 1e-6);
+  EXPECT_DOUBLE_EQ(PlannerNodeTestPeer::aerialFleetFront(*node), 2.0);
+  const auto status = PlannerNodeTestPeer::aerialStatusJson(*node);
+  EXPECT_NE(status.find("\"front_peer\":2"), std::string::npos) << status;
+  EXPECT_NE(status.find("\"front_is_lower_bound\":true"), std::string::npos) << status;
+}
+
+TEST_F(PlannerNodeTest, AerialOnlyStalePeerFrontierDoesNotComplete) {
+  auto node = makeNode("aerial_stale_not_complete", "world", {
+      rclcpp::Parameter("fleet.enabled", false),
+      rclcpp::Parameter("neighbour_offsets", std::vector<double>{2,0,0,0}),
+      rclcpp::Parameter("aerial_frontier_height_m", 1.0)});
+  PlannerNodeTestPeer::setAerialRobot(*node);
+  PlannerNodeTestPeer::gainFromUnknownVoxelsOnly(*node);
+  PlannerNodeTestPeer::observeFreeBox(*node, {0,0,1}, {14,14,8});
+  PlannerNodeTestPeer::acceptOdometryFacing(*node, 0, 0, 0, 1, 1);
+  PlannerNodeTestPeer::addGlobalVertex(*node, 1, 4, 0, 1, {0});
+  PlannerNodeTestPeer::setGainSpace(*node, {-2,-2,0}, {2,2,2});
+  PlannerNodeTestPeer::consultGlobalPlannerAtOnce(*node);
+  PlannerNodeTestPeer::setTour(*node, true, 1.0);
+  mgg_msgs::msg::Graph peer;
+  peer.header.frame_id = "world";
+  mgg_msgs::msg::Vertex pose;
+  pose.id = 10; pose.robot_id = 2; pose.visited = true;
+  pose.pose.position.x = 1; pose.pose.orientation.w = 1;
+  peer.vertices.push_back(pose);
+  pose.id = 11; pose.visited = false; pose.is_frontier = true;
+  pose.num_unknown_voxels = 1000000; pose.pose.position.x = 4;
+  peer.vertices.push_back(pose);
+  PlannerNodeTestPeer::receiveGraph(*node, peer);
+  PlannerNodeTestPeer::ageAerialPeer(*node, 2);
+  auto response = std::make_shared<mgg_msgs::srv::PlannerSrv::Response>();
+  PlannerNodeTestPeer::plan(*node, response);
+  EXPECT_NE(response->status, PlannerNode::kStatusComplete);
 }
 
 TEST_F(PlannerNodeTest, AerialNoFrontiersAnywhereCompletesInsteadOfEmptyPlanLoop) {
