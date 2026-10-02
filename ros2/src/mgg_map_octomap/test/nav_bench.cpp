@@ -3,7 +3,7 @@
 // reports the time each takes and where it goes (mgg::PlanProfile).
 //
 // Usage:
-//   mgg_nav_bench <peer_root> [--repeat N] [--json]
+//   mgg_nav_bench <peer_root> [--repeat N] [--budget-ms N] [--json]
 //
 // <peer_root> holds mola/source.json, mola/index.json and the planner grid
 // (the robot's maps/<mission>/<robot>/planning directory). The authority
@@ -32,16 +32,23 @@
 int main(int argc, char** argv) {
   if (argc < 2) {
     std::fprintf(stderr,
-                 "usage: mgg_nav_bench <peer_root> [--repeat N] [--json]\n");
+                 "usage: mgg_nav_bench <peer_root> [--repeat N] [--budget-ms N] [--json]\n");
     return 2;
   }
   int repeat = 3;
   bool json = false;
+  double budget_ms = 0.0;
   for (int i = 2; i < argc; ++i) {
     if (std::strcmp(argv[i], "--repeat") == 0 && i + 1 < argc) {
       repeat = std::max(1, std::atoi(argv[++i]));
+    } else if (std::strcmp(argv[i], "--budget-ms") == 0 && i + 1 < argc) {
+      char* end = nullptr;
+      budget_ms = std::strtod(argv[++i], &end);
+      if (*end != '\0' || !std::isfinite(budget_ms) || budget_ms <= 0.0) return 2;
     } else if (std::strcmp(argv[i], "--json") == 0) {
       json = true;
+    } else {
+      return 2;
     }
   }
   std::string error;
@@ -52,7 +59,8 @@ int main(int argc, char** argv) {
   }
   auto lease = map->acquireReadLease();
   int failures = 0;
-  for (const auto& scenario : mgg::nav_bench::scenarios()) {
+  for (auto scenario : mgg::nav_bench::scenarios()) {
+    if (budget_ms > 0.0) scenario.budget_ms = budget_ms;
     for (int r = 0; r < repeat; ++r) {
       const mgg::nav_bench::Outcome outcome =
           mgg::nav_bench::run(*map, scenario);
