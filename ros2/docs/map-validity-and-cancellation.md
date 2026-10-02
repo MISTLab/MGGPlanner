@@ -14,13 +14,21 @@ Relative to the shared planner/PCI namespace (normally `/<robot_id>/mgg`):
 - `cancel_planning` (`std_srvs/srv/Trigger`) revokes exploration and objectives.
   Its response acknowledges revocation, not completion of unwinding. Retained
   exploration state is cleared at the next request admission or maintenance tick
-  once background planner work releases its lock.
+  once background planner work releases its lock. The target-setting service
+  consumes any queued clear before accepting a new target, so a target set after
+  the cancel acknowledgement is not erased by a later maintenance tick.
 - `cancel_exploration_planning` (same type) revokes exploration requests only.
   `pci_stop` forwards only here, so a delayed PCI stop never cancels NAVIGATE or
   RETURN_HOME. A delayed stop can still cancel *new exploration*: sequence-bearing
   scoped cancellation is a follow-up, not implemented by Trigger.
 - Adapter ordering: clear exploration target → `pci_stop` → `cancel_planning`
   **answered** → `plan_objective`. A newer objective also pre-empts implicitly.
+  `plan_objective` itself does not clear the exploration target or ongoing global
+  repositioning: NAVIGATE is also used for explore-toward-goal route probes.
+  Exploration interrupted by a probe retains that state for its next request.
+  Operator dispatch must keep the explicit target clear and acknowledged general
+  cancel above; probes do neither. Explicit general cancellation still clears
+  exploration state through its queued clear.
 - Interrupted exploration returns `PlannerSrv.Response.CANCELLED` (`-4`), with no
   path. PCI reports `waiting`, reason `planning cancelled; retrying automatically`.
   Missing initial observations still return NOT_READY (`-1`) and PCI reports

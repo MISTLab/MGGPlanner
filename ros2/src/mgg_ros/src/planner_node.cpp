@@ -5365,12 +5365,8 @@ void PlannerNode::onPlanRequest(
     ++graph_revision_;
     local_graph_->reset();
     best_path_.clear();
-    if ((request_generation_.load() != generation ||
-         exploration_generation_.load() != exploration_generation) && exploration_target_) {
-      exploration_target_.reset();
-      publishPlannerConfigState();
-    }
-    global_exploration_ongoing_ = false;
+    // A route probe also pre-empts exploration. Keep its target/repositioning;
+    // explicit general cancellation clears them through applyPendingCancel().
     response->path.clear();
     response->status = mgg_msgs::srv::PlannerSrv::Response::CANCELLED;
     RCLCPP_INFO(get_logger(), "planning cancelled: superseded or map authority expired/changed");
@@ -5408,11 +5404,8 @@ void PlannerNode::onObjectiveRequest(
   });
   try {
     mgg::planningCheckpoint();
-    global_exploration_ongoing_ = false;
-    if (exploration_target_) {
-      exploration_target_.reset();
-      publishPlannerConfigState();
-    }
+    // NAVIGATE is also used for route probes. The adapter explicitly clears
+    // exploration before operator objectives; probes must preserve its state.
     onObjectiveRequestImpl(request, response);
     std::lock_guard<std::mutex> fence(cancellation_mutex_);
     mgg::planningCheckpoint();
@@ -6386,6 +6379,7 @@ void PlannerNode::onExplorationTargetRequest(
     std::shared_ptr<mgg_msgs::srv::PlannerSetExplorationTarget::Response>
         response) {
   const std::lock_guard<std::recursive_mutex> lock(planner_mutex_);
+  applyPendingCancel();
   // The direction paths are scored against changes with the target.
   turn_back_hysteresis_.reset();
   if (!request->active) {
