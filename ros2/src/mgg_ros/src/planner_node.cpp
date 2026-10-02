@@ -782,7 +782,12 @@ PlannerNode::PlannerNode(const rclcpp::NodeOptions& options)
   // wall rate while the ARGoS bridge steps simulated time at its own pace.
   graph_timer_ = create_timer(
       std::chrono::duration<double>(publish_period),
-      [this]() { publishOwnGraph(); publishMarkers(); }, callback_group_);
+      [this]() {
+        std::unique_lock<std::recursive_mutex> lock(planner_mutex_, std::try_to_lock);
+        if (!lock.owns_lock()) return;
+        publishOwnGraph();
+        publishMarkers();
+      }, callback_group_);
   global_graph_update_timer_ = create_timer(
       std::chrono::duration<double>(mgg::kGlobalGraphUpdateTimerPeriod),
       [this]() { expandGlobalGraphTimerCallback(); }, callback_group_);
@@ -2419,6 +2424,14 @@ void PlannerNode::onMappingSnapshot(
   component_from_navigation.translation() = Eigen::Vector3d(t.x, t.y, t.z);
   {
     std::lock_guard<std::mutex> lock(input_mutex_);
+    const auto active = mola_map_->activeRequest();
+    const bool changed = latest_snapshot_
+        ? latest_snapshot_->component_id != msg->component_id || latest_snapshot_->epoch != msg->epoch
+        : active && (active->component_id != msg->component_id || active->epoch != msg->epoch);
+    if (changed) {
+      bootstrap_started_ns_ = 0;
+      setAcquiringObservations(true);
+    }
     latest_snapshot_ = msg;
   }
   ++heartbeats_received_;
@@ -3517,7 +3530,8 @@ void PlannerNode::ingestOdometryIntoGlobalGraph() {
 
 void PlannerNode::expandGlobalGraphTimerCallback() {
   const auto generation = request_generation_.load();
-  const std::lock_guard<std::recursive_mutex> lock(planner_mutex_);
+  std::unique_lock<std::recursive_mutex> lock(planner_mutex_, std::try_to_lock);
+  if (!lock.owns_lock()) return;
   mgg::PlanningCancellationScope cancellation([this, generation] {
     return generation != request_generation_.load();
   });

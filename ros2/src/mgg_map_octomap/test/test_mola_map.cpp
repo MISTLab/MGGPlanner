@@ -1588,6 +1588,7 @@ TEST(MolaMap, FootprintSupportDoesNotInventAdjacentGroundOrFreeSpace) {
   Eigen::Vector3d hit;
   EXPECT_EQ(provider.getGroundRayStatus({0, 0, 0}, {0, 0, -1}, false, hit), VoxelStatus::kOccupied);
   EXPECT_DOUBLE_EQ(hit.z(), -0.6);
+  EXPECT_EQ(provider.getGroundRayStatus({0, 0, 0}, {0, 0, -1}, true, hit), VoxelStatus::kUnknown);
   EXPECT_NE(provider.getGroundRayStatus({0.6, 0, 0}, {0.6, 0, -1}, false, hit), VoxelStatus::kOccupied);
   provider.setFootprintGroundSupport({0, 0, -0.6}, {1.0, 0.5}, M_PI / 2);
   EXPECT_EQ(provider.getGroundRayStatus({0, 0.4, 0}, {0, 0.4, -1}, false, hit), VoxelStatus::kOccupied);

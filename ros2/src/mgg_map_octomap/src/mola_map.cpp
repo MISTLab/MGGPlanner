@@ -1181,8 +1181,10 @@ VoxelStatus MolaMap::getGroundRayStatus(
   end_voxel = transform.inverse() * component_end;
   const auto support = std::atomic_load(&footprint_ground_);
   // Only a downward vertical probe through the footprint. An actual return
-  // always wins, including an obstacle above the inferred floor.
-  if (status != VoxelStatus::kOccupied && support &&
+  // always wins, including an obstacle above the inferred floor. A strict
+  // ray keeps its unknown verdict: otherwise an unknown cell could hide an
+  // occupied return that the early-stopping ray never reached.
+  if (!stop_at_unknown_voxel && status != VoxelStatus::kOccupied && support &&
       compatible(support->authority, snapshot->request) &&
       (view_point.head<2>() - voxel_to_test.head<2>()).norm() < 1e-9 &&
       view_point.z() >= support->center.z() &&
