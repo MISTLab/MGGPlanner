@@ -73,22 +73,26 @@ class SlowMolaPlanningMap : public mgg::MolaMap {
   explicit SlowMolaPlanningMap(const mgg::MolaMapConfig& config) : mgg::MolaMap(config) {}
   mutable std::atomic<bool> entered{false};
   std::atomic<bool> slow{false};
+  std::atomic<bool> hold_until_cancel{false};
+  void delayQuery() const {
+    if (!slow) return;
+    entered = true;
+    while (hold_until_cancel && slow) {
+      mgg::planningCheckpoint();
+      std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(25));
+  }
   mgg::VoxelStatus getBoxStatus(const Eigen::Vector3d& c,
                                const Eigen::Vector3d& size, bool unknown) const override {
-    if (slow) {
-      entered = true;
-      std::this_thread::sleep_for(std::chrono::milliseconds(25));
-    }
+    delayQuery();
     return mgg::MolaMap::getBoxStatus(c, size, unknown);
   }
   // NAVIGATE's conservative pre-filter uses the static strict query;
   // delaying only ordinary boxes no longer guarantees an in-flight request.
   mgg::VoxelStatus getStaticStrictBoxStatus(const Eigen::Vector3d& c,
                                            const Eigen::Vector3d& size) const override {
-    if (slow) {
-      entered = true;
-      std::this_thread::sleep_for(std::chrono::milliseconds(25));
-    }
+    delayQuery();
     return mgg::MolaMap::getStaticStrictBoxStatus(c, size);
   }
 
@@ -2159,6 +2163,13 @@ TEST_F(PlannerNodeTest, CriticalInputsSurviveAllPlannerExecutorThreadsBlocked) {
   planner.add_node(node);
   std::thread critical_thread([&] { critical.spin(); });
   std::thread planner_thread([&] { planner.spin(); });
+  // Faster connected-frontier planning can finish before the 750ms heartbeat
+  // exercise. Keep this stress request in flight, not dependent on query count.
+  struct QueryHold {
+    SlowMolaPlanningMap& map;
+    explicit QueryHold(SlowMolaPlanningMap& value) : map(value) { map.hold_until_cancel = true; }
+    ~QueryHold() { map.hold_until_cancel = false; }
+  } query_hold(*map);  // releases on every exit, including an assertion failure
   map->slow = true;
   auto first = plan->async_send_request(std::make_shared<mgg_msgs::srv::PlannerSrv::Request>());
   const auto planning_by = std::chrono::steady_clock::now() + 2s;
@@ -2205,6 +2216,7 @@ TEST_F(PlannerNodeTest, CriticalInputsSurviveAllPlannerExecutorThreadsBlocked) {
       std::chrono::steady_clock::now() - cancel_start).count();
   EXPECT_LT(cancel_ms, 200.0);
   RecordProperty("saturated_executor_cancel_ms", cancel_ms);
+  map->hold_until_cancel = false;
   map->slow = false;
   // Heartbeat isolation must not weaken TTL enforcement.
   std::this_thread::sleep_for(400ms);
