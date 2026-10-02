@@ -306,6 +306,27 @@ class PlannerNodeTestPeer {
     msg->pose.pose.orientation.w = std::cos(yaw / 2.0);
     node.onOdometry(msg);
   }
+  static bool peersOpen(const PlannerNode& node) { return node.peer_edges_open_; }
+  static bool peerDeadlineSet(const PlannerNode& node) {
+    return node.peer_diagnosis_deadline_.has_value();
+  }
+  static bool peerBlocks(PlannerNode& node) {
+    return node.peerBlocksSegment(Eigen::Vector3d(0, 0, 0.935),
+                                 Eigen::Vector3d(2, 0, 0.935));
+  }
+  static void installPeerAndGraph(PlannerNode& node) {
+    node.mola_map_->setTransientDiscs({Eigen::Vector2d(1, 0)}, 0.5, 60.0);
+    node.global_graph_->reset();
+    auto* a = new mgg::Vertex(0, mgg::StateVec(0, 0, 0.935, 0));
+    auto* b = new mgg::Vertex(1, mgg::StateVec(2, 0, 0.935, 0));
+    node.global_graph_->addVertex(a);
+    node.global_graph_->addVertex(b);
+    node.global_graph_->addEdge(a, b, 2.0);
+  }
+  static void diagnose(PlannerNode& node) {
+    mgg::ShortestPathsReport report;
+    node.diagnosePeerSearch(0, report);
+  }
   static void setBudget(PlannerNode& node, double seconds) {
     node.lattice_time_budget_s_ = seconds;
   }
@@ -391,6 +412,29 @@ class PlannerNavigationTest : public ::testing::Test {
   static void SetUpTestSuite() { rclcpp::init(0, nullptr); }
   static void TearDownTestSuite() { rclcpp::shutdown(); }
 };
+
+TEST_F(PlannerNavigationTest, InterruptedPeerDiagnosisRestoresCollisionChecks) {
+  MolaTerrainProduct product(0.1, -3, 4, -3, 3, flat);
+  auto node = botmanNode("peer_diagnosis_budget", product);
+  PlannerNodeTestPeer::installPeerAndGraph(*node);
+  ASSERT_TRUE(PlannerNodeTestPeer::peerBlocks(*node));
+  bool interrupted_in_diagnosis = false;
+  {
+    // Deterministically expire the request only once the diagnosis has
+    // disabled peer edges, not during ordinary route search.
+    mgg::PlanningCancellationScope deadline([&] {
+      interrupted_in_diagnosis = PlannerNodeTestPeer::peersOpen(*node);
+      return interrupted_in_diagnosis;
+    });
+    EXPECT_THROW(PlannerNodeTestPeer::diagnose(*node), mgg::PlanningInterrupted);
+  }
+  EXPECT_TRUE(interrupted_in_diagnosis);
+  EXPECT_FALSE(PlannerNodeTestPeer::peersOpen(*node));
+  EXPECT_FALSE(PlannerNodeTestPeer::peerDeadlineSet(*node));
+  EXPECT_TRUE(PlannerNodeTestPeer::peerBlocks(*node));
+  PlannerNodeTestPeer::diagnose(*node);
+  EXPECT_TRUE(PlannerNodeTestPeer::peerBlocks(*node));
+}
 
 TEST_F(PlannerNavigationTest, RequestBudgetRefusesWithoutPublishingAPartialRoute) {
   MolaTerrainProduct product(0.1, -8, 8, -8, 8,
