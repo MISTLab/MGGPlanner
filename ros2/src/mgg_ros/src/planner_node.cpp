@@ -1448,6 +1448,34 @@ double PlannerNode::aerialPeerProgress(int sender) {
   return aerialGraphProgress(position);
 }
 
+double PlannerNode::aerialFleetFront() {
+  double front = -1.0;
+  for (const auto& [sender, snapshot] : neighbour_roadmaps_) {
+    (void)snapshot;
+    const double progress = aerialPeerProgress(sender);
+    if (std::isfinite(progress)) front = std::max(front, progress);
+  }
+  return front < 0.0 ? mgg::kUnreachableCost : front;
+}
+
+void PlannerNode::biasAerialTourCosts(mgg::TourCostMatrix& costs,
+                                     const std::vector<mgg::FrontierCluster>& clusters) {
+  if (fleet_ || robot_params_.type != mgg::RobotType::kAerialRobot ||
+      !std::isfinite(aerial_front_m_)) return;
+  const auto* home = tour_distances_.from(*global_graph_, graph_revision_,
+                                        kHomeVertexId, peer_generation_);
+  if (!home) return;
+  // At most five metres of first-leg preference, never a feasibility or
+  // gain change. A nearby own frontier may still beat a distant scout target.
+  constexpr double kFrontBiasM = 5.0;
+  for (std::size_t i = 0; i < clusters.size(); ++i) {
+    const double progress = mgg::reachedDistance(*home, clusters[i].representative_vertex_id);
+    if (std::isfinite(progress) && std::isfinite(costs.from_robot[i])) {
+      costs.from_robot[i] += std::clamp(aerial_front_m_ + kFrontBiasM - progress, 0.0, kFrontBiasM);
+    }
+  }
+}
+
 std::vector<mgg::FrontierCluster> PlannerNode::tourCandidates(
     std::vector<mgg::FrontierCluster> clusters) {
   refreshScoutingExclusions();
@@ -1652,6 +1680,13 @@ std::optional<mgg::FrontierCluster> PlannerNode::refreshTour(
   // no longer worth its distance is not kept, nor one now worth it left
   // out, while the graph stays as it is (review r0, I-2).
   const int own_id = static_cast<int>(planning_params_.robot_id);
+  if (!fleet_ && robot_params_.type == mgg::RobotType::kAerialRobot) {
+    const double front = aerialFleetFront();
+    if (front != aerial_front_m_) {
+      aerial_front_m_ = front;
+      ++tour_assignment_version_;
+    }
+  }
   const bool worth_changed =
       !fleet_ &&
       std::any_of(clusters.begin(), clusters.end(),
@@ -1725,6 +1760,7 @@ std::optional<mgg::FrontierCluster> PlannerNode::refreshTour(
         }
       }
     }
+    biasAerialTourCosts(costs, clusters);
     tour_planner_->solve(clusters, costs, graph_revision_,
                          tour_assignment_version_, now_s, peer_generation_);
     if (robot_params_.type == mgg::RobotType::kAerialRobot) {
@@ -6298,10 +6334,14 @@ bool PlannerNode::onPlanRequestImpl(
         : best_path_.empty() ? current_state_.head<3>().eval() : best_path_.back().head<3>().eval();
     const double progress = best_path_.empty() ? mgg::kUnreachableCost : aerialGraphProgress(target);
     const std::string distance = std::isfinite(progress) ? std::to_string(progress) : "unknown";
-    RCLCPP_INFO(get_logger(), "aerial choice: target=%s graph_front_m=%s reason=%s",
+    const double fleet_front = aerialFleetFront();
+    const std::string fleet_distance = std::isfinite(fleet_front) ? std::to_string(fleet_front) : "unknown";
+    RCLCPP_INFO(get_logger(), "aerial choice: target=%s graph_front_m=%s fleet_front_m=%s reason=%s",
         best_path_.empty() ? "none" : lifted ? "lifted" : "own",
-        distance.c_str(), complete ? "exploration complete" : best_path_.empty() ? "no admissible path"
-        : aerial_chosen_target ? "tour target, reachable and value-qualified"
+        distance.c_str(), fleet_distance.c_str(),
+        complete ? "exploration complete" : best_path_.empty() ? "no admissible path"
+        : aerial_chosen_target ? (lifted ? "ahead of peer and not behind drone; bounded graph-front bias"
+                                        : "own tour target; bounded graph-front bias")
         : best_path_from_global_graph_ ? "global fallback or resumed route"
         : "local exploration before peer fallback");
     RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 10000, "aerial_status %s",

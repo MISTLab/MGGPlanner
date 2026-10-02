@@ -626,6 +626,10 @@ class PlannerNode : public rclcpp::Node {
   // projection. Never use a ground edge as evidence of aerial traversability.
   double aerialGraphProgress(const Eigen::Vector3d& position);
   double aerialPeerProgress(int sender);
+  double aerialFleetFront();
+  void biasAerialTourCosts(mgg::TourCostMatrix& costs,
+                          const std::vector<mgg::FrontierCluster>& clusters);
+  double aerial_front_m_ = mgg::kUnreachableCost;
   bool aerialLocalFrontiers() const;
   std::unordered_map<int, std::chrono::steady_clock::time_point> aerial_peer_received_;
   std::vector<mgg::FrontierCluster> tourCandidates(
