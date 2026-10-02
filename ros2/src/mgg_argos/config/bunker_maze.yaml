@@ -181,7 +181,7 @@
     auto_period_sec: 4.0
     stuck_timeout_sec: 12.0
     reach_distance: 0.35
-    bootstrap_distance: 2.0
+    bootstrap_distance: 0.0  # opt in explicitly only for legacy blind departure
     bound_mode: 0
 
 mgg_argos_bridge:

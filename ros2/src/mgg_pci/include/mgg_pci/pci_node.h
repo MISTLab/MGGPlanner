@@ -115,7 +115,8 @@ class PciNode : public rclcpp::Node {
   double service_timeout_sec_ = 60.0;
   double reach_distance_ = 0.3;
   double stuck_timeout_sec_ = 20.0;
-  double bootstrap_distance_ = 3.0;
+  // Legacy unchecked departure is opt-in, never the MGG default.
+  double bootstrap_distance_ = 0.0;
   double empty_plan_retry_initial_sec_ = 1.0;
   double empty_plan_retry_max_sec_ = 10.0;
   int max_empty_plans_before_stop_ = 3;

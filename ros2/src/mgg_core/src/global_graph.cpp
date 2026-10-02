@@ -6,6 +6,7 @@
 #include <cmath>
 #include <functional>
 #include <limits>
+#include <memory>
 #include <queue>
 #include <unordered_map>
 #include <unordered_set>
@@ -39,11 +40,13 @@ bool RobotStateHistory::getNearestStates(
     std::vector<const StateVec*>* s_res) const {
   // The kd-tree library cannot deal with an empty tree (rrg.cpp:6245).
   if (state_hist_.empty()) return false;
-  kdres* neighbors =
-      kd_nearest_range3(kd_tree_, state.x(), state.y(), state.z(), range);
+  const std::unique_ptr<kdres, decltype(&kd_res_free)> result(
+      kd_nearest_range3(kd_tree_, state.x(), state.y(), state.z(), range),
+      &kd_res_free);
+  kdres* neighbors = result.get();
+  if (!neighbors) return false;
   const int neighbors_size = kd_res_size(neighbors);
   if (neighbors_size <= 0) {
-    kd_res_free(neighbors);  // upstream returned without freeing (rrg.cpp:6249)
     return false;
   }
   s_res->clear();
@@ -52,7 +55,6 @@ bool RobotStateHistory::getNearestStates(
     s_res->push_back(static_cast<const StateVec*>(kd_res_item_data(neighbors)));
     if (kd_res_next(neighbors) <= 0) break;
   }
-  kd_res_free(neighbors);
   return true;
 }
 

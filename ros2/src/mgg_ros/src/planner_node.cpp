@@ -345,7 +345,7 @@ PlannerNode::PlannerNode(const rclcpp::NodeOptions& options)
   callback_group_ =
       create_callback_group(rclcpp::CallbackGroupType::Reentrant);
   input_callback_group_ =
-      create_callback_group(rclcpp::CallbackGroupType::Reentrant);
+      create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive, false);
   rclcpp::SubscriptionOptions input_opts;
   input_opts.callback_group = input_callback_group_;
   planning_status_pub_ = create_publisher<std_msgs::msg::String>(
@@ -355,14 +355,17 @@ PlannerNode::PlannerNode(const rclcpp::NodeOptions& options)
       [this]() { publishPlanningStatus(); }, input_callback_group_);
   input_timer_ = create_wall_timer(std::chrono::milliseconds(20), [this]() {
     std::unique_lock<std::recursive_mutex> lock(planner_mutex_, std::try_to_lock);
-    if (lock.owns_lock()) applyLatestOdometry();
-  }, input_callback_group_);
+    if (lock.owns_lock()) {
+      applyPendingCancel();
+      applyLatestOdometry();
+    }
+  }, callback_group_);
   rclcpp::SubscriptionOptions sub_opts;
   sub_opts.callback_group = callback_group_;
 
   odom_sub_ = create_subscription<nav_msgs::msg::Odometry>(
       "odometry", rclcpp::QoS(10),
-      [this](nav_msgs::msg::Odometry::ConstSharedPtr m) { onOdometry(m); },
+      [this](nav_msgs::msg::Odometry::ConstSharedPtr m) { onOdometry(m, false); },
       input_opts);
 
   if (cloud_map_ != nullptr) {
@@ -376,7 +379,7 @@ PlannerNode::PlannerNode(const rclcpp::NodeOptions& options)
         sub_opts);
   }
   if (mola_map_ != nullptr) {
-    snapshot_callback_group_ = create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
+    snapshot_callback_group_ = create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive, false);
     rclcpp::SubscriptionOptions snapshot_opts;
     snapshot_opts.callback_group = snapshot_callback_group_;
     mapping_snapshot_sub_ = create_subscription<mgg_msgs::msg::MappingSnapshot>(
@@ -822,6 +825,12 @@ PlannerNode::PlannerNode(const rclcpp::NodeOptions& options)
               planning_params_.robot_id, world_frame_.c_str(),
               grid_params_.resolution.x(), grid_params_.resolution.y(),
               grid_params_.resolution.z());
+}
+
+void PlannerNode::addInputCallbackGroupsTo(rclcpp::Executor& executor) {
+  executor.add_callback_group(input_callback_group_, get_node_base_interface());
+  if (snapshot_callback_group_)
+    executor.add_callback_group(snapshot_callback_group_, get_node_base_interface());
 }
 
 void PlannerNode::loadParameters() {
@@ -2079,8 +2088,11 @@ void PlannerNode::refreshMapRevision() {
     }
   }
   if (const auto active = mola_map_->activeRequest()) {
-    const auto identity = std::make_pair(active->component_id, active->epoch);
-    if (served_map_identity_ && *served_map_identity_ != identity) {
+    if (served_map_identity_ &&
+        (served_map_identity_->component_id != active->component_id ||
+         served_map_identity_->epoch != active->epoch ||
+         !served_map_identity_->component_from_navigation.matrix().isApprox(
+             active->component_from_navigation.matrix(), 1e-9))) {
       global_graph_->reset();
       local_graph_->reset();
       // Lifted slots are graph vertex IDs, not reusable across an epoch.
@@ -2097,7 +2109,7 @@ void PlannerNode::refreshMapRevision() {
       setAcquiringObservations(true);
       ++map_identity_changes_;
     }
-    served_map_identity_ = identity;
+    served_map_identity_ = *active;
     mapping_snapshot_.component_id = active->component_id;
     mapping_snapshot_.epoch = active->epoch;
     mapping_snapshot_.graph_revision = active->graph_revision;
@@ -2113,7 +2125,7 @@ void PlannerNode::refreshMapRevision() {
     have_mapping_snapshot_ = true;
   }
   if (have_odometry_ && robot_params_.type == mgg::RobotType::kGroundRobot) {
-    Eigen::Vector3d floor = current_state_.head<3>();
+    Eigen::Vector3d floor = current_state_.head<3>() + robot_params_.center_offset;
     floor.z() -= robot_params_.size.z() / 2.0;
     mola_map_->setFootprintGroundSupport(floor, robot_params_.size.head<2>(), current_state_[3]);
   }
@@ -2288,7 +2300,7 @@ mgg::RecomputeGainFn PlannerNode::globalFrontierGain() {
 // ---------------------------------------------------------------------------
 // Inputs
 
-void PlannerNode::onOdometry(nav_msgs::msg::Odometry::ConstSharedPtr msg) {
+void PlannerNode::onOdometry(nav_msgs::msg::Odometry::ConstSharedPtr msg, bool apply_now) {
   const mgg::StateVec state = fromPoseMsg(msg->pose.pose);
   if (!state.allFinite()) {
     RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000,
@@ -2299,15 +2311,20 @@ void PlannerNode::onOdometry(nav_msgs::msg::Odometry::ConstSharedPtr msg) {
   {
     std::lock_guard<std::mutex> lock(input_mutex_);
     if (latest_odometry_ &&
-        rclcpp::Time(msg->header.stamp) < rclcpp::Time(latest_odometry_->header.stamp))
+        rclcpp::Time(msg->header.stamp) < rclcpp::Time(latest_odometry_->header.stamp)) {
+      RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000,
+                           "ignoring odometry older than latest accepted state");
       return;
+    }
     latest_odometry_ = msg;
     latest_odometry_received_ = received;
     odometry_sample_stamp_ns_ = rclcpp::Time(msg->header.stamp).nanoseconds();
   }
   odometry_ingest_lag_s_.store(
       std::chrono::duration<double>(std::chrono::steady_clock::now() - received).count());
-  // Never queue behind planning. Requests and the timer drain the latest slot.
+  // The dedicated input executor only ingests: applying odometry can expand
+  // the graph and must never occupy its heartbeat/cancel thread.
+  if (!apply_now) return;
   std::unique_lock<std::recursive_mutex> lock(planner_mutex_, std::try_to_lock);
   if (lock.owns_lock()) applyLatestOdometry();
 }
@@ -5247,6 +5264,7 @@ void PlannerNode::onBuildRequest(
     std::shared_ptr<std_srvs::srv::Trigger::Response> response) {
   const auto generation = request_generation_.load();
   const std::lock_guard<std::recursive_mutex> lock(planner_mutex_);
+  applyPendingCancel();
   auto map_read = mapReadLease();
   const bool admitted = map_read.hasSnapshot();
   const auto map_generation = mola_map_ ? mola_map_->activeGeneration() : 0;
@@ -5273,21 +5291,25 @@ void PlannerNode::onBuildRequest(
 }
 
 void PlannerNode::cancelPlanning() {
-  // Linearizes cancellation with path publication; never takes planner_mutex_.
-  {
-    std::lock_guard<std::mutex> lock(cancellation_mutex_);
-    ++request_generation_;
+  // No planner work on the dedicated input thread, even when currently idle.
+  std::lock_guard<std::mutex> fence(cancellation_mutex_);
+  ++request_generation_;
+  pending_cancel_clear_ = true;
+}
+
+void PlannerNode::applyPendingCancel() {
+  // Caller holds planner_mutex_. Consume before admitting new work, or on the
+  // maintenance tick after background work releases the planner lock.
+  std::lock_guard<std::mutex> fence(cancellation_mutex_);
+  if (!pending_cancel_clear_.exchange(false)) return;
+  const bool had_path = !best_path_.empty();
+  best_path_.clear();
+  global_exploration_ongoing_ = false;
+  if (exploration_target_) {
+    exploration_target_.reset();
+    publishPlannerConfigState();
   }
-  std::unique_lock<std::recursive_mutex> lock(planner_mutex_, std::try_to_lock);
-  if (lock.owns_lock()) {
-    best_path_.clear();
-    global_exploration_ongoing_ = false;
-    if (exploration_target_) {
-      exploration_target_.reset();
-      publishPlannerConfigState();
-    }
-    publishPath();
-  }
+  if (had_path) publishPathUnderCancellationFence();
 }
 
 void PlannerNode::cancelExplorationPlanning() {
@@ -5303,6 +5325,7 @@ void PlannerNode::onPlanRequest(
   const auto generation = request_generation_.load();
   const auto exploration_generation = exploration_generation_.load();
   const std::lock_guard<std::recursive_mutex> lock(planner_mutex_);
+  applyPendingCancel();
   RequestActivity activity(request_active_);
   auto map_read = mapReadLease();
   if (mola_map_) {
@@ -5326,9 +5349,20 @@ void PlannerNode::onPlanRequest(
   });
   try {
     mgg::planningCheckpoint();
-    onPlanRequestImpl(request, response);
+    const bool computed = onPlanRequestImpl(request, response);
     std::lock_guard<std::mutex> fence(cancellation_mutex_);
     mgg::planningCheckpoint();
+    // This is the commit point. No cancellation checkpoint may run after it:
+    // a later cancel belongs after this answer, not to an unsent computation.
+    if (computed) {
+      recordSentPath();
+      if (!best_path_.empty()) setAcquiringObservations(false);
+      publishPathUnderCancellationFence();
+      if (planner_config_state_.last_plan_generation != planner_config_state_.generation) {
+        planner_config_state_.last_plan_generation = planner_config_state_.generation;
+        publishPlannerConfigState();
+      }
+    }
   } catch (const mgg::PlanningInterrupted&) {
     ++cancellations_;
     ++graph_revision_;
@@ -5341,7 +5375,9 @@ void PlannerNode::onPlanRequest(
     }
     global_exploration_ongoing_ = false;
     response->path.clear();
-    response->status = kStatusNotReady;
+    response->status = (request_generation_.load() != generation ||
+                        exploration_generation_.load() != exploration_generation)
+        ? mgg_msgs::srv::PlannerSrv::Response::CANCELLED : kStatusNotReady;
     RCLCPP_INFO(get_logger(), "planning cancelled: superseded or map authority expired/changed");
   }
   robot_params_.bound_mode = bound;
@@ -5356,6 +5392,7 @@ void PlannerNode::onObjectiveRequest(
     generation = ++request_generation_;
   }
   const std::lock_guard<std::recursive_mutex> lock(planner_mutex_);
+  applyPendingCancel();
   RequestActivity activity(request_active_);
   auto map_read = mapReadLease();
   if (mola_map_) {
@@ -5406,7 +5443,7 @@ void PlannerNode::onObjectiveRequest(
   }
 }
 
-void PlannerNode::onPlanRequestImpl(
+bool PlannerNode::onPlanRequestImpl(
     const std::shared_ptr<mgg_msgs::srv::PlannerSrv::Request> request,
     std::shared_ptr<mgg_msgs::srv::PlannerSrv::Response> response) {
   const std::lock_guard<std::recursive_mutex> lock(planner_mutex_);
@@ -5428,7 +5465,7 @@ void PlannerNode::onPlanRequestImpl(
     response->status = kStatusNotReady;
     RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 5000,
                          "plan request refused: waiting for flight_state");
-    return;
+    return false;
   }
   if (!have_odometry_ || !map_->getStatus()) {
     response->status = kStatusNotReady;
@@ -5436,7 +5473,7 @@ void PlannerNode::onPlanRequestImpl(
                          "plan request refused: %s",
                          have_odometry_ ? "acquiring observations" : "no odometry");
     setAcquiringObservations(true);
-    return;
+    return false;
   }
   // The planner's state is its last odometry message; a plan from where the
   // robot was is completed at once by the controller where the robot is.
@@ -5444,7 +5481,7 @@ void PlannerNode::onPlanRequestImpl(
     response->status = kStatusNotReady;
     RCLCPP_WARN(get_logger(), "plan request refused: odometry is %.1f s old",
                 secondsSince(last_odometry_received_));
-    return;
+    return false;
   }
   ++plan_requests_;
   expireReverseExitExclusions();
@@ -5768,7 +5805,6 @@ void PlannerNode::onPlanRequestImpl(
   }
   robot_params_.bound_mode = previous;
   refreshNoGoZones();
-  recordSentPath();
   enforceSafeCompletion(complete);
   if (mola_map_ && robot_params_.type == mgg::RobotType::kGroundRobot &&
       acquiring_observations_.load() && best_path_.empty() &&
@@ -5776,8 +5812,6 @@ void PlannerNode::onPlanRequestImpl(
     setAcquiringObservations(true);
     complete = false;
     summary += "; acquiring observations";
-  } else if (!best_path_.empty()) {
-    setAcquiringObservations(false);
   }
   response->status = !best_path_.empty()
                          ? mgg_msgs::srv::PlannerSrv::Response::FORWARD
@@ -5788,21 +5822,13 @@ void PlannerNode::onPlanRequestImpl(
   for (const mgg::StateVec& s : best_path_) {
     response->path.push_back(toPoseMsg(s));
   }
-  publishPath();
   publishMarkers();
   RCLCPP_INFO(get_logger(), "plan request: %s", summary.c_str());
   if (robot_params_.type == mgg::RobotType::kAerialRobot) {
     RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 10000, "aerial_status %s",
                          aerialStatusJson().c_str());
   }
-  // A computed answer (including no-path/complete), not an early NOT_READY
-  // refusal, establishes which configuration this exploration cycle used.
-  // Publish before returning the service response, still under planner_mutex_.
-  if (planner_config_state_.last_plan_generation !=
-      planner_config_state_.generation) {
-    planner_config_state_.last_plan_generation = planner_config_state_.generation;
-    publishPlannerConfigState();
-  }
+  return true;
 }
 
 std::string PlannerNode::clearInadmissibleBestPath() {
@@ -6827,6 +6853,10 @@ void PlannerNode::onObjectiveRequestImpl(
 void PlannerNode::publishPath() {
   std::lock_guard<std::mutex> fence(cancellation_mutex_);
   mgg::planningCheckpoint();
+  publishPathUnderCancellationFence();
+}
+
+void PlannerNode::publishPathUnderCancellationFence() {
   nav_msgs::msg::Path msg;
   msg.header.stamp = now();
   msg.header.frame_id = world_frame_;

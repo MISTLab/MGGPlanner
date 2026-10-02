@@ -359,7 +359,8 @@ class PlannerNodeTestPeer {
   static auto blockingService(PlannerNode& node, std::atomic<int>& entered,
                              std::atomic<bool>& release) {
     return node.create_service<std_srvs::srv::Trigger>("busy_planner",
-        [&node, &entered, &release](auto, auto) {
+        [&node, &entered, &release](std::shared_ptr<std_srvs::srv::Trigger::Request>,
+                                  std::shared_ptr<std_srvs::srv::Trigger::Response>) {
           ++entered;
           std::lock_guard<std::recursive_mutex> lock(node.planner_mutex_);
           while (!release) std::this_thread::sleep_for(std::chrono::milliseconds(1));
@@ -2194,8 +2195,8 @@ TEST_F(PlannerNodeTest, FootprintGroundSupportUsesBodyCenterOffset) {
   PlannerNodeTestPeer::acceptOdometry(*node, 0, 0, 1);
   PlannerNodeTestPeer::refresh(*node);
   Eigen::Vector3d hit;
-  EXPECT_EQ(map->getRayStatus({1, 0, 0.4}, {1, 0, -0.4}, false, hit), mgg::VoxelStatus::kOccupied);
-  EXPECT_EQ(map->getRayStatus({0, 0, 0.4}, {0, 0, -0.4}, false, hit), mgg::VoxelStatus::kUnknown);
+  EXPECT_EQ(map->getGroundRayStatus({1, 0, 0.4}, {1, 0, -0.4}, false, hit), mgg::VoxelStatus::kOccupied);
+  EXPECT_NE(map->getGroundRayStatus({0, 0, 0.4}, {0, 0, -0.4}, false, hit), mgg::VoxelStatus::kOccupied);
 }
 
 TEST_F(PlannerNodeTest, LatestOdometryIngestedDuringFiveSecondPlannerCall) {
@@ -2248,7 +2249,7 @@ TEST_F(PlannerNodeTest, CancellationInterruptsSlowPlanWithoutReturningPath) {
   RecordProperty("interruption_ms", std::to_string(
       std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count()));
   EXPECT_TRUE(response->path.empty());
-  EXPECT_EQ(response->status, -4); // CANCELLED, not acquiring observations
+  EXPECT_EQ(response->status, mgg_msgs::srv::PlannerSrv::Response::CANCELLED);
   const auto receive_until = std::chrono::steady_clock::now() + std::chrono::milliseconds(200);
   while (std::chrono::steady_clock::now() < receive_until) {
     rclcpp::spin_some(node);
@@ -2293,6 +2294,9 @@ TEST_F(PlannerNodeTest, ExplorationCancelInterruptsOnlyExplorationRequests) {
     while (!slow->entered && std::chrono::steady_clock::now() < entered_by)
       std::this_thread::sleep_for(std::chrono::milliseconds(1));
     EXPECT_TRUE(slow->entered);
+    rclcpp::executors::SingleThreadedExecutor critical;
+    PlannerNodeTestPeer::addCriticalGroups(*node, critical);
+    std::thread critical_thread([&] { critical.spin(); });
     const auto cancel_started = std::chrono::steady_clock::now();
     if (available) {
       auto answer = client->async_send_request(std::make_shared<std_srvs::srv::Trigger::Request>());
@@ -2303,6 +2307,8 @@ TEST_F(PlannerNodeTest, ExplorationCancelInterruptsOnlyExplorationRequests) {
       if (kind == -1)
         EXPECT_EQ(work.wait_for(std::chrono::milliseconds(200)), std::future_status::ready);
     }
+    critical.cancel();
+    critical_thread.join();
     slow->slow = false;
     work.get();
     if (kind == -1) {
@@ -2311,7 +2317,7 @@ TEST_F(PlannerNodeTest, ExplorationCancelInterruptsOnlyExplorationRequests) {
       EXPECT_LT(elapsed_ms, 200.0);
       RecordProperty("exploration_cancel_ms", std::to_string(elapsed_ms));
       EXPECT_TRUE(plan->path.empty());
-      EXPECT_EQ(plan->status, -4); // CANCELLED
+      EXPECT_EQ(plan->status, mgg_msgs::srv::PlannerSrv::Response::CANCELLED);
       const auto receive_until = std::chrono::steady_clock::now() + std::chrono::milliseconds(200);
       while (std::chrono::steady_clock::now() < receive_until) {
         rclcpp::spin_some(node);

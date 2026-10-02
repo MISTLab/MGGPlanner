@@ -286,6 +286,15 @@ void PciNode::planAndPublish() {
   planning_in_progress_ = false;
   if (!running_ || generation != generation_) return;
 
+  if (ok && plan_status_ == mgg_msgs::srv::PlannerSrv::Response::CANCELLED) {
+    consecutive_empty_plans_ = 0;
+    path_in_progress_ = false;
+    waiting_for_plan_ = true;
+    retry_not_before_ = now() + rclcpp::Duration::from_seconds(0.25);
+    publishStatus("waiting", "planning cancelled; retrying automatically");
+    return;
+  }
+
   // Missing observations (including a fresh epoch) are retryable forever.
   // Never replace MGG with the legacy blind bootstrap motion or terminal
   // empty-plan backoff while it is acquiring its first product.

@@ -17,6 +17,7 @@
 #include <gtest/gtest.h>
 
 #include "mgg_core/global_graph.h"
+#include "mgg_core/planning_cancellation.h"
 #include "terrain_fixture.h"
 
 namespace {
@@ -2328,3 +2329,17 @@ TEST(GraphDeadline, APassedDeadlineCutsALargeSearchShort) {
 }
 
 }  // namespace
+
+TEST(RobotStateHistory, InterruptedNeighborResultsUnwindAndCanBeQueriedAgain) {
+  mgg::RobotStateHistory history;
+  for (int i = 0; i < 64; ++i) history.addState(mgg::StateVec(i, 0, 0, 0));
+  std::vector<const mgg::StateVec*> found;
+  for (int attempt = 0; attempt < 100; ++attempt) {
+    int checkpoints = 0;
+    mgg::PlanningCancellationScope scope([&] { return ++checkpoints == 10; });
+    EXPECT_THROW(history.getNearestStates(mgg::StateVec::Zero(), 100, &found),
+                 mgg::PlanningInterrupted);
+  }
+  ASSERT_TRUE(history.getNearestStates(mgg::StateVec::Zero(), 100, &found));
+  EXPECT_EQ(found.size(), 64u);
+}
