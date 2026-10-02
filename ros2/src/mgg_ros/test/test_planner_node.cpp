@@ -81,6 +81,17 @@ class SlowMolaPlanningMap : public mgg::MolaMap {
     }
     return mgg::MolaMap::getBoxStatus(c, size, unknown);
   }
+  // NAVIGATE's conservative pre-filter uses the static strict query;
+  // delaying only ordinary boxes no longer guarantees an in-flight request.
+  mgg::VoxelStatus getStaticStrictBoxStatus(const Eigen::Vector3d& c,
+                                           const Eigen::Vector3d& size) const override {
+    if (slow) {
+      entered = true;
+      std::this_thread::sleep_for(std::chrono::milliseconds(25));
+    }
+    return mgg::MolaMap::getStaticStrictBoxStatus(c, size);
+  }
+
 };
 
 class SlowPlanningMap : public mgg::OctomapMap {
@@ -96,6 +107,17 @@ class SlowPlanningMap : public mgg::OctomapMap {
     }
     return mgg::OctomapMap::getBoxStatus(c, size, unknown);
   }
+  // NAVIGATE's conservative pre-filter uses the static strict query;
+  // delaying only ordinary boxes no longer guarantees an in-flight request.
+  mgg::VoxelStatus getStaticStrictBoxStatus(const Eigen::Vector3d& c,
+                                           const Eigen::Vector3d& size) const override {
+    if (slow) {
+      entered = true;
+      std::this_thread::sleep_for(std::chrono::milliseconds(25));
+    }
+    return mgg::OctomapMap::getStaticStrictBoxStatus(c, size);
+  }
+
 };
 
 class SlowScanMap : public mgg::OctomapMap {
@@ -2105,7 +2127,10 @@ class PlannerNodeTest : public ::testing::Test {
 
 TEST_F(PlannerNodeTest, CriticalInputsSurviveAllPlannerExecutorThreadsBlocked) {
   using namespace std::chrono_literals;
-  auto node = makeNode("saturated_inputs");
+  // This is an intentionally >750ms authority/cancel stress test, not a
+  // performance request. Keep the planner running until cancellation.
+  auto node = makeNode("saturated_inputs", "world",
+      {rclcpp::Parameter("lattice_time_budget_s", 0.0)});
   MolaFloorProduct product(-1, 4, -1, 1);
   auto provider = product.serve<SlowMolaPlanningMap>(0.35);
   auto* map = provider.get();
