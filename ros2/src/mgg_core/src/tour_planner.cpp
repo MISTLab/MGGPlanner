@@ -1,3 +1,4 @@
+#include "mgg_core/planning_cancellation.h"
 #include "mgg_core/tour_planner.h"
 
 #include <algorithm>
@@ -48,6 +49,7 @@ const TourPlan& TourPlanner::solve(const std::vector<FrontierCluster>& clusters,
   bool kept = false;
   int current = -1;
   for (std::size_t i = 0; i < clusters.size(); ++i) {
+    planningCheckpoint();
     if (clusters[i].id == target_) current = static_cast<int>(i);
   }
   if (current >= 0 && !best.order.empty() && best.order.front() != current) {

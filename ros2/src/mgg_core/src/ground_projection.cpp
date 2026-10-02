@@ -1,3 +1,4 @@
+#include "mgg_core/planning_cancellation.h"
 #include "mgg_core/ground_projection.h"
 
 #include <algorithm>
@@ -93,6 +94,7 @@ double GroundProjection::castProjection(Eigen::Vector3d& sample,
   const double sample_z = sample(2);
 
   for (size_t i = 0; i < extra_samples.size(); ++i) {
+    planningCheckpoint();
     const Eigen::Vector3d start = sample + extra_samples[i];
     const Eigen::Vector3d end =
         start - Eigen::Vector3d(0.0, 0.0, max_projection_length);
@@ -206,6 +208,7 @@ ProjectedEdgeStatus GroundProjection::getProjectedEdgeStatus(
   if (ray_len >= 2.0 * step_size) {
     Eigen::Vector3d last_point = start;
     for (double step = 0.0; step < ray_len; step += step_size) {
+      planningCheckpoint();
       Eigen::Vector3d edge_point = start + step * ray_normed;
       last_point = edge_point;
       if (preserve_start_height && step == 0.0) {
@@ -261,6 +264,7 @@ ProjectedEdgeStatus GroundProjection::getProjectedEdgeStatus(
 
   // Inclination of each segment. Cheaper than a collision check, so first.
   for (size_t i = 1; i < projected_edge.size(); ++i) {
+    planningCheckpoint();
     const Eigen::Vector3d segment = projected_edge[i] - projected_edge[i - 1];
     const double theta =
         std::atan2(std::abs(segment(2)), std::abs(segment.head(2).norm()));
@@ -269,6 +273,7 @@ ProjectedEdgeStatus GroundProjection::getProjectedEdgeStatus(
   }
 
   for (size_t i = 1; i < projected_edge.size(); ++i) {
+    planningCheckpoint();
     ProfileScope timed_sweep(profile_ ? &profile_->body_sweeps : nullptr);
     const VoxelStatus path =
         body != nullptr
@@ -297,6 +302,7 @@ ProjectedEdgeStatus GroundProjection::getProjectedEdgeStatus(
   // lattice lay (run 5, robot_2). Not the start where the robot stands.
   std::vector<Eigen::Vector3d> samples;
   for (std::size_t i = 1; i < projected_edge.size(); ++i) {
+    planningCheckpoint();
     const Eigen::Vector3d& from = projected_edge[i - 1];
     const Eigen::Vector3d& to = projected_edge[i];
     const int count = std::max(
@@ -304,6 +310,7 @@ ProjectedEdgeStatus GroundProjection::getProjectedEdgeStatus(
                                           kFootprintSampleSpacing -
                                       1e-9)));
     for (int k = (i == 1 && standing_at_start) ? 1 : 0; k < count; ++k) {
+      planningCheckpoint();
       samples.push_back(from + (to - from) * (double(k) / count));
     }
   }
@@ -320,6 +327,7 @@ ProjectedEdgeStatus GroundProjection::getProjectedEdgeStatus(
   if ((check_tilt || check_step || check_rise) && heading.norm() > 1e-9) {
     ProfileScope timed_footprint(profile_ ? &profile_->footprint : nullptr);
     for (const Eigen::Vector3d& point : samples) {
+      planningCheckpoint();
       if (check_tilt || check_step) {
         const FootprintPlane plane = footprintPlane(point, heading, box_size);
         if (plane.measured &&
@@ -350,6 +358,7 @@ ProjectedEdgeStatus GroundProjection::getProjectedEdgeStatus(
   if (min_ground > 0.0 && heading.norm() > 1e-9) {
     ProfileScope timed_ahead(profile_ ? &profile_->ground_ahead : nullptr);
     for (std::size_t i = 0; i < samples.size(); ++i) {
+      planningCheckpoint();
       if (is_hanging && i + 1 < samples.size()) continue;
       if (observedGroundAhead(samples[i], heading, box_size) <
               min_ground - 1e-9 ||
@@ -396,9 +405,11 @@ struct GroundProjection::BridgeCells {
     // A cell with both its next neighbours listed; the cells lie in a
     // circle, so most have them.
     for (const XYCellCenter& cell : cells_) {
+      planningCheckpoint();
       const XYCellCenter* next_x = nullptr;
       const XYCellCenter* next_y = nullptr;
       for (const XYCellCenter& other : cells_) {
+        planningCheckpoint();
         if (other.grid_x == cell.grid_x + 1 && other.grid_y == cell.grid_y) {
           next_x = &other;
         } else if (other.grid_x == cell.grid_x &&
@@ -445,6 +456,7 @@ double GroundProjection::observedGroundAhead(
   int ahead = 0;
   int observed = 0;
   for (const XYCellCenter& cell : candidates) {
+    planningCheckpoint();
     const Eigen::Vector2d offset = cell.center - point.head<2>();
     const double forward = offset.dot(along);
     if (forward < -1e-9 || forward > half_length + 1e-9 ||
@@ -488,6 +500,7 @@ bool GroundProjection::groundBridged(BridgeCells& cells,
   const auto nearest = [&](const Eigen::Vector2d& direction) {
     Side side;
     for (int k = 1; k <= kGroundBridgeCells; ++k) {
+      planningCheckpoint();
       const Eigen::Vector2d at =
           cells.centerOf(cell + k * resolution * direction);
       Eigen::Vector3d ground;
@@ -504,6 +517,7 @@ bool GroundProjection::groundBridged(BridgeCells& cells,
   };
   const Eigen::Vector2d across(-along.y(), along.x());
   for (const Eigen::Vector2d& direction : {along, across}) {
+    planningCheckpoint();
     const Side ahead = nearest(direction);
     if (!ahead.found) continue;
     const Side behind = nearest(-direction);
@@ -544,6 +558,7 @@ double GroundProjection::footprintCellRise(
   // grid.
   std::map<std::pair<std::int64_t, std::int64_t>, double> ground_by_cell;
   for (const XYCellCenter& cell : candidates) {
+    planningCheckpoint();
     const Eigen::Vector2d offset = cell.center - point.head<2>();
     if (std::abs(offset.dot(along)) > half_length + 1e-9 ||
         std::abs(offset.dot(across)) > half_width + 1e-9) {
@@ -558,6 +573,7 @@ double GroundProjection::footprintCellRise(
   }
   double rise = 0.0;
   for (const auto& [index, z] : ground_by_cell) {
+    planningCheckpoint();
     for (const std::pair<std::int64_t, std::int64_t> next :
          {std::make_pair(index.first + 1, index.second),
           std::make_pair(index.first, index.second + 1)}) {
@@ -598,6 +614,7 @@ double GroundProjection::crossSlope(const std::vector<Eigen::Vector3d>& edge,
   std::vector<Eigen::Vector2d> positions;
   std::vector<double> gradients;
   for (std::size_t i = skip_start ? 1 : 0; i < edge.size(); ++i) {
+    planningCheckpoint();
     const Eigen::Vector3d& point = edge[i];
     Eigen::Vector3d left;
     Eigen::Vector3d right;
@@ -612,6 +629,7 @@ double GroundProjection::crossSlope(const std::vector<Eigen::Vector3d>& edge,
   const double body = std::max(box_size.x(), box_size.y());
   double steepest = 0.0;
   for (std::size_t first = 0; first < gradients.size(); ++first) {
+    planningCheckpoint();
     double sum = 0.0;
     std::size_t next = first;
     while (next < gradients.size() &&
@@ -633,6 +651,7 @@ bool GroundProjection::footprintGroundBelow(const Eigen::Vector3d& point,
   std::vector<GroundFromHeight>& column =
       ground_below_column_[ColumnKey{micro(point.x()), micro(point.y())}];
   for (const GroundFromHeight& earlier : column) {
+    planningCheckpoint();
     // A ray that starts between an earlier ray's start and the ground it
     // found crosses only cells that ray found empty, then that ground; its
     // end, 5 m below its start, is still below that ground. The ground
@@ -674,6 +693,7 @@ bool GroundProjection::freeInColumn(const Eigen::Vector2d& cell, double top,
     const auto lowest = static_cast<std::int64_t>(
         std::ceil((to - kSampleTolerance) / resolution - 0.5));
     for (std::int64_t k = highest; k >= lowest; --k) {
+      planningCheckpoint();
       const double z = (static_cast<double>(k) + 0.5) * resolution;
       if (map_.getVoxelStatus(Eigen::Vector3d(cell.x(), cell.y(), z)) ==
           VoxelStatus::kFree) {
@@ -765,6 +785,7 @@ double GroundProjection::clearancePenalty(
   const Eigen::Vector2d half = 0.5 * box_size.head<2>();
   double clearance = margin;
   for (const auto& cell : cells) {
+    planningCheckpoint();
     const Eigen::Vector2d offset = cell.center - point.head<2>();
     const Eigen::Vector2d local(std::abs(offset.dot(along)),
                                 std::abs(offset.dot(across)));
@@ -787,6 +808,7 @@ std::vector<Eigen::Vector3d> GroundProjection::clearanceSamples(
   std::vector<Eigen::Vector3d> points;
   points.reserve(samples);
   for (int i = 0; i < samples; ++i) {
+    planningCheckpoint();
     Eigen::Vector3d point = start + ((i + 0.5) / samples) * (end - start);
     // Follow the support surface even on a shortcut spanning a ramp crest.
     Eigen::Vector3d ground;
@@ -879,6 +901,7 @@ FootprintPlane GroundProjection::measureFootprintPlane(
   ground_points.reserve(candidates.size());
   int cells_under = 0;
   for (const XYCellCenter& cell : candidates) {
+    planningCheckpoint();
     const Eigen::Vector2d offset = cell.center - point.head<2>();
     if (std::abs(offset.dot(along)) > half_length + 1e-9 ||
         std::abs(offset.dot(across)) > half_width + 1e-9) {
@@ -905,6 +928,7 @@ FootprintPlane GroundProjection::measureFootprintPlane(
   Eigen::Matrix3d normal = Eigen::Matrix3d::Zero();
   Eigen::Vector3d moment = Eigen::Vector3d::Zero();
   for (const Eigen::Vector3d& g : ground_points) {
+    planningCheckpoint();
     const Eigen::Vector3d r = row(g);
     normal.noalias() += r * r.transpose();
     moment += r * g.z();
@@ -916,6 +940,7 @@ FootprintPlane GroundProjection::measureFootprintPlane(
   plane.measured = true;
   plane.tilt = std::atan(coefficients.tail<2>().norm());
   for (const Eigen::Vector3d& g : ground_points) {
+    planningCheckpoint();
     plane.max_residual = std::max(
         plane.max_residual, std::abs(g.z() - row(g).dot(coefficients)));
   }

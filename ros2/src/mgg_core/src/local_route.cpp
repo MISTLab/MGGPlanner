@@ -1,3 +1,4 @@
+#include "mgg_core/planning_cancellation.h"
 #include "mgg_core/local_route.h"
 
 #include <algorithm>
@@ -131,7 +132,7 @@ Vertex* linkGoalToLattice(GraphManager& graph, const StateVec& goal_state,
   Vertex* linked = connectStateToGraph(graph, goal_state, ctx,
                                        kLocalGoalLinkRadius,
                                        /*exact_state=*/true);
-  if (linked != nullptr) return linked;
+  if (linked != nullptr || ctx.robot->type == RobotType::kAerialRobot) return linked;
   std::vector<Vertex*> around;
   if (!graph.getNearestVertices(&goal_state, ctx.planning->edge_length_max,
                                 &around)) {
@@ -144,6 +145,7 @@ Vertex* linkGoalToLattice(GraphManager& graph, const StateVec& goal_state,
             });
   int tried = 0;
   for (Vertex* parent : around) {
+    planningCheckpoint();
     if (parent == nullptr || (reached && !reached(*parent))) continue;
     if (tried++ >= kGoalLinkCandidates) break;
     ExpandGraphReport rep;

@@ -1,3 +1,4 @@
+#include "mgg_core/planning_cancellation.h"
 #include "mgg_core/tour_solver.h"
 
 #include <algorithm>
@@ -50,8 +51,10 @@ class LegCost {
 bool twoOptMove(std::vector<int>& order, const LegCost& leg, std::size_t lo) {
   const std::size_t n = order.size();
   for (std::size_t i = lo; i + 1 < n; ++i) {
+    planningCheckpoint();
     const int before = i == 0 ? kStart : order[i - 1];
     for (std::size_t j = i + 1; j < n; ++j) {
+      planningCheckpoint();
       const int after = j + 1 < n ? order[j + 1] : kEnd;
       const double added = leg(before, order[j]) + leg(order[i], after);
       const double removed = leg(before, order[i]) + leg(order[j], after);
@@ -69,7 +72,9 @@ bool twoOptMove(std::vector<int>& order, const LegCost& leg, std::size_t lo) {
 bool orOptMove(std::vector<int>& order, const LegCost& leg, std::size_t lo) {
   const std::size_t n = order.size();
   for (std::size_t length = 1; length <= 3; ++length) {
+    planningCheckpoint();
     for (std::size_t i = lo; i + length <= n; ++i) {
+      planningCheckpoint();
       const std::size_t k = i + length - 1;
       const int first = order[i];
       const int last = order[k];
@@ -81,6 +86,7 @@ bool orOptMove(std::vector<int>& order, const LegCost& leg, std::size_t lo) {
       rest.insert(rest.end(), order.begin(), order.begin() + i);
       rest.insert(rest.end(), order.begin() + k + 1, order.end());
       for (std::size_t p = lo; p <= rest.size(); ++p) {
+        planningCheckpoint();
         if (p == i) continue;  // where the segment came from
         const int u = p == 0 ? kStart : rest[p - 1];
         const int v = p < rest.size() ? rest[p] : kEnd;
@@ -113,6 +119,7 @@ double openTourCost(const std::vector<int>& order,
   if (order.empty()) return 0.0;
   double cost = from_start[order.front()];
   for (std::size_t i = 1; i < order.size(); ++i) {
+    planningCheckpoint();
     cost += between[order[i - 1]][order[i]];
   }
   return cost;
@@ -147,6 +154,7 @@ OpenTour solveOpenTour(const std::vector<double>& from_start,
   }
   std::vector<int> rest;
   for (int i = 0; i < n; ++i) {
+    planningCheckpoint();
     if (i != first && std::isfinite(from_start[i])) rest.push_back(i);
   }
   if (rest.empty() && first < 0) return tour;
@@ -160,9 +168,11 @@ OpenTour solveOpenTour(const std::vector<double>& from_start,
     std::vector<int> best = rest;
     double best_cost = kUnreachableCost;
     do {
+      planningCheckpoint();
       int previous = first >= 0 ? first : kStart;
       double cost = first >= 0 ? leg(kStart, first) : 0.0;
       for (const int index : rest) {
+        planningCheckpoint();
         cost += leg(previous, index);
         previous = index;
       }
@@ -184,9 +194,11 @@ OpenTour solveOpenTour(const std::vector<double>& from_start,
   std::vector<bool> placed(n, false);
   int current = first >= 0 ? first : kStart;
   for (std::size_t step = 0; step < rest.size(); ++step) {
+    planningCheckpoint();
     int next = -1;
     double next_cost = kUnreachableCost;
     for (const int index : rest) {
+      planningCheckpoint();
       if (placed[index]) continue;
       const double cost = leg(current, index);
       if (next < 0 || cost < next_cost) {
@@ -211,6 +223,7 @@ Insertion cheapestInsertion(const std::vector<int>& order, int index,
   Insertion best;
   const std::size_t lo = keep_first && !order.empty() ? 1 : 0;
   for (std::size_t p = lo; p <= order.size(); ++p) {
+    planningCheckpoint();
     const int u = p == 0 ? kStart : order[p - 1];
     const double in = cost(u, index);
     const double out = p < order.size() ? between[index][order[p]] : 0.0;

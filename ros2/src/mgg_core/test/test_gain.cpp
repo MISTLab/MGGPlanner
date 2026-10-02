@@ -1,3 +1,5 @@
+#include <chrono>
+#include "mgg_core/planning_cancellation.h"
 // Tests for volumetric gain, the quantity the exploration planner maximises.
 
 #include <cmath>
@@ -309,6 +311,17 @@ TEST(Gain, NonContiguousVertexIdsAreHandled) {
   graph.addVertex(new Vertex(99, StateVec(4, 0, 0, 0)));
   const int n = computeExplorationGain(graph, f.ctx, false, false);
   EXPECT_EQ(n, 3);
+}
+
+TEST(Gain, ExpiredRequestBudgetInterruptsGain) {
+  Fixture f;
+  VolumetricGain gain;
+  const auto deadline = std::chrono::steady_clock::now();
+  mgg::PlanningCancellationScope budget([&] {
+    return std::chrono::steady_clock::now() >= deadline;
+  });
+  EXPECT_THROW(computeVolumetricGain(StateVec(0, 0, 0, 0), gain, f.ctx),
+               mgg::PlanningInterrupted);
 }
 
 }  // namespace

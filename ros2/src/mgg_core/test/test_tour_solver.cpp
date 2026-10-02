@@ -1,3 +1,5 @@
+#include <chrono>
+#include "mgg_core/planning_cancellation.h"
 // Tests for the open tour over frontier clusters (tour-exploration design
 // §2.3): optimal on small scenes, within 5 % of the best known on 50
 // clusters, and fast.
@@ -304,6 +306,16 @@ TEST(OpenTour, CheapestInsertionFindsTheGapAndKeepsAKeptFirst) {
       mgg::cheapestInsertion({}, 2, line.from_start, line.between, true);
   EXPECT_EQ(empty.position, 0u);
   EXPECT_DOUBLE_EQ(empty.added_cost, 3.0);
+}
+
+TEST(OpenTour, ExpiredRequestBudgetInterruptsTour) {
+  const Scene scene = randomScene(50, 123);
+  const auto deadline = std::chrono::steady_clock::now();
+  mgg::PlanningCancellationScope budget([&] {
+    return std::chrono::steady_clock::now() >= deadline;
+  });
+  EXPECT_THROW(mgg::solveOpenTour(scene.from_start, scene.between),
+               mgg::PlanningInterrupted);
 }
 
 }  // namespace

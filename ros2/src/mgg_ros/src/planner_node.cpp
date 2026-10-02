@@ -1,3 +1,4 @@
+#include "mgg_core/planning_cancellation.h"
 #include "mgg_ros/planner_node.h"
 
 #include <algorithm>
@@ -179,7 +180,13 @@ struct FlagScope {
 struct DeadlineScope {
   DeadlineScope(std::optional<std::chrono::steady_clock::time_point>& deadline,
                 double budget_s)
-      : deadline_(deadline), previous_(deadline) {
+      : deadline_(deadline), previous_(deadline),
+        outer_(mgg::planning_cancelled), started_(std::chrono::steady_clock::now()),
+        cancellation_([this] {
+          if (outer_ && (*outer_)()) { cancelled_ = true; return true; }
+          exhausted_ = deadline_ && std::chrono::steady_clock::now() >= *deadline_;
+          return exhausted_;
+        }) {
     if (budget_s > 0.0 && !deadline_) {
       deadline_ = std::chrono::steady_clock::now() +
                   std::chrono::duration_cast<std::chrono::steady_clock::duration>(
@@ -191,6 +198,17 @@ struct DeadlineScope {
   DeadlineScope& operator=(const DeadlineScope&) = delete;
   std::optional<std::chrono::steady_clock::time_point>& deadline_;
   std::optional<std::chrono::steady_clock::time_point> previous_;
+  const std::function<bool()>* outer_;
+  std::chrono::steady_clock::time_point started_;
+  bool exhausted_ = false;
+  bool cancelled_ = false;
+  mgg::PlanningCancellationScope cancellation_;
+  std::string reason() const {
+    const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - started_).count();
+    return std::string(cancelled_ ? "cancelled" : "planning budget exceeded") +
+           " after " + std::to_string(ms) + " ms";
+  }
 };
 
 double secondsSince(const std::chrono::steady_clock::time_point& then) {
@@ -3724,8 +3742,9 @@ void PlannerNode::shortcutAndResample(std::vector<mgg::StateVec>& path,
   const mgg::PathOkFn sent_admissible = [&](const mgg::PathType& trial) {
     return admissible(resample(trial));
   };
-  points = mgg::shortcutPathKeepingClearance(points, segment_free,
-                                             sent_admissible, clearance);
+  points = robot_params_.type == mgg::RobotType::kGroundRobot
+      ? mgg::shortcutPathKeepingClearance(points, segment_free, sent_admissible, clearance)
+      : mgg::shortcutPath(points, segment_free, admissible);
   path_shortcut_corners_ = static_cast<int>(points.size());
   points = resample(points);
   // Resampling moves where each turn's measuring window ends, so the route
@@ -3763,7 +3782,9 @@ std::string PlannerNode::buildLocalGraph() {
   // ray-casting through it.
   const std::lock_guard<std::recursive_mutex> lock(planner_mutex_);
   StandingStartScope standing_scope(*this);
-  const DeadlineScope budget(lattice_deadline_, lattice_time_budget_s_);
+  const DeadlineScope budget(lattice_deadline_,
+      robot_params_.type == mgg::RobotType::kGroundRobot ? lattice_time_budget_s_ : 0.0);
+  try {
   auto map_read = mapReadLease();
   refreshMapRevision();
   refreshScoutingExclusions();
@@ -4222,7 +4243,14 @@ std::string PlannerNode::buildLocalGraph() {
     arrival_note = "; standing start: no admissible observed-arrival goal; "
                    "waiting for observed support/clearance";
   }
+  mgg::planningCheckpoint();
   return std::string(buf) + standing_note + room_note + corner_note + arrival_note;
+  } catch (const mgg::PlanningInterrupted&) {
+    if (budget.previous_) throw;  // the outer request owns its refusal
+    best_path_.clear();
+    lattice_path_.clear();
+    return budget.reason();
+  }
 }
 
 std::string PlannerNode::departBoxedIn(const mgg::StateVec& root_state,
@@ -5116,6 +5144,10 @@ void PlannerNode::onPlanRequest(
     std::shared_ptr<mgg_msgs::srv::PlannerSrv::Response> response) {
   const std::lock_guard<std::recursive_mutex> lock(planner_mutex_);
   StandingStartScope standing_scope(*this);
+  const DeadlineScope budget(lattice_deadline_,
+      robot_params_.type == mgg::RobotType::kGroundRobot ? lattice_time_budget_s_ : 0.0);
+  const auto request_bound_mode = robot_params_.bound_mode;
+  try {
   // One peer set for the whole request (review r0, I5).
   std::optional<PeerBodyPin> peer_pin;
   pinPeerBodies(peer_pin);
@@ -5470,6 +5502,7 @@ void PlannerNode::onPlanRequest(
   }
   robot_params_.bound_mode = previous;
   refreshNoGoZones();
+  mgg::planningCheckpoint();
   recordSentPath();
   enforceSafeCompletion(complete);
   response->status = !best_path_.empty()
@@ -5493,6 +5526,14 @@ void PlannerNode::onPlanRequest(
       planner_config_state_.generation) {
     planner_config_state_.last_plan_generation = planner_config_state_.generation;
     publishPlannerConfigState();
+  }
+  } catch (const mgg::PlanningInterrupted&) {
+    robot_params_.bound_mode = request_bound_mode;
+    best_path_.clear();
+    lattice_path_.clear();
+    response->path.clear();
+    response->status = kStatusNotReady;
+    RCLCPP_WARN(get_logger(), "plan request refused: %s", budget.reason().c_str());
   }
 }
 
@@ -6251,7 +6292,9 @@ void PlannerNode::onObjectiveRequest(
   using Service = mgg_msgs::srv::PlanObjective;
   const std::lock_guard<std::recursive_mutex> lock(planner_mutex_);
   StandingStartScope standing_scope(*this);
-  const DeadlineScope budget(lattice_deadline_, lattice_time_budget_s_);
+  const DeadlineScope budget(lattice_deadline_,
+      robot_params_.type == mgg::RobotType::kGroundRobot ? lattice_time_budget_s_ : 0.0);
+  try {
   local_route_profile_.clear();
   // One peer set for the whole request (review r0, I5).
   std::optional<PeerBodyPin> peer_pin;
@@ -6514,6 +6557,13 @@ void PlannerNode::onObjectiveRequest(
   route_note = note;
   if (local && !local_route_profile_.empty()) {
     route_note += " [" + local_route_profile_ + "]";
+  }
+  mgg::planningCheckpoint();
+  } catch (const mgg::PlanningInterrupted&) {
+    response->path.clear();
+    response->status = mgg_msgs::srv::PlanObjective::Response::BLOCKED;
+    response->reason = budget.reason();
+    RCLCPP_WARN(get_logger(), "%s", response->reason.c_str());
   }
 }
 

@@ -1,3 +1,4 @@
+#include "mgg_core/planning_cancellation.h"
 #include "mgg_core/path_selection.h"
 
 #include <algorithm>
@@ -100,6 +101,7 @@ bool cutBackToWayBack(std::vector<StateVec>& route,
   if (route.size() < 2) return false;
   std::vector<double> along(route.size(), 0.0);
   for (std::size_t i = 1; i < route.size(); ++i) {
+    planningCheckpoint();
     along[i] = along[i - 1] +
                (route[i].head<3>() - route[i - 1].head<3>()).norm();
   }
@@ -109,8 +111,10 @@ bool cutBackToWayBack(std::vector<StateVec>& route,
     return room[i] == 1;
   };
   for (std::size_t end = route.size() - 1; end > 0; --end) {
+    planningCheckpoint();
     bool way_back = !on_slope(end);
     for (std::size_t i = end; reverse_allowed && !way_back && i-- > 0;) {
+      planningCheckpoint();
       const double limit = reverse_edge_admissible
           ? (max_reverse_length > 0.0 ? max_reverse_length : kDepartureMaxM) : kDepartureMaxM;
       if (along[end] - along[i] > limit + 1e-9) break;
@@ -173,6 +177,7 @@ PathSelectionResult selectBestPath(GraphManager& graph,
     if (!planning.departure_reverse_allowed) return false;
     double retreat_distance = 0.0;
     for (std::size_t i = end; i-- > 0;) {
+      planningCheckpoint();
       // Routing weights include soft clearance; retreat reach is metres.
       retreat_distance += (path[i + 1]->state.head<3>() -
                            path[i]->state.head<3>()).norm();
@@ -202,6 +207,7 @@ PathSelectionResult selectBestPath(GraphManager& graph,
   const auto metric_along = [](Candidate& candidate) {
     candidate.along.assign(candidate.path.size(), 0.0);
     for (std::size_t i = 1; i < candidate.path.size(); ++i) {
+      planningCheckpoint();
       candidate.along[i] = candidate.along[i - 1] +
           (candidate.path[i]->state.head<3>() -
            candidate.path[i - 1]->state.head<3>()).norm();
@@ -209,6 +215,7 @@ PathSelectionResult selectBestPath(GraphManager& graph,
   };
   std::vector<Candidate> shortest;
   for (Vertex* leaf : leaves) {
+    planningCheckpoint();
     if (leaf == nullptr) continue;
     Candidate candidate;
     graph.getShortestPath(leaf->id, rep, true, candidate.path);
@@ -233,6 +240,7 @@ PathSelectionResult selectBestPath(GraphManager& graph,
                            const std::vector<double>& along, double& gain) {
       double path_gain = 0.0;
       for (size_t ind = 0; ind < path.size(); ++ind) {
+        planningCheckpoint();
         Vertex* v = path[ind];
         const double path_length = along[ind];
         // Hanging vertices are worth less: there is no ground under them.
@@ -359,6 +367,7 @@ PathSelectionResult selectBestPath(GraphManager& graph,
     double best_clear_leads_to = 0.0;
     std::vector<Vertex*> best_clear_path;
     for (const Candidate& candidate : candidates) {
+      planningCheckpoint();
       if (candidate.path.size() <= 1) continue;  // needs root and leaf
       // Reservations are checked where each candidate ends: the leaf for the
       // path as it is, the vertex it is cut back to otherwise.
@@ -460,6 +469,7 @@ PathSelectionResult selectBestPath(GraphManager& graph,
     if (sharp_turn_allowed) {
       std::vector<int> destinations;
       for (const auto& [id, v] : graph.vertices_map_) {
+        planningCheckpoint();
         if (id != 0 && v != nullptr && v->vol_gain.gain > 0.0) {
           destinations.push_back(id);
         }
@@ -475,6 +485,7 @@ PathSelectionResult selectBestPath(GraphManager& graph,
       std::vector<Candidate> candidates;
       candidates.reserve(routes.to.size());
       for (const int id : destinations) {
+        planningCheckpoint();
         const auto found = routes.to.find(id);
         if (found != routes.to.end()) {
           candidates.push_back(found->second);
@@ -503,6 +514,7 @@ PathSelectionResult selectBestPath(GraphManager& graph,
   // Re-parent along the winning path so the branch can be walked from the
   // root. The path is the leaf's shortest path, or a detour.
   for (size_t i = 1; i < result.best_path.size(); ++i) {
+    planningCheckpoint();
     result.best_path[i]->parent = result.best_path[i - 1];
   }
   return result;

@@ -1,3 +1,4 @@
+#include "mgg_core/planning_cancellation.h"
 // NAVIGATE objectives for a Bunker-sized ground robot (botman) on MOLA
 // planning products at its deployed 0.10 m resolution: what the lattice,
 // the goal link and the shortcut make of open floor, a wall and a ramp.
@@ -305,6 +306,9 @@ class PlannerNodeTestPeer {
     msg->pose.pose.orientation.w = std::cos(yaw / 2.0);
     node.onOdometry(msg);
   }
+  static void setBudget(PlannerNode& node, double seconds) {
+    node.lattice_time_budget_s_ = seconds;
+  }
   static void objective(
       PlannerNode& node,
       std::shared_ptr<mgg_msgs::srv::PlanObjective::Request> request,
@@ -387,6 +391,34 @@ class PlannerNavigationTest : public ::testing::Test {
   static void SetUpTestSuite() { rclcpp::init(0, nullptr); }
   static void TearDownTestSuite() { rclcpp::shutdown(); }
 };
+
+TEST_F(PlannerNavigationTest, RequestBudgetRefusesWithoutPublishingAPartialRoute) {
+  MolaTerrainProduct product(0.1, -8, 8, -8, 8,
+                              [](double, double) { return -0.61; });
+  auto node = botmanNode("budget_navigation", product);
+  PlannerNodeTestPeer::standAt(*node, 0, 0, -0.61, 0, 1);
+  PlannerNodeTestPeer::setBudget(*node, 1e-9);
+  const auto started = std::chrono::steady_clock::now();
+  const auto response = navigate(*node, 4, 0);
+  EXPECT_EQ(response->status, Service::Response::BLOCKED);
+  EXPECT_TRUE(response->path.empty());
+  EXPECT_NE(response->reason.find("planning budget exceeded"), std::string::npos);
+  EXPECT_NE(response->reason.find("ms"), std::string::npos);
+  EXPECT_LT(std::chrono::steady_clock::now() - started, std::chrono::seconds(1));
+}
+
+TEST_F(PlannerNavigationTest, RequestBudgetPreservesOuterCancellation) {
+  MolaTerrainProduct product(0.1, -8, 8, -8, 8,
+                              [](double, double) { return -0.61; });
+  auto node = botmanNode("cancel_navigation", product);
+  PlannerNodeTestPeer::standAt(*node, 0, 0, -0.61, 0, 1);
+  mgg::PlanningCancellationScope cancelled([] { return true; });
+  const auto response = navigate(*node, 4, 0);
+  EXPECT_EQ(response->status, Service::Response::BLOCKED);
+  EXPECT_TRUE(response->path.empty());
+  EXPECT_NE(response->reason.find("cancelled"), std::string::npos);
+  EXPECT_EQ(response->reason.find("budget exceeded"), std::string::npos);
+}
 
 TEST_F(PlannerNavigationTest, ATwoMetreMoveOnOpenFloorComesOutStraight) {
   // The robot faces 0.3 rad, so its lattice is turned against the goal's

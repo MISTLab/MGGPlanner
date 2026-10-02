@@ -1,3 +1,5 @@
+#include <chrono>
+#include "mgg_core/planning_cancellation.h"
 // Tests for the global roadmap: path ingestion (Rrg::addRefPathToGraph),
 // frontier ingestion (Rrg::addFrontiers), the global frontier search
 // (Rrg::runGlobalPlanner's ranking), the timed expansion into observed space
@@ -2325,6 +2327,18 @@ TEST(GraphDeadline, APassedDeadlineCutsALargeSearchShort) {
       0, report, std::chrono::steady_clock::now() + std::chrono::hours(1)));
   EXPECT_FALSE(report.cut_short);
   EXPECT_NEAR(report.distance_map.at(499), 249.5, 1e-9);
+}
+
+TEST(ConnectGoalThroughLattice, ExpiredRequestBudgetInterruptsBridges) {
+  WallWithGap map;
+  GoalLatticeScene scene(map);
+  // No sweep: this exercises the bridge loop, not lattice cancellation.
+  scene.fixture.planning.num_vertices_max = 1;
+  mgg::GoalLatticeReport report;
+  mgg::PlanningCancellationScope budget([&] { return report.passes > 0; });
+  EXPECT_THROW(mgg::connectGoalThroughLattice(
+      scene.fixture.global, StateVec(3.0, 0.5, 0, 0), scene.grid,
+      scene.fixture.ctx, 0.0, nullptr, &report), mgg::PlanningInterrupted);
 }
 
 }  // namespace

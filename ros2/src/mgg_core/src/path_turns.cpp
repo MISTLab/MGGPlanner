@@ -1,3 +1,4 @@
+#include "mgg_core/planning_cancellation.h"
 #include "mgg_core/path_turns.h"
 
 #include <Eigen/Eigenvalues>
@@ -38,6 +39,7 @@ std::vector<double> pathTurns(const std::vector<Eigen::Vector3d>& points,
   // Planar distance along the path to each point.
   std::vector<double> along(n, 0.0);
   for (std::size_t i = 1; i < n; ++i) {
+    planningCheckpoint();
     along[i] = along[i - 1] + (points[i] - points[i - 1]).head<2>().norm();
   }
   const auto far_enough = [&](std::size_t a, std::size_t b) {
@@ -45,6 +47,7 @@ std::vector<double> pathTurns(const std::vector<Eigen::Vector3d>& points,
     return d >= window && d > kMinMove;
   };
   for (std::size_t i = 0; i + 1 < n; ++i) {
+    planningCheckpoint();
     std::size_t ahead = i + 1;
     while (ahead + 1 < n && !far_enough(i, ahead)) ++ahead;
     if (along[ahead] - along[i] <= kMinMove) continue;  // no way out: no turn
@@ -71,6 +74,7 @@ double planeSlope(const std::vector<Eigen::Vector3d>& points) {
   Eigen::MatrixXd a(points.size(), 3);
   Eigen::VectorXd z(points.size());
   for (std::size_t i = 0; i < points.size(); ++i) {
+    planningCheckpoint();
     a.row(i) << points[i].x(), points[i].y(), 1.0;
     z(i) = points[i].z();
   }
@@ -90,6 +94,7 @@ double terrainSlope(GraphManager& graph, const Vertex& vertex, double radius) {
   }
   std::vector<Eigen::Vector3d> ground;
   for (const Vertex* v : nearby) {
+    planningCheckpoint();
     if (v != nullptr && !v->is_hanging) {
       ground.push_back(v->state.head<3>() - vertex.state.head<3>());
     }
@@ -108,7 +113,9 @@ double groundSlope(const GroundProjection& ground,
     // The inner ring retains a non-collinear fit on a real ramp when the
     // outer samples differ by more than a step. Wall/kerb tops are not floor.
     for (double scale : {1.0, 0.5}) {
+      planningCheckpoint();
       for (int k = 0; k < 8; ++k) {
+        planningCheckpoint();
         const double angle = k * M_PI / 4.0;
         Eigen::Vector3d probe = position;
         probe.x() += scale * radius * std::cos(angle);
@@ -130,6 +137,7 @@ double groundSlope(const GroundProjection& ground,
     lattice->getNearestVertices(&probe, radius, &nearby);
     Eigen::Vector2d mean = Eigen::Vector2d::Zero();
     for (const auto* v : nearby) {
+      planningCheckpoint();
       if (v == nullptr || v->is_hanging) continue;
       samples.push_back(v->state.head<3>() - position);
       mean += samples.back().head<2>();
@@ -141,6 +149,7 @@ double groundSlope(const GroundProjection& ground,
       mean /= samples.size();
       Eigen::Matrix2d covariance = Eigen::Matrix2d::Zero();
       for (const auto& sample : samples) {
+        planningCheckpoint();
         const Eigen::Vector2d p = sample.head<2>() - mean;
         covariance += p * p.transpose();
       }
@@ -149,6 +158,7 @@ double groundSlope(const GroundProjection& ground,
         Eigen::Vector2d low = Eigen::Vector2d::Constant(INFINITY);
         Eigen::Vector2d high = Eigen::Vector2d::Constant(-INFINITY);
         for (const auto& sample : samples) {
+          planningCheckpoint();
           const Eigen::Vector2d p = axes.eigenvectors().transpose() *
                                     (sample.head<2>() - mean);
           low = low.cwiseMin(p);
@@ -210,6 +220,7 @@ TurnCompliantRoutes findTurnCompliantRoutes(
   for (int id : destinations) wanted.emplace(id, true);
 
   while (!open.empty() && destinations_left > 0) {
+    planningCheckpoint();
     const auto [cost, si] = open.top();
     open.pop();
     if (settled[si] || cost > states[si].cost) continue;
@@ -227,6 +238,7 @@ TurnCompliantRoutes findTurnCompliantRoutes(
     route.clear();
     back.clear();
     for (int p = si; p >= 0; p = states[p].parent) {
+      planningCheckpoint();
       const Vertex* v = vertex(states[p].at);
       if (v == nullptr) break;
       back.push_back(route.empty() ? 0.0
@@ -244,6 +256,7 @@ TurnCompliantRoutes findTurnCompliantRoutes(
     // and at the start the robot's heading.
     const auto heading_into = [&](std::size_t k) {
       for (std::size_t j = k + 1; j < route.size(); ++j) {
+        planningCheckpoint();
         if (far(back[j] - back[k]) ||
             (j + 1 == route.size() && back[j] - back[k] > kMinMove)) {
           return headingBetween(route[j]->state.head<3>(),
@@ -278,6 +291,7 @@ TurnCompliantRoutes findTurnCompliantRoutes(
     const auto edges = graph.edge_map_.find(s.at);
     if (edges == graph.edge_map_.end()) continue;
     for (const auto& [w, weight] : edges->second) {
+      planningCheckpoint();
       if (w == s.from) continue;
       const Vertex* next = vertex(w);
       if (next == nullptr) continue;
@@ -323,10 +337,12 @@ TurnCompliantRoutes findTurnCompliantRoutes(
   }
 
   for (int id : destinations) {
+    planningCheckpoint();
     const auto found = arrival.find(id);
     if (found == arrival.end()) continue;
     TurnCompliantRoutes::Route route;
     for (int si = found->second; si >= 0; si = states[si].parent) {
+      planningCheckpoint();
       route.path.push_back(vertex(states[si].at));
       route.along.push_back(states[si].cost);
     }
@@ -364,6 +380,7 @@ bool turnSpaceObserved(const MapInterface& map, const RobotParams& robot,
   const double lowest = center.z() - 2.0 * planning.max_ground_height;
   int observed_ground = 0;
   for (const XYCellCenter& cell : cells) {
+    planningCheckpoint();
     // The ground the robot stands on at its start, which its lidar has not
     // seen: observed unless it was seen to fall away.
     const bool standing_on =
@@ -413,6 +430,7 @@ bool observedArrivalDisk(const MapInterface& map, const RobotParams& robot,
   if (map.getOccupiedOnlyCylinderPathStatus(center, center, radius,
       robot.getPlanningSize().z()) == VoxelStatus::kOccupied) return false;
   for (const auto& cell : cells) {
+    planningCheckpoint();
     const Eigen::Vector3d from(cell.center.x(), cell.center.y(), center.z());
     Eigen::Vector3d ground;
     if (map.getGroundRayStatus(from,
@@ -481,6 +499,7 @@ PathTurnCheck::Refusal PathTurnCheck::firstRefusal(
     const std::vector<Eigen::Vector3d>& points, double start_heading, bool record) {
   const std::vector<double> turns = pathTurns(points, start_heading, window_);
   for (std::size_t i = 0; i < turns.size(); ++i) {
+    planningCheckpoint();
     if (turns[i] <= kSharpTurnRad + 1e-9) continue;
     const double slope = slopeAt(points[i]);
     const bool on_slope = slope > kLevelGroundSlopeRad;
