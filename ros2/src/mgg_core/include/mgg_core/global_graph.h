@@ -454,8 +454,8 @@ struct FleetCoverageLinks {
 
 /// Whether `box`, swept in a straight line from `from` to `to`, meets
 /// nothing `map` knows occupied in its static occupancy
-/// (MapInterface::getStaticBoxStatus): peer bodies and no-go discs, which
-/// are not walls, neither block nor clear it (review r3, P1); unknown
+/// (MapInterface::getStaticBoxStatus): no-go discs are not walls and
+/// neither block nor clear it (review r3, P1); unknown
 /// space passes. The sweep is split into steps of at most a map cell, each
 /// box grown by its step.
 bool fleetCoverageLinkClear(const MapInterface& map,

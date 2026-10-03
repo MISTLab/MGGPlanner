@@ -11,14 +11,12 @@ namespace mgg {
 bool TourPlanner::needsSolve(const std::vector<FrontierCluster>& clusters,
                              std::uint64_t graph_revision,
                              std::uint64_t assignment_version,
-                             double now_s,
-                             std::uint64_t peer_generation) const {
+                             double now_s) const {
   if (!solved_ || released_) return true;
   std::set<ClusterId> ids;
   for (const FrontierCluster& cluster : clusters) ids.insert(cluster.id);
   if (target_ != kNoCluster && ids.count(target_) == 0) return true;
   const bool changed = graph_revision != graph_revision_ ||
-                       peer_generation != peer_generation_ ||
                        assignment_version != assignment_version_ ||
                        ids != cluster_ids_;
   // A clock that went backwards (a simulation reset under use_sim_time)
@@ -33,12 +31,10 @@ const TourPlan& TourPlanner::solve(const std::vector<FrontierCluster>& clusters,
                                    const TourCostMatrix& costs,
                                    std::uint64_t graph_revision,
                                    std::uint64_t assignment_version,
-                                   double now_s,
-                                   std::uint64_t peer_generation) {
+                                   double now_s) {
   solved_ = true;
   released_ = false;
   graph_revision_ = graph_revision;
-  peer_generation_ = peer_generation;
   assignment_version_ = assignment_version;
   solved_at_s_ = now_s;
   cluster_ids_.clear();

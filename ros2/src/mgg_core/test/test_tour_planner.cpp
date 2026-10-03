@@ -99,8 +99,6 @@ TEST(TourPlanner, SolvesOnChangeAtMostEveryIntervalAndAtOnceWhenTheTargetGoes) {
   EXPECT_FALSE(planner.needsSolve(clusters, 2, 0, 0.5));  // too soon
   EXPECT_TRUE(planner.needsSolve(clusters, 2, 0, 1.0));   // graph changed
   EXPECT_TRUE(planner.needsSolve(clusters, 1, 1, 1.0));   // assignment changed
-  EXPECT_FALSE(planner.needsSolve(clusters, 1, 0, 0.5, 1));  // too soon
-  EXPECT_TRUE(planner.needsSolve(clusters, 1, 0, 1.0, 1));   // peers changed
   EXPECT_TRUE(planner.needsSolve({named(1, 10.0)}, 1, 0, 1.0));  // set changed
   // The target's cluster is gone: at once.
   EXPECT_TRUE(planner.needsSolve({named(2, -11.0)}, 1, 0, 0.1));

@@ -413,64 +413,38 @@ std::vector<Voxel> freeBlockWithout(const Voxel& endpoint) {
   return result;
 }
 
-TEST(MolaMap, TransientDiscsAreOccupiedUntilTheyExpire) {
+TEST(MolaMap, RobotSizedOccupiedBlobUsesOrdinaryVoxelSweepsAndMapReplacement) {
   Publication publication;
-  const Voxel endpoint{10, 0, 2};
-  const auto request = publication.publish(0, {endpoint},
-                                           freeBlockWithout(endpoint), true,
-                                           Eigen::Isometry3d::Identity());
-  MolaMap provider(config(publication));
-  mgg::MapInterface* map = &provider;
-  provider.requestSnapshot(request);
-  ASSERT_TRUE(waitFor([&]() { return map->getStatus(); })) << provider.lastError();
-
-  const Eigen::Vector3d here(0.1, 0.1, 0.1);
-  const Eigen::Vector3d there(0.5, 0.1, 0.1);
-  const Eigen::Vector3d body(0.1, 0.1, 0.1);
-  ASSERT_EQ(map->getBoxStatus(here, body, true), VoxelStatus::kFree);
-  ASSERT_EQ(map->getPathStatus(here, there, body, true), VoxelStatus::kFree);
-
-  // A neighbour stands beside the segment: nothing in the map says so.
-  provider.setTransientDiscs({Eigen::Vector2d(0.3, 0.35)}, 0.25, 60.0);
-  EXPECT_EQ(map->getBoxStatus(here, body, true), VoxelStatus::kFree);
-  EXPECT_EQ(map->getPathStatus(here, there, body, true), VoxelStatus::kOccupied);
-  EXPECT_EQ(map->getStrictPathStatus(here, there, body), VoxelStatus::kOccupied);
-  EXPECT_EQ(map->getBoxStatus(Eigen::Vector3d(0.3, 0.2, 0.1), body, true),
-            VoxelStatus::kOccupied);
-  EXPECT_EQ(map->getOccupiedOnlyCylinderPathStatus(here, there, 0.1, 0.2),
-            VoxelStatus::kOccupied);
-
-  // A sweep that starts inside the neighbour's reach may leave it but not
-  // approach it: two robots parked side by side must be able to drive apart.
-  const Eigen::Vector3d beside(0.3, 0.2, 0.1);
-  EXPECT_EQ(map->getBoxStatus(beside, body, true), VoxelStatus::kOccupied);
-  EXPECT_EQ(map->getPathStatus(beside, Eigen::Vector3d(0.3, -0.4, 0.1), body,
-                               true),
-            VoxelStatus::kFree);
-  EXPECT_EQ(map->getStrictPathStatus(beside, Eigen::Vector3d(0.3, -0.4, 0.1),
-                                     body),
-            VoxelStatus::kFree);
-  EXPECT_EQ(map->getPathStatus(beside, Eigen::Vector3d(0.3, 0.3, 0.1), body,
-                               true),
-            VoxelStatus::kOccupied);
-  EXPECT_EQ(map->getPathStatus(beside, Eigen::Vector3d(0.9, 0.6, 0.1), body,
-                               true),
-            VoxelStatus::kOccupied);
-
-  // The neighbour left, or its reports stopped: the map decides again.
-  provider.setTransientDiscs({}, 0.25, 60.0);
-  EXPECT_EQ(map->getPathStatus(here, there, body, true), VoxelStatus::kFree);
-  provider.setTransientDiscs({Eigen::Vector2d(0.3, 0.35)}, 0.25, 0.05);
-  std::this_thread::sleep_for(std::chrono::milliseconds(120));
-  EXPECT_EQ(map->getPathStatus(here, there, body, true), VoxelStatus::kFree);
+  std::vector<Voxel> occupied, free, all;
+  for (int x = -10; x <= 10; ++x)
+    for (int y = -4; y <= 4; ++y)
+      for (int z = 0; z <= 10; ++z) {
+        const Voxel cell{x, y, z};
+        all.push_back(cell);
+        if (x >= 0 && x < 4 && y >= -1 && y <= 1 && z < 3)
+          occupied.push_back(cell);
+        else free.push_back(cell);
+      }
+  MolaMap map(config(publication));
+  map.requestSnapshot(publication.publish(0, occupied, free));
+  ASSERT_TRUE(waitFor([&] { return map.getStatus(); }));
+  const Eigen::Vector3d start(-1, .1, .3), end(1.5, .1, .3), box(.2, .2, .2);
+  EXPECT_EQ(map.getStrictPathStatus(start, end, box), VoxelStatus::kOccupied);
+  EXPECT_EQ(map.getStaticStrictPathStatus(start, end, box), VoxelStatus::kOccupied);
+  EXPECT_EQ(map.getStrictBoxStatus({.3, .1, .3}, box), VoxelStatus::kOccupied);
+  // No synthetic infinite-height disc: observed space above the robot is free.
+  EXPECT_EQ(map.getStrictPathStatus({-1, .1, 1.5}, {1.5, .1, 1.5}, box), VoxelStatus::kFree);
+  const auto generation = map.activeGeneration();
+  map.requestSnapshot(publication.publish(1, {}, all));
+  ASSERT_TRUE(waitFor([&] { return map.activeGeneration() > generation && map.getStatus(); }));
+  EXPECT_EQ(map.getStrictPathStatus(start, end, box), VoxelStatus::kFree);
 }
 
-
-TEST(MolaMap, NoGoDiscsStayUntilReplacedAndCoexistWithPeerBodies) {
+TEST(MolaMap, NoGoDiscsStayUntilReplaced) {
   // Run 8: a Scout tipped over debris its 0.2 m map showed as a low plateau,
   // three times in 4 s, each time sent back over it. SwarmDeck marks where
   // the tilt guard tripped; the planner must not drive there. Those discs
-  // do not expire in the map, and neither disc set replaces the other.
+  // do not expire in the map; only an explicit replacement clears them.
   Publication publication;
   const Voxel endpoint{10, 0, 2};
   const auto request = publication.publish(0, {endpoint},
@@ -484,7 +458,7 @@ TEST(MolaMap, NoGoDiscsStayUntilReplacedAndCoexistWithPeerBodies) {
   const Eigen::Vector3d here(0.1, 0.1, 0.1);
   const Eigen::Vector3d there(0.5, 0.1, 0.1);
   const Eigen::Vector3d body(0.1, 0.1, 0.1);
-  // A segment well away from the no-go disc, for the peer body.
+  // A segment well away from the no-go disc.
   const Eigen::Vector3d west(-0.5, 0.1, 0.1);
   const Eigen::Vector3d far_west(-1.3, 0.1, 0.1);
   ASSERT_EQ(map->getPathStatus(here, there, body, true), VoxelStatus::kFree);
@@ -494,7 +468,7 @@ TEST(MolaMap, NoGoDiscsStayUntilReplacedAndCoexistWithPeerBodies) {
   EXPECT_EQ(map->getPathStatus(here, there, body, true), VoxelStatus::kOccupied);
   EXPECT_EQ(map->getBoxStatus(Eigen::Vector3d(0.3, 0.2, 0.1), body, true),
             VoxelStatus::kOccupied);
-  // A robot standing in one may leave it, as it may leave a peer's reach.
+  // A robot standing in a no-go disc may leave it.
   EXPECT_EQ(map->getPathStatus(Eigen::Vector3d(0.3, 0.2, 0.1),
                                Eigen::Vector3d(0.3, -0.4, 0.1), body, true),
             VoxelStatus::kFree);
@@ -508,62 +482,18 @@ TEST(MolaMap, NoGoDiscsStayUntilReplacedAndCoexistWithPeerBodies) {
   EXPECT_EQ(mgg::orientedBoxPathStatus(*map, outside, inside, oriented, true, nullptr),
             VoxelStatus::kOccupied);
 
-  // A peer body elsewhere, with a short TTL: both sets hold at once.
-  provider.setTransientDiscs({Eigen::Vector2d(-0.9, 0.1)}, 0.1, 0.05);
-  EXPECT_EQ(map->getPathStatus(west, far_west, body, true),
-            VoxelStatus::kOccupied);
-  EXPECT_EQ(map->getPathStatus(here, there, body, true), VoxelStatus::kOccupied);
   std::this_thread::sleep_for(std::chrono::milliseconds(120));
-  // The peer body expired; the no-go disc did not.
-  EXPECT_EQ(map->getPathStatus(west, far_west, body, true), VoxelStatus::kFree);
-  EXPECT_EQ(map->getPathStatus(here, there, body, true), VoxelStatus::kOccupied);
-  // Peer bodies do not clear it either.
-  provider.setTransientDiscs({}, 0.25, 60.0);
   EXPECT_EQ(map->getPathStatus(here, there, body, true), VoxelStatus::kOccupied);
   // An empty set clears it.
   provider.setNoGoDiscs({}, 0.25);
   EXPECT_EQ(map->getPathStatus(here, there, body, true), VoxelStatus::kFree);
 }
 
-TEST(MolaMap, LatticeCellsInsidePeerMarginsRemainOccupied) {
-  Publication publication;
-  const Voxel endpoint{10, 0, 2};
-  const auto request = publication.publish(0, {endpoint},
-      freeBlockWithout(endpoint), true, Eigen::Isometry3d::Identity());
-  MolaMap map(config(publication));
-  map.requestSnapshot(request);
-  ASSERT_TRUE(waitFor([&]() { return map.getStatus(); }));
-  map.setTransientDiscs({Eigen::Vector2d(0.5, 0.1)}, 0.4, 60.0);
-  mgg::RobotParams robot;
-  robot.type = mgg::RobotType::kGroundRobot;
-  robot.size = Eigen::Vector3d::Constant(0.1);
-  mgg::PlanningParams planning;
-  planning.num_loops_max = 100;
-  mgg::GroundProjection ground(map, planning);
-  mgg::ExpandContext ctx;
-  ctx.map = &map; ctx.robot = &robot; ctx.planning = &planning;
-  ctx.ground = &ground; ctx.robot_box_size = robot.getPlanningSize();
-  ctx.allow_unknown_lattice_body = true;
-  const mgg::StateVec root(-0.1, 0.1, 0.1, 0);
-  mgg::GraphManager graph;
-  graph.addVertex(new mgg::Vertex(0, root));
-  mgg::GridGraphParams grid;
-  grid.min_val = Eigen::Vector3d::Zero();
-  grid.max_val = Eigen::Vector3d(0.6, 0, 0);
-  grid.resolution = Eigen::Vector3d::Constant(0.6);
-  // Root is clear. The other cell and every cross-offset are inside the
-  // peer margin: none is a free place, even though a stationary sweep is
-  // allowed to depart an already occupied margin.
-  const auto result = mgg::buildGridGraph(graph, root, grid, ctx, 0);
-  EXPECT_EQ(result.free_cells, 1);
-  EXPECT_EQ(result.vertices_added, 0);
-}
-
 TEST(MolaMap, ZeroSizePathVisitsEveryVoxelTheSegmentCrossesAndHonoursDiscs) {
   // The robot's own-pose link is checked along its centre line: a zero-size
   // sweep. It must still meet every voxel the segment crosses, here
   // [0,0.2) x [0.2,0.4) x [0,0.2), which it enters between fractions 0.8 and
-  // 0.9 (review r0), and a neighbour's transient disc.
+  // 0.9 (review r0), and a no-go disc.
   Publication publication;
   const Voxel wall{0, 1, 0};
   const auto request = publication.publish(
@@ -583,12 +513,11 @@ TEST(MolaMap, ZeroSizePathVisitsEveryVoxelTheSegmentCrossesAndHonoursDiscs) {
     EXPECT_EQ(map->getPathStatus(b, a, zero, stop_at_unknown),
               VoxelStatus::kOccupied);
   }
-  // Away from the wall the centre line is free, until a neighbour stands on
-  // it.
+  // Away from the wall the centre line is free until a no-go disc closes it.
   const Eigen::Vector3d c(0.5, 0.1, 0.1);
   const Eigen::Vector3d d(1.3, 0.1, 0.1);
   ASSERT_EQ(map->getPathStatus(c, d, zero, true), VoxelStatus::kFree);
-  provider.setTransientDiscs({Eigen::Vector2d(0.9, 0.3)}, 0.25, 60.0);
+  provider.setNoGoDiscs({Eigen::Vector2d(0.9, 0.3)}, 0.25);
   EXPECT_EQ(map->getPathStatus(c, d, zero, true), VoxelStatus::kOccupied);
 }
 
@@ -832,8 +761,8 @@ struct AerialMolaScene {
   const mgg::StateVec hover{0.1, 0.1, 1.5, 0};
 };
 
-TEST(MolaMap, AerialRootDepartsPeerAndNoGoMarginsThroughObservedRoom) {
-  for (int margin = 0; margin < 3; ++margin) {
+TEST(MolaMap, AerialRootDepartsNoGoMarginsThroughObservedRoom) {
+  for (int margin = 0; margin < 2; ++margin) {
     SCOPED_TRACE(margin);
     AerialMolaScene scene;
     Eigen::Isometry3d transform = Eigen::Isometry3d::Identity();
@@ -841,9 +770,7 @@ TEST(MolaMap, AerialRootDepartsPeerAndNoGoMarginsThroughObservedRoom) {
     scene.load(AerialMolaScene::observedRoom(), {}, transform);
     const Eigen::Vector2d disc = scene.hover.head<2>() +
         (margin == 1 ? Eigen::Vector2d(-0.2, 0.0) : Eigen::Vector2d::Zero());
-    std::optional<MolaMap::TransientDiscPin> peers;
-    if (margin < 2) peers.emplace(scene.map, std::vector<Eigen::Vector2d>{disc}, 0.6);
-    else scene.map.setNoGoDiscs({disc}, 0.6);
+    scene.map.setNoGoDiscs({disc}, 0.6);
     mgg::GraphManager graph;
     graph.addVertex(new mgg::Vertex(0, scene.hover));
     mgg::Vertex target(1, scene.hover + mgg::StateVec(1.0, 0, 0, 0));
@@ -2382,7 +2309,6 @@ TEST(MolaMap, SparseMeasuredRayCorridorGrowsFootprintValidatedGroundGraph) {
   }
 }
 
-
 TEST(NativeMolaGrid, AStraightDepartureAlongACorridorChecksTheBodyTurnedToItsHeading) {
   // mgg::findDeparture on the native MOLA grid, as mgg_ros PlannerNode
   // departs a boxed-in ground robot: 0.1 m steps checked with
@@ -3206,7 +3132,6 @@ TEST(MolaMap, CentreLineDiscsUseTheirOwnReachAndAllowOutwardSweeps) {
   EXPECT_TRUE(provider.dynamicBoxBlocked({10, 0, 0}, {1, 1, 1}));
 }
 
-
 TEST(MolaMap, FullPadReachDepartureFromCentreAndNearWall) {
   for (bool wall : {false, true}) {
     SCOPED_TRACE(wall);
@@ -3342,7 +3267,7 @@ TEST(AerialRootRecovery, ArchivedR6GridsAllowAwayButNotIntoPillar) {
 TEST(AerialRootRecovery, StrictSafetyBoundsAndDynamicMargins) {
   // A finite post lets toward/along endpoints be free: rejection must come
   // from the sweep, not merely from the ordinary endpoint test.
-  for (int mode = 0; mode < 8; ++mode) {
+  for (int mode = 0; mode < 7; ++mode) {
     SCOPED_TRACE(mode);
     Publication publication;
     std::vector<Voxel> occupied{{2,0,5}}, free;
@@ -3360,9 +3285,8 @@ TEST(AerialRootRecovery, StrictSafetyBoundsAndDynamicMargins) {
     ASSERT_TRUE(waitFor([&] { return map.getStatus(); }));
     const Eigen::Vector3d start(0.15,0.1,1.1), size(0.55,0.55,0.3);
     const Eigen::Vector3d away = start - Eigen::Vector3d(1,0,0);
-    if (mode == 5) map.setTransientDiscs({{-0.4,0.1}}, 0.1, 60);
-    if (mode == 6) map.setNoGoDiscs({{-0.4,0.1}}, 0.1);
-    if (mode == 7) map.setNoGoCentreLineDiscs({{-0.4,0.1}}, {0.1});
+    if (mode == 5) map.setNoGoDiscs({{-0.4,0.1}}, 0.1);
+    if (mode == 6) map.setNoGoCentreLineDiscs({{-0.4,0.1}}, {0.1});
     EXPECT_EQ(mgg::aerialRootDepartureTraversable(map, start, away, size), mode == 0);
     ASSERT_EQ(map.getStrictBoxStatus(start + Eigen::Vector3d(0,0.8,0), size), VoxelStatus::kFree);
     EXPECT_FALSE(mgg::aerialRootDepartureTraversable(map, start, start + Eigen::Vector3d(0,0.8,0), size));
@@ -3808,7 +3732,6 @@ TEST(AerialDoor, R7HangarGateFromRecordedHover) {
     door::expectWithinBudget(scene, route.points);
   }
 }
-
 
 TEST(AerialDoor, A08mDoorExactlyAlignedToFourFreeVoxelsPasses) {
   for (double frame : {0.0, 0.38}) {
