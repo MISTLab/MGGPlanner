@@ -2822,6 +2822,33 @@ TEST(TransformRoadmap, NonDijkstraRoutesCannotUseAnUncertifiedEdge) {
   }
 }
 
+TEST(TransformRoadmap, ZoneRespectingRouteSkipsANoGoEdgeWithoutRecertifyingIt) {
+  // mgg-flown review r1 P2: the certifier meets operator no-go discs (MolaMap
+  // applies them to every check), so a dirty edge across a zone certified
+  // before the zone step was removed for good. The zone closes it for this
+  // search only; once the zone is cleared it routes.
+  Roadmap fixture;
+  fixture.add(fixture.global, StateVec(2, 0, 0, 0), fixture.global.getVertex(0));
+  mgg::NoGoZones zones;
+  zones.set({Eigen::Vector2d(1.0, 0.0)}, 0.3);
+  int checks = 0;
+  fixture.global.setEdgeRecertifier([&](const Vertex& from, const Vertex& to, bool) {
+    ++checks;
+    return !zones.blocksEdge(from.state.head<3>(), to.state.head<3>(),
+                             from.state.head<3>());
+  });
+  mgg::transformRoadmap(fixture.global, 0, Eigen::Isometry3d::Identity());
+  EXPECT_TRUE(mgg::zoneRespectingRoute(fixture.global, 0, 1,
+                                       Eigen::Vector3d::Zero(), zones).empty());
+  EXPECT_EQ(checks, 0);
+  EXPECT_TRUE(fixture.global.graph_->edgeExists(0, 1));
+  zones.set({}, 0.3);
+  EXPECT_EQ(mgg::zoneRespectingRoute(fixture.global, 0, 1,
+                                     Eigen::Vector3d::Zero(), zones).size(), 2u);
+  EXPECT_EQ(checks, 1);
+  EXPECT_TRUE(fixture.global.graph_->edgeExists(0, 1));
+}
+
 TEST(TransformRoadmap, ResetDoesNotReuseDirtyEdgeIds) {
   Roadmap fixture;
   fixture.add(fixture.global, StateVec(1, 0, 0, 0), fixture.global.getVertex(0));

@@ -179,11 +179,15 @@ std::vector<Vertex*> zoneRespectingRoute(GraphManager& graph, int source_id,
     for (const auto& [w, weight] : edges->second) {
       Vertex* v = vertex(w);
       if (v == nullptr || !graph.inService(*v) ||
-          !graph.graph_->edgeExists(s.at, w) || !graph.edgeCertified(*u, *v)) {
+          !graph.graph_->edgeExists(s.at, w)) {
         continue;
       }
+      // The zone step first: an edge a zone closes is skipped for this
+      // search, not certified against a map that holds the zone, failed and
+      // removed for good (mgg-flown review r1 P2).
       NoGoZones::Departing leaving = s.leaving;
-      if (!zones.step(u->state.head<3>(), v->state.head<3>(), leaving)) {
+      if (!zones.step(u->state.head<3>(), v->state.head<3>(), leaving) ||
+          !graph.edgeCertified(*u, *v)) {
         continue;
       }
       const double next_cost = cost + weight;
