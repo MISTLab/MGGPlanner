@@ -722,19 +722,6 @@ class PlannerNodeTestPeer {
     const std::lock_guard<std::recursive_mutex> lock(node.planner_mutex_);
     node.findGlobalVertex(id)->type = type;
   }
-  /// Global frontier vertices east of `x`.
-  static int globalFrontiersBeyond(PlannerNode& node, double x) {
-    const std::lock_guard<std::recursive_mutex> lock(node.planner_mutex_);
-    int frontiers = 0;
-    for (const auto& [id, vertex] : node.global_graph_->vertices_map_) {
-      if (vertex != nullptr && vertex->type == mgg::VertexType::kFrontier &&
-          vertex->state.x() > x) {
-        ++frontiers;
-      }
-    }
-    return frontiers;
-  }
-
   /// How long the tour's cluster `id` is set aside for; -1 when it is not.
   static double tourAsideRetry(PlannerNode& node, mgg::ClusterId id) {
     const std::lock_guard<std::recursive_mutex> lock(node.planner_mutex_);
@@ -2072,13 +2059,6 @@ class PlannerNodeTestPeer {
     const std::lock_guard<std::recursive_mutex> lock(node.planner_mutex_);
     return node.aerialStatusJson();
   }
-  /// Whether the global edge between `a` and `b` is closed, as a search
-  /// sees it; records what closed it.
-  static bool globalEdgeBlocked(PlannerNode& node, int a, int b) {
-    const std::lock_guard<std::recursive_mutex> lock(node.planner_mutex_);
-    return node.globalEdgeBlocked(*node.findGlobalVertex(a), *node.findGlobalVertex(b));
-  }
-
   static void setAerialBodySize(PlannerNode& node, const Eigen::Vector3d& size) {
     node.robot_params_.size = size;
   }

@@ -581,25 +581,6 @@ class PlannerNodeTestPeer {
     node.shortcutAndResample(path, {}, {}, true);
   }
 
-  static void nearRequestDeadline(PlannerNode& node) {
-    node.lattice_deadline_ = std::chrono::steady_clock::now() + std::chrono::milliseconds(80);
-    node.global_graph_->reset();
-    for (int i = 0; i < 500; ++i) {
-      node.global_graph_->addVertex(new mgg::Vertex(i, mgg::StateVec(i, 0, .935, 0)));
-      if (i) node.global_graph_->addEdge(node.global_graph_->getVertex(i-1),
-                                       node.global_graph_->getVertex(i), 1);
-    }
-    node.global_graph_->setEdgeBlocked([](const auto&, const auto&) {
-      std::this_thread::sleep_for(std::chrono::milliseconds(1)); return false;
-    });
-  }
-  static void expireRequest(PlannerNode& node) {
-    node.lattice_deadline_ = std::chrono::steady_clock::now() - std::chrono::seconds(1);
-  }
-  static bool requestExpired(const PlannerNode& node) {
-    return std::chrono::steady_clock::now() >= *node.lattice_deadline_;
-  }
-
   static void setBudget(PlannerNode& node, double seconds) {
     node.lattice_time_budget_s_ = seconds;
   }
