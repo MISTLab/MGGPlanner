@@ -208,6 +208,14 @@ void expandGraphFrom(GraphManager& graph, Vertex& new_vertex,
     new_state[2] = new_pos[2];
     direction = new_state.head<3>() - origin;
     direction_norm = direction.norm();
+    // Projection can collapse a raw Z-offset sample into the root column.
+    // Keep nondegenerate in-reach connectors: the controller's endpoint
+    // tolerance may exceed the ordinary edge length, but not the whole route.
+    if (nearest_vertex->id == 0 && !allow_short_edge &&
+        direction.head<2>().norm() <= ctx.planning->edge_length_min) {
+      rep.status = ExpandGraphStatus::kErrorShortEdge;
+      return;
+    }
     if (hanging_root &&
         direction_norm > ctx.hanging_root_edge_length_max + 1e-9) {
       rep.status = ExpandGraphStatus::kErrorCollisionEdge;

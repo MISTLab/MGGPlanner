@@ -21,6 +21,8 @@
 #ifndef MGG_ROS_PLANNER_NODE_H_
 #define MGG_ROS_PLANNER_NODE_H_
 
+#include "mgg_ros/no_path_streak.h"
+
 #include <array>
 #include <atomic>
 #include <chrono>
@@ -108,6 +110,7 @@ class PlannerNode : public rclcpp::Node {
   static constexpr int kStatusNotReady = -1;      // waiting for inputs
   static constexpr int kStatusNoPath = -2;        // this cycle found none
   static constexpr int kStatusComplete = -3;      // nothing left to explore
+  static constexpr int kStatusPlanningBlocked = -6;  // same-input no-path streak
 
 
   /// What set a rebuild of the global graph off; each has its own rate
@@ -924,6 +927,8 @@ class PlannerNode : public rclcpp::Node {
   /// rrg.cpp:2098 to 2120: rounds without a frontier among the local
   /// leaves, or whose best path scores under low_gain_voxels; at the
   /// configured count the global planner runs.
+  NoPathStreak no_path_streak_;
+  std::atomic<bool> planning_blocked_{false};
   int low_gain_rounds_ = 0;
   /// Whether the last lattice path sent turned back: the next selection
   /// then bounds no direction penalty. Reset when the plan sent something

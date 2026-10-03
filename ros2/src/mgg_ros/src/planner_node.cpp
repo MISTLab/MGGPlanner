@@ -2434,6 +2434,7 @@ void PlannerNode::publishPlanningStatus() {
       ",\"odometry_sample_age_s\":" + jsonNumber(odometry_sample_stamp_ns_.load() ?
           (now().nanoseconds() - odometry_sample_stamp_ns_.load()) * 1e-9 : NAN) +
       ",\"odometry_ingest_lag_s\":" + jsonNumber(odometry_ingest_lag_s_.load()) +
+      ",\"planning_blocked\":" + (planning_blocked_.load() ? "true" : "false") +
       ",\"cancellations\":" + std::to_string(cancellations_.load()) + "}";
   planning_status_pub_->publish(status);
 }
@@ -4275,6 +4276,17 @@ void PlannerNode::shortcutAndResample(std::vector<mgg::StateVec>& path,
           resampled[i].z() -= below - planning_params_.max_ground_height;
         }
       }
+      // Reprojection samples different columns than the native two-map-cell
+      // edge check. Never send adjacent poses that violate that same step AND
+      // grade contract. Keep validated corners, not smoothed/linear-Z terrain.
+      for (std::size_t i = 1; i < resampled.size(); ++i) {
+        const Eigen::Vector3d segment = resampled[i] - resampled[i - 1];
+        if (std::abs(segment.z()) > planning_params_.max_step_height + 1e-6 &&
+            std::atan2(std::abs(segment.z()), segment.head<2>().norm()) >
+                planning_params_.max_inclination) {
+          return corners;
+        }
+      }
     }
     return resampled;
   };
@@ -4437,7 +4449,12 @@ std::string PlannerNode::buildLocalGraph() {
     if (entry.second != nullptr &&
         entry.second->type == mgg::VertexType::kFrontier) {
       ++frontiers;
-      if (!reverseExitEndpointGivenUp(entry.second->state)) ++outstanding_frontiers;
+      // Gain in the collapsed root column cannot justify waiting forever.
+      // Do not confuse the robot's own spot with a large endpoint tolerance.
+      const bool at_ground_root = robot_params_.type == mgg::RobotType::kGroundRobot &&
+          (entry.second->state.head<2>() - root_state.head<2>()).norm() <= planning_params_.edge_length_min;
+      if (!at_ground_root && !reverseExitEndpointGivenUp(entry.second->state))
+        ++outstanding_frontiers;
     }
   }
   RCLCPP_INFO(get_logger(),
@@ -4649,16 +4666,21 @@ std::string PlannerNode::buildLocalGraph() {
   // repositioning below run as they do when there is none.
   char nowhere[128] = "";
   const bool goes_nowhere =
-      mgg::pathGoesNowhere(sel, current_state_.head<3>(), reach_distance_);
+      mgg::pathGoesNowhere(sel, current_state_.head<3>(), reach_distance_) ||
+      (sel.best_path.empty() && sel.rejected_goes_nowhere);
   if (goes_nowhere) {
     ++paths_going_nowhere_;
     last_nowhere_poses_ = static_cast<int>(best_path_.size());
-    std::snprintf(nowhere, sizeof(nowhere),
-                  "; best path goes nowhere (ends %.2f m away, gain %.1f of "
-                  "%.1f): no path",
-                  (best_path_.back().head<2>() - current_state_.head<2>())
-                      .norm(),
-                  sel.best_gain, sel.best_full_gain);
+    if (best_path_.empty()) {
+      std::snprintf(nowhere, sizeof(nowhere),
+                    "; candidate paths go nowhere: already in reach");
+    } else {
+      std::snprintf(nowhere, sizeof(nowhere),
+                    "; best path goes nowhere (ends %.2f m away, gain %.1f of "
+                    "%.1f): no path",
+                    (best_path_.back().head<2>() - current_state_.head<2>()).norm(),
+                    sel.best_gain, sel.best_full_gain);
+    }
     best_path_.clear();
     path_shortcut_from_ = path_shortcut_corners_ = path_shortcut_to_ = 0;
   }
@@ -4795,8 +4817,9 @@ std::string PlannerNode::buildLocalGraph() {
     // Nothing was scored; this round says nothing about the frontier.
   } else if (frontiers == 0 || goes_nowhere || best_path_.empty()) {
     ++low_gain_rounds_;
-    local_gain_remains_now_ =
-        outstanding_frontiers > 0 || (goes_nowhere && sel.best_full_gain > 0.0);
+    local_gain_remains_now_ = outstanding_frontiers > 0 ||
+        (robot_params_.type != mgg::RobotType::kGroundRobot &&
+         goes_nowhere && sel.best_full_gain > 0.0);
   } else if (!is_boxed_in && sel.best_gain < low_gain_score) {
     ++low_gain_rounds_;
     low_gain_path_now_ = true;
@@ -5917,8 +5940,13 @@ void PlannerNode::onPlanRequest(
   applyPendingCancel();
   RequestActivity activity(request_active_);
   auto map_read = mapReadLease();
+  std::string no_path_identity;
   if (mola_map_) {
     if (const auto snapshot = mola_map_->activeRequest()) {
+      no_path_identity = snapshot->component_id + ":" + std::to_string(snapshot->epoch) +
+          ":" + snapshot->geometry_revision + ":" + std::to_string(exploration_generation) +
+          ":" + std::to_string(generation);
+      if (snapshot->geometry_revision.empty()) no_path_identity.clear();
       std::atomic_store(&last_planning_snapshot_,
           std::make_shared<const mgg::MolaSnapshotRequest>(*snapshot));
       RCLCPP_INFO(get_logger(), "plan identity: component=%s epoch=%llu geometry_revision=%s",
@@ -5941,6 +5969,14 @@ void PlannerNode::onPlanRequest(
     const bool computed = onPlanRequestImpl(request, response);
     std::lock_guard<std::mutex> fence(cancellation_mutex_);
     mgg::planningCheckpoint();
+    // Impl applies the latest queued odometry before planning. The planner
+    // lock pins that physical pose until this answer is committed.
+    planning_blocked_ = no_path_streak_.note(no_path_identity, current_state_,
+        robot_params_.type == mgg::RobotType::kGroundRobot &&
+        response->path.empty() && response->status == kStatusNoPath);
+    // -6 is a distinct nonterminal same-input stall, consumed by PCI. Keep
+    // the existing service wire type (status is already int32).
+    if (planning_blocked_) response->status = kStatusPlanningBlocked;
     // This is the commit point. No cancellation checkpoint may run after it:
     // a later cancel belongs after this answer, not to an unsent computation.
     if (computed) {
@@ -5961,6 +5997,8 @@ void PlannerNode::onPlanRequest(
     // explicit general cancellation clears them through applyPendingCancel().
     response->path.clear();
     response->status = mgg_msgs::srv::PlannerSrv::Response::CANCELLED;
+    no_path_streak_.note("", current_state_, false);
+    planning_blocked_ = false;
     RCLCPP_INFO(get_logger(), "planning cancelled: superseded or map authority expired/changed");
   }
   robot_params_.bound_mode = bound;

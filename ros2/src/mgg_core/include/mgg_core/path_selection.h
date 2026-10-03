@@ -172,6 +172,9 @@ struct PathSelectionResult {
   /// Any vertex on any evaluated path was a frontier.
   bool frontier_exists = false;
   int leaves_evaluated = 0;
+  /// An otherwise admissible positive-gain end was already in reach.
+  /// Retain the diagnostic for departure/repositioning without selecting it.
+  bool rejected_goes_nowhere = false;
   /// Paths discarded for descending more steeply than max_negative_inclination.
   int paths_rejected_steep = 0;
   /// Paths whose leaf failed `viewpoint_clear`: those pulled back along the

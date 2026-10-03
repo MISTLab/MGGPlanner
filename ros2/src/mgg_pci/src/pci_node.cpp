@@ -303,6 +303,7 @@ void PciNode::planAndPublish() {
     scouting_revision = scouting_revision_;
     scouting_retry_ = false;
     planning_in_progress_ = true;
+    planning_blocked_ = false;
   }
 
   std::vector<geometry_msgs::msg::Pose> path;
@@ -313,6 +314,16 @@ void PciNode::planAndPublish() {
   planning_in_progress_ = false;
   if (!running_ || generation != generation_) return;
 
+  // Planner counts six no-path answers on one leased geometry and pose.
+  // Do not publish an empty (terminal) path or retry behind recovery's back.
+  if (ok && path.empty() && plan_status_ == kPlannerStatusPlanningBlocked) {
+    planning_blocked_ = true;
+    path_in_progress_ = false;
+    waiting_for_plan_ = true;
+    scouting_retry_ = false;
+    publishStatus("planning_blocked", "six no-path answers on unchanged geometry and pose");
+    return;
+  }
   if (ok && plan_status_ == mgg_msgs::srv::PlannerSrv::Response::CANCELLED) {
     consecutive_empty_plans_ = 0;
     path_in_progress_ = false;
@@ -436,7 +447,7 @@ void PciNode::planAndPublish() {
 
 void PciNode::tick() {
   std::unique_lock<std::mutex> lock(mutex_);
-  if (!running_ || planning_in_progress_ || exploration_completed_) return;
+  if (!running_ || planning_in_progress_ || exploration_completed_ || planning_blocked_) return;
 
   if (!path_in_progress_) {
     if (external_path_execution_ && waiting_for_plan_ &&

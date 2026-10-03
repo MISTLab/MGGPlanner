@@ -98,6 +98,8 @@ class PciNode : public rclcpp::Node {
   rclcpp::Publisher<std_msgs::msg::String>::SharedPtr status_pub_;
   /// mgg_ros::PlannerNode::kStatusComplete: nothing left to explore.
   static constexpr int kPlannerStatusComplete = -3;
+  /// mgg_ros::PlannerNode::kStatusPlanningBlocked: recovery must replan.
+  static constexpr int kPlannerStatusPlanningBlocked = -6;
   int plan_status_ = -1;
   StallBudget stall_budget_;
   uint64_t generation_ = 0;
@@ -106,6 +108,7 @@ class PciNode : public rclcpp::Node {
   bool planning_in_progress_ = false;
   bool path_in_progress_ = false;
   bool waiting_for_plan_ = false;
+  bool planning_blocked_ = false;
   bool has_bootstrapped_ = false;
   bool exploration_completed_ = false;
   bool external_path_execution_ = false;

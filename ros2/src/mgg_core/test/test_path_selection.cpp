@@ -823,3 +823,70 @@ TEST(PathSelection, WeightedRoutingKeepsMetricGainDiscount) {
   EXPECT_NEAR(result.best_gain, 100 * std::exp(-0.25 * 2), 1e-9);
   EXPECT_NEAR(result.best_full_gain, 100 * std::exp(-0.25 * 2), 1e-9);
 }
+
+TEST(PathSelection, PositiveGainRootColumnCannotWinUnclearFallback) {
+  GraphManager graph;
+  auto* root = new Vertex(0, StateVec(24.46, -57.62, 0, 0.71));
+  auto* end = new Vertex(1, StateVec(24.46, -57.62, 0.1, 0.71));
+  end->vol_gain.gain = 4838.4;
+  graph.addVertex(root);
+  graph.addVertex(end);
+  graph.addEdge(root, end, 0.1);
+  const auto selected = mgg::selectBestPath(graph, makePlanning(), RobotParams(),
+      EdgeInclinations(), 0.2, 0, {}, 0,
+      [](const Vertex&) { return false; }, nullptr, nullptr, 0.3);
+  EXPECT_TRUE(selected.best_path.empty());
+}
+
+TEST(PathSelection, RootColumnDoesNotMaskSharpTurnFallback) {
+  GraphManager graph;
+  auto* root = new Vertex(0, StateVec(24.46, -57.62, 0, 0.71));
+  graph.addVertex(root);
+  for (int id : {1, 2}) {
+    auto* end = new Vertex(id, root->state + StateVec(id == 1 ? 0 : 2, 0, 0.1, 0));
+    end->vol_gain.gain = id == 1 ? 4838.4 : 100;
+    graph.addVertex(end);
+    graph.addEdge(root, end, id == 1 ? 0.1 : 2);
+  }
+  const auto selected = mgg::selectBestPath(graph, makePlanning(), RobotParams(),
+      EdgeInclinations(), 0.2, 0, {}, 0,
+      [](const Vertex&) { return false; },
+      [](const std::vector<Vertex*>& path) { return path.back()->id == 1; },
+      nullptr, 0.3);
+  ASSERT_FALSE(selected.best_path.empty());
+  EXPECT_EQ(selected.best_path.back()->id, 2);
+  EXPECT_TRUE(selected.sharp_turn_fallback);
+  EXPECT_FALSE(mgg::pathGoesNowhere(selected, root->state.head<3>(), 0.3));
+}
+
+TEST(PathSelection, ClearPrefixCannotBorrowGainFromTheRobotsOwnSpot) {
+  GraphManager graph;
+  auto* root = new Vertex(0, StateVec(0, 0, 0, 0));
+  auto* clear_prefix = new Vertex(1, StateVec(1, 0, 0, 0));
+  auto* root_column = new Vertex(2, StateVec(0, 0, 0.1, 0));
+  root_column->vol_gain.gain = 4838.4;
+  graph.addVertex(root);
+  graph.addVertex(clear_prefix);
+  graph.addVertex(root_column);
+  graph.addEdge(root, clear_prefix, 1);
+  graph.addEdge(clear_prefix, root_column, 1);
+  const auto selected = mgg::selectBestPath(graph, makePlanning(), RobotParams(),
+      EdgeInclinations(), 0.2, 0, {}, 0,
+      [](const Vertex& v) { return v.id == 1; }, nullptr, nullptr, 0.3);
+  EXPECT_TRUE(selected.best_path.empty());
+  EXPECT_EQ(selected.best_full_gain, 0);
+  // Real interest at the clear prefix remains selectable.
+  clear_prefix->vol_gain.gain = 2;
+  const auto useful = mgg::selectBestPath(graph, makePlanning(), RobotParams(),
+      EdgeInclinations(), 0.2, 0, {}, 0,
+      [](const Vertex& v) { return v.id == 1; }, nullptr, nullptr, 0.3);
+  ASSERT_FALSE(useful.best_path.empty());
+  EXPECT_EQ(useful.best_path.back()->id, 1);
+  EXPECT_DOUBLE_EQ(useful.best_full_gain, 2);
+  // The physical root's established common scoring baseline is unchanged.
+  root->vol_gain.gain = 3;
+  const auto with_baseline = mgg::selectBestPath(graph, makePlanning(), RobotParams(),
+      EdgeInclinations(), 0.2, 0, {}, 0,
+      [](const Vertex& v) { return v.id == 1; }, nullptr, nullptr, 0.3);
+  EXPECT_DOUBLE_EQ(with_baseline.best_full_gain, 5);
+}

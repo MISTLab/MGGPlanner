@@ -1223,3 +1223,23 @@ TEST(GridGraph, DirectShortcutFallsBackForASharpStartTurnOnASlope) {
   ASSERT_TRUE(result.routed);
   EXPECT_GT(graph.getNumVertices(), 2);
 }
+
+TEST(GridGraph, ProjectionCannotAdmitPositiveGainRootColumn) {
+  SparseGroundFixture f(true);
+  auto* root = f.graph.getVertex(0);
+  // A z-offset passes the pre-projection minimum length; projection brings
+  // it into the physical root column. No assumption about incident path length.
+  Vertex candidate(1, StateVec(0, 0, 0.7, 0));
+  candidate.vol_gain.gain = 4838.4;
+  mgg::ExpandGraphReport report;
+  mgg::expandGraphFrom(f.graph, candidate, root, report, f.ctx);
+  EXPECT_EQ(report.status, mgg::ExpandGraphStatus::kErrorShortEdge);
+}
+
+TEST(GridGraph, NondegenerateRootConnectorSurvivesProjection) {
+  SparseGroundFixture f(true);
+  Vertex candidate(1, StateVec(0.2, 0, 0.7, 0));
+  mgg::ExpandGraphReport report;
+  mgg::expandGraphFrom(f.graph, candidate, f.graph.getVertex(0), report, f.ctx);
+  EXPECT_EQ(report.status, mgg::ExpandGraphStatus::kSuccess);
+}
