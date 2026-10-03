@@ -4023,20 +4023,30 @@ void PlannerNode::addFrontiers() {
 // ---------------------------------------------------------------------------
 // Paths
 
+bool PlannerNode::groundPathAdmissible(const mgg::PathType& points) const {
+  if (robot_params_.type != mgg::RobotType::kGroundRobot) return true;
+  for (std::size_t i = 0; i < points.size(); ++i) {
+    if (!points[i].allFinite()) return false;
+    if (i == 0) continue;
+    const Eigen::Vector3d segment = points[i] - points[i - 1];
+    const double rise = std::abs(segment.z());
+    if (rise > planning_params_.max_step_height + 1e-6 &&
+        std::atan2(rise, segment.head<2>().norm()) > planning_params_.max_inclination) {
+      return false;
+    }
+  }
+  mgg::planningCheckpoint();
+  return ground_ == nullptr || ground_->groundStepsAdmissible(points);
+}
+
 bool PlannerNode::groundPosePairsAdmissible(
     const std::vector<geometry_msgs::msg::Pose>& poses) const {
-  if (robot_params_.type != mgg::RobotType::kGroundRobot) return true;
-  for (std::size_t i = 0; i < poses.size(); ++i) {
-    const auto& p = poses[i].position;
-    if (!std::isfinite(p.x) || !std::isfinite(p.y) || !std::isfinite(p.z)) return false;
-    if (i == 0) continue;
-    const auto& previous = poses[i - 1].position;
-    const double rise = std::abs(p.z - previous.z);
-    const double run = std::hypot(p.x - previous.x, p.y - previous.y);
-    if (rise > planning_params_.max_step_height + 1e-6 &&
-        std::atan2(rise, run) > planning_params_.max_inclination) return false;
+  mgg::PathType points;
+  points.reserve(poses.size());
+  for (const auto& pose : poses) {
+    points.emplace_back(pose.position.x, pose.position.y, pose.position.z);
   }
-  return true;
+  return groundPathAdmissible(points);
 }
 
 void PlannerNode::shortcutAndResample(std::vector<mgg::StateVec>& path,
@@ -4159,7 +4169,8 @@ void PlannerNode::shortcutAndResample(std::vector<mgg::StateVec>& path,
       }
       // Reprojection samples different columns than the native two-map-cell
       // edge check. Never send adjacent poses that violate that same step AND
-      // grade contract. Keep validated corners, not smoothed/linear-Z terrain.
+      // grade contract. Keep the corners, not smoothed/linear-Z terrain; the
+      // final walk below still checks the ground under every corner segment.
       for (std::size_t i = 1; i < resampled.size(); ++i) {
         const Eigen::Vector3d segment = resampled[i] - resampled[i - 1];
         if (std::abs(segment.z()) > planning_params_.max_step_height + 1e-6 &&
@@ -4191,6 +4202,23 @@ void PlannerNode::shortcutAndResample(std::vector<mgg::StateVec>& path,
                 "shortcut route fails turn or reverse-corridor checks; sent "
                 "unshortcut (%d so far)",
                 shortcut_turn_reverts_);
+  }
+  // The route as sent keeps MGG's native step contract over the ground
+  // under every segment (groundPathAdmissible). A shortcut leap is checked
+  // at the native edge spacing only and may cross a column between its
+  // samples: then the route as it came, and if that fails too, no route
+  // (ground12 review P1-1).
+  if (robot_params_.type == mgg::RobotType::kGroundRobot && !groundPathAdmissible(points)) {
+    points = unshortcut;
+    path_shortcut_corners_ = static_cast<int>(points.size());
+    if (!groundPathAdmissible(points)) {
+      RCLCPP_WARN(get_logger(),
+                  "route refused: a sent segment crosses ground that breaks the "
+                  "step/inclination contract");
+      path.clear();
+      path_shortcut_to_ = 0;
+      return;
+    }
   }
   path_shortcut_to_ = static_cast<int>(points.size());
 
@@ -5782,6 +5810,10 @@ void PlannerNode::onPlanRequest(
       response->status = kStatusNoPath;
       RCLCPP_WARN(get_logger(), "refused sent ground path: step/inclination contract");
     }
+    if (!no_path_identity.empty()) {
+      no_path_identity += ":" + noPathPlanningInputs(scouting_revision_, no_go_.centres(),
+                                                     no_go_.reaches());
+    }
     std::lock_guard<std::mutex> fence(cancellation_mutex_);
     mgg::planningCheckpoint();
     // Impl applies the latest queued odometry before planning. The planner
@@ -7222,6 +7254,13 @@ void PlannerNode::onObjectiveRequestImpl(
   // room, which sets needs_departure for answer_with_departure.
   const auto certify_route = [&](bool& needs_departure) {
     needs_departure = false;
+    // shortcutAndResample empties a ground route only for the terrain
+    // contract (groundPathAdmissible): never a SUCCEEDED empty route.
+    if (route.empty()) {
+      response->status = Service::Response::BLOCKED;
+      response->reason = "sent ground path violates step/inclination contract";
+      return false;
+    }
     mgg::PathType objective_points;
     for (const auto& pose : route) objective_points.push_back(pose.head<3>());
     if (routeStartsWithTurnWithoutRoom(objective_points)) {
@@ -7241,6 +7280,15 @@ void PlannerNode::onObjectiveRequestImpl(
     if (!noGoAdmissible(route)) {
       response->status = Service::Response::UNREACHABLE;
       response->reason = "the route enters a no-go zone";
+      return false;
+    }
+    // The final sent-path terrain contract, here too so a polished route
+    // that breaks it falls back to the certified raw route.
+    mgg::PathType sent_points;
+    for (const auto& pose : route) sent_points.push_back(pose.head<3>());
+    if (!groundPathAdmissible(sent_points)) {
+      response->status = Service::Response::BLOCKED;
+      response->reason = "sent ground path violates step/inclination contract";
       return false;
     }
     return true;

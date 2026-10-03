@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <functional>
 #include <limits>
 #include <map>
 #include <utility>
@@ -1079,4 +1080,79 @@ TEST(GroundProjection, Robot0LoggedRejectedPairsAlsoViolateNativeContract) {
                   {run, 0, 0.5 + pair.first}, {0.1, 0.1, 0.1}, true, projected, false),
               ProjectedEdgeStatus::kSteep);
   }
+}
+
+namespace {
+/// Columns on 0.2 m cells: x index -> top, the same across y.
+mgg_test::TerrainFixture columnsAlongX(const std::function<double(std::int64_t)>& top) {
+  std::map<std::pair<std::int64_t, std::int64_t>, double> tops;
+  for (std::int64_t x = -10; x < 30; ++x) {
+    for (std::int64_t y = -10; y < 10; ++y) tops[{x, y}] = top(x);
+  }
+  return mgg_test::TerrainFixture(0.2, tops);
+}
+
+PlanningParams bunkerStepParams() {
+  PlanningParams params;
+  params.max_ground_height = 0.5;
+  params.max_step_height = 0.15;
+  params.max_inclination = 27 * M_PI / 180;
+  return params;
+}
+
+/// A 16 degree ramp quantised to 0.15 m risers on 0.2 m cells: 2 or 3 cells
+/// apart, never two risers within two cells.
+double quantisedSixteenDegreeRamp(std::int64_t x) {
+  const double rise = std::max<std::int64_t>(0, x) * 0.2 * std::tan(16 * M_PI / 180);
+  return 0.15 * std::round(rise / 0.15);
+}
+}  // namespace
+
+TEST(GroundProjection, AShortEdgeKeepsTheStepContractBetweenItsEnds) {
+  // ground12 review P1-1: an edge shorter than two native steps (0.8 m on
+  // 0.2 m cells) was projected only at its ends, so a 0.215 m column in
+  // cell 1 under a 0.7 m edge went unseen. Compared two cells apart, as the
+  // long-edge walk compares its samples, the column rises 0.215 m over
+  // 0.4 m: steeper than 27 degrees and higher than a 0.15 m step.
+  const auto map = columnsAlongX([](std::int64_t x) { return x == 1 ? 0.215 : 0.0; });
+  const PlanningParams params = bunkerStepParams();
+  GroundProjection ground(map, params);
+  std::vector<Eigen::Vector3d> projected;
+  EXPECT_FALSE(ground.groundStepsAdmissible({0.05, 0.05, 0.5}, {0.75, 0.05, 0.5}));
+  EXPECT_EQ(ground.getProjectedEdgeStatus({0.05, 0.05, 0.5}, {0.75, 0.05, 0.5},
+                                          {0.02, 0.02, 0.02}, true, projected, false),
+            ProjectedEdgeStatus::kSteep);
+  // The lane's 0.5 m corner segment alone: the column lies within two cells
+  // of both ends, which the native spacing cannot compare; the route the
+  // segment belongs to is walked as a whole.
+  EXPECT_TRUE(ground.groundStepsAdmissible({0.05, 0.05, 0.5}, {0.55, 0.05, 0.5}));
+  EXPECT_FALSE(ground.groundStepsAdmissible(
+      {{0.05, 0.05, 0.5}, {0.55, 0.05, 0.5}, {1.05, 0.05, 0.5}}));
+  // Round a corner too: two cells along the path, not across.
+  EXPECT_FALSE(ground.groundStepsAdmissible(
+      {{0.05, -0.35, 0.5}, {0.05, 0.05, 0.5}, {0.55, 0.05, 0.5}}));
+  // A real 0.4 m block under a short edge, both ends on the lower floor.
+  const auto step = columnsAlongX([](std::int64_t x) { return x == 1 ? 0.4 : 0.0; });
+  GroundProjection stepped(step, params);
+  EXPECT_FALSE(stepped.groundStepsAdmissible({0.05, 0.05, 0.5}, {0.75, 0.05, 0.5}));
+}
+
+TEST(GroundProjection, AQuantisedSixteenDegreeRampKeepsTheStepContract) {
+  // Not a raw 0.25 m pair rule: a quantised ramp's riser over one cell is
+  // steep, but over the native two cells it never exceeds one 0.15 m step.
+  const auto map = columnsAlongX(quantisedSixteenDegreeRamp);
+  const PlanningParams params = bunkerStepParams();
+  GroundProjection ground(map, params);
+  const auto at = [](double x) {
+    return Eigen::Vector3d(x, 0.05, quantisedSixteenDegreeRamp(
+        static_cast<std::int64_t>(std::floor(x / 0.2))) + 0.5);
+  };
+  for (double from = 0.05; from < 2.0; from += 0.2) {
+    std::vector<Eigen::Vector3d> projected;
+    EXPECT_TRUE(ground.groundStepsAdmissible(at(from), at(from + 0.5))) << from;
+    EXPECT_NE(ground.getProjectedEdgeStatus(at(from), at(from + 0.5), {0.02, 0.02, 0.02},
+                                            true, projected, false),
+              ProjectedEdgeStatus::kSteep) << from;
+  }
+  EXPECT_TRUE(ground.groundStepsAdmissible(at(0.05), at(3.05)));
 }

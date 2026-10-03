@@ -380,6 +380,14 @@ class PlannerNode : public rclcpp::Node {
                                    const std::vector<mgg::StateVec>& lead_in,
                                    std::vector<mgg::Vertex*>& route,
                                    const char* route_name);
+  /// The final sent-path terrain contract for a ground robot; adapters do
+  /// not repeat it. Every pose is finite, every pair of sent poses keeps
+  /// MGG's native step-AND-grade rule, and so does the ground under the
+  /// whole route, corner segments included, two map cells apart
+  /// (mgg::GroundProjection::groundStepsAdmissible). Other robots: true.
+  bool groundPathAdmissible(const mgg::PathType& points) const;
+  bool groundPosePairsAdmissible(
+      const std::vector<geometry_msgs::msg::Pose>& poses) const;
   /// Straightens a route where the map vouches for the straight segment and
   /// resamples it at path_interpolation_distance (rrg.cpp:4160 and 4176).
   /// With `turns_ok`, a route that passes it still passes afterwards: the
@@ -392,9 +400,6 @@ class PlannerNode : public rclcpp::Node {
   /// body volume the local lattice admits, otherwise space must be observed
   /// free as on the roadmap. A leap may not pass closer to a hazard than the
   /// edges it replaces (mgg::shortcutPathKeepingClearance).
-  // Final serialized-pose terrain contract; adapters do not repeat it.
-  bool groundPosePairsAdmissible(
-      const std::vector<geometry_msgs::msg::Pose>& poses) const;
   void shortcutAndResample(std::vector<mgg::StateVec>& path,
                            const mgg::PathOkFn& turns_ok = nullptr,
                            const mgg::PathOkFn& corridor_ok = nullptr,

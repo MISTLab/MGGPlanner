@@ -631,9 +631,16 @@ class PlannerNodeTestPeer {
     return node.mola_map_->getStatus();
   }
   static void useResamplingTestTerrain(PlannerNode& node, double rise = 0.215, bool ramp = false) {
+    useTerrainTopsAlongX(node, [rise, ramp](std::int64_t x) {
+      return ramp ? std::max<std::int64_t>(0, x) * rise : x == 1 ? rise : 0.0;
+    });
+  }
+  /// 0.2 m terrain columns whose top depends on the x cell only.
+  static void useTerrainTopsAlongX(PlannerNode& node,
+                                   const std::function<double(std::int64_t)>& top) {
     std::map<std::pair<std::int64_t, std::int64_t>, double> tops;
     for (int x = -10; x < 20; ++x)
-      for (int y = -10; y < 10; ++y) tops[{x, y}] = ramp ? std::max(0, x) * rise : x == 1 ? rise : 0.0;
+      for (int y = -10; y < 10; ++y) tops[{x, y}] = top(x);
     node.cloud_map_ = nullptr;
     node.mola_map_ = nullptr;
     node.map_ = std::make_unique<mgg_test::TerrainFixture>(0.2, tops);
@@ -646,6 +653,13 @@ class PlannerNodeTestPeer {
     node.planning_params_.path_clearance_margin = 0;
     node.ground_ = std::make_unique<mgg::GroundProjection>(
         *node.map_, node.planning_params_);
+  }
+  /// The final sent-path certifier (groundPosePairsAdmissible) on `path`.
+  static bool sentGroundPathAdmissible(PlannerNode& node,
+                                       const std::vector<mgg::StateVec>& path) {
+    std::vector<geometry_msgs::msg::Pose> poses;
+    for (const auto& state : path) poses.push_back(toPoseMsg(state));
+    return node.groundPosePairsAdmissible(poses);
   }
   static void useCloudMap(PlannerNode& node, std::unique_ptr<mgg::OctomapMap> map) {
     node.cloud_map_ = map.get();
@@ -11791,29 +11805,25 @@ TEST_F(PlannerNodeTest, AerialLastExclusionExpiryPublishesWithoutWaitingForAPlan
 }  // namespace mgg_ros
 
 namespace mgg_ros {
-TEST_F(PlannerNodeTest, ResampledGroundDiscontinuityFallsBackToValidatedCorners) {
+// ground12 review P1-1: the final sent-path certifier applies MGG's native
+// step-AND-grade rule along every sent segment, two map cells apart, corner
+// segments included. Intended change from ground12's corner fallback: a
+// corner segment crossing a refused discontinuity is no path, not sent.
+TEST_F(PlannerNodeTest, ResampledGroundDiscontinuityInsideACornerSegmentIsRefused) {
   auto node = makeNode("resample_step_contract");
   PlannerNodeTestPeer::useResamplingTestTerrain(*node);
-  // Synthetic sampling repro, NOT the missing robot_0 map. The 0.4 m
-  // projection spacing misses the high column hit by 0.25 m resampling.
+  // Synthetic sampling repro, NOT the missing robot_0 map. The corners are
+  // 0.5 m apart, so the native short-edge check saw only their ends; the
+  // 0.215 m column in cell 1 lies between them.
   const std::vector<mgg::StateVec> corners{{0.05, 0.05, 0.5, 0},
                                          {0.55, 0.05, 0.5, 0},
                                          {1.05, 0.05, 0.5, 0}};
+  EXPECT_FALSE(PlannerNodeTestPeer::sentGroundPathAdmissible(*node, corners));
   auto sent = corners;
   PlannerNodeTestPeer::shortcutAndResample(*node, sent, {});
-  ASSERT_LE(sent.size(), corners.size());
-  ASSERT_GE(sent.size(), 2u);
-  EXPECT_TRUE(sent.front().head<3>().isApprox(corners.front().head<3>()));
-  EXPECT_TRUE(sent.back().head<3>().isApprox(corners.back().head<3>()));
-  for (const auto& pose : sent)
-    EXPECT_TRUE(std::any_of(corners.begin(), corners.end(), [&](const auto& corner) {
-      return pose.head<3>().isApprox(corner.template head<3>());
-    }));
+  EXPECT_TRUE(sent.empty());
 }
 
-}  // namespace mgg_ros
-
-namespace mgg_ros {
 TEST_F(PlannerNodeTest, ResamplingKeepsGroundStepsWithinTheExistingLimit) {
   auto node = makeNode("resample_admissible_step");
   PlannerNodeTestPeer::useResamplingTestTerrain(*node, 0.10);
@@ -11827,10 +11837,9 @@ TEST_F(PlannerNodeTest, ResamplingKeepsGroundStepsWithinTheExistingLimit) {
     EXPECT_TRUE(std::abs(delta.z()) <= 0.15 + 1e-6 ||
                 std::atan2(std::abs(delta.z()), delta.head<2>().norm()) <= 27 * M_PI / 180);
   }
+  EXPECT_TRUE(PlannerNodeTestPeer::sentGroundPathAdmissible(*node, sent));
 }
-}  // namespace mgg_ros
 
-namespace mgg_ros {
 TEST_F(PlannerNodeTest, UncertifiedTwoPoseGroundPathIsRefused) {
   auto node = makeNode("uncertified_two_pose");
   PlannerNodeTestPeer::useResamplingTestTerrain(*node);
@@ -11838,17 +11847,58 @@ TEST_F(PlannerNodeTest, UncertifiedTwoPoseGroundPathIsRefused) {
   PlannerNodeTestPeer::shortcutAndResample(*node, path, {});
   EXPECT_TRUE(path.empty());
 }
-TEST_F(PlannerNodeTest, FifteenCentimeterCellRampCertifiesEverySentPair) {
+
+// Intended change from ground12: 0.15 m per 0.2 m cell is a 36.9 degree
+// staircase. Two cells apart it rises 0.30 m over 0.4 m, which MGG's native
+// edge check refuses on any edge long enough to be walked; a path of 0.2 m
+// segments no longer slips it through pair by pair.
+TEST_F(PlannerNodeTest, ThirtySevenDegreeCellStaircaseIsRefusedAtNativeSpacing) {
   auto node = makeNode("fifteen_centimeter_ramp");
   PlannerNodeTestPeer::useResamplingTestTerrain(*node, .15, true);
   std::vector<mgg::StateVec> path;
   for (int i = 0; i <= 5; ++i) path.emplace_back(.05 + .2*i, .05, .5 + .15*i, 0);
+  EXPECT_FALSE(PlannerNodeTestPeer::sentGroundPathAdmissible(*node, path));
+  PlannerNodeTestPeer::shortcutAndResample(*node, path, {});
+  EXPECT_TRUE(path.empty());
+}
+
+TEST_F(PlannerNodeTest, QuantisedSixteenDegreeRampIsSentAtNativeSpacing) {
+  // A 16 degree ramp quantised to 0.15 m risers on 0.2 m cells (2 or 3
+  // cells apart). Raw consecutive-pair checks at 0.25 m would see a riser
+  // as steep; two cells apart it never rises more than one 0.15 m step.
+  auto node = makeNode("quantised_sixteen_degree_ramp");
+  const auto top = [](std::int64_t x) {
+    return 0.15 * std::round(std::max<std::int64_t>(0, x) * 0.2 *
+                             std::tan(16 * M_PI / 180) / 0.15);
+  };
+  PlannerNodeTestPeer::useTerrainTopsAlongX(*node, top);
+  std::vector<mgg::StateVec> path;
+  for (int i = 0; i <= 12; ++i) path.emplace_back(.05 + .2 * i, .05, .5 + top(i), 0);
+  EXPECT_TRUE(PlannerNodeTestPeer::sentGroundPathAdmissible(*node, path));
   PlannerNodeTestPeer::shortcutAndResample(*node, path, {});
   ASSERT_GE(path.size(), 2u);
-  for (std::size_t i = 1; i < path.size(); ++i) {
-    const Eigen::Vector3d delta = path[i].head<3>() - path[i-1].head<3>();
-    EXPECT_TRUE(std::abs(delta.z()) <= .15 + 1e-6 ||
-        std::atan2(std::abs(delta.z()), delta.head<2>().norm()) <= 27*M_PI/180);
-  }
+  EXPECT_NEAR(path.back().x(), .05 + .2 * 12, 1e-9);
+  EXPECT_TRUE(PlannerNodeTestPeer::sentGroundPathAdmissible(*node, path));
+}
+
+TEST_F(PlannerNodeTest, ARealFortyCentimetreStepIsRefused) {
+  auto node = makeNode("forty_centimetre_step");
+  // A 0.4 m block in cell 1 between two floor corners 0.5 m apart.
+  PlannerNodeTestPeer::useResamplingTestTerrain(*node, 0.4);
+  const std::vector<mgg::StateVec> across{{0.05, 0.05, 0.5, 0},
+                                        {0.55, 0.05, 0.5, 0},
+                                        {1.05, 0.05, 0.5, 0}};
+  EXPECT_FALSE(PlannerNodeTestPeer::sentGroundPathAdmissible(*node, across));
+  auto sent = across;
+  PlannerNodeTestPeer::shortcutAndResample(*node, sent, {});
+  EXPECT_TRUE(sent.empty());
+  // A 0.4 m step up onto a deck from cell 2 on, each pose at its floor.
+  PlannerNodeTestPeer::useTerrainTopsAlongX(
+      *node, [](std::int64_t x) { return x >= 2 ? 0.4 : 0.0; });
+  std::vector<mgg::StateVec> up{{0.05, 0.05, 0.5, 0}, {0.35, 0.05, 0.5, 0},
+                                {0.45, 0.05, 0.9, 0}, {0.85, 0.05, 0.9, 0}};
+  EXPECT_FALSE(PlannerNodeTestPeer::sentGroundPathAdmissible(*node, up));
+  PlannerNodeTestPeer::shortcutAndResample(*node, up, {});
+  EXPECT_TRUE(up.empty());
 }
 }  // namespace mgg_ros

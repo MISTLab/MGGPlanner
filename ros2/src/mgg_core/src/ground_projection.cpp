@@ -192,6 +192,55 @@ double GroundProjection::projectGoal(Eigen::Vector3d& sample,
   return below;
 }
 
+bool GroundProjection::groundStepsAdmissible(
+    const std::vector<Eigen::Vector3d>& path) const {
+  const double resolution = map_.getResolution();
+  if (!(resolution > 0.0) || path.size() < 2) return true;
+  std::vector<double> along(path.size(), 0.0);  // distance driven to each point
+  for (std::size_t i = 0; i < path.size(); ++i) {
+    if (!path[i].allFinite()) return false;
+    if (i > 0) along[i] = along[i - 1] + (path[i] - path[i - 1]).head<2>().norm();
+  }
+  const double length = along.back();
+  const double spacing = 0.5 * resolution;
+  const double baseline = 2.0 * resolution;
+  if (length < baseline - 1e-9) return true;
+  // The ground under the path `s` along it, if known.
+  const auto ground_at = [&](double s, double& ground) {
+    checkpoint_.check();
+    const std::size_t i = std::clamp<std::size_t>(
+        std::upper_bound(along.begin(), along.end(), s) - along.begin(), 1,
+        path.size() - 1);
+    const double segment = along[i] - along[i - 1];
+    const double t = segment > 1e-12 ? std::clamp((s - along[i - 1]) / segment, 0.0, 1.0)
+                                     : 1.0;
+    Eigen::Vector3d sample = path[i - 1] + (path[i] - path[i - 1]) * t;
+    const double sample_z = sample.z();
+    VoxelStatus status = VoxelStatus::kUnknown;
+    const double below = projectSample(sample, status);
+    ground = sample_z - below;
+    return status == VoxelStatus::kOccupied;
+  };
+  const auto keeps_contract = [&](double from_ground, double to_ground) {
+    const double rise = std::abs(to_ground - from_ground);
+    return !(rise > params_.max_step_height + 1e-6 &&
+             std::atan2(rise, baseline) > params_.max_inclination);
+  };
+  const int cells = static_cast<int>(std::floor(length / spacing + 1e-9));
+  std::vector<double> ground(cells + 1, 0.0);
+  std::vector<bool> known(cells + 1, false);
+  for (int k = 0; k <= cells; ++k) known[k] = ground_at(k * spacing, ground[k]);
+  const int ahead = static_cast<int>(std::lround(baseline / spacing));
+  for (int k = 0; k + ahead <= cells; ++k) {
+    if (known[k] && known[k + ahead] && !keeps_contract(ground[k], ground[k + ahead])) {
+      return false;
+    }
+  }
+  double before = 0.0, end = 0.0;
+  return !(ground_at(length - baseline, before) && ground_at(length, end) &&
+           !keeps_contract(before, end));
+}
+
 ProjectedEdgeStatus GroundProjection::getProjectedEdgeStatus(
     const Eigen::Vector3d& start, const Eigen::Vector3d& end,
     const Eigen::Vector3d& box_size, bool stop_at_unknown_voxel,
@@ -278,6 +327,11 @@ ProjectedEdgeStatus GroundProjection::getProjectedEdgeStatus(
         std::atan2(std::abs(segment(2)), std::abs(segment.head(2).norm()));
     if (std::abs(segment(2)) > params_.max_step_height + 1e-6 &&
         std::abs(theta) > max_inclination) return ProjectedEdgeStatus::kSteep;
+  }
+  // A short edge was projected at its ends only: a column between them
+  // (ground12 review P1-1, 0.215 m under a 0.5 m edge) went unseen.
+  if (ray_len < 2.0 * step_size && !groundStepsAdmissible(start, end)) {
+    return ProjectedEdgeStatus::kSteep;
   }
 
   for (size_t i = 1; i < projected_edge.size(); ++i) {
