@@ -194,9 +194,27 @@ double GroundProjection::projectGoal(Eigen::Vector3d& sample,
 }
 
 bool GroundProjection::groundStepsAdmissible(
-    const std::vector<Eigen::Vector3d>& path, bool preserve_start_height) const {
+    const std::vector<Eigen::Vector3d>& sweep_path,
+    const Eigen::Vector3d* physical_root) const {
   const double resolution = map_.getResolution();
-  if (!(resolution > 0.0) || path.size() < 2) return true;
+  if (!(resolution > 0.0) || sweep_path.size() < 2) return true;
+  // Restore the physical start for terrain only; never move the collision
+  // sweep back into the robot's exempt footprint or apply its body offset
+  // to the robot's ground evidence.
+  std::vector<Eigen::Vector3d> root_path;
+  bool hanging_root = false;
+  if (physical_root != nullptr) {
+    if (!physical_root->allFinite()) return false;
+    Eigen::Vector3d sample = *physical_root;
+    VoxelStatus status = VoxelStatus::kUnknown;
+    projectSample(sample, status);
+    hanging_root = status != VoxelStatus::kOccupied;
+    if (hanging_root) {
+      root_path = sweep_path;
+      root_path.front() = *physical_root;
+    }
+  }
+  const auto& path = hanging_root ? root_path : sweep_path;
   std::vector<double> along(path.size(), 0.0);  // distance driven to each point
   for (std::size_t i = 0; i < path.size(); ++i) {
     if (!path[i].allFinite()) return false;
@@ -228,9 +246,9 @@ bool GroundProjection::groundStepsAdmissible(
   std::vector<double> ground(samples.size(), 0.0);
   std::vector<bool> known(samples.size(), false);
   for (std::size_t i = 0; i < samples.size(); ++i) {
-    if (i == 0 && preserve_start_height) {
+    if (i == 0 && hanging_root) {
       // The root's own ground, under the robot where the map has none.
-      ground[0] = path.front().z() - params_.max_ground_height;
+      ground[0] = physical_root->z() - params_.max_ground_height;
       known[0] = true;
       continue;
     }
@@ -261,13 +279,13 @@ ProjectedEdgeStatus GroundProjection::getProjectedEdgeStatus(
     const Eigen::Vector3d& box_size, bool stop_at_unknown_voxel,
     std::vector<Eigen::Vector3d>& projected_edge_out, bool is_hanging,
     bool preserve_start_height, const EdgeBodyCheck* body,
-    EdgeTravel travel) const {
+    EdgeTravel travel, const Eigen::Vector3d* physical_root) const {
   ProfileScope timed(profile_ ? &profile_->edge_checks : nullptr);
   const double step_size = 2.0 * map_.getResolution();
   // The same projected-ground rule as final sent paths, including short
   // lattice edges. Endpoint pose heights are not a separate terrain rule,
   // except a preserved root's, which is its only ground evidence.
-  if (!groundStepsAdmissible(start, end, preserve_start_height)) {
+  if (!groundStepsAdmissible(start, end, physical_root)) {
     return ProjectedEdgeStatus::kSteep;
   }
 

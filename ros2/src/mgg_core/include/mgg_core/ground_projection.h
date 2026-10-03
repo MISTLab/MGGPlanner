@@ -180,17 +180,17 @@ class GroundProjection {
   /// by max_inclination. Clipped windows, including paths shorter than two
   /// cells, keep the native two-cell grade denominator. Unknown ground is
   /// not evidence either way; serialized pose spacing is not a grade rule.
-  /// With `preserve_start_height`, the start is a root kept at its physical
-  /// driving height (a hanging root, whose ground the lidar cannot see): its
-  /// first sample is known ground at its height less max_ground_height, so
-  /// an edge off an unmapped dock still measures the drop it starts with.
+  /// With `physical_root`, terrain sampling starts at that unoffset,
+  /// unclipped driving pose, independently of the collision sweep. Only if
+  /// no ground is observed under it, its height less max_ground_height is
+  /// known ground evidence, so an unmapped dock still measures its drop.
   bool groundStepsAdmissible(const std::vector<Eigen::Vector3d>& path,
-                             bool preserve_start_height = false) const;
+                             const Eigen::Vector3d* physical_root = nullptr) const;
   bool groundStepsAdmissible(const Eigen::Vector3d& start,
                              const Eigen::Vector3d& end,
-                             bool preserve_start_height = false) const {
+                             const Eigen::Vector3d* physical_root = nullptr) const {
     return groundStepsAdmissible(std::vector<Eigen::Vector3d>{start, end},
-                                 preserve_start_height);
+                                 physical_root);
   }
 
   /// Whether a robot could drive from `start` to `end` once both are dropped
@@ -221,6 +221,8 @@ class GroundProjection {
   /// rising no more than max_step_height is exempt from max_inclination,
   /// and the cross slope is averaged over a body length.
   ///
+  /// `preserve_start_height` affects only collision-sweep projection.
+  /// Terrain root evidence must be supplied separately as `physical_root`.
   /// With `body`, each segment is checked with its sweep instead of the
   /// map's box sweep of `box_size`, which still sizes the cross slope and
   /// the footprint plane.
@@ -230,7 +232,8 @@ class GroundProjection {
       std::vector<Eigen::Vector3d>& projected_edge_out, bool is_hanging,
       bool preserve_start_height = false,
       const EdgeBodyCheck* body = nullptr,
-      EdgeTravel travel = EdgeTravel::kBothWays) const;
+      EdgeTravel travel = EdgeTravel::kBothWays,
+      const Eigen::Vector3d* physical_root = nullptr) const;
 
   /// Sideways slope of the ground under a ground-following polyline at
   /// driving height, relative to its heading from first to last point,

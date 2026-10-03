@@ -662,6 +662,13 @@ class PlannerNodeTestPeer {
     node.ground_ = std::make_unique<mgg::GroundProjection>(
         *node.map_, node.planning_params_);
   }
+  static void captureTerrainRootAtDrivingPose(PlannerNode& node,
+                                               const mgg::StateVec& root) {
+    node.current_state_ = root;
+    node.current_state_.z() -= node.planning_params_.max_ground_height -
+                               node.robot_params_.size.z() / 2.0;
+    node.capturePlanningTerrainRoot();
+  }
   /// The final sent-path certifier (groundPosePairsAdmissible) on `path`.
   static bool sentGroundPathAdmissible(PlannerNode& node,
                                        const std::vector<mgg::StateVec>& path) {
@@ -11992,14 +11999,37 @@ TEST_F(PlannerNodeTest, SentPathFromAHangingRootOnAnUnmappedDockIsRefused) {
     return x >= 3 ? 0.0 : std::numeric_limits<double>::quiet_NaN();
   });
   std::vector<mgg::StateVec> dock{{.05, .05, 1.0, 0}, {.65, .05, .5, 0}};
+  PlannerNodeTestPeer::captureTerrainRootAtDrivingPose(*node, dock.front());
   EXPECT_FALSE(PlannerNodeTestPeer::sentGroundPathAdmissible(*node, dock));
   PlannerNodeTestPeer::shortcutAndResample(*node, dock, {});
   EXPECT_TRUE(dock.empty());
   // A blind start level with the floor is sent.
   std::vector<mgg::StateVec> level{{.05, .05, .5, 0}, {.65, .05, .5, 0}};
+  PlannerNodeTestPeer::captureTerrainRootAtDrivingPose(*node, level.front());
   EXPECT_TRUE(PlannerNodeTestPeer::sentGroundPathAdmissible(*node, level));
   PlannerNodeTestPeer::shortcutAndResample(*node, level, {});
   EXPECT_GE(level.size(), 2u);
+}
+
+TEST_F(PlannerNodeTest, SentPathUsesOnlyItsCapturedPhysicalHangingRoot) {
+  auto node = makeNode("captured_hanging_root");
+  PlannerNodeTestPeer::useTerrainTopsAlongX(*node, [](std::int64_t x) {
+    return x >= 3 ? 0.0 : std::numeric_limits<double>::quiet_NaN();
+  });
+  const std::vector<mgg::StateVec> dock{{.05, .05, 1.0, 0}, {.65, .05, .5, 0}};
+  PlannerNodeTestPeer::captureTerrainRootAtDrivingPose(*node, dock.front());
+  // New odometry must not replace the root used to plan this path.
+  PlannerNodeTestPeer::acceptOdometry(*node, 2.0, .05, 2.0);
+  EXPECT_FALSE(PlannerNodeTestPeer::sentGroundPathAdmissible(*node, dock));
+  // A different unknown start is not the captured robot pose, so it cannot
+  // manufacture physical ground evidence from an arbitrary path height.
+  const std::vector<mgg::StateVec> elsewhere{{.05, .25, 1.0, 0}, {.65, .25, .5, 0}};
+  EXPECT_TRUE(PlannerNodeTestPeer::sentGroundPathAdmissible(*node, elsewhere));
+  // A supported root never contributes synthetic height, even when given
+  // a path with the unprojected body height rather than driving height.
+  PlannerNodeTestPeer::useTerrainTopsAlongX(*node, [](std::int64_t) { return 0.0; });
+  PlannerNodeTestPeer::captureTerrainRootAtDrivingPose(*node, dock.front());
+  EXPECT_TRUE(PlannerNodeTestPeer::sentGroundPathAdmissible(*node, dock));
 }
 
 TEST_F(PlannerNodeTest, QuantisedSixteenDegreeRampWithAboveStepRisersIsSent) {

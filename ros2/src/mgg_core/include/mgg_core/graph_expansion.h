@@ -39,7 +39,8 @@ namespace mgg {
 /// body size), so the z levels of a lattice column that drop onto the same
 /// ground, from the same vertex, are checked once. Valid while the map,
 /// the context and the GroundProjection stay as they were: one build,
-/// under one map lease. Not thread-safe.
+/// under one map lease. Root edges bypass this cache: their physical terrain
+/// anchor is independent of the keyed collision sweep. Not thread-safe.
 class EdgeVerdictCache {
  public:
   using Key = std::array<std::int64_t, 12>;
@@ -124,6 +125,8 @@ struct ExpandContext {
   /// Qualified simulation bootstrap keeps the physical root at its odometry
   /// height while the first edge is projected. This applies only when vertex
   /// zero is the edge start; all later samples and endpoints remain projected.
+  /// Terrain evidence separately uses the unoffset, unclipped root state,
+  /// and only when that root is the hanging physical robot.
   bool preserve_hanging_root_start_height = false;
   /// Edges out of vertex zero (the robot) are swept from the edge of the
   /// robot's own footprint: where the robot stands is not an obstacle to it.

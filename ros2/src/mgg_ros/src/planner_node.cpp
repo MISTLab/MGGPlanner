@@ -4032,20 +4032,20 @@ bool PlannerNode::groundPathAdmissible(const mgg::PathType& points) const {
     if (!point.allFinite()) return false;
   }
   mgg::planningCheckpoint();
-  return ground_ == nullptr ||
-         ground_->groundStepsAdmissible(points, startsAtHangingRoot(points));
+  const Eigen::Vector3d* physical_root =
+      planning_terrain_root_ && !points.empty() &&
+              (points.front() - *planning_terrain_root_).norm() <= 1e-6
+          ? &*planning_terrain_root_ : nullptr;
+  return ground_ == nullptr || ground_->groundStepsAdmissible(points, physical_root);
 }
 
-bool PlannerNode::startsAtHangingRoot(const mgg::PathType& points) const {
-  // A path's start without ground under it is a hanging root: the lattice
-  // root, a departure's start or a post-spin start, all kept at the
-  // physical driving height. Its height is then its ground evidence, as
-  // the lattice's preserved root edge measures it (at least as strict).
-  if (points.empty() || ground_ == nullptr) return false;
-  Eigen::Vector3d start = points.front();
-  mgg::VoxelStatus status = mgg::VoxelStatus::kUnknown;
-  ground_->projectSample(start, status);
-  return status != mgg::VoxelStatus::kOccupied;
+void PlannerNode::capturePlanningTerrainRoot() {
+  planning_terrain_root_.reset();
+  if (robot_params_.type != mgg::RobotType::kGroundRobot || ground_ == nullptr) return;
+  mgg::StateVec root = current_state_;
+  if (!projectToDrivingHeight(root)) {
+    planning_terrain_root_ = physicalAnchorAtDrivingHeight(current_state_).head<3>();
+  }
 }
 
 bool PlannerNode::groundPosePairsAdmissible(
@@ -5916,7 +5916,9 @@ bool PlannerNode::onPlanRequestImpl(
   const auto request_bound_mode = robot_params_.bound_mode;
   // Escape memory changes only with a path actually sent (review r1, P2).
   const ReverseExitMemory request_exit_memory = saveReverseExitMemory();
+  const RestoreScope restore_terrain_root(planning_terrain_root_);
   try {
+  capturePlanningTerrainRoot();
   departure_sent_now_ = false;
   stored_reverse_sent_now_ = false;
   lattice_path_.clear();
@@ -7144,7 +7146,9 @@ void PlannerNode::onObjectiveRequestImpl(
   }};
   // Escape memory changes only with a route actually sent (review r1, P2).
   const ReverseExitMemory objective_exit_memory = saveReverseExitMemory();
+  const RestoreScope restore_terrain_root(planning_terrain_root_);
   try {
+  capturePlanningTerrainRoot();
   local_route_profile_.clear();
   // An objective supersedes exploration's last path.
   turn_back_hysteresis_.reset();

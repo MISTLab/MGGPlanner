@@ -1148,17 +1148,53 @@ TEST(GroundProjection, AHangingRootOnAnUnmappedDockKeepsItsDropAsTerrainEvidence
   const Eigen::Vector3d root(.05, .05, .5 + .5);
   const Eigen::Vector3d candidate(.65, .05, .5);
   EXPECT_TRUE(ground.groundStepsAdmissible(root, candidate));  // no evidence
-  EXPECT_FALSE(ground.groundStepsAdmissible(root, candidate, true));
+  EXPECT_FALSE(ground.groundStepsAdmissible(root, candidate, &root));
   std::vector<Eigen::Vector3d> projected;
   EXPECT_EQ(ground.getProjectedEdgeStatus(root, candidate, {.02, .02, .02}, true,
-                projected, /*is_hanging=*/true, /*preserve_start_height=*/true),
+                projected, /*is_hanging=*/true, /*preserve_start_height=*/true,
+                nullptr, mgg::EdgeTravel::kForward, &root),
             ProjectedEdgeStatus::kSteep);
   // Standing on the lower floor itself, the same blind start is admitted.
   const Eigen::Vector3d floor_root(.05, .05, .5);
-  EXPECT_TRUE(ground.groundStepsAdmissible(floor_root, candidate, true));
+  EXPECT_TRUE(ground.groundStepsAdmissible(floor_root, candidate, &floor_root));
   EXPECT_EQ(ground.getProjectedEdgeStatus(floor_root, candidate, {.02, .02, .02},
-                true, projected, true, true),
+                true, projected, true, true, nullptr,
+                mgg::EdgeTravel::kForward, &floor_root),
             ProjectedEdgeStatus::kAdmissible);
+}
+
+TEST(GroundProjection, PhysicalRootEvidenceIsIndependentOfTheClippedCollisionSweep) {
+  const auto map = columnsAlongX([](std::int64_t x) {
+    return x >= 3 ? 0.0 : std::numeric_limits<double>::quiet_NaN();
+  });
+  PlanningParams params = bunkerStepParams();
+  params.min_observed_ground_fraction = 0;
+  GroundProjection ground(map, params);
+  const Eigen::Vector3d root(.05, .05, 1.0), end(.65, .05, .5);
+  const Eigen::Vector3d direction = end - root;
+  const Eigen::Vector3d unit = direction.normalized();
+  const Eigen::Vector3d clipped = root + .7 * std::abs(unit.x()) * unit;
+  EXPECT_NEAR(clipped.x(), .4631147541, 1e-9);
+  EXPECT_NEAR(clipped.z(), .6557377049, 1e-9);
+  EXPECT_TRUE(ground.groundStepsAdmissible(clipped, end));
+  EXPECT_FALSE(ground.groundStepsAdmissible(clipped, end, &root));
+  std::vector<Eigen::Vector3d> projected;
+  EXPECT_EQ(ground.getProjectedEdgeStatus(clipped, end, {1.4, .02, .02},
+                false, projected, true, true, nullptr,
+                mgg::EdgeTravel::kForward, &root), ProjectedEdgeStatus::kSteep);
+  // The terrain anchor must not move the exempt collision sweep back to
+  // the root: a level blind start still sweeps only the caller's segment.
+  const Eigen::Vector3d level_root(.05, .05, .5), sweep_start(.45, .05, .5);
+  mgg::EdgeBodyCheck body;
+  body.sweep = [&](const Eigen::Vector3d& from, const Eigen::Vector3d&) {
+    EXPECT_TRUE(from.isApprox(sweep_start));
+    return VoxelStatus::kFree;
+  };
+  EXPECT_EQ(ground.getProjectedEdgeStatus(sweep_start, end, {.02, .02, .02},
+                false, projected, true, true, &body,
+                mgg::EdgeTravel::kForward, &level_root), ProjectedEdgeStatus::kAdmissible);
+  ASSERT_FALSE(projected.empty());
+  EXPECT_TRUE(projected.front().isApprox(sweep_start));
 }
 
 TEST(GroundProjection, Robot0LoggedRisersAreMeasuredOverNativeGroundWindows) {

@@ -402,9 +402,10 @@ class PlannerNode : public rclcpp::Node {
   /// whole route, corner segments included, two map cells apart
   /// (mgg::GroundProjection::groundStepsAdmissible). Other robots: true.
   bool groundPathAdmissible(const mgg::PathType& points) const;
-  /// Whether `points` starts where no ground is found under it, as a hanging
-  /// root does: groundPathAdmissible then takes its height as its ground.
-  bool startsAtHangingRoot(const mgg::PathType& points) const;
+  /// Capture the same physical driving root used by this request's lattice.
+  /// Never substitute a later odometry state during final certification.
+  void capturePlanningTerrainRoot();
+  std::optional<Eigen::Vector3d> planning_terrain_root_;
   bool groundPosePairsAdmissible(
       const std::vector<geometry_msgs::msg::Pose>& poses) const;
   /// Straightens a route where the map vouches for the straight segment and
