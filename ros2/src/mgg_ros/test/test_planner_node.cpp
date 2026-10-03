@@ -1517,6 +1517,9 @@ class PlannerNodeTestPeer {
   static void setMinObservedGround(PlannerNode& node, double fraction) {
     node.planning_params_.min_observed_ground_fraction = fraction;
   }
+  static void setMaxStepHeight(PlannerNode& node, double height) {
+    node.planning_params_.max_step_height = height;
+  }
   static int pathsGoingNowhere(PlannerNode& node) {
     return node.paths_going_nowhere_;
   }
@@ -4702,6 +4705,10 @@ TEST_F(PlannerNodeTest, ARobotRestingInADipStillPlans) {
   // edges, so it is off here; a hole-free ring 0.25 m up all round, a step
   // over max_step_height, has no way out at all.
   PlannerNodeTestPeer::setMinObservedGround(*node, 0.0);
+  // mgg-integ2 (ground12 review P1-1): the sent route's ground is walked two
+  // map cells apart, so a route through the holes still meets the ring's
+  // 0.25 m rise and is refused. The robot here can climb it.
+  PlannerNodeTestPeer::setMaxStepHeight(*node, 0.26);
   PlannerNodeTestPeer::observeFloor(*node, -1.5, 4.0, -1.5, 1.5, false);
   // A raised ring of floor 0.25 m up, from 0.3 m to 0.7 m out, all around.
   PlannerNodeTestPeer::observeRaisedRing(*node, 0.3, 0.7, 0.25);
