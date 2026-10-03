@@ -605,8 +605,14 @@ class PlannerNodeTestPeer {
   }
   static bool polishing(const PlannerNode& node) { return node.path_shortcut_from_ > 2; }
   // The shortcut has finished: the polished route is being certified.
+  // shortcutAndResample sets path_shortcut_to_ to its input size on entry
+  // and to the sent size only once it is done, so a positive value alone is
+  // still the shortcut (mgg-budget review r1 P2). The budget roadmaps'
+  // routes are resampled to more poses than their graph corners; a route
+  // whose sizes matched would never report this phase, and the tests
+  // assert it was reached.
   static bool certifyingPolish(const PlannerNode& node) {
-    return polishing(node) && node.path_shortcut_to_ > 0;
+    return polishing(node) && node.path_shortcut_to_ != node.path_shortcut_from_;
   }
   // The raw graph route first doubles back to a vertex inside the chassis
   // spin's offset circle, so its spin joins nothing before an initial-leg
@@ -960,6 +966,7 @@ TEST_F(PlannerNavigationTest, ObjectiveBudgetsExpiryDuringPolishCertificationKee
   auto node = botmanNode("budget_polish_certify_expiry", product);
   PlannerNodeTestPeer::standAt(*node, 0, 0, 0, M_PI, 1);
   PlannerNodeTestPeer::budgetRoadmap(*node);
+  PlannerNodeTestPeer::resetPolish(*node);
   bool expired = false;
   mgg::PlanningCancellationScope instrument([&] {
     if (!expired && PlannerNodeTestPeer::certifyingPolish(*node)) {
@@ -970,7 +977,8 @@ TEST_F(PlannerNavigationTest, ObjectiveBudgetsExpiryDuringPolishCertificationKee
   });
   auto response = std::make_shared<Service::Response>();
   PlannerNodeTestPeer::objective(*node, budgetRequest(*node, Service::Request::RETURN_HOME), response);
-  EXPECT_TRUE(expired);
+  // Expired during the polished route's final checks, not its shortcut.
+  ASSERT_TRUE(expired);
   ASSERT_EQ(response->status, Service::Response::SUCCEEDED) << response->reason;
   ASSERT_GE(response->path.size(), 2u);
   EXPECT_NEAR(response->path.back().position.x, -2, .001);
@@ -1007,9 +1015,16 @@ TEST_F(PlannerNavigationTest, ObjectiveBudgetsCancelWhileCertifyingPolishNeverRe
   auto node = botmanNode("budget_polish_certify_cancel", product);
   PlannerNodeTestPeer::standAt(*node, 0, 0, 0, M_PI, 1);
   PlannerNodeTestPeer::rawCornerRoadmap(*node);
-  mgg::PlanningCancellationScope instrument([&] { return PlannerNodeTestPeer::certifyingPolish(*node); });
+  PlannerNodeTestPeer::resetPolish(*node);
+  bool cancelled = false;
+  mgg::PlanningCancellationScope instrument([&] {
+    cancelled = cancelled || PlannerNodeTestPeer::certifyingPolish(*node);
+    return cancelled;
+  });
   auto response = std::make_shared<Service::Response>();
   PlannerNodeTestPeer::objective(*node, budgetRequest(*node, Service::Request::RETURN_HOME), response);
+  // Cancelled during the polished route's final checks, not its shortcut.
+  EXPECT_TRUE(cancelled);
   EXPECT_EQ(response->status, Service::Response::BLOCKED) << response->reason;
   EXPECT_TRUE(response->path.empty());
 }
