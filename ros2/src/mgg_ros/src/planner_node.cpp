@@ -1292,24 +1292,7 @@ std::vector<mgg::FrontierCluster> PlannerNode::liftedPeerFrontiers() {
                 a.anchor == b.anchor && a.length == b.length;
           });
   if (changed) {
-    // Remove both Boost edges and adjacency used by non-Dijkstra searches.
-    // The pool remains bounded across withdrawal and re-admission.
-    for (const int id : lifted_target_vertices_) {
-      auto* v = findGlobalVertex(id);
-      if (!v) continue;
-      if (current_global_vertex_id_ == id) global_exploration_ongoing_ = false;
-      const auto neighbours = global_graph_->edge_map_[id];
-      for (const auto& [other, cost] : neighbours) {
-        (void)cost;
-        if (auto* u = findGlobalVertex(other)) global_graph_->removeEdge(v, u);
-        auto& edges = global_graph_->edge_map_[other];
-        edges.erase(std::remove_if(edges.begin(), edges.end(),
-            [id](const auto& edge) { return edge.first == id; }), edges.end());
-      }
-      global_graph_->edge_map_[id].clear();
-      v->type = mgg::VertexType::kUnvisited;
-      v->vol_gain = mgg::VolumetricGain();
-    }
+    withdrawLiftedTargets();
     for (std::size_t i = 0; i < targets.size(); ++i) {
       auto& target = targets[i];
       auto& c = target.cluster;
@@ -1335,6 +1318,28 @@ std::vector<mgg::FrontierCluster> PlannerNode::liftedPeerFrontiers() {
   std::vector<mgg::FrontierCluster> clusters;
   for (const auto& target : lifted_targets_) clusters.push_back(target.cluster);
   return clusters;
+}
+
+void PlannerNode::withdrawLiftedTargets() {
+  // Remove both Boost edges and adjacency used by non-Dijkstra searches.
+  // The pool remains bounded across withdrawal and re-admission.
+  for (const int id : lifted_target_vertices_) {
+    auto* v = findGlobalVertex(id);
+    if (!v) continue;
+    if (current_global_vertex_id_ == id) global_exploration_ongoing_ = false;
+    const auto neighbours = global_graph_->edge_map_[id];
+    for (const auto& [other, cost] : neighbours) {
+      (void)cost;
+      if (auto* u = findGlobalVertex(other)) global_graph_->removeEdge(v, u);
+      auto& edges = global_graph_->edge_map_[other];
+      edges.erase(std::remove_if(edges.begin(), edges.end(),
+          [id](const auto& edge) { return edge.first == id; }), edges.end());
+    }
+    global_graph_->edge_map_[id].clear();
+    v->type = mgg::VertexType::kUnvisited;
+    v->vol_gain = mgg::VolumetricGain();
+  }
+  lifted_targets_.clear();
 }
 
 std::vector<mgg::FrontierCluster> PlannerNode::globalFrontierClusters() {
@@ -2162,6 +2167,15 @@ std::string PlannerNode::aerialStatusJson() const {
        ",\"reroots\":" + std::to_string(home_reroots_) +
        ",\"relink_attempts\":" + std::to_string(home_relink_attempts_) +
        ",\"relinks\":" + std::to_string(home_relinks_) + "}";
+  j += ",\"flown\":{\"breadcrumbs\":" +
+       std::to_string(flown_trail_counters_.added) +
+       ",\"merged\":" + std::to_string(flown_trail_counters_.merged) +
+       ",\"joined\":" + std::to_string(flown_trail_counters_.joined) +
+       ",\"given_up\":" + std::to_string(flown_trail_counters_.expired) +
+       ",\"capped\":" + std::to_string(flown_trail_counters_.capped) +
+       ",\"pending\":" + std::to_string(flown_trail_.pending.size()) +
+       ",\"chained\":" + (flown_trail_.head_vertex_id >= 0 ? "true" : "false") +
+       ",\"map_corrections\":" + std::to_string(map_corrections_.load()) + "}";
   j += ",\"lifted\":{\"proposed\":" + std::to_string(c.lifted_proposed) +
        ",\"admitted\":" + std::to_string(c.lifted_admitted) +
        ",\"rejected\":{\"gain\":" + std::to_string(c.lifted_rejected_gain) +
@@ -2378,6 +2392,7 @@ void PlannerNode::publishPlanningStatus() {
       ",\"heartbeats_during_planning\":" + std::to_string(heartbeats_during_planning_.load()) +
       ",\"heartbeats_validated\":" + std::to_string(mola_map_ ? mola_map_->statRevalidationCount() : 0) +
       ",\"map_identity_changes\":" + std::to_string(map_identity_changes_.load()) +
+      ",\"map_corrections\":" + std::to_string(map_corrections_.load()) +
       ",\"last_plan_component_id\":" + jsonString(planned ? planned->component_id : "") +
       ",\"last_plan_epoch\":" + std::to_string(planned ? planned->epoch : 0) +
       ",\"last_plan_geometry_revision\":" + jsonString(planned ? planned->geometry_revision : "") +
@@ -2401,12 +2416,28 @@ void PlannerNode::refreshMapRevision() {
     }
   }
   if (const auto active = mola_map_->activeRequest()) {
-    if (served_map_identity_ &&
+    // Another component or epoch is another map: nothing checked against
+    // the old one holds on it, and the graphs start again. A new
+    // component_from_navigation alone (C-SLAM re-optimising where the
+    // component lies in the planning frame) moves the same map rigidly:
+    // the graphs move with it (followMapCorrection) and keep their place
+    // in the map their edges were checked against. Resetting on it too
+    // (mapvalid m8) wiped the drone's roadmap and flown trail seven times
+    // in one SubT session (mgg-flown evidence, robot_4).
+    const bool other_map =
+        served_map_identity_ &&
         (served_map_identity_->component_id != active->component_id ||
-         served_map_identity_->epoch != active->epoch ||
-         !served_map_identity_->component_from_navigation.matrix().isApprox(
-             active->component_from_navigation.matrix(), 1e-9))) {
+         served_map_identity_->epoch != active->epoch);
+    if (served_map_identity_ && !other_map &&
+        !served_map_identity_->component_from_navigation.matrix().isApprox(
+            active->component_from_navigation.matrix(), 1e-9)) {
+      // p_component = T_old p_old = T_new p_new.
+      followMapCorrection(active->component_from_navigation.inverse() *
+                          served_map_identity_->component_from_navigation);
+    }
+    if (other_map) {
       global_graph_->reset();
+      flown_trail_ = mgg::FlownTrail{};
       local_graph_->reset();
       // Lifted slots are graph vertex IDs, not reusable across an epoch.
       lifted_target_vertices_.clear();
@@ -2446,6 +2477,58 @@ void PlannerNode::refreshMapRevision() {
   if (generation == observed_map_generation_) return;
   observed_map_generation_ = generation;
   ++map_revision_;
+}
+
+void PlannerNode::followMapCorrection(const Eigen::Isometry3d& delta) {
+  const int own = static_cast<int>(planning_params_.robot_id);
+  // Lifted targets are peers' frontiers placed by their transforms, and
+  // anchored on vertices that move: placed again by the next query.
+  withdrawLiftedTargets();
+  global_graph_->setEdgeRecertifier(
+      [this](const mgg::Vertex& a, const mgg::Vertex& b, bool terrain_changed) {
+        mgg::ExpandGraphReport report;
+        // Own aerial roadmap edges have no height band: keep flown heights.
+        // EGO enforces the execution band; only lifted peer targets use MGG's
+        // aerial_min/max_height_m.
+        return mgg::correctedRoadmapEdgeTraversable(
+            makeGlobalContext(), a, b, terrain_changed, report);
+      });
+  const int moved = mgg::transformRoadmap(*global_graph_, own, delta);
+  mgg::transformFlownTrail(flown_trail_, delta);
+  robot_state_hist_.transform(delta);
+  // Neighbours' roadmaps are placed by their own transforms, and their
+  // links to this robot's vertices were checked where those stood: cut
+  // and merged again, with fresh links, when their transform or roadmap
+  // next arrives (readmitQuarantinedNeighbours), as after a rebuild.
+  int quarantined = 0;
+  for (const auto& entry : neighbour_roadmaps_) {
+    const auto merged = global_graph_->merged_graphs_.find(entry.first);
+    if (merged != global_graph_->merged_graphs_.end() && merged->second &&
+        !global_graph_->isQuarantined(entry.first)) {
+      global_graph_->disconnectNeighbourGraph(entry.first);
+      ++quarantined;
+    }
+    if (global_graph_->isQuarantined(entry.first)) {
+      roadmaps_to_readmit_.insert(entry.first);
+    }
+  }
+  // What was planned in the old placement is planned again.
+  local_graph_->reset();
+  local_graph_->setRobotId(own);
+  best_path_.clear();
+  global_exploration_ongoing_ = false;
+  ++graph_revision_;
+  ++map_corrections_;
+  const Eigen::Vector3d shift = delta.translation();
+  RCLCPP_INFO(get_logger(),
+              "map placement corrected: the global graph follows it (%d "
+              "vertices moved by (%.2f, %.2f, %.2f), turned %.3f rad; %zu "
+              "flown samples pending; %d neighbour roadmap(s) to merge "
+              "again); %lu correction(s) so far",
+              moved, shift.x(), shift.y(), shift.z(),
+              std::atan2(delta.linear()(1, 0), delta.linear()(0, 0)),
+              flown_trail_.pending.size(), quarantined,
+              static_cast<unsigned long>(map_corrections_.load()));
 }
 
 bool PlannerNode::projectToDrivingHeight(mgg::StateVec& state) const {
@@ -3311,7 +3394,8 @@ void PlannerNode::seedGlobalGraph() {
   if (!have_odometry_) return;
   if (global_graph_->getNumVertices() == 0) {
     if (robot_params_.type == mgg::RobotType::kAerialRobot &&
-        aerial_home_height_m_ > 0.0 && !latest_flight_state_) {
+        aerial_home_height_m_ > 0.0 && !latest_flight_state_ &&
+        !home_seeded_) {
       const auto now_time = now();
       if (!home_state_wait_started_ ||
           home_state_wait_started_->nanoseconds() == 0) {
@@ -3350,16 +3434,30 @@ void PlannerNode::seedGlobalGraph() {
     // meets the floor and no edge joins it: home is aerial_home_height_m
     // over it, where it takes off to. Without that report (timed out, or a
     // planner restarted in flight) home is where the drone is.
-    home_seeded_landed_ =
-        robot_params_.type == mgg::RobotType::kAerialRobot &&
-        aerial_home_height_m_ > 0.0 &&
-        latest_flight_state_ == std::string(kFlightStateLanded);
-    home_seeded_on_timeout_ =
-        robot_params_.type == mgg::RobotType::kAerialRobot &&
-        aerial_home_height_m_ > 0.0 && !latest_flight_state_;
-    home_seed_pose_ = current_state_;
+    // That is decided at the first seed only. A later one follows a map
+    // reset (another component or epoch), usually in flight: vertex 0 is
+    // where the drone is until the keyframe rebuild puts home back,
+    // and that rebuild still lifts the pad its keyframes start on. Taking
+    // the in-flight state then put home back on the pad, unlifted, its
+    // box in the floor (mgg-flown evidence, robot_4).
+    const bool first_seed = !home_seeded_;
+    if (first_seed) {
+      home_seeded_landed_ =
+          robot_params_.type == mgg::RobotType::kAerialRobot &&
+          aerial_home_height_m_ > 0.0 &&
+          latest_flight_state_ == std::string(kFlightStateLanded);
+      home_seeded_on_timeout_ =
+          robot_params_.type == mgg::RobotType::kAerialRobot &&
+          aerial_home_height_m_ > 0.0 && !latest_flight_state_;
+      home_seed_pose_ = current_state_;
+    } else {
+      home_seeded_on_timeout_ = false;
+    }
+    home_seeded_ = true;
     mgg::StateVec root_state = current_state_;
-    if (home_seeded_landed_) root_state[2] += aerial_home_height_m_;
+    if (first_seed && home_seeded_landed_) {
+      root_state[2] += aerial_home_height_m_;
+    }
     global_root_supported_ = projectToDrivingHeight(root_state);
     if (!global_root_supported_) {
       root_state = physicalAnchorAtDrivingHeight(current_state_);
@@ -3376,7 +3474,8 @@ void PlannerNode::seedGlobalGraph() {
                 "global graph seeded at (%.2f, %.2f, %.2f)%s%s", root_state[0],
                 root_state[1], root_state[2],
                 global_root_supported_ ? "" : " (awaiting mapped support)",
-                home_seeded_landed_
+                !first_seed ? " (after a map reset)"
+                : home_seeded_landed_
                     ? " (landed: aerial_home_height_m over the pad)"
                     : "");
     return;
@@ -3564,6 +3663,10 @@ bool PlannerNode::rebuildGlobalGraphFromKeyframes(
     }
   }
   global_graph_ = rebuilt;
+  // The flown trail's breadcrumbs were the old graph's; its samples still
+  // waiting join the rebuilt one.
+  flown_trail_.head_vertex_id = -1;
+  flown_trail_.vertices_added = 0;
   global_root_supported_ = true;
   global_exploration_ongoing_ = false;
   current_global_vertex_id_ = -1;
@@ -3612,8 +3715,74 @@ bool PlannerNode::rebuildGlobalGraphFromKeyframes(
   return true;
 }
 
+void PlannerNode::advanceFlownTrail(bool sample_pose) {
+  if (robot_params_.type != mgg::RobotType::kAerialRobot || !have_odometry_ ||
+      global_graph_->getNumVertices() == 0) {
+    return;
+  }
+  mgg::FlownTrailParams params;
+  params.spacing_m = global_vertex_spacing_;
+  params.merge_radius_m = 0.5 * global_vertex_spacing_;
+  const double now_s = 1e-9 * static_cast<double>(last_odometry_stamp_ns_);
+  const bool sampled =
+      sample_pose &&
+      mgg::sampleFlownPose(flown_trail_, current_state_, now_s, params);
+  const int discarded = mgg::trimFlownTrail(flown_trail_, params, now_s);
+  flown_trail_counters_.expired += discarded;
+  if (discarded > 0) {
+    RCLCPP_WARN_THROTTLE(
+        get_logger(), *get_clock(), 5000,
+        "flown trail broken: %d pending sample(s) discarded before certification "
+        "(limit %d samples / %.0f s), map %s",
+        discarded, params.max_pending, params.patience_s,
+        map_->getStatus() ? "available" : "unavailable");
+  }
+  if (flown_trail_.pending.empty() || !map_->getStatus()) return;
+  if (sample_pose && !sampled && discarded == 0 &&
+      map_revision_ == flown_trail_map_revision_) {
+    return;
+  }
+  flown_trail_map_revision_ = map_revision_;
+  const int vertices = global_graph_->getNumVertices();
+  const int edges = global_graph_->getNumEdges();
+  const mgg::FlownTrailReport report = mgg::addFlownBreadcrumbs(
+      *global_graph_, flown_trail_, makeGlobalContext(), params, now_s);
+  if (global_graph_->getNumVertices() != vertices ||
+      global_graph_->getNumEdges() != edges) {
+    ++graph_revision_;
+  }
+  flown_trail_counters_.added += report.added;
+  flown_trail_counters_.merged += report.merged;
+  flown_trail_counters_.joined += report.joined;
+  flown_trail_counters_.expired += report.expired;
+  flown_trail_counters_.capped += report.capped;
+  if (report.expired > 0 || report.capped > 0) {
+    RCLCPP_WARN_THROTTLE(
+        get_logger(), *get_clock(), 5000,
+        "flown trail broken: %d sample(s) given up (their sweep not observed "
+        "free within %.0f s, or more than %d waiting), %d past the %d-vertex "
+        "cap; the next sample joins the global graph where it can",
+        report.expired, params.patience_s, params.max_pending, report.capped,
+        params.max_vertices);
+  }
+  if (report.added > 0 || report.joined > 0) {
+    RCLCPP_INFO_THROTTLE(
+        get_logger(), *get_clock(), 5000,
+        "flown trail: +%d breadcrumb(s), %d on existing vertices, %d joined "
+        "anew; %zu waiting for the map; %d added in all (%d vertices, %d "
+        "edges)",
+        report.added, report.merged, report.joined,
+        flown_trail_.pending.size(), flown_trail_.vertices_added,
+        global_graph_->getNumVertices(), global_graph_->getNumEdges());
+  }
+}
+
 void PlannerNode::ingestOdometryIntoGlobalGraph() {
   if (!have_odometry_ || global_graph_->getNumVertices() == 0) return;
+  // Wherever the drone flies, by whatever it was sent: not only the
+  // exploration paths, which teleoperation, an operator's goal or Return
+  // Home never add.
+  advanceFlownTrail(/*sample_pose=*/true);
   const bool add_state =
       (current_state_.head<3>() - last_state_marker_.head<3>()).norm() >=
       kOdoUpdateMinLength;
@@ -4643,6 +4812,9 @@ bool PlannerNode::routeOverGlobalGraph(const mgg::StateVec goal,
   if (!projectToDrivingHeight(current)) {
     current = physicalAnchorAtDrivingHeight(current_state_);
   }
+  // The drone departs from its latest breadcrumb: store those the map has
+  // observed since.
+  advanceFlownTrail(/*sample_pose=*/false);
   const mgg::ExpandContext ctx = makeGlobalContext();
   // An existing home/goal vertex is not free-space evidence. In particular,
   // home over the pad must be observed (or supplied as traversed-column

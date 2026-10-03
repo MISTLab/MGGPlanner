@@ -403,6 +403,19 @@ class PlannerNode : public rclcpp::Node {
   /// neighbour; every kMinLength it is recorded and event E1 marks the
   /// roadmap around it visited.
   void ingestOdometryIntoGlobalGraph();
+  /// A drone's flown trail (mgg::addFlownBreadcrumbs): with `sample_pose`,
+  /// samples the current odometry when due; stores the pending samples
+  /// when one was taken, the map changed or the oldest has waited too
+  /// long, and always without `sample_pose` (before routing from where the
+  /// drone is).
+  void advanceFlownTrail(bool sample_pose);
+  /// The map's placement in the planning frame was corrected (a new
+  /// component_from_navigation, same component and epoch): the roadmap,
+  /// the flown trail and the robot's state history move with the map by
+  /// `delta` (old planning frame to new), so each keeps its place in the
+  /// map its edges were checked against. Plan state is dropped, lifted
+  /// targets withdrawn and merged neighbours re-merged with fresh links.
+  void followMapCorrection(const Eigen::Isometry3d& delta);
   /// The root is home: the current odometry at seeding, dropped onto the
   /// terrain once mapped. An aerial anchor waits for flight_state or its
   /// timeout; only "landed" lifts it (home_seeded_landed_).
@@ -694,6 +707,9 @@ class PlannerNode : public rclcpp::Node {
   /// Configured by the fleet host; Graph messages carry no platform type.
   std::vector<std::int64_t> aerial_peer_robot_ids_;
   std::vector<mgg::FrontierCluster> liftedPeerFrontiers();
+  /// Cuts the lifted target endpoints out of the global graph and forgets
+  /// the targets; the endpoints stay pooled for the next placement.
+  void withdrawLiftedTargets();
   // Revalidate on every query; replace slots only when their accepted set
   // changes. Never roadmap anchors, own frontier evidence, or broadcasts.
   std::weak_ptr<mgg::GraphManager> lifted_target_graph_;
@@ -740,6 +756,19 @@ class PlannerNode : public rclcpp::Node {
   bool global_route_at_target_ = false;
   mgg::RandomSampler random_sampler_;
   mgg::RobotStateHistory robot_state_hist_;
+  /// Aerial: where the drone has flown, chained into the global graph
+  /// (advanceFlownTrail). Spacing is global_vertex_spacing_.
+  mgg::FlownTrail flown_trail_;
+  std::uint64_t flown_trail_map_revision_ = 0;
+  /// Totals over the trail's life, for aerial_status.
+  struct FlownTrailCounters {
+    int added = 0;
+    int merged = 0;
+    int joined = 0;
+    int expired = 0;
+    int capped = 0;
+  };
+  FlownTrailCounters flown_trail_counters_;
 
   mgg::RobotParams robot_params_;
   mgg::PlanningParams planning_params_;
@@ -778,6 +807,9 @@ class PlannerNode : public rclcpp::Node {
   mgg_msgs::msg::MappingSnapshot::ConstSharedPtr latest_snapshot_;
   std::optional<mgg::MolaSnapshotRequest> served_map_identity_;
   std::atomic<std::uint64_t> map_identity_changes_{0};
+  /// Corrections of component_from_navigation alone, which the graphs
+  /// follow (followMapCorrection) rather than being reset.
+  std::atomic<std::uint64_t> map_corrections_{0};
   std::atomic<std::uint64_t> heartbeats_received_{0};
   std::atomic<std::uint64_t> heartbeats_during_planning_{0};
   std::atomic<bool> request_active_{false};
@@ -1012,7 +1044,12 @@ class PlannerNode : public rclcpp::Node {
   /// Home was seeded while flight_state was "landed" (a drone on its pad,
   /// with aerial_home_height_m_ set), so it is that high over the pose. The
   /// keyframe rebuild lifts its first keyframe on this decision alone.
+  /// Taken at the first seeding and kept across map resets: a graph
+  /// reseeded in flight after an epoch or component change still has its
+  /// keyframes start on that pad.
   bool home_seeded_landed_ = false;
+  /// Home has been seeded once; later seeds follow a map reset.
+  bool home_seeded_ = false;
   /// Home was seeded on the flight_state wait's timeout, with no state yet,
   /// from home_seed_pose_: a late "landed" may still re-root it
   /// (rerootHomeOnLateLandedState), once.

@@ -179,6 +179,7 @@ TurnCompliantRoutes findTurnCompliantRoutes(
     const std::vector<int>& destinations,
     const SharpTurnAllowedFn& sharp_turn_allowed, int max_states,
     int start_id) {
+  const GraphManager::EdgeValidationScope validation(graph);
   TurnCompliantRoutes out;
   const auto vertex = [&graph](int id) -> Vertex* {
     const auto it = graph.vertices_map_.find(id);

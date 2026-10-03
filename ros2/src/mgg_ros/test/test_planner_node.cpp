@@ -437,6 +437,10 @@ class PlannerNodeTestPeer {
   }
   static void retainOldLiftedSlot(PlannerNode& node) { node.lifted_target_vertices_.push_back(999); }
   static bool hasLiftedSlots(PlannerNode& node) { return !node.lifted_target_vertices_.empty(); }
+  static void retainOldLiftedTarget(PlannerNode& node) {
+    node.lifted_targets_.push_back({mgg::FrontierCluster{}, 0, 0.0});
+  }
+  static bool hasLiftedTargets(PlannerNode& node) { return !node.lifted_targets_.empty(); }
   static bool acquiring(PlannerNode& node) { return node.acquiring_observations_.load(); }
   static double latestX(PlannerNode& node) {
     std::lock_guard<std::mutex> lock(node.input_mutex_);
@@ -2113,6 +2117,10 @@ class PlannerNodeTestPeer {
     }
     return false;
   }
+  static void withdrawCloudMap(PlannerNode& node) { node.cloud_map_->resetMap(); }
+  static const mgg::FlownTrail& flownTrail(PlannerNode& node) {
+    return node.flown_trail_;
+  }
   static bool repositioningOngoing(PlannerNode& node) {
     return node.global_exploration_ongoing_;
   }
@@ -2433,15 +2441,24 @@ TEST_F(PlannerNodeTest, NavigateProbePreemptsExplorationWithoutLosingTargetBias)
   EXPECT_LT(next->path.back().position.x, -1.0) << "the retained target must bias exploration west";
 }
 
-TEST_F(PlannerNodeTest, TransformOnlyChangeRetiresOldGraphSlots) {
-  auto node = makeNode("transform_reset");
+TEST_F(PlannerNodeTest, TransformOnlyChangeMovesTheGraphAndWithdrawsLiftedTargets) {
+  // mapvalid m8 reset both graphs on a transform-only change, so that
+  // nothing placed with the old component_from_navigation was used with
+  // the new one. The same map placed anew is not another map: the graph
+  // moves with it (mgg-flown), keeping its place in the map its edges were
+  // checked against. Lifted targets, placed by peers' transforms and
+  // anchored on vertices that moved, are withdrawn and placed again.
+  auto node = makeNode("transform_follow");
   MolaFloorProduct product(-1, 4, -1, 1);
   auto provider = product.serve();
   auto* map = provider.get();
   PlannerNodeTestPeer::useMolaMap(*node, std::move(provider));
   PlannerNodeTestPeer::acceptOdometry(*node, 0, 0, 1);
   PlannerNodeTestPeer::refresh(*node);
-  PlannerNodeTestPeer::retainOldLiftedSlot(*node);
+  const int vertices = PlannerNodeTestPeer::globalVertices(*node);
+  ASSERT_GT(vertices, 0);
+  const mgg::StateVec home = PlannerNodeTestPeer::globalVertexState(*node, 0);
+  PlannerNodeTestPeer::retainOldLiftedTarget(*node);
   auto moved = product.request();
   moved.component_from_navigation.translation().x() = 1;
   map->requestSnapshot(moved);
@@ -2450,7 +2467,13 @@ TEST_F(PlannerNodeTest, TransformOnlyChangeRetiresOldGraphSlots) {
          std::chrono::steady_clock::now() < deadline) std::this_thread::sleep_for(std::chrono::milliseconds(5));
   ASSERT_TRUE(map->activeRequest());
   PlannerNodeTestPeer::refresh(*node);
-  EXPECT_FALSE(PlannerNodeTestPeer::hasLiftedSlots(*node));
+  EXPECT_FALSE(PlannerNodeTestPeer::hasLiftedTargets(*node));
+  EXPECT_EQ(PlannerNodeTestPeer::globalVertices(*node), vertices);
+  // p_component = T_old p_old = T_new p_new: one metre back in x.
+  const mgg::StateVec followed = PlannerNodeTestPeer::globalVertexState(*node, 0);
+  EXPECT_NEAR(followed.x(), home.x() - 1.0, 1e-9);
+  EXPECT_NEAR(followed.y(), home.y(), 1e-9);
+  EXPECT_NEAR(followed.z(), home.z(), 1e-9);
 }
 
 TEST_F(PlannerNodeTest, FootprintGroundSupportUsesBodyCenterOffset) {
@@ -10266,6 +10289,327 @@ TEST_F(PlannerNodeTest, ADronesRebuildJudgesHomeByTheRoutesItsGraphHas) {
   EXPECT_TRUE(PlannerNodeTestPeer::rebuildRoadmap(
       *blocked, PlannerNode::RoadmapRebuildTrigger::kPathUnlinkable));
   EXPECT_EQ(PlannerNodeTestPeer::roadmapRebuildsRefused(*blocked), 0);
+}
+
+/// Odometry at (x, y, z) facing `yaw`, stamped `stamp_s` to the nanosecond.
+nav_msgs::msg::Odometry::SharedPtr flownOdometry(double x, double y, double z,
+                                                 double yaw, double stamp_s) {
+  auto msg = std::make_shared<nav_msgs::msg::Odometry>();
+  const std::int64_t ns = std::llround(stamp_s * 1e9);
+  msg->header.stamp.sec = static_cast<std::int32_t>(ns / 1000000000);
+  msg->header.stamp.nanosec = static_cast<std::uint32_t>(ns % 1000000000);
+  msg->pose.pose.position.x = x;
+  msg->pose.pose.position.y = y;
+  msg->pose.pose.position.z = z;
+  msg->pose.pose.orientation.z = std::sin(yaw / 2.0);
+  msg->pose.pose.orientation.w = std::cos(yaw / 2.0);
+  return msg;
+}
+
+/// Flies the drone from `from` to `to` at 1 m/s, an odometry message every
+/// `step` metres, facing the way it flies; returns the last stamp.
+double flyStraight(PlannerNode& node, const Eigen::Vector3d& from,
+                   const Eigen::Vector3d& to, double stamp_s,
+                   double step = 0.25) {
+  const Eigen::Vector3d leg = to - from;
+  const double yaw = std::atan2(leg.y(), leg.x());
+  const int steps = std::max(1, static_cast<int>(std::round(leg.norm() / step)));
+  for (int k = 1; k <= steps; ++k) {
+    const Eigen::Vector3d p = from + leg * k / steps;
+    stamp_s += leg.norm() / steps;
+    PlannerNodeTestPeer::acceptOdometry(
+        node, flownOdometry(p.x(), p.y(), p.z(), yaw, stamp_s));
+  }
+  return stamp_s;
+}
+
+/// Return Home to `home`, on the map `component` at `epoch` (none named:
+/// a cloud map).
+std::shared_ptr<mgg_msgs::srv::PlanObjective::Response> returnHomeTo(
+    PlannerNode& node, const mgg::StateVec& home,
+    const std::string& component = "", std::uint64_t epoch = 0) {
+  auto request = std::make_shared<mgg_msgs::srv::PlanObjective::Request>();
+  request->objective = mgg_msgs::srv::PlanObjective::Request::RETURN_HOME;
+  request->component_id = component;
+  request->map_epoch = epoch;
+  request->goal.position.x = home.x();
+  request->goal.position.y = home.y();
+  request->goal.position.z = home.z();
+  request->goal.orientation.w = 1.0;
+  auto response = std::make_shared<mgg_msgs::srv::PlanObjective::Response>();
+  PlannerNodeTestPeer::objective(node, request, response);
+  return response;
+}
+
+/// Serves `request` from `map` and waits until it is the request in force.
+void serveRequest(mgg::MolaMap& map, const mgg::MolaSnapshotRequest& request) {
+  map.requestSnapshot(request);
+  const auto deadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds(2);
+  const auto served = [&map, &request]() {
+    const auto active = map.activeRequest();
+    return active && active->epoch == request.epoch &&
+           active->component_from_navigation.matrix().isApprox(
+               request.component_from_navigation.matrix(), 1e-12);
+  };
+  while (!served() && std::chrono::steady_clock::now() < deadline) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+  }
+  ASSERT_TRUE(served()) << map.lastError();
+}
+
+TEST_F(PlannerNodeTest, FlownPendingStaysBoundedWhileTheMapIsUnavailable) {
+  auto node = makeNode("flown_map_outage");
+  PlannerNodeTestPeer::setAerialRobot(*node);
+  PlannerNodeTestPeer::observeFreeBox(*node, {0, 0, 1}, {4, 4, 2});
+  PlannerNodeTestPeer::acceptOdometry(*node, flownOdometry(0, 0, 1, 0, 1));
+  ASSERT_EQ(PlannerNodeTestPeer::globalVertices(*node), 1);
+  PlannerNodeTestPeer::withdrawCloudMap(*node);
+  // Fast sampling exercises the count limit before the age limit.
+  for (int i = 1; i <= 50; ++i) {
+    PlannerNodeTestPeer::acceptOdometry(
+        *node, flownOdometry(i, 0, 1, 0, 1 + i * 0.1));
+  }
+  EXPECT_LE(PlannerNodeTestPeer::flownTrail(*node).pending.size(), 20u);
+  EXPECT_EQ(PlannerNodeTestPeer::flownTrail(*node).head_vertex_id, -1);
+  // Hovering takes no new sample, but must still expire the queue.
+  PlannerNodeTestPeer::acceptOdometry(*node, flownOdometry(50, 0, 1, 0, 20));
+  EXPECT_TRUE(PlannerNodeTestPeer::flownTrail(*node).pending.empty());
+  PlannerNodeTestPeer::observeFreeBox(*node, {25, 0, 1}, {54, 4, 2});
+  PlannerNodeTestPeer::acceptOdometry(*node, flownOdometry(50, 0, 1, 0, 21));
+  EXPECT_TRUE(PlannerNodeTestPeer::flownTrail(*node).pending.empty());
+  EXPECT_EQ(PlannerNodeTestPeer::globalVertices(*node), 1);
+}
+
+TEST_F(PlannerNodeTest, ADroneTeleoperatedAwayReturnsHomeOverWhereItFlew) {
+  // mgg-flown (SubT 2026-10-03, robot_4): teleoperated away from where it
+  // had explored, out of its local lattice, the drone was refused Return
+  // Home 304 times ("none onto the robot's roadmap"): its global graph grew
+  // from exploration paths only. The map lags the flight (the snapshot is
+  // 0.6 to 3.6 s behind odometry), so here each corridor is observed only
+  // once the drone is past it; round the corner, the line from the old
+  // graph to the drone runs through rock never observed.
+  auto node = makeNode("flown_return_home");
+  PlannerNodeTestPeer::setAerialRobot(*node);
+  const double z = 1.0;
+  PlannerNodeTestPeer::observeFreeBox(*node, {2.0, 0.0, z}, {6.0, 2.0, 1.0});
+  double stamp = 1.0;
+  PlannerNodeTestPeer::acceptOdometry(*node,
+                                      flownOdometry(0.0, 0.0, z, 0.0, stamp));
+  ASSERT_EQ(PlannerNodeTestPeer::globalVertices(*node), 1);
+  // Its exploration graph, home to (3, 0).
+  PlannerNodeTestPeer::addGlobalChainToFrontier(
+      *node, {{0.5, 0.0}, {1.0, 0.0}, {1.5, 0.0}, {2.0, 0.0}, {2.5, 0.0},
+              {3.0, 0.0}});
+  // Teleoperated 12 m along x, then 8 m round a corner along y.
+  stamp = flyStraight(*node, {0.0, 0.0, z}, {12.0, 0.0, z}, stamp);
+  PlannerNodeTestPeer::observeFreeBox(*node, {9.0, 0.0, z}, {8.0, 2.0, 1.0});
+  stamp = flyStraight(*node, {12.0, 0.0, z}, {12.0, 8.0, z}, stamp);
+  PlannerNodeTestPeer::observeFreeBox(*node, {12.0, 4.5, z}, {2.0, 9.0, 1.0});
+  stamp += 0.25;
+  PlannerNodeTestPeer::acceptOdometry(
+      *node, flownOdometry(12.0, 8.0, z, M_PI / 2.0, stamp));
+  // Breadcrumbs along both corridors, joined to home.
+  EXPECT_TRUE(PlannerNodeTestPeer::hasGlobalVertexNear(*node, 12.0, 4.0, 0.3));
+  EXPECT_TRUE(PlannerNodeTestPeer::globalGraphRoutes(*node, {0.0, 0.0},
+                                                     {12.0, 8.0}));
+
+  const auto response = returnHomeTo(*node, mgg::StateVec(0.0, 0.0, z, 0.0));
+  ASSERT_EQ(response->status,
+            mgg_msgs::srv::PlanObjective::Response::SUCCEEDED)
+      << response->reason;
+  ASSERT_GE(response->path.size(), 2u);
+  EXPECT_NEAR(response->path.front().position.x, 12.0, 0.6);
+  EXPECT_NEAR(response->path.front().position.y, 8.0, 0.6);
+  EXPECT_NEAR(response->path.back().position.x, 0.0, 1e-3);
+  EXPECT_NEAR(response->path.back().position.y, 0.0, 1e-3);
+  // Back the way it flew: never through the rock inside the corner.
+  for (const auto& pose : response->path) {
+    EXPECT_TRUE(pose.position.x >= 10.9 || std::abs(pose.position.y) <= 1.1)
+        << pose.position.x << ", " << pose.position.y;
+  }
+  // Navigate departs from where the drone is too, to a goal on its way.
+  auto navigate = std::make_shared<mgg_msgs::srv::PlanObjective::Request>();
+  navigate->objective = mgg_msgs::srv::PlanObjective::Request::NAVIGATE;
+  navigate->goal.position.x = 7.0;
+  navigate->goal.position.z = z;
+  navigate->goal.orientation.w = 1.0;
+  auto navigated = std::make_shared<mgg_msgs::srv::PlanObjective::Response>();
+  PlannerNodeTestPeer::objective(*node, navigate, navigated);
+  ASSERT_EQ(navigated->status,
+            mgg_msgs::srv::PlanObjective::Response::SUCCEEDED)
+      << navigated->reason;
+  EXPECT_NEAR(navigated->path.front().position.y, 8.0, 0.6);
+  EXPECT_NEAR(navigated->path.back().position.x, 7.0, 1e-3);
+  for (const auto& pose : navigated->path) {
+    EXPECT_TRUE(pose.position.x >= 10.9 || std::abs(pose.position.y) <= 1.1)
+        << pose.position.x << ", " << pose.position.y;
+  }
+}
+
+TEST_F(PlannerNodeTest, MapCorrectionsMoveTheDronesGraphWithTheMapInsteadOfWipingIt) {
+  // mgg-flown evidence: robot_4's global graph was wiped and reseeded where
+  // the drone hovered seven times in one session, each time C-SLAM
+  // corrected component_from_navigation (same component, same epoch;
+  // mapvalid m8 reset on it). The map is the same map, placed anew: the
+  // graph and the flown trail move with it, and Return Home still routes
+  // to the home the caller sends through the current correction. Another
+  // epoch is another map, and still starts the graph again.
+  auto node = makeNode("flown_map_corrections");
+  PlannerNodeTestPeer::setAerialRobot(*node);
+  MolaFloorProduct product(-1, 10, -1, 1);
+  auto provider = product.serve();
+  auto* map = provider.get();
+  PlannerNodeTestPeer::useMolaMap(*node, std::move(provider));
+  const double z = 0.4;
+  double stamp = 1.0;
+  PlannerNodeTestPeer::acceptOdometry(*node,
+                                      flownOdometry(0.0, 0.0, z, 0.0, stamp));
+  ASSERT_EQ(PlannerNodeTestPeer::globalVertices(*node), 1);
+  stamp = flyStraight(*node, {0.0, 0.0, z}, {2.0, 0.0, z}, stamp);
+  ASSERT_GT(PlannerNodeTestPeer::globalVertices(*node), 2);
+  double x = 2.0;
+  double served_x = 0.0;
+  for (int k = 1; k <= 7; ++k) {
+    SCOPED_TRACE(k);
+    // Corrected by a voxel and back, in turn.
+    const double corrected_x = k % 2 == 1 ? 0.2 : 0.0;
+    auto corrected = product.request();
+    corrected.component_from_navigation.translation().x() = corrected_x;
+    const int vertices = PlannerNodeTestPeer::globalVertices(*node);
+    const mgg::StateVec home = PlannerNodeTestPeer::globalVertexState(*node, 0);
+    serveRequest(*map, corrected);
+    stamp += 0.25;
+    PlannerNodeTestPeer::acceptOdometry(*node,
+                                        flownOdometry(x, 0.0, z, 0.0, stamp));
+    // p_component = T_old p_old = T_new p_new.
+    EXPECT_GE(PlannerNodeTestPeer::globalVertices(*node), vertices);
+    EXPECT_NEAR(PlannerNodeTestPeer::globalVertexState(*node, 0).x(),
+                home.x() + served_x - corrected_x, 1e-9);
+    EXPECT_NEAR(PlannerNodeTestPeer::globalVertexState(*node, 0).z(),
+                home.z(), 1e-9);
+    served_x = corrected_x;
+    stamp = flyStraight(*node, {x, 0.0, z}, {x + 0.75, 0.0, z}, stamp);
+    x += 0.75;
+  }
+  // Home, as the caller sends it: through the correction in force.
+  const mgg::StateVec home = PlannerNodeTestPeer::globalVertexState(*node, 0);
+  EXPECT_NEAR(home.x(), -served_x, 1e-9);
+  EXPECT_TRUE(PlannerNodeTestPeer::globalGraphRoutes(*node, {home.x(), 0.0},
+                                                     {x - served_x, 0.0}));
+  const auto response = returnHomeTo(*node, home, "component:test", 1);
+  ASSERT_EQ(response->status,
+            mgg_msgs::srv::PlanObjective::Response::SUCCEEDED)
+      << response->reason;
+  EXPECT_NEAR(response->path.front().position.x, x, 0.3);
+  EXPECT_NEAR(response->path.back().position.x, home.x(), 1e-3);
+
+  // Another epoch: the graph starts again where the drone is.
+  MolaFloorProduct next(-1, 10, -1, 1, {}, {}, 2);
+  product.publishFrom(next);
+  serveRequest(*map, next.request());
+  stamp += 0.25;
+  PlannerNodeTestPeer::acceptOdometry(*node,
+                                      flownOdometry(x, 0.0, z, 0.0, stamp));
+  EXPECT_EQ(PlannerNodeTestPeer::globalVertices(*node), 1);
+  EXPECT_NEAR(PlannerNodeTestPeer::globalVertexState(*node, 0).x(), x, 1e-9);
+}
+
+TEST_F(PlannerNodeTest, ADronesHomeStaysLiftedWhenAnEpochChangeResetsItsGraphInFlight) {
+  // mgg-flown evidence (00:57:18): the map's epoch changed in flight; the
+  // graph was reseeded where the drone hovered, the seed taking the
+  // in-flight state, and the keyframe rebuild then put home back on the
+  // pad unlifted, its box in the floor: "home body not observed free",
+  // home's component one vertex. Whether home was a pad is decided once.
+  auto node = makeNode("flown_home_lift_epoch", "world",
+                       {rclcpp::Parameter("aerial_home_height_m", 0.4),
+                        rclcpp::Parameter("aerial_home_state_wait_s", 5.0)});
+  PlannerNodeTestPeer::setAerialRobot(*node);
+  MolaFloorProduct product(-1, 6, -1, 1);
+  auto provider = product.serve();
+  auto* map = provider.get();
+  PlannerNodeTestPeer::useMolaMap(*node, std::move(provider));
+  PlannerNodeTestPeer::setRoadmapRebuildInterval(*node, 0.0);
+  auto source = std::make_unique<TrajectoryInMemory>();
+  source->trajectory = keyframesAlongX(0.0, 4.0);
+  source->trajectory.epoch = 2;
+  for (std::size_t i = 1; i < source->trajectory.poses.size(); ++i) {
+    source->trajectory.poses[i].translation().z() = 0.4;
+  }
+  PlannerNodeTestPeer::setKeyframeSource(*node, std::move(source));
+  PlannerNodeTestPeer::setFlightState(*node, "landed");
+  PlannerNodeTestPeer::acceptOdometry(*node, odometryAt(0.0, 0.0, 0.075, 1));
+  ASSERT_NEAR(PlannerNodeTestPeer::globalVertexState(*node, 0).z(), 0.475,
+              1e-9);
+  PlannerNodeTestPeer::setFlightState(*node, "flying");
+  double stamp = flyStraight(*node, {0.0, 0.0, 0.4}, {4.0, 0.0, 0.4}, 1.0);
+  ASSERT_EQ(PlannerNodeTestPeer::roadmapRebuilds(*node), 0);
+
+  MolaFloorProduct next(-1, 6, -1, 1, {}, {}, 2);
+  product.publishFrom(next);
+  serveRequest(*map, next.request());
+  stamp += 0.25;
+  PlannerNodeTestPeer::acceptOdometry(*node,
+                                      flownOdometry(4.0, 0.0, 0.4, 0.0, stamp));
+  ASSERT_EQ(PlannerNodeTestPeer::roadmapRebuilds(*node), 1);
+  const mgg::StateVec home = PlannerNodeTestPeer::globalVertexState(*node, 0);
+  EXPECT_NEAR(home.x(), 0.0, 1e-9);
+  EXPECT_NEAR(home.z(), 0.475, 1e-9);
+  EXPECT_NE(PlannerNodeTestPeer::aerialStatusJson(*node).find("\"lifted\":true"),
+            std::string::npos);
+}
+
+TEST_F(PlannerNodeTest, AGroundRobotsGraphKeepsTheTrackItWasDrivenAlong) {
+  // mgg-flown item 4: a ground robot driven by hand round a corner, out of
+  // its local lattice, with no exploration path. Its graph already keeps
+  // where it drove: odometry joins it every 0.5 m (rrg.cpp:5247) where the
+  // map has the floor; where the map saw the floor only after the robot
+  // had passed, Return Home rebuilds the graph from its keyframes, the
+  // driven chain (APoseTheGraphCannotReachRebuildsItAndRoutesHome).
+  for (const bool lag : {false, true}) {
+    SCOPED_TRACE(lag ? "floor seen after the drive" : "floor seen before");
+    auto node = makeNode(lag ? "driven_track_lag" : "driven_track");
+    PlannerNodeTestPeer::observeFloor(*node, -1.5, 2.5, -1.5, 1.5);
+    const auto observe_track = [&node]() {
+      PlannerNodeTestPeer::observeFloor(*node, 2.0, 8.5, -0.7, 0.7);
+      PlannerNodeTestPeer::observeFloor(*node, 7.3, 8.7, -0.7, 5.5);
+    };
+    if (!lag) observe_track();
+    PlannerNodeTestPeer::acceptOdometry(*node, 0.0, 0.0, 1.0);
+    PlannerNodeTestPeer::addGlobalChainToFrontier(*node,
+                                                  {{0.5, 0.0}, {1.0, 0.0}});
+    double stamp = 2.0;
+    for (double x = 0.25; x <= 8.0 + 1e-9; x += 0.25) {
+      PlannerNodeTestPeer::acceptOdometryFacing(*node, x, 0.0, 0.0, stamp++);
+    }
+    for (double y = 0.25; y <= 5.0 + 1e-9; y += 0.25) {
+      PlannerNodeTestPeer::acceptOdometryFacing(*node, 8.0, y, M_PI / 2.0,
+                                                stamp++);
+    }
+    if (lag) {
+      observe_track();
+      PlannerNodeTestPeer::serveMap(*node, "component:test", 0);
+      auto source = std::make_unique<TrajectoryInMemory>();
+      source->trajectory =
+          keyframesAlong({{0.0, 0.0}, {8.0, 0.0}, {8.0, 5.0}});
+      PlannerNodeTestPeer::setKeyframeSource(*node, std::move(source));
+      PlannerNodeTestPeer::acceptOdometryFacing(*node, 8.0, 5.0, M_PI / 2.0,
+                                                stamp++);
+    }
+    const auto response = returnHome(*node, 0.0, 0.0);
+    ASSERT_EQ(response->status,
+              mgg_msgs::srv::PlanObjective::Response::SUCCEEDED)
+        << response->reason;
+    EXPECT_NEAR(response->path.front().position.x, 8.0, 0.3);
+    EXPECT_NEAR(response->path.front().position.y, 5.0, 0.3);
+    EXPECT_NEAR(response->path.back().position.x, 0.0, 1e-3);
+    EXPECT_NEAR(response->path.back().position.y, 0.0, 1e-3);
+    EXPECT_EQ(PlannerNodeTestPeer::roadmapRebuilds(*node), lag ? 1 : 0);
+    for (const auto& pose : response->path) {
+      EXPECT_TRUE(pose.position.x >= 7.2 || std::abs(pose.position.y) <= 0.8)
+          << pose.position.x << ", " << pose.position.y;
+    }
+  }
 }
 
 TEST_F(PlannerNodeTest, AClusterBehindTheRobotWithinReachStaysInTheTour) {
