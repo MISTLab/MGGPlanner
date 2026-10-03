@@ -250,14 +250,14 @@ class FakePlanner : public rclcpp::Node {
 struct ExternalExecutionRig {
   explicit ExternalExecutionRig(const std::string& ns,
                                 std::vector<std::vector<double>> path_x,
-                                int status = -2)
+                                int status = -2, double auto_period = 0.0)
       : planner(std::make_shared<FakePlanner>(ns, std::move(path_x), status)),
         pci(std::make_shared<mgg_pci::PciNode>(
             rclcpp::NodeOptions()
                 .arguments({"--ros-args", "-r", "__ns:=" + ns})
                 .parameter_overrides(
                     {rclcpp::Parameter("external_path_execution", true),
-                     rclcpp::Parameter("auto_period_sec", 0.0),
+                     rclcpp::Parameter("auto_period_sec", auto_period),
                      rclcpp::Parameter("bootstrap_distance", 0.0),
                      rclcpp::Parameter("service_timeout_sec", 2.0)}))),
         caller(std::make_shared<rclcpp::Node>(
@@ -495,4 +495,15 @@ int main(int argc, char** argv) {
   const int rc = RUN_ALL_TESTS();
   rclcpp::shutdown();
   return rc;
+}
+
+TEST(PciExternalExecution, SameInputBlockedIsNonterminalAndExplicitlyReplannable) {
+  ExternalExecutionRig rig("/same_input_blocked", {{}}, -6, 0.05);
+  ASSERT_TRUE(rig.call("pci_trigger"));
+  ASSERT_TRUE(rig.waitForStatus("planning_blocked"));
+  const auto count = rig.planner->calls();
+  std::this_thread::sleep_for(1200ms);
+  EXPECT_EQ(rig.planner->calls(), count);
+  ASSERT_TRUE(rig.call("pci_replan"));
+  EXPECT_GT(rig.planner->calls(), count);
 }

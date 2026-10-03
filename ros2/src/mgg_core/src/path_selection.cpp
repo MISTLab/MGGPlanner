@@ -246,8 +246,15 @@ PathSelectionResult selectBestPath(GraphManager& graph,
         planningCheckpoint();
         Vertex* v = path[ind];
         const double path_length = along[ind];
+        // A detour back to the root column must not lend the robot's own
+        // gain to a clear prefix. Preserve the physical root's legacy common
+        // scoring baseline; suppress only non-root collapsed candidates.
+        const bool at_ground_root = ind > 0 &&
+            robot.type == RobotType::kGroundRobot &&
+            (v->state.head<2>() - path.front()->state.head<2>()).norm() <=
+                planning.edge_length_min;
         // Hanging vertices are worth less: there is no ground under them.
-        const double vol_gain =
+        const double vol_gain = at_ground_root ? 0.0 :
             v->vol_gain.gain *
             std::exp(-static_cast<double>(v->is_hanging) *
                      planning.hanging_vertex_penalty);
@@ -344,6 +351,10 @@ PathSelectionResult selectBestPath(GraphManager& graph,
           ((path.back()->state.head<2>() - path.front()->state.head<2>())
                    .norm() <= goal_reach ||
            !(std::max(leaf.leads_to, gain) > 0.0))) {
+        // Only a positive-gain candidate could previously win the fallback.
+        // Do not turn an ordinary exhausted/gainless graph into a departure.
+        if (std::max(leaf.leads_to, gain) > 0.0)
+          result.rejected_goes_nowhere = true;
         return Ending::kGoesNowhere;
       }
       return Ending::kAdmissible;
@@ -396,7 +407,7 @@ PathSelectionResult selectBestPath(GraphManager& graph,
         }
         std::vector<Vertex*> path;
         double gain = 0.0;
-        if (ending(candidate, leaf, end, false, path, gain) ==
+        if (ending(candidate, leaf, end, true, path, gain) ==
                 Ending::kAdmissible &&
             std::max(gain, leaf.leads_to) > 0.0 &&
             (fallback_path.empty() || gain > fallback_gain ||

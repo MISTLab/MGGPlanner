@@ -1065,3 +1065,18 @@ TEST(GroundProjection, GroundAheadMemoKeepsHeadingHeightLimitAndExactPosition) {
   params.max_ground_height = 1.0;
   EXPECT_DOUBLE_EQ(cached.observedGroundAhead(point, {-1, 0}, body), 1.0);
 }
+
+TEST(GroundProjection, Robot0LoggedRejectedPairsAlsoViolateNativeContract) {
+  Terrain map;
+  PlanningParams params;
+  params.max_step_height = 0.15;
+  params.max_inclination = 27 * M_PI / 180;
+  GroundProjection ground(map, params);
+  for (auto pair : {std::pair<double, double>{0.215, 0.731}, {0.169, 0.601}}) {
+    const double run = pair.first / std::tan(pair.second);
+    std::vector<Eigen::Vector3d> projected;
+    EXPECT_EQ(ground.getProjectedEdgeStatus({0, 0, 0.5},
+                  {run, 0, 0.5 + pair.first}, {0.1, 0.1, 0.1}, true, projected, false),
+              ProjectedEdgeStatus::kSteep);
+  }
+}
