@@ -4025,15 +4025,10 @@ void PlannerNode::addFrontiers() {
 
 bool PlannerNode::groundPathAdmissible(const mgg::PathType& points) const {
   if (robot_params_.type != mgg::RobotType::kGroundRobot) return true;
-  for (std::size_t i = 0; i < points.size(); ++i) {
-    if (!points[i].allFinite()) return false;
-    if (i == 0) continue;
-    const Eigen::Vector3d segment = points[i] - points[i - 1];
-    const double rise = std::abs(segment.z());
-    if (rise > planning_params_.max_step_height + 1e-6 &&
-        std::atan2(rise, segment.head<2>().norm()) > planning_params_.max_inclination) {
-      return false;
-    }
+  // Serialized coordinates must be finite; terrain admission is exclusively
+  // the native-length projected-ground window, not adjacent pose grade.
+  for (const auto& point : points) {
+    if (!point.allFinite()) return false;
   }
   mgg::planningCheckpoint();
   return ground_ == nullptr || ground_->groundStepsAdmissible(points);
@@ -4165,18 +4160,6 @@ void PlannerNode::shortcutAndResample(std::vector<mgg::StateVec>& path,
         const double below = shortcut_ground.projectSample(probe, status);
         if (status == mgg::VoxelStatus::kOccupied) {
           resampled[i].z() -= below - planning_params_.max_ground_height;
-        }
-      }
-      // Reprojection samples different columns than the native two-map-cell
-      // edge check. Never send adjacent poses that violate that same step AND
-      // grade contract. Keep the corners, not smoothed/linear-Z terrain; the
-      // final walk below still checks the ground under every corner segment.
-      for (std::size_t i = 1; i < resampled.size(); ++i) {
-        const Eigen::Vector3d segment = resampled[i] - resampled[i - 1];
-        if (std::abs(segment.z()) > planning_params_.max_step_height + 1e-6 &&
-            std::atan2(std::abs(segment.z()), segment.head<2>().norm()) >
-                planning_params_.max_inclination) {
-          return corners;
         }
       }
     }
@@ -5802,14 +5785,7 @@ void PlannerNode::onPlanRequest(
   try {
     mgg::planningCheckpoint();
     const bool computed = onPlanRequestImpl(request, response);
-    // Certify the actual output, including short paths, corner fallbacks and
-    // departures that bypass resampling. A native contract failure is no path.
-    if (!groundPosePairsAdmissible(response->path)) {
-      response->path.clear();
-      best_path_.clear();
-      response->status = kStatusNoPath;
-      RCLCPP_WARN(get_logger(), "refused sent ground path: step/inclination contract");
-    }
+    // Impl certifies the exact serialized route inside its request budget.
     if (!no_path_identity.empty()) {
       no_path_identity += ":" + noPathPlanningInputs(scouting_revision_, no_go_.centres(),
                                                      no_go_.reaches());
@@ -5887,11 +5863,8 @@ void PlannerNode::onObjectiveRequest(
     // NAVIGATE is also used for route probes. The adapter explicitly clears
     // exploration before operator objectives; probes must preserve its state.
     onObjectiveRequestImpl(request, response);
-    if (!groundPosePairsAdmissible(response->path)) {
-      response->path.clear();
-      response->status = mgg_msgs::srv::PlanObjective::Response::BLOCKED;
-      response->reason = "sent ground path violates step/inclination contract";
-    }
+    // Impl certifies normal and departure routes before leaving its budget.
+    // The unchanged serialized result needs only the authority fence here.
     std::lock_guard<std::mutex> fence(cancellation_mutex_);
     mgg::planningCheckpoint();
   } catch (const mgg::PlanningInterrupted&) {
@@ -6306,6 +6279,14 @@ bool PlannerNode::onPlanRequestImpl(
                                 : kStatusNoPath;
   for (const mgg::StateVec& s : best_path_) {
     response->path.push_back(toPoseMsg(s));
+  }
+  // Includes short paths and departures that bypass shortcut/resampling.
+  // This final projection must remain inside the request's DeadlineScope.
+  if (!groundPosePairsAdmissible(response->path)) {
+    response->path.clear();
+    best_path_.clear();
+    response->status = kStatusNoPath;
+    summary += "; refused sent ground path: step/inclination contract";
   }
   publishMarkers();
   RCLCPP_INFO(get_logger(), "plan request: %s", summary.c_str());
@@ -7323,6 +7304,13 @@ void PlannerNode::onObjectiveRequestImpl(
             std::to_string(mgg::kDepartureMaxM) + " m";
       }
     }
+    // Departures bypass certify_route, but not the sent terrain contract or
+    // the request deadline. A refused departure must never be sent.
+    if (!groundPosePairsAdmissible(response->path)) {
+      response->path.clear();
+      response->status = Service::Response::BLOCKED;
+      response->reason = "sent ground path violates step/inclination contract";
+    }
     // Keep the remaining escape; never command an in-place turn.
   };
   const auto retain_exit = [&](bool needs_stored_exit) {
@@ -7437,6 +7425,10 @@ void PlannerNode::onObjectiveRequestImpl(
       }
     }
   }
+  // Both the selected raw fallback and polish have passed certify_route.
+  // toPoseMsg preserves their certified XYZ exactly; no geometry changes
+  // occur from here through the outer authority fence. Reuse that evidence,
+  // especially after an expired polish: never project the route again.
   if (anytime) budget.finishCertifiedResult();
   response->status = Service::Response::SUCCEEDED;
   for (const mgg::StateVec& s : route) response->path.push_back(toPoseMsg(s));

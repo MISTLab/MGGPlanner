@@ -524,6 +524,45 @@ TEST(GridGraph, GroundLatticeKeepsOneVertexPerColumnOfOneFloor) {
   EXPECT_EQ(columns.size(), graph.getNumVertices());
 }
 
+TEST(GridGraph, ExpansionUsesNativeWindowRatherThanRawProjectedPairs) {
+  std::map<std::pair<std::int64_t, std::int64_t>, double> tops;
+  for (std::int64_t x = -10; x < 20; ++x) {
+    const double top = .18 * std::round(std::max<std::int64_t>(0, x) * .2 *
+                                       std::tan(16 * M_PI / 180) / .18);
+    for (std::int64_t y = -10; y < 10; ++y) tops[{x, y}] = top;
+  }
+  const mgg_test::TerrainFixture map(.2, tops);
+  RobotParams robot;
+  robot.type = RobotType::kGroundRobot;
+  robot.size = Eigen::Vector3d::Constant(.02);
+  PlanningParams planning;
+  planning.max_ground_height = .5;
+  planning.max_step_height = .15;
+  planning.max_inclination = 27 * M_PI / 180;
+  planning.edge_length_min = .05;
+  planning.edge_length_max = 2;
+  planning.edge_overshoot = 0;
+  planning.nearest_range = 1;
+  planning.nearest_range_min = .05;
+  planning.nearest_range_max = 100;
+  const mgg::GroundProjection ground(map, planning);
+  ExpandContext ctx;
+  ctx.map = &map;
+  ctx.robot = &robot;
+  ctx.planning = &planning;
+  ctx.ground = &ground;
+  ctx.robot_box_size = robot.getPlanningSize();
+  ctx.root_is_robot = true;
+  GraphManager graph;
+  graph.addVertex(new Vertex(0, StateVec(.25, .05, .5, 0)));
+  Vertex candidate(1, StateVec(.45, .05, .68, 0));
+  ASSERT_TRUE(ground.groundStepsAdmissible(graph.getVertex(0)->state.head<3>(),
+                                         candidate.state.head<3>()));
+  mgg::ExpandGraphReport report;
+  mgg::expandGraph(graph, candidate, report, ctx);
+  EXPECT_EQ(report.num_vertices_added, 1);
+}
+
 // The merge is by ground height: within a step it is the same ground, more
 // than a step apart another level (a floor under a walkway), kept apart.
 TEST(GridGraph, LatticeColumnGroundMergesWithinAStepAndKeepsOtherLevels) {

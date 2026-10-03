@@ -968,7 +968,9 @@ TEST_F(PlannerNavigationTest, ObjectiveBudgetsExpiryDuringPolishCertificationKee
   PlannerNodeTestPeer::budgetRoadmap(*node);
   PlannerNodeTestPeer::resetPolish(*node);
   bool expired = false;
+  int post_budget_checkpoints = 0;
   mgg::PlanningCancellationScope instrument([&] {
+    if (expired && !PlannerNodeTestPeer::deadlineActive(*node)) ++post_budget_checkpoints;
     if (!expired && PlannerNodeTestPeer::certifyingPolish(*node)) {
       expired = true;
       PlannerNodeTestPeer::expireRequest(*node);
@@ -979,6 +981,8 @@ TEST_F(PlannerNavigationTest, ObjectiveBudgetsExpiryDuringPolishCertificationKee
   PlannerNodeTestPeer::objective(*node, budgetRequest(*node, Service::Request::RETURN_HOME), response);
   // Expired during the polished route's final checks, not its shortcut.
   ASSERT_TRUE(expired);
+  // Only the outer publication fence, never another ground projection walk.
+  EXPECT_EQ(post_budget_checkpoints, 1);
   ASSERT_EQ(response->status, Service::Response::SUCCEEDED) << response->reason;
   ASSERT_GE(response->path.size(), 2u);
   EXPECT_NEAR(response->path.back().position.x, -2, .001);

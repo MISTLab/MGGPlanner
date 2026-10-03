@@ -1259,6 +1259,16 @@ class PlannerNodeTestPeer {
   static int keyframeReadErrorsLogged(PlannerNode& node) {
     return node.keyframe_read_errors_logged_;
   }
+  static void planImpl(PlannerNode& node,
+                       std::shared_ptr<mgg_msgs::srv::PlannerSrv::Response> response) {
+    node.onPlanRequestImpl(std::make_shared<mgg_msgs::srv::PlannerSrv::Request>(), response);
+  }
+  static bool requestDeadlineActive(const PlannerNode& node) {
+    return node.lattice_deadline_.has_value();
+  }
+  static void expireRequestDeadline(PlannerNode& node) {
+    node.lattice_deadline_ = std::chrono::steady_clock::now() - std::chrono::seconds(1);
+  }
   static void plan(PlannerNode& node,
                    std::shared_ptr<mgg_msgs::srv::PlannerSrv::Response> response) {
     node.onPlanRequest(std::make_shared<mgg_msgs::srv::PlannerSrv::Request>(),
@@ -2986,6 +2996,30 @@ TEST_F(PlannerNodeTest, ExplorationReturnsTheWholeLatticePath) {
   EXPECT_LT(std::hypot(response->path.front().position.x - first.back().position.x,
                        response->path.front().position.y - first.back().position.y),
             0.30);
+}
+
+TEST_F(PlannerNodeTest, ExplorationFinalTerrainCertificationUsesRequestDeadline) {
+  auto node = makeNode("explore_final_terrain_budget");
+  PlannerNodeTestPeer::observeFloor(*node, -1.5, 4.0, -1.5, 1.5);
+  PlannerNodeTestPeer::acceptOdometry(*node, 0, 0, 1);
+  auto response = std::make_shared<mgg_msgs::srv::PlannerSrv::Response>();
+  bool final_phase_reached = false;
+  bool deadline_active = false;
+  mgg::PlanningCancellationScope instrument([&] {
+    if (!final_phase_reached && !response->path.empty()) {
+      final_phase_reached = true;
+      deadline_active = PlannerNodeTestPeer::requestDeadlineActive(*node);
+      PlannerNodeTestPeer::expireRequestDeadline(*node);
+    }
+    return false;
+  });
+  // Exercise the implementation's own DeadlineScope with a checkpoint probe;
+  // the public exploration handler installs its independent authority fence.
+  PlannerNodeTestPeer::planImpl(*node, response);
+  ASSERT_TRUE(final_phase_reached);
+  EXPECT_TRUE(deadline_active);
+  EXPECT_TRUE(response->path.empty());
+  EXPECT_EQ(response->status, PlannerNode::kStatusNotReady);
 }
 
 TEST_F(PlannerNodeTest, FullyMappedGroundFixtureCompletesWithoutAnExplorationSpin) {
@@ -5804,6 +5838,48 @@ TEST_F(PlannerNodeTest, ReturnHomeFromANarrowEndpointUsesAndKeepsTheReverseCorri
   EXPECT_NEAR(response->path.back().position.x, request->goal.position.x, 0.001);
   EXPECT_NEAR(response->path.back().position.y, request->goal.position.y, 0.001);
   EXPECT_NEAR(response->path.back().position.z, request->goal.position.z, 0.001);
+}
+
+TEST_F(PlannerNodeTest, ObjectiveDepartureTerrainCertificationUsesRequestDeadline) {
+  using Service = mgg_msgs::srv::PlanObjective;
+  MolaFloorProduct map(-2, 7, -2, 2,
+      {{{0.8, 7, 0.4, 0.6}}, {{0.8, 7, -0.6, -0.4}}});
+  auto node = makeNode("departure_terrain_budget");
+  PlannerNodeTestPeer::seeGroundContinuation(*node);
+  PlannerNodeTestPeer::useMolaMap(*node, map.serve());
+  PlannerNodeTestPeer::serveMap(*node, "component:test", 1);
+  PlannerNodeTestPeer::setRobotFootprint(*node, 1.0, 0.3);
+  PlannerNodeTestPeer::setLattice(*node, {0, 0}, {5.5, 0});
+  PlannerNodeTestPeer::acceptOdometryFacing(*node, 0, 0, 0, 1);
+  auto entry = std::make_shared<mgg_msgs::srv::PlannerSrv::Response>();
+  PlannerNodeTestPeer::plan(*node, entry);
+  ASSERT_GE(entry->path.size(), 2u);
+  ASSERT_GT(entry->path.back().position.x, 4.0);
+  PlannerNodeTestPeer::acceptOdometryFacing(*node, entry->path.back().position.x, 0, 0, 2);
+  auto request = std::make_shared<Service::Request>();
+  request->component_id = "component:test";
+  request->map_epoch = 1;
+  request->objective = Service::Request::RETURN_HOME;
+  request->goal.position.x = -0.8;
+  request->goal.position.z = entry->path.front().position.z;
+  request->goal.orientation.w = 1;
+  auto response = std::make_shared<Service::Response>();
+  bool final_phase_reached = false;
+  bool deadline_active = false;
+  mgg::PlanningCancellationScope instrument([&] {
+    if (!final_phase_reached && !response->path.empty()) {
+      final_phase_reached = true;
+      deadline_active = PlannerNodeTestPeer::requestDeadlineActive(*node);
+      PlannerNodeTestPeer::expireRequestDeadline(*node);
+    }
+    return false;
+  });
+  PlannerNodeTestPeer::objective(*node, request, response);
+  ASSERT_TRUE(final_phase_reached);
+  EXPECT_TRUE(deadline_active);
+  EXPECT_TRUE(response->path.empty());
+  EXPECT_EQ(response->status, Service::Response::UNREACHABLE) << response->reason;
+  EXPECT_NE(response->reason.find("budget exceeded"), std::string::npos);
 }
 
 TEST_F(PlannerNodeTest, ARefugeArrivalBandNeedsNoSecondDepartureAfterAnEarlyStop) {
@@ -11845,6 +11921,34 @@ TEST_F(PlannerNodeTest, ResamplingKeepsGroundStepsWithinTheExistingLimit) {
                 std::atan2(std::abs(delta.z()), delta.head<2>().norm()) <= 27 * M_PI / 180);
   }
   EXPECT_TRUE(PlannerNodeTestPeer::sentGroundPathAdmissible(*node, sent));
+}
+
+TEST_F(PlannerNodeTest, TwoPoseGroundPathRefusesInteriorColumnsAtNativeSpacing) {
+  auto node = makeNode("two_pose_interior_columns");
+  for (double rise : {0.215, 0.4}) {
+    SCOPED_TRACE(rise);
+    PlannerNodeTestPeer::useResamplingTestTerrain(*node, rise);
+    std::vector<mgg::StateVec> path{{.05, .05, .5, 0}, {.55, .05, .5, 0}};
+    EXPECT_FALSE(PlannerNodeTestPeer::sentGroundPathAdmissible(*node, path));
+    PlannerNodeTestPeer::shortcutAndResample(*node, path, {});
+    EXPECT_TRUE(path.empty());
+  }
+}
+
+TEST_F(PlannerNodeTest, QuantisedSixteenDegreeRampWithAboveStepRisersIsSent) {
+  auto node = makeNode("eighteen_centimetre_risers");
+  const auto top = [](std::int64_t x) {
+    return .18 * std::round(std::max<std::int64_t>(0, x) * .2 *
+                            std::tan(16 * M_PI / 180) / .18);
+  };
+  PlannerNodeTestPeer::useTerrainTopsAlongX(*node, top);
+  std::vector<mgg::StateVec> path;
+  for (int i = 0; i <= 12; ++i) path.emplace_back(.05 + .2*i, .05, .5 + top(i), 0);
+  // The rise exceeds the step threshold but is only 24.2 degrees over two cells.
+  EXPECT_TRUE(PlannerNodeTestPeer::sentGroundPathAdmissible(*node, path));
+  PlannerNodeTestPeer::shortcutAndResample(*node, path, {});
+  ASSERT_GE(path.size(), 2u);
+  EXPECT_TRUE(PlannerNodeTestPeer::sentGroundPathAdmissible(*node, path));
 }
 
 TEST_F(PlannerNodeTest, UncertifiedTwoPoseGroundPathIsRefused) {

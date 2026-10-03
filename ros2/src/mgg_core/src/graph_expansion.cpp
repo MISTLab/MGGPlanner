@@ -317,18 +317,9 @@ void expandGraphFrom(GraphManager& graph, Vertex& new_vertex,
           ctx.planning->nearest_range_z) {
     admissible_edge = false;
   }
-  // Re-check segment inclination. getProjectedEdgeStatus already rejects
-  // steep edges, so this is redundant for ground robots and a no-op for
-  // aerial ones (projected_edge stays empty). Kept because removing it would
-  // be a behaviour change on a path this port cannot yet exercise end to end.
-  for (size_t i = 1; i < projected_edge.size(); ++i) {
-    const Eigen::Vector3d segment = projected_edge[i] - projected_edge[i - 1];
-    if (std::abs(segment(2)) > ctx.planning->max_step_height + 1e-6 &&
-        std::atan2(std::abs(segment(2)), segment.head(2).norm()) >
-        ctx.planning->max_inclination) {
-      admissible_edge = false;
-    }
-  }
+  // Ground terrain was certified by getProjectedEdgeStatus's native window.
+  // Rechecking its projected vertices as raw pairs would reject admissible
+  // quantised ramps solely because a short edge straddles one riser.
 
   if (!admissible_edge) {
     rep.status = ExpandGraphStatus::kErrorCollisionEdge;

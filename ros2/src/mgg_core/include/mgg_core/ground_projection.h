@@ -174,18 +174,12 @@ class GroundProjection {
   /// how far below `sample` the ground lies, negative when above.
   double projectGoal(Eigen::Vector3d& sample, VoxelStatus& status) const;
 
-  /// Whether the ground under `path`, a polyline of points at driving
-  /// height, keeps MGG's step-AND-grade rule (no rise above
-  /// max_step_height steeper than max_inclination) at the native edge-check
-  /// spacing, two map cells: the ground every half cell along the path,
-  /// corners included, is compared with the ground two cells further
-  /// along, and the end with the ground two cells before it. Never over a
-  /// shorter run: a quantised ramp's riser is steep over one cell but
-  /// within one step over two (not the 0.25 m pair rule). A path shorter
-  /// than two cells is left to its end points, as the native check leaves
-  /// a short edge; on a path shorter than four cells the points within two
-  /// cells of both ends have no partner. Points without known ground are
-  /// not evidence either way.
+  /// MGG's step-AND-grade rule over projected ground sampled every map
+  /// cell along the polyline, plus its endpoint. In each two-cell window,
+  /// max-minus-min must not exceed both max_step_height and the rise allowed
+  /// by max_inclination. Clipped windows, including paths shorter than two
+  /// cells, keep the native two-cell grade denominator. Unknown ground is
+  /// not evidence either way; serialized pose spacing is not a grade rule.
   bool groundStepsAdmissible(const std::vector<Eigen::Vector3d>& path) const;
   bool groundStepsAdmissible(const Eigen::Vector3d& start,
                              const Eigen::Vector3d& end) const {
@@ -194,15 +188,11 @@ class GroundProjection {
 
   /// Whether a robot could drive from `start` to `end` once both are dropped
   /// onto the ground, filling `projected_edge_out` with the ground-following
-  /// polyline when it can.
+  /// polyline when it can. Terrain admission uses groundStepsAdmissible.
   ///
-  /// PRECONDITION, inherited from the ROS 1 code and easy to miss: `start` and
-  /// `end` must ALREADY sit at driving height, i.e. max_ground_height above
-  /// the ground. Intermediate samples are height-corrected as they are
-  /// generated, but the endpoint is appended as given, without correction. Feed
-  /// it raw endpoints and the final segment jumps by whatever the height
-  /// mismatch is, and the edge is rejected as kSteep. Rrg::expandGraph
-  /// satisfies this by projecting the new state before calling in.
+  /// `start` and `end` should already sit at driving height, i.e.
+  /// max_ground_height above the ground, so the downward probes find the
+  /// intended surface. Rrg::expandGraph projects the new state before calling.
   ///
   /// Once the edge is known to be clear, the ground under the robot's two
   /// sides is compared: see crossSlope. An edge whose cross slope exceeds

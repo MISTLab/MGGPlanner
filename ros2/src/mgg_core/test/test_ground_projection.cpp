@@ -192,16 +192,17 @@ TEST(GroundProjection, FlatEdgeIsAdmissible) {
   EXPECT_FALSE(path.empty());
 }
 
-TEST(GroundProjection, SteepEdgeIsRejectedBeforeAnyMapQuery) {
+TEST(GroundProjection, EndpointAboveProjectionReachIsRefusedAsHanging) {
   Terrain map;
   PlanningParams params = makeParams();
   GroundProjection gp(map, params);
 
   std::vector<Eigen::Vector3d> path;
-  // Straight up: far past max_inclination.
+  // A pose far above the floor is not evidence of steep terrain. Projection
+  // cannot reach its support: still refused, by the existing hanging check.
   const auto s = gp.getProjectedEdgeStatus({0.0, 0.0, 0.5}, {0.2, 0.0, 5.0},
                                            {0.4, 0.4, 0.4}, true, path, false);
-  EXPECT_EQ(s, ProjectedEdgeStatus::kSteep);
+  EXPECT_EQ(s, ProjectedEdgeStatus::kHanging);
 }
 
 TEST(GroundProjection, EdgeOverAPitHangs) {
@@ -1067,21 +1068,6 @@ TEST(GroundProjection, GroundAheadMemoKeepsHeadingHeightLimitAndExactPosition) {
   EXPECT_DOUBLE_EQ(cached.observedGroundAhead(point, {-1, 0}, body), 1.0);
 }
 
-TEST(GroundProjection, Robot0LoggedRejectedPairsAlsoViolateNativeContract) {
-  Terrain map;
-  PlanningParams params;
-  params.max_step_height = 0.15;
-  params.max_inclination = 27 * M_PI / 180;
-  GroundProjection ground(map, params);
-  for (auto pair : {std::pair<double, double>{0.215, 0.731}, {0.169, 0.601}}) {
-    const double run = pair.first / std::tan(pair.second);
-    std::vector<Eigen::Vector3d> projected;
-    EXPECT_EQ(ground.getProjectedEdgeStatus({0, 0, 0.5},
-                  {run, 0, 0.5 + pair.first}, {0.1, 0.1, 0.1}, true, projected, false),
-              ProjectedEdgeStatus::kSteep);
-  }
-}
-
 namespace {
 /// Columns on 0.2 m cells: x index -> top, the same across y.
 mgg_test::TerrainFixture columnsAlongX(const std::function<double(std::int64_t)>& top) {
@@ -1122,10 +1108,8 @@ TEST(GroundProjection, AShortEdgeKeepsTheStepContractBetweenItsEnds) {
   EXPECT_EQ(ground.getProjectedEdgeStatus({0.05, 0.05, 0.5}, {0.75, 0.05, 0.5},
                                           {0.02, 0.02, 0.02}, true, projected, false),
             ProjectedEdgeStatus::kSteep);
-  // The lane's 0.5 m corner segment alone: the column lies within two cells
-  // of both ends, which the native spacing cannot compare; the route the
-  // segment belongs to is walked as a whole.
-  EXPECT_TRUE(ground.groundStepsAdmissible({0.05, 0.05, 0.5}, {0.55, 0.05, 0.5}));
+  // The standalone two-pose segment must include the interior column too.
+  EXPECT_FALSE(ground.groundStepsAdmissible({0.05, 0.05, 0.5}, {0.55, 0.05, 0.5}));
   EXPECT_FALSE(ground.groundStepsAdmissible(
       {{0.05, 0.05, 0.5}, {0.55, 0.05, 0.5}, {1.05, 0.05, 0.5}}));
   // Round a corner too: two cells along the path, not across.
@@ -1135,6 +1119,47 @@ TEST(GroundProjection, AShortEdgeKeepsTheStepContractBetweenItsEnds) {
   const auto step = columnsAlongX([](std::int64_t x) { return x == 1 ? 0.4 : 0.0; });
   GroundProjection stepped(step, params);
   EXPECT_FALSE(stepped.groundStepsAdmissible({0.05, 0.05, 0.5}, {0.75, 0.05, 0.5}));
+  for (const auto* projection : {&ground, &stepped}) {
+    EXPECT_FALSE(projection->groundStepsAdmissible({0.05, 0.05, 0.5}, {0.55, 0.05, 0.5}));
+    EXPECT_EQ(projection->getProjectedEdgeStatus({0.05, 0.05, 0.5}, {0.55, 0.05, 0.5},
+                  {0.02, 0.02, 0.02}, true, projected, false), ProjectedEdgeStatus::kSteep);
+    // Even shorter than a native window: clipped samples, native denominator.
+    EXPECT_FALSE(projection->groundStepsAdmissible({0.05, 0.05, 0.5}, {0.25, 0.05, 0.5}));
+  }
+}
+
+TEST(GroundProjection, Robot0LoggedRisersAreMeasuredOverNativeGroundWindows) {
+  const PlanningParams params = bunkerStepParams();
+  for (auto pair : {std::pair<double, double>{0.215, 0.731}, {0.169, 0.601}}) {
+    const auto map = columnsAlongX([&](std::int64_t x) { return x >= 1 ? pair.first : 0.0; });
+    GroundProjection ground(map, params);
+    const double run = pair.first / std::tan(pair.second);
+    std::vector<Eigen::Vector3d> projected;
+    // Unlike the old synthetic flat-map test, the mapped riser is present.
+    // 0.215 exceeds 27 degrees over 0.4 m; 0.169 does not, regardless of
+    // the raw adjacent-pose inclination in the original log.
+    const auto status = ground.getProjectedEdgeStatus({.05, .05, .5},
+        {.05 + run, .05, .5 + pair.first}, {.02, .02, .02}, true, projected, false);
+    EXPECT_EQ(status == ProjectedEdgeStatus::kSteep, pair.first > .2);
+  }
+}
+
+TEST(GroundProjection, AboveStepRisersOnASixteenDegreeRampPassShortNativeEdges) {
+  const auto top = [](std::int64_t x) {
+    return .18 * std::round(std::max<std::int64_t>(0, x) * .2 *
+                            std::tan(16 * M_PI / 180) / .18);
+  };
+  const auto map = columnsAlongX(top);
+  const PlanningParams params = bunkerStepParams();
+  GroundProjection ground(map, params);
+  for (int i = 0; i < 12; ++i) {
+    const Eigen::Vector3d start(.05 + .2*i, .05, .5 + top(i));
+    const Eigen::Vector3d end(.05 + .2*(i+1), .05, .5 + top(i+1));
+    std::vector<Eigen::Vector3d> projected;
+    EXPECT_TRUE(ground.groundStepsAdmissible(start, end));
+    EXPECT_NE(ground.getProjectedEdgeStatus(start, end, {.02, .02, .02},
+                  true, projected, false), ProjectedEdgeStatus::kSteep) << i;
+  }
 }
 
 TEST(GroundProjection, AQuantisedSixteenDegreeRampKeepsTheStepContract) {

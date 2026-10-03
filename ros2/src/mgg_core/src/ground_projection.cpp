@@ -5,6 +5,7 @@
 #include <cmath>
 #include <cstring>
 #include <functional>
+#include <limits>
 #include <map>
 #include <utility>
 
@@ -202,9 +203,7 @@ bool GroundProjection::groundStepsAdmissible(
     if (i > 0) along[i] = along[i - 1] + (path[i] - path[i - 1]).head<2>().norm();
   }
   const double length = along.back();
-  const double spacing = 0.5 * resolution;
   const double baseline = 2.0 * resolution;
-  if (length < baseline - 1e-9) return true;
   // The ground under the path `s` along it, if known.
   const auto ground_at = [&](double s, double& ground) {
     checkpoint_.check();
@@ -221,24 +220,34 @@ bool GroundProjection::groundStepsAdmissible(
     ground = sample_z - below;
     return status == VoxelStatus::kOccupied;
   };
-  const auto keeps_contract = [&](double from_ground, double to_ground) {
-    const double rise = std::abs(to_ground - from_ground);
-    return !(rise > params_.max_step_height + 1e-6 &&
-             std::atan2(rise, baseline) > params_.max_inclination);
-  };
-  const int cells = static_cast<int>(std::floor(length / spacing + 1e-9));
-  std::vector<double> ground(cells + 1, 0.0);
-  std::vector<bool> known(cells + 1, false);
-  for (int k = 0; k <= cells; ++k) known[k] = ground_at(k * spacing, ground[k]);
-  const int ahead = static_cast<int>(std::lround(baseline / spacing));
-  for (int k = 0; k + ahead <= cells; ++k) {
-    if (known[k] && known[k + ahead] && !keeps_contract(ground[k], ground[k + ahead])) {
-      return false;
-    }
+  // Sampling is along the whole polyline, independent of serialized pose
+  // spacing. Include the endpoint even when it falls between cell samples.
+  std::vector<double> samples;
+  for (double s = 0.0; s < length - 1e-9; s += resolution) samples.push_back(s);
+  samples.push_back(length);
+  std::vector<double> ground(samples.size(), 0.0);
+  std::vector<bool> known(samples.size(), false);
+  for (std::size_t i = 0; i < samples.size(); ++i) {
+    known[i] = ground_at(samples[i], ground[i]);
   }
-  double before = 0.0, end = 0.0;
-  return !(ground_at(length - baseline, before) && ground_at(length, end) &&
-           !keeps_contract(before, end));
+  // Every native-length window includes its interior, not just its ends.
+  // Starting at each sample covers every distinct set of sampled heights.
+  // Clipped windows (including a path shorter than two cells) retain the
+  // native denominator: a quantised riser is not a raw adjacent-pose grade.
+  for (std::size_t i = 0; i < samples.size(); ++i) {
+    checkpoint_.check();
+    double low = std::numeric_limits<double>::infinity();
+    double high = -std::numeric_limits<double>::infinity();
+    for (std::size_t j = i; j < samples.size() && samples[j] - samples[i] <= baseline + 1e-9; ++j) {
+      if (!known[j]) continue;
+      low = std::min(low, ground[j]);
+      high = std::max(high, ground[j]);
+    }
+    const double rise = high - low;
+    if (rise > params_.max_step_height + 1e-6 &&
+        std::atan2(rise, baseline) > params_.max_inclination) return false;
+  }
+  return true;
 }
 
 ProjectedEdgeStatus GroundProjection::getProjectedEdgeStatus(
@@ -249,12 +258,11 @@ ProjectedEdgeStatus GroundProjection::getProjectedEdgeStatus(
     EdgeTravel travel) const {
   ProfileScope timed(profile_ ? &profile_->edge_checks : nullptr);
   const double step_size = 2.0 * map_.getResolution();
-  const double max_inclination = params_.max_inclination;
+  // The same projected-ground rule as final sent paths, including short
+  // lattice edges. Endpoint pose heights are not a separate terrain rule.
+  if (!groundStepsAdmissible(start, end)) return ProjectedEdgeStatus::kSteep;
 
   const Eigen::Vector3d ray = end - start;
-  const double edge_incl =
-      std::atan2(std::abs(ray(2)), std::abs(ray.head(2).norm()));
-  if (std::abs(ray(2)) > params_.max_step_height + 1e-6 && edge_incl > max_inclination) return ProjectedEdgeStatus::kSteep;
 
   const double ray_len = ray.norm();
   if (ray_len < 1e-12) return ProjectedEdgeStatus::kAdmissible;
@@ -318,21 +326,6 @@ ProjectedEdgeStatus GroundProjection::getProjectedEdgeStatus(
     end_m(2) -= (ground_height - params_.max_ground_height);
   projected_edge.push_back(end_m);
 
-
-  // Inclination of each segment. Cheaper than a collision check, so first.
-  for (size_t i = 1; i < projected_edge.size(); ++i) {
-    checkpoint_.check();
-    const Eigen::Vector3d segment = projected_edge[i] - projected_edge[i - 1];
-    const double theta =
-        std::atan2(std::abs(segment(2)), std::abs(segment.head(2).norm()));
-    if (std::abs(segment(2)) > params_.max_step_height + 1e-6 &&
-        std::abs(theta) > max_inclination) return ProjectedEdgeStatus::kSteep;
-  }
-  // A short edge was projected at its ends only: a column between them
-  // (ground12 review P1-1, 0.215 m under a 0.5 m edge) went unseen.
-  if (ray_len < 2.0 * step_size && !groundStepsAdmissible(start, end)) {
-    return ProjectedEdgeStatus::kSteep;
-  }
 
   for (size_t i = 1; i < projected_edge.size(); ++i) {
     checkpoint_.check();

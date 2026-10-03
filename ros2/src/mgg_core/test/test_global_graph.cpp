@@ -2686,6 +2686,12 @@ TEST(TransformRoadmap, RollMakesAGroundEdgeTooSteepOnNextSearch) {
   Eigen::Isometry3d delta = Eigen::Isometry3d::Identity();
   delta.linear() = Eigen::AngleAxisd(0.6, Eigen::Vector3d::UnitX()).toRotationMatrix();
   mgg::transformRoadmap(scene.graph, 0, delta);
+  // The corrected map must carry the tilted floor too. Endpoint pose tilt
+  // alone over an unchanged flat map is no longer a terrain refusal: the
+  // shared native window certifies projected ground, not raw pose pairs.
+  scene.map = mgg_test::TerrainFixture(0.2, TrajectoryScene::tops(
+      [](std::int64_t, std::int64_t y) { return (y + .5) * .2 * std::tan(.6); }));
+  EXPECT_FALSE(scene.ground.groundStepsAdmissible(a->state.head<3>(), b->state.head<3>()));
   EXPECT_TRUE(scene.graph.graph_->edgeExists(0, 1));  // lazy, not at correction
   EXPECT_EQ(full_checks, 0);
   EXPECT_FALSE(scene.reachable(0, 1));
