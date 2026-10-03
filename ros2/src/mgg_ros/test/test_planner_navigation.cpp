@@ -582,6 +582,9 @@ class PlannerNodeTestPeer {
     node.shortcutAndResample(path, {}, {}, true);
   }
 
+  static void expireRequest(PlannerNode& node) {
+    node.lattice_deadline_ = std::chrono::steady_clock::now() - std::chrono::seconds(1);
+  }
   static void setBudget(PlannerNode& node, double seconds) {
     node.lattice_time_budget_s_ = seconds;
     node.navigate_time_budget_s_ = seconds;
