@@ -201,7 +201,8 @@ struct DeadlineScope {
         outer_(mgg::planning_cancelled), started_(std::chrono::steady_clock::now()),
         cancellation_([this] {
           if (outer_ && (*outer_)()) { cancelled_ = true; return true; }
-          exhausted_ = deadline_ && std::chrono::steady_clock::now() >= *deadline_;
+          exhausted_ = !certified_result_ && deadline_ &&
+                       std::chrono::steady_clock::now() >= *deadline_;
           if (exhausted_ && diagnosing_) interrupted_diagnosis_ = *diagnosing_;
           return exhausted_;
         }) {
@@ -223,6 +224,20 @@ struct DeadlineScope {
   const bool* diagnosing_ = nullptr;
   bool exhausted_ = false;
   bool cancelled_ = false;
+  bool certified_result_ = false;
+  // A global fallback gets the long-route budget from the original start,
+  // never a fresh five seconds. An enclosing deadline is still authoritative.
+  void useBudget(double seconds) {
+    if (previous_) return;
+    deadline_.reset();
+    if (seconds > 0.0) {
+      deadline_ = started_ + std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+          std::chrono::duration<double>(seconds));
+    }
+  }
+  // Only after full certification: no more geometry work, just serialize and
+  // fence the result. The outer cancellation/authority predicate stays active.
+  void finishCertifiedResult() { certified_result_ = true; }
   mgg::PlanningCancellationScope cancellation_;
   std::string reason() const {
     const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -716,14 +731,25 @@ PlannerNode::PlannerNode(const rclcpp::NodeOptions& options)
         "strictly above the planning body bottom; USING STRICT UNKNOWN POLICY",
         unknown_body_sensor_.c_str());
   }
-  // The most one request (an objective, a plan request) spends sweeping
-  // lattices, seconds: past it a sweep stops and the request plans over
-  // what it built, or refuses with the budget named. A planning call longer
-  // than the MOLA snapshot TTL (3 s) let the map expire under the next
-  // request (botman, 2026-10-01). 0 is no bound.
+  // Ground exploration is cyclic; operator objectives are rarer and may
+  // traverse the whole roadmap. Aerial planning retains its unbounded policy.
+  // Keep lattice_time_budget_s as exploration's existing parameter (0 unbound).
   lattice_time_budget_s_ = std::max(
       0.0, declareOrGet<double>(this, "lattice_time_budget_s",
                                 lattice_time_budget_s_));
+  navigate_time_budget_s_ = std::max(
+      0.0, declareOrGet<double>(this, "navigate_time_budget_s",
+                                navigate_time_budget_s_));
+  global_route_time_budget_s_ = std::max(
+      0.0, declareOrGet<double>(this, "global_route_time_budget_s",
+                                global_route_time_budget_s_));
+  RCLCPP_INFO(get_logger(),
+      "planning budgets: ground exploration (lattice_time_budget_s)=%.3f s, "
+      "NAVIGATE local (navigate_time_budget_s)=%.3f s, RETURN_HOME/global NAVIGATE "
+      "(global_route_time_budget_s)=%.3f s; 0=unbounded; aerial requests unbounded; "
+      "ground exploration lattice soft slice=%.3f s",
+      lattice_time_budget_s_, navigate_time_budget_s_, global_route_time_budget_s_,
+      ground_exploration_lattice_budget_s_);
   // A lidar does not see the ground under the robot: within its blind radius
   // a keyframe map holds no floor, so the graph root has no support until
   // the robot has driven away from where it stands. The root then sits at
@@ -5368,8 +5394,7 @@ bool PlannerNode::routeOverLocalLattice(const mgg::StateVec& goal,
     reason = local.reason;
     if (local.lattice.hit_deadline) {
       if (peer_diagnosis_deadline_) peer_diagnosis_cut_short_ = true;
-      reason += " (the lattice stopped at its time budget, " +
-                std::to_string(lattice_time_budget_s_) + " s)";
+      reason += " (the lattice stopped at its request deadline)";
     }
     return false;
   }
@@ -7259,9 +7284,11 @@ void PlannerNode::onObjectiveRequestImpl(
   applyLatestOdometry();
   refreshMapRevision();
   StandingStartScope standing_scope(*this);
-  const DeadlineScope budget(lattice_deadline_,
-      robot_params_.type == mgg::RobotType::kGroundRobot ? lattice_time_budget_s_ : 0.0,
-      &peer_diagnosis_in_progress_);
+  const bool bounded_ground = robot_params_.type == mgg::RobotType::kGroundRobot;
+  DeadlineScope budget(lattice_deadline_, bounded_ground
+      ? (request->objective == Service::Request::RETURN_HOME
+          ? global_route_time_budget_s_ : navigate_time_budget_s_)
+      : 0.0, &peer_diagnosis_in_progress_);
   // Every answer is logged with the objective, where the robot is and the
   // goal it asked for: a refusal alone does not say which objective it
   // answered or where it was going (run 5, 2026-09-25).
@@ -7386,6 +7413,7 @@ void PlannerNode::onObjectiveRequestImpl(
       routeOverLocalLattice(goal, route, turns_ok, local_reason);
   const int rebuilds_before = roadmap_rebuilds_;
   peer_diagnosis_cut_short_ = false;
+  if (!local && bounded_ground) budget.useBudget(global_route_time_budget_s_);
   bool routed =
       local || routeOverGlobalGraph(goal, tolerance, route, turns_ok, reason);
   if (home_is_vertex_zero && roadmap_rebuilds_ != rebuilds_before) {
@@ -7455,62 +7483,79 @@ void PlannerNode::onObjectiveRequestImpl(
     response->reason = reason;
     return;
   }
-  shortcutAndResample(route, turns_ok, nullptr, /*lattice_route=*/local);
-  mgg::PathType objective_points;
-  for (const auto& pose : route) objective_points.push_back(pose.head<3>());
-  // Check the actual route being sent, even without retained escape memory.
-  // No SUCCEEDED objective may start with a turn at a room-less root.
-  if (routeStartsWithTurnWithoutRoom(objective_points)) {
-    mgg::StateVec start = current_state_;
-    if (!projectToDrivingHeight(start)) start = physicalAnchorAtDrivingHeight(current_state_);
-    std::string exit_note;
-    std::vector<mgg::StateVec> exit_path;
-    if (validateStoredReverseExit(start, exit_path, exit_note) && !exit_path.empty()) {
-      keepReverseDeparture(exit_path);
-      response->status = Service::Response::DEPARTURE_FIRST;
-      response->reason = "stored reverse exit revalidated to refuge; request the objective again from there";
-      route_note = response->reason;
-      for (const auto& pose : exit_path) response->path.push_back(toPoseMsg(pose));
-    } else {
-      if (exit_note.empty()) exit_note = "; stored reverse exit unavailable at projected current pose";
-      mgg::Departure departure;
-      if (straightDeparture(start, departure, /*arrival_band=*/true)) {
-        response->status = Service::Response::DEPARTURE_FIRST;
-        response->reason = std::string("validated departure ") +
-            (departure.reverse ? "in reverse" : "ahead") +
-            "; request the objective again from its end" + exit_note;
-        route_note = response->reason;
-        for (const auto& pose : departure.path) response->path.push_back(toPoseMsg(pose));
-      } else {
-        response->status = Service::Response::BLOCKED;
-        response->reason = "objective requires a departure" + exit_note +
-            "; validated departure refused: no terrain-clear leg with turn room within " +
-            std::to_string(mgg::kDepartureMaxM) + " m";
-      }
+  const bool anytime = bounded_ground && !local;
+  if (!anytime) {
+    shortcutAndResample(route, turns_ok, nullptr, /*lattice_route=*/local);
+  } else {
+    // The unpolished graph route must also carry outgoing headings, as the
+    // shortcut normally supplies them. Do not interpolate uncertified leaps.
+    for (std::size_t i = 0; i + 1 < route.size(); ++i) {
+      const Eigen::Vector2d step = (route[i + 1] - route[i]).head<2>();
+      if (step.norm() > 1e-9) route[i][3] = std::atan2(step.y(), step.x());
     }
-    return;  // keep the remaining escape; never command an in-place turn
+    if (route.size() > 1) route.back()[3] = route[route.size() - 2][3];
   }
-  if (!startPathAfterChassisSpin(route, local)) {
-    response->status = Service::Response::UNREACHABLE;
-    response->reason = "post-spin reference cannot join the route safely";
-    return;
-  }
-  if (!route.empty() && !standingStartGoalAdmissible(route.back())) {
-    response->status = Service::Response::UNREACHABLE;
-    response->reason = "the goal intersects the standing-start arrival band";
-    return;
-  }
-  if (!noGoAdmissible(route)) {
-    response->status = Service::Response::UNREACHABLE;
-    response->reason = "the route enters a no-go zone";
-    return;
-  }
-  if (!peerAdmissible(route)) {
-    response->status = Service::Response::BLOCKED;
-    response->reason = "blocked by a peer: the route meets a peer body";
-    return;
-  }
-  if (!route.empty() && currentPoseNeedsStoredExit()) {
+  const auto certify_route = [&](bool allow_departure) {
+    mgg::PathType objective_points;
+    for (const auto& pose : route) objective_points.push_back(pose.head<3>());
+    // Check the actual route being sent, even without retained escape memory.
+    // No SUCCEEDED objective may start with a turn at a room-less root.
+    if (routeStartsWithTurnWithoutRoom(objective_points)) {
+      if (!allow_departure) return false;
+      mgg::StateVec start = current_state_;
+      if (!projectToDrivingHeight(start)) start = physicalAnchorAtDrivingHeight(current_state_);
+      std::string exit_note;
+      std::vector<mgg::StateVec> exit_path;
+      if (validateStoredReverseExit(start, exit_path, exit_note) && !exit_path.empty()) {
+        keepReverseDeparture(exit_path);
+        response->status = Service::Response::DEPARTURE_FIRST;
+        response->reason = "stored reverse exit revalidated to refuge; request the objective again from there";
+        route_note = response->reason;
+        for (const auto& pose : exit_path) response->path.push_back(toPoseMsg(pose));
+      } else {
+        if (exit_note.empty()) exit_note = "; stored reverse exit unavailable at projected current pose";
+        mgg::Departure departure;
+        if (straightDeparture(start, departure, /*arrival_band=*/true)) {
+          response->status = Service::Response::DEPARTURE_FIRST;
+          response->reason = std::string("validated departure ") +
+              (departure.reverse ? "in reverse" : "ahead") +
+              "; request the objective again from its end" + exit_note;
+          route_note = response->reason;
+          for (const auto& pose : departure.path) response->path.push_back(toPoseMsg(pose));
+        } else {
+          response->status = Service::Response::BLOCKED;
+          response->reason = "objective requires a departure" + exit_note +
+              "; validated departure refused: no terrain-clear leg with turn room within " +
+              std::to_string(mgg::kDepartureMaxM) + " m";
+        }
+      }
+      return false;  // keep the remaining escape; never command an in-place turn
+    }
+    if (!startPathAfterChassisSpin(route, local)) {
+      response->status = Service::Response::UNREACHABLE;
+      response->reason = "post-spin reference cannot join the route safely";
+      return false;
+    }
+    if (!route.empty() && !standingStartGoalAdmissible(route.back())) {
+      response->status = Service::Response::UNREACHABLE;
+      response->reason = "the goal intersects the standing-start arrival band";
+      return false;
+    }
+    if (!noGoAdmissible(route)) {
+      response->status = Service::Response::UNREACHABLE;
+      response->reason = "the route enters a no-go zone";
+      return false;
+    }
+    if (!peerAdmissible(route)) {
+      response->status = Service::Response::BLOCKED;
+      response->reason = "blocked by a peer: the route meets a peer body";
+      return false;
+    }
+    return true;
+  };
+  if (!certify_route(/*allow_departure=*/true)) return;
+  const bool needs_stored_exit = !route.empty() && currentPoseNeedsStoredExit();
+  if (needs_stored_exit) {
     const std::string refusal = retainReverseExit(route, false);
     if (!refusal.empty()) {
       response->reason = "escape corridor not retained: " + refusal;
@@ -7519,6 +7564,32 @@ void PlannerNode::onObjectiveRequestImpl(
   } else {
     stored_reverse_exit_.clear();
   }
+  // A retained reverse corridor belongs to its certified route: do not
+  // optionally rewrite it. Otherwise polish transactionally under the same
+  // map lease, and keep the certified graph route if time runs out.
+  if (anytime && !needs_stored_exit) {
+    const auto certified_route = route;
+    const auto certified_response = *response;
+    bool kept_certified = false;
+    try {
+      mgg::planningCheckpoint();
+      shortcutAndResample(route, turns_ok, nullptr, /*lattice_route=*/false);
+      if (!certify_route(/*allow_departure=*/false)) kept_certified = true;
+      mgg::planningCheckpoint();
+    } catch (const mgg::PlanningInterrupted&) {
+      if (budget.cancelled_ || !budget.exhausted_) throw;
+      kept_certified = true;
+    }
+    if (kept_certified) {
+      route = certified_route;
+      *response = certified_response;
+      path_shortcut_corners_ = static_cast<int>(route.size());
+      path_shortcut_to_ = path_shortcut_corners_;
+      if (!reason.empty()) reason += "; ";
+      reason += "kept certified global route without final shortcut polish";
+    }
+  }
+  if (anytime) budget.finishCertifiedResult();
   response->status = Service::Response::SUCCEEDED;
   for (const mgg::StateVec& s : route) response->path.push_back(toPoseMsg(s));
   char note[160];
