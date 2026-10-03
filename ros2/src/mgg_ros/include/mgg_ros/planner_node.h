@@ -167,6 +167,22 @@ class PlannerNode : public rclcpp::Node {
       std::vector<mgg::StateVec>& path, std::string& note,
       std::string* unusable_here = nullptr);
   void keepReverseDeparture(const std::vector<mgg::StateVec>& path);
+  /// The escape memory a request may change before its answer is final:
+  /// stored reverse exit, entry path and retreating flag. A request that
+  /// sends nothing (deadline expiry, refused final terrain certification)
+  /// restores what it held before.
+  struct ReverseExitMemory {
+    std::vector<mgg::StateVec> exit, entry;
+    bool retreating = false;
+  };
+  ReverseExitMemory saveReverseExitMemory() const {
+    return {stored_reverse_exit_, reverse_exit_entry_path_, stored_reverse_retreating_};
+  }
+  void restoreReverseExitMemory(const ReverseExitMemory& memory) {
+    stored_reverse_exit_ = memory.exit;
+    reverse_exit_entry_path_ = memory.entry;
+    stored_reverse_retreating_ = memory.retreating;
+  }
   void retainEntryPastRefuge(const std::vector<mgg::StateVec>& reverse);
   bool reverseExitEndpointExcluded(const mgg::StateVec& pose) const;
   /// Within the radius of a given-up exclusion: unreachable from here.
@@ -386,6 +402,9 @@ class PlannerNode : public rclcpp::Node {
   /// whole route, corner segments included, two map cells apart
   /// (mgg::GroundProjection::groundStepsAdmissible). Other robots: true.
   bool groundPathAdmissible(const mgg::PathType& points) const;
+  /// Whether `points` starts where no ground is found under it, as a hanging
+  /// root does: groundPathAdmissible then takes its height as its ground.
+  bool startsAtHangingRoot(const mgg::PathType& points) const;
   bool groundPosePairsAdmissible(
       const std::vector<geometry_msgs::msg::Pose>& poses) const;
   /// Straightens a route where the map vouches for the straight segment and

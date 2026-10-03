@@ -276,6 +276,46 @@ TEST(GraphMerge, EdgesTooSteepForTheReceiverAreNotTakenOver) {
   EXPECT_EQ(s.edges_added, 2);
 }
 
+TEST(GraphMerge, IncomingEdgesKeepTheNativeGroundWindowRule) {
+  // review-r1 P2: an incoming ground edge is judged by the native two-cell
+  // window over straight ground between its vertex ground heights, not by
+  // its raw endpoint grade. A Bunker receiver on 0.2 m cells.
+  mgg::ReceiverPlatform bunker;
+  bunker.max_step_height = 0.15;
+  bunker.max_inclination = 27 * M_PI / 180;
+  bunker.map_resolution = 0.2;
+  // Flat 1 m lead-in, then the edge under test: `run` along, `rise` up.
+  const auto too_steep = [](double run, double rise, const mgg::ReceiverPlatform& platform) {
+    GraphManager gm;
+    buildOwnGraph(gm);
+    StaticPoseSource poses;
+    poses.setOffset(2, 0.0, 1.0);
+    GraphExchange g = neighbourGraph();
+    g.vertices[2].state = StateVec(1.0 + run, 0.0, rise, 0.0);
+    const auto r = mergeNeighbourGraph(gm, g, poses, kAlwaysAdmissible, 5.0, platform);
+    EXPECT_TRUE(r.merged);
+    return r.edges_too_steep;
+  };
+  // Short edge, 0.3 m: a 0.18 m riser is 24.2 degrees over the 0.4 m window
+  // (the raw pair grade, 31 degrees, used to refuse it); 0.215 m is 28.3.
+  EXPECT_EQ(too_steep(0.3, 0.18, bunker), 0);
+  EXPECT_EQ(too_steep(0.3, 0.215, bunker), 1);
+  // Long edge, 1 m: a uniform 31 degree climb rises 0.24 m per window and
+  // is refused; 24.2 degrees is admitted.
+  EXPECT_EQ(too_steep(1.0, 0.6, bunker), 1);
+  EXPECT_EQ(too_steep(1.0, 0.45, bunker), 0);
+  // Long edge, 2 m, steeper than a 0.2 rad limit: refused only where a
+  // window rises past the step, as on mapped ground.
+  mgg::ReceiverPlatform gentle = bunker;
+  gentle.max_inclination = 0.2;
+  EXPECT_EQ(too_steep(2.0, 0.5, gentle), 0);   // 0.10 m per window
+  EXPECT_EQ(too_steep(2.0, 0.9, gentle), 1);   // 0.18 m per window
+  // Without the receiver's resolution the window is the whole edge.
+  mgg::ReceiverPlatform unset = bunker;
+  unset.map_resolution = 0.0;
+  EXPECT_EQ(too_steep(0.3, 0.18, unset), 1);
+}
+
 TEST(GraphMerge, MergedVerticesFollowAMovedTransform) {
   GraphManager gm;
   buildOwnGraph(gm);

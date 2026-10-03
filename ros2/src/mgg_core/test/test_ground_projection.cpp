@@ -1073,7 +1073,10 @@ namespace {
 mgg_test::TerrainFixture columnsAlongX(const std::function<double(std::int64_t)>& top) {
   std::map<std::pair<std::int64_t, std::int64_t>, double> tops;
   for (std::int64_t x = -10; x < 30; ++x) {
-    for (std::int64_t y = -10; y < 10; ++y) tops[{x, y}] = top(x);
+    // A NaN top leaves the column unmapped.
+    for (std::int64_t y = -10; y < 10; ++y) {
+      if (!std::isnan(top(x))) tops[{x, y}] = top(x);
+    }
   }
   return mgg_test::TerrainFixture(0.2, tops);
 }
@@ -1126,6 +1129,36 @@ TEST(GroundProjection, AShortEdgeKeepsTheStepContractBetweenItsEnds) {
     // Even shorter than a native window: clipped samples, native denominator.
     EXPECT_FALSE(projection->groundStepsAdmissible({0.05, 0.05, 0.5}, {0.25, 0.05, 0.5}));
   }
+}
+
+TEST(GroundProjection, AHangingRootOnAnUnmappedDockKeepsItsDropAsTerrainEvidence) {
+  // review-r1 P1: the robot stands on a 0.5 m dock top its lidar has not
+  // mapped (cells x < 3, beyond the 0.4 m projection probes from x = 0.05),
+  // so its root hangs at its physical driving height.
+  // The candidate 0.6 m away is on the mapped lower floor. Every projected
+  // sample is on that floor: without the root's own height, no window sees
+  // the 0.5 m drop.
+  const auto map = columnsAlongX([](std::int64_t x) {
+    return x >= 3 ? 0.0 : std::numeric_limits<double>::quiet_NaN();
+  });
+  PlanningParams params = bunkerStepParams();
+  // Isolate terrain: a 2 cm test body measures no observed-ground fraction.
+  params.min_observed_ground_fraction = 0;
+  GroundProjection ground(map, params);
+  const Eigen::Vector3d root(.05, .05, .5 + .5);
+  const Eigen::Vector3d candidate(.65, .05, .5);
+  EXPECT_TRUE(ground.groundStepsAdmissible(root, candidate));  // no evidence
+  EXPECT_FALSE(ground.groundStepsAdmissible(root, candidate, true));
+  std::vector<Eigen::Vector3d> projected;
+  EXPECT_EQ(ground.getProjectedEdgeStatus(root, candidate, {.02, .02, .02}, true,
+                projected, /*is_hanging=*/true, /*preserve_start_height=*/true),
+            ProjectedEdgeStatus::kSteep);
+  // Standing on the lower floor itself, the same blind start is admitted.
+  const Eigen::Vector3d floor_root(.05, .05, .5);
+  EXPECT_TRUE(ground.groundStepsAdmissible(floor_root, candidate, true));
+  EXPECT_EQ(ground.getProjectedEdgeStatus(floor_root, candidate, {.02, .02, .02},
+                true, projected, true, true),
+            ProjectedEdgeStatus::kAdmissible);
 }
 
 TEST(GroundProjection, Robot0LoggedRisersAreMeasuredOverNativeGroundWindows) {

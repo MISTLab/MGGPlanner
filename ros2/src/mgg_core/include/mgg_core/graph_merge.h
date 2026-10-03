@@ -145,12 +145,20 @@ struct ReceiverPlatform {
   /// states carry ground height (GraphExchangeVertex::state), so this is
   /// added after the transform.
   double driving_height = 0.0;
-  /// An edge rising more than max_step_height at a grade steeper than
-  /// max_inclination is not taken over, the rule ground projection applies to
-  /// this robot's own edges. A neighbour of another platform may drive what
-  /// this one cannot.
+  /// A neighbour of another platform may drive what this one cannot. An
+  /// incoming edge is judged by the window rule ground projection applies to
+  /// this robot's own edges and sent paths (GroundProjection::
+  /// groundStepsAdmissible), on the only ground evidence the exchange
+  /// carries: its two vertices' ground heights, with straight ground between
+  /// them. In a window of two map cells (2 * map_resolution) such ground
+  /// rises dz * min(1, window / length); the edge is not taken over when
+  /// that rise exceeds max_step_height and its grade over the window exceeds
+  /// max_inclination. An edge shorter than the window keeps the window as
+  /// its grade denominator, as a quantised riser does natively.
   double max_step_height = std::numeric_limits<double>::infinity();
   double max_inclination = std::numeric_limits<double>::infinity();
+  /// This robot's map cell size. Unset (0), the window is the whole edge.
+  double map_resolution = 0.0;
   /// Aerial receivers revalidate incoming edges on their own observed map;
   /// a ground neighbour's relaxed unknown policy is not flight evidence.
   RobotType type = RobotType::kGroundRobot;

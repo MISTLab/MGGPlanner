@@ -3236,6 +3236,7 @@ mgg::ReceiverPlatform PlannerNode::receiverPlatform() const {
     platform.driving_height = planning_params_.max_ground_height;
     platform.max_step_height = planning_params_.max_step_height;
     platform.max_inclination = planning_params_.max_inclination;
+    if (map_) platform.map_resolution = map_->getResolution();
   }
   return platform;
 }
@@ -4031,7 +4032,20 @@ bool PlannerNode::groundPathAdmissible(const mgg::PathType& points) const {
     if (!point.allFinite()) return false;
   }
   mgg::planningCheckpoint();
-  return ground_ == nullptr || ground_->groundStepsAdmissible(points);
+  return ground_ == nullptr ||
+         ground_->groundStepsAdmissible(points, startsAtHangingRoot(points));
+}
+
+bool PlannerNode::startsAtHangingRoot(const mgg::PathType& points) const {
+  // A path's start without ground under it is a hanging root: the lattice
+  // root, a departure's start or a post-spin start, all kept at the
+  // physical driving height. Its height is then its ground evidence, as
+  // the lattice's preserved root edge measures it (at least as strict).
+  if (points.empty() || ground_ == nullptr) return false;
+  Eigen::Vector3d start = points.front();
+  mgg::VoxelStatus status = mgg::VoxelStatus::kUnknown;
+  ground_->projectSample(start, status);
+  return status != mgg::VoxelStatus::kOccupied;
 }
 
 bool PlannerNode::groundPosePairsAdmissible(
@@ -5900,6 +5914,8 @@ bool PlannerNode::onPlanRequestImpl(
   const DeadlineScope budget(lattice_deadline_,
       robot_params_.type == mgg::RobotType::kGroundRobot ? lattice_time_budget_s_ : 0.0);
   const auto request_bound_mode = robot_params_.bound_mode;
+  // Escape memory changes only with a path actually sent (review r1, P2).
+  const ReverseExitMemory request_exit_memory = saveReverseExitMemory();
   try {
   departure_sent_now_ = false;
   stored_reverse_sent_now_ = false;
@@ -6285,6 +6301,7 @@ bool PlannerNode::onPlanRequestImpl(
   if (!groundPosePairsAdmissible(response->path)) {
     response->path.clear();
     best_path_.clear();
+    restoreReverseExitMemory(request_exit_memory);
     response->status = kStatusNoPath;
     summary += "; refused sent ground path: step/inclination contract";
   }
@@ -6326,6 +6343,7 @@ bool PlannerNode::onPlanRequestImpl(
     if (budget.cancelled_) throw;
     best_path_.clear();
     lattice_path_.clear();
+    restoreReverseExitMemory(request_exit_memory);
     response->path.clear();
     response->status = kStatusNotReady;
     RCLCPP_WARN(get_logger(), "plan request refused: %s", budget.reason().c_str());
@@ -7124,6 +7142,8 @@ void PlannerNode::onObjectiveRequestImpl(
                 objective, current_state_.x(), current_state_.y(), g.x, g.y,
                 g.z, status, response->reason.c_str());
   }};
+  // Escape memory changes only with a route actually sent (review r1, P2).
+  const ReverseExitMemory objective_exit_memory = saveReverseExitMemory();
   try {
   local_route_profile_.clear();
   // An objective supersedes exploration's last path.
@@ -7281,8 +7301,9 @@ void PlannerNode::onObjectiveRequestImpl(
     if (!projectToDrivingHeight(start)) start = physicalAnchorAtDrivingHeight(current_state_);
     std::string exit_note;
     std::vector<mgg::StateVec> exit_path;
+    bool stored_exit_sent = false;
     if (validateStoredReverseExit(start, exit_path, exit_note) && !exit_path.empty()) {
-      keepReverseDeparture(exit_path);
+      stored_exit_sent = true;
       response->status = Service::Response::DEPARTURE_FIRST;
       response->reason = "stored reverse exit revalidated to refuge; request the objective again from there";
       route_note = response->reason;
@@ -7305,11 +7326,14 @@ void PlannerNode::onObjectiveRequestImpl(
       }
     }
     // Departures bypass certify_route, but not the sent terrain contract or
-    // the request deadline. A refused departure must never be sent.
+    // the request deadline. A refused departure must never be sent, nor its
+    // escape remembered: the stored exit is kept only once it is certified.
     if (!groundPosePairsAdmissible(response->path)) {
       response->path.clear();
       response->status = Service::Response::BLOCKED;
       response->reason = "sent ground path violates step/inclination contract";
+    } else if (stored_exit_sent) {
+      keepReverseDeparture(exit_path);
     }
     // Keep the remaining escape; never command an in-place turn.
   };
@@ -7338,18 +7362,9 @@ void PlannerNode::onObjectiveRequestImpl(
     // is not final. Then the base order (shortcut, then the same checks)
     // decides; the raw route stands in when the deadline cuts that short or
     // the polished route fails its checks. Cancellation always aborts.
-    struct ReverseExitMemory {
-      std::vector<mgg::StateVec> exit, entry;
-      bool retreating;
-    };
-    const auto save_exit = [this] {
-      return ReverseExitMemory{stored_reverse_exit_, reverse_exit_entry_path_,
-                               stored_reverse_retreating_};
-    };
+    const auto save_exit = [this] { return saveReverseExitMemory(); };
     const auto restore_exit = [this](const ReverseExitMemory& memory) {
-      stored_reverse_exit_ = memory.exit;
-      reverse_exit_entry_path_ = memory.entry;
-      stored_reverse_retreating_ = memory.retreating;
+      restoreReverseExitMemory(memory);
     };
     const std::vector<mgg::StateVec> graph_route = route;
     const auto request_response = *response;
@@ -7453,6 +7468,7 @@ void PlannerNode::onObjectiveRequestImpl(
       response->reason = budget.reason();
       throw;
     }
+    restoreReverseExitMemory(objective_exit_memory);
     response->path.clear();
     response->status = budget.cancelled_
         ? mgg_msgs::srv::PlanObjective::Response::BLOCKED

@@ -26,14 +26,20 @@ StateVec placeState(const StateVec& state,
   return StateVec(p_ours.x(), p_ours.y(), p_ours.z() + driving_height, yaw);
 }
 
-/// Within this robot's step and grade limits, the rule ground projection
-/// applies to its own edges (ground_projection.cpp).
+/// Within this robot's step and grade limits: GroundProjection::
+/// groundStepsAdmissible's native window over the edge's straight ground
+/// between its two vertex ground heights (ReceiverPlatform).
 bool climbable(const Vertex& a, const Vertex& b,
                const ReceiverPlatform& platform) {
   const Eigen::Vector3d ray = b.state.head<3>() - a.state.head<3>();
+  const double length = ray.head<2>().norm();
   const double rise = std::abs(ray.z());
-  return rise <= platform.max_step_height + 1e-6 ||
-         std::atan2(rise, ray.head<2>().norm()) <= platform.max_inclination;
+  const double window = platform.map_resolution > 0.0
+                            ? 2.0 * platform.map_resolution : length;
+  const double window_rise =
+      length > window ? rise * window / length : rise;
+  return window_rise <= platform.max_step_height + 1e-6 ||
+         std::atan2(window_rise, window) <= platform.max_inclination;
 }
 
 Vertex* makeVertex(GraphManager& graph, const GraphExchangeVertex& v,

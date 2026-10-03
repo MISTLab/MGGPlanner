@@ -194,7 +194,7 @@ double GroundProjection::projectGoal(Eigen::Vector3d& sample,
 }
 
 bool GroundProjection::groundStepsAdmissible(
-    const std::vector<Eigen::Vector3d>& path) const {
+    const std::vector<Eigen::Vector3d>& path, bool preserve_start_height) const {
   const double resolution = map_.getResolution();
   if (!(resolution > 0.0) || path.size() < 2) return true;
   std::vector<double> along(path.size(), 0.0);  // distance driven to each point
@@ -228,6 +228,12 @@ bool GroundProjection::groundStepsAdmissible(
   std::vector<double> ground(samples.size(), 0.0);
   std::vector<bool> known(samples.size(), false);
   for (std::size_t i = 0; i < samples.size(); ++i) {
+    if (i == 0 && preserve_start_height) {
+      // The root's own ground, under the robot where the map has none.
+      ground[0] = path.front().z() - params_.max_ground_height;
+      known[0] = true;
+      continue;
+    }
     known[i] = ground_at(samples[i], ground[i]);
   }
   // Every native-length window includes its interior, not just its ends.
@@ -259,8 +265,11 @@ ProjectedEdgeStatus GroundProjection::getProjectedEdgeStatus(
   ProfileScope timed(profile_ ? &profile_->edge_checks : nullptr);
   const double step_size = 2.0 * map_.getResolution();
   // The same projected-ground rule as final sent paths, including short
-  // lattice edges. Endpoint pose heights are not a separate terrain rule.
-  if (!groundStepsAdmissible(start, end)) return ProjectedEdgeStatus::kSteep;
+  // lattice edges. Endpoint pose heights are not a separate terrain rule,
+  // except a preserved root's, which is its only ground evidence.
+  if (!groundStepsAdmissible(start, end, preserve_start_height)) {
+    return ProjectedEdgeStatus::kSteep;
+  }
 
   const Eigen::Vector3d ray = end - start;
 

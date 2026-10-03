@@ -26,6 +26,7 @@
 #include <optional>
 #include <string>
 #include <thread>
+#include <tuple>
 #include <vector>
 
 #include <geometry_msgs/msg/transform_stamped.hpp>
@@ -577,6 +578,12 @@ class PlannerNodeTestPeer {
   static std::size_t storedReversePoses(const PlannerNode& node) {
     return node.stored_reverse_exit_.size();
   }
+  /// Stored reverse exit, entry path and retreating flag, comparable.
+  static std::tuple<std::vector<mgg::StateVec>, std::vector<mgg::StateVec>, bool>
+  reverseExitMemory(const PlannerNode& node) {
+    return {node.stored_reverse_exit_, node.reverse_exit_entry_path_,
+            node.stored_reverse_retreating_};
+  }
   static std::string executeStoredReverse(PlannerNode& node,
                                            const std::vector<mgg::StateVec>& route) {
     node.stored_reverse_exit_ = route;
@@ -639,8 +646,9 @@ class PlannerNodeTestPeer {
   static void useTerrainTopsAlongX(PlannerNode& node,
                                    const std::function<double(std::int64_t)>& top) {
     std::map<std::pair<std::int64_t, std::int64_t>, double> tops;
-    for (int x = -10; x < 20; ++x)
-      for (int y = -10; y < 10; ++y) tops[{x, y}] = top(x);
+    for (int x = -10; x < 20; ++x)  // a NaN top leaves the column unmapped
+      for (int y = -10; y < 10; ++y)
+        if (!std::isnan(top(x))) tops[{x, y}] = top(x);
     node.cloud_map_ = nullptr;
     node.mola_map_ = nullptr;
     node.map_ = std::make_unique<mgg_test::TerrainFixture>(0.2, tops);
@@ -3020,6 +3028,39 @@ TEST_F(PlannerNodeTest, ExplorationFinalTerrainCertificationUsesRequestDeadline)
   EXPECT_TRUE(deadline_active);
   EXPECT_TRUE(response->path.empty());
   EXPECT_EQ(response->status, PlannerNode::kStatusNotReady);
+}
+
+TEST_F(PlannerNodeTest, ExplorationDeadlineExpiryKeepsNoEscapeOfAnUnsentPath) {
+  // review r1, P2: the corridor's path would be remembered with its reverse
+  // exit before final certification; expiring there sends nothing, so
+  // nothing may be remembered either.
+  MolaFloorProduct map(-2, 7, -2, 2,
+      {{{0.8, 7, 0.4, 0.6}}, {{0.8, 7, -0.6, -0.4}}});
+  auto node = makeNode("explore_expiry_escape_memory");
+  PlannerNodeTestPeer::seeGroundContinuation(*node);
+  PlannerNodeTestPeer::useMolaMap(*node, map.serve());
+  PlannerNodeTestPeer::serveMap(*node, "component:test", 1);
+  PlannerNodeTestPeer::setRobotFootprint(*node, 1.0, 0.3);
+  PlannerNodeTestPeer::setLattice(*node, {0, 0}, {5.5, 0});
+  PlannerNodeTestPeer::acceptOdometryFacing(*node, 0, 0, 0, 1);
+  const auto memory = PlannerNodeTestPeer::reverseExitMemory(*node);
+  auto response = std::make_shared<mgg_msgs::srv::PlannerSrv::Response>();
+  bool final_phase_reached = false;
+  std::size_t remembered = 0;
+  mgg::PlanningCancellationScope instrument([&] {
+    if (!final_phase_reached && !response->path.empty()) {
+      final_phase_reached = true;
+      remembered = PlannerNodeTestPeer::storedReversePoses(*node);
+      PlannerNodeTestPeer::expireRequestDeadline(*node);
+    }
+    return false;
+  });
+  PlannerNodeTestPeer::planImpl(*node, response);
+  ASSERT_TRUE(final_phase_reached);
+  EXPECT_GT(remembered, 1u);  // the escape was retained for the path
+  EXPECT_TRUE(response->path.empty());
+  EXPECT_EQ(response->status, PlannerNode::kStatusNotReady);
+  EXPECT_TRUE(PlannerNodeTestPeer::reverseExitMemory(*node) == memory);
 }
 
 TEST_F(PlannerNodeTest, FullyMappedGroundFixtureCompletesWithoutAnExplorationSpin) {
@@ -5866,6 +5907,10 @@ TEST_F(PlannerNodeTest, ObjectiveDepartureTerrainCertificationUsesRequestDeadlin
   auto response = std::make_shared<Service::Response>();
   bool final_phase_reached = false;
   bool deadline_active = false;
+  // The departure answered is the stored exit: the escape memory it would
+  // keep differs from what the entry plan left (review r1, P2).
+  ASSERT_GT(PlannerNodeTestPeer::storedReversePoses(*node), 1u);
+  const auto memory = PlannerNodeTestPeer::reverseExitMemory(*node);
   mgg::PlanningCancellationScope instrument([&] {
     if (!final_phase_reached && !response->path.empty()) {
       final_phase_reached = true;
@@ -5880,6 +5925,8 @@ TEST_F(PlannerNodeTest, ObjectiveDepartureTerrainCertificationUsesRequestDeadlin
   EXPECT_TRUE(response->path.empty());
   EXPECT_EQ(response->status, Service::Response::UNREACHABLE) << response->reason;
   EXPECT_NE(response->reason.find("budget exceeded"), std::string::npos);
+  // Nothing was sent: no retreat along it is remembered.
+  EXPECT_TRUE(PlannerNodeTestPeer::reverseExitMemory(*node) == memory);
 }
 
 TEST_F(PlannerNodeTest, ARefugeArrivalBandNeedsNoSecondDepartureAfterAnEarlyStop) {
@@ -11933,6 +11980,26 @@ TEST_F(PlannerNodeTest, TwoPoseGroundPathRefusesInteriorColumnsAtNativeSpacing) 
     PlannerNodeTestPeer::shortcutAndResample(*node, path, {});
     EXPECT_TRUE(path.empty());
   }
+}
+
+TEST_F(PlannerNodeTest, SentPathFromAHangingRootOnAnUnmappedDockIsRefused) {
+  // review-r1 P1, sent-path backstop: the robot stands on an unmapped 0.5 m
+  // dock top (cells x < 3, beyond the 0.4 m projection probes, so no ground
+  // is found under its start), the path's first pose at its physical driving
+  // height; its second is on the mapped lower floor 0.6 m away.
+  auto node = makeNode("hanging_root_dock_sent_path");
+  PlannerNodeTestPeer::useTerrainTopsAlongX(*node, [](std::int64_t x) {
+    return x >= 3 ? 0.0 : std::numeric_limits<double>::quiet_NaN();
+  });
+  std::vector<mgg::StateVec> dock{{.05, .05, 1.0, 0}, {.65, .05, .5, 0}};
+  EXPECT_FALSE(PlannerNodeTestPeer::sentGroundPathAdmissible(*node, dock));
+  PlannerNodeTestPeer::shortcutAndResample(*node, dock, {});
+  EXPECT_TRUE(dock.empty());
+  // A blind start level with the floor is sent.
+  std::vector<mgg::StateVec> level{{.05, .05, .5, 0}, {.65, .05, .5, 0}};
+  EXPECT_TRUE(PlannerNodeTestPeer::sentGroundPathAdmissible(*node, level));
+  PlannerNodeTestPeer::shortcutAndResample(*node, level, {});
+  EXPECT_GE(level.size(), 2u);
 }
 
 TEST_F(PlannerNodeTest, QuantisedSixteenDegreeRampWithAboveStepRisersIsSent) {

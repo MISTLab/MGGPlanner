@@ -180,10 +180,17 @@ class GroundProjection {
   /// by max_inclination. Clipped windows, including paths shorter than two
   /// cells, keep the native two-cell grade denominator. Unknown ground is
   /// not evidence either way; serialized pose spacing is not a grade rule.
-  bool groundStepsAdmissible(const std::vector<Eigen::Vector3d>& path) const;
+  /// With `preserve_start_height`, the start is a root kept at its physical
+  /// driving height (a hanging root, whose ground the lidar cannot see): its
+  /// first sample is known ground at its height less max_ground_height, so
+  /// an edge off an unmapped dock still measures the drop it starts with.
+  bool groundStepsAdmissible(const std::vector<Eigen::Vector3d>& path,
+                             bool preserve_start_height = false) const;
   bool groundStepsAdmissible(const Eigen::Vector3d& start,
-                             const Eigen::Vector3d& end) const {
-    return groundStepsAdmissible(std::vector<Eigen::Vector3d>{start, end});
+                             const Eigen::Vector3d& end,
+                             bool preserve_start_height = false) const {
+    return groundStepsAdmissible(std::vector<Eigen::Vector3d>{start, end},
+                                 preserve_start_height);
   }
 
   /// Whether a robot could drive from `start` to `end` once both are dropped

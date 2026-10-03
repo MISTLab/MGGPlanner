@@ -570,6 +570,54 @@ TEST(GridGraph, ExpansionUsesNativeWindowRatherThanRawProjectedPairs) {
   EXPECT_EQ(report.num_vertices_added, 1);
 }
 
+TEST(GridGraph, AHangingRootOnAnUnmappedDockDoesNotStepDownToTheFloor) {
+  // review-r1 P1: the robot stands on an unmapped 0.5 m dock top (cells
+  // x < 3, beyond the 0.4 m projection probes); its root hangs at the
+  // physical driving height. The candidate 0.6 m away is on the mapped
+  // lower floor, within the hanging reach.
+  std::map<std::pair<std::int64_t, std::int64_t>, double> tops;
+  for (std::int64_t x = 3; x < 20; ++x) {
+    for (std::int64_t y = -10; y < 10; ++y) tops[{x, y}] = 0.0;
+  }
+  const mgg_test::TerrainFixture map(.2, tops);
+  RobotParams robot;
+  robot.type = RobotType::kGroundRobot;
+  robot.size = Eigen::Vector3d::Constant(.02);
+  PlanningParams planning;
+  planning.max_ground_height = .5;
+  planning.max_step_height = .15;
+  planning.max_inclination = 27 * M_PI / 180;
+  planning.edge_length_min = .05;
+  planning.edge_length_max = 2;
+  planning.edge_overshoot = 0;
+  planning.nearest_range = 1;
+  planning.nearest_range_min = .05;
+  planning.nearest_range_max = 100;
+  planning.min_observed_ground_fraction = 0;
+  const mgg::GroundProjection ground(map, planning);
+  for (const double dock : {.5, 0.0}) {
+    SCOPED_TRACE(dock);
+    ExpandContext ctx;
+    ctx.map = &map;
+    ctx.robot = &robot;
+    ctx.planning = &planning;
+    ctx.ground = &ground;
+    ctx.robot_box_size = robot.getPlanningSize();
+    ctx.root_is_robot = true;
+    ctx.hanging_root_edge_length_max = 1.0;
+    ctx.preserve_hanging_root_start_height = true;
+    GraphManager graph;
+    auto* root = new Vertex(0, StateVec(.05, .05, dock + .5, 0));
+    root->is_hanging = true;
+    graph.addVertex(root);
+    Vertex candidate(1, StateVec(.65, .05, .5, 0));
+    mgg::ExpandGraphReport report;
+    mgg::expandGraph(graph, candidate, report, ctx);
+    // Off the dock: refused by the root's own ground. Level: admitted.
+    EXPECT_EQ(report.num_vertices_added, dock > 0 ? 0 : 1);
+  }
+}
+
 // The merge is by ground height: within a step it is the same ground, more
 // than a step apart another level (a floor under a walkway), kept apart.
 TEST(GridGraph, LatticeColumnGroundMergesWithinAStepAndKeepsOtherLevels) {
