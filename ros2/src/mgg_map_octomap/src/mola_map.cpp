@@ -314,7 +314,6 @@ struct MolaMap::PendingRequest {
 };
 
 thread_local std::vector<MolaMap::ThreadPin> MolaMap::thread_pins_;
-thread_local std::vector<MolaMap::DiscPin> MolaMap::disc_pins_;
 
 MolaMap::ReadLease::ReadLease(const MolaMap& owner)
     : owner_(&owner),
@@ -1215,26 +1214,9 @@ VoxelStatus MolaMap::getGroundRayStatus(
   return status;
 }
 
-void MolaMap::setTransientDiscs(std::vector<Eigen::Vector2d> centres,
-                                const double radius_m, const double ttl_s) {
-  auto discs = std::make_shared<TransientDiscs>();
-  if (std::isfinite(radius_m) && radius_m > 0.0 && std::isfinite(ttl_s) &&
-      ttl_s > 0.0) {
-    for (const Eigen::Vector2d& centre : centres) {
-      if (centre.allFinite()) discs->centres.push_back(centre);
-    }
-    discs->radius_m = radius_m;
-    discs->expires =
-        Clock::now() + std::chrono::duration_cast<Clock::duration>(
-                           std::chrono::duration<double>(ttl_s));
-  }
-  std::atomic_store(&transient_discs_,
-                    std::shared_ptr<const TransientDiscs>(std::move(discs)));
-}
-
 void MolaMap::setNoGoDiscs(std::vector<Eigen::Vector2d> centres,
                            const double radius_m) {
-  auto discs = std::make_shared<TransientDiscs>();
+  auto discs = std::make_shared<NoGoDiscs>();
   if (std::isfinite(radius_m) && radius_m > 0.0) {
     for (const Eigen::Vector2d& centre : centres) {
       if (centre.allFinite()) discs->centres.push_back(centre);
@@ -1243,7 +1225,7 @@ void MolaMap::setNoGoDiscs(std::vector<Eigen::Vector2d> centres,
     discs->expires = Clock::time_point::max();
   }
   std::atomic_store(&no_go_discs_,
-                    std::shared_ptr<const TransientDiscs>(std::move(discs)));
+                    std::shared_ptr<const NoGoDiscs>(std::move(discs)));
 }
 
 void MolaMap::setNoGoCentreLineDiscs(std::vector<Eigen::Vector2d> centres,
@@ -1254,49 +1236,6 @@ void MolaMap::setNoGoCentreLineDiscs(std::vector<Eigen::Vector2d> centres,
                     std::shared_ptr<const NoGoZones>(std::move(discs)));
 }
 
-MolaMap::TransientDiscPin::TransientDiscPin(const MolaMap& map,
-                                            std::vector<Eigen::Vector2d> centres,
-                                            const double radius_m)
-    : map_(&map) {
-  auto discs = std::make_shared<TransientDiscs>();
-  if (std::isfinite(radius_m) && radius_m > 0.0) {
-    for (const Eigen::Vector2d& centre : centres) {
-      if (centre.allFinite()) discs->centres.push_back(centre);
-    }
-    discs->radius_m = radius_m;
-  }
-  discs->expires = Clock::time_point::max();
-  disc_pins_.push_back(DiscPin{map_, std::move(discs)});
-}
-
-MolaMap::TransientDiscPin::~TransientDiscPin() {
-  for (auto pin = disc_pins_.rbegin(); pin != disc_pins_.rend(); ++pin) {
-    if (pin->map == map_) {
-      disc_pins_.erase(std::next(pin).base());
-      return;
-    }
-  }
-}
-
-std::shared_ptr<const MolaMap::TransientDiscs> MolaMap::transientDiscs() const {
-  for (auto pin = disc_pins_.rbegin(); pin != disc_pins_.rend(); ++pin) {
-    if (pin->map == this) return pin->discs;
-  }
-  return std::atomic_load(&transient_discs_);
-}
-
-MolaMap::TransientDiscSet MolaMap::activeTransientDiscs() const {
-  TransientDiscSet set;
-  const auto discs = transientDiscs();
-  if (discs == nullptr || discs->centres.empty() ||
-      Clock::now() > discs->expires) {
-    return set;
-  }
-  set.centres = discs->centres;
-  set.radius_m = discs->radius_m;
-  return set;
-}
-
 bool MolaMap::discsBlockSweep(const Eigen::Vector3d& start,
                               const Eigen::Vector3d& end,
                               const double half_width) const {
@@ -1305,21 +1244,12 @@ bool MolaMap::discsBlockSweep(const Eigen::Vector3d& start,
     auto leaving = discs->departing(start);
     if (!discs->step(start, end, leaving)) return true;
   }
-  return discSetBlocksSweep(transientDiscs(), start, end,
-                            half_width) ||
-         discSetBlocksSweep(std::atomic_load(&no_go_discs_), start, end,
-                            half_width);
-}
-
-bool MolaMap::transientDiscsBlockSweep(const Eigen::Vector3d& start,
-                                       const Eigen::Vector3d& end,
-                                       const double half_width) const {
-  return discSetBlocksSweep(transientDiscs(), start, end,
+  return discSetBlocksSweep(std::atomic_load(&no_go_discs_), start, end,
                             half_width);
 }
 
 bool MolaMap::discSetBlocksSweep(
-    const std::shared_ptr<const TransientDiscs>& discs,
+    const std::shared_ptr<const NoGoDiscs>& discs,
     const Eigen::Vector3d& start, const Eigen::Vector3d& end,
     const double half_width) {
   if (discs == nullptr || discs->centres.empty() ||
@@ -1357,12 +1287,11 @@ bool MolaMap::discsBlockBox(const Eigen::Vector3d& center,
                             const Eigen::Vector3d& size) const {
   const auto discs = std::atomic_load(&no_go_centre_line_discs_);
   return (discs && discs->inside(center)) ||
-         discSetBlocksBox(transientDiscs(), center, size) ||
          discSetBlocksBox(std::atomic_load(&no_go_discs_), center, size);
 }
 
 bool MolaMap::discSetBlocksBox(
-    const std::shared_ptr<const TransientDiscs>& discs,
+    const std::shared_ptr<const NoGoDiscs>& discs,
     const Eigen::Vector3d& center, const Eigen::Vector3d& size) {
   // A box is a place, not a departure: inside a neighbour's reach it is
   // occupied, whichever way a sweep through it might be allowed to leave.
@@ -1386,7 +1315,7 @@ bool MolaMap::dynamicBoxBlocked(const Eigen::Vector3d& center,
 bool MolaMap::dynamicSweepBlocked(const Eigen::Vector3d& start,
                                    const Eigen::Vector3d& end,
                                    double half_width) const {
-  // Both peer bodies and no-go margins retain getPathStatus's outward-only
+  // No-go margins retain getPathStatus's outward-only
   // departure exemption. Static measured obstacles never get it.
   return discsBlockSweep(start, end, half_width);
 }
@@ -1516,9 +1445,7 @@ bool MolaMap::aerialRootRecoveryTraversable(
   const auto snapshot = current();
   if (snapshot == nullptr || !start.allFinite() || !end.allFinite() ||
       !size.allFinite() || (size.array() <= 0).any()) return false;
-  // Peer/no-go departure semantics are unchanged, but the sweep radius
-  // follows this aerial size: deployed .55/2 -> .600001/2 m with the
-  // minimum-free-run policy. The explicit aerial peer margin stays .35 m.
+  // The no-go departure sweep radius follows the aerial planning size.
   if (discsBlockSweep(start, end, 0.5 * std::max(size.x(), size.y())) ||
       discsBlockBox(end, size)) return false;
   const auto& transform = snapshot->request.component_from_navigation;

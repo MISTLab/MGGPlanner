@@ -153,14 +153,13 @@ class PlannerNode : public rclcpp::Node {
   void recordSentPath();
   void enforceSafeCompletion(bool& complete);
   /// The last nets on best_path_: the standing-start arrival band, no-go
-  /// zones and peer bodies. Clears a path one refuses; returns why.
+  /// and scouting zones. Clears a path one refuses; returns why.
   std::string clearInadmissibleBestPath();
   std::string rememberReverseExit();
   std::string retainReverseExit(const std::vector<mgg::StateVec>& path, bool departure);
   // True means attempted; an empty output path is a refusal. Does not alter
-  // exploration state or consume the stored corridor. A refusal that no
-  // peer's moving on can lift (heading, swept clearance, or a reverse edge
-  // that fails without peers too) is named in unusable_here.
+  // exploration state or consume the stored corridor. An invalid heading,
+  // swept clearance or reverse edge is named in unusable_here.
   bool validateStoredReverseExit(const mgg::StateVec& start,
       std::vector<mgg::StateVec>& path, std::string& note,
       std::string* unusable_here = nullptr);
@@ -191,8 +190,6 @@ class PlannerNode : public rclcpp::Node {
                                     bool require_level = true) const;
   bool reverseExitEdge(const mgg::GroundProjection& ground,
                        const mgg::StateVec& from, const mgg::StateVec& to) const;
-  /// reverseExitEdge with no peer bodies: whether only a peer blocks it.
-  bool reverseExitEdgeWithoutPeers(const mgg::StateVec& from, const mgg::StateVec& to) const;
   void forgetReverseExitIfOffRoute();
   /// Re-certify the join from the actual reference after a stationary chassis spin.
   bool startPathAfterChassisSpin(std::vector<mgg::StateVec>& path,
@@ -222,12 +219,11 @@ class PlannerNode : public rclcpp::Node {
                                             const mgg::UsableVertexFn& reachable);
   void onCoordinationExclusions(
       geometry_msgs::msg::PoseArray::ConstSharedPtr msg);
-  void onPeerBodies(geometry_msgs::msg::PoseArray::ConstSharedPtr msg);
   /// Places the robot must not drive into (no_go_zones: SwarmDeck marks
   /// where a robot tripped its tilt guard), in the planning frame. Each
   /// message replaces the set; an empty one clears it. Each position is a
-  /// disc of PlanningParams::no_go_radius_m, of unbounded height, kept
-  /// apart from the peer bodies: with the mola_snapshot backend the map
+  /// disc of PlanningParams::no_go_radius_m, of unbounded height.
+  /// With the mola_snapshot backend the map
   /// reports it occupied to the lattice, path ends and every sweep (a sweep
   /// leaving one it starts in excepted), and on every backend the global
   /// graph's searches leave out the edges through it (noGoBlocksEdge).
@@ -270,52 +266,10 @@ class PlannerNode : public rclcpp::Node {
   /// The same for a straight segment, such as a shortcut.
   bool noGoBlocksSegment(const Eigen::Vector3d& from,
                          const Eigen::Vector3d& to) const;
-  /// Advances peer_generation_ when the peer bodies in force (a request's
-  /// pinned set, else those published and not expired) differ from those
-  /// it last saw, centres compared on a kPeerGenerationCellM grid: a peer
-  /// appearing, leaving, expiring or moving at all. Run when the tour's
-  /// costs are read, which are cached by it with the graph revision.
-  void refreshPeerGeneration();
-  /// Whether a peer body closes the straight segment from `from` to `to`,
-  /// driven that way: the sweep the lattice's edges take
-  /// (mgg::MolaMap::transientDiscsBlockSweep, the outward departure from a
-  /// peer's reach left open) of the robot's planning box. Aerial spec-aware
-  /// cylinders work on every backend. Never while peer_edges_open_.
-  struct PeerBodyPin;
-  bool peerBlocksSegment(const Eigen::Vector3d& from,
-                         const Eigen::Vector3d& to) const;
-  /// What closes a segment for peerBlocksSegment, counted in
-  /// aerial_counters_.
-  enum class PeerBlock { kNone, kAerialCylinder, kLegacyDisc };
-  PeerBlock peerBlockingSegment(const Eigen::Vector3d& from,
-                                const Eigen::Vector3d& to) const;
-  /// The aerial features' counters and home status as one JSON object,
-  /// logged as "aerial_status {...}" (throttled) after an aerial plan.
-  std::string aerialStatusJson() const;
-  void onAerialPeerBodies(geometry_msgs::msg::PoseArray::ConstSharedPtr msg);
-  /// Pins the peer bodies in force now in `pin`, on this thread, for the
-  /// rest of a plan or objective request (PeerBodyPin):
-  /// every map query, roadmap search and route check of the request sees
-  /// this one set, and onPeerBodies, serialised with planning, publishes
-  /// the next only after it. Ground discs still require mola_snapshot.
-  void pinPeerBodies(std::optional<PeerBodyPin>& pin);
-  /// Whether `path`, driven from its first pose, keeps clear of the peer
-  /// bodies (peerBlocksSegment): the last check on every path and route
-  /// sent, as noGoAdmissible is for the zones.
-  bool peerAdmissible(const std::vector<mgg::StateVec>& path) const;
-  /// Whether any peer body is in force (a request's pinned set, or those
-  /// published and not expired): without, no peer diagnosis runs.
-  bool peersInForce() const;
-  /// A peer diagnosis: the roadmap search from `source_id` with the peers'
-  /// edges open, stopped at peer_diagnosis_deadline_, or else
-  /// global_search_time_budget_s from now (review r0, I4). False when cut
-  /// short, which sets peer_diagnosis_cut_short_.
-  bool diagnosePeerSearch(int source_id, mgg::ShortestPathsReport& rep);
-  /// The global graph's edge test (GraphManager::setEdgeBlocked): a no-go
-  /// zone or a peer body closes the edge from `a` to `b` for this search,
-  /// and the roadmap keeps it. Records each edge a peer closes in
-  /// peer_blocked_edges_.
+  /// A no-go zone closes an edge for this search without deleting it.
   bool globalEdgeBlocked(const mgg::Vertex& a, const mgg::Vertex& b);
+  /// The aerial features' counters and home status as JSON.
+  std::string aerialStatusJson() const;
   void onBuildRequest(
       const std::shared_ptr<std_srvs::srv::Trigger::Request> request,
       std::shared_ptr<std_srvs::srv::Trigger::Response> response);
@@ -488,7 +442,7 @@ class PlannerNode : public rclcpp::Node {
   /// This robot's own vertices in the global graph.
   std::size_t ownGlobalVertices() const;
   /// rrg.cpp:2535 expandGlobalGraphTimerCallback, idle while its inputs
-  /// (graph, map, peer bodies, robot position) are unchanged.
+  /// (graph, map, robot position) are unchanged.
   void expandGlobalGraphTimerCallback();
   void expandGlobalGraphTimerCallbackImpl();
 
@@ -529,7 +483,7 @@ class PlannerNode : public rclcpp::Node {
   int standing_start_scope_depth_ = 0;
   std::optional<std::optional<mgg::StandingStart>> plan_standing_start_;
   // Directed geometry, shared by selection and every shortcut trial. Never
-  // reused across requests or map generations; the request pins peers.
+  // reused across requests or map generations.
   mutable std::map<std::array<double, 6>, bool> plan_reverse_edges_;
   mutable std::uint64_t plan_reverse_generation_ = 0;
   // Ends (path ends and global targets) whose reverse-exit retention was
@@ -596,9 +550,8 @@ class PlannerNode : public rclcpp::Node {
   /// target, until the robot moves more than kTourSetAsideMoveM from here,
   /// its gain rises by more than kTourSetAsideGainRise of its scored gain
   /// now and by more than tour.min_cluster_gain, or `retry_s` passes: the
-  /// robot
-  /// could not be routed to it (tour.route_retry_s; less when only peer
-  /// bodies were in the way), reached it with little local gain, or stands
+  /// robot could not be routed to it (tour.route_retry_s), reached it
+  /// with little local gain, or stands
   /// on its representative (the route's source, which the tour costs zero
   /// and no route leaves).
   /// At-target failures do not lapse on movement; consecutive failures
@@ -645,7 +598,7 @@ class PlannerNode : public rclcpp::Node {
   std::optional<mgg::FrontierCluster> refreshTour(std::string& note);
   /// Graph distance from each cluster's representative to home (vertex 0),
   /// the way back, from the tour's distance cache under the same key as the
-  /// tour's costs: graph revision and peer generation.
+  /// tour's costs: graph revision.
   std::vector<double> homeDistances(
       const std::vector<mgg::FrontierCluster>& clusters);
   /// An aerial robot's home (vertex 0) is the endpoint its return is costed
@@ -654,7 +607,7 @@ class PlannerNode : public rclcpp::Node {
   /// is observed free, as Return Home links its goal: a home linked before
   /// its air was seen would otherwise stay cut off, and every cluster fail
   /// the battery reach cap (drone-r3). At most once per graph, revision, map
-  /// revision and peer generation; records home_link_status_. No-op for
+  /// revision; records home_link_status_. No-op for
   /// ground robots.
   void relinkAerialHome(int robot_vertex_id);
   /// Whether a repositioning to global vertex `vertex_id` still heads for
@@ -913,9 +866,6 @@ class PlannerNode : public rclcpp::Node {
   /// sampler: its other inputs are the graph and map revisions.
   static constexpr double kOdometryStillM = 1e-3;
   std::uint64_t expansion_graph_revision_ = 0;
-  /// The peer generation (refreshPeerGeneration) the last pass sampled
-  /// against.
-  std::uint64_t expansion_peer_generation_ = 0;
   std::uint64_t expansion_map_revision_ = 0;
   mgg::StateVec expansion_state_ = mgg::StateVec::Zero();
   /// rrg.cpp:2548: nothing to grow before the first plan.
@@ -978,21 +928,8 @@ class PlannerNode : public rclcpp::Node {
   /// not, and its first turn, from the robot's heading, is sharp where the
   /// robot has no room to turn (applyRouteTurnRule): a turn it cannot make.
   bool last_route_starts_with_turn_without_room_ = false;
-  /// The last route to a goal failed only because peer bodies closed every
-  /// way there (routeOverGlobalGraph), or the last global frontier search
-  /// found frontiers only behind them (runGlobalPlanner): a retryable
-  /// outcome, not a missing route.
-  bool last_route_blocked_by_peer_ = false;
-  /// Global graph edges a peer body closed in the searches of this plan
-  /// request (globalEdgeBlocked), as (lower id, higher id).
-  std::set<std::pair<int, int>> peer_blocked_edges_;
-  /// Of those, the ones an aerial peer cylinder closed (the rest: legacy
-  /// discs).
-  std::set<std::pair<int, int>> peer_cylinder_blocked_edges_;
-  /// Cheap counters for the aerial features (mgg-home, drone-r3 left them
-  /// unobservable). "last_" values are of the latest evaluation; the rest
-  /// accumulate since start. Counts per evaluation, not per unique target:
-  /// a plan request evaluates the candidates more than once.
+  /// Cheap counters for the aerial features. Latest-evaluation values and
+  /// cumulative counts are per evaluation, not per unique target.
   struct AerialCounters {
     /// liftedPeerFrontiers, its latest evaluation: peer frontier vertices
     /// it lifted, those refused (gain floor, the 64-slot cap, within the
@@ -1020,16 +957,6 @@ class PlannerNode : public rclcpp::Node {
     /// keeps the same one is not counted again).
     std::uint64_t lifted_selected = 0;
     mgg::ClusterId lifted_selected_target = mgg::kNoCluster;
-    /// aerial_peer_bodies messages accepted, refused for their frame or a
-    /// malformed entry, and the frame of the last accepted one.
-    std::uint64_t cylinder_messages_accepted = 0;
-    std::uint64_t cylinder_messages_wrong_frame = 0;
-    std::uint64_t cylinder_messages_invalid = 0;
-    std::string cylinder_frame;
-    /// Segment checks (roadmap edges in a search, path segments) a peer
-    /// closed, by what closed them.
-    mutable std::uint64_t cylinder_segment_blocks = 0;
-    mutable std::uint64_t disc_segment_blocks = 0;
     /// Clusters the battery reach cap refused, those with no way home at
     /// all, and the last refusal's out and back distances and budget.
     std::uint64_t reach_cap_rejects = 0;
@@ -1041,23 +968,6 @@ class PlannerNode : public rclcpp::Node {
   AerialCounters aerial_counters_;
   /// The reach-cap note for an aerial cluster refused by it, counted.
   std::string noteReachCapReject(double out_m, double back_m);
-  /// Peer bodies are left out of peerBlocksSegment: set only to ask whether
-  /// a failed search would have succeeded without them.
-  bool peer_edges_open_ = false;
-  /// While an objective is routed again without peers to tell whether they
-  /// alone stopped it, every roadmap search stops here (diagnosePeerSearch).
-  std::optional<std::chrono::steady_clock::time_point> peer_diagnosis_deadline_;
-  /// A peer diagnosis was cut short since last reset.
-  bool peer_diagnosis_cut_short_ = false;
-  bool peer_diagnosis_in_progress_ = false;
-  /// Peer diagnoses run since the node started.
-  int peer_diagnoses_ = 0;
-  /// Changes whenever the peer bodies in force change
-  /// (refreshPeerGeneration): the tour's route costs are cached by it and
-  /// the graph revision (review r0, I3). Its key: the centres, quantized
-  /// and sorted, then the radius.
-  std::uint64_t peer_generation_ = 0;
-  std::vector<std::array<long, 2>> peer_generation_key_;
   /// Exploration paths sent unshortcut because the shortcut, once resampled,
   /// turned where the lattice path did not, since the node started.
   int shortcut_turn_reverts_ = 0;
@@ -1105,9 +1015,8 @@ class PlannerNode : public rclcpp::Node {
   mgg::StateVec home_seed_pose_ = mgg::StateVec::Zero();
   /// relinkAerialHome's last inputs and outcome, and how often it re-rooted
   /// or relinked home.
-  std::tuple<const mgg::GraphManager*, std::uint64_t, std::uint64_t,
-             std::uint64_t>
-      home_link_key_{nullptr, 0, 0, 0};
+  std::tuple<const mgg::GraphManager*, std::uint64_t, std::uint64_t>
+      home_link_key_{nullptr, 0, 0};
   std::string home_link_status_ = "unknown";
   int home_reroots_ = 0;
   int home_relink_attempts_ = 0;
@@ -1208,26 +1117,6 @@ class PlannerNode : public rclcpp::Node {
   /// with its box whatever a request sets (review r3, P1).
   mgg::BoundModeType nominal_bound_mode_ = mgg::BoundModeType::kExtendedBound;
   double reservation_exclusion_ttl_s_ = 3.0;
-  double peer_body_radius_m_ = 0.6;
-  double aerial_peer_margin_m_ = 0.35;
-  struct AerialPeerBody {
-    Eigen::Vector3d top;
-    double radius;
-  };
-  std::vector<AerialPeerBody> aerial_peer_bodies_;
-  std::chrono::steady_clock::time_point aerial_peer_bodies_received_;
-  bool have_aerial_peer_bodies_ = false;
-  std::vector<std::array<double, 4>> aerial_peer_generation_key_;
-  std::optional<std::vector<AerialPeerBody>> pinned_aerial_peer_bodies_;
-  std::vector<AerialPeerBody> activeAerialPeerBodies() const;
-  struct PeerBodyPin {
-    explicit PeerBodyPin(PlannerNode& node);
-    ~PeerBodyPin();
-    PlannerNode& node;
-    std::optional<std::vector<AerialPeerBody>> previous;
-    std::optional<mgg::MolaMap::TransientDiscPin> ground;
-  };
-  double peer_body_ttl_s_ = 3.0;
 
   /// A goal the robot has no known route to yet, in the world frame. While
   /// set, local path selection is biased toward it instead of along the
@@ -1273,9 +1162,6 @@ class PlannerNode : public rclcpp::Node {
       neighbour_transforms_sub_;
   rclcpp::Subscription<geometry_msgs::msg::PoseArray>::SharedPtr
       coordination_exclusions_sub_;
-  rclcpp::Subscription<geometry_msgs::msg::PoseArray>::SharedPtr
-      peer_bodies_sub_;
-  rclcpp::Subscription<geometry_msgs::msg::PoseArray>::SharedPtr aerial_peer_bodies_sub_;
   rclcpp::Subscription<geometry_msgs::msg::PoseArray>::SharedPtr
       no_go_zones_sub_;
   /// The no-go zones' centres, planning frame (onNoGoZones).
@@ -1362,8 +1248,6 @@ class PlannerNode : public rclcpp::Node {
   /// no_go_zones alone: its messages replace one another, so they are
   /// handled one at a time.
   rclcpp::CallbackGroup::SharedPtr no_go_zones_group_;
-  /// peer_bodies alone, for the same reason (review r1, R3).
-  rclcpp::CallbackGroup::SharedPtr peer_bodies_group_;
   /// flight_state alone, for the same reason.
   rclcpp::CallbackGroup::SharedPtr flight_state_group_;
 };

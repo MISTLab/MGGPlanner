@@ -25,16 +25,14 @@ namespace mgg {
 inline constexpr double kFirstLegLookaheadM = 2.0;
 
 /// Dijkstra reports over one graph, one per source vertex, dropped when the
-/// graph instance, its revision or the peer generation changes: the edges a
-/// peer body closes change with the peers alone (review r0, I3).
+/// graph instance or its revision changes.
 class GraphDistanceCache {
  public:
   /// The report from `source_id`, solved on first use in this `graph` at
-  /// this `revision` and `peer_generation`; null when the source is not in
+  /// this `revision`; null when the source is not in
   /// the graph or Dijkstra cannot run (a graph of fewer than two vertices).
   const ShortestPathsReport* from(GraphManager& graph, std::uint64_t revision,
-                                  int source_id,
-                                  std::uint64_t peer_generation = 0);
+                                  int source_id);
   /// Dijkstra runs so far.
   std::size_t solves() const { return solves_; }
 
@@ -43,7 +41,6 @@ class GraphDistanceCache {
   /// Identity only, never dereferenced: which graph the reports came from.
   const GraphManager* graph_ = nullptr;
   std::uint64_t revision_ = 0;
-  std::uint64_t peer_generation_ = 0;
   std::unordered_map<int, ShortestPathsReport> reports_;
   std::unordered_set<int> failed_;
   std::size_t solves_ = 0;
@@ -72,15 +69,14 @@ struct TourCostMatrix {
 };
 
 /// Costs of `clusters` from `source_vertex_id`, the vertex the robot joins
-/// the graph at, cached by `revision` and `peer_generation`. Unreachable
+/// the graph at, cached by `revision`. Unreachable
 /// legs are kUnreachableCost, which leaves a cluster out of the tour until
 /// it connects.
 TourCostMatrix computeTourCosts(GraphManager& graph, std::uint64_t revision,
                                 GraphDistanceCache& cache,
                                 int source_vertex_id, double robot_yaw,
                                 const std::vector<FrontierCluster>& clusters,
-                                double heading_weight,
-                                std::uint64_t peer_generation = 0);
+                                double heading_weight);
 
 /// A robot with limited flight left (a drone on battery, drone scout design
 /// §4.3) does not take clusters it could reach but not return from: those

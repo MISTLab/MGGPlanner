@@ -120,23 +120,6 @@ class PlannerNodeTestPeer {
     EXPECT_TRUE(response->success);
   }
 
-  /// A peer body parked at (x, y), as peer_bodies delivers it.
-  static void receivePeerBody(PlannerNode& node, double x, double y) {
-    auto msg = std::make_shared<geometry_msgs::msg::PoseArray>();
-    msg->header.frame_id = node.world_frame_;
-    geometry_msgs::msg::Pose pose;
-    pose.position.x = x;
-    pose.position.y = y;
-    pose.orientation.w = 1.0;
-    msg->poses.push_back(pose);
-    node.onPeerBodies(msg);
-  }
-
-  static bool peersInForce(PlannerNode& node) {
-    const std::lock_guard<std::recursive_mutex> lock(node.planner_mutex_);
-    return node.peersInForce();
-  }
-
   static std::unique_lock<std::recursive_mutex> holdPlanner(PlannerNode& node) {
     return std::unique_lock<std::recursive_mutex>(node.planner_mutex_);
   }
@@ -474,46 +457,6 @@ TEST_F(PlannerConfigStateTest, ComputedPlanPublishesItsGenerationBeforeResponseD
   plan();
   EXPECT_EQ(PlannerNodeTestPeer::computedPlans(*planner), 3);
   EXPECT_EQ(observer.states.back().last_plan_generation, 2u);
-}
-
-TEST_F(PlannerConfigStateTest, APeerPinnedPlanRecordsTheGenerationItUsed) {
-  // Run 10's peer bodies with the drone's configuration state: a plan made
-  // with a peer set pinned for the whole request, the path it found then
-  // checked against those bodies, is a computed answer. It records the
-  // configuration generation it used, as any computed plan does; peer
-  // bodies arriving are not configuration and publish nothing.
-  auto planner = makeNode("config_plan_peers");
-  Observer observer(planner);
-  ASSERT_TRUE(observer.waitFor([&] { return !observer.states.empty(); }));
-  PlannerNodeTestPeer::enablePlanning(*planner);
-  Region::Request region;
-  region.active = true;
-  region.min.x = -5;
-  region.min.y = -5;
-  region.min.z = -5;
-  region.max.x = 5;
-  region.max.y = 5;
-  region.max.z = 5;
-  ASSERT_TRUE(observer.call<Region>(
-      "/config_plan_peers/mgg/set_exploration_region", region)->success);
-  ASSERT_TRUE(observer.waitFor(
-      [&] { return observer.states.back().generation == 2u; }));
-  const auto count = observer.states.size();
-
-  PlannerNodeTestPeer::receivePeerBody(*planner, 0.5, 0.0);
-  ASSERT_TRUE(PlannerNodeTestPeer::peersInForce(*planner));
-  EXPECT_FALSE(
-      observer.waitFor([&] { return observer.states.size() > count; }, 100ms));
-
-  auto response = observer.call<mgg_msgs::srv::PlannerSrv>(
-      "/config_plan_peers/mgg/mggplanner",
-      mgg_msgs::srv::PlannerSrv::Request());
-  EXPECT_EQ(response->status, PlannerNode::kStatusNoPath);
-  EXPECT_EQ(PlannerNodeTestPeer::computedPlans(*planner), 1);
-  ASSERT_TRUE(observer.waitFor(
-      [&] { return observer.states.back().last_plan_generation == 2u; }));
-  EXPECT_EQ(observer.states.back().generation, 2u);
-  EXPECT_TRUE(observer.states.back().region_active);
 }
 
 TEST_F(PlannerConfigStateTest, NotReadyRefusalDoesNotClaimAPlanUsedTheConfiguration) {

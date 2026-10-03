@@ -197,53 +197,12 @@ class MolaMap : public MapInterface {
       std::vector<XYCellCenter>& centers) const override;
   bool getStatus() const override;
 
-  /// Bodies that stand in the world and in no map: other robots of the fleet.
-  /// A capture-time mask keeps them out of the persistent product, so without
-  /// this the planner routes straight through a parked neighbour. Each disc is
-  /// a vertical cylinder of unbounded height in the navigation frame; the box,
-  /// path and cylinder queries report it occupied. The list expires after
-  /// `ttl_s`, so a silent publisher cannot freeze an obstacle in place. The
-  /// cost per query is one distance test per disc.
-  void setTransientDiscs(std::vector<Eigen::Vector2d> centres, double radius_m,
-                         double ttl_s);
-  /// Places the robot must not drive into, such as where it tripped its
-  /// tilt guard: discs as setTransientDiscs makes them, kept apart from
-  /// them (neither call replaces the other's), and without expiry: each
-  /// call replaces the set, and an empty one clears it; the publisher owns
-  /// their lifetime.
+  /// Persistent no-go discs, such as tilt trip zones. Each message replaces
+  /// the set; the publisher owns their lifetime.
   void setNoGoDiscs(std::vector<Eigen::Vector2d> centres, double radius_m);
   /// Already body-inflated centre-line reaches, independent of terrain discs.
   void setNoGoCentreLineDiscs(std::vector<Eigen::Vector2d> centres,
                               std::vector<double> reaches);
-  /// dynamicSweepBlocked for the discs of setTransientDiscs alone, the
-  /// peer bodies: the same sweep test and outward departure from a disc's
-  /// reach, without the no-go discs, which a caller checks on its own terms.
-  bool transientDiscsBlockSweep(const Eigen::Vector3d& start,
-                                const Eigen::Vector3d& end,
-                                double half_width) const;
-  /// The transient discs this thread's queries see now: a pin's, or those
-  /// published and not expired; no centres when there are none.
-  struct TransientDiscSet {
-    std::vector<Eigen::Vector2d> centres;
-    double radius_m = 0.0;
-  };
-  TransientDiscSet activeTransientDiscs() const;
-  /// While it lives, every query of this map on the constructing thread
-  /// sees `centres` of `radius_m` as the transient discs, without expiry,
-  /// in place of those setTransientDiscs published; no centres, none.
-  /// Other threads are unaffected. Pins nest; the innermost applies. For
-  /// one planning request to see one peer set throughout, or none.
-  class TransientDiscPin {
-   public:
-    TransientDiscPin(const MolaMap& map, std::vector<Eigen::Vector2d> centres,
-                     double radius_m);
-    ~TransientDiscPin();
-    TransientDiscPin(const TransientDiscPin&) = delete;
-    TransientDiscPin& operator=(const TransientDiscPin&) = delete;
-
-   private:
-    const MolaMap* map_;
-  };
   VoxelStatus getVoxelStatus(const Eigen::Vector3d& position) const override;
   VoxelStatus getRayStatus(const Eigen::Vector3d& view_point,
                            const Eigen::Vector3d& voxel_to_test,
@@ -359,29 +318,20 @@ class MolaMap : public MapInterface {
   bool stopping_ = false;
   std::thread worker_;
 
-  struct TransientDiscs {
+  struct NoGoDiscs {
     std::vector<Eigen::Vector2d> centres;
     double radius_m = 0.0;
     std::chrono::steady_clock::time_point expires;
   };
-  std::shared_ptr<const TransientDiscs> transient_discs_;
-  std::shared_ptr<const TransientDiscs> no_go_discs_;
+  std::shared_ptr<const NoGoDiscs> no_go_discs_;
   std::shared_ptr<const NoGoZones> no_go_centre_line_discs_;
-  /// The transient discs queries on this thread see: the innermost
-  /// TransientDiscPin's, or those published.
-  std::shared_ptr<const TransientDiscs> transientDiscs() const;
-  struct DiscPin {
-    const MolaMap* map;
-    std::shared_ptr<const TransientDiscs> discs;
-  };
-  static thread_local std::vector<DiscPin> disc_pins_;
   bool discsBlockBox(const Eigen::Vector3d& center,
                      const Eigen::Vector3d& size) const;
   static bool discSetBlocksBox(
-      const std::shared_ptr<const TransientDiscs>& discs,
+      const std::shared_ptr<const NoGoDiscs>& discs,
       const Eigen::Vector3d& center, const Eigen::Vector3d& size);
   static bool discSetBlocksSweep(
-      const std::shared_ptr<const TransientDiscs>& discs,
+      const std::shared_ptr<const NoGoDiscs>& discs,
       const Eigen::Vector3d& start, const Eigen::Vector3d& end,
       double half_width);
   bool discsBlockSweep(const Eigen::Vector3d& start, const Eigen::Vector3d& end,

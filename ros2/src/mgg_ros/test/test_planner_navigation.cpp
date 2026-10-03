@@ -580,23 +580,7 @@ class PlannerNodeTestPeer {
   static void shortcut(PlannerNode& node, std::vector<mgg::StateVec>& path) {
     node.shortcutAndResample(path, {}, {}, true);
   }
-  static bool peersOpen(const PlannerNode& node) { return node.peer_edges_open_; }
-  static bool peerDeadlineSet(const PlannerNode& node) {
-    return node.peer_diagnosis_deadline_.has_value();
-  }
-  static bool peerBlocks(PlannerNode& node) {
-    return node.peerBlocksSegment(Eigen::Vector3d(0, 0, 0.935),
-                                 Eigen::Vector3d(2, 0, 0.935));
-  }
-  static void installPeerAndGraph(PlannerNode& node) {
-    node.mola_map_->setTransientDiscs({Eigen::Vector2d(1, 0)}, 0.5, 60.0);
-    node.global_graph_->reset();
-    auto* a = new mgg::Vertex(0, mgg::StateVec(0, 0, 0.935, 0));
-    auto* b = new mgg::Vertex(1, mgg::StateVec(2, 0, 0.935, 0));
-    node.global_graph_->addVertex(a);
-    node.global_graph_->addVertex(b);
-    node.global_graph_->addEdge(a, b, 2.0);
-  }
+
   static void nearRequestDeadline(PlannerNode& node) {
     node.lattice_deadline_ = std::chrono::steady_clock::now() + std::chrono::milliseconds(80);
     node.global_graph_->reset();
@@ -615,11 +599,7 @@ class PlannerNodeTestPeer {
   static bool requestExpired(const PlannerNode& node) {
     return std::chrono::steady_clock::now() >= *node.lattice_deadline_;
   }
-  static bool diagnosisCutShort(const PlannerNode& node) { return node.peer_diagnosis_cut_short_; }
-  static void diagnose(PlannerNode& node) {
-    mgg::ShortestPathsReport report;
-    node.diagnosePeerSearch(0, report);
-  }
+
   static void setBudget(PlannerNode& node, double seconds) {
     node.lattice_time_budget_s_ = seconds;
   }
@@ -1036,90 +1016,6 @@ TEST_F(PlannerNavigationTest, SensorFovPolicyBelowBodyBottomFailsClosed) {
   }
 }
 
-TEST_F(PlannerNavigationTest, InterruptedPeerDiagnosisRestoresCollisionChecks) {
-  MolaTerrainProduct product(0.1, -3, 4, -3, 3, flat);
-  auto node = botmanNode("peer_diagnosis_budget", product);
-  PlannerNodeTestPeer::installPeerAndGraph(*node);
-  ASSERT_TRUE(PlannerNodeTestPeer::peerBlocks(*node));
-  bool interrupted_in_diagnosis = false;
-  {
-    // Deterministically expire the request only once the diagnosis has
-    // disabled peer edges, not during ordinary route search.
-    mgg::PlanningCancellationScope deadline([&] {
-      interrupted_in_diagnosis = PlannerNodeTestPeer::peersOpen(*node);
-      return interrupted_in_diagnosis;
-    });
-    EXPECT_THROW(PlannerNodeTestPeer::diagnose(*node), mgg::PlanningInterrupted);
-  }
-  EXPECT_TRUE(interrupted_in_diagnosis);
-  EXPECT_FALSE(PlannerNodeTestPeer::peersOpen(*node));
-  EXPECT_FALSE(PlannerNodeTestPeer::peerDeadlineSet(*node));
-  EXPECT_TRUE(PlannerNodeTestPeer::peerBlocks(*node));
-  PlannerNodeTestPeer::diagnose(*node);
-  EXPECT_TRUE(PlannerNodeTestPeer::peerBlocks(*node));
-}
-
-TEST_F(PlannerNavigationTest, ObjectiveInterruptionRestoresPeerDiagnosisDeadline) {
-  MolaTerrainProduct product(.1, -3, 5, -3, 3, flat, {{1, 4, -3, 3, 2}});
-  auto node = botmanNode("objective_peer_interrupt", product);
-  PlannerNodeTestPeer::standAt(*node, 0, 0, 0, 0, 1);
-  PlannerNodeTestPeer::setBudget(*node, 0);
-  PlannerNodeTestPeer::installPeerAndGraph(*node);
-  bool during_diagnosis = false;
-  {
-    mgg::PlanningCancellationScope interrupt([&] {
-      during_diagnosis = PlannerNodeTestPeer::peerDeadlineSet(*node);
-      return during_diagnosis;
-    });
-    const auto response = navigate(*node, 3, 0);
-    EXPECT_EQ(response->status, Service::Response::BLOCKED);
-    EXPECT_NE(response->reason.find("cancelled"), std::string::npos);
-  }
-  EXPECT_TRUE(during_diagnosis);
-  EXPECT_FALSE(PlannerNodeTestPeer::peersOpen(*node));
-  EXPECT_FALSE(PlannerNodeTestPeer::peerDeadlineSet(*node));
-  EXPECT_TRUE(PlannerNodeTestPeer::peerBlocks(*node));
-  // Another objective must enter ordinary peer handling, not the stale
-  // diagnostic mode left by the interrupted request.
-  const auto next = navigate(*node, 0, 0);
-  EXPECT_TRUE(PlannerNodeTestPeer::peerBlocks(*node));
-  EXPECT_FALSE(PlannerNodeTestPeer::peerDeadlineSet(*node));
-}
-
-TEST_F(PlannerNavigationTest, RequestBudgetDuringPeerDiagnosisIsBlocked) {
-  MolaTerrainProduct product(.1, -3, 5, -3, 3, flat, {{1, 4, -3, 3, 2}});
-  auto node = botmanNode("objective_peer_budget", product);
-  PlannerNodeTestPeer::standAt(*node, 0, 0, 0, 0, 1);
-  PlannerNodeTestPeer::setBudget(*node, 5.0);
-  PlannerNodeTestPeer::installPeerAndGraph(*node);
-  bool expired = false;
-  mgg::PlanningCancellationScope instrument([&] {
-    if (PlannerNodeTestPeer::peerDeadlineSet(*node)) {
-      PlannerNodeTestPeer::expireRequest(*node);
-      expired = true;
-    }
-    return false;  // not external cancellation
-  });
-  const auto response = navigate(*node, 3, 0);
-  EXPECT_TRUE(expired);
-  EXPECT_EQ(response->status, Service::Response::BLOCKED);
-  EXPECT_NE(response->reason.find("budget exceeded"), std::string::npos);
-  EXPECT_TRUE(response->path.empty());
-  EXPECT_FALSE(PlannerNodeTestPeer::peersOpen(*node));
-  EXPECT_FALSE(PlannerNodeTestPeer::peerDeadlineSet(*node));
-  EXPECT_TRUE(PlannerNodeTestPeer::peerBlocks(*node));
-}
-
-TEST_F(PlannerNavigationTest, PeerDiagnosisYieldsBeforeTheRequestDeadline) {
-  MolaTerrainProduct product(.1, -3, 4, -3, 3, flat);
-  auto node = botmanNode("nested_budget", product);
-  PlannerNodeTestPeer::nearRequestDeadline(*node);
-  mgg::PlanningCancellationScope hard([&] { return PlannerNodeTestPeer::requestExpired(*node); });
-  EXPECT_NO_THROW(PlannerNodeTestPeer::diagnose(*node));
-  EXPECT_TRUE(PlannerNodeTestPeer::diagnosisCutShort(*node));
-  EXPECT_FALSE(PlannerNodeTestPeer::requestExpired(*node));
-}
-
 TEST_F(PlannerNavigationTest, RequestBudgetRefusesWithoutPublishingAPartialRoute) {
   MolaTerrainProduct product(0.1, -8, 8, -8, 8,
                               [](double, double) { return -0.61; });
@@ -1220,6 +1116,23 @@ TEST_F(PlannerNavigationTest, ARampRouteStaysWithinTheSlopeLimits) {
     EXPECT_NEAR(b.z - ramp(b.x, b.y), 0.935, 0.12);
   }
   EXPECT_LE(maxCornerDeg(response->path), 10.0);
+}
+
+TEST_F(PlannerNavigationTest, RobotSizedMapObstacleIsUnreachableNotPeerBlocked) {
+  // An occupied robot-sized block at the goal has no special identity or
+  // retry-only peer status. A later free map admits the same objective.
+  for (const bool occupied : {true, false}) {
+    SCOPED_TRACE(occupied);
+    MolaTerrainProduct product(.1, -3, 5, -3, 3, flat,
+        occupied ? std::vector<Block>{{1.6, 2.4, -.3, .3, .6}} : std::vector<Block>{});
+    auto node = botmanNode("mapped_robot_obstacle", product);
+    PlannerNodeTestPeer::standAt(*node, 0, 0, 0, 0, 1);
+    const auto response = navigate(*node, 2, 0);
+    EXPECT_EQ(response->status, occupied ? Service::Response::UNREACHABLE
+                                        : Service::Response::SUCCEEDED) << response->reason;
+    EXPECT_EQ(node->count_subscribers("peer_bodies"), 0u);
+    EXPECT_EQ(node->count_subscribers("aerial_peer_bodies"), 0u);
+  }
 }
 
 }  // namespace mgg_ros
