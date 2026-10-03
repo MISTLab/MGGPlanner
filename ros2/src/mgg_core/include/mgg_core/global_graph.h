@@ -27,6 +27,7 @@
 #define MGG_CORE_GLOBAL_GRAPH_H_
 
 #include <chrono>
+#include <cmath>
 #include <cstdint>
 #include <deque>
 #include <functional>
@@ -72,6 +73,10 @@ class RobotStateHistory {
   bool getNearestStates(const StateVec& state, double range,
                         std::vector<const StateVec*>* s_res) const;
   void reset();
+  /// Moves every recorded state by `delta` (position and yaw), as the
+  /// roadmap is moved when the map's placement in the planning frame is
+  /// corrected (transformRoadmap).
+  void transform(const Eigen::Isometry3d& delta);
   std::size_t size() const { return state_hist_.size(); }
   const std::deque<StateVec>& states() const { return state_hist_; }
 
@@ -290,6 +295,98 @@ struct RoadmapRebuildReport {
 RoadmapRebuildReport rebuildRoadmapFromTrajectory(
     GraphManager& graph, const std::vector<TrajectoryKeyframe>& keyframes,
     const ExpandContext& ctx, const RoadmapRebuildParams& params);
+
+/// How an aerial robot's flown trail joins its roadmap
+/// (addFlownBreadcrumbs).
+struct FlownTrailParams {
+  /// A pose is sampled once the robot has flown this far since the last
+  /// sample, or turned its heading by turn_rad.
+  double spacing_m = 1.0;
+  double turn_rad = M_PI / 6.0;
+  /// A sample this close to one of the robot's own in-service vertices is
+  /// that vertex: the trail adds none there.
+  double merge_radius_m = 0.5;
+  /// Vertices one trail may add; past that it only merges.
+  int max_vertices = 2000;
+  /// Samples waiting for the map to observe their sweep, at most, and how
+  /// long, by their odometry stamps, one may wait.
+  int max_pending = 20;
+  double patience_s = 10.0;
+};
+
+/// One flown pose and its odometry stamp.
+struct FlownSample {
+  StateVec pose = StateVec::Zero();
+  double stamp_s = 0.0;
+};
+
+/// Where an aerial robot has flown, whatever flew it (exploration, an
+/// operator's goal, teleoperation, Return Home, an escape), as a chain of
+/// breadcrumbs in its roadmap.
+struct FlownTrail {
+  /// Samples not yet stored, oldest first: the map had not observed their
+  /// sweep when they were tried.
+  std::deque<FlownSample> pending;
+  /// The last pose sampled, in the odometry the next one is measured from.
+  bool sampled = false;
+  StateVec last_sample = StateVec::Zero();
+  /// The chain's latest breadcrumb (a vertex of the roadmap), or -1 when
+  /// the chain is broken and the next sample must join the roadmap anew.
+  int head_vertex_id = -1;
+  /// Vertices this trail added (FlownTrailParams::max_vertices).
+  int vertices_added = 0;
+};
+
+/// Takes a sample of `pose` when it is due: the first pose of a trail, then
+/// once the robot has flown params.spacing_m or turned params.turn_rad
+/// since the last sample. Returns whether one was taken.
+bool sampleFlownPose(FlownTrail& trail, const StateVec& pose, double stamp_s,
+                     const FlownTrailParams& params);
+
+struct FlownTrailReport {
+  /// Breadcrumbs added as new vertices, samples that fell on a vertex of
+  /// the robot's already there, and edges stored along the chain.
+  int added = 0;
+  int merged = 0;
+  int chain_edges = 0;
+  /// Samples that joined the roadmap by its linking rules
+  /// (connectStateToGraph), not by an edge from the previous breadcrumb.
+  int joined = 0;
+  /// Chain edges refused by their sweep, and samples given up: too old or
+  /// too many waiting (each breaks the chain), or past max_vertices.
+  int refused = 0;
+  int expired = 0;
+  int capped = 0;
+  /// The oldest pending sample still waits for the map.
+  bool waiting = false;
+};
+
+/// Stores the trail's pending samples, oldest first, in `graph`, checked
+/// against the map as it is now. A sample on one of the robot's own
+/// in-service vertices (within merge_radius_m) is that vertex. Otherwise it
+/// becomes a kVisited vertex, never a frontier, joined to the previous
+/// breadcrumb by an edge whose aerial body sweep passes
+/// (roadmapEdgeTraversable, as for exploration paths' edges), then wired to
+/// its other reachable neighbours (expandGraphEdges). Without that edge it
+/// joins the roadmap where the linking rules allow (connectStateToGraph,
+/// exact); without either it is not stored and waits for the map, until it
+/// is params.patience_s older than `now_s` or more than params.max_pending
+/// wait, when it is given up and the chain breaks. Only the oldest sample
+/// waits: those after it wait behind it.
+FlownTrailReport addFlownBreadcrumbs(GraphManager& graph, FlownTrail& trail,
+                                     const ExpandContext& ctx,
+                                     const FlownTrailParams& params,
+                                     double now_s);
+
+/// Moves the robot's own vertices of `graph` (lifted peer targets aside) by
+/// `delta`, position and yaw, and rebuilds its nearest-neighbour index.
+/// Rigid: every edge keeps its length. Returns how many moved.
+int transformRoadmap(GraphManager& graph, int robot_id,
+                     const Eigen::Isometry3d& delta);
+
+/// Moves the trail's pending samples by `delta` with the roadmap. The last
+/// sample stays in odometry, which the next sample is measured in.
+void transformFlownTrail(FlownTrail& trail, const Eigen::Isometry3d& delta);
 
 /// The edge check of a roadmap rebuilt from the robot's trajectory, the
 /// roadmap edge check (roadmapEdgeTraversable) with two differences, both

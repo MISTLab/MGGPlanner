@@ -669,6 +669,23 @@ TEST(LinkDeparture, AGroundRobotAgainstAWallDoesNotDepartThroughIt) {
   EXPECT_EQ(fixture.global.getNumEdges(), 0);
 }
 
+TEST(LinkDeparture, ARobotMoreThanAnEdgeFromTheGraphIsNotLinkedShortOfIt) {
+  // mgg-flown: driven or flown 5 m from a graph whose edges reach 2 m,
+  // the robot's approximate link clipped its edge and returned a vertex
+  // 3 m short of it, which Return Home routed from: the route started
+  // where the robot was not, and the keyframe rebuild that would have
+  // linked it never ran.
+  Roadmap fixture;
+  const mgg::DepartureLink link = mgg::linkDeparture(
+      fixture.global, StateVec(5.0, 0.0, 0.0, 0.0), fixture.ctx, 1.5);
+  EXPECT_EQ(link.vertex, nullptr);
+  // Within an edge, it links where it stands, as before.
+  const mgg::DepartureLink near = mgg::linkDeparture(
+      fixture.global, StateVec(1.8, 0.0, 0.0, 0.0), fixture.ctx, 1.5);
+  ASSERT_NE(near.vertex, nullptr);
+  EXPECT_NEAR(near.vertex->state.x(), 1.8, 1e-9);
+}
+
 TEST(LinkDeparture, AClearDepartureIsStoredAsBefore) {
   Roadmap fixture;
   BoxSweptSlab wall(0.25, 0.35);
@@ -2361,6 +2378,258 @@ TEST(ConnectGoalThroughLattice, ExpiredRequestBudgetInterruptsBridges) {
   EXPECT_THROW(mgg::connectGoalThroughLattice(
       scene.fixture.global, StateVec(3.0, 0.5, 0, 0), scene.grid,
       scene.fixture.ctx, 0.0, nullptr, &report), mgg::PlanningInterrupted);
+}
+
+/// Open space the map has observed only up to x = observed_x, as a map
+/// lagging the flight: unknown beyond, until the map catches up.
+class LaggingSpace : public OpenSpace {
+ public:
+  VoxelStatus getVoxelStatus(const Eigen::Vector3d& p) const override {
+    return p.x() <= observed_x ? VoxelStatus::kFree : VoxelStatus::kUnknown;
+  }
+  double observed_x = 1e9;
+};
+
+/// Samples poses every `step` along x from x0 to x1 (facing +x, or -x
+/// when x1 < x0), one per 0.25 s from `stamp_s` on; returns the last stamp.
+double flyAlongX(mgg::FlownTrail& trail, const mgg::FlownTrailParams& params,
+                 double x0, double x1, double stamp_s, double step = 0.25) {
+  const double yaw = x1 < x0 ? M_PI : 0.0;
+  const int steps = static_cast<int>(std::round(std::abs(x1 - x0) / step));
+  for (int k = 0; k <= steps; ++k) {
+    const double x = x0 + (x1 - x0) * k / std::max(steps, 1);
+    stamp_s += 0.25;
+    mgg::sampleFlownPose(trail, StateVec(x, 0.0, 0.0, yaw), stamp_s, params);
+  }
+  return stamp_s;
+}
+
+TEST(FlownTrail, APoseIsSampledEverySpacingOfFlightOrTurnOfHeading) {
+  mgg::FlownTrail trail;
+  const mgg::FlownTrailParams params;  // 1 m, 30 degrees
+  EXPECT_TRUE(mgg::sampleFlownPose(trail, StateVec(0, 0, 0, 0), 1.0, params));
+  EXPECT_FALSE(mgg::sampleFlownPose(trail, StateVec(0.5, 0, 0, 0), 1.5, params));
+  EXPECT_TRUE(mgg::sampleFlownPose(trail, StateVec(1.0, 0, 0, 0), 2.0, params));
+  EXPECT_FALSE(mgg::sampleFlownPose(trail, StateVec(1.2, 0, 0, 0.4), 2.2, params));
+  EXPECT_TRUE(mgg::sampleFlownPose(trail, StateVec(1.2, 0, 0, 0.6), 2.4, params));
+  // The same heading, wrapped round.
+  EXPECT_FALSE(mgg::sampleFlownPose(
+      trail, StateVec(1.2, 0, 0, 0.6 - 2.0 * M_PI + 0.1), 2.6, params));
+  ASSERT_EQ(trail.pending.size(), 3u);
+  EXPECT_NEAR(trail.pending.back().stamp_s, 2.4, 1e-12);
+}
+
+TEST(FlownTrail, BreadcrumbsChainWhereTheRobotFlewAndAreNoFrontiers) {
+  Roadmap fixture;
+  mgg::FlownTrail trail;
+  const mgg::FlownTrailParams params;
+  double stamp = flyAlongX(trail, params, 0.0, 5.0, 0.0);
+  mgg::FlownTrailReport report = mgg::addFlownBreadcrumbs(
+      fixture.global, trail, fixture.ctx, params, stamp);
+  // Its first sample is home, where the chain starts.
+  EXPECT_EQ(report.merged, 1);
+  EXPECT_EQ(report.added, 5);
+  EXPECT_EQ(report.chain_edges, 5);
+  EXPECT_TRUE(trail.pending.empty());
+  EXPECT_EQ(fixture.global.getNumVertices(), 6);
+  EXPECT_EQ(fixture.global.getNumEdges(), 5);
+  for (int i = 1; i <= 5; ++i) {
+    const Vertex* crumb = fixture.nearest(Eigen::Vector3d(i, 0.0, 0.0));
+    ASSERT_NE(crumb, nullptr) << i;
+    EXPECT_EQ(crumb->type, VertexType::kVisited);
+    EXPECT_FALSE(crumb->vol_gain.is_frontier);
+  }
+  EXPECT_NEAR(fixture.distanceFromRoot(
+                  fixture.nearest(Eigen::Vector3d(5.0, 0.0, 0.0))->id),
+              5.0, 1e-9);
+  // Flown back the same way, it adds nothing: every sample is a breadcrumb.
+  stamp = flyAlongX(trail, params, 5.0, 0.0, stamp);
+  report = mgg::addFlownBreadcrumbs(fixture.global, trail, fixture.ctx,
+                                    params, stamp);
+  EXPECT_EQ(report.added, 0);
+  EXPECT_GT(report.merged, 0);
+  EXPECT_EQ(fixture.global.getNumVertices(), 6);
+  EXPECT_EQ(fixture.global.getNumEdges(), 5);
+  EXPECT_EQ(trail.head_vertex_id, 0);
+}
+
+TEST(FlownTrail, SamplesTheMapHasNotObservedWaitForItThenChain) {
+  Roadmap fixture;
+  LaggingSpace lagging;
+  lagging.observed_x = 1.5;
+  fixture.ctx.map = &lagging;
+  mgg::FlownTrail trail;
+  const mgg::FlownTrailParams params;
+  const double stamp = flyAlongX(trail, params, 0.0, 4.0, 0.0);
+  mgg::FlownTrailReport report = mgg::addFlownBreadcrumbs(
+      fixture.global, trail, fixture.ctx, params, stamp);
+  EXPECT_TRUE(report.waiting);
+  EXPECT_EQ(report.added, 1);
+  EXPECT_EQ(trail.pending.size(), 3u);
+  EXPECT_EQ(fixture.global.getNumVertices(), 2);
+  // The map catches up: the chain goes on where it stopped.
+  lagging.observed_x = 10.0;
+  report = mgg::addFlownBreadcrumbs(fixture.global, trail, fixture.ctx,
+                                    params, stamp + 1.0);
+  EXPECT_FALSE(report.waiting);
+  EXPECT_EQ(report.added, 3);
+  EXPECT_EQ(report.chain_edges, 3);
+  EXPECT_TRUE(trail.pending.empty());
+  EXPECT_NEAR(fixture.distanceFromRoot(
+                  fixture.nearest(Eigen::Vector3d(4.0, 0.0, 0.0))->id),
+              4.0, 1e-9);
+}
+
+TEST(FlownTrail, ASampleNeverObservedIsGivenUpAndTheChainRejoinsWhereItCan) {
+  Roadmap fixture;
+  LaggingSpace lagging;
+  lagging.observed_x = 1.5;
+  fixture.ctx.map = &lagging;
+  mgg::FlownTrail trail;
+  const mgg::FlownTrailParams params;
+  double stamp = flyAlongX(trail, params, 0.0, 3.0, 0.0);
+  mgg::FlownTrailReport report = mgg::addFlownBreadcrumbs(
+      fixture.global, trail, fixture.ctx, params, stamp);
+  ASSERT_TRUE(report.waiting);
+  ASSERT_EQ(trail.pending.size(), 2u);
+  // Still unobserved past their patience: given up, the chain broken, and
+  // nothing stored for them.
+  stamp += params.patience_s + 1.0;
+  report = mgg::addFlownBreadcrumbs(fixture.global, trail, fixture.ctx,
+                                    params, stamp);
+  EXPECT_EQ(report.expired, 2);
+  EXPECT_FALSE(report.waiting);
+  EXPECT_TRUE(trail.pending.empty());
+  EXPECT_EQ(trail.head_vertex_id, -1);
+  EXPECT_EQ(fixture.global.getNumVertices(), 2);
+  // Observed now, but 3.5 m from the graph, beyond any link: no island of
+  // breadcrumbs is started there.
+  lagging.observed_x = 10.0;
+  mgg::sampleFlownPose(trail, StateVec(5.0, 0.0, 0.0, 0.0), stamp, params);
+  report = mgg::addFlownBreadcrumbs(fixture.global, trail, fixture.ctx,
+                                    params, stamp);
+  EXPECT_TRUE(report.waiting);
+  report = mgg::addFlownBreadcrumbs(fixture.global, trail, fixture.ctx,
+                                    params, stamp + params.patience_s + 1.0);
+  EXPECT_EQ(report.expired, 1);
+  EXPECT_EQ(fixture.global.getNumVertices(), 2);
+  // Within an edge of the graph, the next sample joins it there.
+  stamp += params.patience_s + 2.0;
+  mgg::sampleFlownPose(trail, StateVec(2.5, 0.0, 0.0, M_PI), stamp, params);
+  report = mgg::addFlownBreadcrumbs(fixture.global, trail, fixture.ctx,
+                                    params, stamp);
+  EXPECT_EQ(report.joined, 1);
+  EXPECT_EQ(report.added, 1);
+  EXPECT_EQ(fixture.global.getNumVertices(), 3);
+  const Vertex* joined = fixture.nearest(Eigen::Vector3d(2.5, 0.0, 0.0));
+  ASSERT_NE(joined, nullptr);
+  EXPECT_EQ(trail.head_vertex_id, joined->id);
+  EXPECT_EQ(joined->type, VertexType::kVisited);
+  EXPECT_NEAR(fixture.distanceFromRoot(joined->id), 2.5, 1e-9);
+}
+
+TEST(FlownTrail, AnEdgeThroughAWallIsNeverStored) {
+  // An odometry jump across a wall: the robot did not fly through it.
+  Roadmap fixture;
+  SlabSpace wall(0.4, 0.6);
+  fixture.ctx.map = &wall;
+  mgg::FlownTrail trail;
+  const mgg::FlownTrailParams params;
+  mgg::sampleFlownPose(trail, StateVec(0.0, 0.0, 0.0, 0.0), 1.0, params);
+  mgg::sampleFlownPose(trail, StateVec(0.0, 1.0, 0.0, 0.0), 2.0, params);
+  mgg::FlownTrailReport report = mgg::addFlownBreadcrumbs(
+      fixture.global, trail, fixture.ctx, params, 2.0);
+  EXPECT_EQ(report.merged, 1);
+  EXPECT_GT(report.refused, 0);
+  EXPECT_TRUE(report.waiting);
+  report = mgg::addFlownBreadcrumbs(fixture.global, trail, fixture.ctx,
+                                    params, 2.0 + params.patience_s + 1.0);
+  EXPECT_EQ(report.expired, 1);
+  EXPECT_EQ(fixture.global.getNumVertices(), 1);
+  EXPECT_EQ(fixture.global.getNumEdges(), 0);
+}
+
+TEST(FlownTrail, TooManyWaitingSamplesAreGivenUpOldestFirst) {
+  Roadmap fixture;
+  LaggingSpace lagging;
+  lagging.observed_x = 0.5;
+  fixture.ctx.map = &lagging;
+  mgg::FlownTrail trail;
+  mgg::FlownTrailParams params;
+  params.max_pending = 4;
+  const double stamp = flyAlongX(trail, params, 0.0, 6.0, 0.0);
+  const mgg::FlownTrailReport report = mgg::addFlownBreadcrumbs(
+      fixture.global, trail, fixture.ctx, params, stamp);
+  EXPECT_TRUE(report.waiting);
+  EXPECT_EQ(report.expired, 2);
+  ASSERT_EQ(trail.pending.size(), 4u);
+  EXPECT_NEAR(trail.pending.front().pose.x(), 3.0, 1e-9);
+}
+
+TEST(FlownTrail, ATrailAddsAtMostItsCapThenOnlyMerges) {
+  Roadmap fixture;
+  mgg::FlownTrail trail;
+  mgg::FlownTrailParams params;
+  params.max_vertices = 3;
+  double stamp = flyAlongX(trail, params, 0.0, 6.0, 0.0);
+  mgg::FlownTrailReport report = mgg::addFlownBreadcrumbs(
+      fixture.global, trail, fixture.ctx, params, stamp);
+  EXPECT_EQ(report.added, 3);
+  EXPECT_EQ(report.capped, 3);
+  EXPECT_EQ(fixture.global.getNumVertices(), 4);
+  // Back over its breadcrumbs it still follows them.
+  stamp = flyAlongX(trail, params, 3.0, 0.0, stamp);
+  report = mgg::addFlownBreadcrumbs(fixture.global, trail, fixture.ctx,
+                                    params, stamp);
+  EXPECT_EQ(report.added, 0);
+  EXPECT_EQ(report.capped, 0);
+  EXPECT_EQ(trail.head_vertex_id, 0);
+}
+
+TEST(TransformRoadmap, OwnVerticesTrailAndHistoryMoveRigidlyPeersAndLiftedStay) {
+  Roadmap fixture;
+  Vertex* root = fixture.global.getVertex(0);
+  Vertex* one = fixture.add(fixture.global, StateVec(1, 0, 0, 0), root);
+  fixture.add(fixture.global, StateVec(2, 0, 0, 0), one);
+  auto* lifted = new Vertex(fixture.global.generateVertexID(), StateVec(3, 3, 1, 0));
+  lifted->lifted_peer_target = true;
+  fixture.global.addVertex(lifted);
+  auto* peer = new Vertex(fixture.global.generateVertexID(), StateVec(5, 5, 0, 0));
+  peer->robot_id = 7;
+  fixture.global.addNeighbourVertex(peer, 1);
+  const double before = fixture.distanceFromRoot(
+      fixture.nearest(Eigen::Vector3d(2, 0, 0))->id);
+
+  Eigen::Isometry3d delta = Eigen::Isometry3d::Identity();
+  delta.linear() = Eigen::AngleAxisd(M_PI / 2.0, Eigen::Vector3d::UnitZ())
+                       .toRotationMatrix();
+  delta.translation() = Eigen::Vector3d(1, 2, 0);
+  EXPECT_EQ(mgg::transformRoadmap(fixture.global, 0, delta), 3);
+  EXPECT_TRUE(fixture.global.getVertex(0)->state.isApprox(
+      StateVec(1, 2, 0, M_PI / 2.0), 1e-12));
+  const Vertex* far = fixture.nearest(Eigen::Vector3d(1, 4, 0));
+  ASSERT_NE(far, nullptr);
+  EXPECT_NEAR(far->state[3], M_PI / 2.0, 1e-12);
+  EXPECT_NEAR(fixture.distanceFromRoot(far->id), before, 1e-12);
+  EXPECT_TRUE(lifted->state.isApprox(StateVec(3, 3, 1, 0)));
+  EXPECT_TRUE(peer->state.isApprox(StateVec(5, 5, 0, 0)));
+  EXPECT_NE(fixture.nearest(Eigen::Vector3d(5, 5, 0)), nullptr);
+
+  mgg::FlownTrail trail;
+  const mgg::FlownTrailParams params;
+  mgg::sampleFlownPose(trail, StateVec(1, 0, 0, 0), 1.0, params);
+  mgg::transformFlownTrail(trail, delta);
+  EXPECT_TRUE(trail.pending.front().pose.isApprox(
+      StateVec(1, 3, 0, M_PI / 2.0), 1e-12));
+  // The next sample is measured in odometry, which did not move.
+  EXPECT_TRUE(trail.last_sample.isApprox(StateVec(1, 0, 0, 0)));
+
+  mgg::RobotStateHistory history;
+  history.addState(StateVec(1, 0, 0, 0));
+  history.transform(delta);
+  std::vector<const StateVec*> found;
+  ASSERT_TRUE(history.getNearestStates(StateVec(1, 3, 0, 0), 1e-6, &found));
+  EXPECT_EQ(found.size(), 1u);
 }
 
 }  // namespace

@@ -29,6 +29,30 @@ void RobotStateHistory::reset() {
   state_hist_.clear();
 }
 
+namespace {
+
+/// The heading `delta` turns a yaw by.
+double yawOf(const Eigen::Isometry3d& delta) {
+  return std::atan2(delta.linear()(1, 0), delta.linear()(0, 0));
+}
+
+/// `state` moved by `delta`: its position transformed, its yaw turned.
+StateVec transformedState(const StateVec& state,
+                          const Eigen::Isometry3d& delta) {
+  StateVec moved = state;
+  moved.head<3>() = delta * Eigen::Vector3d(state.head<3>());
+  moved[3] = std::remainder(state[3] + yawOf(delta), 2.0 * M_PI);
+  return moved;
+}
+
+}  // namespace
+
+void RobotStateHistory::transform(const Eigen::Isometry3d& delta) {
+  const std::deque<StateVec> states = state_hist_;
+  reset();
+  for (const StateVec& state : states) addState(transformedState(state, delta));
+}
+
 void RobotStateHistory::addState(const StateVec& state) {
   state_hist_.push_back(state);
   StateVec* stored = &state_hist_.back();
@@ -339,7 +363,15 @@ DepartureLink linkDeparture(GraphManager& graph, const StateVec& state,
   DepartureLink link;
   link.vertex = connectStateToGraph(graph, state, ctx, link_radius,
                                     /*exact_state=*/false);
-  if (link.vertex != nullptr) return link;
+  // More than an edge from the graph, expandGraph clips its edge and
+  // stores a vertex short of the pose: not where the robot stands, and a
+  // route from it would start metres from the robot (a robot driven or
+  // flown away from its graph, mgg-flown). That is no link.
+  if (link.vertex != nullptr &&
+      (link.vertex->state.head<2>() - state.head<2>()).norm() <= kDeltaLimit) {
+    return link;
+  }
+  link.vertex = nullptr;
   // The robot's own pose is where it stands, even when its box touches a
   // wall it stopped against: every box sweep out of there was refused and
   // the robot could not be routed anywhere (robot_1 and robot_2 on the SubT
@@ -401,6 +433,185 @@ bool addRefPathToGraph(GraphManager& graph,
     poses.push_back({path[i]->state, carried ? path[i] : nullptr});
   }
   return addRefPath(graph, poses, ctx, vertex_spacing, path_vertices);
+}
+
+bool sampleFlownPose(FlownTrail& trail, const StateVec& pose, double stamp_s,
+                     const FlownTrailParams& params) {
+  if (trail.sampled) {
+    const double flown =
+        (pose.head<3>() - trail.last_sample.head<3>()).norm();
+    const double turned =
+        std::abs(std::remainder(pose[3] - trail.last_sample[3], 2.0 * M_PI));
+    if (flown < params.spacing_m && turned < params.turn_rad) return false;
+  }
+  trail.sampled = true;
+  trail.last_sample = pose;
+  trail.pending.push_back({pose, stamp_s});
+  return true;
+}
+
+namespace {
+
+/// The trail's latest breadcrumb, while it is still a vertex in service.
+Vertex* flownTrailHead(GraphManager& graph, const FlownTrail& trail) {
+  if (trail.head_vertex_id < 0) return nullptr;
+  const auto found = graph.vertices_map_.find(trail.head_vertex_id);
+  if (found == graph.vertices_map_.end() || found->second == nullptr ||
+      found->second->lifted_peer_target || !graph.inService(*found->second)) {
+    return nullptr;
+  }
+  return found->second;
+}
+
+/// The robot's own in-service vertex nearest `state` within `radius`.
+Vertex* ownVertexWithin(GraphManager& graph, const StateVec& state,
+                        double radius, int robot_id) {
+  std::vector<Vertex*> near;
+  StateVec query = state;
+  if (radius <= 0.0 || !graph.getNearestVertices(&query, radius, &near)) {
+    return nullptr;
+  }
+  Vertex* best = nullptr;
+  double best_distance = std::numeric_limits<double>::infinity();
+  for (Vertex* vertex : near) {
+    if (vertex == nullptr || vertex->robot_id != robot_id ||
+        vertex->lifted_peer_target || !graph.inService(*vertex)) {
+      continue;
+    }
+    const double distance = (vertex->state.head<3>() - state.head<3>()).norm();
+    if (distance < best_distance) {
+      best_distance = distance;
+      best = vertex;
+    }
+  }
+  return best;
+}
+
+}  // namespace
+
+FlownTrailReport addFlownBreadcrumbs(GraphManager& graph, FlownTrail& trail,
+                                     const ExpandContext& ctx,
+                                     const FlownTrailParams& params,
+                                     double now_s) {
+  FlownTrailReport report;
+  while (!trail.pending.empty()) {
+    planningCheckpoint();
+    const FlownSample sample = trail.pending.front();
+    Vertex* head = flownTrailHead(graph, trail);
+    if (head == nullptr) trail.head_vertex_id = -1;
+    // The robot was on a vertex of its own: the chain goes through it.
+    if (Vertex* on = ownVertexWithin(graph, sample.pose, params.merge_radius_m,
+                                     ctx.robot_id)) {
+      if (head != nullptr && head != on &&
+          !graph.graph_->edgeExists(head->id, on->id)) {
+        ExpandGraphReport rep;
+        if (roadmapEdgeTraversable(ctx, *head, *on, rep)) {
+          graph.addEdge(
+              on, head, (on->state.head<3>() - head->state.head<3>()).norm());
+          ++report.chain_edges;
+        } else {
+          ++report.refused;
+        }
+      }
+      trail.head_vertex_id = on->id;
+      trail.pending.pop_front();
+      ++report.merged;
+      continue;
+    }
+    if (trail.vertices_added >= params.max_vertices) {
+      trail.head_vertex_id = -1;
+      trail.pending.pop_front();
+      ++report.capped;
+      continue;
+    }
+    // The edge from the previous breadcrumb, as flown.
+    if (head != nullptr) {
+      Vertex candidate(-1, sample.pose);
+      ExpandGraphReport rep;
+      if (roadmapEdgeTraversable(ctx, *head, candidate, rep)) {
+        const double length =
+            (sample.pose.head<3>() - head->state.head<3>()).norm();
+        auto* crumb = new Vertex(graph.generateVertexID(), sample.pose);
+        crumb->robot_id = ctx.robot_id;
+        crumb->type = VertexType::kVisited;
+        crumb->parent = head;
+        crumb->distance = head->distance + length;
+        head->children.push_back(crumb);
+        graph.addVertex(crumb);
+        graph.addEdge(crumb, head, length);
+        ++report.chain_edges;
+        // The chain also joins whatever else it reaches here.
+        ExpandGraphReport wired;
+        expandGraphEdges(graph, crumb, wired, ctx);
+        trail.head_vertex_id = crumb->id;
+        ++trail.vertices_added;
+        trail.pending.pop_front();
+        ++report.added;
+        continue;
+      }
+      ++report.refused;
+    }
+    // No edge from the previous breadcrumb (none, or its sweep is not yet
+    // observed free): the sample joins the roadmap where it can, as an
+    // exploration path's first pose does, and only within an edge of it:
+    // farther, expandGraph would store a clipped vertex short of the
+    // sample, where the robot never was.
+    Vertex* nearest = nullptr;
+    StateVec query = sample.pose;
+    const bool within_an_edge =
+        graph.getNearestVertex(&query, &nearest) && nearest != nullptr &&
+        (nearest->state.head<3>() - sample.pose.head<3>()).norm() <=
+            ctx.planning->edge_length_max;
+    const int before = graph.getNumVertices();
+    if (Vertex* joined =
+            within_an_edge
+                ? connectStateToGraph(graph, sample.pose, ctx, kRadiusLimit,
+                                      /*exact_state=*/true)
+                : nullptr) {
+      if (graph.getNumVertices() != before) {
+        joined->type = VertexType::kVisited;
+        ++trail.vertices_added;
+        ++report.added;
+      }
+      trail.head_vertex_id = joined->id;
+      trail.pending.pop_front();
+      ++report.joined;
+      continue;
+    }
+    // Not stored. It waits for the map to observe its sweep, unless it
+    // has waited too long or too many wait: then the chain breaks.
+    if (now_s - sample.stamp_s > params.patience_s ||
+        static_cast<int>(trail.pending.size()) > params.max_pending) {
+      trail.head_vertex_id = -1;
+      trail.pending.pop_front();
+      ++report.expired;
+      continue;
+    }
+    report.waiting = true;
+    break;
+  }
+  return report;
+}
+
+int transformRoadmap(GraphManager& graph, int robot_id,
+                     const Eigen::Isometry3d& delta) {
+  const auto own = graph.vertex_by_robot_id_.find(robot_id);
+  if (own == graph.vertex_by_robot_id_.end()) return 0;
+  int moved = 0;
+  for (const auto& entry : own->second) {
+    Vertex* vertex = entry.second;
+    if (vertex == nullptr || vertex->lifted_peer_target) continue;
+    vertex->state = transformedState(vertex->state, delta);
+    ++moved;
+  }
+  graph.rebuildNearestIndex();
+  return moved;
+}
+
+void transformFlownTrail(FlownTrail& trail, const Eigen::Isometry3d& delta) {
+  for (FlownSample& sample : trail.pending) {
+    sample.pose = transformedState(sample.pose, delta);
+  }
 }
 
 namespace {
