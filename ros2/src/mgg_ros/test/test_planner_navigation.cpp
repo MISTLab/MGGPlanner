@@ -17,6 +17,7 @@
 #include <filesystem>
 #include <fstream>
 #include <functional>
+#include <future>
 #include <iomanip>
 #include <limits>
 #include <memory>
@@ -583,6 +584,58 @@ class PlannerNodeTestPeer {
 
   static void setBudget(PlannerNode& node, double seconds) {
     node.lattice_time_budget_s_ = seconds;
+    node.navigate_time_budget_s_ = seconds;
+    node.global_route_time_budget_s_ = seconds;
+  }
+  // Inject cooperative work at real request checkpoints, not an uninterruptible
+  // sleep or a machine-dependent graph size. No production timing hook.
+  static bool deadlineActive(const PlannerNode& node) {
+    return node.lattice_deadline_.has_value();
+  }
+  static void cancel(PlannerNode& node) { node.cancelPlanning(); }
+  static double& rawRouteCertificationMs(PlannerNode& node) {
+    return node.raw_route_certification_ms_;
+  }
+  static void resetPolish(PlannerNode& node) {
+    node.path_shortcut_from_ = 0;
+    node.path_shortcut_to_ = 0;
+  }
+  static bool polishing(const PlannerNode& node) { return node.path_shortcut_from_ > 2; }
+  // The shortcut has finished: the polished route is being certified.
+  static bool certifyingPolish(const PlannerNode& node) {
+    return polishing(node) && node.path_shortcut_to_ > 0;
+  }
+  // The raw graph route first doubles back to a vertex inside the chassis
+  // spin's offset circle, so its spin joins nothing before an initial-leg
+  // corner. Its shortcut runs straight ahead along the robot's heading. The
+  // long edge keeps the link expansion from bypassing that first vertex.
+  static void rawCornerRoadmap(PlannerNode& node) {
+    node.applyLatestOdometry();
+    node.global_graph_->reset();
+    const std::vector<Eigen::Vector2d> at{{0, 0}, {.16, .1}, {-1.2, 0}, {-2, 0}};
+    for (std::size_t i = 0; i < at.size(); ++i) {
+      auto* v = new mgg::Vertex(static_cast<int>(i), mgg::StateVec(at[i].x(), at[i].y(), .935, M_PI));
+      node.global_graph_->addVertex(v);
+      if (i) node.global_graph_->addEdge(node.global_graph_->getVertex(static_cast<int>(i) - 1), v,
+                                         (at[i] - at[i - 1]).norm());
+    }
+    node.global_root_supported_ = true;
+    resetPolish(node);
+  }
+  static void budgetRoadmap(PlannerNode& node) {
+    node.applyLatestOdometry();
+    node.global_graph_->reset();
+    for (int i = 0; i < 5; ++i) {
+      auto* v = new mgg::Vertex(i, mgg::StateVec(-i * .5, 0, .935, M_PI));
+      node.global_graph_->addVertex(v);
+      if (i) node.global_graph_->addEdge(node.global_graph_->getVertex(i-1), v, .5);
+    }
+    node.global_root_supported_ = true;
+    resetPolish(node);
+  }
+  static void exploreImpl(PlannerNode& node,
+      std::shared_ptr<mgg_msgs::srv::PlannerSrv::Response> response) {
+    node.onPlanRequestImpl(std::make_shared<mgg_msgs::srv::PlannerSrv::Request>(), response);
   }
   static void objective(
       PlannerNode& node,
@@ -597,16 +650,19 @@ namespace {
 using Service = mgg_msgs::srv::PlanObjective;
 
 std::shared_ptr<PlannerNode> botmanNode(const std::string& name,
-                                        const MolaTerrainProduct& product) {
+                                        const MolaTerrainProduct& product,
+                                        std::vector<rclcpp::Parameter> extra = {}) {
   rclcpp::NodeOptions options;
   options.arguments({"--ros-args", "-r", "__node:=" + name});
-  options.parameter_overrides({
+  std::vector<rclcpp::Parameter> parameters{
       rclcpp::Parameter("map.backend", "mola_snapshot"),
       rclcpp::Parameter("map.resolution", product.resolution()),
       rclcpp::Parameter("map.mola.peer_root", product.root().string()),
       rclcpp::Parameter("map.mola.snapshot_ttl_sec", 60.0),
       rclcpp::Parameter("PlanningParams.global_frame_id", "world"),
-  });
+  };
+  parameters.insert(parameters.end(), extra.begin(), extra.end());
+  options.parameter_overrides(parameters);
   options.automatically_declare_parameters_from_overrides(true);
   auto node = std::make_shared<PlannerNode>(options);
   PlannerNodeTestPeer::configureBotman(*node);
@@ -665,6 +721,295 @@ class PlannerNavigationTest : public ::testing::Test {
   static void SetUpTestSuite() { rclcpp::init(0, nullptr); }
   static void TearDownTestSuite() { rclcpp::shutdown(); }
 };
+
+namespace {
+// Work injected once inside the active deadline, checked every millisecond.
+class CooperativeBudgetWork {
+ public:
+  CooperativeBudgetWork(PlannerNode& node, double seconds, std::atomic<bool>* admitted = nullptr,
+                        bool during_polish = false)
+      : scope_([&, seconds, admitted, during_polish] {
+          if (!entered && PlannerNodeTestPeer::deadlineActive(node) &&
+              (!during_polish || PlannerNodeTestPeer::polishing(node))) {
+            entered = true;
+            if (admitted) *admitted = true;
+            const auto until = std::chrono::steady_clock::now() +
+                std::chrono::duration<double>(seconds);
+            while (std::chrono::steady_clock::now() < until) {
+              mgg::planningCheckpoint();
+              std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            }
+          }
+          return false;
+        }) {}
+  std::atomic<bool> entered{false};
+ private:
+  mgg::PlanningCancellationScope scope_;
+};
+std::shared_ptr<Service::Request> budgetRequest(PlannerNode& node, int objective) {
+  auto request = std::make_shared<Service::Request>();
+  request->objective = objective;
+  PlannerNodeTestPeer::objectiveIdentity(node, *request);
+  request->goal.position.x = -2;
+  request->goal.orientation.w = 1;
+  return request;
+}
+}  // namespace
+
+TEST_F(PlannerNavigationTest, ObjectiveBudgetsAllowReturnHomeBeyondHalfSecond) {
+  MolaTerrainProduct product(.1, -4, 3, -3, 3, flat, {}, 2.5);
+  auto node = botmanNode("budget_home", product);
+  PlannerNodeTestPeer::standAt(*node, 0, 0, 0, M_PI, 1);
+  PlannerNodeTestPeer::budgetRoadmap(*node);
+  CooperativeBudgetWork work(*node, .75);
+  auto response = std::make_shared<Service::Response>();
+  const auto start = std::chrono::steady_clock::now();
+  PlannerNodeTestPeer::objective(*node, budgetRequest(*node, Service::Request::RETURN_HOME), response);
+  const double elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now()-start).count();
+  EXPECT_GT(elapsed, .5);
+  EXPECT_LT(elapsed, 5.0);
+  ASSERT_EQ(response->status, Service::Response::SUCCEEDED) << response->reason;
+  ASSERT_FALSE(response->path.empty());
+  EXPECT_NEAR(response->path.back().position.x, -2, .001);
+}
+
+TEST_F(PlannerNavigationTest, ObjectiveBudgetsNavigateHasOneSecondNotHalfSecond) {
+  MolaTerrainProduct product(.1, -4, 3, -3, 3, flat, {}, 2.5);
+  for (double duration : {.65, 1.2}) {
+    SCOPED_TRACE(duration);
+    auto node = botmanNode("budget_navigate", product);
+    PlannerNodeTestPeer::standAt(*node, 0, 0, 0, M_PI, 1);
+    CooperativeBudgetWork work(*node, duration);
+    const auto start = std::chrono::steady_clock::now();
+    auto response = navigate(*node, -2, 0);
+    const double elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now()-start).count();
+    if (duration < 1) {
+      EXPECT_EQ(response->status, Service::Response::SUCCEEDED) << response->reason;
+      EXPECT_FALSE(response->path.empty());
+    } else {
+      EXPECT_EQ(response->status, Service::Response::UNREACHABLE);
+      EXPECT_TRUE(response->path.empty());
+      EXPECT_NE(response->reason.find("budget exceeded"), std::string::npos);
+      EXPECT_GE(elapsed, 1.0);
+      EXPECT_LT(elapsed, 1.2);
+    }
+  }
+}
+
+TEST_F(PlannerNavigationTest, ObjectiveBudgetsExplorationStillStopsAtHalfSecond) {
+  MolaTerrainProduct product(.1, -4, 3, -3, 3, flat, {}, 2.5);
+  auto node = botmanNode("budget_explore", product);
+  PlannerNodeTestPeer::standAt(*node, 0, 0, 0, M_PI, 1);
+  CooperativeBudgetWork work(*node, 1.2);
+  auto response = std::make_shared<mgg_msgs::srv::PlannerSrv::Response>();
+  const auto start = std::chrono::steady_clock::now();
+  PlannerNodeTestPeer::exploreImpl(*node, response);
+  const double elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now()-start).count();
+  EXPECT_TRUE(work.entered);
+  EXPECT_GE(elapsed, .5);
+  EXPECT_LT(elapsed, .7);
+  EXPECT_TRUE(response->path.empty());
+}
+
+TEST_F(PlannerNavigationTest, ObjectiveBudgetsCancelThreeSecondHomeWithin200ms) {
+  using namespace std::chrono_literals;
+  MolaTerrainProduct product(.1, -4, 3, -3, 3, flat, {}, 2.5);
+  auto node = botmanNode("budget_cancel_home", product);
+  PlannerNodeTestPeer::standAt(*node, 0, 0, 0, M_PI, 1);
+  PlannerNodeTestPeer::budgetRoadmap(*node);
+  auto response = std::make_shared<Service::Response>();
+  std::atomic<bool> entered{false};
+  auto future = std::async(std::launch::async, [&] {
+    CooperativeBudgetWork work(*node, 3.0, &entered);
+    PlannerNodeTestPeer::objective(*node, budgetRequest(*node, Service::Request::RETURN_HOME), response);
+  });
+  const auto by = std::chrono::steady_clock::now() + 2s;
+  while (!entered && std::chrono::steady_clock::now() < by) std::this_thread::sleep_for(1ms);
+  std::this_thread::sleep_for(700ms);
+  EXPECT_EQ(future.wait_for(0ms), std::future_status::timeout);
+  const auto start = std::chrono::steady_clock::now();
+  PlannerNodeTestPeer::cancel(*node);
+  EXPECT_EQ(future.wait_for(200ms), std::future_status::ready);
+  future.get();
+  EXPECT_LT(std::chrono::steady_clock::now()-start, 200ms);
+  EXPECT_TRUE(response->path.empty());
+  EXPECT_EQ(response->status, Service::Response::BLOCKED) << response->reason;
+}
+
+TEST_F(PlannerNavigationTest, ObjectiveBudgetsKeepCertifiedGlobalRouteWhenPolishExpires) {
+  MolaTerrainProduct product(.1, -4, 3, -3, 3, flat, {}, 2.5);
+  for (int objective : {Service::Request::RETURN_HOME, Service::Request::NAVIGATE}) {
+    auto node = botmanNode("budget_anytime", product);
+    PlannerNodeTestPeer::standAt(*node, 0, 0, 0, M_PI, 1);
+    PlannerNodeTestPeer::budgetRoadmap(*node);
+    PlannerNodeTestPeer::forceGlobalFallback(*node, true);
+    bool expired = false;
+    mgg::PlanningCancellationScope instrument([&] {
+      if (!expired && PlannerNodeTestPeer::polishing(*node)) {
+        expired = true;
+        PlannerNodeTestPeer::expireRequest(*node);
+      }
+      return false;
+    });
+    auto response = std::make_shared<Service::Response>();
+    PlannerNodeTestPeer::objective(*node, budgetRequest(*node, objective), response);
+    EXPECT_TRUE(expired);
+    ASSERT_EQ(response->status, Service::Response::SUCCEEDED) << response->reason;
+    ASSERT_GE(response->path.size(), 2u);
+    EXPECT_NEAR(response->path.back().position.x, -2, .001);
+    EXPECT_NE(response->reason.find("certified"), std::string::npos);
+  }
+}
+
+TEST_F(PlannerNavigationTest, ObjectiveBudgetsGlobalNavigateRunsBeyondOneSecond) {
+  MolaTerrainProduct product(.1, -4, 3, -3, 3, flat, {}, 2.5);
+  auto node = botmanNode("budget_global_navigate", product);
+  PlannerNodeTestPeer::standAt(*node, 0, 0, 0, M_PI, 1);
+  PlannerNodeTestPeer::budgetRoadmap(*node);
+  PlannerNodeTestPeer::forceGlobalFallback(*node, true);
+  CooperativeBudgetWork work(*node, 1.2, nullptr, /*during_polish=*/true);
+  const auto start = std::chrono::steady_clock::now();
+  const auto response = navigate(*node, -2, 0);
+  const double elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now()-start).count();
+  EXPECT_TRUE(work.entered);
+  EXPECT_GT(elapsed, 1.0);
+  EXPECT_LT(elapsed, 5.0);
+  EXPECT_EQ(response->status, Service::Response::SUCCEEDED) << response->reason;
+  EXPECT_FALSE(response->path.empty());
+}
+
+TEST_F(PlannerNavigationTest, ObjectiveBudgetsFiveSecondExpiryKeepsCertifiedHome) {
+  MolaTerrainProduct product(.1, -4, 3, -3, 3, flat, {}, 2.5);
+  auto node = botmanNode("budget_five_second_home", product);
+  PlannerNodeTestPeer::standAt(*node, 0, 0, 0, M_PI, 1);
+  PlannerNodeTestPeer::budgetRoadmap(*node);
+  CooperativeBudgetWork work(*node, 6.0, nullptr, /*during_polish=*/true);
+  const auto start = std::chrono::steady_clock::now();
+  auto response = std::make_shared<Service::Response>();
+  PlannerNodeTestPeer::objective(*node, budgetRequest(*node, Service::Request::RETURN_HOME), response);
+  const double elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now()-start).count();
+  EXPECT_TRUE(work.entered);
+  EXPECT_GE(elapsed, 5.0);
+  EXPECT_LT(elapsed, 5.2);
+  ASSERT_EQ(response->status, Service::Response::SUCCEEDED) << response->reason;
+  ASSERT_FALSE(response->path.empty());
+  EXPECT_NEAR(response->path.back().position.x, -2, .001);
+  EXPECT_NE(response->reason.find("certified"), std::string::npos);
+}
+
+TEST_F(PlannerNavigationTest, ObjectiveBudgetsAreIndependentParameters) {
+  MolaTerrainProduct product(.1, -4, 3, -3, 3, flat, {}, 2.5);
+  auto node = botmanNode("budget_parameters", product, {
+      rclcpp::Parameter("lattice_time_budget_s", .02),
+      rclcpp::Parameter("navigate_time_budget_s", .03),
+      rclcpp::Parameter("global_route_time_budget_s", .2)});
+  EXPECT_DOUBLE_EQ(node->get_parameter("lattice_time_budget_s").as_double(), .02);
+  EXPECT_DOUBLE_EQ(node->get_parameter("navigate_time_budget_s").as_double(), .03);
+  EXPECT_DOUBLE_EQ(node->get_parameter("global_route_time_budget_s").as_double(), .2);
+  PlannerNodeTestPeer::standAt(*node, 0, 0, 0, M_PI, 1);
+  PlannerNodeTestPeer::budgetRoadmap(*node);
+  CooperativeBudgetWork work(*node, .08);
+  auto response = std::make_shared<Service::Response>();
+  PlannerNodeTestPeer::objective(*node, budgetRequest(*node, Service::Request::RETURN_HOME), response);
+  EXPECT_EQ(response->status, Service::Response::SUCCEEDED) << response->reason;
+  EXPECT_FALSE(response->path.empty());
+}
+
+TEST_F(PlannerNavigationTest, ObjectiveBudgetsCancellationDuringPolishNeverReturnsRoute) {
+  MolaTerrainProduct product(.1, -4, 3, -3, 3, flat, {}, 2.5);
+  auto node = botmanNode("budget_polish_cancel", product);
+  PlannerNodeTestPeer::standAt(*node, 0, 0, 0, M_PI, 1);
+  PlannerNodeTestPeer::budgetRoadmap(*node);
+  mgg::PlanningCancellationScope instrument([&] { return PlannerNodeTestPeer::polishing(*node); });
+  auto response = std::make_shared<Service::Response>();
+  PlannerNodeTestPeer::objective(*node, budgetRequest(*node, Service::Request::RETURN_HOME), response);
+  EXPECT_EQ(response->status, Service::Response::BLOCKED);
+  EXPECT_TRUE(response->path.empty());
+}
+
+// Review r0 P1: the base flow polished and then certified. A raw graph route
+// failing the post-spin join must not hide its passing shortcut.
+TEST_F(PlannerNavigationTest, ObjectiveBudgetsAcceptPolishedRouteWhoseRawCornersFail) {
+  MolaTerrainProduct product(.1, -4, 3, -3, 3, flat, {}, 2.5);
+  for (int objective : {Service::Request::RETURN_HOME, Service::Request::NAVIGATE}) {
+    SCOPED_TRACE(objective);
+    auto node = botmanNode("budget_raw_corner", product);
+    PlannerNodeTestPeer::standAt(*node, 0, 0, 0, M_PI, 1);
+    PlannerNodeTestPeer::rawCornerRoadmap(*node);
+    PlannerNodeTestPeer::forceGlobalFallback(*node, true);
+    auto response = std::make_shared<Service::Response>();
+    PlannerNodeTestPeer::objective(*node, budgetRequest(*node, objective), response);
+    ASSERT_EQ(response->status, Service::Response::SUCCEEDED) << response->reason;
+    ASSERT_GE(response->path.size(), 2u);
+    EXPECT_NEAR(response->path.back().position.x, -2, .001);
+    EXPECT_EQ(response->reason.find("certified"), std::string::npos) << response->reason;
+    // The up-front raw check here runs the post-spin join to its corner.
+    RecordProperty(objective == Service::Request::RETURN_HOME
+                       ? "home_raw_route_certification_ms" : "navigate_raw_route_certification_ms",
+                   std::to_string(PlannerNodeTestPeer::rawRouteCertificationMs(*node)));
+    // The polished route never visits the doubled-back vertex behind the robot.
+    for (const auto& pose : response->path) EXPECT_LT(pose.position.x, .05);
+  }
+}
+
+TEST_F(PlannerNavigationTest, ObjectiveBudgetsExpiryDuringPolishCertificationKeepsCertifiedRoute) {
+  MolaTerrainProduct product(.1, -4, 3, -3, 3, flat, {}, 2.5);
+  auto node = botmanNode("budget_polish_certify_expiry", product);
+  PlannerNodeTestPeer::standAt(*node, 0, 0, 0, M_PI, 1);
+  PlannerNodeTestPeer::budgetRoadmap(*node);
+  bool expired = false;
+  mgg::PlanningCancellationScope instrument([&] {
+    if (!expired && PlannerNodeTestPeer::certifyingPolish(*node)) {
+      expired = true;
+      PlannerNodeTestPeer::expireRequest(*node);
+    }
+    return false;
+  });
+  auto response = std::make_shared<Service::Response>();
+  PlannerNodeTestPeer::objective(*node, budgetRequest(*node, Service::Request::RETURN_HOME), response);
+  EXPECT_TRUE(expired);
+  ASSERT_EQ(response->status, Service::Response::SUCCEEDED) << response->reason;
+  ASSERT_GE(response->path.size(), 2u);
+  EXPECT_NEAR(response->path.back().position.x, -2, .001);
+  EXPECT_NE(response->reason.find("certified"), std::string::npos) << response->reason;
+}
+
+// Both routes fail: polish cut by the deadline leaves the raw route's reason.
+TEST_F(PlannerNavigationTest, ObjectiveBudgetsBothRoutesFailingReportRawReasonAfterExpiry) {
+  MolaTerrainProduct product(.1, -4, 3, -3, 3, flat, {}, 2.5);
+  auto node = botmanNode("budget_both_fail", product);
+  PlannerNodeTestPeer::standAt(*node, 0, 0, 0, M_PI, 1);
+  PlannerNodeTestPeer::rawCornerRoadmap(*node);
+  bool expired = false;
+  mgg::PlanningCancellationScope instrument([&] {
+    if (!expired && PlannerNodeTestPeer::polishing(*node)) {
+      expired = true;
+      PlannerNodeTestPeer::expireRequest(*node);
+    }
+    return false;
+  });
+  auto response = std::make_shared<Service::Response>();
+  PlannerNodeTestPeer::objective(*node, budgetRequest(*node, Service::Request::RETURN_HOME), response);
+  EXPECT_TRUE(expired);
+  EXPECT_EQ(response->status, Service::Response::UNREACHABLE) << response->reason;
+  EXPECT_TRUE(response->path.empty());
+  EXPECT_NE(response->reason.find("post-spin reference cannot join"), std::string::npos)
+      << response->reason;
+  EXPECT_NE(response->reason.find("polish stopped at the request deadline"), std::string::npos)
+      << response->reason;
+}
+
+TEST_F(PlannerNavigationTest, ObjectiveBudgetsCancelWhileCertifyingPolishNeverReturnsRoute) {
+  MolaTerrainProduct product(.1, -4, 3, -3, 3, flat, {}, 2.5);
+  auto node = botmanNode("budget_polish_certify_cancel", product);
+  PlannerNodeTestPeer::standAt(*node, 0, 0, 0, M_PI, 1);
+  PlannerNodeTestPeer::rawCornerRoadmap(*node);
+  mgg::PlanningCancellationScope instrument([&] { return PlannerNodeTestPeer::certifyingPolish(*node); });
+  auto response = std::make_shared<Service::Response>();
+  PlannerNodeTestPeer::objective(*node, budgetRequest(*node, Service::Request::RETURN_HOME), response);
+  EXPECT_EQ(response->status, Service::Response::BLOCKED) << response->reason;
+  EXPECT_TRUE(response->path.empty());
+}
 
 TEST_F(PlannerNavigationTest, HardwareNavigateFitsNorthDoorwayWithObservedBody) {
   MolaTerrainProduct product(.1, -5, 5, -3, 7, flat,
@@ -739,6 +1084,7 @@ TEST_F(PlannerNavigationTest, BotmanFixtureFullServicesBenchmark) {
     PlannerNodeTestPeer::standAt(*node, 0, 0, -.61, M_PI, run+1);
     for (const std::string mode : {"navigate_local", "navigate_global_fallback", "navigate_15m", "explore_origin", "explore_1.13", "explore_-3.17"}) {
       PlannerNodeTestPeer::forceGlobalFallback(*node, mode == "navigate_global_fallback");
+      PlannerNodeTestPeer::rawRouteCertificationMs(*node) = -1;
       const auto started = std::chrono::steady_clock::now();
       int status = 0;
       std::size_t poses = 0;
@@ -760,11 +1106,14 @@ TEST_F(PlannerNavigationTest, BotmanFixtureFullServicesBenchmark) {
       const double elapsed = std::chrono::duration<double, std::milli>(
           std::chrono::steady_clock::now() - started).count();
       nlohmann::json row{{"service",mode},{"repeat",run},{"unknown_body_policy",policy},{"allow_unknown_body",allow_unknown},
-          {"request_budget_ms",500},{"total_ms",elapsed},{"status",status},{"poses",poses},
+          {"exploration_budget_ms",500},{"navigate_budget_ms",1000},
+          {"global_route_budget_ms",5000},{"total_ms",elapsed},{"status",status},{"poses",poses},
           {"reason",reason},{"x86_budget_met",elapsed <= 300}};
       if (exploring) row.update(PlannerNodeTestPeer::explorationMetrics(*node));
       row.update(PlannerNodeTestPeer::groundGainModel(*node));
       if (mode == "navigate_global_fallback") row["global_diagnostic"] = PlannerNodeTestPeer::globalLinks(*node);
+      if (PlannerNodeTestPeer::rawRouteCertificationMs(*node) >= 0)
+        row["raw_route_certification_ms"] = PlannerNodeTestPeer::rawRouteCertificationMs(*node);
       std::printf("SERVICE_BENCH %s\n", row.dump().c_str());
       EXPECT_LT(elapsed, 1000);  // hard envelope, not a claim of the x86 target
     }

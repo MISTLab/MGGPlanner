@@ -985,9 +985,14 @@ class PlannerNode : public rclcpp::Node {
   bool allow_unknown_lattice_body_ = false;
   std::string unknown_body_policy_ = "strict";
   std::string unknown_body_sensor_ = "VLP16";
-  /// How long one request's lattice sweeps may take, seconds
-  /// (lattice_time_budget_s); 0 is no bound.
+  /// Ground request budgets in seconds; 0 is no bound. Exploration keeps
+  /// the legacy parameter name; objective deadlines share the same checkpoints.
   double lattice_time_budget_s_ = 0.5;
+  double navigate_time_budget_s_ = 1.0;
+  double global_route_time_budget_s_ = 5.0;
+  /// The last ground global route's raw-route certification, ms: the
+  /// anytime fallback's up-front cost (fixture benchmark row).
+  double raw_route_certification_ms_ = 0.0;
   /// While a request runs, where its lattice sweeps stop (makeContext's
   /// ExpandContext::deadline): the sweep keeps what it built by then.
   std::optional<std::chrono::steady_clock::time_point> lattice_deadline_;

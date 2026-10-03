@@ -192,7 +192,8 @@ struct DeadlineScope {
         outer_(mgg::planning_cancelled), started_(std::chrono::steady_clock::now()),
         cancellation_([this] {
           if (outer_ && (*outer_)()) { cancelled_ = true; return true; }
-          exhausted_ = deadline_ && std::chrono::steady_clock::now() >= *deadline_;
+          exhausted_ = !certified_result_ && deadline_ &&
+                       std::chrono::steady_clock::now() >= *deadline_;
           return exhausted_;
         }) {
     if (budget_s > 0.0 && !deadline_) {
@@ -210,6 +211,20 @@ struct DeadlineScope {
   std::chrono::steady_clock::time_point started_;
   bool exhausted_ = false;
   bool cancelled_ = false;
+  bool certified_result_ = false;
+  // A global fallback gets the long-route budget from the original start,
+  // never a fresh five seconds. An enclosing deadline is still authoritative.
+  void useBudget(double seconds) {
+    if (previous_) return;
+    deadline_.reset();
+    if (seconds > 0.0) {
+      deadline_ = started_ + std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+          std::chrono::duration<double>(seconds));
+    }
+  }
+  // Only after full certification: no more geometry work, just serialize and
+  // fence the result. The outer cancellation/authority predicate stays active.
+  void finishCertifiedResult() { certified_result_ = true; }
   mgg::PlanningCancellationScope cancellation_;
   std::string reason() const {
     const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -670,14 +685,25 @@ PlannerNode::PlannerNode(const rclcpp::NodeOptions& options)
         "strictly above the planning body bottom; USING STRICT UNKNOWN POLICY",
         unknown_body_sensor_.c_str());
   }
-  // The most one request (an objective, a plan request) spends sweeping
-  // lattices, seconds: past it a sweep stops and the request plans over
-  // what it built, or refuses with the budget named. A planning call longer
-  // than the MOLA snapshot TTL (3 s) let the map expire under the next
-  // request (botman, 2026-10-01). 0 is no bound.
+  // Ground exploration is cyclic; operator objectives are rarer and may
+  // traverse the whole roadmap. Aerial planning retains its unbounded policy.
+  // Keep lattice_time_budget_s as exploration's existing parameter (0 unbound).
   lattice_time_budget_s_ = std::max(
       0.0, declareOrGet<double>(this, "lattice_time_budget_s",
                                 lattice_time_budget_s_));
+  navigate_time_budget_s_ = std::max(
+      0.0, declareOrGet<double>(this, "navigate_time_budget_s",
+                                navigate_time_budget_s_));
+  global_route_time_budget_s_ = std::max(
+      0.0, declareOrGet<double>(this, "global_route_time_budget_s",
+                                global_route_time_budget_s_));
+  RCLCPP_INFO(get_logger(),
+      "planning budgets: ground exploration (lattice_time_budget_s)=%.3f s, "
+      "NAVIGATE local (navigate_time_budget_s)=%.3f s, RETURN_HOME/global NAVIGATE "
+      "(global_route_time_budget_s)=%.3f s; 0=unbounded; aerial requests unbounded; "
+      "ground exploration lattice soft slice=%.3f s",
+      lattice_time_budget_s_, navigate_time_budget_s_, global_route_time_budget_s_,
+      ground_exploration_lattice_budget_s_);
   // A lidar does not see the ground under the robot: within its blind radius
   // a keyframe map holds no floor, so the graph root has no support until
   // the robot has driven away from where it stands. The root then sits at
@@ -4997,8 +5023,7 @@ bool PlannerNode::routeOverLocalLattice(const mgg::StateVec& goal,
   if (!local.routed) {
     reason = local.reason;
     if (local.lattice.hit_deadline) {
-      reason += " (the lattice stopped at its time budget, " +
-                std::to_string(lattice_time_budget_s_) + " s)";
+      reason += " (the lattice stopped at its request deadline)";
     }
     return false;
   }
@@ -6804,8 +6829,11 @@ void PlannerNode::onObjectiveRequestImpl(
   applyLatestOdometry();
   refreshMapRevision();
   StandingStartScope standing_scope(*this);
-  const DeadlineScope budget(lattice_deadline_,
-      robot_params_.type == mgg::RobotType::kGroundRobot ? lattice_time_budget_s_ : 0.0);
+  const bool bounded_ground = robot_params_.type == mgg::RobotType::kGroundRobot;
+  DeadlineScope budget(lattice_deadline_, bounded_ground
+      ? (request->objective == Service::Request::RETURN_HOME
+          ? global_route_time_budget_s_ : navigate_time_budget_s_)
+      : 0.0);
   // Every answer is logged with the objective, where the robot is and the
   // goal it asked for: a refusal alone does not say which objective it
   // answered or where it was going (run 5, 2026-09-25).
@@ -6926,6 +6954,7 @@ void PlannerNode::onObjectiveRequestImpl(
       request->objective == Service::Request::NAVIGATE &&
       routeOverLocalLattice(goal, route, turns_ok, local_reason);
   const int rebuilds_before = roadmap_rebuilds_;
+  if (!local && bounded_ground) budget.useBudget(global_route_time_budget_s_);
   bool routed =
       local || routeOverGlobalGraph(goal, tolerance, route, turns_ok, reason);
   if (home_is_vertex_zero && roadmap_rebuilds_ != rebuilds_before) {
@@ -6943,12 +6972,38 @@ void PlannerNode::onObjectiveRequestImpl(
     response->reason = reason;
     return;
   }
-  shortcutAndResample(route, turns_ok, nullptr, /*lattice_route=*/local);
-  mgg::PathType objective_points;
-  for (const auto& pose : route) objective_points.push_back(pose.head<3>());
-  // Check the actual route being sent, even without retained escape memory.
-  // No SUCCEEDED objective may start with a turn at a room-less root.
-  if (routeStartsWithTurnWithoutRoom(objective_points)) {
+  const bool anytime = bounded_ground && !local;
+  // The final checks of the route as it will be sent, even without retained
+  // escape memory. A failure fills *response, except a start turn without
+  // room, which sets needs_departure for answer_with_departure.
+  const auto certify_route = [&](bool& needs_departure) {
+    needs_departure = false;
+    mgg::PathType objective_points;
+    for (const auto& pose : route) objective_points.push_back(pose.head<3>());
+    if (routeStartsWithTurnWithoutRoom(objective_points)) {
+      needs_departure = true;
+      return false;
+    }
+    if (!startPathAfterChassisSpin(route, local)) {
+      response->status = Service::Response::UNREACHABLE;
+      response->reason = "post-spin reference cannot join the route safely";
+      return false;
+    }
+    if (!route.empty() && !standingStartGoalAdmissible(route.back())) {
+      response->status = Service::Response::UNREACHABLE;
+      response->reason = "the goal intersects the standing-start arrival band";
+      return false;
+    }
+    if (!noGoAdmissible(route)) {
+      response->status = Service::Response::UNREACHABLE;
+      response->reason = "the route enters a no-go zone";
+      return false;
+    }
+    return true;
+  };
+  // No SUCCEEDED objective may start with a turn at a room-less root. The
+  // departure depends on the robot's pose only, not on the route refused.
+  const auto answer_with_departure = [&] {
     mgg::StateVec start = current_state_;
     if (!projectToDrivingHeight(start)) start = physicalAnchorAtDrivingHeight(current_state_);
     std::string exit_note;
@@ -6976,32 +7031,121 @@ void PlannerNode::onObjectiveRequestImpl(
             std::to_string(mgg::kDepartureMaxM) + " m";
       }
     }
-    return;  // keep the remaining escape; never command an in-place turn
-  }
-  if (!startPathAfterChassisSpin(route, local)) {
-    response->status = Service::Response::UNREACHABLE;
-    response->reason = "post-spin reference cannot join the route safely";
-    return;
-  }
-  if (!route.empty() && !standingStartGoalAdmissible(route.back())) {
-    response->status = Service::Response::UNREACHABLE;
-    response->reason = "the goal intersects the standing-start arrival band";
-    return;
-  }
-  if (!noGoAdmissible(route)) {
-    response->status = Service::Response::UNREACHABLE;
-    response->reason = "the route enters a no-go zone";
-    return;
-  }
-  if (!route.empty() && currentPoseNeedsStoredExit()) {
-    const std::string refusal = retainReverseExit(route, false);
-    if (!refusal.empty()) {
-      response->reason = "escape corridor not retained: " + refusal;
-      RCLCPP_WARN(get_logger(), "%s", response->reason.c_str());
+    // Keep the remaining escape; never command an in-place turn.
+  };
+  const auto retain_exit = [&](bool needs_stored_exit) {
+    if (needs_stored_exit) {
+      const std::string refusal = retainReverseExit(route, false);
+      if (!refusal.empty()) {
+        response->reason = "escape corridor not retained: " + refusal;
+        RCLCPP_WARN(get_logger(), "%s", response->reason.c_str());
+      }
+    } else {
+      stored_reverse_exit_.clear();
     }
+  };
+  if (!anytime) {
+    shortcutAndResample(route, turns_ok, nullptr, /*lattice_route=*/local);
+    bool needs_departure = false;
+    if (!certify_route(needs_departure)) {
+      if (needs_departure) answer_with_departure();
+      return;
+    }
+    retain_exit(!route.empty() && currentPoseNeedsStoredExit());
   } else {
-    stored_reverse_exit_.clear();
+    // Anytime: certify the raw graph route first, without side effects, so
+    // a certified route is in hand before the optional polish. Its failure
+    // is not final. Then the base order (shortcut, then the same checks)
+    // decides; the raw route stands in when the deadline cuts that short or
+    // the polished route fails its checks. Cancellation always aborts.
+    struct ReverseExitMemory {
+      std::vector<mgg::StateVec> exit, entry;
+      bool retreating;
+    };
+    const auto save_exit = [this] {
+      return ReverseExitMemory{stored_reverse_exit_, reverse_exit_entry_path_,
+                               stored_reverse_retreating_};
+    };
+    const auto restore_exit = [this](const ReverseExitMemory& memory) {
+      stored_reverse_exit_ = memory.exit;
+      reverse_exit_entry_path_ = memory.entry;
+      stored_reverse_retreating_ = memory.retreating;
+    };
+    const std::vector<mgg::StateVec> graph_route = route;
+    const auto request_response = *response;
+    const ReverseExitMemory request_exit = save_exit();
+    const bool needs_stored_exit = !route.empty() && currentPoseNeedsStoredExit();
+    const auto raw_started = std::chrono::steady_clock::now();
+    // The unpolished graph route must also carry outgoing headings, as the
+    // shortcut normally supplies them. Do not interpolate uncertified leaps.
+    for (std::size_t i = 0; i + 1 < route.size(); ++i) {
+      const Eigen::Vector2d step = (route[i + 1] - route[i]).head<2>();
+      if (step.norm() > 1e-9) route[i][3] = std::atan2(step.y(), step.x());
+    }
+    if (route.size() > 1) route.back()[3] = route[route.size() - 2][3];
+    bool raw_departure = false;
+    const bool raw_certified = certify_route(raw_departure);
+    if (raw_certified) retain_exit(needs_stored_exit);
+    raw_route_certification_ms_ = std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - raw_started).count();
+    const std::vector<mgg::StateVec> raw_route = route;
+    const auto raw_response = *response;
+    const ReverseExitMemory raw_exit = save_exit();
+    *response = request_response;
+    restore_exit(request_exit);
+    bool polished_certified = false;
+    bool polished_departure = false;
+    bool polish_expired = false;
+    try {
+      mgg::planningCheckpoint();
+      route = graph_route;
+      shortcutAndResample(route, turns_ok, nullptr, /*lattice_route=*/false);
+      if (certify_route(polished_departure)) {
+        retain_exit(needs_stored_exit);
+        polished_certified = true;
+      }
+    } catch (const mgg::PlanningInterrupted&) {
+      if (budget.cancelled_ || !budget.exhausted_) throw;
+      polish_expired = true;
+    }
+    if (!polished_certified) {
+      if (raw_certified) {
+        const std::string polished_refusal = polished_departure
+            ? "it starts with a turn without room" : response->reason;
+        route = raw_route;
+        *response = raw_response;
+        restore_exit(raw_exit);
+        path_shortcut_corners_ = static_cast<int>(route.size());
+        path_shortcut_to_ = path_shortcut_corners_;
+        if (!reason.empty()) reason += "; ";
+        reason += polish_expired
+            ? "kept certified global route: final shortcut polish stopped at the request deadline"
+            : "kept certified global route: the polished route failed its final checks (" +
+                  polished_refusal + ")";
+      } else if (polish_expired) {
+        // Only the raw route was checked to the end: its verdict. A
+        // departure past the deadline ends as the budget refusal.
+        *response = request_response;
+        restore_exit(request_exit);
+        if (raw_departure) {
+          answer_with_departure();
+        } else {
+          *response = raw_response;
+          response->reason += "; final shortcut polish stopped at the request deadline";
+        }
+        return;
+      } else {
+        // Both checked to the end: the polished verdict, as at base.
+        restore_exit(request_exit);
+        if (polished_departure) {
+          *response = request_response;
+          answer_with_departure();
+        }
+        return;
+      }
+    }
   }
+  if (anytime) budget.finishCertifiedResult();
   response->status = Service::Response::SUCCEEDED;
   for (const mgg::StateVec& s : route) response->path.push_back(toPoseMsg(s));
   char note[160];
