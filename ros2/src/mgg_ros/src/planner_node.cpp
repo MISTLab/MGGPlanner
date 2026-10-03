@@ -4161,6 +4161,22 @@ void PlannerNode::addFrontiers() {
 // ---------------------------------------------------------------------------
 // Paths
 
+bool PlannerNode::groundPosePairsAdmissible(
+    const std::vector<geometry_msgs::msg::Pose>& poses) const {
+  if (robot_params_.type != mgg::RobotType::kGroundRobot) return true;
+  for (std::size_t i = 0; i < poses.size(); ++i) {
+    const auto& p = poses[i].position;
+    if (!std::isfinite(p.x) || !std::isfinite(p.y) || !std::isfinite(p.z)) return false;
+    if (i == 0) continue;
+    const auto& previous = poses[i - 1].position;
+    const double rise = std::abs(p.z - previous.z);
+    const double run = std::hypot(p.x - previous.x, p.y - previous.y);
+    if (rise > planning_params_.max_step_height + 1e-6 &&
+        std::atan2(rise, run) > planning_params_.max_inclination) return false;
+  }
+  return true;
+}
+
 void PlannerNode::shortcutAndResample(std::vector<mgg::StateVec>& path,
                                       const mgg::PathOkFn& turns_ok,
                                       const mgg::PathOkFn& corridor_ok,
@@ -4168,7 +4184,12 @@ void PlannerNode::shortcutAndResample(std::vector<mgg::StateVec>& path,
   path_shortcut_from_ = static_cast<int>(path.size());
   path_shortcut_corners_ = path_shortcut_from_;
   path_shortcut_to_ = path_shortcut_from_;
-  if (path.size() <= 2) return;
+  if (path.size() <= 2) {
+    std::vector<geometry_msgs::msg::Pose> poses;
+    for (const auto& state : path) poses.push_back(toPoseMsg(state));
+    if (!groundPosePairsAdmissible(poses)) path.clear();
+    return;
+  }
   // What comes out of a graph is a walk along its edges: it steps between
   // vertices and reads as a staircase even across open floor. ROS 1 ran every
   // path it returned through improveFreePath and interpolatePath
@@ -5967,6 +5988,14 @@ void PlannerNode::onPlanRequest(
   try {
     mgg::planningCheckpoint();
     const bool computed = onPlanRequestImpl(request, response);
+    // Certify the actual output, including short paths, corner fallbacks and
+    // departures that bypass resampling. A native contract failure is no path.
+    if (!groundPosePairsAdmissible(response->path)) {
+      response->path.clear();
+      best_path_.clear();
+      response->status = kStatusNoPath;
+      RCLCPP_WARN(get_logger(), "refused sent ground path: step/inclination contract");
+    }
     std::lock_guard<std::mutex> fence(cancellation_mutex_);
     mgg::planningCheckpoint();
     // Impl applies the latest queued odometry before planning. The planner
@@ -6040,6 +6069,11 @@ void PlannerNode::onObjectiveRequest(
     // NAVIGATE is also used for route probes. The adapter explicitly clears
     // exploration before operator objectives; probes must preserve its state.
     onObjectiveRequestImpl(request, response);
+    if (!groundPosePairsAdmissible(response->path)) {
+      response->path.clear();
+      response->status = mgg_msgs::srv::PlanObjective::Response::BLOCKED;
+      response->reason = "sent ground path violates step/inclination contract";
+    }
     std::lock_guard<std::mutex> fence(cancellation_mutex_);
     mgg::planningCheckpoint();
   } catch (const mgg::PlanningInterrupted&) {

@@ -626,10 +626,10 @@ class PlannerNodeTestPeer {
     }
     return node.mola_map_->getStatus();
   }
-  static void useResamplingTestTerrain(PlannerNode& node, double rise = 0.215) {
+  static void useResamplingTestTerrain(PlannerNode& node, double rise = 0.215, bool ramp = false) {
     std::map<std::pair<std::int64_t, std::int64_t>, double> tops;
     for (int x = -10; x < 20; ++x)
-      for (int y = -10; y < 10; ++y) tops[{x, y}] = x == 1 ? rise : 0.0;
+      for (int y = -10; y < 10; ++y) tops[{x, y}] = ramp ? std::max(0, x) * rise : x == 1 ? rise : 0.0;
     node.cloud_map_ = nullptr;
     node.mola_map_ = nullptr;
     node.map_ = std::make_unique<mgg_test::TerrainFixture>(0.2, tops);
@@ -12736,6 +12736,29 @@ TEST_F(PlannerNodeTest, ResamplingKeepsGroundStepsWithinTheExistingLimit) {
     const Eigen::Vector3d delta = sent[i].head<3>() - sent[i - 1].head<3>();
     EXPECT_TRUE(std::abs(delta.z()) <= 0.15 + 1e-6 ||
                 std::atan2(std::abs(delta.z()), delta.head<2>().norm()) <= 27 * M_PI / 180);
+  }
+}
+}  // namespace mgg_ros
+
+namespace mgg_ros {
+TEST_F(PlannerNodeTest, UncertifiedTwoPoseGroundPathIsRefused) {
+  auto node = makeNode("uncertified_two_pose");
+  PlannerNodeTestPeer::useResamplingTestTerrain(*node);
+  std::vector<mgg::StateVec> path{{0, 0, .5, 0}, {.24, 0, .715, 0}};
+  PlannerNodeTestPeer::shortcutAndResample(*node, path, {});
+  EXPECT_TRUE(path.empty());
+}
+TEST_F(PlannerNodeTest, FifteenCentimeterCellRampCertifiesEverySentPair) {
+  auto node = makeNode("fifteen_centimeter_ramp");
+  PlannerNodeTestPeer::useResamplingTestTerrain(*node, .15, true);
+  std::vector<mgg::StateVec> path;
+  for (int i = 0; i <= 5; ++i) path.emplace_back(.05 + .2*i, .05, .5 + .15*i, 0);
+  PlannerNodeTestPeer::shortcutAndResample(*node, path, {});
+  ASSERT_GE(path.size(), 2u);
+  for (std::size_t i = 1; i < path.size(); ++i) {
+    const Eigen::Vector3d delta = path[i].head<3>() - path[i-1].head<3>();
+    EXPECT_TRUE(std::abs(delta.z()) <= .15 + 1e-6 ||
+        std::atan2(std::abs(delta.z()), delta.head<2>().norm()) <= 27*M_PI/180);
   }
 }
 }  // namespace mgg_ros

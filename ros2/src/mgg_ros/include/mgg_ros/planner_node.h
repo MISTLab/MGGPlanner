@@ -438,6 +438,9 @@ class PlannerNode : public rclcpp::Node {
   /// body volume the local lattice admits, otherwise space must be observed
   /// free as on the roadmap. A leap may not pass closer to a hazard than the
   /// edges it replaces (mgg::shortcutPathKeepingClearance).
+  // Final serialized-pose terrain contract; adapters do not repeat it.
+  bool groundPosePairsAdmissible(
+      const std::vector<geometry_msgs::msg::Pose>& poses) const;
   void shortcutAndResample(std::vector<mgg::StateVec>& path,
                            const mgg::PathOkFn& turns_ok = nullptr,
                            const mgg::PathOkFn& corridor_ok = nullptr,
