@@ -1029,9 +1029,6 @@ class PlannerNodeTestPeer {
     const std::lock_guard<std::recursive_mutex> lock(node.planner_mutex_);
     return node.runGlobalPlanner(target_id, reason);
   }
-  static bool lastRouteBlockedByPeer(const PlannerNode& node) {
-    return node.last_route_blocked_by_peer_;
-  }
   static bool isGlobalFrontier(PlannerNode& node, int id) {
     const std::lock_guard<std::recursive_mutex> lock(node.planner_mutex_);
     return node.global_graph_->getVertex(id)->type == mgg::VertexType::kFrontier;
@@ -3771,6 +3768,17 @@ double furthestX(const std::vector<geometry_msgs::msg::Pose>& path) {
   return x;
 }
 
+/// The least distance of a pose of `path` from `centre`, in the plane.
+double nearestTo(const std::vector<geometry_msgs::msg::Pose>& path,
+                 const Eigen::Vector2d& centre) {
+  double d = 1e9;
+  for (const auto& pose : path) {
+    d = std::min(d, std::hypot(pose.position.x - centre.x(),
+                               pose.position.y - centre.y()));
+  }
+  return d;
+}
+
 /// A robot on the mola_snapshot backend serving a level floor over
 /// [x0, x1] x [y0, y1].
 std::shared_ptr<PlannerNode> peerFloorNode(
@@ -4847,7 +4855,6 @@ TEST_F(PlannerNodeTest, UnchangedPeerFrontierAndLiftDoNotRetriggerExpansionOrTou
     EXPECT_EQ(PlannerNodeTestPeer::expandGlobalGraph(*node), 0);
     EXPECT_TRUE(PlannerNodeTestPeer::nextExpansionSample(*node).isApprox(sample, 0.0));
   }
-  PlannerNodeTestPeer::expireAerialPeers(*node);
 }
 
 TEST_F(PlannerNodeTest, LiftedPeerSlotCapKeepsHighestGainAndReusesWithdrawnSlots) {
@@ -10622,7 +10629,6 @@ std::shared_ptr<PlannerNode> frontierBesideAPeerVertex(
   PlannerNodeTestPeer::useMolaMap(*node, product->serve());
   PlannerNodeTestPeer::serveMap(*node, "component:test", 1);
   PlannerNodeTestPeer::setMinObservedGround(*node, 0.0);
-  PlannerNodeTestPeer::setPeerBodyTtl(*node, 600.0);
   PlannerNodeTestPeer::acceptOdometry(*node, 0.0, 0.0, 1.0);
   frontier = PlannerNodeTestPeer::addGlobalChainToFrontier(
       *node, {{1.5, 0.0}, {3.0, 0.0}});
