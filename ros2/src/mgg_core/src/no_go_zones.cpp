@@ -140,6 +140,7 @@ std::vector<Vertex*> zoneRespectingRoute(GraphManager& graph, int source_id,
   if (source == nullptr || target == nullptr || zones.inside(target->state.head<3>())) {
     return {};
   }
+  const GraphManager::EdgeValidationScope validation(graph);
   NoGoZones::Departing first = zones.departing(start);
   if ((source->state.head<3>() - start).norm() > 1e-9 &&
       !zones.step(start, source->state.head<3>(), first)) {
@@ -178,7 +179,7 @@ std::vector<Vertex*> zoneRespectingRoute(GraphManager& graph, int source_id,
     for (const auto& [w, weight] : edges->second) {
       Vertex* v = vertex(w);
       if (v == nullptr || !graph.inService(*v) ||
-          !graph.graph_->edgeExists(s.at, w)) {
+          !graph.graph_->edgeExists(s.at, w) || !graph.edgeCertified(*u, *v)) {
         continue;
       }
       NoGoZones::Departing leaving = s.leaving;

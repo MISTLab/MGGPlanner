@@ -55,6 +55,8 @@ void GraphManager::reset() {
   for (auto& entry : vertices_map_) delete entry.second;
   vertices_map_.clear();
   edge_map_.clear();
+  edges_needing_certification_.clear();
+  rejected_edges_.clear();
   vertex_by_robot_id_.clear();
   merged_graphs_.clear();
   neighbour_placements_.clear();
@@ -113,6 +115,15 @@ void GraphManager::addNeighbourEdge(Vertex* v, Vertex* u, double weight) {
 
 void GraphManager::removeEdge(Vertex* v, Vertex* u) {
   graph_->removeEdge(v->id, u->id);
+  for (const auto& ids : {std::make_pair(v->id, u->id), std::make_pair(u->id, v->id)}) {
+    auto found = edge_map_.find(ids.first);
+    if (found == edge_map_.end()) continue;
+    auto& edges = found->second;
+    edges.erase(std::remove_if(edges.begin(), edges.end(),
+        [&](const auto& edge) { return edge.first == ids.second; }), edges.end());
+  }
+  edges_needing_certification_.erase(std::minmax(v->id, u->id));
+  rejected_edges_.erase(std::minmax(v->id, u->id));
 }
 
 bool GraphManager::updateVertexState(int id, const StateVec& state) {
@@ -309,13 +320,51 @@ bool GraphManager::updatePoseIdToNearestVertices(const StateVec* state,
   return true;
 }
 
+void GraphManager::markOwnEdgesForRecertification(int robot_id, bool terrain_changed) {
+  for (const auto& [id, edges] : edge_map_) {
+    const auto a = vertices_map_.find(id);
+    if (a == vertices_map_.end() || !a->second || a->second->robot_id != robot_id ||
+        a->second->lifted_peer_target) continue;
+    for (const auto& [other, weight] : edges) {
+      const auto b = vertices_map_.find(other);
+      if (id >= other || b == vertices_map_.end() || !b->second ||
+          b->second->robot_id != robot_id || b->second->lifted_peer_target ||
+          !graph_->edgeExists(id, other)) continue;
+      // A later yaw correction must not clear an earlier pending tilt check.
+      auto& full = edges_needing_certification_[{id, other}];
+      full = full || terrain_changed;
+    }
+  }
+  installEdgeBlocked();
+}
+
+bool GraphManager::edgeCertified(const Vertex& a, const Vertex& b) const {
+  const std::pair<int, int> key = std::minmax(a.id, b.id);
+  if (rejected_edges_.count(key)) return false;
+  const auto dirty = edges_needing_certification_.find(key);
+  if (dirty == edges_needing_certification_.end()) return true;
+  if (!edge_recertifier_) return false;
+  // Leave dirty on interruption; retry on the next query, not a cached pass.
+  const bool pass = edge_recertifier_(a, b, dirty->second);
+  if (!pass) rejected_edges_.insert(key);
+  edges_needing_certification_.erase(dirty);
+  return pass;
+}
+
+void GraphManager::removeRejectedEdges() {
+  while (!rejected_edges_.empty()) {
+    const auto [a, b] = *rejected_edges_.begin();
+    removeEdge(vertices_map_.at(a), vertices_map_.at(b));
+  }
+}
+
 void GraphManager::setEdgeBlocked(EdgeBlockedFn blocked) {
   edge_blocked_ = std::move(blocked);
   installEdgeBlocked();
 }
 
 void GraphManager::installEdgeBlocked() {
-  if (!edge_blocked_) {
+  if (!edge_blocked_ && edges_needing_certification_.empty()) {
     graph_->setEdgeBlocked(nullptr);
     return;
   }
@@ -324,21 +373,23 @@ void GraphManager::installEdgeBlocked() {
     const auto b = vertices_map_.find(v);
     return a != vertices_map_.end() && b != vertices_map_.end() &&
            a->second != nullptr && b->second != nullptr &&
-           edge_blocked_(*a->second, *b->second);
+           edgeBlocked(*a->second, *b->second);
   });
 }
 
 bool GraphManager::findShortestPaths(ShortestPathsReport& rep) {
-  return graph_->findDijkstraShortestPaths(0, rep);
+  return findShortestPaths(0, rep);
 }
 
 bool GraphManager::findShortestPaths(int source_id, ShortestPathsReport& rep) {
+  const EdgeValidationScope validation(*this);
   return graph_->findDijkstraShortestPaths(source_id, rep);
 }
 
 bool GraphManager::findShortestPaths(
     int source_id, ShortestPathsReport& rep,
     std::chrono::steady_clock::time_point deadline) {
+  const EdgeValidationScope validation(*this);
   return graph_->findDijkstraShortestPaths(source_id, rep, &deadline);
 }
 
@@ -411,6 +462,15 @@ void GraphManager::getShortestPath(int target_id,
     path.push_back(parent_id);
   }
 
+  const EdgeValidationScope validation(*this);
+  for (std::size_t i = 1; i < path.size(); ++i) {
+    const Vertex* a = vertices_map_.at(path[i - 1]);
+    const Vertex* b = vertices_map_.at(path[i]);
+    if (!graph_->edgeExists(a->id, b->id) || !edgeCertified(*a, *b)) {
+      path.clear();
+      return;
+    }
+  }
   // Initially, the path follows target to source order. Reverse if required.
   if (source_to_target_order) {
     std::reverse(path.begin(), path.end());

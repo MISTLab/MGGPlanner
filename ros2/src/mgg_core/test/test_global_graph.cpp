@@ -19,6 +19,8 @@
 #include <gtest/gtest.h>
 
 #include "mgg_core/global_graph.h"
+#include "mgg_core/no_go_zones.h"
+#include "mgg_core/path_turns.h"
 #include "mgg_core/planning_cancellation.h"
 #include "terrain_fixture.h"
 
@@ -2561,7 +2563,7 @@ TEST(FlownTrail, TooManyWaitingSamplesAreGivenUpOldestFirst) {
   const mgg::FlownTrailReport report = mgg::addFlownBreadcrumbs(
       fixture.global, trail, fixture.ctx, params, stamp);
   EXPECT_TRUE(report.waiting);
-  EXPECT_EQ(report.expired, 2);
+  EXPECT_EQ(report.expired, 3);  // bounded before even merging the root sample
   ASSERT_EQ(trail.pending.size(), 4u);
   EXPECT_NEAR(trail.pending.front().pose.x(), 3.0, 1e-9);
 }
@@ -2610,6 +2612,10 @@ TEST(TransformRoadmap, OwnVerticesTrailAndHistoryMoveRigidlyPeersAndLiftedStay) 
   const Vertex* far = fixture.nearest(Eigen::Vector3d(1, 4, 0));
   ASSERT_NE(far, nullptr);
   EXPECT_NEAR(far->state[3], M_PI / 2.0, 1e-12);
+  fixture.global.setEdgeRecertifier([&](const Vertex& a, const Vertex& b, bool full) {
+    mgg::ExpandGraphReport report;
+    return mgg::correctedRoadmapEdgeTraversable(fixture.ctx, a, b, full, report);
+  });
   EXPECT_NEAR(fixture.distanceFromRoot(far->id), before, 1e-12);
   EXPECT_TRUE(lifted->state.isApprox(StateVec(3, 3, 1, 0)));
   EXPECT_TRUE(peer->state.isApprox(StateVec(5, 5, 0, 0)));
@@ -2646,4 +2652,183 @@ TEST(RobotStateHistory, InterruptedNeighborResultsUnwindAndCanBeQueriedAgain) {
   }
   ASSERT_TRUE(history.getNearestStates(mgg::StateVec::Zero(), 100, &found));
   EXPECT_EQ(found.size(), 64u);
+}
+
+TEST(FlownTrail, ExpiredSamplesAreNotCertifiedEvenWhenTheMapIsFree) {
+  Roadmap fixture;
+  mgg::FlownTrail trail;
+  mgg::FlownTrailParams params;
+  trail.head_vertex_id = 0;
+  mgg::sampleFlownPose(trail, StateVec(1, 0, 0, 0), 1, params);
+  const auto report = mgg::addFlownBreadcrumbs(
+      fixture.global, trail, fixture.ctx, params, 12);
+  EXPECT_EQ(report.expired, 1);
+  EXPECT_EQ(report.added, 0);
+  EXPECT_EQ(trail.head_vertex_id, -1);
+  EXPECT_EQ(fixture.global.getNumVertices(), 1);
+}
+
+TEST(TransformRoadmap, RollMakesAGroundEdgeTooSteepOnNextSearch) {
+  TrajectoryScene scene;
+  auto* a = new Vertex(0, StateVec(0, 0, 0.525, 0));
+  auto* b = new Vertex(1, StateVec(0, 1.5, 0.525, 0));
+  scene.graph.addVertex(a);
+  scene.graph.addVertex(b);
+  mgg::ExpandGraphReport initial;
+  ASSERT_TRUE(mgg::drivenEdgeTraversable(scene.ctx, *a, *b, initial));
+  scene.graph.addEdge(a, b, 1.5);
+  int full_checks = 0;
+  scene.graph.setEdgeRecertifier([&](const Vertex& from, const Vertex& to, bool full) {
+    if (full) ++full_checks;
+    mgg::ExpandGraphReport report;
+    return mgg::correctedRoadmapEdgeTraversable(scene.ctx, from, to, full, report);
+  });
+  Eigen::Isometry3d delta = Eigen::Isometry3d::Identity();
+  delta.linear() = Eigen::AngleAxisd(0.6, Eigen::Vector3d::UnitX()).toRotationMatrix();
+  mgg::transformRoadmap(scene.graph, 0, delta);
+  EXPECT_TRUE(scene.graph.graph_->edgeExists(0, 1));  // lazy, not at correction
+  EXPECT_EQ(full_checks, 0);
+  EXPECT_FALSE(scene.reachable(0, 1));
+  EXPECT_EQ(full_checks, 1);
+  EXPECT_FALSE(scene.graph.graph_->edgeExists(0, 1));
+  EXPECT_TRUE(scene.graph.edge_map_[0].empty());
+  EXPECT_TRUE(scene.graph.edge_map_[1].empty());
+}
+
+TEST(TransformRoadmap, YawOnlyChecksGroundClearanceNotTerrain) {
+  TrajectoryScene scene;
+  auto* a = new Vertex(0, StateVec(0, 0, 0.525, 0));
+  auto* b = new Vertex(1, StateVec(1.5, 0, 0.525, 0));
+  scene.graph.addVertex(a);
+  scene.graph.addVertex(b);
+  scene.graph.addEdge(a, b, 1.5);
+  int checks = 0;
+  scene.graph.setEdgeRecertifier([&](const Vertex& from, const Vertex& to, bool full) {
+    ++checks;
+    EXPECT_FALSE(full);
+    mgg::ExpandGraphReport report;
+    return mgg::correctedRoadmapEdgeTraversable(scene.ctx, from, to, full, report);
+  });
+  Eigen::Isometry3d delta = Eigen::Isometry3d::Identity();
+  delta.linear() = Eigen::AngleAxisd(0.3, Eigen::Vector3d::UnitZ()).toRotationMatrix();
+  mgg::transformRoadmap(scene.graph, 0, delta);
+  EXPECT_EQ(checks, 0);
+  EXPECT_TRUE(scene.reachable(0, 1));
+  EXPECT_EQ(checks, 1);
+  EXPECT_TRUE(scene.reachable(1, 0));
+  EXPECT_EQ(checks, 1);
+}
+
+TEST(TransformRoadmap, AerialCorrectionResweepsAndRemovesBlockedEdges) {
+  Roadmap fixture;
+  auto* a = fixture.global.getVertex(0);
+  fixture.add(fixture.global, StateVec(1, 0, 0, 0), a);
+  int checks = 0;
+  fixture.global.setEdgeRecertifier([&](const Vertex& from, const Vertex& to, bool full) {
+    ++checks;
+    mgg::ExpandGraphReport report;
+    return mgg::correctedRoadmapEdgeTraversable(fixture.ctx, from, to, full, report);
+  });
+  OpenSpace blocked(-1);
+  fixture.ctx.map = &blocked;
+  mgg::transformRoadmap(fixture.global, 0, Eigen::Isometry3d::Identity());
+  ShortestPathsReport rep;
+  ASSERT_TRUE(fixture.global.findShortestPaths(rep));
+  EXPECT_EQ(checks, 1);
+  EXPECT_EQ(rep.parent_id_map.at(1), 1);
+  EXPECT_FALSE(fixture.global.graph_->edgeExists(0, 1));
+}
+
+TEST(TransformRoadmap, PendingTiltSurvivesALaterGravityPreservingCorrection) {
+  Roadmap fixture;
+  fixture.add(fixture.global, StateVec(1, 0, 0, 0), fixture.global.getVertex(0));
+  bool full_check = false;
+  fixture.global.setEdgeRecertifier([&](const Vertex&, const Vertex&, bool full) {
+    full_check = full;
+    return false;
+  });
+  Eigen::Isometry3d tilt = Eigen::Isometry3d::Identity();
+  tilt.linear() = Eigen::AngleAxisd(0.01, Eigen::Vector3d::UnitX()).toRotationMatrix();
+  mgg::transformRoadmap(fixture.global, 0, tilt);
+  mgg::transformRoadmap(fixture.global, 0, Eigen::Isometry3d::Identity());
+  ShortestPathsReport rep;
+  ASSERT_TRUE(fixture.global.findShortestPaths(rep));
+  EXPECT_TRUE(full_check);
+  EXPECT_EQ(fixture.global.getNumEdges(), 0);
+}
+
+TEST(TransformRoadmap, OldRouteExtractionCannotBypassRecertification) {
+  Roadmap fixture;
+  fixture.add(fixture.global, StateVec(1, 0, 0, 0), fixture.global.getVertex(0));
+  ShortestPathsReport rep;
+  ASSERT_TRUE(fixture.global.findShortestPaths(rep));
+  fixture.global.setEdgeRecertifier([](const Vertex&, const Vertex&, bool) { return false; });
+  mgg::transformRoadmap(fixture.global, 0, Eigen::Isometry3d::Identity());
+  std::vector<int> route;
+  fixture.global.getShortestPath(1, rep, true, route);
+  EXPECT_TRUE(route.empty());
+  EXPECT_EQ(fixture.global.getNumEdges(), 0);
+}
+
+TEST(TransformRoadmap, InterruptedCheckStaysDirtyUntilItCanBeCertified) {
+  Roadmap fixture;
+  fixture.add(fixture.global, StateVec(1, 0, 0, 0), fixture.global.getVertex(0));
+  fixture.global.setEdgeRecertifier([](const Vertex&, const Vertex&, bool) -> bool {
+    throw mgg::PlanningInterrupted();
+  });
+  mgg::transformRoadmap(fixture.global, 0, Eigen::Isometry3d::Identity());
+  ShortestPathsReport rep;
+  EXPECT_THROW(fixture.global.findShortestPaths(rep), mgg::PlanningInterrupted);
+  EXPECT_EQ(fixture.global.getNumEdges(), 1);
+  int retried = 0;
+  fixture.global.setEdgeRecertifier([&](const Vertex&, const Vertex&, bool) {
+    ++retried;
+    return false;
+  });
+  ASSERT_TRUE(fixture.global.findShortestPaths(rep));
+  EXPECT_EQ(retried, 1);
+  EXPECT_EQ(fixture.global.getNumEdges(), 0);
+}
+
+TEST(TransformRoadmap, YawOnlyGroundClearanceRejectsANewObstacle) {
+  TrajectoryScene scene;
+  Vertex a(0, StateVec(0, 0, 0.525, 0));
+  Vertex b(1, StateVec(1.5, 0, 0.525, 0));
+  mgg::ExpandGraphReport report;
+  ASSERT_TRUE(mgg::correctedRoadmapEdgeTraversable(scene.ctx, a, b, false, report));
+  TrajectoryScene obstructed([](std::int64_t, std::int64_t) { return 0.5; });
+  EXPECT_FALSE(mgg::correctedRoadmapEdgeTraversable(obstructed.ctx, a, b, false, report));
+}
+
+TEST(TransformRoadmap, NonDijkstraRoutesCannotUseAnUncertifiedEdge) {
+  for (bool turns : {false, true}) {
+    Roadmap fixture;
+    fixture.add(fixture.global, StateVec(1, 0, 0, 0), fixture.global.getVertex(0));
+    fixture.global.setEdgeRecertifier([](const Vertex&, const Vertex&, bool) { return false; });
+    mgg::transformRoadmap(fixture.global, 0, Eigen::Isometry3d::Identity());
+    if (turns) {
+      const auto routes = mgg::findTurnCompliantRoutes(
+          fixture.global, 0.0, 0.8, {1},
+          [](const Vertex&) { return true; }, 100);
+      EXPECT_TRUE(routes.to.empty());
+    } else {
+      mgg::NoGoZones zones;
+      const auto route = mgg::zoneRespectingRoute(
+          fixture.global, 0, 1, Eigen::Vector3d::Zero(), zones);
+      EXPECT_TRUE(route.empty());
+    }
+    EXPECT_FALSE(fixture.global.graph_->edgeExists(0, 1));
+    EXPECT_TRUE(fixture.global.edge_map_[0].empty());
+  }
+}
+
+TEST(TransformRoadmap, ResetDoesNotReuseDirtyEdgeIds) {
+  Roadmap fixture;
+  fixture.add(fixture.global, StateVec(1, 0, 0, 0), fixture.global.getVertex(0));
+  fixture.global.setEdgeRecertifier([](const Vertex&, const Vertex&, bool) { return false; });
+  mgg::transformRoadmap(fixture.global, 0, Eigen::Isometry3d::Identity());
+  fixture.global.reset();
+  fixture.global.addVertex(new Vertex(0, StateVec::Zero()));
+  fixture.add(fixture.global, StateVec(1, 0, 0, 0), fixture.global.getVertex(0));
+  EXPECT_NEAR(fixture.distanceFromRoot(1), 1.0, 1e-9);
 }

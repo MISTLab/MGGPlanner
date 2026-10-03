@@ -489,11 +489,24 @@ Vertex* ownVertexWithin(GraphManager& graph, const StateVec& state,
 
 }  // namespace
 
+int trimFlownTrail(FlownTrail& trail, const FlownTrailParams& params, double now_s) {
+  int discarded = 0;
+  while (!trail.pending.empty() &&
+         (static_cast<int>(trail.pending.size()) > params.max_pending ||
+          now_s - trail.pending.front().stamp_s > params.patience_s)) {
+    trail.pending.pop_front();
+    trail.head_vertex_id = -1;
+    ++discarded;
+  }
+  return discarded;
+}
+
 FlownTrailReport addFlownBreadcrumbs(GraphManager& graph, FlownTrail& trail,
                                      const ExpandContext& ctx,
                                      const FlownTrailParams& params,
                                      double now_s) {
   FlownTrailReport report;
+  report.expired = trimFlownTrail(trail, params, now_s);
   while (!trail.pending.empty()) {
     planningCheckpoint();
     const FlownSample sample = trail.pending.front();
@@ -578,15 +591,7 @@ FlownTrailReport addFlownBreadcrumbs(GraphManager& graph, FlownTrail& trail,
       ++report.joined;
       continue;
     }
-    // Not stored. It waits for the map to observe its sweep, unless it
-    // has waited too long or too many wait: then the chain breaks.
-    if (now_s - sample.stamp_s > params.patience_s ||
-        static_cast<int>(trail.pending.size()) > params.max_pending) {
-      trail.head_vertex_id = -1;
-      trail.pending.pop_front();
-      ++report.expired;
-      continue;
-    }
+    // Within the waiting bounds, but not yet observed: try on the next map.
     report.waiting = true;
     break;
   }
@@ -605,6 +610,11 @@ int transformRoadmap(GraphManager& graph, int robot_id,
     ++moved;
   }
   graph.rebuildNearestIndex();
+  // Only exactly gravity-preserving corrections skip terrain checks. Even
+  // small repeated tilts must not accumulate into an unchecked steep edge.
+  const bool terrain_changed =
+      (delta.linear() * Eigen::Vector3d::UnitZ() - Eigen::Vector3d::UnitZ()).norm() > 1e-9;
+  graph.markOwnEdgesForRecertification(robot_id, terrain_changed);
   return moved;
 }
 
@@ -700,6 +710,42 @@ bool drivenEdgeTraversable(const ExpandContext& ctx, const Vertex& from,
   }
   ++rep.edge_status[static_cast<int>(status)];
   return status == ProjectedEdgeStatus::kAdmissible;
+}
+
+bool correctedRoadmapEdgeTraversable(const ExpandContext& ctx,
+    const Vertex& from, const Vertex& to, bool terrain_changed,
+    ExpandGraphReport& rep) {
+  if (ctx.robot->type == RobotType::kAerialRobot) {
+    return roadmapEdgeTraversable(ctx, from, to, rep);
+  }
+  if (terrain_changed) return drivenEdgeTraversable(ctx, from, to, rep);
+  // Gravity-preserving corrections keep terrain verdicts, not upright-body
+  // clearance. Sweep both chassis headings (non-central body offsets).
+  const Eigen::Vector3d direction = to.state.head<3>() - from.state.head<3>();
+  const double length = direction.norm();
+  const Eigen::Vector3d overshoot = length > 1e-12
+      ? Eigen::Vector3d(direction / length * ctx.planning->edge_overshoot)
+      : Eigen::Vector3d::Zero();
+  OrientedBox body;
+  body.size = ctx.robot_box_size;
+  body.heading = std::atan2(direction.y(), direction.x());
+  for (int reverse = 0; reverse < 2; ++reverse) {
+    const Eigen::Vector3d offset = ctx.robot->offsetForHeading(body.heading);
+    const Eigen::Vector3d start = from.state.head<3>() + offset - overshoot;
+    Eigen::Vector3d end = to.state.head<3>() + offset;
+    if (to.id != 0) end += overshoot;
+    if (ctx.planning->geofence_checking_enable && ctx.geofence != nullptr &&
+        ctx.geofence->getPathStatus(start.head<2>(), end.head<2>(),
+                                   ctx.robot_box_size.head<2>()) ==
+            GeofenceManager::CoordinateStatus::kViolated) {
+      rep.status = ExpandGraphStatus::kErrorGeofenceViolated;
+      return false;
+    }
+    if (orientedBoxPathStatus(*ctx.map, start, end, body, false, nullptr, true) !=
+        VoxelStatus::kFree) return false;
+    body.heading += M_PI;
+  }
+  return true;
 }
 
 RoadmapRebuildReport rebuildRoadmapFromTrajectory(

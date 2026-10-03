@@ -343,6 +343,10 @@ struct FlownTrail {
 bool sampleFlownPose(FlownTrail& trail, const StateVec& pose, double stamp_s,
                      const FlownTrailParams& params);
 
+/// Discards oldest samples over either waiting bound, breaking the chain.
+/// Call even without a map or a new sample. Returns the number discarded.
+int trimFlownTrail(FlownTrail& trail, const FlownTrailParams& params, double now_s);
+
 struct FlownTrailReport {
   /// Breadcrumbs added as new vertices, samples that fell on a vertex of
   /// the robot's already there, and edges stored along the chain.
@@ -380,7 +384,8 @@ FlownTrailReport addFlownBreadcrumbs(GraphManager& graph, FlownTrail& trail,
 
 /// Moves the robot's own vertices of `graph` (lifted peer targets aside) by
 /// `delta`, position and yaw, and rebuilds its nearest-neighbour index.
-/// Rigid: every edge keeps its length. Returns how many moved.
+/// Rigid: every edge keeps its length, but moved own edges need lazy
+/// re-certification before routing. Returns how many vertices moved.
 int transformRoadmap(GraphManager& graph, int robot_id,
                      const Eigen::Isometry3d& delta);
 
@@ -397,6 +402,13 @@ void transformFlownTrail(FlownTrail& trail, const Eigen::Isometry3d& delta);
 /// A geofence refusal sets rep.status to kErrorGeofenceViolated.
 bool drivenEdgeTraversable(const ExpandContext& ctx, const Vertex& from,
                            const Vertex& to, ExpandGraphReport& rep);
+
+/// Rechecks a moved edge: full ground terrain checks after tilt, otherwise
+/// upright-body clearance only; aerial edges always use their strict sweep.
+/// Ground retains the driven-chain unknown-body policy, never relaxed terrain.
+bool correctedRoadmapEdgeTraversable(const ExpandContext& ctx,
+    const Vertex& from, const Vertex& to, bool terrain_changed,
+    ExpandGraphReport& rep);
 
 /// Bounds the lattice-to-roadmap edge checks of one connectGoalThroughLattice.
 inline constexpr int kMaxGoalBridgeChecks = 4096;

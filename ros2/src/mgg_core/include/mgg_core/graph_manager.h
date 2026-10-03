@@ -131,6 +131,22 @@ class GraphManager {
   /// (Graph::findDijkstraShortestPaths).
   bool findShortestPaths(int source_id, ShortestPathsReport& rep,
                          std::chrono::steady_clock::time_point deadline);
+  /// Called lazily for an edge moved by a map correction. The bool requests
+  /// full terrain checks; false still requires body clearance. Without a
+  /// certifier a dirty edge is unavailable, never trusted implicitly.
+  using EdgeRecertifyFn = std::function<bool(const Vertex&, const Vertex&, bool)>;
+  void setEdgeRecertifier(EdgeRecertifyFn check) { edge_recertifier_ = std::move(check); }
+  void markOwnEdgesForRecertification(int robot_id, bool terrain_changed);
+  bool edgeCertified(const Vertex& a, const Vertex& b) const;
+  /// Searches defer physical deletion until their adjacency iterators die,
+  /// including on cancellation. Failed edges are blocked immediately.
+  class EdgeValidationScope {
+   public:
+    explicit EdgeValidationScope(GraphManager& graph) : graph_(graph) {}
+    ~EdgeValidationScope() { graph_.removeRejectedEdges(); }
+   private:
+    GraphManager& graph_;
+  };
   /// Whether the edge between two vertices is closed to every search
   /// (findShortestPaths), though it stays in the graph: an edge through a
   /// no-go zone. An empty function opens them all.
@@ -139,7 +155,7 @@ class GraphManager {
   /// Whether setEdgeBlocked closes the edge between `a` and `b`: for
   /// searches that walk edge_map_ themselves (findTurnCompliantRoutes).
   bool edgeBlocked(const Vertex& a, const Vertex& b) const {
-    return edge_blocked_ && edge_blocked_(a, b);
+    return (edge_blocked_ && edge_blocked_(a, b)) || !edgeCertified(a, b);
   }
 
   void getShortestPath(int target_id, const ShortestPathsReport& rep,
@@ -192,6 +208,10 @@ class GraphManager {
   /// Puts edge_blocked_ on graph_, which reset() replaces.
   void installEdgeBlocked();
   EdgeBlockedFn edge_blocked_;
+  EdgeRecertifyFn edge_recertifier_;
+  mutable std::map<std::pair<int, int>, bool> edges_needing_certification_;
+  mutable std::set<std::pair<int, int>> rejected_edges_;
+  void removeRejectedEdges();
   /// Nearest-neighbour index over the vertices.
   kdtree* kd_tree_ = nullptr;
   int subgraph_ind_ = -1;

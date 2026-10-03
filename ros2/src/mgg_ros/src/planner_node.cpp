@@ -2531,6 +2531,20 @@ void PlannerNode::followMapCorrection(const Eigen::Isometry3d& delta) {
   // Lifted targets are peers' frontiers placed by their transforms, and
   // anchored on vertices that move: placed again by the next query.
   withdrawLiftedTargets();
+  global_graph_->setEdgeRecertifier(
+      [this](const mgg::Vertex& a, const mgg::Vertex& b, bool terrain_changed) {
+        // Peers close edges for this search only, never erase map geometry.
+        std::optional<mgg::MolaMap::TransientDiscPin> no_peers;
+        if (mola_map_ != nullptr) {
+          no_peers.emplace(*mola_map_, std::vector<Eigen::Vector2d>{}, 0.0);
+        }
+        mgg::ExpandGraphReport report;
+        // Own aerial roadmap edges have no height band: keep flown heights.
+        // EGO enforces the execution band; only lifted peer targets use MGG's
+        // aerial_min/max_height_m.
+        return mgg::correctedRoadmapEdgeTraversable(
+            makeGlobalContext(), a, b, terrain_changed, report);
+      });
   const int moved = mgg::transformRoadmap(*global_graph_, own, delta);
   mgg::transformFlownTrail(flown_trail_, delta);
   robot_state_hist_.transform(delta);
@@ -4013,10 +4027,18 @@ void PlannerNode::advanceFlownTrail(bool sample_pose) {
   const bool sampled =
       sample_pose &&
       mgg::sampleFlownPose(flown_trail_, current_state_, now_s, params);
+  const int discarded = mgg::trimFlownTrail(flown_trail_, params, now_s);
+  flown_trail_counters_.expired += discarded;
+  if (discarded > 0) {
+    RCLCPP_WARN_THROTTLE(
+        get_logger(), *get_clock(), 5000,
+        "flown trail broken: %d pending sample(s) discarded before certification "
+        "(limit %d samples / %.0f s), map %s",
+        discarded, params.max_pending, params.patience_s,
+        map_->getStatus() ? "available" : "unavailable");
+  }
   if (flown_trail_.pending.empty() || !map_->getStatus()) return;
-  const bool oldest_overdue =
-      now_s - flown_trail_.pending.front().stamp_s > params.patience_s;
-  if (sample_pose && !sampled && !oldest_overdue &&
+  if (sample_pose && !sampled && discarded == 0 &&
       map_revision_ == flown_trail_map_revision_) {
     return;
   }

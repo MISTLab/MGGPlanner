@@ -2223,6 +2223,10 @@ class PlannerNodeTestPeer {
     }
     return false;
   }
+  static void withdrawCloudMap(PlannerNode& node) { node.cloud_map_->resetMap(); }
+  static const mgg::FlownTrail& flownTrail(PlannerNode& node) {
+    return node.flown_trail_;
+  }
   static bool repositioningOngoing(PlannerNode& node) {
     return node.global_exploration_ongoing_;
   }
@@ -11598,6 +11602,29 @@ void serveRequest(mgg::MolaMap& map, const mgg::MolaSnapshotRequest& request) {
     std::this_thread::sleep_for(std::chrono::milliseconds(5));
   }
   ASSERT_TRUE(served()) << map.lastError();
+}
+
+TEST_F(PlannerNodeTest, FlownPendingStaysBoundedWhileTheMapIsUnavailable) {
+  auto node = makeNode("flown_map_outage");
+  PlannerNodeTestPeer::setAerialRobot(*node);
+  PlannerNodeTestPeer::observeFreeBox(*node, {0, 0, 1}, {4, 4, 2});
+  PlannerNodeTestPeer::acceptOdometry(*node, flownOdometry(0, 0, 1, 0, 1));
+  ASSERT_EQ(PlannerNodeTestPeer::globalVertices(*node), 1);
+  PlannerNodeTestPeer::withdrawCloudMap(*node);
+  // Fast sampling exercises the count limit before the age limit.
+  for (int i = 1; i <= 50; ++i) {
+    PlannerNodeTestPeer::acceptOdometry(
+        *node, flownOdometry(i, 0, 1, 0, 1 + i * 0.1));
+  }
+  EXPECT_LE(PlannerNodeTestPeer::flownTrail(*node).pending.size(), 20u);
+  EXPECT_EQ(PlannerNodeTestPeer::flownTrail(*node).head_vertex_id, -1);
+  // Hovering takes no new sample, but must still expire the queue.
+  PlannerNodeTestPeer::acceptOdometry(*node, flownOdometry(50, 0, 1, 0, 20));
+  EXPECT_TRUE(PlannerNodeTestPeer::flownTrail(*node).pending.empty());
+  PlannerNodeTestPeer::observeFreeBox(*node, {25, 0, 1}, {54, 4, 2});
+  PlannerNodeTestPeer::acceptOdometry(*node, flownOdometry(50, 0, 1, 0, 21));
+  EXPECT_TRUE(PlannerNodeTestPeer::flownTrail(*node).pending.empty());
+  EXPECT_EQ(PlannerNodeTestPeer::globalVertices(*node), 1);
 }
 
 TEST_F(PlannerNodeTest, ADroneTeleoperatedAwayReturnsHomeOverWhereItFlew) {
