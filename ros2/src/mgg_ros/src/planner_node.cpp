@@ -7484,52 +7484,16 @@ void PlannerNode::onObjectiveRequestImpl(
     return;
   }
   const bool anytime = bounded_ground && !local;
-  if (!anytime) {
-    shortcutAndResample(route, turns_ok, nullptr, /*lattice_route=*/local);
-  } else {
-    // The unpolished graph route must also carry outgoing headings, as the
-    // shortcut normally supplies them. Do not interpolate uncertified leaps.
-    for (std::size_t i = 0; i + 1 < route.size(); ++i) {
-      const Eigen::Vector2d step = (route[i + 1] - route[i]).head<2>();
-      if (step.norm() > 1e-9) route[i][3] = std::atan2(step.y(), step.x());
-    }
-    if (route.size() > 1) route.back()[3] = route[route.size() - 2][3];
-  }
-  const auto certify_route = [&](bool allow_departure) {
+  // The final checks of the route as it will be sent, even without retained
+  // escape memory. A failure fills *response, except a start turn without
+  // room, which sets needs_departure for answer_with_departure.
+  const auto certify_route = [&](bool& needs_departure) {
+    needs_departure = false;
     mgg::PathType objective_points;
     for (const auto& pose : route) objective_points.push_back(pose.head<3>());
-    // Check the actual route being sent, even without retained escape memory.
-    // No SUCCEEDED objective may start with a turn at a room-less root.
     if (routeStartsWithTurnWithoutRoom(objective_points)) {
-      if (!allow_departure) return false;
-      mgg::StateVec start = current_state_;
-      if (!projectToDrivingHeight(start)) start = physicalAnchorAtDrivingHeight(current_state_);
-      std::string exit_note;
-      std::vector<mgg::StateVec> exit_path;
-      if (validateStoredReverseExit(start, exit_path, exit_note) && !exit_path.empty()) {
-        keepReverseDeparture(exit_path);
-        response->status = Service::Response::DEPARTURE_FIRST;
-        response->reason = "stored reverse exit revalidated to refuge; request the objective again from there";
-        route_note = response->reason;
-        for (const auto& pose : exit_path) response->path.push_back(toPoseMsg(pose));
-      } else {
-        if (exit_note.empty()) exit_note = "; stored reverse exit unavailable at projected current pose";
-        mgg::Departure departure;
-        if (straightDeparture(start, departure, /*arrival_band=*/true)) {
-          response->status = Service::Response::DEPARTURE_FIRST;
-          response->reason = std::string("validated departure ") +
-              (departure.reverse ? "in reverse" : "ahead") +
-              "; request the objective again from its end" + exit_note;
-          route_note = response->reason;
-          for (const auto& pose : departure.path) response->path.push_back(toPoseMsg(pose));
-        } else {
-          response->status = Service::Response::BLOCKED;
-          response->reason = "objective requires a departure" + exit_note +
-              "; validated departure refused: no terrain-clear leg with turn room within " +
-              std::to_string(mgg::kDepartureMaxM) + " m";
-        }
-      }
-      return false;  // keep the remaining escape; never command an in-place turn
+      needs_departure = true;
+      return false;
     }
     if (!startPathAfterChassisSpin(route, local)) {
       response->status = Service::Response::UNREACHABLE;
@@ -7553,40 +7517,148 @@ void PlannerNode::onObjectiveRequestImpl(
     }
     return true;
   };
-  if (!certify_route(/*allow_departure=*/true)) return;
-  const bool needs_stored_exit = !route.empty() && currentPoseNeedsStoredExit();
-  if (needs_stored_exit) {
-    const std::string refusal = retainReverseExit(route, false);
-    if (!refusal.empty()) {
-      response->reason = "escape corridor not retained: " + refusal;
-      RCLCPP_WARN(get_logger(), "%s", response->reason.c_str());
+  // No SUCCEEDED objective may start with a turn at a room-less root. The
+  // departure depends on the robot's pose only, not on the route refused.
+  const auto answer_with_departure = [&] {
+    mgg::StateVec start = current_state_;
+    if (!projectToDrivingHeight(start)) start = physicalAnchorAtDrivingHeight(current_state_);
+    std::string exit_note;
+    std::vector<mgg::StateVec> exit_path;
+    if (validateStoredReverseExit(start, exit_path, exit_note) && !exit_path.empty()) {
+      keepReverseDeparture(exit_path);
+      response->status = Service::Response::DEPARTURE_FIRST;
+      response->reason = "stored reverse exit revalidated to refuge; request the objective again from there";
+      route_note = response->reason;
+      for (const auto& pose : exit_path) response->path.push_back(toPoseMsg(pose));
+    } else {
+      if (exit_note.empty()) exit_note = "; stored reverse exit unavailable at projected current pose";
+      mgg::Departure departure;
+      if (straightDeparture(start, departure, /*arrival_band=*/true)) {
+        response->status = Service::Response::DEPARTURE_FIRST;
+        response->reason = std::string("validated departure ") +
+            (departure.reverse ? "in reverse" : "ahead") +
+            "; request the objective again from its end" + exit_note;
+        route_note = response->reason;
+        for (const auto& pose : departure.path) response->path.push_back(toPoseMsg(pose));
+      } else {
+        response->status = Service::Response::BLOCKED;
+        response->reason = "objective requires a departure" + exit_note +
+            "; validated departure refused: no terrain-clear leg with turn room within " +
+            std::to_string(mgg::kDepartureMaxM) + " m";
+      }
     }
+    // Keep the remaining escape; never command an in-place turn.
+  };
+  const auto retain_exit = [&](bool needs_stored_exit) {
+    if (needs_stored_exit) {
+      const std::string refusal = retainReverseExit(route, false);
+      if (!refusal.empty()) {
+        response->reason = "escape corridor not retained: " + refusal;
+        RCLCPP_WARN(get_logger(), "%s", response->reason.c_str());
+      }
+    } else {
+      stored_reverse_exit_.clear();
+    }
+  };
+  if (!anytime) {
+    shortcutAndResample(route, turns_ok, nullptr, /*lattice_route=*/local);
+    bool needs_departure = false;
+    if (!certify_route(needs_departure)) {
+      if (needs_departure) answer_with_departure();
+      return;
+    }
+    retain_exit(!route.empty() && currentPoseNeedsStoredExit());
   } else {
-    stored_reverse_exit_.clear();
-  }
-  // A retained reverse corridor belongs to its certified route: do not
-  // optionally rewrite it. Otherwise polish transactionally under the same
-  // map lease, and keep the certified graph route if time runs out.
-  if (anytime && !needs_stored_exit) {
-    const auto certified_route = route;
-    const auto certified_response = *response;
-    bool kept_certified = false;
+    // Anytime: certify the raw graph route first, without side effects, so
+    // a certified route is in hand before the optional polish. Its failure
+    // is not final. Then the base order (shortcut, then the same checks)
+    // decides; the raw route stands in when the deadline cuts that short or
+    // the polished route fails its checks. Cancellation always aborts.
+    struct ReverseExitMemory {
+      std::vector<mgg::StateVec> exit, entry;
+      bool retreating;
+    };
+    const auto save_exit = [this] {
+      return ReverseExitMemory{stored_reverse_exit_, reverse_exit_entry_path_,
+                               stored_reverse_retreating_};
+    };
+    const auto restore_exit = [this](const ReverseExitMemory& memory) {
+      stored_reverse_exit_ = memory.exit;
+      reverse_exit_entry_path_ = memory.entry;
+      stored_reverse_retreating_ = memory.retreating;
+    };
+    const std::vector<mgg::StateVec> graph_route = route;
+    const auto request_response = *response;
+    const ReverseExitMemory request_exit = save_exit();
+    const bool needs_stored_exit = !route.empty() && currentPoseNeedsStoredExit();
+    const auto raw_started = std::chrono::steady_clock::now();
+    // The unpolished graph route must also carry outgoing headings, as the
+    // shortcut normally supplies them. Do not interpolate uncertified leaps.
+    for (std::size_t i = 0; i + 1 < route.size(); ++i) {
+      const Eigen::Vector2d step = (route[i + 1] - route[i]).head<2>();
+      if (step.norm() > 1e-9) route[i][3] = std::atan2(step.y(), step.x());
+    }
+    if (route.size() > 1) route.back()[3] = route[route.size() - 2][3];
+    bool raw_departure = false;
+    const bool raw_certified = certify_route(raw_departure);
+    if (raw_certified) retain_exit(needs_stored_exit);
+    raw_route_certification_ms_ = std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - raw_started).count();
+    const std::vector<mgg::StateVec> raw_route = route;
+    const auto raw_response = *response;
+    const ReverseExitMemory raw_exit = save_exit();
+    *response = request_response;
+    restore_exit(request_exit);
+    bool polished_certified = false;
+    bool polished_departure = false;
+    bool polish_expired = false;
     try {
       mgg::planningCheckpoint();
+      route = graph_route;
       shortcutAndResample(route, turns_ok, nullptr, /*lattice_route=*/false);
-      if (!certify_route(/*allow_departure=*/false)) kept_certified = true;
-      mgg::planningCheckpoint();
+      if (certify_route(polished_departure)) {
+        retain_exit(needs_stored_exit);
+        polished_certified = true;
+      }
     } catch (const mgg::PlanningInterrupted&) {
       if (budget.cancelled_ || !budget.exhausted_) throw;
-      kept_certified = true;
+      polish_expired = true;
     }
-    if (kept_certified) {
-      route = certified_route;
-      *response = certified_response;
-      path_shortcut_corners_ = static_cast<int>(route.size());
-      path_shortcut_to_ = path_shortcut_corners_;
-      if (!reason.empty()) reason += "; ";
-      reason += "kept certified global route without final shortcut polish";
+    if (!polished_certified) {
+      if (raw_certified) {
+        const std::string polished_refusal = polished_departure
+            ? "it starts with a turn without room" : response->reason;
+        route = raw_route;
+        *response = raw_response;
+        restore_exit(raw_exit);
+        path_shortcut_corners_ = static_cast<int>(route.size());
+        path_shortcut_to_ = path_shortcut_corners_;
+        if (!reason.empty()) reason += "; ";
+        reason += polish_expired
+            ? "kept certified global route: final shortcut polish stopped at the request deadline"
+            : "kept certified global route: the polished route failed its final checks (" +
+                  polished_refusal + ")";
+      } else if (polish_expired) {
+        // Only the raw route was checked to the end: its verdict. A
+        // departure past the deadline ends as the budget refusal.
+        *response = request_response;
+        restore_exit(request_exit);
+        if (raw_departure) {
+          answer_with_departure();
+        } else {
+          *response = raw_response;
+          response->reason += "; final shortcut polish stopped at the request deadline";
+        }
+        return;
+      } else {
+        // Both checked to the end: the polished verdict, as at base.
+        restore_exit(request_exit);
+        if (polished_departure) {
+          *response = request_response;
+          answer_with_departure();
+        }
+        return;
+      }
     }
   }
   if (anytime) budget.finishCertifiedResult();

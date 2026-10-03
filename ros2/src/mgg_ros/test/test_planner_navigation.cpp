@@ -632,8 +632,35 @@ class PlannerNodeTestPeer {
     return node.lattice_deadline_.has_value();
   }
   static void cancel(PlannerNode& node) { node.cancelPlanning(); }
-  static void resetPolish(PlannerNode& node) { node.path_shortcut_from_ = 0; }
+  static double& rawRouteCertificationMs(PlannerNode& node) {
+    return node.raw_route_certification_ms_;
+  }
+  static void resetPolish(PlannerNode& node) {
+    node.path_shortcut_from_ = 0;
+    node.path_shortcut_to_ = 0;
+  }
   static bool polishing(const PlannerNode& node) { return node.path_shortcut_from_ > 2; }
+  // The shortcut has finished: the polished route is being certified.
+  static bool certifyingPolish(const PlannerNode& node) {
+    return polishing(node) && node.path_shortcut_to_ > 0;
+  }
+  // The raw graph route first doubles back to a vertex inside the chassis
+  // spin's offset circle, so its spin joins nothing before an initial-leg
+  // corner. Its shortcut runs straight ahead along the robot's heading. The
+  // long edge keeps the link expansion from bypassing that first vertex.
+  static void rawCornerRoadmap(PlannerNode& node) {
+    node.applyLatestOdometry();
+    node.global_graph_->reset();
+    const std::vector<Eigen::Vector2d> at{{0, 0}, {.16, .1}, {-1.2, 0}, {-2, 0}};
+    for (std::size_t i = 0; i < at.size(); ++i) {
+      auto* v = new mgg::Vertex(static_cast<int>(i), mgg::StateVec(at[i].x(), at[i].y(), .935, M_PI));
+      node.global_graph_->addVertex(v);
+      if (i) node.global_graph_->addEdge(node.global_graph_->getVertex(static_cast<int>(i) - 1), v,
+                                         (at[i] - at[i - 1]).norm());
+    }
+    node.global_root_supported_ = true;
+    resetPolish(node);
+  }
   static void budgetRoadmap(PlannerNode& node) {
     node.applyLatestOdometry();
     node.global_graph_->reset();
@@ -939,6 +966,90 @@ TEST_F(PlannerNavigationTest, ObjectiveBudgetsCancellationDuringPolishNeverRetur
   EXPECT_TRUE(response->path.empty());
 }
 
+// Review r0 P1: the base flow polished and then certified. A raw graph route
+// failing the post-spin join must not hide its passing shortcut.
+TEST_F(PlannerNavigationTest, ObjectiveBudgetsAcceptPolishedRouteWhoseRawCornersFail) {
+  MolaTerrainProduct product(.1, -4, 3, -3, 3, flat, {}, 2.5);
+  for (int objective : {Service::Request::RETURN_HOME, Service::Request::NAVIGATE}) {
+    SCOPED_TRACE(objective);
+    auto node = botmanNode("budget_raw_corner", product);
+    PlannerNodeTestPeer::standAt(*node, 0, 0, 0, M_PI, 1);
+    PlannerNodeTestPeer::rawCornerRoadmap(*node);
+    PlannerNodeTestPeer::forceGlobalFallback(*node, true);
+    auto response = std::make_shared<Service::Response>();
+    PlannerNodeTestPeer::objective(*node, budgetRequest(*node, objective), response);
+    ASSERT_EQ(response->status, Service::Response::SUCCEEDED) << response->reason;
+    ASSERT_GE(response->path.size(), 2u);
+    EXPECT_NEAR(response->path.back().position.x, -2, .001);
+    EXPECT_EQ(response->reason.find("certified"), std::string::npos) << response->reason;
+    // The up-front raw check here runs the post-spin join to its corner.
+    RecordProperty(objective == Service::Request::RETURN_HOME
+                       ? "home_raw_route_certification_ms" : "navigate_raw_route_certification_ms",
+                   std::to_string(PlannerNodeTestPeer::rawRouteCertificationMs(*node)));
+    // The polished route never visits the doubled-back vertex behind the robot.
+    for (const auto& pose : response->path) EXPECT_LT(pose.position.x, .05);
+  }
+}
+
+TEST_F(PlannerNavigationTest, ObjectiveBudgetsExpiryDuringPolishCertificationKeepsCertifiedRoute) {
+  MolaTerrainProduct product(.1, -4, 3, -3, 3, flat, {}, 2.5);
+  auto node = botmanNode("budget_polish_certify_expiry", product);
+  PlannerNodeTestPeer::standAt(*node, 0, 0, 0, M_PI, 1);
+  PlannerNodeTestPeer::budgetRoadmap(*node);
+  bool expired = false;
+  mgg::PlanningCancellationScope instrument([&] {
+    if (!expired && PlannerNodeTestPeer::certifyingPolish(*node)) {
+      expired = true;
+      PlannerNodeTestPeer::expireRequest(*node);
+    }
+    return false;
+  });
+  auto response = std::make_shared<Service::Response>();
+  PlannerNodeTestPeer::objective(*node, budgetRequest(*node, Service::Request::RETURN_HOME), response);
+  EXPECT_TRUE(expired);
+  ASSERT_EQ(response->status, Service::Response::SUCCEEDED) << response->reason;
+  ASSERT_GE(response->path.size(), 2u);
+  EXPECT_NEAR(response->path.back().position.x, -2, .001);
+  EXPECT_NE(response->reason.find("certified"), std::string::npos) << response->reason;
+}
+
+// Both routes fail: polish cut by the deadline leaves the raw route's reason.
+TEST_F(PlannerNavigationTest, ObjectiveBudgetsBothRoutesFailingReportRawReasonAfterExpiry) {
+  MolaTerrainProduct product(.1, -4, 3, -3, 3, flat, {}, 2.5);
+  auto node = botmanNode("budget_both_fail", product);
+  PlannerNodeTestPeer::standAt(*node, 0, 0, 0, M_PI, 1);
+  PlannerNodeTestPeer::rawCornerRoadmap(*node);
+  bool expired = false;
+  mgg::PlanningCancellationScope instrument([&] {
+    if (!expired && PlannerNodeTestPeer::polishing(*node)) {
+      expired = true;
+      PlannerNodeTestPeer::expireRequest(*node);
+    }
+    return false;
+  });
+  auto response = std::make_shared<Service::Response>();
+  PlannerNodeTestPeer::objective(*node, budgetRequest(*node, Service::Request::RETURN_HOME), response);
+  EXPECT_TRUE(expired);
+  EXPECT_EQ(response->status, Service::Response::UNREACHABLE) << response->reason;
+  EXPECT_TRUE(response->path.empty());
+  EXPECT_NE(response->reason.find("post-spin reference cannot join"), std::string::npos)
+      << response->reason;
+  EXPECT_NE(response->reason.find("polish stopped at the request deadline"), std::string::npos)
+      << response->reason;
+}
+
+TEST_F(PlannerNavigationTest, ObjectiveBudgetsCancelWhileCertifyingPolishNeverReturnsRoute) {
+  MolaTerrainProduct product(.1, -4, 3, -3, 3, flat, {}, 2.5);
+  auto node = botmanNode("budget_polish_certify_cancel", product);
+  PlannerNodeTestPeer::standAt(*node, 0, 0, 0, M_PI, 1);
+  PlannerNodeTestPeer::rawCornerRoadmap(*node);
+  mgg::PlanningCancellationScope instrument([&] { return PlannerNodeTestPeer::certifyingPolish(*node); });
+  auto response = std::make_shared<Service::Response>();
+  PlannerNodeTestPeer::objective(*node, budgetRequest(*node, Service::Request::RETURN_HOME), response);
+  EXPECT_EQ(response->status, Service::Response::BLOCKED) << response->reason;
+  EXPECT_TRUE(response->path.empty());
+}
+
 TEST_F(PlannerNavigationTest, HardwareNavigateFitsNorthDoorwayWithObservedBody) {
   MolaTerrainProduct product(.1, -5, 5, -3, 7, flat,
       {{-5, -.6, 1.5, 1.8, 2}, {.6, 5, 1.5, 1.8, 2}}, 2.0);
@@ -1012,6 +1123,7 @@ TEST_F(PlannerNavigationTest, BotmanFixtureFullServicesBenchmark) {
     PlannerNodeTestPeer::standAt(*node, 0, 0, -.61, M_PI, run+1);
     for (const std::string mode : {"navigate_local", "navigate_global_fallback", "navigate_15m", "explore_origin", "explore_1.13", "explore_-3.17"}) {
       PlannerNodeTestPeer::forceGlobalFallback(*node, mode == "navigate_global_fallback");
+      PlannerNodeTestPeer::rawRouteCertificationMs(*node) = -1;
       const auto started = std::chrono::steady_clock::now();
       int status = 0;
       std::size_t poses = 0;
@@ -1039,6 +1151,8 @@ TEST_F(PlannerNavigationTest, BotmanFixtureFullServicesBenchmark) {
       if (exploring) row.update(PlannerNodeTestPeer::explorationMetrics(*node));
       row.update(PlannerNodeTestPeer::groundGainModel(*node));
       if (mode == "navigate_global_fallback") row["global_diagnostic"] = PlannerNodeTestPeer::globalLinks(*node);
+      if (PlannerNodeTestPeer::rawRouteCertificationMs(*node) >= 0)
+        row["raw_route_certification_ms"] = PlannerNodeTestPeer::rawRouteCertificationMs(*node);
       std::printf("SERVICE_BENCH %s\n", row.dump().c_str());
       EXPECT_LT(elapsed, 1000);  // hard envelope, not a claim of the x86 target
     }
