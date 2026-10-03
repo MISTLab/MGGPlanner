@@ -545,6 +545,9 @@ TEST(GridGraph, ExpansionUsesNativeWindowRatherThanRawProjectedPairs) {
   planning.nearest_range = 1;
   planning.nearest_range_min = .05;
   planning.nearest_range_max = 100;
+  // Isolate terrain admission; a 2 cm test body has no footprint cell centres
+  // from which to measure the separate observed-ground fraction.
+  planning.min_observed_ground_fraction = 0;
   const mgg::GroundProjection ground(map, planning);
   ExpandContext ctx;
   ctx.map = &map;
@@ -558,6 +561,10 @@ TEST(GridGraph, ExpansionUsesNativeWindowRatherThanRawProjectedPairs) {
   Vertex candidate(1, StateVec(.45, .05, .68, 0));
   ASSERT_TRUE(ground.groundStepsAdmissible(graph.getVertex(0)->state.head<3>(),
                                          candidate.state.head<3>()));
+  std::vector<Eigen::Vector3d> projected;
+  ASSERT_EQ(ground.getProjectedEdgeStatus(graph.getVertex(0)->state.head<3>(),
+                candidate.state.head<3>(), ctx.robot_box_size, true, projected, false),
+            mgg::ProjectedEdgeStatus::kAdmissible);
   mgg::ExpandGraphReport report;
   mgg::expandGraph(graph, candidate, report, ctx);
   EXPECT_EQ(report.num_vertices_added, 1);
