@@ -1,16 +1,21 @@
 // The ground local planner process: odometry jumps reset ground admissions
 // as well as voxels, sustained obstacle churn beside an unchanged corridor
-// does not starve it, and outputs echo the current session and request.
+// does not starve it, outputs echo the current session and request, and
+// accepted requests and planning cycles are logged as native events.
 
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <cstdarg>
+#include <cstdio>
 #include <memory>
 #include <set>
 #include <string>
 #include <vector>
 
 #include <gtest/gtest.h>
+#include <nlohmann/json.hpp>
+#include <rcutils/logging.h>
 #include <rclcpp/rclcpp.hpp>
 #include <sensor_msgs/point_cloud2_iterator.hpp>
 
@@ -215,6 +220,44 @@ int8_t cellAt(const nav_msgs::msg::OccupancyGrid& grid, double x, double y) {
     return -2;
   return grid.data[iy * grid.info.width + ix];
 }
+
+std::vector<std::string>* g_event_lines = nullptr;
+
+void captureEventLine(const rcutils_log_location_t*, int, const char*,
+                      rcutils_time_point_value_t, const char* format,
+                      va_list* args) {
+  if (!g_event_lines) return;
+  va_list copy;
+  va_copy(copy, *args);
+  std::vector<char> buffer(32 * 1024);
+  std::vsnprintf(buffer.data(), buffer.size(), format, copy);
+  va_end(copy);
+  const std::string line(buffer.data());
+  const auto at = line.find("SDEVT1 ");
+  if (at != std::string::npos) g_event_lines->push_back(line.substr(at + 7));
+}
+
+/// The node's native event lines, as RCLCPP_INFO writes them.
+struct EventCapture {
+  rcutils_logging_output_handler_t previous;
+  std::vector<std::string> lines;
+  EventCapture() : previous(rcutils_logging_get_output_handler()) {
+    g_event_lines = &lines;
+    rcutils_logging_set_output_handler(captureEventLine);
+  }
+  ~EventCapture() {
+    rcutils_logging_set_output_handler(previous);
+    g_event_lines = nullptr;
+  }
+  std::vector<nlohmann::json> of(const std::string& kind) const {
+    std::vector<nlohmann::json> events;
+    for (const auto& line : lines) {
+      auto event = nlohmann::json::parse(line);
+      if (event["kind"] == kind) events.push_back(std::move(event));
+    }
+    return events;
+  }
+};
 
 std::vector<StateVec> posesOf(const LocalPath& path) {
   std::vector<StateVec> poses;
@@ -451,4 +494,61 @@ TEST_F(LocalPlannerNodeTest, NoGoUpdateWithdrawsDrivenPath) {
   EXPECT_EQ(detour.kind, LocalPath::BREAK);
   EXPECT_EQ(detour.extends_sequence_id, driven.sequence_id);
   EXPECT_FALSE(mgg_test::pathCrosses(posesOf(detour), zone, 0.8));
+}
+
+TEST_F(LocalPlannerNodeTest, SetModeEmitsLocalRequest) {
+  Harness h("set_mode_events");
+  const StateVec base = basePose(0.1, 0.1);
+  for (int i = 0; i < 12; ++i) {
+    h.step(base);
+    h.t += 0.1;
+  }
+  EventCapture capture;
+  // An idle planner has no session: no planning-cycle event.
+  h.node->planCycle();
+  EXPECT_TRUE(capture.of("local_plan").empty());
+
+  LocalPlannerNode::SetMode::Request req;
+  req.session_id = "s1";
+  req.request_id = "r1";
+  req.mode = LocalPlannerNode::SetMode::Request::FOLLOW_ROUTE;
+  req.frame_id = "odom";
+  req.goal.x = 6.1;
+  req.goal.y = 0.1;
+  req.goal.z = drivingPoint(6.1, 0.1).z();
+  req.tolerance_m = 0.3;
+  LocalPlannerNode::SetMode::Response res;
+  h.node->onSetMode(req, res);
+  ASSERT_TRUE(res.accepted) << res.reason;
+  auto requests = capture.of("local_request");
+  ASSERT_EQ(requests.size(), 1u);
+  const auto& event = requests.front();
+  EXPECT_EQ(event["robot_id"], "set_mode_events");
+  EXPECT_EQ(event["payload"]["request_id"], req.request_id);
+  EXPECT_EQ(event["payload"]["session_id"], req.session_id);
+  EXPECT_FALSE(event["payload"]["continuation"].get<bool>());
+  EXPECT_NEAR(event["payload"]["pose"]["x"].get<double>(), base.x(), 1e-9);
+  EXPECT_EQ(event["payload"]["mode"], "follow_route");
+  // The accepted request planned at once: one cycle, one status change.
+  const auto plans = capture.of("local_plan");
+  ASSERT_EQ(plans.size(), 1u);
+  EXPECT_EQ(plans.back()["payload"]["request_id"], req.request_id);
+  EXPECT_EQ(plans.back()["payload"]["outcome"], "path");
+  EXPECT_GE(plans.back()["payload"]["path_length_m"].get<double>(), 0.0);
+  const auto statuses = capture.of("local_status");
+  ASSERT_EQ(statuses.size(), 1u);
+  EXPECT_EQ(statuses.back()["payload"]["status"], "moving");
+
+  // Same session: a continuation. A refused request is not an event.
+  req.request_id = "r2";
+  h.node->onSetMode(req, res);
+  ASSERT_TRUE(res.accepted);
+  req.session_id = "";
+  req.request_id = "r3";
+  h.node->onSetMode(req, res);
+  ASSERT_FALSE(res.accepted);
+  requests = capture.of("local_request");
+  ASSERT_EQ(requests.size(), 2u);
+  EXPECT_EQ(requests.back()["payload"]["request_id"], "r2");
+  EXPECT_TRUE(requests.back()["payload"]["continuation"].get<bool>());
 }

@@ -8,6 +8,8 @@
 #include <tf2/exceptions.h>
 
 #include "mgg_ros/conversions.h"
+#include "mgg_ros/exploration_event.h"
+#include "mgg_ros/local_events.h"
 #include "mgg_ros/local_path_conversions.h"
 #include "mgg_ros/param_loader.h"
 #include "mgg_ros/scan_input.h"
@@ -27,6 +29,7 @@ LocalPlannerNode::LocalPlannerNode(const rclcpp::NodeOptions& options)
       tf_buffer_(std::make_unique<tf2_ros::Buffer>(get_clock())),
       core_(loadParameters()) {
   tf_listener_ = std::make_shared<tf2_ros::TransformListener>(*tf_buffer_);
+  robot_id_ = robotIdFromNamespace(get_namespace(), get_name());
   core_.setFrameLookup(
       [this](const std::string& frame) { return lookup(frame); });
 
@@ -222,9 +225,14 @@ void LocalPlannerNode::onSetMode(const SetMode::Request& request,
                                  SetMode::Response& response) {
   const std::lock_guard<std::mutex> lock(mutex_);
   response.epoch = core_.epoch();
+  LocalModeRequest mode;
   LocalModeResponse result;
+  bool continuation = false;
   try {
-    result = core_.setMode(fromModeRequest(request));
+    mode = fromModeRequest(request);
+    // As the core decides it: the request keeps the current session.
+    continuation = mode.session_id == core_.sessionId();
+    result = core_.setMode(mode);
   } catch (const std::invalid_argument& error) {
     response.accepted = false;
     response.reason = error.what();
@@ -233,7 +241,11 @@ void LocalPlannerNode::onSetMode(const SetMode::Request& request,
   response.accepted = result.accepted;
   response.reason = result.reason;
   response.epoch = result.epoch;
-  if (result.accepted) runPlan();
+  if (!result.accepted) return;
+  // Requests are service calls, not recorded topics: replay re-issues these.
+  emitEvent("local_request",
+            localRequestPayload(mode, continuation, base_, now().seconds()));
+  runPlan();
 }
 
 void LocalPlannerNode::planCycle() {
@@ -261,6 +273,46 @@ void LocalPlannerNode::runPlan() {
   status.stamp = now();
   status.guidance_sequence_id = core_.guidanceSequenceId();
   status_pub_->publish(status);
+  if (core_.sessionId().empty() || core_.requestId().empty()) return;
+  if (core_.mode() != LocalMode::kIdle)
+    emitEvent("local_plan",
+              localPlanPayload(result, core_.sessionId(), core_.requestId(),
+                               status.map_revision));
+  const std::string status_event = status.status + '\n' + status.reason +
+                                   '\n' + status.session_id + '\n' +
+                                   status.request_id;
+  if (status_event != last_status_event_) {
+    last_status_event_ = status_event;
+    emitEvent("local_status", localStatusPayload(status));
+  }
+}
+
+void LocalPlannerNode::emitEvent(const std::string& kind,
+                                 nlohmann::json payload) {
+  // Sim time once /clock runs; before it, consumers place the wall time.
+  const double seconds = now().seconds();
+  const std::optional<double> stamp =
+      seconds > 0 ? std::optional<double>(seconds) : std::nullopt;
+  std::string line;
+  try {
+    line = mgg_ros::explorationEventLine(kind, robot_id_, payload, stamp);
+  } catch (const std::invalid_argument& error) {
+    // A long request route can exceed the log line budget: keep the
+    // request, say how many route points it dropped.
+    if (!payload.contains("route") || payload["route"].empty()) {
+      RCLCPP_WARN(get_logger(), "dropped %s event: %s", kind.c_str(),
+                  error.what());
+      return;
+    }
+    payload["route_omitted"] = payload["route"].size();
+    payload["route"] = nlohmann::json::array();
+    RCLCPP_WARN(get_logger(), "%s event without its %zu route points: %s",
+                kind.c_str(), payload["route_omitted"].get<std::size_t>(),
+                error.what());
+    emitEvent(kind, std::move(payload));
+    return;
+  }
+  RCLCPP_INFO(get_logger(), "%s", line.c_str());
 }
 
 void LocalPlannerNode::publishInvalidations(bool plan_after) {

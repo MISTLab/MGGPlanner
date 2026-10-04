@@ -449,6 +449,7 @@ LocalPlanResult LocalPlanner::search(const LocalPlanInputs& in,
                 return a.score == b.score ? a.id < b.id : a.score < b.score;
               });
   }
+  result.candidate_count = candidates.size();
   std::vector<int> destinations;
   for (const auto& c : candidates) destinations.push_back(c.id);
   auto routes = findTurnCompliantRoutes(

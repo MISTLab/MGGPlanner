@@ -11,6 +11,7 @@ TEST(LocalPlanner, CorridorAndSplice) {
   auto in = s.inputs();
   auto first = planner.plan(in, {});
   ASSERT_TRUE(first.path) << first.reason;
+  EXPECT_TRUE(first.candidate_count && *first.candidate_count > 0);
   EXPECT_GE(pathLength(*first.path), 6);
   EXPECT_LE(pathLength(*first.path), 10);
   in.executing_path = first.path;

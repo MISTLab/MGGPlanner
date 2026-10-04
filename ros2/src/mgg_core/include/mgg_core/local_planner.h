@@ -1,5 +1,6 @@
 #ifndef MGG_CORE_LOCAL_PLANNER_H_
 #define MGG_CORE_LOCAL_PLANNER_H_
+#include <cstddef>
 #include <optional>
 
 #include "mgg_core/certification_cache.h"
@@ -36,6 +37,9 @@ struct LocalPlanResult {
   // Driver exposes this cap through its feedback/control boundary. It does
   // not replace the executor's instantaneous remaining-distance fence.
   std::optional<double> speed_cap_mps;
+  // Destinations considered (the goal, or scored gain viewpoints); set only
+  // when the search reached candidate selection. Telemetry, not policy.
+  std::optional<std::size_t> candidate_count;
 };
 class LocalPlanner {
  public:

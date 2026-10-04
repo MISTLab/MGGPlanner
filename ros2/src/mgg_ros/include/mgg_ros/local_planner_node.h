@@ -11,6 +11,11 @@
 // Callbacks are serialized: one mutex guards the core. A scan without TF at
 // its stamp is dropped and counted. The odometry frame is the first
 // odometry header's frame; outputs are in it.
+//
+// Native events (C4a, mgg_ros/local_events.h), logged through RCLCPP_INFO
+// for the namespace's robot: local_request per accepted set_mode,
+// local_plan per planning cycle of a session in EXPLORE or FOLLOW_ROUTE,
+// local_status when status, reason, session or request changes.
 
 #ifndef MGG_ROS_LOCAL_PLANNER_NODE_H_
 #define MGG_ROS_LOCAL_PLANNER_NODE_H_
@@ -29,6 +34,7 @@
 #include <mgg_msgs/msg/local_planner_status.hpp>
 #include <mgg_msgs/srv/set_local_planner_mode.hpp>
 #include <nav_msgs/msg/occupancy_grid.hpp>
+#include <nlohmann/json.hpp>
 #include <nav_msgs/msg/odometry.hpp>
 #include <rclcpp/rclcpp.hpp>
 #include <sensor_msgs/msg/point_cloud2.hpp>
@@ -70,6 +76,9 @@ class LocalPlannerNode : public rclcpp::Node {
   void publishInvalidations(bool plan_after);
   void publishGrid();
   std::optional<Eigen::Isometry3d> lookup(const std::string& frame) const;
+  /// Logs one native event; a payload p0's envelope refuses is a warning,
+  /// never a planning failure.
+  void emitEvent(const std::string& kind, nlohmann::json payload);
 
   mutable std::mutex mutex_;
   std::unique_ptr<tf2_ros::Buffer> tf_buffer_;
@@ -80,6 +89,9 @@ class LocalPlannerNode : public rclcpp::Node {
   std::string odom_frame_;
   std::optional<StateVec> base_;
   std::uint64_t dropped_scans_ = 0;
+  std::string robot_id_;
+  /// Status, reason, session and request of the last local_status event.
+  std::string last_status_event_;
 
   rclcpp::Publisher<mgg_msgs::msg::LocalPath>::SharedPtr path_pub_;
   rclcpp::Publisher<mgg_msgs::msg::LocalPathInvalidation>::SharedPtr

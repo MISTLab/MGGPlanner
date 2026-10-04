@@ -46,6 +46,7 @@ add_library(${PROJECT_NAME}
   src/global_guidance.cpp
   src/planner_guidance.cpp
   src/keyframe_trajectory.cpp
+  src/local_events.cpp
   src/local_path_conversions.cpp
   src/local_planner_node.cpp
   src/local_planning_core.cpp
@@ -121,6 +122,9 @@ if(BUILD_TESTING)
   ament_add_gtest(test_local_path_conversions test/test_local_path_conversions.cpp)
   target_link_libraries(test_local_path_conversions ${PROJECT_NAME})
   ament_target_dependencies(test_local_path_conversions mgg_msgs)
+  ament_add_gtest(test_local_events test/test_local_events.cpp)
+  target_link_libraries(test_local_events ${PROJECT_NAME})
+  ament_target_dependencies(test_local_events mgg_msgs)
   ament_add_gtest(test_scan_input test/test_scan_input.cpp)
   target_link_libraries(test_scan_input ${PROJECT_NAME})
   ament_target_dependencies(test_scan_input sensor_msgs tf2)
