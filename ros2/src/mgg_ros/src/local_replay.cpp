@@ -4,6 +4,7 @@
 #include <array>
 #include <chrono>
 #include <cmath>
+#include <deque>
 #include <fstream>
 #include <iomanip>
 #include <iostream>
@@ -322,6 +323,13 @@ struct Replay {
   std::size_t ignored_stale_feedback = 0, callback_count = 0;
   bool core_has_scan = false;
   double accumulated_ms = 0;
+  // One sim-clock tick can stamp a plan and the feedback it caused alike
+  // (the recorder stamps callbacks with its latest /clock). Within a tick,
+  // EXECUTING feedback waits for the local_plan event it names; later
+  // feedback queues behind it to keep receipt order.
+  double tick = std::numeric_limits<double>::quiet_NaN();
+  std::set<Identity> tick_publications;  // recorded, not yet replayed
+  std::deque<BagInput> deferred_feedback;
 
   explicit Replay(const Bundle& b) : bundle(b) { newCore(); }
   void newCore() {
@@ -349,7 +357,46 @@ struct Replay {
     accumulated_ms = 0;
     callback_count = 0;
   }
+  /// Starts the tick of events[first], whose local_plan identities a
+  /// same-tick feedback may wait for.
+  void beginTick(const std::vector<Event>& events, std::size_t first) {
+    tick = events[first].time;
+    tick_publications.clear();
+    for (auto i = first; i < events.size() && events[i].time == tick; ++i) {
+      const auto& e = events[i].value;
+      const auto& p = e.at("payload");
+      if (e.at("kind") == "local_plan" && p.contains("sequence_id") &&
+          p.contains("epoch"))
+        tick_publications.insert({p.at("session_id").get<std::string>(),
+                                  p.at("epoch").get<std::uint64_t>(),
+                                  p.at("sequence_id").get<std::uint64_t>()});
+    }
+  }
+  bool awaitsPublication(const BagInput& input) const {
+    const auto* m = std::get_if<Feedback>(&input.message);
+    return m && m->state == Feedback::EXECUTING &&
+           tick_publications.count({m->session_id, m->epoch, m->sequence_id});
+  }
+  /// Delivers deferred feedback whose publication has replayed. At the end
+  /// of the tick nothing waits: unmatched identities fail as usual.
+  void releaseFeedback(bool end_of_tick) {
+    if (end_of_tick) tick_publications.clear();
+    while (!deferred_feedback.empty() &&
+           !awaitsPublication(deferred_feedback.front())) {
+      const auto input = std::move(deferred_feedback.front());
+      deferred_feedback.pop_front();
+      deliver(input);
+    }
+  }
   void apply(const BagInput& input) {
+    if (std::holds_alternative<Feedback>(input.message) && input.time == tick &&
+        (!deferred_feedback.empty() || awaitsPublication(input))) {
+      deferred_feedback.push_back(input);
+      return;
+    }
+    deliver(input);
+  }
+  void deliver(const BagInput& input) {
     const bool measured = active();
     const auto start = Clock::now();
     std::visit([&](const auto& m) { applyMessage(m, input.topic); }, input.message);
@@ -495,6 +542,10 @@ struct Replay {
       require(publications.emplace(key, result.path->sequence_id).second,
               "duplicate recorded path identity");
     }
+    if (p.contains("sequence_id") && p.contains("epoch"))
+      tick_publications.erase({p.at("session_id").get<std::string>(),
+                               p.at("epoch").get<std::uint64_t>(),
+                               p.at("sequence_id").get<std::uint64_t>()});
     const json path = pathOutput(result.path);
     const std::string status = statusName(result.status);
     json tags = json::array();
@@ -531,11 +582,14 @@ int runLocalReplay(const fs::path& manifest, const fs::path& output,
     std::size_t bag_index = 0;
     // Stable bag receipt order, then exported event order at a tie. Nothing
     // recorded later is visible to a cycle, including dynamic TF.
-    for (const auto& event : b.events) {
+    for (std::size_t i = 0; i < b.events.size(); ++i) {
+      const auto& event = b.events[i];
+      if (i == 0 || b.events[i - 1].time != event.time) replay.beginTick(b.events, i);
       while (bag_index < b.bag.size() && b.bag[bag_index].time <= event.time)
         replay.apply(b.bag[bag_index++]);
       if (event.request) replay.request(event);
       if (event.value.at("kind") == "local_plan") rows.push_back(replay.cycle(event));
+      replay.releaseFeedback(i + 1 == b.events.size() || b.events[i + 1].time != event.time);
     }
     // Consume trailing callbacks too, including drops and stale feedback,
     // without allowing a trailing scan to qualify unobserved planning cycles.

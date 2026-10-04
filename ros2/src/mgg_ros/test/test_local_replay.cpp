@@ -37,7 +37,8 @@ std::string hashFile(const fs::path& file) {
 
 enum class Extra {
   None, KnownIdle, UnknownIdle, GuidanceAndZones, MissingTf,
-  DroppedInputs, IdleGap, RestartFeedback, LateScans
+  DroppedInputs, IdleGap, RestartFeedback, LateScans, SameTickFeedback,
+  SameTickUnmatchedFeedback
 };
 
 struct Bundle {
@@ -138,14 +139,17 @@ struct Bundle {
       mgg_msgs::msg::LocalPathFeedback fb;
       fb.session_id = "s1";
       fb.epoch = 777;
-      fb.sequence_id = 1;
+      // Same tick: the recorder stamps callbacks with its latest /clock.
+      const bool same_tick = extra == Extra::SameTickFeedback ||
+                             extra == Extra::SameTickUnmatchedFeedback;
+      fb.sequence_id = extra == Extra::SameTickUnmatchedFeedback ? 2 : 1;
       fb.state = "executing";
       fb.progress_m = 0.5;
       fb.speed_mps = 0.3;
       fb.deceleration_mps2 = 0.5;
       fb.latency_s = 0.2;
       fb.speed_cap_mps = 0.6;
-      write(fb, "mgg/local_planner/local_path_feedback", 2.5);
+      write(fb, "mgg/local_planner/local_path_feedback", same_tick ? 2.0 : 2.5);
     }
     if (extra == Extra::KnownIdle || extra == Extra::UnknownIdle) {
       mgg_msgs::msg::LocalPathFeedback idle;
@@ -344,6 +348,26 @@ TEST(LocalReplay, MissingParamsAndUnmatchedFeedbackFail) {
   b.events[1]["payload"]["sequence_id"] = 99;
   b.save();
   EXPECT_NE(mgg::runLocalReplay(b.manifest, b.output, b.params), 0);
+  EXPECT_FALSE(fs::exists(b.output));
+}
+TEST(LocalReplay, SameTickFeedbackFollowsItsPublication) {
+  Bundle same(true, true, Extra::SameTickFeedback), later;
+  const auto rows = same.run(), reference = later.run();
+  ASSERT_EQ(rows.size(), 5u); ASSERT_EQ(reference.size(), 5u);
+  EXPECT_EQ(rows.back()["failures"], 0);
+  EXPECT_EQ(rows[0]["progress_m"], 0.0);
+  EXPECT_EQ(rows[1]["progress_m"], 0.5);
+  ASSERT_FALSE(rows[1]["path"].is_null());
+  EXPECT_EQ(rows[1]["path"]["kind"], static_cast<int>(mgg::LocalPathKind::kExtend));
+  EXPECT_EQ(rows[1]["path"]["splice_point"], reference[1]["path"]["splice_point"]);
+}
+TEST(LocalReplay, SameTickFeedbackWithoutItsPublicationFails) {
+  Bundle b(true, true, Extra::SameTickUnmatchedFeedback);
+  testing::internal::CaptureStderr();
+  const int result = mgg::runLocalReplay(b.manifest, b.output, b.params);
+  const auto error = testing::internal::GetCapturedStderr();
+  EXPECT_NE(result, 0);
+  EXPECT_NE(error.find("unmatched feedback epoch/sequence"), std::string::npos);
   EXPECT_FALSE(fs::exists(b.output));
 }
 TEST(LocalReplay, IdleEpochMappingAndUnmatchedIdleCount) {
