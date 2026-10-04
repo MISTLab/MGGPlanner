@@ -1,5 +1,7 @@
 #ifndef MGG_CORE_TEST_LOCAL_PLANNER_FIXTURE_H_
 #define MGG_CORE_TEST_LOCAL_PLANNER_FIXTURE_H_
+#include <thread>
+
 #include "mgg_core/local_planner.h"
 #include "terrain_fixture.h"
 namespace mgg_test {
@@ -17,6 +19,11 @@ class LocalMap : public TerrainFixture {
                                Eigen::Vector3d(8, 8, 4));
   }
   mgg::VoxelStatus getVoxelStatus(const Eigen::Vector3d& p) const override {
+    if (delay_voxel_queries && (++voxel_queries % 1024 == 0))
+      std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    if (unknown_beside_corridor && std::abs(p.y()) > .8 && p.z() > 0 &&
+        p.z() < .8)
+      return mgg::VoxelStatus::kUnknown;
     if (!windowBounds()->contains(p)) return mgg::VoxelStatus::kUnknown;
     if (narrow && p.x() > 0.7 && std::abs(p.y()) >= 0.4 && p.z() > 0.1 &&
         p.z() < 0.9)
@@ -31,6 +38,9 @@ class LocalMap : public TerrainFixture {
   mgg::VoxelStatus getBoxStatus(const Eigen::Vector3d& p,
                                 const Eigen::Vector3d& size,
                                 bool stop) const override {
+    if (unknown_beside_corridor && std::abs(p.y()) + size.y() / 2 > .8 &&
+        p.z() + size.z() / 2 > .2 && p.z() - size.z() / 2 < .8)
+      return mgg::VoxelStatus::kUnknown;
     if (interior_unknown && p.x() + size.x() / 2 > 6 &&
         p.x() - size.x() / 2 < 7 && p.y() + size.y() / 2 > 1.5 &&
         p.y() - size.y() / 2 < 2.5 && p.z() + size.z() / 2 > 0.2 &&
@@ -44,6 +54,8 @@ class LocalMap : public TerrainFixture {
       return mgg::VoxelStatus::kOccupied;
     return TerrainFixture::getBoxStatus(p, size, stop);
   }
+  bool unknown_beside_corridor = false, delay_voxel_queries = false;
+  mutable size_t voxel_queries = 0;
   double wall_x = 2;
   bool wall = false, narrow = false, boundary_unknown = false,
        interior_unknown = false;

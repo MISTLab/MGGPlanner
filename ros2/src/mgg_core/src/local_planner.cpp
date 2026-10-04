@@ -143,10 +143,12 @@ double LocalPlanner::localGain(const StateVec& state,
     sensor_.getFrustumEndpoints(state, endpoints);
   }
   std::unordered_set<VoxelKey, VoxelKeyHash> unknown;
+  PlanningCheckpointThrottle checkpoint;
   for (const auto& end : endpoints) {
     planningCheckpoint();
     walkVoxels(origin, end, map_.getResolution(), 100000,
                [&](const VoxelIndex& k) {
+                 checkpoint.check();
                  const VoxelKey key{static_cast<int32_t>(k.x),
                                     static_cast<int32_t>(k.y),
                                     static_cast<int32_t>(k.z)};
@@ -242,6 +244,7 @@ LocalPlanResult LocalPlanner::search(const LocalPlanInputs& in,
     prefix = committedPrefix(*in.executing_path, in.progress_m, commit);
     if (!certify(prefix, in.no_go_zones)) prefix = LocalPathPlan{};
   }
+  bool selection_complete = true;
   auto publish = [&](LocalPathPlan path) -> bool {
     if (!certify(path, in.no_go_zones)) return false;
     const double length = pathLength(path);
@@ -250,14 +253,22 @@ LocalPlanResult LocalPlanner::search(const LocalPlanInputs& in,
         speed * speed / (2 * in.braking.deceleration_mps2) +
         speed * (in.braking.latency_s + in.braking.planning_latency_s) +
         in.braking.margin_m;
-    if (speed > 0 && length + 1e-9 < stopping) return false;
+    // A stationary terminal is a stop request, not a new motion segment.
+    // Accept it even while slowing down; the executor fences velocity and
+    // rechecks goal tolerance. Moving terminals still need stopping space.
+    const bool stationary_terminal =
+        path.reaches_goal && path.poses.size() == 1;
+    if (!stationary_terminal && speed > 0 && length + 1e-9 < stopping)
+      return false;
     path.commit_length_m = std::min(length, commit);
     // Preserve the envelope, never silently shorten it to two seconds.
     // A cap lets subsequent cycles return to the nominal two-second horizon.
-    if (speed > 0 && stopping > 2 * speed)
+    if (stationary_terminal)
+      result.speed_cap_mps = 0;
+    else if (speed > 0 && stopping > 2 * speed)
       result.speed_cap_mps =
           commitmentSpeedCap(std::min(length, 2 * speed), in.braking);
-    if (!prefix.poses.empty())
+    if (!stationary_terminal && !prefix.poses.empty())
       path.commit_length_m = std::max(path.commit_length_m, pathLength(prefix));
     if (path.prefix_length == 0) {
       path.prefix_length =
@@ -267,7 +278,7 @@ LocalPlanResult LocalPlanner::search(const LocalPlanInputs& in,
     result.status = LocalStatus::kMoving;
     result.reason = result.path->reaches_goal ? "final goal certified"
                                               : "certified local path";
-    result.checks_complete = true;
+    result.checks_complete = selection_complete;
     return true;
   };
   if (in.target &&
@@ -277,6 +288,28 @@ LocalPlanResult LocalPlanner::search(const LocalPlanInputs& in,
     path.reverse = {false};
     path.reaches_goal = true;
     if (publish(path)) return result;
+  }
+  if (!prefix.poses.empty() && prefix.reverse.front()) {
+    // Re-certify the original escape to its original refuge. The newly
+    // recorded reverse odometry must not become a fresh backwards escape,
+    // nor may a forward suffix be appended to a reverse commitment.
+    if (!roomToTurn(map_, robot_, planning_, in.pose)) {
+      auto remaining = committedPrefix(*in.executing_path, in.progress_m,
+                                       pathLength(*in.executing_path));
+      auto continuation = identity;
+      continuation.kind = LocalPathKind::kExtend;
+      continuation.poses = std::move(remaining.poses);
+      continuation.reverse = std::move(remaining.reverse);
+      continuation.prefix_length = prefix.poses.size();
+      continuation.reaches_goal =
+          in.target &&
+          (continuation.poses.back().head<3>() - *in.target).norm() <=
+              in.goal_tolerance_m;
+      if (continuation.poses.size() > 1 && publish(continuation)) return result;
+    }
+    // At the refuge (or after failed revalidation), start forward from the
+    // current pose with BREAK instead of attempting a mixed-direction splice.
+    prefix = LocalPathPlan{};
   }
   const StateVec root = prefix.poses.empty() ? in.pose : prefix.poses.back();
   if (layer_.pending(dependency(root, root))) {
@@ -363,14 +396,54 @@ LocalPlanResult LocalPlanner::search(const LocalPlanInputs& in,
         linkGoalToLattice(graph, goal, ctx, [](const Vertex&) { return true; });
     if (exact) candidates.push_back({exact->id, 0});
   } else {
+    // Score useful-length candidates first, then keep the best *completed*
+    // scores within a soft slice. Leave time to route and certify them.
+    std::vector<Vertex*> viewpoints;
     for (const auto& entry : graph.vertices_map_) {
       const auto& v = *entry.second;
-      if (v.id == 0 || !interior(window, v.state.head<3>()) ||
-          layer_.pending(dependency(v.state, v.state)))
-        continue;
-      const double gain = localGain(v.state, window);
-      if (gain > 0) candidates.push_back({v.id, -gain});
+      if (v.id != 0 && interior(window, v.state.head<3>()) &&
+          !layer_.pending(dependency(v.state, v.state)))
+        viewpoints.push_back(entry.second);
     }
+    const double retained_length = pathLength(prefix);
+    const auto priority = [&](const Vertex* v) {
+      const Eigen::Vector2d delta = (v->state - root).head<2>();
+      const double turn = std::abs(
+          std::remainder(std::atan2(delta.y(), delta.x()) - root[3], 2 * M_PI));
+      return std::abs(delta.norm() + retained_length - 7.0) + .25 * turn;
+    };
+    std::sort(viewpoints.begin(), viewpoints.end(),
+              [&](const Vertex* a, const Vertex* b) {
+                const double pa = priority(a), pb = priority(b);
+                return pa == pb ? a->id < b->id : pa < pb;
+              });
+    const auto scoring_deadline =
+        std::min(Clock::now() + std::chrono::milliseconds(100),
+                 deadline - std::chrono::milliseconds(100));
+    const auto* parent = planning_cancelled;
+    bool parent_interrupted = false;
+    {
+      PlanningCancellationScope scoring_scope([&] {
+        if (parent && (*parent)()) {
+          parent_interrupted = true;
+          return true;
+        }
+        return Clock::now() >= scoring_deadline;
+      });
+      try {
+        for (const Vertex* v : viewpoints) {
+          planningCheckpoint();
+          const double gain = localGain(v->state, window);
+          if (gain > 0) candidates.push_back({v->id, -gain});
+        }
+      } catch (const PlanningInterrupted&) {
+        if (parent_interrupted) throw;
+        selection_complete = false;
+      }
+    }
+    // Only the scoring slice may be recovered. Never swallow cancellation or
+    // the outer cycle deadline and publish a partial safety certificate.
+    planningCheckpoint();
     std::sort(candidates.begin(), candidates.end(),
               [](const auto& a, const auto& b) {
                 return a.score == b.score ? a.id < b.id : a.score < b.score;
@@ -454,8 +527,8 @@ LocalPlanResult LocalPlanner::search(const LocalPlanInputs& in,
       }
     }
   }
-  result.checks_complete =
-      !lattice.hit_limit && !routes.capped && layer_.pendingCount() == 0;
+  result.checks_complete = selection_complete && !lattice.hit_limit &&
+                           !routes.capped && layer_.pendingCount() == 0;
   if (!in.target && layer_.pendingCount() > 0) {
     result.status = LocalStatus::kWaitingForMap;
     result.reason = "pending map prevents exhaustion";

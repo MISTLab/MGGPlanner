@@ -1,6 +1,8 @@
 #include <gtest/gtest.h>
 
 #include "local_planner_fixture.h"
+#include "mgg_core/local_route.h"
+#include "mgg_core/planning_cancellation.h"
 using namespace mgg;
 
 TEST(LocalPlanner, CorridorAndSplice) {
@@ -70,20 +72,41 @@ TEST(LocalPlanner, CertificationNotFallback) {
   mgg_test::LocalScene s;
   LocalPlanner planner(s.map, s.layer, s.cache, s.planning, s.robot, s.sensor);
   auto in = s.inputs();
-  in.no_go_zones.set({{2, 0}}, 20);
+  s.map.narrow = true;
+  in.pose = {2, 0, .5, 0};
+  in.target = Eigen::Vector3d(6, 0, .5);
+  ASSERT_TRUE(planner.plan(in, {}).path);
+  in.no_go_zones.set({{4, 0}}, .8);
+  ASSERT_FALSE(in.no_go_zones.inside(in.pose.head<3>()));
   EXPECT_FALSE(planner.plan(in, {}).path);
   in.no_go_zones.set({}, 0);
+  s.map.narrow = false;
+  s.cache.flushAll();
+  in = s.inputs();
   in.target.reset();
   s.map.boundary_unknown = true;
   EXPECT_FALSE(planner.plan(in, {}).path);
-  // A turn on unmeasured/steep ground is never accepted as a fallback.
+  // Translation is collision-free, but facing backwards requires a spin.
   LocalPathPlan sharp;
-  sharp.poses = {{0, 0, 0.5, 0}, {0, 1, 0.5, 1.57}};
-  sharp.reverse = {false, false};
+  sharp.poses = {{2, 0, .5, 0}, {1.75, 0, .5, M_PI}, {1.5, 0, .5, M_PI}};
+  sharp.reverse = {false, false, false};
   s.map.narrow = true;
   s.cache.flushAll();
-  sharp.poses = {{2, 0, 0.5, 0}, {2, 1, 0.5, 1.57}};
+  GroundProjection ground(s.map, s.planning);
+  ExpandContext ctx;
+  ctx.map = &s.map;
+  ctx.ground = &ground;
+  ctx.robot = &s.robot;
+  ctx.planning = &s.planning;
+  ctx.robot_box_size = s.robot.getPlanningSize();
+  ASSERT_TRUE(groundShortcutSegmentAdmissible(
+      ctx, sharp.poses.front().head<3>(), sharp.poses.back().head<3>(), true));
+  ASSERT_FALSE(roomToTurn(s.map, s.robot, s.planning, sharp.poses.front()));
   EXPECT_FALSE(planner.pathStillCertified(sharp, 0));
+  s.map.narrow = false;
+  s.cache.flushAll();
+  ASSERT_TRUE(roomToTurn(s.map, s.robot, s.planning, sharp.poses.front()));
+  EXPECT_TRUE(planner.pathStillCertified(sharp, 0));
 }
 TEST(LocalPlanner, FinalNotIntermediateGoal) {
   mgg_test::LocalScene s;
@@ -193,7 +216,83 @@ TEST(LocalPlanner, LocalGainIsUncachedAndNotWindowBoundary) {
   EXPECT_LE(pathLength(*frontier.path), 10);
   s.map.interior_unknown = false;
   s.map.boundary_unknown = true;
-  auto observed = planner.plan(in, MapChange{2, {}, true});
+  // No withdrawal/flush is needed to refresh gain: it is not cached.
+  const auto warm_edges = s.cache.edges().size();
+  ASSERT_GT(warm_edges, 0u);
+  auto observed = planner.plan(in, {});
+  EXPECT_GE(s.cache.edges().size(), warm_edges);
   EXPECT_FALSE(observed.path);
   EXPECT_EQ(observed.status, LocalStatus::kNoLocalTarget) << observed.reason;
+}
+
+TEST(LocalPlanner, StationaryTerminalWhileSlowingDown) {
+  mgg_test::LocalScene s;
+  LocalPlanner planner(s.map, s.layer, s.cache, s.planning, s.robot, s.sensor);
+  auto in = s.inputs();
+  auto previous = planner.plan(in, {});
+  ASSERT_TRUE(previous.path);
+  in.executing_path = previous.path;
+  in.target = Eigen::Vector3d(.2, 0, .5);
+  in.goal_tolerance_m = .2;
+  for (double speed : {.2, 1e-6}) {
+    in.speed_mps = speed;
+    auto terminal = planner.plan(in, {});
+    ASSERT_TRUE(terminal.path) << terminal.reason;
+    EXPECT_EQ(terminal.status, LocalStatus::kMoving);
+    EXPECT_TRUE(terminal.path->reaches_goal);
+    ASSERT_EQ(terminal.path->poses.size(), 1u);
+    EXPECT_EQ(terminal.path->poses.front(), in.pose);
+    EXPECT_EQ(terminal.path->kind, LocalPathKind::kBreak);
+    EXPECT_EQ(terminal.path->commit_length_m, 0);
+    EXPECT_EQ(terminal.path->prefix_length, 1u);
+    ASSERT_TRUE(terminal.speed_cap_mps);
+    EXPECT_EQ(*terminal.speed_cap_mps, 0);
+  }
+}
+
+TEST(LocalPlanner, ScoringBudgetKeepsCertifiedCandidate) {
+  mgg_test::LocalScene s;
+  s.map.unknown_beside_corridor = true;
+  s.map.delay_voxel_queries = true;
+  s.sensor.max_range = 20;
+  s.sensor.fov = {2 * M_PI, M_PI / 6};
+  s.sensor.resolution = {M_PI / 36, M_PI / 36};
+  s.sensor.frontier_percentage_threshold = .05;
+  s.sensor.update();
+  LocalPlanner planner(s.map, s.layer, s.cache, s.planning, s.robot, s.sensor);
+  auto in = s.inputs();
+  in.target.reset();
+  auto result = planner.plan(in, {});
+  EXPECT_EQ(result.status, LocalStatus::kMoving) << result.reason;
+  ASSERT_TRUE(result.path) << result.reason;
+  EXPECT_FALSE(result.checks_complete);
+  EXPECT_GE(pathLength(*result.path), 6);
+  EXPECT_LE(pathLength(*result.path), 10);
+  EXPECT_LT(result.cycle_ms,
+            350);  // Cooperative checks, not an Orin qualification.
+  s.map.delay_voxel_queries = false;
+  EXPECT_TRUE(planner.pathStillCertified(*result.path, 0));
+}
+
+TEST(LocalPlanner, ScoringDoesNotSwallowCancellation) {
+  mgg_test::LocalScene s;
+  s.map.interior_unknown = true;
+  s.map.delay_voxel_queries = true;
+  s.sensor.max_range = 2;
+  s.sensor.update();
+  LocalPlanner planner(s.map, s.layer, s.cache, s.planning, s.robot, s.sensor);
+  auto in = s.inputs();
+  in.target.reset();
+  bool cancelled = false;
+  PlanningCancellationScope cancellation([&] {
+    if (!cancelled && s.map.voxel_queries >= 1024) {
+      cancelled = true;
+      return true;
+    }
+    return false;
+  });
+  auto result = planner.plan(in, {});
+  EXPECT_TRUE(cancelled);
+  EXPECT_FALSE(result.path);
+  EXPECT_FALSE(result.checks_complete);
 }
