@@ -1,7 +1,9 @@
 // C4a payloads of the local planner node's native events: p0's required
 // fields are present (path_length_m null without a path), outcomes map
-// from the cycle's status, and the extras sit beside them.
+// from the cycle's status, the extras sit beside them, and a request too
+// long for one line is recorded in parts that replay reassembles exactly.
 
+#include <cmath>
 #include <initializer_list>
 #include <string>
 
@@ -112,4 +114,96 @@ TEST(LocalEvents, RequiredFields) {
 
   EXPECT_EQ(robotIdFromNamespace("/robot_3/mgg/local_planner", "n"), "robot_3");
   EXPECT_EQ(robotIdFromNamespace("/", "n"), "n");
+}
+
+namespace {
+
+LocalModeRequest longRequest(std::size_t points) {
+  LocalModeRequest request;
+  request.session_id = "s";
+  request.request_id = "r";
+  request.mode = LocalMode::kFollowRoute;
+  request.frame_id = "map";
+  request.goal = Eigen::Vector3d(120.25, -3.5, 0.5);
+  request.tolerance_m = 0.3;
+  // Digits that need full precision to round-trip.
+  for (std::size_t i = 0; i < points; ++i)
+    request.route.emplace_back(0.2 * i + 1e-9 * i, -std::sqrt(2.0) * i / 7,
+                               0.5 + 1.0 / 3.0);
+  return request;
+}
+
+}  // namespace
+
+TEST(LocalEvents, OversizedRequestRoundTrips) {
+  const auto request = longRequest(2000);
+  const auto payload =
+      localRequestPayload(request, false, StateVec(1, 2, 3, 0.5), 42.0);
+  ASSERT_GT(payload.dump().size(), kLocalRequestPartBytes);
+  const auto parts = localRequestParts(payload, kLocalRequestPartBytes);
+  ASSERT_GT(parts.size(), 1u);
+  for (std::size_t k = 0; k < parts.size(); ++k) {
+    EXPECT_LE(parts[k].dump().size(), kLocalRequestPartBytes);
+    EXPECT_EQ(parts[k]["route_part"], k);
+    EXPECT_EQ(parts[k]["route_parts"], parts.size());
+    for (const char* key :
+         {"request_id", "session_id", "continuation", "pose", "stamp"})
+      EXPECT_EQ(parts[k][key], payload[key]) << key;
+  }
+  // As replay reads them: from the logged text.
+  std::vector<nlohmann::json> logged;
+  for (const auto& part : parts)
+    logged.push_back(nlohmann::json::parse(part.dump()));
+  const auto recorded = recordedLocalRequests(logged);
+  ASSERT_EQ(recorded.size(), 1u);
+  const auto& replayed = recorded.front().request;
+  EXPECT_EQ(replayed.session_id, "s");
+  EXPECT_EQ(replayed.request_id, "r");
+  EXPECT_EQ(replayed.mode, LocalMode::kFollowRoute);
+  EXPECT_EQ(replayed.frame_id, "map");
+  EXPECT_EQ(replayed.goal, request.goal);
+  EXPECT_EQ(replayed.tolerance_m, request.tolerance_m);
+  ASSERT_EQ(replayed.route.size(), request.route.size());
+  for (std::size_t i = 0; i < request.route.size(); ++i)
+    EXPECT_EQ(replayed.route[i], request.route[i]) << i;
+  EXPECT_FALSE(recorded.front().continuation);
+  ASSERT_TRUE(recorded.front().pose);
+  EXPECT_EQ(*recorded.front().pose, StateVec(1, 2, 3, 0.5));
+
+  // A short request stays one part.
+  const auto single = localRequestParts(
+      localRequestPayload(longRequest(3), true, std::nullopt, 1.0),
+      kLocalRequestPartBytes);
+  ASSERT_EQ(single.size(), 1u);
+  EXPECT_EQ(single.front()["route_parts"], 1u);
+  EXPECT_EQ(recordedLocalRequests(single).front().request.route.size(), 3u);
+}
+
+TEST(LocalEvents, MissingPartFailsReplay) {
+  const auto parts = localRequestParts(
+      localRequestPayload(longRequest(2000), false, std::nullopt, 1.0),
+      kLocalRequestPartBytes);
+  ASSERT_GT(parts.size(), 2u);
+  auto missing = parts;
+  missing.erase(missing.begin() + 1);
+  EXPECT_THROW(recordedLocalRequests(missing), std::invalid_argument);
+  auto headless = parts;
+  headless.erase(headless.begin());
+  EXPECT_THROW(recordedLocalRequests(headless), std::invalid_argument);
+  auto repeated = parts;
+  repeated.push_back(parts.back());
+  EXPECT_THROW(recordedLocalRequests(repeated), std::invalid_argument);
+  auto disagreeing = parts;
+  disagreeing.back()["stamp"] = 2.0;
+  EXPECT_THROW(recordedLocalRequests(disagreeing), std::invalid_argument);
+  // Interleaved with another request, both reassemble.
+  auto other = localRequestPayload(longRequest(1), false, std::nullopt, 1.0);
+  other["request_id"] = "r2";
+  auto interleaved = parts;
+  interleaved.insert(interleaved.begin() + 1,
+                     localRequestParts(other, kLocalRequestPartBytes).front());
+  const auto both = recordedLocalRequests(interleaved);
+  ASSERT_EQ(both.size(), 2u);
+  EXPECT_EQ(both[0].request.route.size(), 2000u);
+  EXPECT_EQ(both[1].request.request_id, "r2");
 }

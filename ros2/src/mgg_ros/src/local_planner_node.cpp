@@ -243,8 +243,13 @@ void LocalPlannerNode::onSetMode(const SetMode::Request& request,
   response.epoch = result.epoch;
   if (!result.accepted) return;
   // Requests are service calls, not recorded topics: replay re-issues these.
-  emitEvent("local_request",
-            localRequestPayload(mode, continuation, base_, now().seconds()));
+  // Losslessly: a route too long for one log line is split into parts that
+  // share the request's identity, pose and stamp.
+  const double seconds = now().seconds();
+  for (auto& part : localRequestParts(
+           localRequestPayload(mode, continuation, base_, seconds),
+           kLocalRequestPartBytes))
+    emitEvent("local_request", std::move(part), seconds);
   runPlan();
 }
 
@@ -277,39 +282,29 @@ void LocalPlannerNode::runPlan() {
   if (core_.mode() != LocalMode::kIdle)
     emitEvent("local_plan",
               localPlanPayload(result, core_.sessionId(), core_.requestId(),
-                               status.map_revision));
+                               status.map_revision),
+              now().seconds());
   const std::string status_event = status.status + '\n' + status.reason +
                                    '\n' + status.session_id + '\n' +
                                    status.request_id;
   if (status_event != last_status_event_) {
     last_status_event_ = status_event;
-    emitEvent("local_status", localStatusPayload(status));
+    emitEvent("local_status", localStatusPayload(status), now().seconds());
   }
 }
 
 void LocalPlannerNode::emitEvent(const std::string& kind,
-                                 nlohmann::json payload) {
+                                 const nlohmann::json& payload,
+                                 double seconds) {
   // Sim time once /clock runs; before it, consumers place the wall time.
-  const double seconds = now().seconds();
   const std::optional<double> stamp =
       seconds > 0 ? std::optional<double>(seconds) : std::nullopt;
   std::string line;
   try {
     line = mgg_ros::explorationEventLine(kind, robot_id_, payload, stamp);
   } catch (const std::invalid_argument& error) {
-    // A long request route can exceed the log line budget: keep the
-    // request, say how many route points it dropped.
-    if (!payload.contains("route") || payload["route"].empty()) {
-      RCLCPP_WARN(get_logger(), "dropped %s event: %s", kind.c_str(),
-                  error.what());
-      return;
-    }
-    payload["route_omitted"] = payload["route"].size();
-    payload["route"] = nlohmann::json::array();
-    RCLCPP_WARN(get_logger(), "%s event without its %zu route points: %s",
-                kind.c_str(), payload["route_omitted"].get<std::size_t>(),
+    RCLCPP_WARN(get_logger(), "dropped %s event: %s", kind.c_str(),
                 error.what());
-    emitEvent(kind, std::move(payload));
     return;
   }
   RCLCPP_INFO(get_logger(), "%s", line.c_str());

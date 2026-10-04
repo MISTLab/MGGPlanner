@@ -76,9 +76,10 @@ class LocalPlannerNode : public rclcpp::Node {
   void publishInvalidations(bool plan_after);
   void publishGrid();
   std::optional<Eigen::Isometry3d> lookup(const std::string& frame) const;
-  /// Logs one native event; a payload p0's envelope refuses is a warning,
-  /// never a planning failure.
-  void emitEvent(const std::string& kind, nlohmann::json payload);
+  /// Logs one native event stamped `seconds` (node clock); a payload p0's
+  /// envelope refuses is a warning, never a planning failure.
+  void emitEvent(const std::string& kind, const nlohmann::json& payload,
+                 double seconds);
 
   mutable std::mutex mutex_;
   std::unique_ptr<tf2_ros::Buffer> tf_buffer_;

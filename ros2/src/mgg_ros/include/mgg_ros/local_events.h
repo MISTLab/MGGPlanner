@@ -6,13 +6,19 @@
 // Every payload carries session_id. Required fields are p0's canonical
 // names (adapters/exploration_telemetry.py); the rest are optional extras
 // that consumers must not require.
+//
+// A local_request is recorded losslessly: when its route would overflow one
+// log line, it is split into parts (localRequestParts), and replay
+// reassembles them (recordedLocalRequests), failing on a missing part.
 
 #ifndef MGG_ROS_LOCAL_EVENTS_H_
 #define MGG_ROS_LOCAL_EVENTS_H_
 
+#include <cstddef>
 #include <cstdint>
 #include <optional>
 #include <string>
+#include <vector>
 
 #include <nlohmann/json.hpp>
 
@@ -45,6 +51,35 @@ nlohmann::json localRequestPayload(const LocalModeRequest& request,
                                    bool continuation,
                                    const std::optional<StateVec>& pose,
                                    double stamp_s);
+
+/// Payload bytes per local_request part: p0's 15360-byte line budget less
+/// the envelope (kind, robot, stamps, boot, seq) with a wide margin.
+inline constexpr std::size_t kLocalRequestPartBytes = 12 * 1024;
+
+/// `payload` (from localRequestPayload) in parts whose dumps fit
+/// `max_bytes`. Every part repeats request_id, session_id, continuation,
+/// pose and stamp and carries route_part (from 0) and route_parts; part 0
+/// also carries the other extras. The parts' route slices concatenate to
+/// the route, unchanged. One part when everything fits.
+std::vector<nlohmann::json> localRequestParts(const nlohmann::json& payload,
+                                              std::size_t max_bytes);
+
+/// One accepted set_mode, as recorded.
+struct RecordedLocalRequest {
+  LocalModeRequest request;
+  bool continuation = false;
+  /// Odometry base pose at the request; nullopt before odometry.
+  std::optional<StateVec> pose;
+  double stamp = 0;
+};
+
+/// The requests of local_request payloads in exported order, each in the
+/// order of its first part, with route parts reassembled. Throws
+/// std::invalid_argument for a missing, repeated or inconsistent part, an
+/// unknown mode or a malformed field: an incomplete recording never
+/// replays.
+std::vector<RecordedLocalRequest> recordedLocalRequests(
+    const std::vector<nlohmann::json>& payloads);
 
 /// The robot of a node namespace: its first segment ("/robot_1/mgg/..."),
 /// else `fallback`.

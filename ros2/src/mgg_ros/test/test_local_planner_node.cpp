@@ -21,6 +21,7 @@
 
 #include "local_planner_scene.h"
 #include "mgg_ros/conversions.h"
+#include "mgg_ros/local_events.h"
 #include "mgg_ros/local_planner_node.h"
 
 using namespace mgg;
@@ -551,4 +552,33 @@ TEST_F(LocalPlannerNodeTest, SetModeEmitsLocalRequest) {
   ASSERT_EQ(requests.size(), 2u);
   EXPECT_EQ(requests.back()["payload"]["request_id"], "r2");
   EXPECT_TRUE(requests.back()["payload"]["continuation"].get<bool>());
+
+  // A route too long for one log line is recorded in parts, losslessly.
+  req.session_id = "s1";
+  req.request_id = "r4";
+  for (int i = 0; i < 2000; ++i) {
+    geometry_msgs::msg::Point p;
+    p.x = 0.1 + 0.003 * i + 1e-9 * i;
+    p.y = 0.1 - 1.0 / 3.0 * 1e-3 * i;
+    p.z = drivingPoint(0, 0).z();
+    req.route.push_back(p);
+  }
+  h.node->onSetMode(req, res);
+  ASSERT_TRUE(res.accepted) << res.reason;
+  requests = capture.of("local_request");
+  ASSERT_GT(requests.size(), 3u);
+  std::vector<nlohmann::json> payloads;
+  for (const auto& request : requests) {
+    payloads.push_back(request["payload"]);
+    if (request["payload"]["request_id"] == "r4")
+      EXPECT_EQ(request["stamp"], requests.back()["stamp"]);
+  }
+  const auto recorded = recordedLocalRequests(payloads);
+  ASSERT_EQ(recorded.size(), 3u);
+  const auto& route = recorded.back().request.route;
+  ASSERT_EQ(route.size(), req.route.size());
+  for (size_t i = 0; i < route.size(); ++i)
+    EXPECT_EQ(route[i], Eigen::Vector3d(req.route[i].x, req.route[i].y,
+                                        req.route[i].z))
+        << i;
 }
