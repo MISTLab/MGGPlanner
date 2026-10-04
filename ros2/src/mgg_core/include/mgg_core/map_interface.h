@@ -28,6 +28,7 @@
 #include <cmath>
 #include <cstdint>
 #include <limits>
+#include <optional>
 #include <utility>
 #include <vector>
 
@@ -86,6 +87,12 @@ class MapInterface {
 
   /// Edge length of one voxel, in metres.
   virtual double getResolution() const = 0;
+
+  /// Current finite rolling window, when the backend has one. Unbounded
+  /// backends leave this unset; consumers supply their own explicit extent.
+  virtual std::optional<Eigen::AlignedBox3d> windowBounds() const {
+    return std::nullopt;
+  }
 
   /// Centre of the uniform, axis-aligned XY cell containing `position`.
   /// Backends without this grid contract leave the query unsupported.

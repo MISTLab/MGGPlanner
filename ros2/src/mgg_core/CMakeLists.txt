@@ -38,6 +38,7 @@ add_library(${PROJECT_NAME}
   src/params.cpp
   src/geofence_manager.cpp
   src/ground_projection.cpp
+  src/ground_layer.cpp
   src/plan_profile.cpp
   src/graph_expansion.cpp
   src/grid_graph.cpp
@@ -92,6 +93,8 @@ if(BUILD_TESTING)
   target_link_libraries(test_params ${PROJECT_NAME})
   ament_add_gtest(test_geofence test/test_geofence.cpp)
   target_link_libraries(test_geofence ${PROJECT_NAME})
+  ament_add_gtest(test_ground_layer test/test_ground_layer.cpp)
+  target_link_libraries(test_ground_layer ${PROJECT_NAME})
   ament_add_gtest(test_ground_projection test/test_ground_projection.cpp)
   target_link_libraries(test_ground_projection ${PROJECT_NAME})
   ament_add_gtest(test_footprint_plane test/test_footprint_plane.cpp)

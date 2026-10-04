@@ -27,6 +27,21 @@ Eigen::AlignedBox3d probe(const Eigen::Vector3d& center) {
   return Eigen::AlignedBox3d(center - half, center + half);
 }
 
+TEST(RollingVoxelMap, BoundsThroughMapInterface) {
+  RollingWindowParams params;
+  params.window_size_m = {6, 4, 3};
+  RollingVoxelMap map(params);
+  const mgg::MapInterface& interface = map;
+  ASSERT_TRUE(interface.windowBounds());
+  EXPECT_TRUE(interface.windowBounds()->isEmpty());
+  map.reset(kRobot);
+  ASSERT_TRUE(interface.windowBounds());
+  EXPECT_TRUE(interface.windowBounds()->min().isApprox(map.window().min()));
+  EXPECT_TRUE(interface.windowBounds()->sizes().isApprox(params.window_size_m));
+  map.recenter({2.1, 0.1, 1.1});
+  EXPECT_TRUE(interface.windowBounds()->min().isApprox(map.window().min()));
+}
+
 TEST(RollingVoxelMap, RollAndForget) {
   RollingVoxelMap map(RollingWindowParams{});
   const Eigen::Vector3d wall(-6.9, 0.1, 1.1);

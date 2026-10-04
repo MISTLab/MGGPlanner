@@ -1,0 +1,337 @@
+#include "mgg_core/ground_layer.h"
+
+#include <algorithm>
+#include <cmath>
+#include <limits>
+#include <queue>
+#include <stdexcept>
+#include <utility>
+
+namespace mgg {
+namespace {
+bool refused(GroundVerdict verdict) {
+  return verdict == GroundVerdict::kRefusedStepGrade ||
+         verdict == GroundVerdict::kRefusedOverhang;
+}
+constexpr int kDirections[8][2] = {
+    {1, 0}, {1, 1}, {0, 1}, {-1, 1},
+    {-1, 0}, {-1, -1}, {0, -1}, {1, -1}};
+}  // namespace
+
+GroundLayer::GroundLayer(const MapInterface& map, const PlanningParams& planning,
+                         const RobotParams& robot, const GroundLayerParams& params)
+    : map_(map), planning_(planning), robot_params_(robot), params_(params),
+      resolution_(map.getResolution()) {
+  if (!std::isfinite(resolution_) || resolution_ <= 0 ||
+      !params_.window_size_m.allFinite() ||
+      (params_.window_size_m.array() <= 0).any())
+    throw std::invalid_argument("GroundLayer: invalid grid dimensions");
+}
+
+int GroundLayer::index(const Eigen::Vector2d& p) const {
+  if (!p.allFinite() || width_ == 0 || height_ == 0) return -1;
+  const Eigen::Vector2d ij = (p - origin_) / resolution_;
+  if ((ij.array() < 0).any() || ij.x() > width_ || ij.y() > height_) return -1;
+  const int x = std::min(width_ - 1, static_cast<int>(std::floor(ij.x())));
+  const int y = std::min(height_ - 1, static_cast<int>(std::floor(ij.y())));
+  return y * width_ + x;
+}
+
+Eigen::Vector2d GroundLayer::center(int i) const {
+  return origin_ + resolution_ * Eigen::Vector2d(i % width_ + 0.5, i / width_ + 0.5);
+}
+
+Eigen::AlignedBox3d GroundLayer::dependency(int i, double z) const {
+  const double probe = std::max(0.2, 2 * resolution_);
+  const Eigen::Vector3d size = robot_params_.getPlanningSize();
+  const double radius = std::max(2 * resolution_ + probe + resolution_,
+                                 size.head<2>().norm() / 2 + resolution_);
+  const Eigen::Vector2d p = center(i);
+  // Includes all eight native step/grade rays, their four offset probes,
+  // and the body band. The parent's rays are added before projection.
+  return Eigen::AlignedBox3d(
+      Eigen::Vector3d(p.x() - radius, p.y() - radius, z - 5.0 - resolution_),
+      Eigen::Vector3d(p.x() + radius, p.y() + radius,
+       z + std::max(probe, planning_.max_ground_height +
+                    std::abs(robot_params_.center_offset.z()) + size.z()) + resolution_));
+}
+
+void GroundLayer::reset(const Eigen::Vector3d& robot, double ground_z) {
+  place(robot, ground_z, true);
+}
+void GroundLayer::recenter(const Eigen::Vector3d& robot, double ground_z) {
+  place(robot, ground_z, false);
+}
+void GroundLayer::place(const Eigen::Vector3d& robot, double ground_z, bool clear) {
+  if (!robot.allFinite() || !std::isfinite(ground_z))
+    throw std::invalid_argument("GroundLayer: invalid anchor");
+  robot_ = robot;
+  Eigen::Vector2d origin, extent;
+  const auto bounds = map_.windowBounds();
+  if (bounds) {
+    if (bounds->isEmpty()) {
+      columns_.clear();
+      width_ = height_ = 0;
+      seed_ = -1;
+      return;
+    }
+    origin = bounds->min().head<2>();
+    extent = bounds->sizes().head<2>();
+  } else {
+    extent = params_.window_size_m;
+    const Eigen::Vector2d cells = (extent / resolution_).array().round();
+    origin = (robot.head<2>() / resolution_).array().floor().matrix() * resolution_ -
+             (cells.array() / 2).floor().matrix() * resolution_;
+  }
+  const Eigen::Vector2d counts = (extent / resolution_).array().round();
+  if (!origin.allFinite() || !counts.allFinite() || (counts.array() < 1).any() ||
+      counts.x() * counts.y() > 1000000)
+    throw std::invalid_argument("GroundLayer: invalid window bounds");
+  const int width = static_cast<int>(counts.x());
+  const int height = static_cast<int>(counts.y());
+  if (!clear && origin.isApprox(origin_, 1e-12) && width == width_ && height == height_)
+    return;
+
+  const auto old_origin = origin_;
+  const int old_width = width_, old_height = height_, old_seed = seed_;
+  auto old = std::move(columns_);
+  origin_ = origin;
+  width_ = width;
+  height_ = height;
+  columns_.assign(width_ * height_, Column{});
+  std::vector<int> remap(old.size(), -1);
+  if (!clear) {
+    for (int i = 0; i < old_width * old_height; ++i) {
+      const Eigen::Vector2d p = old_origin + resolution_ *
+          Eigen::Vector2d(i % old_width + 0.5, i / old_width + 0.5);
+      const int j = index(p);
+      if (j >= 0 && center(j).isApprox(p, 1e-9)) {
+        columns_[j] = old[i];
+        remap[i] = j;
+      }
+    }
+  }
+  seed_ = !clear && old_seed >= 0 ? remap[old_seed] : -1;
+  for (int i = 0; i < static_cast<int>(columns_.size()); ++i) {
+    auto& column = columns_[i];
+    if (column.dependency.isEmpty()) column.dependency = dependency(i, ground_z);
+    if (column.parent >= 0) {
+      column.parent = remap[column.parent];
+      if (column.parent < 0) markPending(i);
+    }
+  }
+  if (seed_ < 0) {
+    seed_ = index(robot.head<2>());
+    seed_ground_hint_ = robot.z() - planning_.max_ground_height;
+    // Losing the flood anchor invalidates the entire retained tree.
+    for (int i = 0; i < static_cast<int>(columns_.size()); ++i) markPending(i);
+    if (seed_ >= 0) columns_[seed_].parent = -1;
+  }
+  if (!clear && old_width > 0 && old_height > 0) {
+    // Recenter is itself a withdrawal boundary, even before the driver's
+    // MapChange arrives: retained columns can depend on evicted rays.
+    const Eigen::Vector2d old_max = old_origin +
+        resolution_ * Eigen::Vector2d(old_width, old_height);
+    const Eigen::Vector2d new_max = origin_ +
+        resolution_ * Eigen::Vector2d(width_, height_);
+    const Eigen::Vector2d low = old_origin.cwiseMin(origin_);
+    const Eigen::Vector2d high = old_max.cwiseMax(new_max);
+    const double infinity = std::numeric_limits<double>::infinity();
+    MapChange scroll;
+    for (int axis = 0; axis < 2; ++axis) {
+      for (int face = 0; face < 2; ++face) {
+        const double before = face == 0 ? old_origin[axis] : old_max[axis];
+        const double after = face == 0 ? origin_[axis] : new_max[axis];
+        if (std::abs(before - after) < 1e-9) continue;
+        Eigen::Vector3d slab_low(low.x(), low.y(), -infinity);
+        Eigen::Vector3d slab_high(high.x(), high.y(), infinity);
+        slab_low[axis] = std::min(before, after);
+        slab_high[axis] = std::max(before, after);
+        scroll.boxes.emplace_back(slab_low, slab_high);
+      }
+    }
+    withdraw(scroll);
+  } else {
+    withdrawDescendants();
+  }
+}
+
+void GroundLayer::markPending(int i) {
+  auto& column = columns_[i];
+  column.dirty = true;
+  if (column.verdict == GroundVerdict::kAdmitted)
+    column.verdict = GroundVerdict::kPending;
+}
+void GroundLayer::withdrawDescendants() {
+  std::vector<std::vector<int>> children(columns_.size());
+  std::queue<int> queue;
+  for (int i = 0; i < static_cast<int>(columns_.size()); ++i) {
+    if (columns_[i].parent >= 0) children[columns_[i].parent].push_back(i);
+    if (columns_[i].dirty) queue.push(i);
+  }
+  while (!queue.empty()) {
+    const int i = queue.front();
+    queue.pop();
+    for (const int child : children[i]) {
+      if (!columns_[child].dirty) {
+        markPending(child);
+        queue.push(child);
+      }
+    }
+  }
+}
+void GroundLayer::withdraw(const MapChange& change) {
+  for (int i = 0; i < static_cast<int>(columns_.size()); ++i)
+    if (changeReaches(change, columns_[i].dependency)) markPending(i);
+  withdrawDescendants();
+}
+
+void GroundLayer::recheck(std::chrono::steady_clock::time_point deadline) {
+  using Clock = std::chrono::steady_clock;
+  if (seed_ < 0 || Clock::now() >= deadline) return;
+  const auto* parent_cancelled = planning_cancelled;
+  PlanningCancellationScope budget([&] {
+    return Clock::now() >= deadline || (parent_cancelled && (*parent_cancelled)());
+  });
+  GroundProjection projection(map_, planning_);
+  using Work = std::pair<double, int>;
+  std::priority_queue<Work, std::vector<Work>, std::greater<Work>> queue;
+  std::vector<bool> queued(columns_.size(), false);
+  std::vector<int> parents(columns_.size(), -1);
+  const auto enqueue = [&](int i, int parent) {
+    if (i < 0 || queued[i] || !columns_[i].dirty) return;
+    queued[i] = true;
+    parents[i] = parent;
+    queue.emplace((center(i) - robot_.head<2>()).squaredNorm(), i);
+  };
+  const auto neighbours = [&](int i, const auto& visit) {
+    const int x = i % width_, y = i / width_;
+    for (const auto& direction : kDirections) {
+      const int nx = x + direction[0], ny = y + direction[1];
+      if (nx >= 0 && nx < width_ && ny >= 0 && ny < height_)
+        visit(ny * width_ + nx);
+    }
+  };
+  try {
+    enqueue(seed_, -1);
+    for (int i = 0; i < static_cast<int>(columns_.size()); ++i) {
+      planningCheckpoint();
+      if (!columns_[i].dirty && columns_[i].observed)
+        neighbours(i, [&](int child) { enqueue(child, i); });
+    }
+    while (!queue.empty()) {
+      planningCheckpoint();
+      const int i = queue.top().second;
+      queue.pop();
+      Column checked = columns_[i];
+      checked.parent = parents[i];
+      const double reference = checked.parent < 0
+          ? seed_ground_hint_
+          : columns_[checked.parent].ground_z;
+      checked.dependency = dependency(i, reference);
+      if (checked.parent >= 0)
+        checked.dependency.extend(dependency(checked.parent, reference));
+      const Eigen::Vector2d xy = center(i);
+      Eigen::Vector3d sample(xy.x(), xy.y(), reference);
+      if (checked.parent < 0) {
+        // Start the seed's ground rays at the physical floor hint, not up
+        // in a low ceiling. No standing-start prior may invent support.
+        sample.z() -= std::max(0.2, 2 * resolution_) - 1e-6;
+      }
+      VoxelStatus status;
+      const double below = projection.projectSample(sample, status);
+      if (status != VoxelStatus::kOccupied) {
+        checked.observed = false;
+        if (!refused(checked.verdict)) checked.verdict = GroundVerdict::kUnknown;
+        planningCheckpoint();
+        columns_[i] = checked;  // still pending: a later scan may reveal support
+        continue;
+      }
+      checked.ground_z = sample.z() - below;
+      if (checked.parent >= 0 && checked.ground_z > reference + 1e-6) {
+        // projectSample starts above the parent floor. If it hits a low
+        // ceiling, keep the nearer observed support underneath, rather
+        // than flooding onto the ceiling and calling its columns free.
+        Eigen::Vector3d lower;
+        if (projection.groundBelow({xy.x(), xy.y(), reference + 1e-6}, lower) &&
+            std::abs(lower.z() - reference) < checked.ground_z - reference)
+          checked.ground_z = lower.z();
+      }
+      checked.dependency.extend(dependency(i, checked.ground_z));
+      checked.observed = true;
+      const Eigen::Vector3d ground(xy.x(), xy.y(), checked.ground_z);
+      GroundVerdict verdict = GroundVerdict::kAdmitted;
+      if (checked.parent >= 0) {
+        const Eigen::Vector2d parent_xy = center(checked.parent);
+        const double offset = std::max(0.2, 2 * resolution_) - 1e-6;
+        // Anchor both endpoint probes on the actual observed supports. A
+        // ceiling must not replace the parent's lower floor in this check.
+        const Eigen::Vector3d start(parent_xy.x(), parent_xy.y(), reference - offset);
+        const Eigen::Vector3d end(xy.x(), xy.y(), checked.ground_z - offset);
+        if (!projection.groundStepsAdmissible(start, end))
+          verdict = GroundVerdict::kRefusedStepGrade;
+      }
+      for (const auto& direction : kDirections) {
+        // Two native cells retain the certified step-AND-grade denominator;
+        // serialization and diagonal pose spacing never substitute for it.
+        Eigen::Vector3d end = ground;
+        end.head<2>() += 2 * resolution_ *
+            Eigen::Vector2d(direction[0], direction[1]).normalized();
+        if (!projection.groundStepsAdmissible(ground, end)) {
+          verdict = GroundVerdict::kRefusedStepGrade;
+          break;
+        }
+      }
+      if (verdict == GroundVerdict::kAdmitted) {
+        const Eigen::Vector3d size = robot_params_.getPlanningSize();
+        const double low = checked.ground_z + 0.5 * resolution_ + 1e-6;
+        const double high = checked.ground_z + std::max(size.z(),
+            planning_.max_ground_height + robot_params_.center_offset.z() + size.z() / 2);
+        // The costmap carries terrain per column; Nav2 applies its own
+        // footprint. A whole horizontal chassis box here would mislabel
+        // an ordinary ramp under its uphill end as an overhang.
+        const double column_size = resolution_ - 1e-6;
+        const VoxelStatus body = map_.getBoxStatus(
+            {xy.x(), xy.y(), (low + high) / 2},
+            {column_size, column_size, std::max(0.0, high - low)}, true);
+        if (body == VoxelStatus::kOccupied) verdict = GroundVerdict::kRefusedOverhang;
+        else if (body == VoxelStatus::kUnknown) verdict = GroundVerdict::kUnknown;
+      }
+      planningCheckpoint();
+      if (verdict != GroundVerdict::kUnknown || !refused(checked.verdict))
+        checked.verdict = verdict;
+      checked.dirty = verdict == GroundVerdict::kUnknown;
+      columns_[i] = checked;
+      if (!checked.dirty) neighbours(i, [&](int child) { enqueue(child, i); });
+    }
+  } catch (const PlanningInterrupted&) {
+    if (parent_cancelled && (*parent_cancelled)()) throw;
+    // The unfinished column has never been published; its old refusal or
+    // withdrawn admission remains until a complete certification fits.
+  }
+}
+
+int GroundLayer::pendingCount() const {
+  return std::count_if(columns_.begin(), columns_.end(),
+                       [](const Column& c) { return c.dirty; });
+}
+bool GroundLayer::pending(const Eigen::AlignedBox3d& region) const {
+  MapChange change;
+  change.boxes.push_back(region);
+  return std::any_of(columns_.begin(), columns_.end(), [&](const Column& c) {
+    return c.dirty && changeReaches(change, c.dependency);
+  });
+}
+GroundVerdict GroundLayer::verdict(const Eigen::Vector2d& p) const {
+  const int i = index(p);
+  return i < 0 ? GroundVerdict::kUnknown : columns_[i].verdict;
+}
+std::vector<int8_t> GroundLayer::occupancy() const {
+  std::vector<int8_t> result;
+  result.reserve(columns_.size());
+  for (const auto& column : columns_)
+    result.push_back(refused(column.verdict) ? 100 :
+                     column.verdict == GroundVerdict::kAdmitted ? 0 : -1);
+  return result;
+}
+}  // namespace mgg

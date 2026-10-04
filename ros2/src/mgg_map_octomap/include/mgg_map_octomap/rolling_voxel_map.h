@@ -62,6 +62,9 @@ class RollingVoxelMap : public MapInterface {
   /// The closed window: a point on its max face belongs to its last voxel.
   /// Empty before the window is placed.
   Eigen::AlignedBox3d window() const;
+  std::optional<Eigen::AlignedBox3d> windowBounds() const override {
+    return window();
+  }
   std::uint64_t revision() const { return revision_; }
   VoxelKey keyOf(const Eigen::Vector3d& p) const;
   Eigen::Vector3d centerOf(const VoxelKey& key) const;
