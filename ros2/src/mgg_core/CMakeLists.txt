@@ -43,6 +43,9 @@ add_library(${PROJECT_NAME}
   src/graph_expansion.cpp
   src/grid_graph.cpp
   src/local_route.cpp
+  src/local_path.cpp
+  src/local_planner.cpp
+  src/recent_track.cpp
   src/gain.cpp
   src/trajectory.cpp
   src/path_selection.cpp
@@ -78,6 +81,13 @@ ament_export_include_directories(include)
 
 if(BUILD_TESTING)
   find_package(ament_cmake_gtest REQUIRED)
+  ament_add_gtest(test_local_path test/test_local_path.cpp)
+  target_link_libraries(test_local_path ${PROJECT_NAME})
+  ament_add_gtest(test_local_planner test/test_local_planner.cpp)
+  target_link_libraries(test_local_planner ${PROJECT_NAME})
+  ament_add_gtest(test_recent_track test/test_recent_track.cpp)
+  target_link_libraries(test_recent_track ${PROJECT_NAME})
+
   ament_add_gtest(test_map_interface test/test_map_interface.cpp)
   target_link_libraries(test_map_interface ${PROJECT_NAME})
   ament_add_gtest(test_graph test/test_graph.cpp)
