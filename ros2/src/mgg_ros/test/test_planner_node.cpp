@@ -372,6 +372,47 @@ class MolaFloorProduct {
 
 class PlannerNodeTestPeer {
  public:
+  static void guidanceExploreCycle(PlannerNode& node) {
+    if (node.guidance_.mode().session_id.empty()) {
+      mgg_msgs::srv::SetLocalPlannerMode::Request request;
+      request.session_id = "explore-session";
+      request.request_id = "explore-request";
+      request.mode = request.EXPLORE;
+      ASSERT_TRUE(node.guidance_.setMode(request));
+    }
+    node.guidanceTick();
+    EXPECT_TRUE(node.best_path_.empty());
+    EXPECT_FALSE(node.departure_sent_now_);
+  }
+  static void guidanceMode(PlannerNode& node, const std::string& session) {
+    mgg_msgs::srv::SetLocalPlannerMode::Request request;
+    request.session_id = session;
+    request.request_id = "request";
+    request.mode = request.EXPLORE;
+    ASSERT_TRUE(node.guidance_.setMode(request));
+    mgg::FrontierCluster cluster;
+    cluster.id = 42;
+    cluster.gain = 10000;
+    node.guidance_target_ = cluster;
+    node.guidance_.message(std::vector<geometry_msgs::msg::Point>(2), false,
+                           "world", "target");
+  }
+  static bool guidanceStatus(PlannerNode& node, const std::string& session) {
+    auto status = std::make_shared<mgg_msgs::msg::LocalPlannerStatus>();
+    status->session_id = session;
+    status->request_id = "request";
+    status->status = status->BLOCKED;
+    node.onLocalPlannerStatus(status);
+    return node.tour_set_aside_.count(42) != 0;
+  }
+  static void guidanceStartChecks(PlannerNode& node, bool guidance) {
+    std::vector<mgg::StateVec> route{{3, 0, .35, M_PI}, {1, 0, .35, M_PI}};
+    mgg::PathType points;
+    for (const auto& pose : route) points.push_back(pose.head<3>());
+    EXPECT_EQ(node.routeStartsWithTurnWithoutRoom(points), !guidance);
+    EXPECT_EQ(node.startPathAfterChassisSpin(route, false), guidance);
+    if (guidance) EXPECT_DOUBLE_EQ(route.front().x(), 3.0);
+  }
   static void addCriticalGroups(PlannerNode& node, rclcpp::Executor& executor) {
     EXPECT_FALSE(node.input_callback_group_->automatically_add_to_executor_with_node());
     if (node.snapshot_callback_group_)
@@ -2302,6 +2343,164 @@ class PlannerNodeTest : public ::testing::Test {
   static void SetUpTestSuite() { rclcpp::init(0, nullptr); }
   static void TearDownTestSuite() { rclcpp::shutdown(); }
 };
+
+TEST_F(PlannerNodeTest, ArchitectureParameter) {
+  auto node = makeNode("architecture_default");
+  EXPECT_EQ(node->get_parameter("exploration_architecture").as_string(), "legacy");
+  EXPECT_THROW(makeNode("architecture_invalid", "world",
+      {rclcpp::Parameter("exploration_architecture", "v3")}), std::invalid_argument);
+  auto aerial = makeNode("architecture_aerial", "world",
+      {rclcpp::Parameter("exploration_architecture", "v2"),
+       rclcpp::Parameter("RobotParams.type", "kAerialRobot")});
+  EXPECT_EQ(aerial->get_parameter("exploration_architecture").as_string(), "legacy");
+}
+
+std::shared_ptr<mgg_msgs::srv::PlanObjective::Response> narrowGuidanceObjective(
+    bool guidance, bool no_go = false, bool wall = false) {
+  auto node = makeNode(guidance ? "v2_narrow" : "legacy_narrow", "world",
+      {rclcpp::Parameter("exploration_architecture", guidance ? "v2" : "legacy")});
+  std::vector<std::array<double, 4>> walls{
+      {-2, 7, .6, .8}, {-2, 7, -.8, -.6}};
+  if (wall) walls.push_back({1.8, 2.2, -.6, .6});
+  MolaFloorProduct floor(-3, 8, -2, 2, walls);
+  PlannerNodeTestPeer::useMolaMap(*node, floor.serve());
+  PlannerNodeTestPeer::serveMap(*node, "component:test", 1);
+  PlannerNodeTestPeer::setRobotFootprint(*node, 1.023, .778);
+  PlannerNodeTestPeer::offset(*node, {-.2, 0, 0});
+  PlannerNodeTestPeer::acceptOdometryFacing(*node, 3, 0, 0, 1);
+  EXPECT_FALSE(PlannerNodeTestPeer::roomToTurnObserved(*node,
+      PlannerNodeTestPeer::drivingState(*node, 3, 0, 0)));
+  PlannerNodeTestPeer::guidanceStartChecks(*node, guidance);
+  if (no_go) PlannerNodeTestPeer::receiveNoGoZones(*node, "world", {{2, 0}});
+  auto request = std::make_shared<mgg_msgs::srv::PlanObjective::Request>();
+  request->objective = request->NAVIGATE;
+  request->component_id = "component:test";
+  request->map_epoch = 1;
+  request->goal.position.x = 1;
+  request->goal.orientation.w = 1;
+  auto response = std::make_shared<mgg_msgs::srv::PlanObjective::Response>();
+  PlannerNodeTestPeer::objective(*node, request, response);
+  return response;
+}
+
+TEST_F(PlannerNodeTest, V2OffsetNarrowStartIsGuidance) {
+  const auto response = narrowGuidanceObjective(true);
+  EXPECT_EQ(response->status, response->SUCCEEDED) << response->reason;
+  EXPECT_FALSE(response->path.empty());
+}
+
+TEST_F(PlannerNodeTest, LegacyStillRequiresSafeSpin) {
+  const auto response = narrowGuidanceObjective(false);
+  EXPECT_NE(response->status, response->SUCCEEDED);
+}
+
+TEST_F(PlannerNodeTest, V2OffsetGuidanceKeepsBodyAndNoGoChecks) {
+  for (bool wall : {false, true}) {
+    const auto response = narrowGuidanceObjective(true, !wall, wall);
+    EXPECT_NE(response->status, response->SUCCEEDED);
+    EXPECT_TRUE(response->path.empty());
+  }
+}
+
+TEST_F(PlannerNodeTest, V2OffsetGuidanceWire) {
+  using namespace std::chrono_literals;
+  auto node = makeNode("guidance_wire", "world",
+      {rclcpp::Parameter("exploration_architecture", "v2")});
+  PlannerNodeTestPeer::observeFloor(*node, -2, 7, -2, 2);
+  for (int x = 0; x <= 4; ++x)
+    PlannerNodeTestPeer::acceptOdometry(*node, x, 0, x + 1);
+  auto caller = std::make_shared<rclcpp::Node>("guidance_caller");
+  auto client = caller->create_client<mgg_msgs::srv::SetLocalPlannerMode>("guidance/set_mode");
+  ASSERT_TRUE(client->wait_for_service(2s));
+  std::vector<mgg_msgs::msg::GlobalGuidance> messages;
+  auto subscription = caller->create_subscription<mgg_msgs::msg::GlobalGuidance>(
+      "global_guidance", rclcpp::QoS(1).reliable().transient_local(),
+      [&](mgg_msgs::msg::GlobalGuidance::ConstSharedPtr msg) { messages.push_back(*msg); });
+  rclcpp::executors::SingleThreadedExecutor executor;
+  executor.add_node(node);
+  executor.add_node(caller);
+  auto mode = std::make_shared<mgg_msgs::srv::SetLocalPlannerMode::Request>();
+  mode->mode = mode->FOLLOW_ROUTE;
+  mode->session_id = "wire-session";
+  mode->request_id = "wire-request";
+  mode->frame_id = "world";
+  mode->goal.x = 1;
+  auto future = client->async_send_request(mode);
+  ASSERT_EQ(executor.spin_until_future_complete(future, 2s), rclcpp::FutureReturnCode::SUCCESS);
+  ASSERT_TRUE(future.get()->accepted);
+  const auto drain = [&] {
+    const auto until = std::chrono::steady_clock::now() + 500ms;
+    while (messages.empty() && std::chrono::steady_clock::now() < until) {
+      executor.spin_some();
+      std::this_thread::sleep_for(1ms);
+    }
+  };
+  drain();
+  ASSERT_FALSE(messages.empty());
+  EXPECT_EQ(messages.back().kind, messages.back().TARGET);
+  EXPECT_EQ(messages.back().session_id, mode->session_id);
+  EXPECT_EQ(messages.back().header.frame_id, "world");
+  ASSERT_FALSE(messages.back().route.empty());
+  EXPECT_NEAR(messages.back().target.x, 1, .001);
+  messages.clear();
+  mode->mode = mode->IDLE;
+  mode->request_id = "stop-request";
+  future = client->async_send_request(mode);
+  ASSERT_EQ(executor.spin_until_future_complete(future, 2s), rclcpp::FutureReturnCode::SUCCESS);
+  EXPECT_TRUE(future.get()->accepted);
+  drain();
+  ASSERT_FALSE(messages.empty());
+  EXPECT_EQ(messages.back().kind, messages.back().NONE);
+  EXPECT_TRUE(messages.back().route.empty());
+}
+
+TEST_F(PlannerNodeTest, V2OffsetGuidanceDiscoversFromVisitedStart) {
+  using namespace std::chrono_literals;
+  auto node = makeNode("guidance_bootstrap", "world",
+      {rclcpp::Parameter("exploration_architecture", "v2"),
+       rclcpp::Parameter("fleet.enabled", false)});
+  PlannerNodeTestPeer::setTour(*node, true, 1);
+  PlannerNodeTestPeer::observeFloor(*node, -1, 4, -1.5, 1.5);
+  PlannerNodeTestPeer::acceptOdometry(*node, 0, 0, 1);
+  ASSERT_EQ(PlannerNodeTestPeer::globalVertices(*node), 1);
+  auto listener = std::make_shared<rclcpp::Node>("guidance_bootstrap_listener");
+  bool target = false;
+  int execution_messages = 0;
+  auto guidance = listener->create_subscription<mgg_msgs::msg::GlobalGuidance>(
+      "global_guidance", rclcpp::QoS(1).reliable().transient_local(),
+      [&](mgg_msgs::msg::GlobalGuidance::ConstSharedPtr msg) {
+        if (msg->kind == msg->TARGET) {
+          target = true;
+          EXPECT_EQ(msg->session_id, "explore-session");
+          EXPECT_FALSE(msg->route.empty());
+        }
+      });
+  auto command = listener->create_subscription<nav_msgs::msg::Path>(
+      "command_path", 10, [&](nav_msgs::msg::Path::ConstSharedPtr) { ++execution_messages; });
+  auto best = listener->create_subscription<nav_msgs::msg::Path>(
+      "best_path", rclcpp::QoS(1).transient_local(),
+      [&](nav_msgs::msg::Path::ConstSharedPtr) { ++execution_messages; });
+  for (int cycle = 0; cycle < 3 && !target; ++cycle) {
+    PlannerNodeTestPeer::guidanceExploreCycle(*node);
+    const auto until = std::chrono::steady_clock::now() + 100ms;
+    while (std::chrono::steady_clock::now() < until) {
+      rclcpp::spin_some(listener);
+      std::this_thread::sleep_for(1ms);
+    }
+  }
+  EXPECT_TRUE(target) << "visited-only start must discover a guidance target within 3 cycles";
+  EXPECT_NE(PlannerNodeTestPeer::tourTarget(*node), mgg::kNoCluster);
+  EXPECT_EQ(execution_messages, 0);
+}
+
+TEST_F(PlannerNodeTest, StaleStatusCannotBlockTarget) {
+  auto node = makeNode("guidance_status", "world",
+      {rclcpp::Parameter("exploration_architecture", "v2")});
+  PlannerNodeTestPeer::guidanceMode(*node, "new-session");
+  EXPECT_FALSE(PlannerNodeTestPeer::guidanceStatus(*node, "old-session"));
+  EXPECT_TRUE(PlannerNodeTestPeer::guidanceStatus(*node, "new-session"));
+  EXPECT_GT(PlannerNodeTestPeer::tourAsideRetry(*node, 42), 0);
+}
 
 TEST_F(PlannerNodeTest, CriticalInputsSurviveAllPlannerExecutorThreadsBlocked) {
   using namespace std::chrono_literals;

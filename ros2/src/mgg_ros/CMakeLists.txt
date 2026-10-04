@@ -43,6 +43,8 @@ add_library(${PROJECT_NAME}
   src/param_loader.cpp
   src/conversions.cpp
   src/fleet_conversions.cpp
+  src/global_guidance.cpp
+  src/planner_guidance.cpp
   src/keyframe_trajectory.cpp
   src/local_path_conversions.cpp
   src/local_planner_node.cpp
@@ -85,6 +87,9 @@ ament_export_include_directories(include)
 
 if(BUILD_TESTING)
   find_package(ament_cmake_gtest REQUIRED)
+  ament_add_gtest(test_global_guidance test/test_global_guidance.cpp)
+  target_link_libraries(test_global_guidance ${PROJECT_NAME})
+  ament_target_dependencies(test_global_guidance mgg_msgs)
   ament_add_gtest(test_param_loader test/test_param_loader.cpp)
   target_link_libraries(test_param_loader ${PROJECT_NAME})
   ament_target_dependencies(test_param_loader rclcpp mgg_msgs)

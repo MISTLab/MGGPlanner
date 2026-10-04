@@ -283,6 +283,15 @@ PlannerNode::PlannerNode(const rclcpp::NodeOptions& options)
               static_cast<unsigned long long>(planner_config_state_.incarnation));
 
   loadParameters();
+  exploration_architecture_ = declareOrGet<std::string>(
+      this, "exploration_architecture", "legacy");
+  if (exploration_architecture_ != "legacy" && exploration_architecture_ != "v2") {
+    throw std::invalid_argument("exploration_architecture must be legacy or v2");
+  }
+  if (robot_params_.type == mgg::RobotType::kAerialRobot) {
+    exploration_architecture_ = "legacy";
+    set_parameter(rclcpp::Parameter("exploration_architecture", "legacy"));
+  }
 
   // The map: an octree built from point clouds, or the MOLA product a
   // mapping process publishes, placed in the planning frame by the
@@ -901,6 +910,8 @@ PlannerNode::PlannerNode(const rclcpp::NodeOptions& options)
   global_graph_update_timer_ = create_timer(
       std::chrono::duration<double>(mgg::kGlobalGraphUpdateTimerPeriod),
       [this]() { expandGlobalGraphTimerCallback(); }, callback_group_);
+
+  if (objectiveRouteIsGuidance()) setupGuidance();
 
   // The one way that choice bites: use_sim_time true with nothing publishing
   // /clock leaves ROS time pinned at zero, so the timer never fires and the
@@ -4380,6 +4391,15 @@ std::string PlannerNode::buildLocalGraph() {
   // The graph's frontiers are worth keeping whether or not a path is chosen.
   add_frontiers_to_global_graph_ = local_graph_->getNumVertices() > 1;
 
+  // Temporary v2 discovery only: never select an executable lattice path
+  // or enter the legacy spin/departure logic below.
+  if (objectiveRouteIsGuidance()) {
+    addFrontiers();
+    add_frontiers_to_global_graph_ = false;
+    guidance_discovery_complete_ = !r.hit_limit && local_graph_->getNumVertices() > 1;
+    return "guidance frontier discovery";
+  }
+
   // The aerial tour must see this lattice's frontiers now, not a plan later
   // after it has already committed to a lifted target behind the fleet.
   if (robot_params_.type == mgg::RobotType::kAerialRobot && add_frontiers_to_global_graph_) {
@@ -5283,6 +5303,7 @@ bool PlannerNode::routeOverLocalLattice(const mgg::StateVec& goal,
 
 bool PlannerNode::startPathAfterChassisSpin(std::vector<mgg::StateVec>& path,
                                              bool lattice_route) {
+  if (objectiveRouteIsGuidance()) return true;
   if (robot_params_.type != mgg::RobotType::kGroundRobot || path.size() < 2 ||
       robot_params_.physicalOffsetForHeading(0).head<2>().norm() < 1e-9) return true;
   const auto refused = [&](const char* check, const mgg::StateVec& from,
@@ -5357,6 +5378,7 @@ bool PlannerNode::startPathAfterChassisSpin(std::vector<mgg::StateVec>& path,
 
 bool PlannerNode::routeStartsWithTurnWithoutRoom(
     const std::vector<Eigen::Vector3d>& points) {
+  if (objectiveRouteIsGuidance()) return false;
   if (robot_params_.type != mgg::RobotType::kGroundRobot || points.size() < 2) {
     return false;
   }
@@ -7342,6 +7364,7 @@ void PlannerNode::onObjectiveRequestImpl(
     // Keep the remaining escape; never command an in-place turn.
   };
   const auto retain_exit = [&](bool needs_stored_exit) {
+    if (objectiveRouteIsGuidance()) return;
     if (needs_stored_exit) {
       const std::string refusal = retainReverseExit(route, false);
       if (!refusal.empty()) {

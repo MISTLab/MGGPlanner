@@ -22,6 +22,7 @@
 #define MGG_ROS_PLANNER_NODE_H_
 
 #include "mgg_ros/no_path_streak.h"
+#include "mgg_ros/global_guidance.h"
 
 #include <array>
 #include <atomic>
@@ -123,6 +124,19 @@ class PlannerNode : public rclcpp::Node {
   static constexpr int kRoadmapRebuildTriggers = 3;
 
  private:
+  void setupGuidance();
+  void guidanceTick();
+  bool objectiveRouteIsGuidance() const;
+  void onLocalPlannerStatus(mgg_msgs::msg::LocalPlannerStatus::ConstSharedPtr msg);
+  std::string exploration_architecture_ = "legacy";
+  mgg::GlobalGuidance guidance_;
+  std::optional<mgg::FrontierCluster> guidance_target_;
+  bool guidance_discovery_complete_ = false;
+  rclcpp::Publisher<mgg_msgs::msg::GlobalGuidance>::SharedPtr guidance_pub_;
+  rclcpp::Subscription<mgg_msgs::msg::LocalPlannerStatus>::SharedPtr local_status_sub_;
+  rclcpp::Service<mgg_msgs::srv::SetLocalPlannerMode>::SharedPtr guidance_mode_service_;
+  rclcpp::TimerBase::SharedPtr guidance_timer_;
+
   void loadParameters();
   void applyLatestOdometry();
   void applyLatestOdometryImpl();
