@@ -11,10 +11,6 @@ namespace {
 
 using Clock = std::chrono::steady_clock;
 
-/// Published paths kept for re-certification. The executor drives the
-/// newest it accepted; feedback prunes everything older than that.
-constexpr size_t kMaxRetained = 8;
-
 Clock::time_point after(double seconds) {
   return Clock::now() + std::chrono::duration_cast<Clock::duration>(
                             std::chrono::duration<double>(seconds));
@@ -396,9 +392,11 @@ LocalPlanResult LocalPlanningCore::plan(Clock::time_point deadline) {
     executing_sequence_ = sequence;
     progress_ = 0;
     while (retained_.size() > kMaxRetained) {
-      // Never stop re-certifying a path the executor may still drive
-      // without telling it.
-      invalidate(retained_.begin()->first, "retention limit");
+      // Retirement is bookkeeping, not a map event. Only fence a path
+      // still being driven; invalidating retired ancestors would otherwise
+      // propagate through the adapter's splice lineage and stop new paths.
+      if (retained_.begin()->first == executing_sequence_)
+        invalidate(retained_.begin()->first, "retention limit");
       retained_.erase(retained_.begin());
     }
   }

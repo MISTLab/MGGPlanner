@@ -286,3 +286,35 @@ TEST(LocalPlanningCore, PendingDescendantsWithdrawRetainedPath) {
   ASSERT_EQ(invalidations.size(), 1u);
   EXPECT_EQ(invalidations[0].sequence_id, path.path->sequence_id);
 }
+
+TEST(LocalPlanningCore, RetentionDoesNotInvalidateExtensionChain) {
+  mgg_test::Corridor corridor;
+  const StateVec base = basePose(0.1, 0.1);
+  LocalPlanningCore core(mgg_test::sceneParams());
+  observe(core, corridor, base);
+  ASSERT_TRUE(
+      core.setMode(follow("s1", "r1", drivingPoint(6.1, 0.1))).accepted);
+  const auto revision = core.map().revision();
+  // No feedback prunes the chain early: cross the retention boundary twice.
+  const std::uint64_t last_sequence = kMaxRetained + 2;
+  for (std::uint64_t sequence = 1; sequence <= last_sequence; ++sequence) {
+    const auto result = core.plan(soon());
+    ASSERT_TRUE(result.path) << result.reason;
+    EXPECT_EQ(result.path->sequence_id, sequence);
+    EXPECT_EQ(result.path->kind, sequence == 1 ? LocalPathKind::kStart
+                                              : LocalPathKind::kExtend);
+    EXPECT_EQ(result.path->extends_sequence_id, sequence - 1);
+    EXPECT_EQ(core.map().revision(), revision);
+    EXPECT_TRUE(core.takeInvalidations().empty()) << "sequence " << sequence;
+  }
+  // Retirement really bounds the retained set, without disabling genuine
+  // withdrawals of its remaining paths (including non-executing ancestors).
+  NoGoZones zones;
+  zones.set({Eigen::Vector2d(3.1, 0.1)}, 0.8);
+  core.setNoGoZones(zones);
+  const auto invalidations = core.takeInvalidations();
+  ASSERT_EQ(invalidations.size(), kMaxRetained);
+  EXPECT_EQ(invalidations.front().sequence_id,
+            last_sequence - kMaxRetained + 1);
+  EXPECT_EQ(invalidations.back().sequence_id, last_sequence);
+}

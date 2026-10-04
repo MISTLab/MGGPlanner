@@ -15,6 +15,7 @@
 #define MGG_ROS_LOCAL_PLANNING_CORE_H_
 
 #include <chrono>
+#include <cstddef>
 #include <cstdint>
 #include <functional>
 #include <map>
@@ -30,6 +31,10 @@
 #include "mgg_map_octomap/rolling_voxel_map.h"
 
 namespace mgg {
+
+/// Published paths kept for re-certification. Paired with the adapter's
+/// local_path.py RETAINED_PATHS ancestor-invalidation window.
+inline constexpr std::size_t kMaxRetained = 8;
 
 /// One scan in the odometry frame: its returns and the sensor's origin, both
 /// from TF at the scan stamp.
@@ -143,9 +148,9 @@ class LocalPlanningCore {
   /// sequence id and the session; the core then treats it as executing
   /// until feedback names another path.
   LocalPlanResult plan(std::chrono::steady_clock::time_point deadline);
-  /// Invalidations produced since the last call: retained paths a map
-  /// change, a reset or retention pruning withdrew. Plan immediately after a
-  /// non-empty result.
+  /// Invalidations produced since the last call: paths withdrawn by map
+  /// changes or resets, or an executing path evicted by retention pruning.
+  /// Retiring other paths is silent. Plan immediately after a non-empty result.
   std::vector<LocalInvalidation> takeInvalidations();
 
   const LocalPlanningParams& params() const { return params_; }
