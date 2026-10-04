@@ -8,22 +8,30 @@
 //                          [--map-product DIR] [--legacy-config FILE]
 //
 // The manifest (v1) must verify: every input relative to its directory,
-// inside it, a regular file with its recorded SHA-256. Each `local_request`
-// event of the manifest's robot in events.jsonl, in its recorded line order
-// (never re-sorted), plans one exploration lattice at its `pose`
-// {x, y, z, yaw} through nav_bench::run. A new `session_id` invalidates the
-// whole window first. The map is a MOLA planning product, the manifest's
-// `map_product` inputs (files under `<root>/mola/`) or `--map-product DIR`;
-// the parameters are Botman's overlaid by the manifest's `config.legacy` or
-// `--legacy-config FILE` (legacyParams()). Giving one both ways is an error,
-// and so is missing either: nothing is replayed then.
+// inside it with no symlink on the way, a regular file with its recorded
+// SHA-256. Each `local_request` event of the manifest's robot in
+// events.jsonl, in its recorded line order (never re-sorted), plans one
+// exploration lattice at its `pose` {x, y, z, yaw} through nav_bench::run.
+// Every lattice is planned from scratch on the map, so nothing outlives a
+// session or a map change.
 //
-// The output holds one C5 cycle record per request and the summary line.
-// `duration_ms` is the plan's own time (Outcome::total_ms); manifest
-// verification, event parsing and the product load are `load_ms`.
+// The map is a MOLA planning product: the manifest's `map_product` inputs,
+// which must include every file the product load reads (mola/source.json,
+// mola/index.json and each planner grid the index names) and are hashed
+// again after the load, or `--map-product DIR`, outside the manifest's
+// hashes. The parameters are Botman's overlaid by the manifest's
+// `config.legacy` or `--legacy-config FILE` (legacyParams()). Giving one
+// both ways is an error, and so is missing either: nothing is replayed then.
+//
+// The output holds one C5 cycle record per request and the summary line,
+// written only when every request was planned: a request that throws fails
+// the run instead of recording a timing it does not have. `duration_ms` is
+// the plan's own time (Outcome::total_ms); manifest verification, event
+// parsing and the product load are `load_ms`.
 
 #include <openssl/evp.h>
 
+#include <algorithm>
 #include <array>
 #include <chrono>
 #include <cstdint>
@@ -36,7 +44,6 @@
 #include <map>
 #include <optional>
 #include <ostream>
-#include <set>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -96,6 +103,8 @@ struct Bundle {
   std::string robot_type;
   std::vector<Request> requests;  ///< recorded order
   fs::path map_product;           ///< peer root; empty without map_product inputs
+  /// The map_product inputs: path relative to the peer root -> SHA-256.
+  std::map<std::string, std::string> map_product_files;
   std::optional<json> legacy_config;  ///< the manifest's config.legacy
 };
 
@@ -165,7 +174,20 @@ inline Bundle loadBundle(const fs::path& manifest) {
                      name.find('\\') != std::string::npos;
       for (const auto& part : relative) escapes = escapes || part == "..";
       if (escapes) return fail("input path escapes the bundle: " + name);
+      fs::path prefix = root;
+      for (const auto& part : relative) {
+        prefix /= part;
+        if (fs::is_symlink(fs::symlink_status(prefix))) {
+          return fail("input path escapes the bundle through a symlink: " + name);
+        }
+      }
       const fs::path file = root / relative;
+      const fs::path canonical_root = fs::weakly_canonical(root);
+      const fs::path canonical = fs::weakly_canonical(file);
+      if (std::mismatch(canonical_root.begin(), canonical_root.end(), canonical.begin(),
+                        canonical.end()).first != canonical_root.end()) {
+        return fail("input path escapes the bundle: " + name);
+      }
       const auto status = fs::symlink_status(file);
       if (!fs::is_regular_file(status)) return fail("input is not a regular file: " + name);
       std::string bytes;
@@ -192,6 +214,10 @@ inline Bundle loadBundle(const fs::path& manifest) {
           return fail("map_product inputs name more than one peer root");
         }
         bundle.map_product = root / peer_root;
+        const fs::path in_product =
+            peer_root.empty() ? relative : relative.lexically_relative(peer_root);
+        bundle.map_product_files[in_product.lexically_normal().generic_string()] =
+            input.at("sha256").get<std::string>();
       } else if (kind != "bag") {
         return fail("unknown input kind " + kind);
       }
@@ -226,6 +252,52 @@ inline Bundle loadBundle(const fs::path& manifest) {
   }
   bundle.accepted = true;
   return bundle;
+}
+
+/// The product files a load of `bundle.map_product` reads: mola/source.json,
+/// mola/index.json and every planner grid the index names. Empty with
+/// `error` naming the first that is not a verified map_product input.
+inline std::vector<std::string> productInputs(const Bundle& bundle, std::string& error) {
+  std::vector<std::string> required{"mola/source.json", "mola/index.json"};
+  for (const std::string& name : required) {
+    if (!bundle.map_product_files.count(name)) {
+      error = "map_product input missing from the manifest: " + name;
+      return {};
+    }
+  }
+  try {
+    std::string text;
+    if (!readFile(bundle.map_product / "mola" / "index.json", text)) {
+      throw std::runtime_error("unreadable");
+    }
+    const json index = json::parse(text);
+    for (const json& artifact : index.at("artifacts")) {
+      if (!artifact.contains("planner")) continue;
+      required.push_back("mola/" + artifact.at("planner").at("path").get<std::string>());
+    }
+  } catch (const std::exception& e) {
+    error = std::string("map_product mola/index.json names no planner grids: ") + e.what();
+    return {};
+  }
+  for (const std::string& name : required) {
+    if (!bundle.map_product_files.count(fs::path(name).lexically_normal().generic_string())) {
+      error = "map_product input missing from the manifest: " + name;
+      return {};
+    }
+  }
+  return required;
+}
+
+/// True when every map_product input still has its recorded SHA-256.
+inline bool productUnchanged(const Bundle& bundle, std::string& error) {
+  for (const auto& [name, digest] : bundle.map_product_files) {
+    std::string bytes;
+    if (!readFile(bundle.map_product / name, bytes) || sha256Hex(bytes) != digest) {
+      error = "map_product input changed during the load: " + name;
+      return false;
+    }
+  }
+  return true;
 }
 
 /// Botman's parameters and the benchmark's product loading, overlaid by the
@@ -331,53 +403,33 @@ inline bool legacyParams(const json& legacy, nav_bench::RecordedParams& params,
 struct Cycle {
   std::string status;
   double duration_ms = 0.0;
+  /// The lattice's edges (nav_bench::latticeEdgeKeys) and their SHA-256.
+  std::vector<std::string> edge_keys;
   std::string output_digest;
-  /// Edges of this lattice validated earlier in the same window (session).
-  std::size_t reused_edges = 0;
 };
 
-/// The legacy lattice over requests in recorded order. Its window is the
-/// lattice edges validated in the current session; a new session
-/// invalidates the whole window before planning.
-class LegacyReplay {
- public:
-  LegacyReplay(const MapInterface& map, nav_bench::RecordedParams params)
-      : map_(map), params_(std::move(params)) {
-    params_.collect_lattice_edges = true;
-  }
-
-  Cycle step(const Request& request) {
-    if (request.session_id != session_) {
-      window_edges_.clear();
-      session_ = request.session_id;
-    }
-    nav_bench::Scenario scenario;
-    scenario.name = "replay_" + request.request_id;
-    scenario.navigate = false;
-    scenario.start = request.pose;
-    const nav_bench::Outcome out = nav_bench::run(map_, scenario, params_);
-    Cycle cycle;
-    cycle.duration_ms = out.total_ms;
-    cycle.status = !out.reason.empty()        ? "interrupted"
-                   : out.lattice.hit_deadline ? "deadline"
-                   : out.routed               ? "lattice"
-                                              : "no_lattice";
-    std::string keys;
-    for (const std::string& key : out.lattice_edge_keys) {
-      keys += key + "\n";
-      cycle.reused_edges += window_edges_.count(key);
-    }
-    window_edges_.insert(out.lattice_edge_keys.begin(), out.lattice_edge_keys.end());
-    cycle.output_digest = sha256Hex(keys);
-    return cycle;
-  }
-
- private:
-  const MapInterface& map_;
-  nav_bench::RecordedParams params_;
-  std::string session_;
-  std::set<std::string> window_edges_;
-};
+/// The legacy exploration lattice of `request` on `map`, planned from
+/// scratch as the planner node does for every exploration request.
+inline Cycle replayRequest(const MapInterface& map, nav_bench::RecordedParams params,
+                           const Request& request) {
+  params.collect_lattice_edges = true;
+  nav_bench::Scenario scenario;
+  scenario.name = "replay_" + request.request_id;
+  scenario.navigate = false;
+  scenario.start = request.pose;
+  const nav_bench::Outcome out = nav_bench::run(map, scenario, params);
+  Cycle cycle;
+  cycle.duration_ms = out.total_ms;
+  cycle.status = !out.reason.empty()        ? "interrupted"
+                 : out.lattice.hit_deadline ? "deadline"
+                 : out.routed               ? "lattice"
+                                            : "no_lattice";
+  cycle.edge_keys = out.lattice_edge_keys;
+  std::string keys;
+  for (const std::string& key : cycle.edge_keys) keys += key + "\n";
+  cycle.output_digest = sha256Hex(keys);
+  return cycle;
+}
 
 /// The C5 cycle record of `cycle`.
 inline json cycleRecord(const Request& request, const Cycle& cycle,
@@ -424,6 +476,11 @@ inline int runMain(const std::vector<std::string>& args, std::ostream& err) {
     return 1;
   }
   fs::path product = bundle.map_product;
+  std::string error;
+  if (!product.empty() && productInputs(bundle, error).empty()) {
+    err << "mgg_exploration_replay: " << error << "\n";
+    return 1;
+  }
   if (options.count("--map-product")) {
     if (!product.empty()) {
       err << "mgg_exploration_replay: the manifest has map_product inputs; "
@@ -466,7 +523,6 @@ inline int runMain(const std::vector<std::string>& args, std::ostream& err) {
   }
   nav_bench::RecordedParams params;
   MolaMapConfig map_config = nav_bench::benchProductConfig();
-  std::string error;
   if (!legacyParams(*legacy, params, map_config, error)) {
     err << "mgg_exploration_replay: " << source << ": " << error << "\n";
     return 1;
@@ -487,6 +543,10 @@ inline int runMain(const std::vector<std::string>& args, std::ostream& err) {
         << ": " << error << "\n";
     return 1;
   }
+  if (!bundle.map_product.empty() && !productUnchanged(bundle, error)) {
+    err << "mgg_exploration_replay: " << error << "\n";
+    return 1;
+  }
   const auto lease = map->acquireReadLease();
   std::uint64_t revision = 0;
   try {
@@ -503,32 +563,25 @@ inline int runMain(const std::vector<std::string>& args, std::ostream& err) {
   const double load_ms =
       std::chrono::duration<double, std::milli>(Clock::now() - started).count();
 
-  std::ofstream out(options["--output"], std::ios::trunc);
-  if (!out) {
-    err << "mgg_exploration_replay: cannot write " << options["--output"] << "\n";
-    return 1;
-  }
-  LegacyReplay replay(*map, params);
-  std::size_t cycles = 0, failures = 0;
+  std::vector<std::string> lines;
   for (const Request& request : bundle.requests) {
     Cycle cycle;
     try {
-      cycle = replay.step(request);
+      cycle = replayRequest(*map, params, request);
     } catch (const std::exception& e) {
-      cycle = Cycle{};
-      cycle.status = std::string("error: ") + e.what();
-      ++failures;
+      err << "mgg_exploration_replay: request " << request.request_id
+          << " (events.jsonl line " << request.input_seq + 1
+          << ") was not measured: " << e.what() << "\n";
+      return 1;
     }
-    json record = cycleRecord(request, cycle, revision);
-    if (cycle.output_digest.empty()) record["output_digest"] = nullptr;
-    out << record.dump() << "\n";
-    ++cycles;
+    lines.push_back(cycleRecord(request, cycle, revision).dump());
   }
-  out << json({{"summary", true}, {"component", kComponent}, {"load_ms", load_ms},
-               {"cycles", cycles}, {"failures", failures},
-               {"runner_version", kRunnerVersion}})
-             .dump()
-      << "\n";
+  lines.push_back(json({{"summary", true}, {"component", kComponent},
+                        {"load_ms", load_ms}, {"cycles", bundle.requests.size()},
+                        {"failures", 0}, {"runner_version", kRunnerVersion}})
+                      .dump());
+  std::ofstream out(options["--output"], std::ios::trunc);
+  for (const std::string& line : lines) out << line << "\n";
   out.flush();
   if (!out) {
     err << "mgg_exploration_replay: writing " << options["--output"] << " failed\n";
