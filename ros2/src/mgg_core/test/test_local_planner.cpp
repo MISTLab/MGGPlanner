@@ -297,3 +297,74 @@ TEST(LocalPlanner, ScoringDoesNotSwallowCancellation) {
   EXPECT_FALSE(result.path);
   EXPECT_FALSE(result.checks_complete);
 }
+
+TEST(LocalPlanner, GroundGoalHeightIsAHint) {
+  mgg_test::LocalScene s;
+  LocalPlanner planner(s.map, s.layer, s.cache, s.planning, s.robot, s.sensor);
+  auto in = s.inputs();
+  // A 2-D objective seeded at the base's height (floor 0, half the body
+  // up), not at the 0.5 m driving height the lattice links at.
+  in.target = Eigen::Vector3d(5, 0, 0.1);
+  auto base_height = planner.plan(in, {});
+  ASSERT_TRUE(base_height.path) << base_height.reason;
+  EXPECT_TRUE(base_height.path->reaches_goal);
+  EXPECT_NEAR(base_height.path->poses.back().z(), 0.5, 1e-9);
+  EXPECT_LE((base_height.path->poses.back().head<2>() - Eigen::Vector2d(5, 0))
+                .norm(),
+            in.goal_tolerance_m);
+  // The objective itself is never rewritten.
+  EXPECT_EQ(*in.target, Eigen::Vector3d(5, 0, 0.1));
+
+  // At the goal, a hint height off the driving height is still terminal.
+  in.speed_mps = 0;
+  in.target = Eigen::Vector3d(0.1, 0, 0.1);
+  auto at = planner.plan(in, {});
+  ASSERT_TRUE(at.path) << at.reason;
+  EXPECT_TRUE(at.path->reaches_goal);
+  EXPECT_EQ(at.path->poses.size(), 1u);
+}
+
+TEST(LocalPlanner, GlobalGroundEstimateDiffersFromLocal) {
+  mgg_test::LocalScene s;
+  LocalPlanner planner(s.map, s.layer, s.cache, s.planning, s.robot, s.sensor);
+  auto in = s.inputs();
+  // Guidance planned on a map whose floor sits 0.4 m above the local one.
+  in.target = Eigen::Vector3d(6, 0, 0.9);
+  auto goal = planner.plan(in, {});
+  ASSERT_TRUE(goal.path) << goal.reason;
+  EXPECT_TRUE(goal.path->reaches_goal);
+  EXPECT_NEAR(goal.path->poses.back().z(), 0.5, 1e-9);
+  // Beyond the window, the route aim is placed on the local ground too.
+  in.target = Eigen::Vector3d(20, 0, 0.9);
+  in.coarse_route = {{7, 0, 0.9}, {20, 0, 0.9}};
+  auto aim = planner.plan(in, {});
+  ASSERT_TRUE(aim.path) << aim.reason;
+  EXPECT_FALSE(aim.path->reaches_goal);
+  EXPECT_NEAR(aim.path->poses.back().z(), 0.5, 1e-9);
+  EXPECT_LT((aim.path->poses.back().head<2>() - Eigen::Vector2d(7, 0)).norm(),
+            0.2);
+}
+
+TEST(LocalPlanner, UnknownGoalGroundWaitsForMap) {
+  mgg_test::LocalScene s;
+  s.map.unknown_ground = true;
+  LocalPlanner planner(s.map, s.layer, s.cache, s.planning, s.robot, s.sensor);
+  auto in = s.inputs();
+  in.target = Eigen::Vector3d(5.5, 2.5, 0.1);
+  auto unknown = planner.plan(in, {});
+  EXPECT_FALSE(unknown.path);
+  EXPECT_EQ(unknown.status, LocalStatus::kWaitingForMap);
+  EXPECT_EQ(unknown.reason, "goal_ground_unknown");
+  // A route aim on unobserved ground falls back to the farthest observed one.
+  in.target = Eigen::Vector3d(20, 0, 0.5);
+  in.coarse_route = {{7, 0, 0.5}, {5.5, 2.5, 0.5}, {20, 0, 0.5}};
+  auto aim = planner.plan(in, {});
+  ASSERT_TRUE(aim.path) << aim.reason;
+  EXPECT_LT((aim.path->poses.back().head<2>() - Eigen::Vector2d(7, 0)).norm(),
+            0.2);
+  in.coarse_route = {{5.5, 2.5, 0.5}, {20, 0, 0.5}};
+  auto none = planner.plan(in, {});
+  EXPECT_FALSE(none.path);
+  EXPECT_EQ(none.status, LocalStatus::kWaitingForMap);
+  EXPECT_EQ(none.reason, "goal_ground_unknown");
+}

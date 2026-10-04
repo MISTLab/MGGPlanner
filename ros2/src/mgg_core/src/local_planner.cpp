@@ -226,6 +226,24 @@ LocalPlanResult LocalPlanner::search(const LocalPlanInputs& in,
   auto window = map_.windowBounds().value_or(
       Eigen::AlignedBox3d(in.pose.head<3>() - Eigen::Vector3d(8, 8, 3),
                           in.pose.head<3>() + Eigen::Vector3d(8, 8, 3)));
+  GroundProjection ground(map_, planning_, true);
+  // A goal's height is a hint (a 2-D objective is seeded at the robot's
+  // altitude; guidance carries the global map's ground). Driving height over
+  // the local ground at the same XY, or nothing: never a guessed height.
+  const auto onLocalGround =
+      [&](const Eigen::Vector3d& p) -> std::optional<Eigen::Vector3d> {
+    Eigen::Vector3d sample = p;
+    VoxelStatus status = VoxelStatus::kUnknown;
+    const double below = ground.projectGoal(sample, status);
+    if (status != VoxelStatus::kOccupied || !std::isfinite(below))
+      return std::nullopt;
+    return Eigen::Vector3d(p.x(), p.y(),
+                           p.z() - below + planning_.max_ground_height);
+  };
+  // in.target placed on the local ground, for linking and terminal checks;
+  // unset where the local map has no ground for it.
+  const std::optional<Eigen::Vector3d> target =
+      in.target ? onLocalGround(*in.target) : std::nullopt;
   LocalPathPlan identity;
   identity.session_id = in.session_id;
   identity.request_id = in.request_id;
@@ -281,8 +299,8 @@ LocalPlanResult LocalPlanner::search(const LocalPlanInputs& in,
     result.checks_complete = selection_complete;
     return true;
   };
-  if (in.target &&
-      (in.pose.head<3>() - *in.target).norm() <= in.goal_tolerance_m + 1e-9) {
+  if (target &&
+      (in.pose.head<3>() - *target).norm() <= in.goal_tolerance_m + 1e-9) {
     auto path = identity;
     path.poses = {in.pose};
     path.reverse = {false};
@@ -302,9 +320,8 @@ LocalPlanResult LocalPlanner::search(const LocalPlanInputs& in,
       continuation.reverse = std::move(remaining.reverse);
       continuation.prefix_length = prefix.poses.size();
       continuation.reaches_goal =
-          in.target &&
-          (continuation.poses.back().head<3>() - *in.target).norm() <=
-              in.goal_tolerance_m;
+          target && (continuation.poses.back().head<3>() - *target).norm() <=
+                        in.goal_tolerance_m;
       if (continuation.poses.size() > 1 && publish(continuation)) return result;
     }
     // At the refuge (or after failed revalidation), start forward from the
@@ -318,11 +335,25 @@ LocalPlanResult LocalPlanner::search(const LocalPlanInputs& in,
     return result;
   }
   std::optional<Eigen::Vector3d> aim;
-  if (in.target && interior(window, *in.target))
-    aim = in.target;
-  else
-    for (const auto& p : in.coarse_route)
-      if (p.allFinite() && interior(window, p)) aim = p;
+  bool aim_ground_unknown = false;
+  if (in.target && interior(window, *in.target)) {
+    aim = target;
+    aim_ground_unknown = !aim;
+  } else {
+    // The farthest route point in the window with local ground under it.
+    for (auto p = in.coarse_route.rbegin(); p != in.coarse_route.rend(); ++p) {
+      if (!p->allFinite() || !interior(window, *p)) continue;
+      aim = onLocalGround(*p);
+      aim_ground_unknown = !aim;
+      if (aim) break;
+    }
+  }
+  if (aim_ground_unknown) {
+    // Blocks only this target; the guidance planner may select elsewhere.
+    result.status = LocalStatus::kWaitingForMap;
+    result.reason = "goal_ground_unknown";
+    return result;
+  }
   if (!aim && !sensor_.isReady()) {
     result.reason = "gain sensor has no configured rays";
     return result;
@@ -336,7 +367,6 @@ LocalPlanResult LocalPlanner::search(const LocalPlanInputs& in,
       return result;
     }
   }
-  GroundProjection ground(map_, planning_, true);
   ExpandContext ctx;
   ctx.map = &map_;
   ctx.planning = &planning_;
@@ -507,8 +537,8 @@ LocalPlanResult LocalPlanner::search(const LocalPlanInputs& in,
       path.reverse.resize(keep);
     }
     path.reaches_goal =
-        in.target && (path.poses.back().head<3>() - *in.target).norm() <=
-                         in.goal_tolerance_m + 1e-9;
+        target && (path.poses.back().head<3>() - *target).norm() <=
+                      in.goal_tolerance_m + 1e-9;
     if (!path.reaches_goal && pathLength(path) < 6) continue;
     if (publish(path)) return result;
   }
@@ -521,8 +551,8 @@ LocalPlanResult LocalPlanner::search(const LocalPlanInputs& in,
       path.poses.push_back(p);
       path.reverse.push_back(true);
       if (path.poses.size() > 1 && room(p)) {
-        path.reaches_goal = in.target && (p.head<3>() - *in.target).norm() <=
-                                             in.goal_tolerance_m;
+        path.reaches_goal =
+            target && (p.head<3>() - *target).norm() <= in.goal_tolerance_m;
         if (publish(path)) return result;
         break;
       }

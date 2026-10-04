@@ -150,6 +150,69 @@ TEST(LocalPlanningCore, GoalFramesFollowTransforms) {
   EXPECT_EQ(zones_missing.reason, "no_transform:map");
 }
 
+TEST(LocalPlanningCore, TwoDimensionalObjectiveReachesGoal) {
+  mgg_test::Corridor corridor;
+  const StateVec base = basePose(0.1, 0.1);
+  LocalPlanningCore core(mgg_test::sceneParams());
+  observe(core, corridor, base);
+  // As the adapter sends a 2-D objective: seeded at the robot's current
+  // altitude (its base), never pre-projected to the driving height.
+  const Eigen::Vector3d objective(5.1, 0.1, mgg_test::kBaseZ);
+  ASSERT_TRUE(core.setMode(follow("s1", "r1", objective)).accepted);
+  const auto result = core.plan(soon());
+  ASSERT_TRUE(result.path) << result.reason;
+  EXPECT_TRUE(result.path->reaches_goal);
+  EXPECT_NEAR(result.path->poses.back().z(), mgg_test::kDrivingZ, 1e-9);
+  EXPECT_LT(
+      (result.path->poses.back().head<2>() - objective.head<2>()).norm(),
+      0.31);
+}
+
+TEST(LocalPlanningCore, GlobalGroundEstimateDiffersFromLocal) {
+  mgg_test::Corridor corridor;
+  const StateVec base = basePose(0.1, 0.1);
+  LocalPlanningCore core(mgg_test::sceneParams());
+  observe(core, corridor, base);
+  // The guidance map puts this floor 0.35 m higher than the local map does.
+  const double offset = 0.35;
+  auto request = follow("s1", "r1",
+                        Eigen::Vector3d(14.1, 0.1, mgg_test::kBaseZ + offset));
+  request.route = {Eigen::Vector3d(7.1, 0.1, mgg_test::kDrivingZ + offset),
+                   Eigen::Vector3d(14.1, 0.1, mgg_test::kDrivingZ + offset)};
+  ASSERT_TRUE(core.setMode(request).accepted);
+  const auto aim = core.plan(soon());
+  ASSERT_TRUE(aim.path) << aim.reason;
+  EXPECT_FALSE(aim.path->reaches_goal);
+  EXPECT_NEAR(aim.path->poses.back().z(), mgg_test::kDrivingZ, 1e-9);
+  EXPECT_LT((aim.path->poses.back().head<2>() - Eigen::Vector2d(7.1, 0.1))
+                .norm(),
+            0.31);
+
+  ASSERT_TRUE(core.setMode(follow("s2", "r2",
+                                  Eigen::Vector3d(6.1, 0.1,
+                                                  mgg_test::kBaseZ + offset)))
+                  .accepted);
+  const auto goal = core.plan(soon());
+  ASSERT_TRUE(goal.path) << goal.reason;
+  EXPECT_TRUE(goal.path->reaches_goal);
+  EXPECT_NEAR(goal.path->poses.back().z(), mgg_test::kDrivingZ, 1e-9);
+}
+
+TEST(LocalPlanningCore, UnobservedGoalGroundWaitsForMap) {
+  mgg_test::Corridor corridor;
+  const StateVec base = basePose(0.1, 0.1);
+  LocalPlanningCore core(mgg_test::sceneParams());
+  observe(core, corridor, base);
+  // Behind the corridor wall: inside the window, never observed.
+  ASSERT_TRUE(core.setMode(follow("s1", "r1",
+                                  Eigen::Vector3d(3.1, 4.1, mgg_test::kBaseZ)))
+                  .accepted);
+  const auto result = core.plan(soon());
+  EXPECT_FALSE(result.path);
+  EXPECT_EQ(result.status, LocalStatus::kWaitingForMap);
+  EXPECT_EQ(result.reason, "goal_ground_unknown");
+}
+
 TEST(LocalPlanningCore, ObstacleOnRetainedPathInvalidates) {
   mgg_test::Corridor corridor;
   const StateVec base = basePose(0.1, 0.1);

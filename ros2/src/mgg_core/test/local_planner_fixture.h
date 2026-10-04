@@ -54,7 +54,20 @@ class LocalMap : public TerrainFixture {
       return mgg::VoxelStatus::kOccupied;
     return TerrainFixture::getBoxStatus(p, size, stop);
   }
+  using TerrainFixture::getRayStatus;
+  mgg::VoxelStatus getRayStatus(const Eigen::Vector3d& a,
+                                const Eigen::Vector3d& b, bool stop,
+                                Eigen::Vector3d& end) const override {
+    // Unobserved ground: downward rays end in unknown space.
+    if (unknown_ground && a.x() > 5 && a.x() < 6 && a.y() > 2 &&
+        a.y() < 3) {
+      end = b;
+      return mgg::VoxelStatus::kUnknown;
+    }
+    return TerrainFixture::getRayStatus(a, b, stop, end);
+  }
   bool unknown_beside_corridor = false, delay_voxel_queries = false;
+  bool unknown_ground = false;
   mutable size_t voxel_queries = 0;
   double wall_x = 2;
   bool wall = false, narrow = false, boundary_unknown = false,
