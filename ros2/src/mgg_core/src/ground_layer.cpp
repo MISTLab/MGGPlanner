@@ -20,7 +20,9 @@ constexpr int kDirections[8][2] = {
 
 GroundLayer::GroundLayer(const MapInterface& map, const PlanningParams& planning,
                          const RobotParams& robot, const GroundLayerParams& params)
-    : map_(map), planning_(planning), robot_params_(robot), params_(params),
+    : map_(map), planning_(planning),
+      projection_length_(GroundProjection(map_, planning_).max_projection_length),
+      robot_params_(robot), params_(params),
       resolution_(map.getResolution()) {
   if (!std::isfinite(resolution_) || resolution_ <= 0 ||
       !params_.window_size_m.allFinite() ||
@@ -50,7 +52,8 @@ Eigen::AlignedBox3d GroundLayer::dependency(int i, double z) const {
   // Includes all eight native step/grade rays, their four offset probes,
   // and the body band. The parent's rays are added before projection.
   return Eigen::AlignedBox3d(
-      Eigen::Vector3d(p.x() - radius, p.y() - radius, z - 5.0 - resolution_),
+      Eigen::Vector3d(p.x() - radius, p.y() - radius,
+                      z - projection_length_ - resolution_),
       Eigen::Vector3d(p.x() + radius, p.y() + radius,
        z + std::max(probe, planning_.max_ground_height +
                     std::abs(robot_params_.center_offset.z()) + size.z()) + resolution_));
@@ -89,8 +92,10 @@ void GroundLayer::place(const Eigen::Vector3d& robot, double ground_z, bool clea
     throw std::invalid_argument("GroundLayer: invalid window bounds");
   const int width = static_cast<int>(counts.x());
   const int height = static_cast<int>(counts.y());
-  if (!clear && origin.isApprox(origin_, 1e-12) && width == width_ && height == height_)
+  if (!clear && origin.isApprox(origin_, 1e-12) && width == width_ && height == height_) {
+    refreshUnsupportedSeed();
     return;
+  }
 
   const auto old_origin = origin_;
   const int old_width = width_, old_height = height_, old_seed = seed_;
@@ -154,6 +159,20 @@ void GroundLayer::place(const Eigen::Vector3d& robot, double ground_z, bool clea
   } else {
     withdrawDescendants();
   }
+  refreshUnsupportedSeed();
+}
+
+void GroundLayer::refreshUnsupportedSeed() {
+  if (seed_ >= 0 && columns_[seed_].observed) return;
+  const int seed = index(robot_.head<2>());
+  const double hint = robot_.z() - planning_.max_ground_height;
+  if (seed < 0 || (seed == seed_ && std::abs(hint - seed_ground_hint_) < 1e-9))
+    return;
+  seed_ = seed;
+  seed_ground_hint_ = hint;
+  columns_[seed_].parent = -1;
+  markPending(seed_);
+  withdrawDescendants();
 }
 
 void GroundLayer::markPending(int i) {
@@ -194,6 +213,7 @@ void GroundLayer::recheck(std::chrono::steady_clock::time_point deadline) {
     return Clock::now() >= deadline || (parent_cancelled && (*parent_cancelled)());
   });
   GroundProjection projection(map_, planning_);
+  projection.max_projection_length = projection_length_;
   using Work = std::pair<double, int>;
   std::priority_queue<Work, std::vector<Work>, std::greater<Work>> queue;
   std::vector<bool> queued(columns_.size(), false);
@@ -224,6 +244,7 @@ void GroundLayer::recheck(std::chrono::steady_clock::time_point deadline) {
       const int i = queue.top().second;
       queue.pop();
       Column checked = columns_[i];
+      checked.evaluated = true;
       checked.parent = parents[i];
       const double reference = checked.parent < 0
           ? seed_ground_hint_
@@ -233,31 +254,43 @@ void GroundLayer::recheck(std::chrono::steady_clock::time_point deadline) {
         checked.dependency.extend(dependency(checked.parent, reference));
       const Eigen::Vector2d xy = center(i);
       Eigen::Vector3d sample(xy.x(), xy.y(), reference);
-      if (checked.parent < 0) {
-        // Start the seed's ground rays at the physical floor hint, not up
-        // in a low ceiling. No standing-start prior may invent support.
-        sample.z() -= std::max(0.2, 2 * resolution_) - 1e-6;
-      }
       VoxelStatus status;
       const double below = projection.projectSample(sample, status);
       if (status != VoxelStatus::kOccupied) {
         checked.observed = false;
+        checked.dirty = false;
         if (!refused(checked.verdict)) checked.verdict = GroundVerdict::kUnknown;
         planningCheckpoint();
-        columns_[i] = checked;  // still pending: a later scan may reveal support
+        columns_[i] = checked;  // complete unknown; retry only after a change
         continue;
       }
       checked.ground_z = sample.z() - below;
-      if (checked.parent >= 0 && checked.ground_z > reference + 1e-6) {
-        // projectSample starts above the parent floor. If it hits a low
-        // ceiling, keep the nearer observed support underneath, rather
-        // than flooding onto the ceiling and calling its columns free.
+      if (checked.ground_z > reference + 1e-6) {
+        // projectSample starts above the floor hint. Prefer nearer observed
+        // support underneath a ceiling. If the hint is slightly below the
+        // floor, also look from below the hit voxel, not only from the hint.
         Eigen::Vector3d lower;
-        if (projection.groundBelow({xy.x(), xy.y(), reference + 1e-6}, lower) &&
-            std::abs(lower.z() - reference) < checked.ground_z - reference)
+        const auto nearer_support = [&](double from_z) {
+          return projection.groundBelow({xy.x(), xy.y(), from_z}, lower) &&
+                 std::abs(lower.z() - reference) < checked.ground_z - reference;
+        };
+        if (nearer_support(reference + 1e-6) ||
+            nearer_support(checked.ground_z - resolution_ - 1e-6))
           checked.ground_z = lower.z();
       }
       checked.dependency.extend(dependency(i, checked.ground_z));
+      // Offset projection rays may find a rim beside an unseen hole. Only
+      // the column's own observed support can certify it as traversable.
+      Eigen::Vector3d support;
+      if (!projection.groundBelow({xy.x(), xy.y(), checked.ground_z + 1e-6}, support) ||
+          std::abs(support.z() - checked.ground_z) > 1e-6) {
+        checked.observed = false;
+        checked.dirty = false;
+        if (!refused(checked.verdict)) checked.verdict = GroundVerdict::kUnknown;
+        planningCheckpoint();
+        columns_[i] = checked;
+        continue;
+      }
       checked.observed = true;
       const Eigen::Vector3d ground(xy.x(), xy.y(), checked.ground_z);
       GroundVerdict verdict = GroundVerdict::kAdmitted;
@@ -300,9 +333,25 @@ void GroundLayer::recheck(std::chrono::steady_clock::time_point deadline) {
       planningCheckpoint();
       if (verdict != GroundVerdict::kUnknown || !refused(checked.verdict))
         checked.verdict = verdict;
-      checked.dirty = verdict == GroundVerdict::kUnknown;
+      checked.dirty = false;
       columns_[i] = checked;
-      if (!checked.dirty) neighbours(i, [&](int child) { enqueue(child, i); });
+      neighbours(i, [&](int child) {
+        // A completed flood can stop before these columns. Newly observed
+        // support now makes them reachable without re-trying already
+        // evaluated unknown cells on every budget cycle.
+        if (!columns_[child].evaluated) markPending(child);
+        enqueue(child, i);
+      });
+    }
+    // No interrupted work remains: columns unreachable from observed
+    // support are unknown, not a permanent backlog. Keep lethal refusals.
+    for (auto& column : columns_) {
+      planningCheckpoint();
+      if (!column.dirty) continue;
+      column.dirty = false;
+      column.observed = false;
+      column.evaluated = false;
+      if (!refused(column.verdict)) column.verdict = GroundVerdict::kUnknown;
     }
   } catch (const PlanningInterrupted&) {
     if (parent_cancelled && (*parent_cancelled)()) throw;

@@ -30,6 +30,11 @@ class LayerMap : public mgg_test::TerrainFixture {
   }
   VoxelStatus getRayStatus(const Eigen::Vector3d& a, const Eigen::Vector3d& b,
                            bool stop, Eigen::Vector3d& end) const override {
+    ++ray_queries;
+    if (!support_visible) {
+      end = b;
+      return VoxelStatus::kUnknown;
+    }
     if (ceiling && a.z() >= 0.3 && b.z() <= 0.3) {
       end = {a.x(), a.y(), 0.3};
       return VoxelStatus::kOccupied;
@@ -40,6 +45,7 @@ class LayerMap : public mgg_test::TerrainFixture {
                            const Eigen::Vector3d& size, bool stop) const override {
     if (slow_body) std::this_thread::sleep_for(std::chrono::milliseconds(5));
     checked_bodies.push_back(p);
+    if (unknown_body) return VoxelStatus::kUnknown;
     if (ceiling && (p.z() - size.z() / 2 <= 0.3) &&
         (p.z() + size.z() / 2 >= 0.3)) return VoxelStatus::kOccupied;
     return TerrainFixture::getBoxStatus(p, size, stop);
@@ -47,6 +53,9 @@ class LayerMap : public mgg_test::TerrainFixture {
   std::optional<Eigen::AlignedBox3d> bounds =
       Eigen::AlignedBox3d(Eigen::Vector3d(-2, -2, -2), Eigen::Vector3d(2, 2, 3));
   bool ceiling = false;
+  bool support_visible = true;
+  bool unknown_body = false;
+  mutable int ray_queries = 0;
   bool slow_body = false;
   mutable std::vector<Eigen::Vector3d> checked_bodies;
 };
@@ -111,6 +120,108 @@ TEST(GroundLayer, CertifiedTerrainMapping) {
   finish(unseen_layer);
   EXPECT_EQ(cost(unseen_layer, {0.1, 0.1}), -1);
   EXPECT_EQ(unseen_layer.verdict({0.1, 0.1}), GroundVerdict::kUnknown);
+}
+
+TEST(GroundLayer, SeedToleratesLowAnchorAndRefreshesBeforeCertification) {
+  LayerMap map([](double) { return 0.0; });
+  GroundLayer layer(map, planning(), robot());
+  layer.reset({0.1, 0.1, 0.57}, 0);
+  finish(layer);
+  EXPECT_EQ(cost(layer, {0.1, 0.1}), 0);  // hint 3 cm below the voxel bottom
+
+  map.ceiling = true;
+  layer.reset({0.1, 0.1, 0.57}, 0);
+  finish(layer);
+  EXPECT_EQ(cost(layer, {0.1, 0.1}), 100);
+  map.ceiling = false;
+
+  layer.reset({0.1, 0.1, -0.1}, 0);
+  finish(layer);
+  EXPECT_EQ(layer.verdict({0.1, 0.1}), GroundVerdict::kUnknown);
+  layer.recenter({0.1, 0.1, 0.57}, 0);  // unchanged XY bounds, corrected odometry
+  finish(layer);
+  EXPECT_EQ(cost(layer, {0.1, 0.1}), 0);
+
+  auto tops = terrain([](double) { return 0.0; });
+  for (auto it = tops.begin(); it != tops.end();) {
+    if (it->first.first < 5) it = tops.erase(it);
+    else ++it;
+  }
+  mgg_test::TerrainFixture offset_support(0.2, tops);
+  GroundLayer moved(offset_support, planning(), robot());
+  moved.reset({0.1, 0.1, 0.6}, 0);
+  finish(moved);
+  EXPECT_EQ(moved.verdict({0.1, 0.1}), GroundVerdict::kUnknown);
+  moved.recenter({1.1, 0.1, 0.6}, 0);
+  finish(moved);
+  EXPECT_EQ(cost(moved, {1.1, 0.1}), 0);
+}
+
+TEST(GroundLayer, CompletedUnknownIsNotPendingAndWaitsForChanges) {
+  LayerMap map([](double) { return 0.0; });
+  map.support_visible = false;
+  GroundLayer layer(map, planning(), robot());
+  layer.reset({0.1, 0.1, 0.6}, 0);
+  finish(layer);
+  EXPECT_EQ(layer.pendingCount(), 0);
+  EXPECT_EQ(layer.verdict({0.1, 0.1}), GroundVerdict::kUnknown);
+  const Eigen::AlignedBox3d region(Eigen::Vector3d(-2, -2, -1),
+                                   Eigen::Vector3d(2, 2, 1));
+  EXPECT_FALSE(layer.pending(region));
+  const int queries = map.ray_queries;
+  layer.recenter({0.1, 0.1, 0.6}, 0);  // same pose must not re-dirty unknown
+  finish(layer);
+  EXPECT_EQ(map.ray_queries, queries);
+
+  map.support_visible = true;
+  layer.withdraw(changeAt({0.1, 0.1, 0}));
+  EXPECT_GT(layer.pendingCount(), 0);
+  finish(layer);
+  EXPECT_EQ(cost(layer, {1.7, 1.7}), 0);  // resumes into previously unreached cells
+  EXPECT_EQ(layer.pendingCount(), 0);
+
+  map.unknown_body = true;
+  layer.withdraw(changeAt({0.1, 0.1, 0.3}));
+  finish(layer);
+  EXPECT_EQ(layer.verdict({0.1, 0.1}), GroundVerdict::kUnknown);
+  EXPECT_EQ(layer.verdict({1.7, 1.7}), GroundVerdict::kUnknown);
+  EXPECT_EQ(layer.pendingCount(), 0);
+  const int body_queries = map.ray_queries;
+  finish(layer);
+  EXPECT_EQ(map.ray_queries, body_queries);
+}
+
+TEST(GroundLayer, DropEdgeCannotBorrowSupportFromRim) {
+  auto tops = terrain([](double) { return 0.0; });
+  for (auto it = tops.begin(); it != tops.end();) {
+    if (it->first.first >= 4) it = tops.erase(it);
+    else ++it;
+  }
+  mgg_test::TerrainFixture map(0.2, tops);
+  GroundLayer layer(map, planning(), robot());
+  layer.reset({0.1, 0.1, 0.6}, 0);
+  finish(layer);
+  EXPECT_EQ(cost(layer, {0.5, 0.1}), 0);
+  EXPECT_EQ(cost(layer, {0.9, 0.1}), -1);
+  EXPECT_EQ(layer.verdict({0.9, 0.1}), GroundVerdict::kUnknown);
+  EXPECT_EQ(layer.pendingCount(), 0);
+}
+
+TEST(GroundLayer, RampAdmissionExercisesGradeLimit) {
+  LayerMap map([](double x) { return x * std::tan(16 * M_PI / 180); });
+  auto params = planning();
+  params.max_step_height = 0.05;  // native two-cell rise exceeds the step limit
+  const Eigen::Vector3d anchor(0.1, 0.1, 0.6 + 0.1 * std::tan(16 * M_PI / 180));
+  GroundLayer admitted(map, params, robot());
+  admitted.reset(anchor, 0);
+  finish(admitted);
+  EXPECT_EQ(cost(admitted, {1.1, 0.1}), 0);
+  params.max_inclination = 10 * M_PI / 180;
+  GroundLayer refused(map, params, robot());
+  refused.reset(anchor, 0);
+  finish(refused);
+  EXPECT_EQ(cost(refused, {1.1, 0.1}), 100);
+  EXPECT_EQ(refused.verdict({1.1, 0.1}), GroundVerdict::kRefusedStepGrade);
 }
 
 TEST(GroundLayer, ResetAndScrollWithdraw) {
@@ -189,7 +300,7 @@ TEST(GroundLayer, RechecksNearestFirstAndRetainsUnchangedAdmissions) {
   double distance = 0;
   for (const auto& body : map.checked_bodies) {
     const double next = (body.head<2>() - Eigen::Vector2d(0.1, 0.1)).norm();
-    EXPECT_GE(next + 1e-9, distance);
+    ASSERT_GE(next + 1e-9, distance);
     distance = next;
   }
   layer.withdraw(changeAt({1.9, 1.9, 0}));

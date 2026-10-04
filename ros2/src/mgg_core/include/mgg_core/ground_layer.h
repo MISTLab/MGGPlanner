@@ -29,10 +29,16 @@ class GroundLayer {
   GroundLayer(const MapInterface& map, const PlanningParams& planning,
               const RobotParams& robot,
               const GroundLayerParams& params = GroundLayerParams{});
+  /// robot is the driving anchor: the seed floor hint is its z minus
+  /// max_ground_height. ground_z only initializes unseen dependency boxes;
+  /// it does not substitute for observed support or override that hint.
   void reset(const Eigen::Vector3d& robot, double ground_z);
+  /// Refreshes an unsupported seed from corrected odometry as well as
+  /// scrolling the grid. ground_z has the same meaning as in reset().
   void recenter(const Eigen::Vector3d& robot, double ground_z);
   void withdraw(const MapChange& change);
   void recheck(std::chrono::steady_clock::time_point deadline);
+  /// Pending means work since the last change, not completed unknown space.
   int pendingCount() const;
   bool pending(const Eigen::AlignedBox3d& region) const;
   GroundVerdict verdict(const Eigen::Vector2d& position) const;
@@ -45,6 +51,7 @@ class GroundLayer {
     GroundVerdict verdict = GroundVerdict::kUnknown;
     bool dirty = true;
     bool observed = false;
+    bool evaluated = false;  // clean but unreached columns may join a later flood
     double ground_z = 0;
     int parent = -1;
     Eigen::AlignedBox3d dependency;
@@ -53,10 +60,12 @@ class GroundLayer {
   Eigen::Vector2d center(int index) const;
   Eigen::AlignedBox3d dependency(int index, double ground_z) const;
   void place(const Eigen::Vector3d& robot, double ground_z, bool clear);
+  void refreshUnsupportedSeed();
   void markPending(int index);
   void withdrawDescendants();
   const MapInterface& map_;
   const PlanningParams planning_;
+  const double projection_length_;  // one depth for rays and their dependencies
   const RobotParams robot_params_;
   const GroundLayerParams params_;
   const double resolution_;
