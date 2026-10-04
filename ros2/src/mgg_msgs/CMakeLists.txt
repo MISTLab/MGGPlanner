@@ -29,7 +29,12 @@ rosidl_generate_interfaces(${PROJECT_NAME}
   "msg/CoveragePlannerLogger.msg"
   "msg/Edge.msg"
   "msg/ExecutionPathMode.msg"
+  "msg/GlobalGuidance.msg"
   "msg/Graph.msg"
+  "msg/LocalPath.msg"
+  "msg/LocalPathFeedback.msg"
+  "msg/LocalPathInvalidation.msg"
+  "msg/LocalPlannerStatus.msg"
   "msg/MappingSnapshot.msg"
   "msg/PlannerConfigState.msg"
   "msg/PlannerStatus.msg"
@@ -75,6 +80,7 @@ rosidl_generate_interfaces(${PROJECT_NAME}
   "srv/PlanObjective.srv"
   "srv/PlannerStringTrigger.srv"
   "srv/ReleaseClaims.srv"
+  "srv/SetLocalPlannerMode.srv"
 
   "action/PathFollower.action"
   DEPENDENCIES std_msgs geometry_msgs sensor_msgs builtin_interfaces

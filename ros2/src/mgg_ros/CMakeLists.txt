@@ -44,7 +44,11 @@ add_library(${PROJECT_NAME}
   src/conversions.cpp
   src/fleet_conversions.cpp
   src/keyframe_trajectory.cpp
-  src/planner_node.cpp)
+  src/local_path_conversions.cpp
+  src/local_planner_node.cpp
+  src/local_planning_core.cpp
+  src/planner_node.cpp
+  src/scan_input.cpp)
 target_include_directories(${PROJECT_NAME} PUBLIC
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
   $<INSTALL_INTERFACE:include>)
@@ -62,6 +66,11 @@ add_executable(mggplanner_node src/planner_main.cpp)
 target_link_libraries(mggplanner_node ${PROJECT_NAME})
 ament_target_dependencies(mggplanner_node rclcpp)
 install(TARGETS mggplanner_node DESTINATION lib/${PROJECT_NAME})
+
+add_executable(mgg_local_planner_node src/local_planner_main.cpp)
+target_link_libraries(mgg_local_planner_node ${PROJECT_NAME})
+ament_target_dependencies(mgg_local_planner_node rclcpp)
+install(TARGETS mgg_local_planner_node DESTINATION lib/${PROJECT_NAME})
 
 install(DIRECTORY include/ DESTINATION include)
 install(DIRECTORY config DESTINATION share/${PROJECT_NAME})
@@ -100,6 +109,22 @@ if(BUILD_TESTING)
     TIMEOUT 300)
   target_link_libraries(test_planner_navigation ${PROJECT_NAME})
   ament_target_dependencies(test_planner_navigation rclcpp mgg_msgs)
+  # The ground local planner uses the OctoMap-free rolling voxel map: its
+  # tests stay outside the MGG_WITH_OCTOMAP conditional.
+  ament_add_gtest(test_local_path_conversions test/test_local_path_conversions.cpp)
+  target_link_libraries(test_local_path_conversions ${PROJECT_NAME})
+  ament_target_dependencies(test_local_path_conversions mgg_msgs)
+  ament_add_gtest(test_scan_input test/test_scan_input.cpp)
+  target_link_libraries(test_scan_input ${PROJECT_NAME})
+  ament_target_dependencies(test_scan_input sensor_msgs tf2)
+  ament_add_gtest(test_local_planning_core test/test_local_planning_core.cpp
+    TIMEOUT 300)
+  target_link_libraries(test_local_planning_core ${PROJECT_NAME})
+  ament_add_gtest(test_local_planner_node test/test_local_planner_node.cpp
+    TIMEOUT 300)
+  target_link_libraries(test_local_planner_node ${PROJECT_NAME})
+  ament_target_dependencies(test_local_planner_node rclcpp mgg_msgs
+    sensor_msgs nav_msgs)
   if(mgg_map_octomap_WITH_OCTOMAP)
     target_compile_definitions(test_map_backend PRIVATE MGG_WITH_OCTOMAP)
     # These scenes are built by inserting points into the OctoMap backend.

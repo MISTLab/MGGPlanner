@@ -1,0 +1,19 @@
+# Starts, continues or ends a local planning session. A new session_id
+# starts a session; the same session_id with a new request_id continues it.
+# goal and route are in frame_id (empty: the local planner's odometry frame),
+# at MGG's driving height; the planner re-transforms them every cycle.
+uint8 IDLE=0
+uint8 EXPLORE=1
+uint8 FOLLOW_ROUTE=2
+string session_id
+string request_id
+uint8 mode
+string frame_id
+geometry_msgs/Point goal
+float64 tolerance_m
+geometry_msgs/Point[] route
+---
+bool accepted
+string reason
+# The planner's process epoch.
+uint64 epoch
