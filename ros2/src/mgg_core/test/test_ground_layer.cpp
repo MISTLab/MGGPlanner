@@ -59,6 +59,53 @@ class LayerMap : public mgg_test::TerrainFixture {
   bool slow_body = false;
   mutable std::vector<Eigen::Vector3d> checked_bodies;
 };
+// Voxel-centre ray hits, including an occupied start voxel, as in the
+// production rolling map. Unlike TerrainFixture, the floor has thickness.
+class StackedGroundMap : public LayerMap {
+ public:
+  explicit StackedGroundMap(bool raised_floor = false)
+      : LayerMap([](double) { return 0.0; }), raised_floor_(raised_floor) {}
+
+  VoxelStatus getVoxelStatus(const Eigen::Vector3d& p) const override {
+    return occupied(keyOf(p, getResolution())) ? VoxelStatus::kOccupied
+                                               : VoxelStatus::kFree;
+  }
+  VoxelStatus getRayStatus(const Eigen::Vector3d& a, const Eigen::Vector3d& b,
+                           bool, Eigen::Vector3d& end) const override {
+    // GroundLayer casts only vertical downward rays. Include the start
+    // cell, even when a starts inside a buried occupied floor voxel.
+    VoxelKey cell = keyOf(a, getResolution());
+    const int last_z = keyOf(b, getResolution()).z;
+    for (; cell.z >= last_z; --cell.z) {
+      if (occupied(cell)) {
+        end = centerOf(cell, getResolution());
+        return VoxelStatus::kOccupied;
+      }
+    }
+    end = b;
+    return VoxelStatus::kFree;
+  }
+  VoxelStatus getBoxStatus(const Eigen::Vector3d& p,
+                           const Eigen::Vector3d& size, bool) const override {
+    const VoxelKey low = keyOf(p - size / 2, getResolution());
+    const VoxelKey high = keyOf(p + size / 2, getResolution());
+    for (int x = low.x; x <= high.x; ++x)
+      for (int y = low.y; y <= high.y; ++y)
+        for (int z = low.z; z <= high.z; ++z)
+          if (occupied({x, y, z})) return VoxelStatus::kOccupied;
+    return VoxelStatus::kFree;
+  }
+
+ private:
+  bool occupied(const VoxelKey& cell) const {
+    const int top = raised_floor_ && cell.x >= 4 ? 1 : 0;
+    // A single-voxel neighbour alongside the two-voxel-thick seed column
+    // also catches a false parent-height discontinuity after projection.
+    return cell.z == top || (cell.x != 1 && cell.z == top - 1);
+  }
+  const bool raised_floor_;
+};
+
 PlanningParams planning() {
   PlanningParams p;
   p.max_ground_height = 0.6;
@@ -155,6 +202,36 @@ TEST(GroundLayer, SeedToleratesLowAnchorAndRefreshesBeforeCertification) {
   moved.recenter({1.1, 0.1, 0.6}, 0);
   finish(moved);
   EXPECT_EQ(cost(moved, {1.1, 0.1}), 0);
+}
+
+TEST(GroundLayer, StackedVoxelsKeepSurfaceAboveBuriedSupport) {
+  StackedGroundMap map;
+  Eigen::Vector3d buried;
+  ASSERT_EQ(map.getRayStatus({0.1, 0.1, -0.02}, {0.1, 0.1, -1}, false, buried),
+            VoxelStatus::kOccupied);
+  EXPECT_NEAR(buried.z(), -0.1, 1e-9);  // the ray starts inside the lower voxel
+  GroundLayer layer(map, planning(), robot());
+  layer.reset({0.1, 0.1, 0.58}, 0);  // floor hint -0.02, surface centre +0.1
+  finish(layer);
+  EXPECT_EQ(cost(layer, {0.1, 0.1}), 0);
+  EXPECT_EQ(cost(layer, {0.1, 0.3}), 0);  // stacked neighbour
+  EXPECT_EQ(cost(layer, {0.3, 0.1}), 0);  // single-voxel neighbour
+  layer.withdraw(changeAt({0.1, 0.1, 0.1}));
+  finish(layer);
+  EXPECT_EQ(cost(layer, {0.1, 0.1}), 0);
+  EXPECT_EQ(cost(layer, {0.3, 0.1}), 0);
+}
+
+TEST(GroundLayer, StackedUphillChildUsesObservedSurface) {
+  StackedGroundMap map(true);
+  auto params = planning();
+  params.max_step_height = 0.25;  // the quantised 0.2 m rise is admissible
+  GroundLayer layer(map, params, robot());
+  layer.reset({0.1, 0.1, 0.7}, 0.1);
+  finish(layer);
+  EXPECT_EQ(cost(layer, {0.1, 0.1}), 0);
+  EXPECT_EQ(cost(layer, {0.9, 0.1}), 0);  // floor centres rise from 0.1 to 0.3
+  EXPECT_EQ(layer.verdict({0.9, 0.1}), GroundVerdict::kAdmitted);
 }
 
 TEST(GroundLayer, CompletedUnknownIsNotPendingAndWaitsForChanges) {

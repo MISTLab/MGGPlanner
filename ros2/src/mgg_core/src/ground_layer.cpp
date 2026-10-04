@@ -272,7 +272,11 @@ void GroundLayer::recheck(std::chrono::steady_clock::time_point deadline) {
         Eigen::Vector3d lower;
         const auto nearer_support = [&](double from_z) {
           return projection.groundBelow({xy.x(), xy.y(), from_z}, lower) &&
-                 std::abs(lower.z() - reference) < checked.ground_z - reference;
+                 std::abs(lower.z() - reference) < checked.ground_z - reference &&
+                 // A ray starting inside a thick floor can hit a buried
+                 // voxel. Only a surface top can be the lower support.
+                 map_.getVoxelStatus(lower + Eigen::Vector3d(0, 0, resolution_)) !=
+                     VoxelStatus::kOccupied;
         };
         if (nearer_support(reference + 1e-6) ||
             nearer_support(checked.ground_z - resolution_ - 1e-6))
