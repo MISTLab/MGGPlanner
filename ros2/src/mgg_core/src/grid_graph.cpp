@@ -147,17 +147,29 @@ GridGraphResult buildGridGraph(GraphManager& graph, const StateVec& state,
       grid.min_val.z() > 0.0 || grid.max_val.x() < 0.0 ||
       grid.max_val.y() < 0.0 || grid.max_val.z() < 0.0 ||
       grid.resolution.x() == 0.0 || grid.resolution.y() == 0.0 ||
-      grid.resolution.z() == 0.0) {
+      grid.resolution.z() == 0.0 ||
+      (grid.world_aligned && !(grid.resolution.array() > 0.0).all())) {
     result.status = GridGraphStatus::kInvalidBounds;
     return result;
   }
 
   // Snap the bounds outward to whole cells so the robot sits on a lattice
-  // point.
+  // point; a world-aligned lattice snaps them to whole map-frame cells
+  // instead, from index `first_cell`.
   Eigen::Vector3d min_val = grid.min_val;
   Eigen::Vector3d max_val = grid.max_val;
   int num_nodes[3];
+  std::int64_t first_cell[3] = {0, 0, 0};
   for (int i = 0; i < 3; ++i) {
+    if (grid.world_aligned) {
+      first_cell[i] = static_cast<std::int64_t>(
+          std::floor((state[i] + min_val[i]) / grid.resolution[i]));
+      const auto last_cell = static_cast<std::int64_t>(
+          std::ceil((state[i] + max_val[i]) / grid.resolution[i]));
+      min_val[i] = first_cell[i] * grid.resolution[i] - state[i];
+      num_nodes[i] = static_cast<int>(last_cell - first_cell[i]) + 1;
+      continue;
+    }
     min_val[i] = -grid.resolution[i] * std::ceil(-min_val[i] / grid.resolution[i]);
     max_val[i] = grid.resolution[i] * std::ceil(max_val[i] / grid.resolution[i]);
     num_nodes[i] =
@@ -165,8 +177,31 @@ GridGraphResult buildGridGraph(GraphManager& graph, const StateVec& state,
     if (num_nodes[i] == 0) num_nodes[i] = 1;
   }
 
-  const double cos_h = heading != 0.0 ? std::cos(heading) : 1.0;
-  const double sin_h = heading != 0.0 ? std::sin(heading) : 0.0;
+  // The heading does not turn a world-aligned lattice.
+  const bool rotated = heading != 0.0 && !grid.world_aligned;
+  const double cos_h = rotated ? std::cos(heading) : 1.0;
+  const double sin_h = rotated ? std::sin(heading) : 0.0;
+  // Lattice cell (i, j, k) in the map frame. World-aligned centres are
+  // whole multiples of the resolution, exactly the same from every pose.
+  const auto cellAt = [&](int i, int j, int k) {
+    if (grid.world_aligned) {
+      return Eigen::Vector3d(
+          static_cast<double>(first_cell[0] + i) * grid.resolution.x(),
+          static_cast<double>(first_cell[1] + j) * grid.resolution.y(),
+          static_cast<double>(first_cell[2] + k) * grid.resolution.z());
+    }
+    double x_val = min_val.x() + i * grid.resolution.x();
+    double y_val = min_val.y() + j * grid.resolution.y();
+    const double z_val = min_val.z() + k * grid.resolution.z();
+    if (heading != 0.0) {
+      const double rx = x_val * cos_h - y_val * sin_h;
+      const double ry = x_val * sin_h + y_val * cos_h;
+      x_val = rx;
+      y_val = ry;
+    }
+    return Eigen::Vector3d(x_val + state.x(), y_val + state.y(),
+                           z_val + state.z());
+  };
 
   int loop_count = 0;
   int num_vertices = 1;
@@ -181,9 +216,12 @@ GridGraphResult buildGridGraph(GraphManager& graph, const StateVec& state,
   columns.reserve(static_cast<std::size_t>(num_nodes[0]) * num_nodes[1]);
   for (int i = 0; i < num_nodes[0]; ++i) {
     for (int j = 0; j < num_nodes[1]; ++j) {
-      const double dx = (i - i0) * grid.resolution.x();
-      const double dy = (j - j0) * grid.resolution.y();
-      columns.emplace_back(std::llround((dx * dx + dy * dy) * 1e6), i, j);
+      const Eigen::Vector2d d =
+          grid.world_aligned
+              ? Eigen::Vector2d(cellAt(i, j, 0).head<2>() - state.head<2>())
+              : Eigen::Vector2d((i - i0) * grid.resolution.x(),
+                                (j - j0) * grid.resolution.y());
+      columns.emplace_back(std::llround(d.squaredNorm() * 1e6), i, j);
     }
   }
   std::stable_sort(columns.begin(), columns.end(),
@@ -198,7 +236,8 @@ GridGraphResult buildGridGraph(GraphManager& graph, const StateVec& state,
   ProfileScope timed_lattice(profile ? &profile->lattice : nullptr);
   const bool aerial = ctx.robot->type == RobotType::kAerialRobot;
   LatticeColumnGround column_ground(ctx.planning->max_step_height);
-  if (ground_robot) column_ground.add(i0, j0, state.z());
+  // The root is a lattice column's cell only in the robot-centred lattice.
+  if (ground_robot && !grid.world_aligned) column_ground.add(i0, j0, state.z());
 
   // Only offer columns beside a connected vertex. A disconnected column
   // is deferred, not discarded: connecting around a wall schedules it.
@@ -214,8 +253,10 @@ GridGraphResult buildGridGraph(GraphManager& graph, const StateVec& state,
       const auto [distance, i, j] = columns[n];
       (void)distance;
       const double x = (i-i0)*grid.resolution.x(), y = (j-j0)*grid.resolution.y();
-      const Eigen::Vector2d world = state.head<2>() +
-          Eigen::Vector2d(cos_h*x-sin_h*y, sin_h*x+cos_h*y);
+      const Eigen::Vector2d world = grid.world_aligned
+          ? Eigen::Vector2d(cellAt(i, j, 0).head<2>())
+          : Eigen::Vector2d(state.head<2>() +
+                Eigen::Vector2d(cos_h*x-sin_h*y, sin_h*x+cos_h*y));
       if ((world-position).norm() > reach+grid.resolution.head<2>().norm()+1e-9) continue;
       scheduled[n] = true;
       ready_columns.insert(n);
@@ -462,35 +503,11 @@ GridGraphResult buildGridGraph(GraphManager& graph, const StateVec& state,
     // levels below start on that ray's way down and meet the same ground
     // (projectSample's column cache).
     if (ground_robot && num_nodes[2] > 1) {
-      double x_val = min_val.x() + i * grid.resolution.x();
-      double y_val = min_val.y() + j * grid.resolution.y();
-      if (heading != 0.0) {
-        const double rx = x_val * cos_h - y_val * sin_h;
-        const double ry = x_val * sin_h + y_val * cos_h;
-        x_val = rx;
-        y_val = ry;
-      }
-      drivingHeight(Eigen::Vector3d(
-          x_val + state.x(), y_val + state.y(),
-          min_val.z() + (num_nodes[2] - 1) * grid.resolution.z() +
-              state.z())).has_value();
+      drivingHeight(cellAt(i, j, num_nodes[2] - 1)).has_value();
     }
     for (int k = 0; k < num_nodes[2]; ++k) {
       if (!charge()) return result;
-      double x_val = min_val.x() + i * grid.resolution.x();
-      double y_val = min_val.y() + j * grid.resolution.y();
-      const double z_val = min_val.z() + k * grid.resolution.z();
-      if (heading != 0.0) {
-        const double rx = x_val * cos_h - y_val * sin_h;
-        const double ry = x_val * sin_h + y_val * cos_h;
-        x_val = rx;
-        y_val = ry;
-      }
-      x_val += state.x();
-      y_val += state.y();
-      const double z_world = z_val + state.z();
-
-      const Eigen::Vector3d cell(x_val, y_val, z_world);
+      const Eigen::Vector3d cell = cellAt(i, j, k);
       const std::optional<double> driving_z = drivingHeight(cell);
       bool added = false;
       const bool refused =
@@ -526,6 +543,11 @@ GridGraphResult buildGridGraph(GraphManager& graph, const StateVec& state,
   // could join where it is; farther out its edge would be clipped to where
   // the sweep's own cells already were.
   const double nudge_reach = ctx.planning->edge_length_max + 0.2;
+  // Across the robot's heading, whether or not the lattice turned with it.
+  const Eigen::Vector3d nudge_across =
+      grid.world_aligned
+          ? Eigen::Vector3d(-std::sin(heading), std::cos(heading), 0.0)
+          : Eigen::Vector3d(-sin_h, cos_h, 0.0);
   for (const Retry& retry : nudges) {
     StateVec query(retry.cell.x(), retry.cell.y(), retry.cell.z(), heading);
     Vertex* nearest = nullptr;
@@ -539,7 +561,7 @@ GridGraphResult buildGridGraph(GraphManager& graph, const StateVec& state,
       if (profile != nullptr) ++profile->nudges;
       bool added = false;
       const Eigen::Vector3d shifted =
-          retry.cell + offset * Eigen::Vector3d(-sin_h, cos_h, 0.0);
+          retry.cell + offset * nudge_across;
       try_cell(shifted, retry.i, retry.j, /*first_pass=*/false, added,
                drivingHeight(shifted));
       if (added) break;

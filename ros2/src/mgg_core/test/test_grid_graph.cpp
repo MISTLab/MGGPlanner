@@ -772,6 +772,39 @@ TEST(GridGraph, LatticeFollowsTheRobotPosition) {
   EXPECT_EQ(r.free_cells, 25);
 }
 
+// A world-aligned lattice puts its cells at the same map positions wherever
+// the robot stands and however it is turned, so certified edges between
+// them can be reused from one pose to the next. The root stays exact.
+TEST(GridGraph, WorldAlignedOverlap) {
+  GridGraphParams g = smallGrid();
+  g.world_aligned = true;
+  const StateVec root_a(0.06, 0.02, 0.0, 0.3);
+  const StateVec root_b(0.19, 0.02, 0.0, -0.4);
+  // Where both robots' lattice bounds overlap.
+  const Eigen::AlignedBox2d overlap(
+      root_b.head<2>() + g.min_val.head<2>(),
+      root_a.head<2>() + g.max_val.head<2>());
+  const auto overlapCells = [&](const StateVec& root) {
+    Fixture f;
+    f.planning.edge_length_min = 0.01;  // a cell beside the root joins too
+    GraphManager graph;
+    graph.addVertex(new Vertex(0, root));
+    const auto r = buildGridGraph(graph, root, g, f.ctx, root[3]);
+    EXPECT_EQ(r.status, GridGraphStatus::kOk);
+    EXPECT_TRUE(graph.getVertex(0)->state == root);
+    std::set<std::pair<double, double>> cells;
+    for (const auto& [id, v] : graph.vertices_map_) {
+      if (id != 0 && overlap.contains(v->state.head<2>()))
+        cells.insert({v->state.x(), v->state.y()});
+    }
+    return cells;
+  };
+  const std::set<std::pair<double, double>> overlap_a = overlapCells(root_a);
+  const std::set<std::pair<double, double>> overlap_b = overlapCells(root_b);
+  ASSERT_GE(overlap_a.size(), 9u);
+  EXPECT_EQ(overlap_a, overlap_b);
+}
+
 TEST(GridGraph, ExplicitBuildRejectsUnknownProjectedEndpointAndKeepsAlternative) {
   ProjectionMismatchSpace map;
   RobotParams robot;

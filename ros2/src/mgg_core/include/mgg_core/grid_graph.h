@@ -39,6 +39,13 @@ struct GridGraphParams {
   Eigen::Vector3d max_val = Eigen::Vector3d(10.0, 10.0, 0.2);
   /// Cell size, metres. No component may be zero.
   Eigen::Vector3d resolution = Eigen::Vector3d(0.5, 0.5, 0.2);
+  /// Lattice cells sit at whole multiples of `resolution` in the map frame,
+  /// covering the robot-relative bounds snapped outward, and the heading no
+  /// longer rotates them: non-root centres repeat exactly across robot
+  /// poses, so certified edge verdicts can be reused (CertificationCache).
+  /// The root stays the robot's exact pose. Resolution must be positive.
+  /// False keeps the robot-centred, heading-rotated legacy lattice.
+  bool world_aligned = false;
 };
 
 /// Ground exploration sweeps retain their nearest-first prefix at this

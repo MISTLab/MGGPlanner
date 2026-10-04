@@ -39,10 +39,13 @@ namespace mgg {
 /// body size), so the z levels of a lattice column that drop onto the same
 /// ground, from the same vertex, are checked once. Valid while the map,
 /// the context and the GroundProjection stay as they were: one build,
-/// under one map lease. Root edges bypass this cache: their physical terrain
+/// under one map lease, unless a CertificationCache withdraws the verdicts a
+/// map change reaches. Root edges bypass this cache: their physical terrain
 /// anchor is independent of the keyed collision sweep. Not thread-safe.
 class EdgeVerdictCache {
  public:
+  /// Elements 0-2 and 3-5 are the exact IEEE-754 bits of the swept start
+  /// and end points (CertificationCache decodes them); the rest are policy.
   using Key = std::array<std::int64_t, 12>;
   struct Verdict {
     ProjectedEdgeStatus status = ProjectedEdgeStatus::kAdmissible;
@@ -56,6 +59,20 @@ class EdgeVerdictCache {
     verdicts_.emplace(key, std::move(verdict));
   }
   std::size_t size() const { return verdicts_.size(); }
+  /// Erases every verdict whose key satisfies `reached`; returns how many.
+  std::size_t eraseIf(const std::function<bool(const Key&)>& reached) {
+    std::size_t erased = 0;
+    for (auto it = verdicts_.begin(); it != verdicts_.end();) {
+      if (reached(it->first)) {
+        it = verdicts_.erase(it);
+        ++erased;
+      } else {
+        ++it;
+      }
+    }
+    return erased;
+  }
+  void clear() { verdicts_.clear(); }
 
  private:
   struct KeyHash {

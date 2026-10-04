@@ -60,6 +60,7 @@ add_library(${PROJECT_NAME}
   src/fleet_coordinator.cpp
   src/random_sampler.cpp
   src/dirty_region.cpp
+  src/certification_cache.cpp
   src/log.cpp)
 target_include_directories(${PROJECT_NAME} PUBLIC
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
@@ -141,6 +142,8 @@ if(BUILD_TESTING)
   target_link_libraries(test_fleet_coordinator ${PROJECT_NAME})
   ament_add_gtest(test_dirty_region test/test_dirty_region.cpp)
   target_link_libraries(test_dirty_region ${PROJECT_NAME})
+  ament_add_gtest(test_certification_cache test/test_certification_cache.cpp)
+  target_link_libraries(test_certification_cache ${PROJECT_NAME})
 endif()
 
 ament_package()
