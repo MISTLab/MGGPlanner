@@ -1,5 +1,6 @@
 #include <fstream>
 #include <iomanip>
+#include <limits>
 #include <sstream>
 #include <unistd.h>
 
@@ -34,7 +35,10 @@ std::string hashFile(const fs::path& file) {
   return out.str();
 }
 
-enum class Extra { None, KnownIdle, UnknownIdle, GuidanceAndZones, MissingTf };
+enum class Extra {
+  None, KnownIdle, UnknownIdle, GuidanceAndZones, MissingTf,
+  DroppedInputs, IdleGap, RestartFeedback, LateScans
+};
 
 struct Bundle {
   fs::path root, manifest, params, output;
@@ -89,8 +93,29 @@ struct Bundle {
     transform.transform.translation.z = origin.z();
     tf.transforms.push_back(transform);
     if (extra != Extra::MissingTf) write(tf, "tf_static", 0.9);
+    if (extra == Extra::DroppedInputs) scan(0.8);
     odometry(1, 0.1);
-    for (int i = 0; i < 12; ++i) scan(1.01 + i * 0.05);
+    for (int i = 0; i < 12; ++i)
+      scan((extra == Extra::LateScans ? 5.1 : 1.01) + i * 0.05);
+    if (extra == Extra::DroppedInputs) {
+      scan(1.65, "unavailable_sensor");
+      nav_msgs::msg::Odometry ignored;
+      ignored.header.frame_id = "other_odom";
+      ignored.pose.pose = mgg_ros::toPoseMsg(mgg_test::basePose(50, 0));
+      write(ignored, "odom", 1.7);
+      ignored.header.frame_id = "odom";
+      ignored.pose.pose.position.x = std::numeric_limits<double>::quiet_NaN();
+      write(ignored, "odom", 1.71);
+      mgg_msgs::msg::GlobalGuidance invalid;
+      invalid.kind = 255;
+      write(invalid, "mgg/global_guidance", 1.72);
+      geometry_msgs::msg::PoseArray zones;
+      zones.header.frame_id = "odom";
+      geometry_msgs::msg::Pose centre;
+      centre.position.x = std::numeric_limits<double>::infinity();
+      zones.poses.push_back(centre);
+      write(zones, "mgg/no_go_zones", 1.73);
+    }
     request("s1", "r1", 1.9);
     if (extra == Extra::GuidanceAndZones) {
       events.back()["payload"]["mode"] = "explore";
@@ -136,9 +161,31 @@ struct Bundle {
       for (int i = 0; i < 4; ++i) scan(3.1 + i * 0.1);
     }
     cycle("s1", "r1", 4, 3);
+    if (extra == Extra::IdleGap) {
+      request("s1", "idle", 4.1);
+      events.back()["payload"]["mode"] = "idle";
+      events.back()["payload"]["continuation"] = true;
+      for (int i = 0; i < 20; ++i) scan(4.11 + i * 0.01);
+    }
     odometry(4.5, 20.1);
     request("s2", "r2", 4.8);
+    if (extra == Extra::IdleGap) scan(4.85);
     cycle("s2", "r2", 5, 4);
+    if (extra == Extra::RestartFeedback) {
+      // Same adapter session, new planner process, distinct recorded epoch.
+      for (std::size_t i = events.size() - 2; i < events.size(); ++i) {
+        events[i]["boot"] = "boot2";
+        events[i]["payload"]["session_id"] = "s1";
+      }
+      events.back()["payload"]["epoch"] = 888;
+      mgg_msgs::msg::LocalPathFeedback stale;
+      stale.session_id = "s1";
+      stale.epoch = 777;
+      stale.sequence_id = 1;
+      stale.state = "executing";
+      stale.progress_m = 9.0;
+      write(stale, "mgg/local_planner/local_path_feedback", 4.9);
+    }
     writer.close();
     save();
   }
@@ -153,9 +200,9 @@ struct Bundle {
     odom.pose.pose = mgg_ros::toPoseMsg(mgg_test::basePose(x, 0.1));
     write(odom, "odom", t);
   }
-  void scan(double t) {
+  void scan(double t, const std::string& frame = "lidar") {
     sensor_msgs::msg::PointCloud2 cloud;
-    cloud.header.frame_id = "lidar";
+    cloud.header.frame_id = frame;
     cloud.header.stamp = rclcpp::Time(static_cast<int64_t>(t * 1e9));
     const auto scan = corridor.odomScan(mgg_test::basePose(0.1, 0.1));
     sensor_msgs::PointCloud2Modifier modifier(cloud);
@@ -227,10 +274,21 @@ TEST(LocalReplay, RealSearchAndTimingScope) {
   EXPECT_GT(rows[3]["reset_count"], 0);
   EXPECT_EQ(rows[0]["measured_scope"], "local_map_ground_invalidation_search");
   EXPECT_GT(rows.back()["load_ms"].get<double>(), 0);
-  EXPECT_EQ(rows.back()["consumed_inputs"], wall.data["inputs"]);
+  json consumed = json::array(), hash_only = json::array();
+  for (const auto& entry : wall.data["inputs"]) {
+    const fs::path path = entry["path"].get<std::string>();
+    if (path.extension() == ".mcap" || path == "events.jsonl") consumed.push_back(entry);
+    else hash_only.push_back(entry);
+  }
+  EXPECT_EQ(rows.back()["consumed_inputs"], consumed);
+  EXPECT_EQ(rows.back()["hash_only_inputs"], hash_only);
   EXPECT_EQ(rows[0]["tags"], json::array({"cold"}));
   EXPECT_EQ(rows[3]["tags"], json::array({"whole_window_invalidation"}));
   EXPECT_GT(rows[0]["duration_ms"].get<double>(), 0);
+  EXPECT_EQ(rows[0]["callback_count"], 0);
+  EXPECT_EQ(rows[1]["callback_count"], 1);  // active feedback
+  EXPECT_EQ(rows[2]["callback_count"], 4);  // four active wall scans
+  EXPECT_EQ(rows[3]["callback_count"], 0);  // new session starts a fresh window
 }
 TEST(LocalReplay, RequestsFromEvents) {
   Bundle bundle;
@@ -314,9 +372,77 @@ TEST(LocalReplay, RecordedGuidanceAndNoGoZonesAreApplied) {
   EXPECT_EQ(rows.back()["input_counts"]["/robot_0/mgg/no_go_zones"], 1);
 }
 TEST(LocalReplay, MissingStampedTfFails) {
-  Bundle b(true, true, Extra::MissingTf);
-  EXPECT_NE(mgg::runLocalReplay(b.manifest, b.output, b.params), 0);
+  Bundle b(false, true, Extra::MissingTf);
+  testing::internal::CaptureStderr();
+  const int result = mgg::runLocalReplay(b.manifest, b.output, b.params);
+  const auto error = testing::internal::GetCapturedStderr();
+  EXPECT_NE(result, 0);
+  EXPECT_NE(error.find("no scan was integrated"), std::string::npos);
   EXPECT_FALSE(fs::exists(b.output));
+}
+TEST(LocalReplay, ProductionDropsAreCountedWithoutAborting) {
+  Bundle b(true, true, Extra::DroppedInputs);
+  const auto rows = b.run();
+  ASSERT_EQ(rows.size(), 5u);
+  EXPECT_FALSE(rows[0]["path"].is_null());
+  EXPECT_EQ(rows[1]["progress_m"], 0.5);
+  EXPECT_EQ(rows.back()["dropped_scans"], 2);
+  EXPECT_EQ(rows.back()["integrated_scans"], 16);
+  EXPECT_EQ(rows.back()["ignored_odometry"], 2);
+  EXPECT_EQ(rows.back()["ignored_guidance"], 1);
+  EXPECT_EQ(rows.back()["ignored_no_go_centres"], 1);
+  EXPECT_EQ(rows.back()["cycles_with_usable_scan"], 3);
+}
+TEST(LocalReplay, PreSessionAndIdleWorkIsNotBilledToCycles) {
+  Bundle b(false, false, Extra::IdleGap);
+  const auto rows = b.run();
+  ASSERT_EQ(rows.size(), 5u);
+  // Initial 12 scans and the 20 scans in IDLE are really integrated, but only
+  // the scan after the second active request belongs to that cold cycle.
+  EXPECT_EQ(rows.back()["integrated_scans"], 33);
+  EXPECT_EQ(rows[0]["callback_count"], 0);
+  EXPECT_EQ(rows[1]["callback_count"], 0);
+  EXPECT_EQ(rows[2]["callback_count"], 0);
+  EXPECT_EQ(rows[3]["callback_count"], 1);
+}
+TEST(LocalReplay, TrailingScansCannotQualifyUnobservedCycles) {
+  Bundle b(false, false, Extra::LateScans);
+  testing::internal::CaptureStderr();
+  const int result = mgg::runLocalReplay(b.manifest, b.output, b.params);
+  const auto error = testing::internal::GetCapturedStderr();
+  EXPECT_NE(result, 0);
+  EXPECT_NE(error.find("no planning cycle had a usable scan"), std::string::npos);
+  EXPECT_FALSE(fs::exists(b.output));
+}
+TEST(LocalReplay, HashOnlyInputsAreNotReportedAsConsumed) {
+  Bundle b;
+  std::ofstream(b.root / "unused-map.json") << "{}";
+  const json extra = {{"path", "unused-map.json"}, {"kind", "map_product"},
+                      {"sha256", hashFile(b.root / "unused-map.json")}};
+  b.data["inputs"].push_back(extra);
+  std::ofstream(b.manifest) << b.data.dump();
+  const auto rows = b.run();
+  ASSERT_EQ(rows.size(), 5u);
+  const auto& consumed = rows.back()["consumed_inputs"];
+  ASSERT_TRUE(consumed.is_array());
+  ASSERT_EQ(consumed.size(), 2u);  // one MCAP, one events stream
+  for (const auto& input : consumed) {
+    const fs::path path = input["path"].get<std::string>();
+    EXPECT_TRUE(path.extension() == ".mcap" || path == "events.jsonl");
+  }
+  const auto& hash_only = rows.back()["hash_only_inputs"];
+  ASSERT_TRUE(hash_only.is_array());
+  ASSERT_EQ(hash_only.size(), 2u);  // bag metadata and unused map product
+  EXPECT_NE(std::find(hash_only.begin(), hash_only.end(), extra), hash_only.end());
+}
+TEST(LocalReplay, KnownForeignEpochAfterRestartIsIgnored) {
+  Bundle b(true, false, Extra::RestartFeedback);
+  const auto rows = b.run();
+  ASSERT_EQ(rows.size(), 5u);
+  EXPECT_EQ(rows[3]["session_id"], "s1");
+  EXPECT_EQ(rows[3]["progress_m"], 0.0);
+  EXPECT_EQ(rows.back()["ignored_stale_feedback"], 1);
+  EXPECT_TRUE(rows[3]["path"].is_null());
 }
 TEST(LocalReplay, InputSymlinkAndEscapingPathFail) {
   Bundle b;

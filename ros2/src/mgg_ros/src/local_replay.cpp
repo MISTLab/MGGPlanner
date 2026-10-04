@@ -116,6 +116,7 @@ struct Event {
 };
 struct Bundle {
   json manifest;
+  json consumed_inputs = json::array(), hash_only_inputs = json::array();
   std::vector<BagInput> bag;
   std::vector<Event> events;
   LocalPlanningParams params;
@@ -181,6 +182,7 @@ Bundle load(const fs::path& manifest_path, const fs::path& params_path) {
   b.params = parameters(params_path, robot);
   b.params_hash = fileDigest(params_path);
   std::set<std::string> names;
+  std::set<fs::path> opened_inputs;
   std::vector<fs::path> bags;
   fs::path event_file;
   for (const auto& entry : j.at("inputs")) {
@@ -215,6 +217,7 @@ Bundle load(const fs::path& manifest_path, const fs::path& params_path) {
     rosbag2_storage::StorageOptions storage;
     storage.uri = file.string(); storage.storage_id = "mcap";
     reader.open(storage);
+    opened_inputs.insert(file);
     for (const auto& topic : reader.get_all_topics_and_types()) {
       const auto it = types.find(topic.name);
       if (it != types.end()) require(topic.type == it->second,
@@ -238,6 +241,8 @@ Bundle load(const fs::path& manifest_path, const fs::path& params_path) {
   std::stable_sort(b.bag.begin(), b.bag.end(),
                    [](const auto& a, const auto& c) { return a.time < c.time; });
   std::ifstream stream(event_file);
+  require(bool(stream), "cannot read " + event_file.string());
+  opened_inputs.insert(event_file);
   std::vector<json> requests;
   double previous = -std::numeric_limits<double>::infinity();
   std::size_t line = 0, cycles = 0;
@@ -277,9 +282,15 @@ Bundle load(const fs::path& manifest_path, const fs::path& params_path) {
             window.at("tag").is_string(), "invalid scenario window");
   }
   // Detect any file changed during loading, including the explicit params.
-  for (const auto& entry : j.at("inputs"))
-    require(fileDigest(inputPath(root, entry.at("path"))) == entry.at("sha256"),
+  for (const auto& entry : j.at("inputs")) {
+    const auto file = inputPath(root, entry.at("path"));
+    require(fileDigest(file) == entry.at("sha256"),
             "input changed during loading: " + entry.at("path").get<std::string>());
+    // Report actual reader/stream opens separately from integrity-only reads.
+    // Bag metadata and unused map products must not claim replay consumption.
+    (opened_inputs.count(file) ? b.consumed_inputs : b.hash_only_inputs)
+        .push_back(entry);
+  }
   require(fileDigest(params_path) == b.params_hash, "local params changed during loading");
   return b;
 }
@@ -306,10 +317,15 @@ struct Replay {
   std::map<Identity, std::uint64_t> publications;
   json sessions = json::array(), counts = json::object();
   std::size_t resets = 0, unmatched_idle_feedback = 0;
+  std::size_t dropped_scans = 0, integrated_scans = 0, cycles_with_usable_scan = 0;
+  std::size_t ignored_odometry = 0, ignored_guidance = 0, ignored_no_go_centres = 0;
+  std::size_t ignored_stale_feedback = 0, callback_count = 0;
+  bool core_has_scan = false;
   double accumulated_ms = 0;
 
   explicit Replay(const Bundle& b) : bundle(b) { newCore(); }
   void newCore() {
+    core_has_scan = false;
     core = std::make_unique<LocalPlanningCore>(bundle.params);
     core->setFrameLookup([this](const std::string& frame) -> std::optional<Eigen::Isometry3d> {
       if (odom_frame.empty()) return std::nullopt;
@@ -326,12 +342,23 @@ struct Replay {
     });
   }
   void count(const std::string& name) { counts[name] = counts.value(name, 0u) + 1; }
+  bool active() const {
+    return !core->sessionId().empty() && core->mode() != LocalMode::kIdle;
+  }
+  void clearTiming() {
+    accumulated_ms = 0;
+    callback_count = 0;
+  }
   void apply(const BagInput& input) {
+    const bool measured = active();
     const auto start = Clock::now();
     std::visit([&](const auto& m) { applyMessage(m, input.topic); }, input.message);
-    // Include integration, withdrawal and recheck work done by callbacks,
-    // not just LocalPlanningCore::plan's search timer.
-    accumulated_ms += milliseconds(Clock::now() - start);
+    // Integrate even while idle, as production does, but bill only callbacks
+    // in the active cycle window, not pre-session or IDLE background work.
+    if (measured) {
+      accumulated_ms += milliseconds(Clock::now() - start);
+      ++callback_count;
+    }
     count(input.topic);
   }
   void applyMessage(const TF& m, const std::string& topic) {
@@ -341,24 +368,50 @@ struct Replay {
   }
   void applyMessage(const Odom& m, const std::string&) {
     const auto pose = mgg_ros::fromPoseMsg(m.pose.pose);
-    require(pose.allFinite() && !m.header.frame_id.empty(), "invalid odometry");
-    require(odom_frame.empty() || odom_frame == m.header.frame_id, "odometry frame changed");
+    if (!pose.allFinite() || m.header.frame_id.empty() ||
+        (!odom_frame.empty() && odom_frame != m.header.frame_id)) {
+      ++ignored_odometry;
+      return;
+    }
     odom_frame = m.header.frame_id; base = pose;
-    if (core->onOdometry(pose).everything) ++resets;
+    if (core->onOdometry(pose).everything) {
+      ++resets;
+      core_has_scan = false;
+    }
   }
   void applyMessage(const Cloud& m, const std::string&) {
-    require(base.has_value(), "scan missing preceding odometry");
+    if (!base || odom_frame.empty()) {
+      ++dropped_scans;
+      return;
+    }
     const auto scan = scanInOdom(m, tf, odom_frame);
-    require(scan.has_value(), "scan missing TF at stamp: " + m.header.frame_id);
+    if (!scan) {
+      ++dropped_scans;
+      return;
+    }
+    const auto dropped_before = core->droppedScans();
     core->onScan(*scan, *base);
+    if (core->droppedScans() != dropped_before) {
+      ++dropped_scans;
+      return;
+    }
+    ++integrated_scans;
+    core_has_scan = core_has_scan || !scan->points.empty();
   }
   void applyMessage(const Guidance& m, const std::string&) {
-    core->setGuidance(fromGuidanceMsg(m));
+    try {
+      core->setGuidance(fromGuidanceMsg(m));
+    } catch (const std::invalid_argument&) {
+      ++ignored_guidance;
+    }
   }
   void applyMessage(const Zones& m, const std::string&) {
     std::vector<Eigen::Vector2d> centres;
     for (const auto& p : m.poses) {
-      require(std::isfinite(p.position.x) && std::isfinite(p.position.y), "invalid no-go zone");
+      if (!std::isfinite(p.position.x) || !std::isfinite(p.position.y)) {
+        ++ignored_no_go_centres;
+        continue;
+      }
       centres.emplace_back(p.position.x, p.position.y);
     }
     const auto box = core->params().robot.getPlanningSize();
@@ -371,6 +424,18 @@ struct Replay {
     auto feedback = fromFeedbackMsg(m);
     // Preserve foreign-session rejection without translating into a live path.
     if (feedback.session_id != core->sessionId()) { core->onFeedback(feedback); return; }
+    const auto current_epochs = bundle.epochs.find({boot, m.session_id});
+    if (current_epochs == bundle.epochs.end() || !current_epochs->second.count(m.epoch)) {
+      for (const auto& entry : bundle.epochs) {
+        if (entry.first.first != boot && entry.first.second == m.session_id &&
+            entry.second.count(m.epoch)) {
+          // A known other process's epoch is foreign to the current core,
+          // even when the adapter kept the same session across the restart.
+          ++ignored_stale_feedback;
+          return;
+        }
+      }
+    }
     require(m.state == Feedback::EXECUTING || m.state == Feedback::IDLE,
             "unknown local_path_feedback state");
     if (feedback.executing || m.sequence_id != 0) {
@@ -392,17 +457,20 @@ struct Replay {
   void request(const Event& event) {
     const auto start = Clock::now();
     const std::string current_boot = event.value.at("boot");
+    const auto& recorded = *event.request;
+    if (!active() || recorded.request.mode == LocalMode::kIdle ||
+        recorded.request.session_id != core->sessionId() || boot != current_boot)
+      clearTiming();
     if (!boot.empty() && boot != current_boot) {
       newCore(); publications.clear(); ++resets;
       if (base) core->onOdometry(*base);
     }
     boot = current_boot;
-    const auto& recorded = *event.request;
     require(recorded.continuation == (recorded.request.session_id == core->sessionId()),
             "local_request continuation mismatch");
     const auto result = core->setMode(recorded.request);
     require(result.accepted, "local_request rejected: " + result.reason);
-    accumulated_ms += milliseconds(Clock::now() - start);
+    if (active()) accumulated_ms += milliseconds(Clock::now() - start);
     sessions.push_back(core->sessionId());
     count("local_request");
   }
@@ -415,10 +483,12 @@ struct Replay {
     const auto deadline = start + std::chrono::duration_cast<Clock::duration>(
         std::chrono::duration<double>(kLocalPlanningBudgetS + 2 * bundle.params.ground_recheck_s));
     const double progress = core->progress();
+    if (core_has_scan) ++cycles_with_usable_scan;
     const auto result = core->plan(deadline);
     const auto invalidations = core->takeInvalidations();
     const double duration = accumulated_ms + milliseconds(Clock::now() - start);
-    accumulated_ms = 0;
+    const auto measured_callbacks = callback_count;
+    clearTiming();
     if (result.path && p.contains("sequence_id") && p.contains("epoch")) {
       const Identity key{core->sessionId(), p.at("epoch").get<std::uint64_t>(),
                          p.at("sequence_id").get<std::uint64_t>()};
@@ -440,6 +510,7 @@ struct Replay {
             {"complete", result.checks_complete}, {"status", status},
             {"output_digest", digest(json({{"path", path}, {"status", status}}).dump())},
             {"path", path}, {"progress_m", progress}, {"tags", tags},
+            {"callback_count", measured_callbacks},
             {"reset_count", resets}, {"invalidations", invalidations.size()},
             {"admitted_cells", std::count(occupancy.begin(), occupancy.end(), 0)}};
   }
@@ -466,15 +537,23 @@ int runLocalReplay(const fs::path& manifest, const fs::path& output,
       if (event.request) replay.request(event);
       if (event.value.at("kind") == "local_plan") rows.push_back(replay.cycle(event));
     }
-    // Validate trailing recorded callbacks too; they must not hide missing TF
-    // or unmatched feedback merely because there is no subsequent plan event.
+    // Consume trailing callbacks too, including drops and stale feedback,
+    // without allowing a trailing scan to qualify unobserved planning cycles.
     while (bag_index < b.bag.size()) replay.apply(b.bag[bag_index++]);
     require(!rows.empty(), "no local planning cycles");
+    require(replay.integrated_scans > 0, "no scan was integrated (missing usable scan/TF input)");
+    require(replay.cycles_with_usable_scan > 0, "no planning cycle had a usable scan");
     const json summary = {{"summary", true}, {"component", "local"},
         {"load_ms", load_ms}, {"cycles", rows.size()}, {"failures", 0},
-        {"runner_version", "mgg_local_replay/1"}, {"consumed_inputs", b.manifest.at("inputs")},
+        {"runner_version", "mgg_local_replay/1"}, {"consumed_inputs", b.consumed_inputs},
+        {"hash_only_inputs", b.hash_only_inputs},
         {"core_sessions", replay.sessions}, {"input_counts", replay.counts},
         {"unmatched_idle_feedback", replay.unmatched_idle_feedback},
+        {"dropped_scans", replay.dropped_scans}, {"integrated_scans", replay.integrated_scans},
+        {"cycles_with_usable_scan", replay.cycles_with_usable_scan},
+        {"ignored_odometry", replay.ignored_odometry}, {"ignored_guidance", replay.ignored_guidance},
+        {"ignored_no_go_centres", replay.ignored_no_go_centres},
+        {"ignored_stale_feedback", replay.ignored_stale_feedback},
         {"local_params", fs::absolute(local_params).string()}, {"local_params_sha256", b.params_hash}};
     // Never expose a partially successful run as a C5 report.
     const fs::path temporary = output.string() + ".tmp";
