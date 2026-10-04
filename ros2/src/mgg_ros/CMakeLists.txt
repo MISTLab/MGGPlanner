@@ -38,6 +38,8 @@ find_package(nav_msgs REQUIRED)
 find_package(sensor_msgs REQUIRED)
 find_package(std_srvs REQUIRED)
 find_package(nlohmann_json REQUIRED)
+find_package(rosbag2_cpp REQUIRED)
+find_package(OpenSSL REQUIRED)
 
 add_library(${PROJECT_NAME}
   src/param_loader.cpp
@@ -50,20 +52,21 @@ add_library(${PROJECT_NAME}
   src/local_path_conversions.cpp
   src/local_planner_node.cpp
   src/local_planning_core.cpp
+  src/local_replay.cpp
   src/planner_node.cpp
   src/scan_input.cpp)
 target_include_directories(${PROJECT_NAME} PUBLIC
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
   $<INSTALL_INTERFACE:include>)
 target_link_libraries(${PROJECT_NAME} mgg_core::mgg_core
-  mgg_map_octomap::mgg_map_octomap Eigen3::Eigen nlohmann_json::nlohmann_json)
+  mgg_map_octomap::mgg_map_octomap Eigen3::Eigen nlohmann_json::nlohmann_json OpenSSL::Crypto)
 # The cloud_octomap map backend exists only if mgg_map_octomap has OctoMap.
 if(mgg_map_octomap_WITH_OCTOMAP)
   target_compile_definitions(${PROJECT_NAME} PRIVATE MGG_WITH_OCTOMAP)
 endif()
 ament_target_dependencies(${PROJECT_NAME}
   rclcpp std_msgs geometry_msgs visualization_msgs tf2 tf2_msgs tf2_ros
-  tf2_geometry_msgs mgg_msgs nav_msgs sensor_msgs std_srvs)
+  tf2_geometry_msgs mgg_msgs nav_msgs sensor_msgs std_srvs rosbag2_cpp)
 
 add_executable(mggplanner_node src/planner_main.cpp)
 target_link_libraries(mggplanner_node ${PROJECT_NAME})
@@ -75,6 +78,10 @@ target_link_libraries(mgg_local_planner_node ${PROJECT_NAME})
 ament_target_dependencies(mgg_local_planner_node rclcpp)
 install(TARGETS mgg_local_planner_node DESTINATION lib/${PROJECT_NAME})
 
+add_executable(mgg_local_replay src/local_replay_main.cpp)
+target_link_libraries(mgg_local_replay ${PROJECT_NAME})
+install(TARGETS mgg_local_replay DESTINATION lib/${PROJECT_NAME})
+
 install(DIRECTORY include/ DESTINATION include)
 install(DIRECTORY config DESTINATION share/${PROJECT_NAME})
 install(TARGETS ${PROJECT_NAME} EXPORT export_${PROJECT_NAME}
@@ -83,7 +90,7 @@ install(TARGETS ${PROJECT_NAME} EXPORT export_${PROJECT_NAME}
 ament_export_targets(export_${PROJECT_NAME} HAS_LIBRARY_TARGET)
 ament_export_dependencies(mgg_core mgg_msgs mgg_map_octomap rclcpp
   geometry_msgs visualization_msgs tf2_msgs tf2_ros nav_msgs sensor_msgs std_srvs
-  Eigen3 nlohmann_json)
+  Eigen3 nlohmann_json rosbag2_cpp OpenSSL)
 ament_export_include_directories(include)
 
 if(BUILD_TESTING)
@@ -122,6 +129,9 @@ if(BUILD_TESTING)
   ament_add_gtest(test_local_path_conversions test/test_local_path_conversions.cpp)
   target_link_libraries(test_local_path_conversions ${PROJECT_NAME})
   ament_target_dependencies(test_local_path_conversions mgg_msgs)
+  ament_add_gtest(test_local_replay test/test_local_replay.cpp TIMEOUT 300)
+  target_link_libraries(test_local_replay ${PROJECT_NAME} OpenSSL::Crypto)
+  ament_target_dependencies(test_local_replay rosbag2_cpp)
   ament_add_gtest(test_local_events test/test_local_events.cpp)
   target_link_libraries(test_local_events ${PROJECT_NAME})
   ament_target_dependencies(test_local_events mgg_msgs)
