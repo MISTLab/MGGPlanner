@@ -24,3 +24,11 @@ TEST(ExplorationEvent, RejectsOversizeAndNonfinite) {
   EXPECT_THROW(mgg_ros::explorationEventLine("goal", "r", {{"duration_ms", std::numeric_limits<double>::infinity()}}, 1.0), std::invalid_argument);
   EXPECT_THROW(mgg_ros::explorationEventLine("goal", "r", nlohmann::json::object(), std::numeric_limits<double>::quiet_NaN()), std::invalid_argument);
 }
+
+TEST(ExplorationEvent, ReservesLogTransportHeadroom) {
+  EXPECT_THROW(mgg_ros::explorationEventLine("goal", "r", {{"reason", std::string(15400, 'x')}}, 1.0), std::invalid_argument);
+  const nlohmann::json payload = {{"reason", std::string(15000, 'x')}};
+  const auto line = mgg_ros::explorationEventLine("goal", "r", payload, 1.0);
+  EXPECT_LE(line.size() + 1024, 16384u);
+  EXPECT_EQ(nlohmann::json::parse(line.substr(7))["payload"], payload);
+}

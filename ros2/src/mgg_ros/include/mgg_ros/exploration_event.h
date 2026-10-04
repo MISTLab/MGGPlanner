@@ -65,8 +65,11 @@ inline std::string explorationEventLine(const std::string& kind,
       {"stamp", stamp_s ? nlohmann::json(*stamp_s) : nlohmann::json(nullptr)},
       {"wall", wall}, {"boot", boot}, {"seq", seq}, {"payload", payload}};
   const std::string line = "SDEVT1 " + event.dump();
-  if (line.size() > 16384)
-    throw std::invalid_argument("exploration event exceeds 16384 bytes");
+  // Consumers accept 16384 bytes; leave room for RCLCPP/launch prefixes and
+  // the newline before Docker splits a stdout record into log chunks.
+  constexpr size_t transport_budget = 16384 - 1024;
+  if (line.size() > transport_budget)
+    throw std::invalid_argument("exploration event exceeds 15360-byte log transport budget");
   ++seq;
   return line;
 }
