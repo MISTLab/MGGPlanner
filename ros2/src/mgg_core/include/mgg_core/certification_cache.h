@@ -42,18 +42,21 @@ struct DependencyHalos {
 };
 
 /// Halos for a ground robot on a map of `resolution`, whose ground
-/// projection looks `max_projection_length` down:
-///  * edge: XY half the planning-box diagonal, plus the bridged ground cells
-///    beside the sweep ((kGroundBridgeCells + 1) resolutions), plus twice the
-///    planning offset (the reversed footprint of an offset body); below the
-///    projection length; above the body height plus the offset height and
-///    a resolution;
+/// projection looks `max_projection_length` (P) down, with probe offset
+/// o = max(0.2, 2 resolution) and g = max_ground_height:
+///  * edge: XY the larger of half the planning-box diagonal plus the bridged
+///    ground cells beside the sweep ((kGroundBridgeCells + 1) resolutions)
+///    and o plus a resolution, plus twice the planning offset (the reversed
+///    footprint of an offset body); below max(0, P + resolution - g) (how
+///    far a projected point can sit below its swept point) plus 2 P (its
+///    ground rays, then a bridge's hole check under the ground they found)
+///    plus 2 resolutions; above the largest of the body height, g plus half
+///    the body height and o, plus the offset height and a resolution;
 ///  * turn: XY the turning radius plus the physical offset and a resolution;
-///    below the deeper of the projection length and 2 max_ground_height,
+///    below the deepest of P, 2 g and the standing-start ground depth (5 m),
 ///    above the body height, each plus the offset height and a resolution;
 ///  * slope (groundSlope over max(robot length, width)): XY that radius plus
-///    a resolution; below the projection length plus a resolution; above a
-///    resolution.
+///    a resolution; below P plus a resolution; above a resolution.
 DependencyHalos dependencyHalos(const RobotParams& robot,
                                 const PlanningParams& planning,
                                 double resolution,

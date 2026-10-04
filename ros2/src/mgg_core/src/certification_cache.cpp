@@ -23,6 +23,10 @@ double fromBits(std::int64_t bits) {
   return value;
 }
 
+/// How far down turnSpaceObserved looks under a standing start
+/// (path_turns.cpp, kStandingGroundDepth), whatever the projection length.
+constexpr double kStandingTurnGroundDepth = 5.0;
+
 Eigen::AlignedBox3d around(const Eigen::Vector3d& lo, const Eigen::Vector3d& hi,
                            double xy, double below, double above) {
   return Eigen::AlignedBox3d(lo - Eigen::Vector3d(xy, xy, below),
@@ -40,18 +44,40 @@ DependencyHalos dependencyHalos(const RobotParams& robot,
   const double offset_z = std::abs(robot.center_offset.z());
   const double physical_offset_xy =
       robot.physicalOffsetForHeading(0.0).head<2>().norm();
+  const double projection = max_projection_length;
+  const double ground_height = planning.max_ground_height;
+  // GroundProjection's projectSample probes start this far above and beside
+  // a sample (ground_projection.cpp, probeOffset).
+  const double probe = std::max(0.20, 2.0 * resolution);
   DependencyHalos halos;
-  halos.edge_xy = 0.5 * box.head<2>().norm() + 2.0 * offset_xy +
-                  (kGroundBridgeCells + 1) * resolution;
-  halos.edge_below = max_projection_length;
-  halos.edge_above = box.z() + offset_z + resolution;
+  halos.edge_xy = std::max(0.5 * box.head<2>().norm() +
+                               (kGroundBridgeCells + 1) * resolution,
+                           probe + resolution) +
+                  2.0 * offset_xy;
+  // Every read of an edge check, from the swept key points down
+  // (getProjectedEdgeStatus): a projected point stands max_ground_height
+  // over ground its sample's ray found, at most a projection length and a
+  // voxel below the sample; the body, the cross-slope and footprint rays
+  // and the ground-ahead rays start at or above it and reach a projection
+  // length further; a ground bridge's hole check (groundBridged) reads from
+  // the bridged ground, which such a ray found, down another projection
+  // length. Each step adds a voxel of slack.
+  const double projected_drop =
+      std::max(0.0, projection + resolution - ground_height);
+  halos.edge_below = projected_drop + 2.0 * projection + 2.0 * resolution;
+  // Upwards: a projected point rises at most max_ground_height over its
+  // sample, with half the body above it; projectSample's rays start a probe
+  // offset above the sample.
+  halos.edge_above =
+      std::max({box.z(), ground_height + 0.5 * box.z(), probe}) + offset_z +
+      resolution;
   halos.turn_xy = robot.turningRadius() + physical_offset_xy + resolution;
   halos.turn_below =
-      std::max(max_projection_length, 2.0 * planning.max_ground_height) +
+      std::max({projection, 2.0 * ground_height, kStandingTurnGroundDepth}) +
       offset_z + resolution;
   halos.turn_above = box.z() + offset_z + resolution;
   halos.slope_xy = std::max(robot.size.x(), robot.size.y()) + resolution;
-  halos.slope_below = max_projection_length + resolution;
+  halos.slope_below = projection + resolution;
   halos.slope_above = resolution;
   return halos;
 }

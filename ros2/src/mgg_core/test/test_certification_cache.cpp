@@ -126,6 +126,129 @@ EdgeSet build(const Scene& scene, const MapInterface& map,
   return edgesOf(graph);
 }
 
+/// Voxels with unknown space: observed free air from z = 0 up, an observed
+/// floor layer of voxels from -0.2 to 0 except at `unseen` columns, and
+/// unknown everywhere under the floor; `voxels` overrides single voxels.
+class VoxelTerrain : public MapInterface {
+ public:
+  using Key = std::array<std::int64_t, 3>;
+
+  std::set<std::pair<std::int64_t, std::int64_t>> unseen;
+  std::map<Key, VoxelStatus> voxels;
+
+  static Key keyAt(const Eigen::Vector3d& p) {
+    return {static_cast<std::int64_t>(std::floor(p.x() / kResolution)),
+            static_cast<std::int64_t>(std::floor(p.y() / kResolution)),
+            static_cast<std::int64_t>(std::floor(p.z() / kResolution))};
+  }
+  static Eigen::AlignedBox3d boxOf(const Key& k) {
+    const Eigen::Vector3d lo(k[0] * kResolution, k[1] * kResolution,
+                             k[2] * kResolution);
+    return Eigen::AlignedBox3d(lo, lo + Eigen::Vector3d::Constant(kResolution));
+  }
+  VoxelStatus at(const Key& k) const {
+    const auto set = voxels.find(k);
+    if (set != voxels.end()) return set->second;
+    if (k[2] >= 0) return VoxelStatus::kFree;
+    if (k[2] == -1 && unseen.count({k[0], k[1]}) == 0) {
+      return VoxelStatus::kOccupied;
+    }
+    return VoxelStatus::kUnknown;
+  }
+
+  double getResolution() const override { return kResolution; }
+  bool getAxisAlignedXYCellCenter(const Eigen::Vector2d& p,
+                                  Eigen::Vector2d& center) const override {
+    center = ((p.array() / kResolution).floor() + 0.5).matrix() * kResolution;
+    return center.allFinite();
+  }
+  bool getStatus() const override { return true; }
+  VoxelStatus getVoxelStatus(const Eigen::Vector3d& p) const override {
+    return at(keyAt(p));
+  }
+  VoxelStatus getRayStatus(const Eigen::Vector3d& a, const Eigen::Vector3d& b,
+                           bool stop_at_unknown) const override {
+    Eigen::Vector3d ignored;
+    return getRayStatus(a, b, stop_at_unknown, ignored);
+  }
+  VoxelStatus getRayStatus(const Eigen::Vector3d& a, const Eigen::Vector3d& b,
+                           bool stop_at_unknown,
+                           Eigen::Vector3d& end_voxel) const override {
+    const double length = (b - a).norm();
+    const int steps =
+        std::max(1, static_cast<int>(std::ceil(length / (0.25 * kResolution))));
+    for (int i = 0; i <= steps; ++i) {
+      const Key k = keyAt(a + (b - a) * (double(i) / steps));
+      const VoxelStatus status = at(k);
+      if (status == VoxelStatus::kOccupied ||
+          (stop_at_unknown && status == VoxelStatus::kUnknown)) {
+        end_voxel = boxOf(k).center();
+        return status;
+      }
+    }
+    end_voxel = b;
+    return VoxelStatus::kFree;
+  }
+  VoxelStatus getBoxStatus(const Eigen::Vector3d& center,
+                           const Eigen::Vector3d& size,
+                           bool stop_at_unknown) const override {
+    const Key lo = keyAt(center - 0.5 * size);
+    const Key hi = keyAt(center + 0.5 * size);
+    bool unknown = false;
+    for (auto x = lo[0]; x <= hi[0]; ++x)
+      for (auto y = lo[1]; y <= hi[1]; ++y)
+        for (auto z = lo[2]; z <= hi[2]; ++z) {
+          const VoxelStatus status = at({x, y, z});
+          if (status == VoxelStatus::kOccupied) return status;
+          unknown = unknown || status == VoxelStatus::kUnknown;
+        }
+    return unknown && stop_at_unknown ? VoxelStatus::kUnknown
+                                      : VoxelStatus::kFree;
+  }
+  VoxelStatus getPathStatus(const Eigen::Vector3d& a, const Eigen::Vector3d& b,
+                            const Eigen::Vector3d& size,
+                            bool stop_at_unknown) const override {
+    const double steps =
+        std::max(1.0, std::ceil((b - a).norm() / kResolution));
+    const Eigen::Vector3d step = (b - a) / steps;
+    for (int i = 0; i <= static_cast<int>(steps); ++i) {
+      const VoxelStatus status =
+          getBoxStatus(a + i * step, size, stop_at_unknown);
+      if (status != VoxelStatus::kFree) return status;
+    }
+    return VoxelStatus::kFree;
+  }
+  void getScanStatus(const Eigen::Vector3d&,
+                     const std::vector<Eigen::Vector3d>&, GainCounts&,
+                     std::vector<std::pair<Eigen::Vector3d, VoxelStatus>>&,
+                     const SensorModel&) override {}
+  void getScanStatusIterative(
+      const Eigen::Vector3d&, const std::vector<Eigen::Vector3d>&,
+      GainCounts&, std::vector<std::pair<Eigen::Vector3d, VoxelStatus>>&,
+      const SensorModel&) override {}
+  bool augmentFreeBox(const Eigen::Vector3d&,
+                      const Eigen::Vector3d&) override {
+    return true;
+  }
+  void augmentFreeFrustum() override {}
+  void resetMap() override {}
+  void extractLocalMap(const Eigen::Vector3d&, const Eigen::Vector3d&,
+                       std::vector<Eigen::Vector3d>&,
+                       std::vector<Eigen::Vector3d>&) override {}
+  void extractLocalMapAlongAxis(const Eigen::Vector3d&,
+                                const Eigen::Vector3d&,
+                                const Eigen::Vector3d&,
+                                std::vector<Eigen::Vector3d>&,
+                                std::vector<Eigen::Vector3d>&) override {}
+  void getLocalPointcloud(const Eigen::Vector3d&, double, double,
+                          std::vector<Eigen::Vector3d>&, bool) override {}
+  void getFreeSpacePointCloud(const std::vector<Eigen::Vector3d>&,
+                              const StateVec&,
+                              std::vector<Eigen::Vector3d>&) override {}
+  void setRaycastingParams(bool, double) override {}
+  void setRobotRadius(double) override {}
+};
+
 TEST(CertificationCache, FloorBelowPoseWithdrawsSlope) {
   const Scene scene;
   Tops tops = flatFloor();
@@ -247,6 +370,56 @@ TEST(CertificationCache, WarmEqualsCold) {
   }
   EXPECT_GT(warm_reused, 0);
   EXPECT_GT(withdrawn, 0);
+}
+
+// review r0, P1: a ground bridge over an unseen floor cell looks for a hole
+// from the bridged ground down a whole projection length, deeper than the
+// edge's own ground rays reach. A voxel seen free only down there disproves
+// the bridge, and the cached admission with it.
+TEST(CertificationCache, BridgeHoleBelowProjectionWithdrawsEdge) {
+  Scene scene;
+  scene.planning.min_observed_ground_fraction = 1.0;  // every cell ahead
+  VoxelTerrain map;
+  map.unseen.insert({2, 1});  // the cell centred (0.5, 0.3), under the body
+  const double projection =
+      GroundProjection(map, scene.planning).max_projection_length;
+  CertificationCache cache(
+      dependencyHalos(scene.robot, scene.planning, kResolution, projection));
+  // The edge from a lattice vertex (not the root) at driving height 0.4,
+  // 0.5 m over the floor's top voxel centre, along y = 0.1.
+  const auto edge = [&](EdgeVerdictCache* verdicts) {
+    const GroundProjection ground(map, scene.planning);
+    ExpandContext ctx = scene.context(map, ground);
+    ctx.edge_verdicts = verdicts;
+    GraphManager graph;
+    graph.addVertex(new Vertex(0, StateVec(-2.0, 0.1, 0.4, 0.0)));
+    auto* parent = new Vertex(1, StateVec(0.1, 0.1, 0.4, 0.0));
+    graph.addVertex(parent);
+    Vertex candidate(2, StateVec(0.9, 0.1, 0.4, 0.0));
+    ExpandGraphReport report;
+    expandGraphFrom(graph, candidate, parent, report, ctx);
+    return report.status;
+  };
+  ASSERT_EQ(edge(nullptr), ExpandGraphStatus::kSuccess);
+  ASSERT_EQ(edge(&cache.edges()), ExpandGraphStatus::kSuccess);
+  ASSERT_GT(cache.edges().size(), 0u);
+
+  // Seen free 4.9 m down the unseen column: below every ray from the edge
+  // (0.4 - P), within the hole check under the bridged floor (-0.1 - P).
+  const VoxelTerrain::Key below{2, 1, -25};
+  MapChange change;
+  change.revision = 1;
+  change.boxes.push_back(VoxelTerrain::boxOf(below));
+  ASSERT_LT(change.boxes[0].max().z(), 0.4 - projection);
+  ASSERT_GT(change.boxes[0].center().z(), -0.1 - projection);
+  map.voxels[below] = VoxelStatus::kFree;
+  cache.withdraw(change);
+  EXPECT_EQ(cache.edges().size(), 0u);
+
+  const ExpandGraphStatus cold = edge(nullptr);
+  const ExpandGraphStatus warm = edge(&cache.edges());
+  EXPECT_NE(cold, ExpandGraphStatus::kSuccess);
+  EXPECT_EQ(warm, cold);
 }
 
 }  // namespace
