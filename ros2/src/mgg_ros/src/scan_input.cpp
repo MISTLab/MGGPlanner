@@ -26,6 +26,10 @@ std::optional<OdomScan> scanInOdom(const sensor_msgs::msg::PointCloud2& cloud,
       !hasFloatField(cloud, "x") || !hasFloatField(cloud, "y") ||
       !hasFloatField(cloud, "z"))
     return std::nullopt;
+  // TF reads a zero time as "latest": an unstamped cloud has no stamp to
+  // place it at.
+  if (cloud.header.stamp.sec == 0 && cloud.header.stamp.nanosec == 0)
+    return std::nullopt;
   const tf2::TimePoint stamp(std::chrono::nanoseconds(
       static_cast<int64_t>(cloud.header.stamp.sec) * 1000000000LL +
       cloud.header.stamp.nanosec));

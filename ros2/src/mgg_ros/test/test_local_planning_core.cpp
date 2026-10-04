@@ -2,6 +2,7 @@
 // session-fenced feedback, no-go zones, inputs in other frames re-transformed
 // every cycle, and retained paths withdrawn when the map changes under them.
 
+#include <algorithm>
 #include <chrono>
 #include <optional>
 
@@ -177,4 +178,111 @@ TEST(LocalPlanningCore, ObstacleOnRetainedPathInvalidates) {
     EXPECT_EQ(next.path->kind, LocalPathKind::kBreak);
     EXPECT_EQ(next.path->extends_sequence_id, first.path->sequence_id);
   }
+}
+
+TEST(LocalPlanningCore, NoGoUpdateWithdrawsRetainedPath) {
+  mgg_test::Corridor corridor;
+  const StateVec base = basePose(0.1, 0.1);
+  const Eigen::Vector2d zone(3.1, 0.1);
+  const double reach = 0.8;
+  LocalPlanningCore core(mgg_test::sceneParams());
+  observe(core, corridor, base);
+  ASSERT_TRUE(
+      core.setMode(follow("s1", "r1", drivingPoint(6.1, 0.1))).accepted);
+  const auto first = core.plan(soon());
+  ASSERT_TRUE(first.path) << first.reason;
+  ASSERT_TRUE(mgg_test::pathCrosses(first.path->poses, zone, reach));
+
+  // Same session: the new zone withdraws the path being driven at once.
+  NoGoZones zones;
+  zones.set({zone}, reach);
+  core.setNoGoZones(zones);
+  auto invalidations = core.takeInvalidations();
+  ASSERT_EQ(invalidations.size(), 1u);
+  EXPECT_EQ(invalidations[0].sequence_id, first.path->sequence_id);
+  EXPECT_EQ(invalidations[0].session_id, "s1");
+  const auto detour = core.plan(soon());
+  ASSERT_TRUE(detour.path) << detour.reason;
+  EXPECT_EQ(detour.path->kind, LocalPathKind::kBreak);
+  EXPECT_EQ(detour.path->extends_sequence_id, first.path->sequence_id);
+  EXPECT_FALSE(mgg_test::pathCrosses(detour.path->poses, zone, reach));
+
+  // Zones re-placed by a later map-to-odometry correction withdraw too.
+  Eigen::Isometry3d odom_T_map = Eigen::Isometry3d::Identity();
+  bool have_map = true;
+  core.setFrameLookup(
+      [&](const std::string& frame) -> std::optional<Eigen::Isometry3d> {
+        if (frame != "map" || !have_map) return std::nullopt;
+        return odom_T_map;
+      });
+  NoGoZones outside;
+  outside.set({Eigen::Vector2d(3.1, 4.1)}, reach);
+  core.setNoGoZones(outside, "map");
+  EXPECT_TRUE(core.takeInvalidations().empty());
+  ASSERT_TRUE(
+      core.setMode(follow("s2", "r2", drivingPoint(6.1, 0.1))).accepted);
+  const auto straight = core.plan(soon());
+  ASSERT_TRUE(straight.path) << straight.reason;
+  ASSERT_TRUE(mgg_test::pathCrosses(straight.path->poses, zone, reach));
+  odom_T_map.translation() = Eigen::Vector3d(0, -4.0, 0);
+  const auto replaced = core.plan(soon());
+  invalidations = core.takeInvalidations();
+  ASSERT_EQ(invalidations.size(), 1u);
+  EXPECT_EQ(invalidations[0].sequence_id, straight.path->sequence_id);
+  ASSERT_TRUE(replaced.path) << replaced.reason;
+  EXPECT_EQ(replaced.path->kind, LocalPathKind::kBreak);
+  EXPECT_FALSE(mgg_test::pathCrosses(replaced.path->poses, zone, reach));
+
+  // Zones without a transform cannot vouch for any path.
+  have_map = false;
+  core.setNoGoZones(outside, "map");
+  invalidations = core.takeInvalidations();
+  ASSERT_EQ(invalidations.size(), 1u);
+  EXPECT_EQ(invalidations[0].sequence_id, replaced.path->sequence_id);
+  EXPECT_EQ(invalidations[0].reason, "no_transform:map");
+}
+
+TEST(LocalPlanningCore, PendingDescendantsWithdrawRetainedPath) {
+  mgg_test::Corridor corridor;
+  LocalPlanningCore core(mgg_test::sceneParams());
+  // The ground flood is seeded where the robot stood first; it then drives
+  // 2 m in steps short of an odometry reset.
+  observe(core, corridor, basePose(0.1, 0.1));
+  for (double x = 0.35; x < 2.1; x += 0.25)
+    observe(core, corridor, basePose(x, 0.1), 2);
+  const StateVec base = basePose(2.1, 0.1);
+  observe(core, corridor, base);
+  ASSERT_TRUE(
+      core.setMode(follow("s1", "r1", drivingPoint(7.1, 0.1))).accepted);
+  const auto path = core.plan(soon());
+  ASSERT_TRUE(path.path) << path.reason;
+  ASSERT_TRUE(core.takeInvalidations().empty());
+  ASSERT_FALSE(path.path->edge_dependencies.empty());
+
+  // An obstacle on the flood seed, behind the robot and out of the path's
+  // reach: the seed's withdrawal withdraws every descendant column, and
+  // with no recheck budget they stay pending.
+  core.setGroundRecheckBudget(0);
+  corridor.obstacle = Eigen::AlignedBox3d(Eigen::Vector3d(-0.3, -0.3, -0.1),
+                                          Eigen::Vector3d(0.1, 0.5, 0.9));
+  MapChange changes;
+  for (int i = 0; i < 4; ++i) {
+    const auto change = core.onScan(corridor.odomScan(base), base);
+    changes.boxes.insert(changes.boxes.end(), change.boxes.begin(),
+                         change.boxes.end());
+    changes.everything |= change.everything;
+  }
+  ASSERT_FALSE(changes.boxes.empty());
+  ASSERT_FALSE(changes.everything);
+  for (const auto& dep : path.path->edge_dependencies)
+    ASSERT_FALSE(changeReaches(changes, dep));
+  ASSERT_TRUE(std::any_of(path.path->edge_dependencies.begin(),
+                          path.path->edge_dependencies.end(),
+                          [&](const Eigen::AlignedBox3d& dep) {
+                            return core.ground().pending(dep);
+                          }));
+
+  const auto invalidations = core.takeInvalidations();
+  ASSERT_EQ(invalidations.size(), 1u);
+  EXPECT_EQ(invalidations[0].sequence_id, path.path->sequence_id);
 }

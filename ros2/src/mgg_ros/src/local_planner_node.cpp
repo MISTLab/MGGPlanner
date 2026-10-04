@@ -214,6 +214,8 @@ void LocalPlannerNode::onNoGoZones(const geometry_msgs::msg::PoseArray& msg) {
   zones.set(std::move(centres),
             no_go_radius_m_ + 0.5 * std::max(box.x(), box.y()));
   core_.setNoGoZones(zones, msg.header.frame_id);
+  // A path the new zones withdraw is reported, and replaced, at once.
+  publishInvalidations(true);
 }
 
 void LocalPlannerNode::onSetMode(const SetMode::Request& request,

@@ -58,6 +58,9 @@ std::vector<rclcpp::Parameter> sceneParameters() {
       rclcpp::Parameter("PlanningParams.min_observed_ground_fraction",
                         p.planning.min_observed_ground_fraction),
       rclcpp::Parameter("PlanningParams.v_max", p.planning.v_max),
+      // Zone reach = radius + half the 1 m body: 0.8 m, which leaves the
+      // corridor a detour.
+      rclcpp::Parameter("PlanningParams.no_go_radius_m", 0.3),
       rclcpp::Parameter("SensorParams.sensor_list",
                         std::vector<std::string>{"lidar"}),
       rclcpp::Parameter("SensorParams.lidar.type", "kLidar"),
@@ -244,6 +247,10 @@ TEST_F(LocalPlannerNodeTest, ResetClearsGroundAndMovesOrigin) {
   h.settle();
   ASSERT_FALSE(h.paths.empty());
   const auto old_origin = h.grids.back().info.origin.position;
+  const size_t invalidations_before = h.invalidations.size();
+  uint64_t certified_revision = 0;
+  for (const auto& path : h.paths)
+    certified_revision = std::max(certified_revision, path.map_revision);
 
   // Odometry jumps 3 m: the window moves, and nothing certified survives.
   h.odometry(basePose(3.1, 0.1));
@@ -261,6 +268,14 @@ TEST_F(LocalPlannerNodeTest, ResetClearsGroundAndMovesOrigin) {
   for (const auto& path : h.paths)
     all_paths_invalidated &= invalidated.count(path.sequence_id) > 0;
   EXPECT_TRUE(all_paths_invalidated);
+  // The reset's invalidations carry the reset's own revision (the status
+  // after the reset reports it; no scan has arrived since), newer than any
+  // revision a path was certified on.
+  ASSERT_GT(h.invalidations.size(), invalidations_before);
+  const uint64_t reset_revision = h.statuses.back().map_revision;
+  EXPECT_GT(reset_revision, certified_revision);
+  for (size_t i = invalidations_before; i < h.invalidations.size(); ++i)
+    EXPECT_EQ(h.invalidations[i].map_revision, reset_revision);
 }
 
 TEST_F(LocalPlannerNodeTest, MovingChurnRecoversWithinOneCycle) {
@@ -402,4 +417,38 @@ TEST_F(LocalPlannerNodeTest, SessionAndRequestEcho) {
   EXPECT_EQ(status.session_id, new_session);
   EXPECT_EQ(status.request_id, latest_request);
   EXPECT_FALSE(old_feedback_applied);
+}
+
+TEST_F(LocalPlannerNodeTest, NoGoUpdateWithdrawsDrivenPath) {
+  Harness h("no_go_update");
+  const StateVec base = basePose(0.1, 0.1);
+  for (int i = 0; i < 12; ++i) {
+    h.step(base);
+    h.t += 0.1;
+  }
+  ASSERT_TRUE(h.setMode("s1", "r1", drivingPoint(6.1, 0.1)).accepted);
+  h.settle();
+  ASSERT_FALSE(h.paths.empty());
+  const LocalPath driven = h.paths.back();
+  const Eigen::Vector2d zone(3.1, 0.1);
+  ASSERT_TRUE(mgg_test::pathCrosses(posesOf(driven), zone, 0.8));
+  const size_t paths_before = h.paths.size();
+
+  // A zone on the driven path, same session: withdrawn and replaced at
+  // once, without waiting for a planning cycle.
+  geometry_msgs::msg::PoseArray zones;
+  zones.header.frame_id = "odom";
+  zones.poses.resize(1);
+  zones.poses[0].position.x = zone.x();
+  zones.poses[0].position.y = zone.y();
+  h.node->onNoGoZones(zones);
+  h.settle();
+  ASSERT_FALSE(h.invalidations.empty());
+  EXPECT_EQ(h.invalidations.back().sequence_id, driven.sequence_id);
+  EXPECT_EQ(h.invalidations.back().session_id, "s1");
+  ASSERT_GT(h.paths.size(), paths_before);
+  const auto& detour = h.paths.back();
+  EXPECT_EQ(detour.kind, LocalPath::BREAK);
+  EXPECT_EQ(detour.extends_sequence_id, driven.sequence_id);
+  EXPECT_FALSE(mgg_test::pathCrosses(posesOf(detour), zone, 0.8));
 }

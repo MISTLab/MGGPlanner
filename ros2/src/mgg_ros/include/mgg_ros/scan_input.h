@@ -17,8 +17,8 @@ namespace mgg {
 
 /// The cloud's finite returns and the sensor frame's origin in `odom_frame`,
 /// both from TF at the cloud's stamp; nullopt when TF has no transform at
-/// that stamp (never the latest transform instead) or the cloud has no
-/// float x/y/z fields.
+/// that stamp (never the latest transform instead), the stamp is zero (TF's
+/// "latest"), or the cloud has no float x/y/z fields.
 std::optional<OdomScan> scanInOdom(const sensor_msgs::msg::PointCloud2& cloud,
                                    const tf2::BufferCore& buffer,
                                    const std::string& odom_frame);

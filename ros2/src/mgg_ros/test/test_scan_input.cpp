@@ -81,4 +81,7 @@ TEST(ScanInput, TfAtStampAndSensorOrigin) {
   const auto cloud_without_tf = cloudAt(12.5, "lidar");
   EXPECT_FALSE(scanInOdom(cloud_without_tf, buffer, "odom"));
   EXPECT_FALSE(scanInOdom(cloudAt(10.5, "unknown_lidar"), buffer, "odom"));
+  // A zero stamp is TF's "latest": it must not place the cloud with the
+  // newest dynamic transform.
+  EXPECT_FALSE(scanInOdom(cloudAt(0.0, "lidar"), buffer, "odom"));
 }

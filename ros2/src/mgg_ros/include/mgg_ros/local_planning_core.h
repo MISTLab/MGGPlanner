@@ -129,12 +129,16 @@ class LocalPlanningCore {
   /// may answer before the local planner hears of the session).
   void setGuidance(const LocalGuidance& guidance);
   /// Zones in `frame_id` (empty: odometry), re-transformed every cycle.
+  /// Retained paths entering them, or every retained path when the zones
+  /// have no transform, are invalidated at once (takeInvalidations).
   void setNoGoZones(const NoGoZones& zones, const std::string& frame_id = {});
   /// Ignored unless it is for the current session and epoch.
   void onFeedback(const LocalFeedback& feedback);
   /// Resolves frames other than the odometry frame. Without it, only
   /// odometry-frame inputs can be planned with.
   void setFrameLookup(FrameLookup lookup) { lookup_ = std::move(lookup); }
+  /// Replaces params.ground_recheck_s for later calls (replay, tests).
+  void setGroundRecheckBudget(double seconds);
   /// One planning cycle. A path it returns carries the epoch, the next
   /// sequence id and the session; the core then treats it as executing
   /// until feedback names another path.
@@ -172,6 +176,11 @@ class LocalPlanningCore {
   MapChange place(const StateVec& anchor, bool* reset);
   void resetAll(const StateVec& anchor, MapChange& change);
   void afterChange(const MapChange& change);
+  /// The zones in the odometry frame; nullopt (naming `failed`) without a
+  /// transform. Empty zones need none.
+  std::optional<NoGoZones> zonesInOdom(std::string& failed) const;
+  void withdrawAgainstZones(const std::optional<NoGoZones>& zones,
+                            const std::string& failed);
   void invalidate(std::uint64_t sequence, const std::string& reason);
   void clearSession();
   std::optional<Eigen::Isometry3d> resolve(const std::string& frame,
@@ -183,6 +192,7 @@ class LocalPlanningCore {
   CertificationCache cache_;
   LocalPlanner planner_;
   FrameLookup lookup_;
+  double ground_recheck_s_;
 
   bool have_pose_ = false;
   StateVec anchor_ = StateVec::Zero();

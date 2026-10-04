@@ -61,7 +61,8 @@ LocalPlanningCore::LocalPlanningCore(const LocalPlanningParams& params)
           params_.robot, params_.planning, map_.getResolution(),
           GroundProjection(map_, params_.planning).max_projection_length)),
       planner_(map_, layer_, cache_, params_.planning, params_.robot,
-               params_.sensor) {}
+               params_.sensor),
+      ground_recheck_s_(params_.ground_recheck_s) {}
 
 StateVec LocalPlanningCore::anchorOf(const StateVec& base) const {
   // The base sits half the body height over its floor; MGG drives at
@@ -76,12 +77,13 @@ double LocalPlanningCore::floorUnder(const StateVec& anchor) const {
 }
 
 void LocalPlanningCore::resetAll(const StateVec& anchor, MapChange& change) {
-  for (auto& entry : retained_)
-    invalidate(entry.first, "odometry jump reset the local map");
   merge(change, map_.reset(anchor.head<3>()));
   layer_.reset(anchor.head<3>(), floorUnder(anchor));
   cache_.flushAll();
   planner_.reset();
+  // After the reset: the invalidations carry the revision that withdrew them.
+  for (auto& entry : retained_)
+    invalidate(entry.first, "odometry jump reset the local map");
 }
 
 MapChange LocalPlanningCore::place(const StateVec& anchor, bool* reset) {
@@ -138,22 +140,41 @@ void LocalPlanningCore::afterChange(const MapChange& change) {
   }
   // Recheck now, so retained paths are judged on completed certification
   // where the budget allows; whatever stays pending fails them below.
-  layer_.recheck(after(params_.ground_recheck_s));
-  if (!changed) return;
+  layer_.recheck(after(ground_recheck_s_));
+  // Ground withdrawals reach beyond the change: a withdrawn flood parent
+  // withdraws its descendants, and so does a scroll or a re-seed. Whatever
+  // is still pending counts as changed for the paths depending on it.
+  const bool pending = layer_.pendingCount() > 0;
+  if (!changed && !pending) return;
   for (auto& [sequence, retained] : retained_) {
     if (retained.invalid) continue;
     const auto& deps = retained.path.edge_dependencies;
-    const bool reached = change.everything || deps.empty() ||
-                         std::any_of(deps.begin(), deps.end(),
-                                     [&](const Eigen::AlignedBox3d& box) {
-                                       return changeReaches(change, box);
-                                     });
+    const auto reaches = [&](const Eigen::AlignedBox3d& box) {
+      return changed && changeReaches(change, box);
+    };
+    bool reached = change.everything || deps.empty() ||
+                   std::any_of(deps.begin(), deps.end(), reaches);
+    if (!reached && pending) {
+      Eigen::AlignedBox3d all;
+      for (const auto& box : deps) all.extend(box);
+      reached = layer_.pending(all) &&
+                std::any_of(deps.begin(), deps.end(),
+                            [&](const Eigen::AlignedBox3d& box) {
+                              return layer_.pending(box);
+                            });
+    }
     if (!reached) continue;
     ++retained_rechecks_;
     const double progress = sequence == executing_sequence_ ? progress_ : 0.0;
     if (!planner_.pathStillCertified(retained.path, progress))
       invalidate(sequence, "map change withdrew the path's certification");
   }
+}
+
+void LocalPlanningCore::setGroundRecheckBudget(double seconds) {
+  if (!std::isfinite(seconds) || seconds < 0)
+    throw std::invalid_argument("ground recheck budget must be finite, >= 0");
+  ground_recheck_s_ = seconds;
 }
 
 void LocalPlanningCore::invalidate(std::uint64_t sequence,
@@ -220,6 +241,41 @@ void LocalPlanningCore::setNoGoZones(const NoGoZones& zones,
                                      const std::string& frame_id) {
   zones_ = zones;
   zones_frame_ = frame_id;
+  std::string failed;
+  withdrawAgainstZones(zonesInOdom(failed), failed);
+}
+
+std::optional<NoGoZones> LocalPlanningCore::zonesInOdom(
+    std::string& failed) const {
+  if (zones_.empty()) return NoGoZones{};
+  const auto T = resolve(zones_frame_, failed);
+  if (!T) return std::nullopt;
+  std::vector<Eigen::Vector2d> centres;
+  for (const auto& c : zones_.centres())
+    centres.push_back((*T * Eigen::Vector3d(c.x(), c.y(), 0)).head<2>());
+  NoGoZones zones;
+  zones.set(std::move(centres), zones_.reaches());
+  return zones;
+}
+
+void LocalPlanningCore::withdrawAgainstZones(
+    const std::optional<NoGoZones>& zones, const std::string& failed) {
+  for (auto& [sequence, retained] : retained_) {
+    if (retained.invalid) continue;
+    if (!zones) {
+      // Zones that cannot be placed cannot vouch for any path.
+      invalidate(sequence, "no_transform:" + failed);
+      continue;
+    }
+    if (zones->empty()) continue;
+    const double progress = sequence == executing_sequence_ ? progress_ : 0.0;
+    const auto remaining =
+        committedPrefix(retained.path, progress, pathLength(retained.path));
+    std::vector<Eigen::Vector3d> points;
+    for (const auto& p : remaining.poses) points.push_back(p.head<3>());
+    if (!zones->pathAdmissible(points))
+      invalidate(sequence, "path enters a no-go zone");
+  }
 }
 
 void LocalPlanningCore::onFeedback(const LocalFeedback& feedback) {
@@ -276,7 +332,7 @@ LocalPlanResult LocalPlanningCore::plan(Clock::time_point deadline) {
     result.reason = "idle";
     return finish();
   }
-  layer_.recheck(std::min(deadline, after(params_.ground_recheck_s)));
+  layer_.recheck(std::min(deadline, after(ground_recheck_s_)));
 
   LocalPlanInputs in;
   std::string failed;
@@ -285,6 +341,14 @@ LocalPlanResult LocalPlanningCore::plan(Clock::time_point deadline) {
     result.reason = "no_transform:" + failed;
     return finish();
   };
+  {
+    // Never plan, nor keep a path, without the zones. Their placement can
+    // move with every map-to-odometry correction: recheck retained paths.
+    const auto zones = zonesInOdom(failed);
+    withdrawAgainstZones(zones, failed);
+    if (!zones) return blocked();
+    in.no_go_zones = *zones;
+  }
   const bool guided = guidance_ && guidance_->kind == GuidanceKind::kTarget;
   std::optional<Eigen::Isometry3d> guidance_T;
   if (guided) {
@@ -303,15 +367,6 @@ LocalPlanResult LocalPlanningCore::plan(Clock::time_point deadline) {
   } else if (guided) {
     in.target = *guidance_T * guidance_->target;
     in.coarse_route = transformed(*guidance_T, guidance_->route);
-  }
-  if (!zones_.empty()) {
-    // Never plan without the zones.
-    const auto T = resolve(zones_frame_, failed);
-    if (!T) return blocked();
-    std::vector<Eigen::Vector2d> centres;
-    for (const auto& c : zones_.centres())
-      centres.push_back((*T * Eigen::Vector3d(c.x(), c.y(), 0)).head<2>());
-    in.no_go_zones.set(std::move(centres), zones_.reaches());
   }
 
   in.pose = anchor_;
