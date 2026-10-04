@@ -73,6 +73,18 @@ enum class GuidanceKind : std::uint8_t {
   kComplete = 2
 };
 
+/// GlobalGuidance's standing_start block (mgg_msgs/StandingStart): the
+/// guidance planner's proof that the robot stands in the disk where it
+/// started. Center is in the guidance frame.
+struct GuidanceStandingStart {
+  bool valid = false;
+  Eigen::Vector3d center = Eigen::Vector3d::Zero();
+  double radius = 0;
+  /// The guidance planner's incarnation; with LocalGuidance::sequence_id,
+  /// the block's identity.
+  std::uint64_t boot = 0;
+};
+
 struct LocalGuidance {
   std::string session_id;
   std::uint64_t sequence_id = 0;
@@ -82,6 +94,7 @@ struct LocalGuidance {
   Eigen::Vector3d target = Eigen::Vector3d::Zero();
   std::vector<Eigen::Vector3d> route;
   std::string reason;
+  GuidanceStandingStart standing_start;
 };
 
 struct LocalFeedback {
@@ -132,6 +145,15 @@ class LocalPlanningCore {
   /// The latest guidance of the current session wins. Guidance of another
   /// session is held until setMode starts that session (the global planner
   /// may answer before the local planner hears of the session).
+  ///
+  /// The current guidance's valid standing_start block, placed in the
+  /// odometry frame once per identity, is applied to the ground layer and
+  /// the planner while the robot's anchor stays in its disk. The core
+  /// revokes it itself when the anchor leaves the disk or odometry jumps,
+  /// and never applies one again; it is also dropped, until a valid block
+  /// returns, with guidance that has none or no transform. Every change
+  /// withdraws the ground layer, the certification cache and every retained
+  /// path, as a map change of everything does.
   void setGuidance(const LocalGuidance& guidance);
   /// Zones in `frame_id` (empty: odometry), re-transformed every cycle.
   /// Retained paths entering them, or every retained path when the zones
@@ -170,11 +192,23 @@ class LocalPlanningCore {
   std::uint64_t droppedScans() const { return dropped_scans_; }
   /// Retained paths re-certified because a map change reached them.
   std::uint64_t retainedRechecks() const { return retained_rechecks_; }
+  /// The standing start applied now, in the odometry frame.
+  std::optional<StandingStart> standingStart() const {
+    return standing_ ? std::optional<StandingStart>(standing_->odom)
+                     : std::nullopt;
+  }
 
  private:
   struct Retained {
     LocalPathPlan path;
     bool invalid = false;
+  };
+  struct AppliedStandingStart {
+    std::uint64_t boot = 0;
+    std::string frame_id;
+    Eigen::Vector3d center = Eigen::Vector3d::Zero();  // guidance frame
+    double radius = 0;
+    StandingStart odom;
   };
   StateVec anchorOf(const StateVec& base) const;
   double floorUnder(const StateVec& anchor) const;
@@ -182,6 +216,8 @@ class LocalPlanningCore {
   MapChange place(const StateVec& anchor, bool* reset);
   void resetAll(const StateVec& anchor, MapChange& change);
   void afterChange(const MapChange& change);
+  /// Applies, keeps or revokes the standing start (setGuidance).
+  void refreshStandingStart();
   /// The zones in the odometry frame; nullopt (naming `failed`) without a
   /// transform. Empty zones need none.
   std::optional<NoGoZones> zonesInOdom(std::string& failed) const;
@@ -208,6 +244,9 @@ class LocalPlanningCore {
   LocalModeRequest request_;
   std::optional<LocalGuidance> guidance_;
   std::optional<LocalGuidance> early_guidance_;
+  std::optional<AppliedStandingStart> standing_;
+  /// The anchor left the disk, or odometry jumped: never stand again.
+  bool left_standing_start_ = false;
   NoGoZones zones_;
   std::string zones_frame_;
 

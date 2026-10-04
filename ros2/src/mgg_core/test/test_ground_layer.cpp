@@ -1,5 +1,6 @@
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <functional>
@@ -402,6 +403,96 @@ TEST(GroundLayer, BoundsAndExplicitFallback) {
   fallback.reset({1.1, 0.1, 0.6}, 0);
   EXPECT_EQ(fallback.occupancy().size(), 600u);
   EXPECT_TRUE(fallback.origin().isApprox(Eigen::Vector2d(-2, -2)));
+}
+
+// A flat floor a lidar standing at the origin sees only beyond `blind` m,
+// as a mounted lidar leaves it: unknown floor and body band nearer. In the
+// blind disk a pit's floor 1 m down was seen (an observed drop), and a hole
+// was looked into (free under the floor, no ground).
+class BlindStartMap : public mgg_test::TerrainFixture {
+ public:
+  BlindStartMap() : TerrainFixture(0.2, tops()) {}
+  static std::map<std::pair<std::int64_t, std::int64_t>, double> tops() {
+    auto t = terrain([](double) { return 0.0; });
+    for (int x = 4; x <= 5; ++x)
+      for (int y = -6; y <= -5; ++y) t[{x, y}] = -1.0;  // the pit
+    t.erase({-6, 0});                                  // the hole
+    return t;
+  }
+  std::optional<Eigen::AlignedBox3d> windowBounds() const override {
+    return Eigen::AlignedBox3d(Eigen::Vector3d(-4, -4, -2), Eigen::Vector3d(4, 4, 3));
+  }
+  VoxelStatus getVoxelStatus(const Eigen::Vector3d& p) const override {
+    if (blind(p) && p.z() <= 0.05) return VoxelStatus::kUnknown;
+    return TerrainFixture::getVoxelStatus(p);
+  }
+  VoxelStatus getRayStatus(const Eigen::Vector3d& a, const Eigen::Vector3d& b,
+                           bool stop, Eigen::Vector3d& end) const override {
+    if (blind(a)) {
+      end = b;
+      return VoxelStatus::kUnknown;
+    }
+    return TerrainFixture::getRayStatus(a, b, stop, end);
+  }
+  VoxelStatus getBoxStatus(const Eigen::Vector3d& p, const Eigen::Vector3d& size,
+                           bool stop) const override {
+    const VoxelStatus seen = TerrainFixture::getBoxStatus(p, size, stop);
+    if (seen == VoxelStatus::kOccupied || !stop) return seen;
+    return p.head<2>().norm() < blind_radius ? VoxelStatus::kUnknown : seen;
+  }
+  double blind_radius = 1.5;
+
+ private:
+  bool blind(const Eigen::Vector3d& p) const {
+    const Eigen::Vector2d xy = p.head<2>();
+    const bool pit = xy.x() >= 0.8 && xy.x() < 1.2 && xy.y() >= -1.2 && xy.y() < -0.8;
+    const bool hole = xy.x() >= -1.2 && xy.x() < -1.0 && xy.y() >= 0 && xy.y() < 0.2;
+    return !pit && !hole && xy.norm() < blind_radius;
+  }
+};
+
+int admitted(const GroundLayer& layer) {
+  const auto cells = layer.occupancy();
+  return static_cast<int>(std::count(cells.begin(), cells.end(), 0));
+}
+
+TEST(GroundLayer, StandingStartSeedsBlindDisk) {
+  BlindStartMap map;
+  GroundLayer layer(map, planning(), robot());
+  layer.reset({0.1, 0.1, 0.6}, 0);
+  finish(layer);
+  // A failed seed outside a standing start stays unknown.
+  EXPECT_EQ(admitted(layer), 0);
+  EXPECT_EQ(layer.verdict({0.1, 0.1}), GroundVerdict::kUnknown);
+
+  layer.setStandingStart(StandingStart{Eigen::Vector2d::Zero(), 2.0});
+  EXPECT_GT(layer.pendingCount(), 0);
+  finish(layer);
+  // The seed rests on the robot's floor; the flood crosses the disk to the
+  // observed ground beyond it, and the disk's unseen body band passes.
+  EXPECT_EQ(layer.verdict({0.1, 0.1}), GroundVerdict::kAdmitted);
+  EXPECT_EQ(layer.verdict({0.7, 0.1}), GroundVerdict::kAdmitted);
+  EXPECT_EQ(layer.verdict({2.5, 0.1}), GroundVerdict::kAdmitted);
+  EXPECT_EQ(layer.verdict({-3.1, 0.1}), GroundVerdict::kAdmitted);
+  // An observed drop in the disk stays a drop: its rim and the way down
+  // are refused.
+  EXPECT_EQ(layer.verdict({0.7, -0.9}), GroundVerdict::kRefusedStepGrade);
+  EXPECT_EQ(layer.verdict({0.9, -0.9}), GroundVerdict::kRefusedStepGrade);
+  // A column the lidar looked into is not the robot's floor.
+  EXPECT_NE(layer.verdict({-1.1, 0.1}), GroundVerdict::kAdmitted);
+
+  // Unknown outside the disk stays unknown, and the flood cannot cross it.
+  layer.setStandingStart(StandingStart{Eigen::Vector2d::Zero(), 1.0});
+  finish(layer);
+  EXPECT_EQ(layer.verdict({0.5, 0.1}), GroundVerdict::kAdmitted);
+  EXPECT_EQ(layer.verdict({1.3, 0.1}), GroundVerdict::kUnknown);
+  EXPECT_EQ(layer.verdict({2.5, 0.1}), GroundVerdict::kUnknown);
+
+  // Revoked: every admission that rested on it is withdrawn.
+  layer.setStandingStart(std::nullopt);
+  EXPECT_GT(layer.pendingCount(), 0);
+  finish(layer);
+  EXPECT_EQ(admitted(layer), 0);
 }
 }  // namespace
 }  // namespace mgg

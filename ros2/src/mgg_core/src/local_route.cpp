@@ -351,7 +351,8 @@ LocalRouteResult routeOverLocalLattice(GraphManager& graph,
 bool groundShortcutSegmentAdmissible(const ExpandContext& ctx,
                                      const Eigen::Vector3d& from,
                                      const Eigen::Vector3d& to,
-                                     bool stop_at_unknown) {
+                                     bool stop_at_unknown, bool is_hanging,
+                                     const Eigen::Vector3d* physical_root) {
   OrientedBox body;
   body.heading = std::atan2(to.y() - from.y(), to.x() - from.x());
   body.size = ctx.robot_box_size;
@@ -369,8 +370,9 @@ bool groundShortcutSegmentAdmissible(const ExpandContext& ctx,
               GeofenceManager::CoordinateStatus::kViolated) return false;
   return ctx.ground->getProjectedEdgeStatus(
              from + offset, to + offset,
-             ctx.robot_box_size, stop_at_unknown, projected, false, false,
-             &check, EdgeTravel::kForward) == ProjectedEdgeStatus::kAdmissible &&
+             ctx.robot_box_size, stop_at_unknown, projected, is_hanging, false,
+             &check, EdgeTravel::kForward,
+             physical_root) == ProjectedEdgeStatus::kAdmissible &&
          (!ctx.projected_edge_admissible || ctx.projected_edge_admissible(projected));
 }
 

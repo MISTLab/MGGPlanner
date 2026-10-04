@@ -199,6 +199,16 @@ void GroundLayer::withdrawDescendants() {
     }
   }
 }
+void GroundLayer::setStandingStart(const std::optional<StandingStart>& standing) {
+  const bool same =
+      standing_.has_value() == standing.has_value() &&
+      (!standing || (standing_->center == standing->center &&
+                     standing_->radius == standing->radius));
+  if (same) return;
+  standing_ = standing;
+  // Admissions may rest on the old disk anywhere the flood went through it.
+  for (int i = 0; i < static_cast<int>(columns_.size()); ++i) markPending(i);
+}
 void GroundLayer::withdraw(const MapChange& change) {
   for (int i = 0; i < static_cast<int>(columns_.size()); ++i)
     if (changeReaches(change, columns_[i].dependency)) markPending(i);
@@ -245,6 +255,7 @@ void GroundLayer::recheck(std::chrono::steady_clock::time_point deadline) {
       queue.pop();
       Column checked = columns_[i];
       checked.evaluated = true;
+      checked.standing = false;
       checked.parent = parents[i];
       const double reference = checked.parent < 0
           ? seed_ground_hint_
@@ -253,10 +264,22 @@ void GroundLayer::recheck(std::chrono::steady_clock::time_point deadline) {
       if (checked.parent >= 0)
         checked.dependency.extend(dependency(checked.parent, reference));
       const Eigen::Vector2d xy = center(i);
+      // In a standing start's disk, a column with no ground observed under
+      // the seed floor hint, and not looked into, rests on the robot's floor.
+      const auto standingGround = [&] {
+        if (!standing_ || !standing_->covers(xy)) return false;
+        Eigen::Vector3d deeper;
+        if (projection.groundBelow({xy.x(), xy.y(), seed_ground_hint_ + 1e-6},
+                                   deeper))
+          return false;  // observed ground, even a drop, is used as observed
+        return map_.getVoxelStatus({xy.x(), xy.y(),
+                                    seed_ground_hint_ - kGroundBridgeHoleDepth}) !=
+               VoxelStatus::kFree;
+      };
       Eigen::Vector3d sample(xy.x(), xy.y(), reference);
       VoxelStatus status;
       const double below = projection.projectSample(sample, status);
-      if (status != VoxelStatus::kOccupied) {
+      if (status != VoxelStatus::kOccupied && !standingGround()) {
         checked.observed = false;
         checked.dirty = false;
         if (!refused(checked.verdict)) checked.verdict = GroundVerdict::kUnknown;
@@ -264,8 +287,9 @@ void GroundLayer::recheck(std::chrono::steady_clock::time_point deadline) {
         columns_[i] = checked;  // complete unknown; retry only after a change
         continue;
       }
-      checked.ground_z = sample.z() - below;
-      if (checked.ground_z > reference + 1e-6) {
+      checked.standing = status != VoxelStatus::kOccupied;
+      checked.ground_z = checked.standing ? seed_ground_hint_ : sample.z() - below;
+      if (!checked.standing && checked.ground_z > reference + 1e-6) {
         // projectSample starts above the floor hint. Prefer nearer observed
         // support underneath a ceiling. If the hint is slightly below the
         // floor, also look from below the hit voxel, not only from the hint.
@@ -286,17 +310,28 @@ void GroundLayer::recheck(std::chrono::steady_clock::time_point deadline) {
       // Offset projection rays may find a rim beside an unseen hole. Only
       // the column's own observed support can certify it as traversable.
       Eigen::Vector3d support;
-      if (!projection.groundBelow({xy.x(), xy.y(), checked.ground_z + 1e-6}, support) ||
-          std::abs(support.z() - checked.ground_z) > 1e-6) {
-        checked.observed = false;
-        checked.dirty = false;
-        if (!refused(checked.verdict)) checked.verdict = GroundVerdict::kUnknown;
-        planningCheckpoint();
-        columns_[i] = checked;
-        continue;
+      if (!checked.standing &&
+          (!projection.groundBelow({xy.x(), xy.y(), checked.ground_z + 1e-6}, support) ||
+           std::abs(support.z() - checked.ground_z) > 1e-6)) {
+        checked.standing = standingGround();
+        if (!checked.standing) {
+          checked.observed = false;
+          checked.dirty = false;
+          if (!refused(checked.verdict)) checked.verdict = GroundVerdict::kUnknown;
+          planningCheckpoint();
+          columns_[i] = checked;
+          continue;
+        }
+        checked.ground_z = seed_ground_hint_;
+        checked.dependency.extend(dependency(i, checked.ground_z));
       }
       checked.observed = true;
       const Eigen::Vector3d ground(xy.x(), xy.y(), checked.ground_z);
+      // Standing-start support is ground evidence only at its own column:
+      // a root at driving height over it (groundStepsAdmissible).
+      const auto standingRoot = [&](const Eigen::Vector2d& at, double z) {
+        return Eigen::Vector3d(at.x(), at.y(), z + planning_.max_ground_height);
+      };
       GroundVerdict verdict = GroundVerdict::kAdmitted;
       if (checked.parent >= 0) {
         const Eigen::Vector2d parent_xy = center(checked.parent);
@@ -305,16 +340,28 @@ void GroundLayer::recheck(std::chrono::steady_clock::time_point deadline) {
         // ceiling must not replace the parent's lower floor in this check.
         const Eigen::Vector3d start(parent_xy.x(), parent_xy.y(), reference - offset);
         const Eigen::Vector3d end(xy.x(), xy.y(), checked.ground_z - offset);
-        if (!projection.groundStepsAdmissible(start, end))
-          verdict = GroundVerdict::kRefusedStepGrade;
+        const bool parent_standing = columns_[checked.parent].standing;
+        bool admissible = true;
+        if (parent_standing && !checked.standing) {
+          const auto root = standingRoot(parent_xy, reference);
+          admissible = projection.groundStepsAdmissible(start, end, &root);
+        } else if (checked.standing && !parent_standing) {
+          const auto root = standingRoot(xy, checked.ground_z);
+          admissible = projection.groundStepsAdmissible(end, start, &root);
+        } else if (!checked.standing) {
+          admissible = projection.groundStepsAdmissible(start, end);
+        }  // two standing columns share the seed floor hint
+        if (!admissible) verdict = GroundVerdict::kRefusedStepGrade;
       }
+      const auto own_root = standingRoot(xy, checked.ground_z);
       for (const auto& direction : kDirections) {
         // Two native cells retain the certified step-AND-grade denominator;
         // serialization and diagonal pose spacing never substitute for it.
         Eigen::Vector3d end = ground;
         end.head<2>() += 2 * resolution_ *
             Eigen::Vector2d(direction[0], direction[1]).normalized();
-        if (!projection.groundStepsAdmissible(ground, end)) {
+        if (!projection.groundStepsAdmissible(
+                ground, end, checked.standing ? &own_root : nullptr)) {
           verdict = GroundVerdict::kRefusedStepGrade;
           break;
         }
@@ -328,9 +375,12 @@ void GroundLayer::recheck(std::chrono::steady_clock::time_point deadline) {
         // footprint. A whole horizontal chassis box here would mislabel
         // an ordinary ramp under its uphill end as an overhang.
         const double column_size = resolution_ - 1e-6;
+        // In the standing start's disk the lidar cannot see the body band
+        // near itself: unknown volume passes there, occupied still refuses.
+        const bool blind_band = standing_ && standing_->covers(xy);
         const VoxelStatus body = map_.getBoxStatus(
             {xy.x(), xy.y(), (low + high) / 2},
-            {column_size, column_size, std::max(0.0, high - low)}, true);
+            {column_size, column_size, std::max(0.0, high - low)}, !blind_band);
         if (body == VoxelStatus::kOccupied) verdict = GroundVerdict::kRefusedOverhang;
         else if (body == VoxelStatus::kUnknown) verdict = GroundVerdict::kUnknown;
       }
@@ -354,6 +404,7 @@ void GroundLayer::recheck(std::chrono::steady_clock::time_point deadline) {
       if (!column.dirty) continue;
       column.dirty = false;
       column.observed = false;
+      column.standing = false;
       column.evaluated = false;
       if (!refused(column.verdict)) column.verdict = GroundVerdict::kUnknown;
     }

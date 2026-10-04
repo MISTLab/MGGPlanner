@@ -470,7 +470,10 @@ GridGraphResult buildGridGraph(GraphManager& graph, const StateVec& state,
       if (ground_robot) prechecks.emplace(precheck_key, status);
     }
     timed_precheck.reset();
-    if (status != VoxelStatus::kFree) return status == VoxelStatus::kOccupied;
+    if (status != VoxelStatus::kFree) {
+      if (first_pass && status == VoxelStatus::kUnknown) ++result.unknown_cells;
+      return status == VoxelStatus::kOccupied;
+    }
     if (first_pass) ++result.free_cells;
     return offer(candidate, i, j, first_pass, added);
   };

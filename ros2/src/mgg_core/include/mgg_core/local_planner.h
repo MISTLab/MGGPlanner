@@ -8,6 +8,7 @@
 #include "mgg_core/local_path.h"
 #include "mgg_core/local_planner_status.h"
 #include "mgg_core/no_go_zones.h"
+#include "mgg_core/path_turns.h"
 #include "mgg_core/recent_track.h"
 #include "mgg_core/sensor_params.h"
 namespace mgg {
@@ -55,6 +56,17 @@ class LocalPlanner {
     track_.clear();
     cache_.flushAll();
   }
+  /// The robot stands in the disk where it started (StandingStart, owned by
+  /// the guidance planner): unobserved ground in it counts as ground, and
+  /// from a root in the disk a departure may hang across it up to the disk's
+  /// radius (hanging_root_edge_length_max) to observed ground, through the
+  /// body band the lidar cannot see (occupied still blocks). Turns use it as
+  /// legacy does, and a path may not end in it (StandingStart::admitsGoal)
+  /// unless its arrival disk is observed. The driver withdraws the cache and
+  /// every retained path on a change.
+  void setStandingStart(const std::optional<StandingStart>& standing) {
+    standing_ = standing;
+  }
 
  private:
   LocalPlanResult search(const LocalPlanInputs&,
@@ -62,12 +74,24 @@ class LocalPlanner {
   bool certify(LocalPathPlan&, const NoGoZones&);
   Eigen::AlignedBox3d dependency(const StateVec&, const StateVec&) const;
   double localGain(const StateVec&, const Eigen::AlignedBox3d&) const;
+  /// Whether a root at `pose` departs as a hanging root: in the standing
+  /// start's disk, where the lidar sees neither the ground nor the body
+  /// band near the robot, whether or not some ground under it is observed.
+  bool hangingRoot(const StateVec& pose) const;
+  /// Where too little ground is observed to measure the slope, the standing
+  /// start's disk is level: its unobserved ground is the robot's floor.
+  SlopeFn standingSlope() const;
+  /// A path's last pose may not stop in the standing start's disk.
+  bool standingArrivalAdmissible(const StateVec& end, double tolerance) const;
   const MapInterface& map_;
   const GroundLayer& layer_;
   CertificationCache& cache_;
   PlanningParams planning_;
   RobotParams robot_;
-  SensorParams sensor_;
+  /// The sensor's gain-only copy (groundGainSensor); visibility policy
+  /// never reads it.
+  SensorParams gain_sensor_;
+  std::optional<StandingStart> standing_;
   DependencyHalos halos_;
   RecentTrack track_;
   NoGoZones zones_;

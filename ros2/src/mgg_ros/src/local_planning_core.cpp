@@ -88,6 +88,8 @@ MapChange LocalPlanningCore::place(const StateVec& anchor, bool* reset) {
   const bool jump =
       !have_pose_ ||
       (anchor.head<3>() - anchor_.head<3>()).norm() > params_.reset_jump_m;
+  // After a jump the robot's place is no proof it never left its start.
+  if (jump && have_pose_) left_standing_start_ = true;
   if (jump) resetAll(anchor, change);
   if (reset) *reset = jump;
   anchor_ = anchor;
@@ -106,6 +108,7 @@ MapChange LocalPlanningCore::onOdometry(const StateVec& robot) {
   }
   planner_.recordPose(anchor);
   afterChange(change);
+  refreshStandingStart();
   return change;
 }
 
@@ -125,6 +128,7 @@ MapChange LocalPlanningCore::onScan(const OdomScan& scan,
   merge(change, map_.insertScan(points, scan.origin, anchor.head<3>()));
   layer_.recenter(anchor.head<3>(), floorUnder(anchor));
   afterChange(change);
+  refreshStandingStart();
   return change;
 }
 
@@ -165,6 +169,49 @@ void LocalPlanningCore::afterChange(const MapChange& change) {
     if (!planner_.pathStillCertified(retained.path, progress))
       invalidate(sequence, "map change withdrew the path's certification");
   }
+}
+
+void LocalPlanningCore::refreshStandingStart() {
+  std::optional<AppliedStandingStart> next;
+  const GuidanceStandingStart* block =
+      guidance_ && guidance_->standing_start.valid &&
+              guidance_->standing_start.center.allFinite() &&
+              std::isfinite(guidance_->standing_start.radius) &&
+              guidance_->standing_start.radius > 0
+          ? &guidance_->standing_start
+          : nullptr;
+  if (block && have_pose_ && !left_standing_start_) {
+    if (standing_ && standing_->boot == block->boot &&
+        standing_->frame_id == guidance_->frame_id &&
+        standing_->center == block->center &&
+        standing_->radius == block->radius) {
+      next = standing_;
+    } else {
+      // Placed once per identity: map-to-odometry corrections must not
+      // move the disk under the robot and withdraw everything each cycle.
+      std::string failed;
+      if (const auto T = resolve(guidance_->frame_id, failed)) {
+        next = AppliedStandingStart{
+            block->boot, guidance_->frame_id, block->center, block->radius,
+            StandingStart{(*T * block->center).head<2>(), block->radius}};
+      }
+    }
+    if (next && !next->odom.covers(anchor_.head<2>())) {
+      left_standing_start_ = true;
+      next.reset();
+    }
+  }
+  const bool changed =
+      next.has_value() != standing_.has_value() ||
+      (next && (next->odom.center != standing_->odom.center ||
+                next->odom.radius != standing_->odom.radius));
+  standing_ = next;
+  if (!changed) return;
+  const std::optional<StandingStart> applied = standingStart();
+  layer_.setStandingStart(applied);
+  planner_.setStandingStart(applied);
+  // Admissions, cached decisions and retained paths may all rest on it.
+  afterChange(MapChange{map_.revision(), {}, true});
 }
 
 void LocalPlanningCore::setGroundRecheckBudget(double seconds) {
@@ -220,6 +267,7 @@ LocalModeResponse LocalPlanningCore::setMode(const LocalModeRequest& request) {
       early_guidance_->session_id == session_id_)
     guidance_ = early_guidance_;
   early_guidance_.reset();
+  refreshStandingStart();
   response.accepted = true;
   response.reason = continuation ? "session continued" : "session started";
   return response;
@@ -232,6 +280,7 @@ void LocalPlanningCore::setGuidance(const LocalGuidance& guidance) {
     return;
   }
   guidance_ = guidance;
+  refreshStandingStart();
 }
 
 void LocalPlanningCore::setNoGoZones(const NoGoZones& zones,
@@ -331,6 +380,8 @@ LocalPlanResult LocalPlanningCore::plan(Clock::time_point deadline) {
     result.reason = "idle";
     return finish();
   }
+  // A transform that was missing when the guidance arrived may exist now.
+  refreshStandingStart();
   layer_.recheck(std::min(deadline, after(ground_recheck_s_)));
 
   LocalPlanInputs in;

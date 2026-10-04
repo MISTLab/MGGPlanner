@@ -117,6 +117,11 @@ struct ExpandContext {
   /// sensor's near-field ground blind spot. The edge is only topology here;
   /// explicit objectives revalidate it with strict body/unknown checks.
   double hanging_root_edge_length_max = 0.0;
+  /// Edges out of that hanging root sweep the body as stop_at_unknown false
+  /// does: unknown volume passes, occupied blocks. The ground local planner
+  /// sets it only while a standing start is applied, whose lidar cannot see
+  /// the body band near itself.
+  bool hanging_root_unknown_body = false;
   /// Qualified ground simulation exploration may offer a lattice candidate whose
   /// body volume is partly unobserved. Known occupied volume still rejects
   /// the candidate, and ground projection plus the edge policy remain

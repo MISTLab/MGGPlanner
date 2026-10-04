@@ -203,6 +203,8 @@ void LocalPlannerNode::onGuidance(const mgg_msgs::msg::GlobalGuidance& msg) {
   } catch (const std::invalid_argument& error) {
     RCLCPP_WARN(get_logger(), "ignoring guidance: %s", error.what());
   }
+  // A revoked standing start withdraws the paths that relied on it at once.
+  publishInvalidations(true);
 }
 
 void LocalPlannerNode::onNoGoZones(const geometry_msgs::msg::PoseArray& msg) {

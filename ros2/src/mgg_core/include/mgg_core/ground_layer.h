@@ -4,6 +4,7 @@
 
 #include <chrono>
 #include <cstdint>
+#include <optional>
 #include <vector>
 
 #include "mgg_core/dirty_region.h"
@@ -37,6 +38,15 @@ class GroundLayer {
   /// scrolling the grid. ground_z has the same meaning as in reset().
   void recenter(const Eigen::Vector3d& robot, double ground_z);
   void withdraw(const MapChange& change);
+  /// The robot stands in the disk where it started (StandingStart): its
+  /// lidar cannot see the ground near itself. A disk column with no ground
+  /// found under it then counts as supported at the seed floor hint; ground
+  /// observed in the disk is used as observed, so a drop stays refused, and
+  /// so does a column the lidar looked into (free kGroundBridgeHoleDepth
+  /// below the hint). In the disk an unknown body band passes; occupied
+  /// still refuses. Elsewhere unknown stays unknown. A change withdraws
+  /// every column.
+  void setStandingStart(const std::optional<StandingStart>& standing);
   void recheck(std::chrono::steady_clock::time_point deadline);
   /// Pending means work since the last change, not completed unknown space.
   int pendingCount() const;
@@ -52,6 +62,7 @@ class GroundLayer {
     bool dirty = true;
     bool observed = false;
     bool evaluated = false;  // clean but unreached columns may join a later flood
+    bool standing = false;   // supported only by the standing start
     double ground_z = 0;
     int parent = -1;
     Eigen::AlignedBox3d dependency;
@@ -72,6 +83,7 @@ class GroundLayer {
   Eigen::Vector2d origin_ = Eigen::Vector2d::Zero();
   Eigen::Vector3d robot_ = Eigen::Vector3d::Zero();
   double seed_ground_hint_ = 0;
+  std::optional<StandingStart> standing_;
   int width_ = 0, height_ = 0, seed_ = -1;
   std::vector<Column> columns_;
 };

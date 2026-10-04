@@ -72,3 +72,28 @@ TEST(GlobalGuidance, StatusIdentityAndMode) {
   mode.mode = 99;
   EXPECT_FALSE(guidance.setMode(mode));
 }
+
+TEST(GlobalGuidance, CarriesTheStandingStartBlock) {
+  mgg::GlobalGuidance guidance;
+  mgg_msgs::srv::SetLocalPlannerMode::Request mode;
+  mode.mode = mode.EXPLORE;
+  mode.session_id = "session";
+  mode.request_id = "request";
+  ASSERT_TRUE(guidance.setMode(mode));
+  builtin_interfaces::msg::Time stamp;
+  const auto standing = guidance.message(
+      {}, false, "world", "discovery", stamp,
+      mgg::StandingStart{Eigen::Vector2d(1.5, -2), 2.5}, 42);
+  EXPECT_TRUE(standing.standing_start.valid);
+  EXPECT_DOUBLE_EQ(standing.standing_start.center.x, 1.5);
+  EXPECT_DOUBLE_EQ(standing.standing_start.center.y, -2);
+  EXPECT_DOUBLE_EQ(standing.standing_start.radius, 2.5);
+  EXPECT_EQ(standing.standing_start.boot, 42u);
+  // Every kind carries it; without the proof it is invalid, same identity.
+  const auto revoked =
+      guidance.message({}, true, "world", "done", stamp, std::nullopt, 42);
+  EXPECT_EQ(revoked.kind, revoked.COMPLETE);
+  EXPECT_FALSE(revoked.standing_start.valid);
+  EXPECT_EQ(revoked.standing_start.boot, 42u);
+  EXPECT_GT(revoked.sequence_id, standing.sequence_id);
+}

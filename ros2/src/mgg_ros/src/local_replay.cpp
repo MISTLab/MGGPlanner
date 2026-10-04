@@ -559,6 +559,7 @@ struct Replay {
             {"session_id", core->sessionId()}, {"input_seq", event.line}, {"sim_s", event.time},
             {"map_revision", core->map().revision()}, {"duration_ms", duration},
             {"complete", result.checks_complete}, {"status", status},
+            {"reason", result.reason},
             {"output_digest", digest(json({{"path", path}, {"status", status}}).dump())},
             {"path", path}, {"progress_m", progress}, {"tags", tags},
             {"callback_count", measured_callbacks},

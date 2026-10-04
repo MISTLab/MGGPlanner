@@ -6,6 +6,7 @@
 #include <unordered_set>
 
 #include "mgg_core/departure.h"
+#include "mgg_core/gain.h"
 #include "mgg_core/grid_graph.h"
 #include "mgg_core/local_route.h"
 #include "mgg_core/planning_cancellation.h"
@@ -26,6 +27,13 @@ bool interior(const Eigen::AlignedBox3d& window, const Eigen::Vector3d& p,
          p.y() <= window.max().y() - margin && p.z() >= window.min().z() &&
          p.z() <= window.max().z();
 }
+/// Whether ground is observed under `p`, at driving height.
+bool groundObserved(const GroundProjection& ground, const Eigen::Vector3d& p) {
+  Eigen::Vector3d sample = p;
+  VoxelStatus status = VoxelStatus::kUnknown;
+  ground.projectSample(sample, status);
+  return status == VoxelStatus::kOccupied;
+}
 }  // namespace
 LocalPlanner::LocalPlanner(const MapInterface& map, const GroundLayer& layer,
                            CertificationCache& cache,
@@ -36,7 +44,7 @@ LocalPlanner::LocalPlanner(const MapInterface& map, const GroundLayer& layer,
       cache_(cache),
       planning_(planning),
       robot_(robot),
-      sensor_(sensor),
+      gain_sensor_(groundGainSensor(sensor, planning).value_or(sensor)),
       halos_(dependencyHalos(
           robot, planning, map.getResolution(),
           GroundProjection(map, planning).max_projection_length)) {
@@ -71,6 +79,7 @@ bool LocalPlanner::certify(LocalPathPlan& path, const NoGoZones& zones) {
       if (!window->contains(p.head<3>())) return false;
   if (!zones.pathAdmissible(points(path))) return false;
   GroundProjection ground(map_, planning_, true);
+  ground.setStandingStart(standing_);
   ExpandContext ctx;
   ctx.map = &map_;
   ctx.ground = &ground;
@@ -80,7 +89,8 @@ bool LocalPlanner::certify(LocalPathPlan& path, const NoGoZones& zones) {
   ctx.stop_at_unknown = true;
   GraphManager graph;
   auto room = cache_.turnRoom([&](const StateVec& p) {
-    return roomToTurn(map_, robot_, planning_, p);
+    return roomToTurn(map_, robot_, planning_, p,
+                      standing_ ? &*standing_ : nullptr);
   });
   auto slope = cache_.slope([&](const Eigen::Vector3d& p) {
     return groundSlope(ground, p, robot_.size.head<2>().maxCoeff(), nullptr);
@@ -92,6 +102,7 @@ bool LocalPlanner::certify(LocalPathPlan& path, const NoGoZones& zones) {
                       [&](const StateVec& a, const StateVec& b) {
                         return turnTransitionClear(map_, robot_, a, b);
                       });
+  turns.setUnmeasuredSlope(standingSlope());
   if (!turns.admissible(points(path),
                         path.poses.front()[3] + (reversing ? M_PI : 0)))
     return false;
@@ -109,6 +120,30 @@ bool LocalPlanner::certify(LocalPathPlan& path, const NoGoZones& zones) {
            orientedBoxPathStatus(map_, center, center, body, true, nullptr) ==
                VoxelStatus::kFree;
   }
+  // A departure from a hanging root is the lattice's hanging-root edge:
+  // to the last pose over observed ground within the disk's radius of the
+  // root (hanging_root_edge_length_max), or the whole path when it stays
+  // within that (a committed prefix; publication keeps ends out of the
+  // disk). Every resampled segment of it is certified as that edge is
+  // (unobserved ground in the disk, unknown body volume; occupied blocks),
+  // and the whole path's terrain with the root's floor as evidence. Beyond
+  // it, the strict checks.
+  const auto pts = points(path);
+  std::size_t hanging_end = 0;
+  if (!reversing && hangingRoot(path.poses.front())) {
+    std::size_t reach = 1;
+    while (reach < pts.size() &&
+           (pts[reach] - pts.front()).norm() <= standing_->radius + 1e-9)
+      ++reach;
+    if (reach == pts.size()) hanging_end = reach - 1;
+    for (std::size_t k = reach - 1; k > 0 && hanging_end == 0; --k)
+      if (groundObserved(ground, pts[k])) hanging_end = k;
+    if (hanging_end == 0) return false;
+    for (std::size_t k = 1; k < hanging_end; ++k)
+      if (!standing_->covers(pts[k].head<2>()) &&
+          !groundObserved(ground, pts[k]))
+        return false;
+  }
   for (size_t i = 1; i < path.poses.size(); ++i) {
     planningCheckpoint();
     const auto& a = path.poses[i - 1];
@@ -119,12 +154,29 @@ bool LocalPlanner::certify(LocalPathPlan& path, const NoGoZones& zones) {
       if (!planning_.departure_reverse_allowed ||
           !reverseExitEdgeAdmissible(map_, ground, robot_, planning_, a, b))
         return false;
-    } else if (!groundShortcutSegmentAdmissible(ctx, a.head<3>(), b.head<3>(),
-                                                true))
+    } else if (!groundShortcutSegmentAdmissible(
+                   ctx, pts[i - 1], pts[i], i > hanging_end, i <= hanging_end,
+                   i == 1 && hanging_end > 0 ? &pts.front() : nullptr))
       return false;
     path.edge_dependencies.push_back(dep);
   }
-  return ground.groundStepsAdmissible(points(path));
+  return ground.groundStepsAdmissible(pts,
+                                      hanging_end > 0 ? &pts.front() : nullptr);
+}
+bool LocalPlanner::hangingRoot(const StateVec& pose) const {
+  return standing_ && standing_->covers(pose.head<2>());
+}
+SlopeFn LocalPlanner::standingSlope() const {
+  return [standing = standing_](const Eigen::Vector3d& p) {
+    return standing && standing->covers(p.head<2>()) ? 0.0 : kUnknownSlopeRad;
+  };
+}
+bool LocalPlanner::standingArrivalAdmissible(const StateVec& end,
+                                             double tolerance) const {
+  if (!standing_ || standing_->admitsGoal(end.head<2>(), tolerance)) return true;
+  StateVec arrival = end;
+  arrival[3] = kUnknownTurnHeading;
+  return observedArrivalDisk(map_, robot_, planning_, arrival, tolerance);
 }
 bool LocalPlanner::pathStillCertified(const LocalPathPlan& path,
                                       double progress) {
@@ -136,11 +188,11 @@ double LocalPlanner::localGain(const StateVec& state,
                                const Eigen::AlignedBox3d& window) const {
   Eigen::Vector3d origin = state.head<3>();
   std::vector<Eigen::Vector3d> endpoints;
-  if (sensor_.mount_height > 0) {
-    sensor_.getMountedFrustumEndpoints(
+  if (gain_sensor_.mount_height > 0) {
+    gain_sensor_.getMountedFrustumEndpoints(
         state, state.z() - planning_.max_ground_height, origin, endpoints);
   } else {
-    sensor_.getFrustumEndpoints(state, endpoints);
+    gain_sensor_.getFrustumEndpoints(state, endpoints);
   }
   std::unordered_set<VoxelKey, VoxelKeyHash> unknown;
   PlanningCheckpointThrottle checkpoint;
@@ -165,7 +217,7 @@ double LocalPlanner::localGain(const StateVec& state,
                  return true;
                });
   }
-  return sensor_.isFrontier(unknown.size(), map_.getResolution())
+  return groundGainFrontier(unknown.size(), map_.getResolution())
              ? unknown.size()
              : 0;
 }
@@ -227,6 +279,7 @@ LocalPlanResult LocalPlanner::search(const LocalPlanInputs& in,
       Eigen::AlignedBox3d(in.pose.head<3>() - Eigen::Vector3d(8, 8, 3),
                           in.pose.head<3>() + Eigen::Vector3d(8, 8, 3)));
   GroundProjection ground(map_, planning_, true);
+  ground.setStandingStart(standing_);
   // A goal's height is a hint (a 2-D objective is seeded at the robot's
   // altitude; guidance carries the global map's ground). Driving height over
   // the local ground at the same XY, or nothing: never a guessed height.
@@ -264,6 +317,10 @@ LocalPlanResult LocalPlanner::search(const LocalPlanInputs& in,
   }
   bool selection_complete = true;
   auto publish = [&](LocalPathPlan path) -> bool {
+    // Legacy's first-goal arrival protection: never stop in the disk.
+    if (path.poses.size() > 1 &&
+        !standingArrivalAdmissible(path.poses.back(), in.goal_tolerance_m))
+      return false;
     if (!certify(path, in.no_go_zones)) return false;
     const double length = pathLength(path);
     const double speed = std::abs(in.speed_mps);
@@ -311,7 +368,8 @@ LocalPlanResult LocalPlanner::search(const LocalPlanInputs& in,
     // Re-certify the original escape to its original refuge. The newly
     // recorded reverse odometry must not become a fresh backwards escape,
     // nor may a forward suffix be appended to a reverse commitment.
-    if (!roomToTurn(map_, robot_, planning_, in.pose)) {
+    if (!roomToTurn(map_, robot_, planning_, in.pose,
+                    standing_ ? &*standing_ : nullptr)) {
       auto remaining = committedPrefix(*in.executing_path, in.progress_m,
                                        pathLength(*in.executing_path));
       auto continuation = identity;
@@ -354,7 +412,7 @@ LocalPlanResult LocalPlanner::search(const LocalPlanInputs& in,
     result.reason = "goal_ground_unknown";
     return result;
   }
-  if (!aim && !sensor_.isReady()) {
+  if (!aim && !gain_sensor_.isReady()) {
     result.reason = "gain sensor has no configured rays";
     return result;
   }
@@ -387,6 +445,16 @@ LocalPlanResult LocalPlanner::search(const LocalPlanInputs& in,
         }
         return true;
       };
+  // The standing start's hanging root, as PlannerNode::makeContext and
+  // buildLocalGraph make it: one edge out of the root may cross the blind
+  // disk to observed ground, through the body band its lidar cannot see.
+  const bool hanging_root = hangingRoot(root);
+  if (hanging_root) {
+    ctx.hanging_root_edge_length_max = standing_->radius;
+    ctx.hanging_root_unknown_body = true;
+    ctx.preserve_hanging_root_start_height = true;
+    ctx.root_is_robot = true;
+  }
   ctx.deadline =
       std::min(deadline, Clock::now() + std::chrono::milliseconds(170));
   GridGraphParams grid;
@@ -405,15 +473,19 @@ LocalPlanResult LocalPlanner::search(const LocalPlanInputs& in,
     return result;
   }
   GraphManager graph;
-  graph.addVertex(new Vertex(graph.generateVertexID(), root));
+  auto* root_vertex = new Vertex(graph.generateVertexID(), root);
+  root_vertex->is_hanging = hanging_root;
+  graph.addVertex(root_vertex);
   const auto lattice = buildGridGraph(graph, root, grid, ctx, 0);
   auto room = cache_.turnRoom([&](const StateVec& p) {
-    return roomToTurn(map_, robot_, planning_, p);
+    return roomToTurn(map_, robot_, planning_, p,
+                      standing_ ? &*standing_ : nullptr);
   });
   auto slope = cache_.slope([&](const Eigen::Vector3d& p) {
     return groundSlope(ground, p, robot_.size.head<2>().maxCoeff(), nullptr);
   });
   PathTurnCheck turns(graph, robot_, room, slope);
+  turns.setUnmeasuredSlope(standingSlope());
   struct Candidate {
     int id;
     double score;
@@ -488,6 +560,7 @@ LocalPlanResult LocalPlanner::search(const LocalPlanInputs& in,
         return turns.sharpTurnAllowedAt(v.state.head<3>());
       },
       20000);
+  std::size_t too_short = 0;  // candidates refused only for their length
   for (const auto& candidate : candidates) {
     planningCheckpoint();
     auto found = routes.to.find(candidate.id);
@@ -539,7 +612,10 @@ LocalPlanResult LocalPlanner::search(const LocalPlanInputs& in,
     path.reaches_goal =
         target && (path.poses.back().head<3>() - *target).norm() <=
                       in.goal_tolerance_m + 1e-9;
-    if (!path.reaches_goal && pathLength(path) < 6) continue;
+    if (!path.reaches_goal && pathLength(path) < 6) {
+      ++too_short;
+      continue;
+    }
     if (publish(path)) return result;
   }
   // Reverse is an escape to the first turn refuge, never a new reverse plan
@@ -560,12 +636,40 @@ LocalPlanResult LocalPlanner::search(const LocalPlanInputs& in,
   }
   result.checks_complete = selection_complete && !lattice.hit_limit &&
                            !routes.capped && layer_.pendingCount() == 0;
+  // Exhaustion needs evidence: every viewpoint scored, none with gain, and
+  // a lattice that left the root unless observed space encloses it.
+  const auto unknown_departures =
+      lattice.no_ground + lattice.unknown_cells +
+      lattice.projected_endpoint_unknown +
+      lattice.edge_status[static_cast<int>(ProjectedEdgeStatus::kUnknown)] +
+      lattice.edge_status[static_cast<int>(ProjectedEdgeStatus::kHanging)] +
+      lattice.edge_status[static_cast<int>(
+          ProjectedEdgeStatus::kGroundUnobserved)];
+  const bool unobserved_surroundings =
+      graph.getNumVertices() == 1 &&
+      (hanging_root || unknown_departures > 0 ||
+       layer_.verdict(root.head<2>()) != GroundVerdict::kAdmitted);
   if (!in.target && layer_.pendingCount() > 0) {
     result.status = LocalStatus::kWaitingForMap;
     result.reason = "pending map prevents exhaustion";
+  } else if (!in.target && !candidates.empty()) {
+    // Gain remains: a route or length refusal is not an empty window.
+    result.status = LocalStatus::kBlocked;
+    result.reason = too_short == candidates.size()
+                        ? "gain candidates are shorter than a useful path"
+                        : "gain candidates have no certified local route";
+  } else if (!in.target && !selection_complete) {
+    result.status = LocalStatus::kWaitingForMap;
+    result.reason = "not every viewpoint was scored";
+  } else if (!in.target && unobserved_surroundings) {
+    result.status = LocalStatus::kWaitingForMap;
+    result.reason = "no certified ground around the robot";
+    result.checks_complete = false;
   } else if (!in.target && result.checks_complete) {
     result.status = LocalStatus::kNoLocalTarget;
-    result.reason = "observed local window has no gain";
+    result.reason = graph.getNumVertices() == 1
+                        ? "observed surroundings enclose the robot"
+                        : "observed local window has no gain";
   } else {
     result.status = LocalStatus::kBlocked;
     result.reason =

@@ -7,6 +7,8 @@
 #ifndef MGG_CORE_GAIN_H_
 #define MGG_CORE_GAIN_H_
 
+#include <cstddef>
+#include <optional>
 #include <string>
 #include <unordered_map>
 #include <utility>
@@ -39,6 +41,28 @@ struct GainContext {
   const std::unordered_map<std::string, SensorParams>* sensors = nullptr;
 };
 
+
+/// The sensor a ground robot's gain is ranked with: a copy of `sensor`,
+/// its rays coarsened to ground_gain_angular_resolution_deg and cut at
+/// ground_gain_max_range where those are positive; nullopt when neither is,
+/// and the real sensor ranks. A gain-only model: what the robot can see
+/// (body and field-of-view policy) always reads the real sensor.
+std::optional<SensorParams> groundGainSensor(const SensorParams& sensor,
+                                             const PlanningParams& planning);
+
+/// Unknown a ground robot's viewpoint must see to be a frontier, metres:
+/// distinct unknown voxels times their edge (groundGainFrontier).
+inline constexpr double kGroundFrontierUnknownM = 0.5;
+
+/// Whether a ground robot's viewpoint seeing `unknown_voxels` distinct
+/// unknown voxels of edge `resolution` in its gain band is a frontier.
+/// Not the sensor's distinct-voxel ratio (SensorParams::isFrontier), whose
+/// full-field denominator can deny a frontier even in space that is all
+/// unknown.
+inline bool groundGainFrontier(std::size_t unknown_voxels, double resolution) {
+  return static_cast<double>(unknown_voxels) * resolution >=
+         kGroundFrontierUnknownM;
+}
 
 /// Gain of a single viewpoint.
 ///

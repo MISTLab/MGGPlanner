@@ -1183,6 +1183,9 @@ class PlannerNodeTestPeer {
     const std::lock_guard<std::recursive_mutex> lock(node.planner_mutex_);
     return node.standingStart();
   }
+  static std::uint64_t incarnation(PlannerNode& node) {
+    return node.planner_config_state_.incarnation;
+  }
   /// An edge's status as the node's lattice checks it, with its standing
   /// start.
   static mgg::ProjectedEdgeStatus edgeStatus(PlannerNode& node,
@@ -12387,5 +12390,120 @@ TEST_F(PlannerNodeTest, ARealFortyCentimetreStepIsRefused) {
   EXPECT_FALSE(PlannerNodeTestPeer::sentGroundPathAdmissible(*node, up));
   PlannerNodeTestPeer::shortcutAndResample(*node, up, {});
   EXPECT_TRUE(up.empty());
+}
+
+/// The latest GlobalGuidance after each guidance cycle of `node`'s EXPLORE
+/// session.
+class GuidanceListener {
+ public:
+  explicit GuidanceListener(const std::string& name)
+      : node_(std::make_shared<rclcpp::Node>(name)),
+        subscription_(node_->create_subscription<mgg_msgs::msg::GlobalGuidance>(
+            "global_guidance", rclcpp::QoS(1).reliable().transient_local(),
+            [this](mgg_msgs::msg::GlobalGuidance::ConstSharedPtr msg) {
+              latest_ = *msg;
+            })) {}
+  mgg_msgs::msg::GlobalGuidance cycle(PlannerNode& planner) {
+    using namespace std::chrono_literals;
+    latest_.reset();
+    PlannerNodeTestPeer::guidanceExploreCycle(planner);
+    const auto until = std::chrono::steady_clock::now() + 500ms;
+    while (!latest_ && std::chrono::steady_clock::now() < until) {
+      rclcpp::spin_some(node_);
+      std::this_thread::sleep_for(1ms);
+    }
+    EXPECT_TRUE(latest_);
+    return latest_.value_or(mgg_msgs::msg::GlobalGuidance());
+  }
+
+ private:
+  rclcpp::Node::SharedPtr node_;
+  rclcpp::Subscription<mgg_msgs::msg::GlobalGuidance>::SharedPtr subscription_;
+  std::optional<mgg_msgs::msg::GlobalGuidance> latest_;
+};
+
+TEST_F(PlannerNodeTest, V2ShortFrontierLeavesWithholdComplete) {
+  // p1a-acc-1 robot_1 and robot_3: every frontier leaf of the discovery
+  // lattice lay on a principal path under principle_path_min_length, the
+  // clustering dropped them all, and COMPLETE went out at the first tick.
+  // Known unexplored frontiers withhold COMPLETE; once nothing is left
+  // unknown round the robot, COMPLETE does come.
+  for (const bool explored : {false, true}) {
+    auto node = makeNode(explored ? "v2_explored" : "v2_short_leaves", "world",
+        {rclcpp::Parameter("exploration_architecture", "v2"),
+         rclcpp::Parameter("fleet.enabled", false)});
+    PlannerNodeTestPeer::seeAllRound(*node);
+    if (explored) {
+      PlannerNodeTestPeer::observeFloor(*node, -3.5, 7.5, -3.5, 3.5);
+    } else {
+      PlannerNodeTestPeer::observeFloor(*node, -1, 1, -1, 1);
+    }
+    PlannerNodeTestPeer::acceptOdometry(*node, 0, 0, 1);
+    // Paths of at most 0.71 m: shorter than principle_path_min_length.
+    PlannerNodeTestPeer::setLattice(*node, {-0.5, -0.5}, {0.5, 0.5});
+    GuidanceListener listener(explored ? "explored_listener" : "short_listener");
+    const auto message = listener.cycle(*node);
+    EXPECT_TRUE(PlannerNodeTestPeer::frontierClusters(*node).empty());
+    if (explored) {
+      EXPECT_EQ(message.kind, message.COMPLETE) << message.reason;
+    } else {
+      EXPECT_EQ(message.kind, message.NONE) << message.reason;
+    }
+  }
+}
+
+TEST_F(PlannerNodeTest, V2GuidanceCarriesStandingStartUntilTheRobotLeavesItsDisk) {
+  const auto standing_node = [](const std::string& name,
+                                const KeyframeTrajectory& keyframes,
+                                TrajectoryInMemory** source_out) {
+    auto node = makeNode(name, "world",
+        {rclcpp::Parameter("exploration_architecture", "v2"),
+         rclcpp::Parameter("fleet.enabled", false)});
+    PlannerNodeTestPeer::setHangingRootReach(*node, 2.0);
+    PlannerNodeTestPeer::observeFloor(*node, -3, 6, -2, 2);
+    PlannerNodeTestPeer::serveMap(*node, "component:test", 0);
+    auto source = std::make_unique<TrajectoryInMemory>();
+    source->trajectory = keyframes;
+    if (source_out) *source_out = source.get();
+    PlannerNodeTestPeer::setKeyframeSource(*node, std::move(source));
+    return node;
+  };
+  TrajectoryInMemory* keyframes = nullptr;
+  auto node = standing_node("v2_standing_guidance", keyframesAlong({{0, 0}}),
+                            &keyframes);
+  PlannerNodeTestPeer::acceptOdometry(*node, 0, 0, 1);
+  GuidanceListener listener("v2_standing_listener");
+  const auto home = listener.cycle(*node);
+  ASSERT_TRUE(home.standing_start.valid) << home.reason;
+  EXPECT_NEAR(home.standing_start.center.x, 0, 1e-9);
+  EXPECT_NEAR(home.standing_start.center.y, 0, 1e-9);
+  EXPECT_DOUBLE_EQ(home.standing_start.radius, 2.0);
+  EXPECT_EQ(home.standing_start.boot, PlannerNodeTestPeer::incarnation(*node));
+  EXPECT_NE(home.standing_start.boot, 0u);
+
+  // Past kStandingStartMoveM, still in the disk: legacy's own prior has
+  // expired, the guidance block holds while the departure crosses the disk.
+  keyframes->trajectory = keyframesAlong({{0, 0}, {1.2, 0}});
+  PlannerNodeTestPeer::acceptOdometry(*node, 1.2, 0, 2);
+  const auto crossing = listener.cycle(*node);
+  EXPECT_TRUE(crossing.standing_start.valid);
+  EXPECT_FALSE(PlannerNodeTestPeer::standingStart(*node));
+
+  // Out of the disk: revoked, and never valid again on this map.
+  keyframes->trajectory = keyframesAlong({{0, 0}, {2.5, 0}});
+  PlannerNodeTestPeer::acceptOdometry(*node, 2.5, 0, 3);
+  EXPECT_FALSE(listener.cycle(*node).standing_start.valid);
+  keyframes->trajectory = keyframesAlong({{0, 0}});
+  PlannerNodeTestPeer::acceptOdometry(*node, 0, 0, 4);
+  EXPECT_FALSE(listener.cycle(*node).standing_start.valid);
+
+  // A planner restarted back at home, whose keyframes show the robot left
+  // the disk: no standing start.
+  auto restarted = standing_node("v2_standing_restarted",
+                                 keyframesAlong({{0, 0}, {2.5, 0}, {0.2, 0}}),
+                                 nullptr);
+  PlannerNodeTestPeer::acceptOdometry(*restarted, 0.2, 0, 1);
+  GuidanceListener restarted_listener("v2_standing_restarted_listener");
+  EXPECT_FALSE(restarted_listener.cycle(*restarted).standing_start.valid);
 }
 }  // namespace mgg_ros

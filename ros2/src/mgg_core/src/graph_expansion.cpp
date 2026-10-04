@@ -302,7 +302,9 @@ void expandGraphFrom(GraphManager& graph, Vertex& new_vertex,
           : edgeTraversable(
                 ctx, start_pos, end_pos, is_hanging,
                 ctx.preserve_hanging_root_start_height && nearest_vertex->id == 0,
-                projected_edge, rep, ctx.stop_at_unknown,
+                projected_edge, rep,
+                ctx.stop_at_unknown &&
+                    !(hanging_root && ctx.hanging_root_unknown_body),
                 nearest_vertex->id == 0 && ctx.root_is_robot
                     ? EdgeTravel::kForward : EdgeTravel::kBothWays,
                 nearest_vertex->id == 0 && ctx.root_is_robot && ctx.standing_body

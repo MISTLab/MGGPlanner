@@ -126,6 +126,27 @@ class ColumnSupport {
 
 }  // namespace
 
+std::optional<SensorParams> groundGainSensor(const SensorParams& sensor,
+                                             const PlanningParams& planning) {
+  const double step_deg = planning.ground_gain_angular_resolution_deg;
+  const double range = planning.ground_gain_max_range;
+  const bool coarser = std::isfinite(step_deg) && step_deg > 0;
+  const bool shorter = std::isfinite(range) && range > 0;
+  if (!coarser && !shorter) return std::nullopt;
+  SensorParams gain = sensor;
+  if (coarser) {
+    const double step = std::min(step_deg, 180.0) * M_PI / 180.0;
+    for (int axis = 0; axis < 2; ++axis) {
+      const double real_step =
+          gain.resolution[axis] > 0 ? gain.resolution[axis] : M_PI / 180.0;
+      gain.resolution[axis] = std::max(real_step, step);
+    }
+  }
+  if (shorter) gain.max_range = std::min(gain.max_range, range);
+  gain.update();
+  return gain;
+}
+
 void computeVolumetricGain(
     const StateVec& state, VolumetricGain& gain, const GainContext& ctx,
     std::vector<std::pair<Eigen::Vector3d, VoxelStatus>>* voxel_log) {
@@ -149,25 +170,9 @@ void computeVolumetricGain(
       continue;
     }
     // A private model for ranking only: never mutate the sensor used by
-    // observed-body/FOV policy. Zero overrides retain its original ray table.
+    // observed-body/FOV policy.
     std::optional<SensorParams> gain_sensor;
-    const double step_deg = ctx.planning->ground_gain_angular_resolution_deg;
-    const double range = ctx.planning->ground_gain_max_range;
-    if (ground_robot && ((std::isfinite(step_deg) && step_deg > 0) ||
-                         (std::isfinite(range) && range > 0))) {
-      gain_sensor = it->second;
-      if (std::isfinite(step_deg) && step_deg > 0) {
-        const double step = std::min(step_deg, 180.0) * M_PI / 180.0;
-        for (int axis = 0; axis < 2; ++axis) {
-          const double real_step = gain_sensor->resolution[axis] > 0
-              ? gain_sensor->resolution[axis] : M_PI / 180.0;
-          gain_sensor->resolution[axis] = std::max(real_step, step);
-        }
-      }
-      if (std::isfinite(range) && range > 0)
-        gain_sensor->max_range = std::min(gain_sensor->max_range, range);
-      gain_sensor->update();
-    }
+    if (ground_robot) gain_sensor = groundGainSensor(it->second, *ctx.planning);
     const SensorParams& sensor = gain_sensor ? *gain_sensor : it->second;
 
     // A ground robot's sensor sees from where it is mounted: rays from the
@@ -267,7 +272,7 @@ void computeVolumetricGain(
     // suited a count of every voxel of every ray; against distinct voxels it
     // can deny a frontier even in space that is all unknown.
     const double resolution = ctx.map->getResolution();
-    if (ground_robot ? unknown * resolution >= 0.5
+    if (ground_robot ? groundGainFrontier(unknown, resolution)
                      : sensor.isFrontier(unknown, resolution)) {
       gain.is_frontier = true;
     }

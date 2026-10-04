@@ -45,6 +45,7 @@ rosidl_generate_interfaces(${PROJECT_NAME}
   "msg/SemanticClass.msg"
   "msg/SemanticPoint.msg"
   "msg/SemanticPolygon.msg"
+  "msg/StandingStart.msg"
   "msg/TourAward.msg"
   "msg/TourBid.msg"
   "msg/TourBundle.msg"

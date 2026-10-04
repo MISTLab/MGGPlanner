@@ -144,6 +144,10 @@ LocalGuidance fromGuidanceMsg(const mgg_msgs::msg::GlobalGuidance& msg) {
   guidance.target = fromPointMsg(msg.target);
   guidance.route = fromPointMsgs(msg.route);
   guidance.reason = msg.reason;
+  guidance.standing_start.valid = msg.standing_start.valid;
+  guidance.standing_start.center = fromPointMsg(msg.standing_start.center);
+  guidance.standing_start.radius = msg.standing_start.radius;
+  guidance.standing_start.boot = msg.standing_start.boot;
   return guidance;
 }
 

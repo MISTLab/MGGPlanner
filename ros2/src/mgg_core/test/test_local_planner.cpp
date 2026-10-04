@@ -52,6 +52,70 @@ TEST(LocalPlanner, StatusCompleteness) {
   auto wall = planner.plan(in, MapChange{1, {}, true});
   EXPECT_EQ(wall.status, LocalStatus::kBlocked) << wall.reason;
   EXPECT_FALSE(wall.reason.empty());
+  in.target.reset();
+  {
+    // Unobserved startup: nothing round the robot is observed, so nothing
+    // was searched. Never "observed and empty".
+    mgg_test::LocalScene blind;
+    blind.map.blind_radius = 1.5;
+    blind.layer.reset({0, 0, 0.5}, 0);
+    blind.layer.recheck(std::chrono::steady_clock::now() +
+                        std::chrono::seconds(20));
+    LocalPlanner blind_planner(blind.map, blind.layer, blind.cache,
+                               blind.planning, blind.robot, blind.sensor);
+    auto unobserved = blind_planner.plan(in, MapChange{1, {}, true});
+    EXPECT_EQ(unobserved.status, LocalStatus::kWaitingForMap)
+        << unobserved.reason;
+    EXPECT_FALSE(unobserved.checks_complete);
+  }
+  {
+    // Not every viewpoint scored within the slice: not exhausted.
+    mgg_test::LocalScene slow;
+    slow.map.delay_voxel_queries = true;
+    slow.sensor.max_range = 20;
+    slow.sensor.fov = {2 * M_PI, M_PI / 6};
+    slow.sensor.resolution = {M_PI / 36, M_PI / 36};
+    slow.sensor.update();
+    LocalPlanner slow_planner(slow.map, slow.layer, slow.cache, slow.planning,
+                              slow.robot, slow.sensor);
+    auto unscored = slow_planner.plan(in, {});
+    EXPECT_EQ(unscored.status, LocalStatus::kWaitingForMap) << unscored.reason;
+    EXPECT_EQ(unscored.reason, "not every viewpoint was scored");
+    EXPECT_FALSE(unscored.checks_complete);
+  }
+  {
+    // Fully observed and enclosed: walls round the robot, every cell seen.
+    mgg_test::LocalScene closed;
+    for (const double side : {-1.0, 1.0}) {
+      closed.map.solids.emplace_back(Eigen::Vector3d(side * 0.75 - 0.1, -1, 0.1),
+                                     Eigen::Vector3d(side * 0.75 + 0.1, 1, 0.9));
+      closed.map.solids.emplace_back(Eigen::Vector3d(-1, side * 0.4 - 0.1, 0.1),
+                                     Eigen::Vector3d(1, side * 0.4 + 0.1, 0.9));
+    }
+    LocalPlanner closed_planner(closed.map, closed.layer, closed.cache,
+                                closed.planning, closed.robot, closed.sensor);
+    auto enclosed = closed_planner.plan(in, {});
+    EXPECT_EQ(enclosed.status, LocalStatus::kNoLocalTarget) << enclosed.reason;
+    EXPECT_TRUE(enclosed.checks_complete);
+  }
+  {
+    // Gain beyond reach of a useful path: blocked, not "no gain".
+    mgg_test::LocalScene boxed;
+    boxed.map.unknown_beside_corridor = true;
+    boxed.map.solids.emplace_back(Eigen::Vector3d(1.6, -1, 0.1),
+                                  Eigen::Vector3d(1.8, 1, 0.9));
+    boxed.map.solids.emplace_back(Eigen::Vector3d(-1.8, -1, 0.1),
+                                  Eigen::Vector3d(-1.6, 1, 0.9));
+    LocalPlanner boxed_planner(boxed.map, boxed.layer, boxed.cache,
+                               boxed.planning, boxed.robot, boxed.sensor);
+    auto short_gain = boxed_planner.plan(in, {});
+    EXPECT_FALSE(short_gain.path);
+    ASSERT_TRUE(short_gain.candidate_count);
+    EXPECT_GT(*short_gain.candidate_count, 0u);
+    EXPECT_EQ(short_gain.status, LocalStatus::kBlocked) << short_gain.reason;
+    EXPECT_EQ(short_gain.reason.rfind("gain candidates", 0), 0u)
+        << short_gain.reason;
+  }
 }
 TEST(LocalPlanner, PendingElsewhereStillMoves) {
   mgg_test::LocalScene s;
@@ -367,4 +431,76 @@ TEST(LocalPlanner, UnknownGoalGroundWaitsForMap) {
   EXPECT_FALSE(none.path);
   EXPECT_EQ(none.status, LocalStatus::kWaitingForMap);
   EXPECT_EQ(none.reason, "goal_ground_unknown");
+}
+
+TEST(LocalPlanner, RealSensorBandUnknownIsGain) {
+  // The deployed VLP16 and ground gain model: unknown confined to the floor
+  // band beyond 4 m to either side is a frontier (0.5 m of unknown), not
+  // a fraction of the sensor's full 360 x 45 degree, 20 m ray table.
+  mgg_test::LocalScene s;
+  s.map.band_unknown_beyond_y = 4;
+  s.sensor = SensorParams();
+  s.sensor.type = SensorType::kLidar;
+  s.sensor.fov = {2 * M_PI, 0.7854};
+  s.sensor.resolution = {5 * M_PI / 180, 5 * M_PI / 180};
+  s.sensor.max_range = 20;
+  s.sensor.frontier_percentage_threshold = 0.05;
+  s.sensor.mount_height = 0.72;
+  s.sensor.update();
+  s.planning.ground_gain_angular_resolution_deg = 7.5;
+  s.planning.ground_gain_max_range = 10;
+  LocalPlanner planner(s.map, s.layer, s.cache, s.planning, s.robot, s.sensor);
+  auto in = s.inputs();
+  in.target.reset();
+  auto result = planner.plan(in, {});
+  ASSERT_TRUE(result.candidate_count);
+  EXPECT_GT(*result.candidate_count, 0u) << result.reason;
+  ASSERT_TRUE(result.path) << result.reason;
+  EXPECT_EQ(result.status, LocalStatus::kMoving);
+  EXPECT_GE(pathLength(*result.path), 6);
+}
+
+TEST(LocalPlanner, StandingStartDepartsAcrossItsBlindDisk) {
+  mgg_test::LocalScene s;
+  s.map.blind_radius = 1.5;
+  LocalPlanner planner(s.map, s.layer, s.cache, s.planning, s.robot, s.sensor);
+  auto in = s.inputs();
+  // Without the prior the robot stands on unobserved ground: no departure.
+  auto blind = planner.plan(in, MapChange{1, {}, true});
+  EXPECT_FALSE(blind.path);
+  const StandingStart standing{Eigen::Vector2d::Zero(), 2.0};
+  planner.setStandingStart(standing);
+  s.cache.flushAll();
+  auto departure = planner.plan(in, MapChange{2, {}, true});
+  ASSERT_TRUE(departure.path) << departure.reason;
+  EXPECT_EQ(departure.status, LocalStatus::kMoving);
+  EXPECT_TRUE(departure.path->reaches_goal);
+  EXPECT_GE(pathLength(*departure.path), 6.5);
+  // Re-certified from points along the departure, still in the disk.
+  EXPECT_TRUE(planner.pathStillCertified(*departure.path, 0.6));
+  // Legacy's first-goal arrival protection: never stop in the disk.
+  auto inside = in;
+  inside.target = Eigen::Vector3d(1.7, 0, 0.5);
+  EXPECT_FALSE(planner.plan(inside, {}).path);
+  // An occupied obstacle in the unseen body band blocks the departure.
+  s.map.solids.emplace_back(Eigen::Vector3d(0.9, -8, 0.3),
+                            Eigen::Vector3d(1.1, 8, 0.5));
+  s.cache.flushAll();
+  auto obstacle = planner.plan(in, MapChange{3, {}, true});
+  EXPECT_FALSE(obstacle.path) << obstacle.reason;
+  EXPECT_FALSE(planner.pathStillCertified(*departure.path, 0));
+  s.map.solids.clear();
+  // An observed drop in the disk is refused even with the prior.
+  s.map.pit = Eigen::AlignedBox2d(Eigen::Vector2d(0.8, -8),
+                                  Eigen::Vector2d(1.2, 8));
+  s.cache.flushAll();
+  auto drop = planner.plan(in, MapChange{4, {}, true});
+  EXPECT_FALSE(drop.path) << drop.reason;
+  s.map.pit.reset();
+  // Revoked, the same unknown floor and body band refuse again.
+  planner.setStandingStart(std::nullopt);
+  s.cache.flushAll();
+  auto revoked = planner.plan(in, MapChange{5, {}, true});
+  EXPECT_FALSE(revoked.path) << revoked.reason;
+  EXPECT_FALSE(planner.pathStillCertified(*departure.path, 0));
 }

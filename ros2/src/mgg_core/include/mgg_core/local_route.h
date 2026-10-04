@@ -62,10 +62,15 @@ StateVec localRouteRoot(const ExpandContext& ctx, const StateVec& robot_pose,
 /// roadmap does not). The axis-aligned box that once checked it refused a
 /// shortcut whenever its corners met unknown air the lattice had allowed,
 /// so lattice weaves were sent as they came (botman, 2026-10-01).
+/// `is_hanging` and `physical_root` are getProjectedEdgeStatus's: a segment
+/// of a departure from a hanging root, whose ground may be unobserved, and
+/// that root's own ground evidence on its first segment.
 bool groundShortcutSegmentAdmissible(const ExpandContext& ctx,
                                      const Eigen::Vector3d& from,
                                      const Eigen::Vector3d& to,
-                                     bool stop_at_unknown);
+                                     bool stop_at_unknown,
+                                     bool is_hanging = false,
+                                     const Eigen::Vector3d* physical_root = nullptr);
 
 /// How many vertices within edge_length_max of a goal, nearest first, the
 /// goal may be linked from when its nearest vertex cannot reach it.

@@ -132,6 +132,15 @@ class PlannerNode : public rclcpp::Node {
   mgg::GlobalGuidance guidance_;
   std::optional<mgg::FrontierCluster> guidance_target_;
   bool guidance_discovery_complete_ = false;
+  /// The standing start v2 guidance carries (mgg_msgs/StandingStart): the
+  /// keyframe proof of readStandingStart, but over the disk of
+  /// hanging_root_edge_length_max round the home keyframe instead of
+  /// kStandingStartMoveM. The local planner's first departure crosses that
+  /// disk and must not lose the prior halfway across it. nullopt without the
+  /// proof; once the keyframes or the robot leave the disk, for good on this
+  /// map. Legacy planning keeps standingStart().
+  std::optional<mgg::StandingStart> guidanceStandingStart();
+  bool guidance_left_standing_disk_ = false;
   rclcpp::Publisher<mgg_msgs::msg::GlobalGuidance>::SharedPtr guidance_pub_;
   rclcpp::Subscription<mgg_msgs::msg::LocalPlannerStatus>::SharedPtr local_status_sub_;
   rclcpp::Service<mgg_msgs::srv::SetLocalPlannerMode>::SharedPtr guidance_mode_service_;

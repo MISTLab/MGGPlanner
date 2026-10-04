@@ -1,6 +1,10 @@
 #ifndef MGG_CORE_TEST_LOCAL_PLANNER_FIXTURE_H_
 #define MGG_CORE_TEST_LOCAL_PLANNER_FIXTURE_H_
+#include <algorithm>
+#include <cmath>
+#include <optional>
 #include <thread>
+#include <vector>
 
 #include "mgg_core/local_planner.h"
 #include "terrain_fixture.h"
@@ -21,6 +25,14 @@ class LocalMap : public TerrainFixture {
   mgg::VoxelStatus getVoxelStatus(const Eigen::Vector3d& p) const override {
     if (delay_voxel_queries && (++voxel_queries % 1024 == 0))
       std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    if (solid(p, Eigen::Vector3d::Zero())) return mgg::VoxelStatus::kOccupied;
+    if (inPit(p)) return p.z() <= kPitFloor && p.z() > kPitFloor - 0.2
+                             ? mgg::VoxelStatus::kOccupied
+                             : mgg::VoxelStatus::kFree;
+    if (blind(p) && p.z() <= 0.6) return mgg::VoxelStatus::kUnknown;
+    if (band_unknown_beyond_y > 0 && std::abs(p.y()) > band_unknown_beyond_y &&
+        p.z() > 0 && p.z() < 0.6)
+      return mgg::VoxelStatus::kUnknown;
     if (unknown_beside_corridor && std::abs(p.y()) > .8 && p.z() > 0 &&
         p.z() < .8)
       return mgg::VoxelStatus::kUnknown;
@@ -38,6 +50,17 @@ class LocalMap : public TerrainFixture {
   mgg::VoxelStatus getBoxStatus(const Eigen::Vector3d& p,
                                 const Eigen::Vector3d& size,
                                 bool stop) const override {
+    if (solid(p, size)) return mgg::VoxelStatus::kOccupied;
+    // The body band a standing lidar cannot see near itself: within
+    // 0.5 m less than its blind floor.
+    if (stop && blind_radius > 0 && p.z() - size.z() / 2 < 0.6 &&
+        p.head<2>().norm() <
+            blind_radius - 0.5 + size.head<2>().norm() / 2)
+      return mgg::VoxelStatus::kUnknown;
+    if (stop && band_unknown_beyond_y > 0 &&
+        std::abs(p.y()) + size.y() / 2 > band_unknown_beyond_y &&
+        p.z() - size.z() / 2 < 0.6)
+      return mgg::VoxelStatus::kUnknown;
     if (unknown_beside_corridor && std::abs(p.y()) + size.y() / 2 > .8 &&
         p.z() + size.z() / 2 > .2 && p.z() - size.z() / 2 < .8)
       return mgg::VoxelStatus::kUnknown;
@@ -58,6 +81,16 @@ class LocalMap : public TerrainFixture {
   mgg::VoxelStatus getRayStatus(const Eigen::Vector3d& a,
                                 const Eigen::Vector3d& b, bool stop,
                                 Eigen::Vector3d& end) const override {
+    // Downward rays only, as ground projection casts.
+    if (inPit(a) && b.z() <= kPitFloor) {
+      end = Eigen::Vector3d((std::floor(a.x() / 0.2) + 0.5) * 0.2,
+                            (std::floor(a.y() / 0.2) + 0.5) * 0.2, kPitFloor);
+      return mgg::VoxelStatus::kOccupied;
+    }
+    if (inPit(a) || blind(a)) {
+      end = b;
+      return inPit(a) ? mgg::VoxelStatus::kFree : mgg::VoxelStatus::kUnknown;
+    }
     // Unobserved ground: downward rays end in unknown space.
     if (unknown_ground && a.x() > 5 && a.x() < 6 && a.y() > 2 &&
         a.y() < 3) {
@@ -66,12 +99,37 @@ class LocalMap : public TerrainFixture {
     }
     return TerrainFixture::getRayStatus(a, b, stop, end);
   }
+  /// The floor within blind_radius of the origin is unobserved, and so is
+  /// the body band within 0.5 m less, as a lidar standing there leaves them.
+  double blind_radius = 0;
+  /// Floor and body band beyond |y| of it are unknown: unknown confined to
+  /// the floor band, away from the robot.
+  double band_unknown_beyond_y = 0;
+  /// Occupied boxes.
+  std::vector<Eigen::AlignedBox3d> solids;
+  /// An observed drop: the floor under it lies at kPitFloor, seen.
+  std::optional<Eigen::AlignedBox2d> pit;
+  static constexpr double kPitFloor = -1.0;
   bool unknown_beside_corridor = false, delay_voxel_queries = false;
   bool unknown_ground = false;
   mutable size_t voxel_queries = 0;
   double wall_x = 2;
   bool wall = false, narrow = false, boundary_unknown = false,
        interior_unknown = false;
+
+ private:
+  bool blind(const Eigen::Vector3d& p) const {
+    return blind_radius > 0 && p.head<2>().norm() < blind_radius;
+  }
+  bool inPit(const Eigen::Vector3d& p) const {
+    return pit && pit->contains(p.head<2>());
+  }
+  bool solid(const Eigen::Vector3d& p, const Eigen::Vector3d& size) const {
+    const Eigen::AlignedBox3d box(p - size / 2, p + size / 2);
+    return std::any_of(solids.begin(), solids.end(), [&](const auto& s) {
+      return s.intersects(box);
+    });
+  }
 };
 inline mgg::RobotParams localRobot() {
   mgg::RobotParams r;
