@@ -520,9 +520,17 @@ void RollingVoxelMap::extractLocalMapAlongAxis(
   extractLocalMap(c, Eigen::Vector3d::Constant(radius), occupied, free);
   const Eigen::Vector3d direction =
       axis.norm() > 1e-9 ? axis.normalized() : Eigen::Vector3d::UnitX();
+  // The minimal rotation taking x onto `direction`, in closed form; opposite
+  // to x, the half turn about z. (Quaterniond::FromTwoVectors gives the same
+  // rotation but trips -Wmaybe-uninitialized in its SVD branch.)
+  const double cos_angle = direction.x();
   const Eigen::Matrix3d frame =
-      Eigen::Quaterniond::FromTwoVectors(Eigen::Vector3d::UnitX(), direction)
-          .toRotationMatrix();
+      cos_angle > -1.0 + 1e-9
+          ? Eigen::Quaterniond(1.0 + cos_angle, 0.0, -direction.z(),
+                               direction.y())
+                .normalized()
+                .toRotationMatrix()
+          : Eigen::Matrix3d(Eigen::AngleAxisd(M_PI, Eigen::Vector3d::UnitZ()));
   const auto outside = [&](const Eigen::Vector3d& p) {
     return ((frame.transpose() * (p - c)).array().abs() > s.array() * .5).any();
   };

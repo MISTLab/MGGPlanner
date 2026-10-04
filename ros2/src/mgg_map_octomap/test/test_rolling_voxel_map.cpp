@@ -228,6 +228,21 @@ TEST(RollingVoxelMap, MapInterfaceQueries) {
   ASSERT_EQ(occupied.size(), 1u);
   EXPECT_TRUE(occupied[0].isApprox(wall));
   EXPECT_EQ(free.size(), 10u);
+  // A thin box along the ray holds it all; turned across the ray, only the
+  // robot's own voxel.
+  const Eigen::Vector3d thin(6.0, 0.3, 0.3);
+  map.extractLocalMapAlongAxis(kRobot, Eigen::Vector3d::UnitX(), thin,
+                               occupied, free);
+  EXPECT_EQ(occupied.size(), 1u);
+  EXPECT_EQ(free.size(), 10u);
+  map.extractLocalMapAlongAxis(kRobot, Eigen::Vector3d::UnitY(), thin,
+                               occupied, free);
+  EXPECT_EQ(occupied.size(), 0u);
+  EXPECT_EQ(free.size(), 1u);
+  map.extractLocalMapAlongAxis(kRobot, -Eigen::Vector3d::UnitX(), thin,
+                               occupied, free);
+  EXPECT_EQ(occupied.size(), 1u);
+  EXPECT_EQ(free.size(), 10u);
 
   mgg::GainCounts gain;
   std::vector<std::pair<Eigen::Vector3d, VoxelStatus>> log;
