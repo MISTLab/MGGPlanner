@@ -56,7 +56,7 @@ void PlannerNode::guidanceTick() {
   const auto& mode = guidance_.mode();
   if (mode.session_id.empty()) return;
   std::vector<geometry_msgs::msg::Point> route;
-  std::string reason = "idle";
+  std::string reason = mode.mode == mode.IDLE ? "idle" : "objective route";
   bool complete = false;
   guidance_target_.reset();
   if (mode.mode != mode.IDLE) {
@@ -86,7 +86,9 @@ void PlannerNode::guidanceTick() {
           // only its frontier vertices/routes enter the global graph.
           guidance_discovery_complete_ = false;
           reason = buildLocalGraph();
-          guidance_target_ = refreshTour(reason);
+          std::string tour_reason;
+          guidance_target_ = refreshTour(tour_reason);
+          reason += tour_reason;
           if (guidance_target_) {
             const auto& p = guidance_target_->position;
             request->goal.position.x = p.x();
@@ -116,9 +118,16 @@ void PlannerNode::guidanceTick() {
         if (have_target) {
           auto response = std::make_shared<mgg_msgs::srv::PlanObjective::Response>();
           onObjectiveRequest(request, response);
-          reason = response->reason;
+          if (!response->reason.empty()) reason += "; " + response->reason;
           if (response->status == response->SUCCEEDED) {
             for (const auto& pose : response->path) route.push_back(pose.position);
+          } else if (mode.mode == mode.EXPLORE && guidance_target_ &&
+                     response->status != response->STALE_REVISION) {
+            // A failed route must not monopolize the tour. This is an
+            // expiring retry, not physical unreachability; stale map authority
+            // is not evidence against the target at all.
+            setTourClusterAside(*guidance_target_, tour_params_.route_retry_s);
+            guidance_target_.reset();
           }
           // A failed bounded search remains NONE, not COMPLETE/unreachable.
         }
@@ -129,8 +138,7 @@ void PlannerNode::guidanceTick() {
       reason = "guidance search interrupted";
     }
   }
-  auto message = guidance_.message(route, complete, world_frame_, reason);
-  message.header.stamp = now();
+  const auto message = guidance_.message(route, complete, world_frame_, reason, now());
   guidance_pub_->publish(message);
 }
 

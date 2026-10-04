@@ -10,12 +10,16 @@ TEST(GlobalGuidance, TargetAndComplete) {
   ASSERT_TRUE(guidance.setMode(mode));
   std::vector<geometry_msgs::msg::Point> global_route(2);
   global_route.back().x = 12;
-  const auto target = guidance.message(global_route, false, "world", "target");
+  builtin_interfaces::msg::Time stamp;
+  stamp.sec = 12;
+  stamp.nanosec = 500;
+  const auto target = guidance.message(global_route, false, "world", "target", stamp);
+  EXPECT_EQ(target.header.stamp, stamp);
   EXPECT_EQ(target.route, global_route);
   EXPECT_EQ(target.target, global_route.back());
   EXPECT_EQ(target.kind, target.TARGET);
   EXPECT_EQ(target.session_id, mode.session_id);
-  const auto done = guidance.message({}, true, "world", "exhausted");
+  const auto done = guidance.message({}, true, "world", "exhausted", stamp);
   EXPECT_EQ(done.kind, done.COMPLETE);
   EXPECT_GT(done.sequence_id, target.sequence_id);
   EXPECT_TRUE(done.route.empty());
@@ -28,9 +32,13 @@ TEST(GlobalGuidance, StatusIdentityAndMode) {
   mode.session_id = "new";
   mode.request_id = "latest";
   ASSERT_TRUE(guidance.setMode(mode));
+  builtin_interfaces::msg::Time stamp;
+  stamp.sec = 12;
+  stamp.nanosec = 500;
   const auto target = guidance.message(std::vector<geometry_msgs::msg::Point>(2),
-                                       false, "world", "target");
+                                       false, "world", "target", stamp);
   mgg_msgs::msg::LocalPlannerStatus status;
+  status.stamp = stamp;
   status.status = status.BLOCKED;
   status.session_id = "old";
   status.request_id = mode.request_id;
@@ -40,6 +48,17 @@ TEST(GlobalGuidance, StatusIdentityAndMode) {
   EXPECT_FALSE(guidance.setsTargetAside(status));
   status.request_id = mode.request_id;
   EXPECT_TRUE(guidance.setsTargetAside(status));  // optional sequence absent
+  // Zero can mean the local node had not yet received any guidance. A
+  // queued status from before this TARGET must not set that target aside.
+  status.stamp.nanosec = stamp.nanosec - 1;
+  EXPECT_FALSE(guidance.setsTargetAside(status));
+  status.stamp.sec = stamp.sec - 1;
+  status.stamp.nanosec = 999999999;
+  EXPECT_FALSE(guidance.setsTargetAside(status));
+  status.stamp = stamp;
+  EXPECT_TRUE(guidance.setsTargetAside(status));
+  ++status.stamp.sec;
+  EXPECT_TRUE(guidance.setsTargetAside(status));
   status.guidance_sequence_id = target.sequence_id + 1;
   EXPECT_FALSE(guidance.setsTargetAside(status));
   status.guidance_sequence_id = target.sequence_id;

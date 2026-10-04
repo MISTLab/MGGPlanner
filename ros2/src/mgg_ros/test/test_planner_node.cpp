@@ -395,13 +395,14 @@ class PlannerNodeTestPeer {
     cluster.gain = 10000;
     node.guidance_target_ = cluster;
     node.guidance_.message(std::vector<geometry_msgs::msg::Point>(2), false,
-                           "world", "target");
+                           "world", "target", node.now());
   }
   static bool guidanceStatus(PlannerNode& node, const std::string& session) {
     auto status = std::make_shared<mgg_msgs::msg::LocalPlannerStatus>();
     status->session_id = session;
     status->request_id = "request";
     status->status = status->BLOCKED;
+    status->stamp = node.now();
     node.onLocalPlannerStatus(status);
     return node.tour_set_aside_.count(42) != 0;
   }
@@ -2491,6 +2492,85 @@ TEST_F(PlannerNodeTest, V2OffsetGuidanceDiscoversFromVisitedStart) {
   EXPECT_TRUE(target) << "visited-only start must discover a guidance target within 3 cycles";
   EXPECT_NE(PlannerNodeTestPeer::tourTarget(*node), mgg::kNoCluster);
   EXPECT_EQ(execution_messages, 0);
+}
+
+TEST_F(PlannerNodeTest, GuidanceRouteFailureRetriesAndOffersAnotherTarget) {
+  using namespace std::chrono_literals;
+  auto node = makeNode("guidance_failed_route", "world",
+      {rclcpp::Parameter("exploration_architecture", "v2"),
+       rclcpp::Parameter("fleet.enabled", false)});
+  PlannerNodeTestPeer::observeFloor(*node, -6, 5, -2, 2);
+  PlannerNodeTestPeer::acceptOdometry(*node, 0, 0, 1);
+  // Isolate the stored global tour from new lattice frontiers.
+  PlannerNodeTestPeer::setLattice(*node, {0, 0}, {0, 0});
+  PlannerNodeTestPeer::setTour(*node, true, 1);
+  PlannerNodeTestPeer::setGlobalFrontierReach(*node, .5);
+  const int blocked = PlannerNodeTestPeer::addGlobalChainToFrontier(
+      *node, {{1, 0}, {2, 0}, {3, 0}});
+  const int reachable = PlannerNodeTestPeer::addGlobalChainToFrontier(
+      *node, {{-1, 0}, {-2, 0}, {-3, 0}, {-4, 0}}, M_PI);
+  PlannerNodeTestPeer::setVertexGain(*node, blocked, 1e6);
+  PlannerNodeTestPeer::setVertexGain(*node, reachable, 1e6);
+  const auto blocked_cluster = PlannerNodeTestPeer::refreshTour(*node);
+  ASSERT_NE(blocked_cluster, mgg::kNoCluster);
+  ASSERT_NEAR(PlannerNodeTestPeer::tourTargetPosition(*node).x(), 3, .001);
+  PlannerNodeTestPeer::receiveNoGoZones(*node, "world", {{3, 0}});
+
+  auto listener = std::make_shared<rclcpp::Node>("guidance_failed_route_listener");
+  std::vector<mgg_msgs::msg::GlobalGuidance> messages;
+  auto subscription = listener->create_subscription<mgg_msgs::msg::GlobalGuidance>(
+      "global_guidance", rclcpp::QoS(1).reliable().transient_local(),
+      [&](mgg_msgs::msg::GlobalGuidance::ConstSharedPtr msg) { messages.push_back(*msg); });
+  const auto cycle = [&] {
+    messages.clear();
+    PlannerNodeTestPeer::guidanceExploreCycle(*node);
+    const auto until = std::chrono::steady_clock::now() + 500ms;
+    while (messages.empty() && std::chrono::steady_clock::now() < until) {
+      rclcpp::spin_some(listener);
+      std::this_thread::sleep_for(1ms);
+    }
+  };
+  cycle();
+  EXPECT_GT(PlannerNodeTestPeer::tourAsideRetry(*node, blocked_cluster), 0);
+  ASSERT_FALSE(messages.empty());
+  EXPECT_EQ(messages.back().kind, messages.back().NONE);
+  cycle();
+  ASSERT_FALSE(messages.empty());
+  EXPECT_EQ(messages.back().kind, messages.back().TARGET) << messages.back().reason;
+  EXPECT_NEAR(messages.back().target.x, -4, .001);
+  ASSERT_GT(PlannerNodeTestPeer::tourAsideRetry(*node, blocked_cluster), 0);
+  // The blocked cluster remains frontier evidence; expiry makes it eligible
+  // again, rather than recording a physical-unreachability verdict.
+  PlannerNodeTestPeer::expireTourAside(*node, blocked_cluster);
+  PlannerNodeTestPeer::receiveNoGoZones(*node, "world", {});
+  PlannerNodeTestPeer::refreshTour(*node);
+  EXPECT_EQ(PlannerNodeTestPeer::tourAsideRetry(*node, blocked_cluster), -1);
+  EXPECT_TRUE(PlannerNodeTestPeer::isGlobalFrontier(*node, blocked));
+}
+
+TEST_F(PlannerNodeTest, GuidancePreservesDiscoveryBudgetReason) {
+  using namespace std::chrono_literals;
+  auto node = makeNode("guidance_budget_reason", "world",
+      {rclcpp::Parameter("exploration_architecture", "v2"),
+       rclcpp::Parameter("lattice_time_budget_s", 1e-9),
+       rclcpp::Parameter("fleet.enabled", false)});
+  PlannerNodeTestPeer::observeFloor(*node, -1, 4, -1.5, 1.5);
+  PlannerNodeTestPeer::acceptOdometry(*node, 0, 0, 1);
+  auto listener = std::make_shared<rclcpp::Node>("guidance_budget_listener");
+  std::optional<mgg_msgs::msg::GlobalGuidance> message;
+  auto subscription = listener->create_subscription<mgg_msgs::msg::GlobalGuidance>(
+      "global_guidance", rclcpp::QoS(1).reliable().transient_local(),
+      [&](mgg_msgs::msg::GlobalGuidance::ConstSharedPtr msg) { message = *msg; });
+  PlannerNodeTestPeer::guidanceExploreCycle(*node);
+  const auto until = std::chrono::steady_clock::now() + 500ms;
+  while (!message && std::chrono::steady_clock::now() < until) {
+    rclcpp::spin_some(listener);
+    std::this_thread::sleep_for(1ms);
+  }
+  ASSERT_TRUE(message);
+  EXPECT_EQ(message->kind, message->NONE);
+  EXPECT_NE(message->reason.find("planning budget exceeded"), std::string::npos)
+      << message->reason;
 }
 
 TEST_F(PlannerNodeTest, StaleStatusCannotBlockTarget) {

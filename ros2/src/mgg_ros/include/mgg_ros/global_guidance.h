@@ -17,7 +17,8 @@ class GlobalGuidance {
   const mgg_msgs::srv::SetLocalPlannerMode::Request& mode() const { return mode_; }
   mgg_msgs::msg::GlobalGuidance message(
       const std::vector<geometry_msgs::msg::Point>& route, bool complete,
-      const std::string& frame, const std::string& reason);
+      const std::string& frame, const std::string& reason,
+      const builtin_interfaces::msg::Time& stamp);
   bool setsTargetAside(const mgg_msgs::msg::LocalPlannerStatus& status) const;
 
  private:
