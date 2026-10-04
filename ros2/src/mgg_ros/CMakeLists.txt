@@ -76,6 +76,8 @@ ament_export_include_directories(include)
 
 if(BUILD_TESTING)
   find_package(ament_cmake_gtest REQUIRED)
+  ament_add_gtest(test_exploration_event test/test_exploration_event.cpp)
+  target_link_libraries(test_exploration_event ${PROJECT_NAME})
   ament_add_gtest(test_param_loader test/test_param_loader.cpp)
   target_link_libraries(test_param_loader ${PROJECT_NAME})
   ament_target_dependencies(test_param_loader rclcpp mgg_msgs)
