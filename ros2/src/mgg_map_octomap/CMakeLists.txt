@@ -43,7 +43,11 @@ find_package(tf2 REQUIRED)
 find_package(tf2_ros REQUIRED)
 find_package(tf2_geometry_msgs REQUIRED)
 
-add_library(${PROJECT_NAME} src/native_mola_grid.cpp src/mola_map.cpp)
+# The rolling voxel map is OctoMap-free and must stay outside every
+# MGG_WITH_OCTOMAP conditional: ground and drone local planning use it in
+# both build variants.
+add_library(${PROJECT_NAME} src/native_mola_grid.cpp src/mola_map.cpp
+  src/rolling_voxel_map.cpp)
 target_include_directories(${PROJECT_NAME} PUBLIC
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
   $<INSTALL_INTERFACE:include>)
@@ -109,6 +113,8 @@ if(BUILD_TESTING)
   target_link_libraries(test_native_gain ${PROJECT_NAME})
   ament_add_gtest(test_native_gain_memory test/test_native_gain_memory.cpp)
   target_link_libraries(test_native_gain_memory ${PROJECT_NAME})
+  ament_add_gtest(test_rolling_voxel_map test/test_rolling_voxel_map.cpp)
+  target_link_libraries(test_rolling_voxel_map ${PROJECT_NAME})
 endif()
 
 ament_package(CONFIG_EXTRAS mgg_map_octomap-extras.cmake.in)
