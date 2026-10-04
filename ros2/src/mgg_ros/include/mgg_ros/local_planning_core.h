@@ -149,8 +149,9 @@ class LocalPlanningCore {
   /// until feedback names another path.
   LocalPlanResult plan(std::chrono::steady_clock::time_point deadline);
   /// Invalidations produced since the last call: paths withdrawn by map
-  /// changes or resets, or an executing path evicted by retention pruning.
-  /// Retiring other paths is silent. Plan immediately after a non-empty result.
+  /// changes or resets, or the last feedback-confirmed executing path evicted
+  /// by retention pruning. Retiring other paths is silent. Plan immediately
+  /// after a non-empty result.
   std::vector<LocalInvalidation> takeInvalidations();
 
   const LocalPlanningParams& params() const { return params_; }
@@ -213,6 +214,8 @@ class LocalPlanningCore {
   std::map<std::uint64_t, Retained> retained_;
   std::uint64_t next_sequence_ = 1;
   std::uint64_t executing_sequence_ = 0;
+  /// Last executor acknowledgement, independent of optimistic publications.
+  std::uint64_t fed_back_sequence_ = 0;
   double progress_ = 0, speed_mps_ = 0;
   BrakingBounds braking_;
   std::vector<LocalInvalidation> invalidations_;

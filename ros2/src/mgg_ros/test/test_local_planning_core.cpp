@@ -318,3 +318,81 @@ TEST(LocalPlanningCore, RetentionDoesNotInvalidateExtensionChain) {
             last_sequence - kMaxRetained + 1);
   EXPECT_EQ(invalidations.back().sequence_id, last_sequence);
 }
+
+TEST(LocalPlanningCore, RetentionInvalidatesFeedbackConfirmedPath) {
+  // Repeated feedback reproduces the rejected-sibling case. One-shot feedback
+  // also has to survive intervening publications without another executor ack.
+  for (const bool repeat_feedback : {false, true}) {
+    SCOPED_TRACE(repeat_feedback);
+    mgg_test::Corridor corridor;
+    const StateVec base = basePose(0.1, 0.1);
+    LocalPlanningCore core(mgg_test::sceneParams());
+    observe(core, corridor, base);
+    ASSERT_TRUE(
+        core.setMode(follow("s1", "r1", drivingPoint(6.1, 0.1))).accepted);
+    const auto first = core.plan(soon());
+    ASSERT_TRUE(first.path) << first.reason;
+    ASSERT_EQ(first.path->sequence_id, 1u);
+    LocalFeedback feedback;
+    feedback.session_id = "s1";
+    feedback.epoch = core.epoch();
+    feedback.sequence_id = first.path->sequence_id;
+    feedback.executing = true;
+    core.onFeedback(feedback);
+    for (size_t i = 0; i < kMaxRetained; ++i) {
+      if (repeat_feedback) core.onFeedback(feedback);
+      const auto next = core.plan(soon());
+      ASSERT_TRUE(next.path) << next.reason;
+      EXPECT_EQ(next.path->kind, LocalPathKind::kExtend);
+      if (repeat_feedback)
+        EXPECT_EQ(next.path->extends_sequence_id, first.path->sequence_id);
+      if (i + 1 < kMaxRetained)
+        EXPECT_TRUE(core.takeInvalidations().empty());
+    }
+    const auto invalidations = core.takeInvalidations();
+    ASSERT_EQ(invalidations.size(), 1u);
+    EXPECT_EQ(invalidations[0].sequence_id, first.path->sequence_id);
+    EXPECT_EQ(invalidations[0].session_id, "s1");
+    EXPECT_EQ(invalidations[0].epoch, core.epoch());
+    EXPECT_EQ(invalidations[0].reason, "retention limit");
+    const auto next = core.plan(soon());
+    ASSERT_TRUE(next.path) << next.reason;
+    EXPECT_TRUE(core.takeInvalidations().empty());
+  }
+}
+
+TEST(LocalPlanningCore, RetentionFeedbackStopIsSessionAndEpochFenced) {
+  for (const std::string stop_kind : {"current", "old_session", "old_epoch"}) {
+    SCOPED_TRACE(stop_kind);
+    mgg_test::Corridor corridor;
+    const StateVec base = basePose(0.1, 0.1);
+    LocalPlanningCore core(mgg_test::sceneParams());
+    observe(core, corridor, base);
+    ASSERT_TRUE(
+        core.setMode(follow("s1", "r1", drivingPoint(6.1, 0.1))).accepted);
+    const auto first = core.plan(soon());
+    ASSERT_TRUE(first.path) << first.reason;
+    LocalFeedback feedback;
+    feedback.session_id = "s1";
+    feedback.epoch = core.epoch();
+    feedback.sequence_id = first.path->sequence_id;
+    feedback.executing = true;
+    core.onFeedback(feedback);
+    feedback.executing = false;
+    if (stop_kind == "old_session") feedback.session_id = "old";
+    if (stop_kind == "old_epoch") ++feedback.epoch;
+    core.onFeedback(feedback);
+    for (size_t i = 0; i < kMaxRetained; ++i) {
+      const auto next = core.plan(soon());
+      ASSERT_TRUE(next.path) << next.reason;
+    }
+    const auto invalidations = core.takeInvalidations();
+    if (stop_kind == "current") {
+      EXPECT_TRUE(invalidations.empty());
+    } else {
+      ASSERT_EQ(invalidations.size(), 1u);
+      EXPECT_EQ(invalidations[0].sequence_id, first.path->sequence_id);
+      EXPECT_EQ(invalidations[0].reason, "retention limit");
+    }
+  }
+}

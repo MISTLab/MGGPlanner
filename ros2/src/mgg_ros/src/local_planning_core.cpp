@@ -185,6 +185,7 @@ void LocalPlanningCore::invalidate(std::uint64_t sequence,
 void LocalPlanningCore::clearSession() {
   retained_.clear();
   executing_sequence_ = 0;
+  fed_back_sequence_ = 0;
   progress_ = 0;
   speed_mps_ = 0;
   guidance_.reset();
@@ -280,12 +281,14 @@ void LocalPlanningCore::onFeedback(const LocalFeedback& feedback) {
       feedback.progress_m < 0)
     return;
   if (feedback.executing && feedback.sequence_id != 0) {
+    fed_back_sequence_ = feedback.sequence_id;
     executing_sequence_ = feedback.sequence_id;
     progress_ = feedback.progress_m;
     // The executor has moved on from every older path.
     retained_.erase(retained_.begin(),
                     retained_.lower_bound(executing_sequence_));
   } else {
+    fed_back_sequence_ = 0;
     executing_sequence_ = 0;
     progress_ = 0;
   }
@@ -392,10 +395,10 @@ LocalPlanResult LocalPlanningCore::plan(Clock::time_point deadline) {
     executing_sequence_ = sequence;
     progress_ = 0;
     while (retained_.size() > kMaxRetained) {
-      // Retirement is bookkeeping, not a map event. Only fence a path
-      // still being driven; invalidating retired ancestors would otherwise
-      // propagate through the adapter's splice lineage and stop new paths.
-      if (retained_.begin()->first == executing_sequence_)
+      // Publication changes the planning assumption, not the last executor
+      // acknowledgement. Fence its path even if feedback skips a cycle;
+      // retiring other ancestors silently avoids stopping newer paths.
+      if (retained_.begin()->first == fed_back_sequence_)
         invalidate(retained_.begin()->first, "retention limit");
       retained_.erase(retained_.begin());
     }
