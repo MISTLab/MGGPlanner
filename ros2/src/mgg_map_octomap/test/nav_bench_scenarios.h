@@ -13,9 +13,11 @@
 #include <filesystem>
 #include <fstream>
 #include <memory>
+#include <optional>
 #include <sstream>
 #include <string>
 #include <thread>
+#include <tuple>
 #include <vector>
 
 #include <nlohmann/json.hpp>
@@ -42,10 +44,21 @@ inline std::string readText(const std::string& path) {
   return buffer.str();
 }
 
+/// The benchmark's product loading: the snapshot never expires and a large
+/// grid may take 10 s to load.
+inline MolaMapConfig benchProductConfig() {
+  MolaMapConfig config;
+  config.snapshot_ttl_sec = 1e6;
+  config.max_load_time = std::chrono::milliseconds(10000);
+  return config;
+}
+
 /// The MOLA product under `peer_root` (its mola/ directory), loaded through
-/// MolaMap with the identity authority transform. Null with `error` set
-/// when it does not load.
+/// MolaMap with the identity authority transform and the recorded loader
+/// configuration `recorded`; its peer root and resolution come from the
+/// product. Null with `error` set when it does not load.
 inline std::unique_ptr<MolaMap> loadProduct(const std::string& peer_root,
+                                            MolaMapConfig recorded,
                                             std::string& error) {
   using nlohmann::json;
   json source, index;
@@ -78,11 +91,9 @@ inline std::unique_ptr<MolaMap> loadProduct(const std::string& peer_root,
   std::uint32_t metadata_size = 0;
   std::memcpy(&metadata_size, grid.data() + 8, 4);
   const json metadata = json::parse(grid.substr(12, metadata_size));
-  MolaMapConfig config;
+  MolaMapConfig config = std::move(recorded);
   config.peer_root = std::filesystem::absolute(peer_root).string();
   config.resolution = metadata.at("resolution_m");
-  config.snapshot_ttl_sec = 1e6;
-  config.max_load_time = std::chrono::milliseconds(10000);
   auto map = std::make_unique<MolaMap>(config);
   map->requestSnapshot(request);
   for (int i = 0; i < 400 && !map->getStatus(); ++i) {
@@ -93,6 +104,12 @@ inline std::unique_ptr<MolaMap> loadProduct(const std::string& peer_root,
     return nullptr;
   }
   return map;
+}
+
+/// The MOLA product under `peer_root`, loaded with benchProductConfig().
+inline std::unique_ptr<MolaMap> loadProduct(const std::string& peer_root,
+                                            std::string& error) {
+  return loadProduct(peer_root, benchProductConfig(), error);
 }
 
 /// Botman's deployed planning parameters at the 0.10 m planner resolution:
@@ -169,6 +186,21 @@ inline GridGraphParams botmanGrid() {
   g.resolution = Eigen::Vector3d(0.4, 0.4, 0.1);
   return g;
 }
+
+/// The parameters a plan runs with: Botman's by default, or those recorded
+/// with a replay.
+struct RecordedParams {
+  PlanningParams planning = botmanPlanning();
+  RobotParams robot = botmanRobot();
+  GridGraphParams grid = botmanGrid();
+  bool allow_unknown_body = true;
+  double request_budget_ms = 500.0;
+  std::optional<double> sensor_height;
+  double lattice_budget_ms = 100.0;
+  /// Fill Outcome::lattice_edge_keys of an exploration lattice, after its
+  /// timing is taken.
+  bool collect_lattice_edges = false;
+};
 
 struct Scenario {
   std::string name;
@@ -262,7 +294,42 @@ struct Outcome {
   bool expectation_met = false;
   PlanProfile profile;
   std::vector<Eigen::Vector3d> path;
+  /// Sorted, unique endpoint pairs (millimetres) of the exploration
+  /// lattice's edges, when RecordedParams::collect_lattice_edges is set.
+  std::vector<std::string> lattice_edge_keys;
 };
+
+/// The edges of `graph` as sorted, unique endpoint pairs in millimetres.
+inline std::vector<std::string> latticeEdgeKeys(GraphManager& graph) {
+  const auto at = [](const Vertex& v) {
+    char text[96];
+    std::snprintf(text, sizeof(text), "%lld,%lld,%lld",
+                  static_cast<long long>(std::llround(v.state.x() * 1000.0)),
+                  static_cast<long long>(std::llround(v.state.y() * 1000.0)),
+                  static_cast<long long>(std::llround(v.state.z() * 1000.0)));
+    return std::string(text);
+  };
+  std::vector<std::string> keys;
+  std::pair<Graph::GraphType::edge_iterator, Graph::GraphType::edge_iterator> edges;
+  graph.graph_->getEdgeIterator(edges);
+  for (auto it = edges.first; it != edges.second; ++it) {
+    int source = 0, target = 0;
+    double weight = 0.0;
+    std::tie(source, target, weight) = graph.graph_->getEdgeProperty(it);
+    const auto a = graph.vertices_map_.find(source);
+    const auto b = graph.vertices_map_.find(target);
+    if (a == graph.vertices_map_.end() || b == graph.vertices_map_.end() ||
+        a->second == nullptr || b->second == nullptr) {
+      continue;
+    }
+    std::string u = at(*a->second), v = at(*b->second);
+    if (v < u) std::swap(u, v);
+    keys.push_back(u + ">" + v);
+  }
+  std::sort(keys.begin(), keys.end());
+  keys.erase(std::unique(keys.begin(), keys.end()), keys.end());
+  return keys;
+}
 
 inline double polylineLength(const std::vector<Eigen::Vector3d>& p) {
   double length = 0.0;
@@ -287,11 +354,14 @@ inline double maxCornerDeg(const std::vector<Eigen::Vector3d>& p) {
   return worst;
 }
 
+/// `scenario` planned on `map` as the planner node does, with `recorded`.
 inline Outcome run(const MapInterface& map, const Scenario& scenario,
-                   bool allow_unknown_body = true, double request_budget_ms = 500.0,
-                   std::optional<double> sensor_height = std::nullopt,
-                   double lattice_budget_ms = 100.0,
+                   const RecordedParams& recorded,
                    const std::vector<StateVec>& own_trajectory = {}) {
+  const bool allow_unknown_body = recorded.allow_unknown_body;
+  const double request_budget_ms = recorded.request_budget_ms;
+  const std::optional<double> sensor_height = recorded.sensor_height;
+  const double lattice_budget_ms = recorded.lattice_budget_ms;
   using Clock = std::chrono::steady_clock;
   const auto ms = [](Clock::time_point a, Clock::time_point b) {
     return std::chrono::duration<double, std::milli>(b - a).count();
@@ -301,9 +371,9 @@ inline Outcome run(const MapInterface& map, const Scenario& scenario,
   out.unknown_body_policy = sensor_height ? "above_sensor_fov" :
       (allow_unknown_body ? "legacy_relaxed" : "strict");
   out.request_budget_ms = request_budget_ms;
-  const PlanningParams planning = botmanPlanning();
-  const RobotParams robot = botmanRobot();
-  const GridGraphParams grid = botmanGrid();
+  const PlanningParams planning = recorded.planning;
+  const RobotParams robot = recorded.robot;
+  const GridGraphParams grid = recorded.grid;
   GroundProjection ground(map, planning, /*cache_footprint_ground=*/true);
   ground.setProfile(&out.profile);
   EdgeInclinations inclinations;
@@ -386,6 +456,7 @@ inline Outcome run(const MapInterface& map, const Scenario& scenario,
     out.expectation_met = out.routed &&
                           (scenario.budget_ms <= 0.0 ||
                            out.total_ms <= scenario.budget_ms);
+    if (recorded.collect_lattice_edges) out.lattice_edge_keys = latticeEdgeKeys(graph);
     diagnostics();
     return out;
   }
@@ -473,6 +544,20 @@ inline Outcome run(const MapInterface& map, const Scenario& scenario,
     out.expectation_met = false;
     return out;
   }
+}
+
+/// `scenario` with Botman's parameters.
+inline Outcome run(const MapInterface& map, const Scenario& scenario,
+                   bool allow_unknown_body = true, double request_budget_ms = 500.0,
+                   std::optional<double> sensor_height = std::nullopt,
+                   double lattice_budget_ms = 100.0,
+                   const std::vector<StateVec>& own_trajectory = {}) {
+  RecordedParams botman;
+  botman.allow_unknown_body = allow_unknown_body;
+  botman.request_budget_ms = request_budget_ms;
+  botman.sensor_height = sensor_height;
+  botman.lattice_budget_ms = lattice_budget_ms;
+  return run(map, scenario, botman, own_trajectory);
 }
 
 inline std::string describe(const Scenario& s, const Outcome& o) {
