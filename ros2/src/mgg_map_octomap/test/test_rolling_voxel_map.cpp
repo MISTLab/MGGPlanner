@@ -77,6 +77,34 @@ TEST(RollingVoxelMap, EnteringSlabAndInclusiveBounds) {
             VoxelStatus::kUnknown);
 }
 
+TEST(RollingVoxelMap, HitOnMaxFaceMarksLastVoxel) {
+  // A 4 m window of 1 m voxels around (0.5, 0.5, 0.5) spans [-2, 2] on each
+  // axis; a return exactly on a max face belongs to the last voxel.
+  RollingWindowParams params;
+  params.resolution = 1.0;
+  params.window_size_m = Eigen::Vector3d(4, 4, 4);
+  const Eigen::Vector3d robot(0.5, 0.5, 0.5);
+  for (int axis = 0; axis < 3; ++axis) {
+    SCOPED_TRACE(axis);
+    RollingVoxelMap map(params);
+    Eigen::Vector3d beyond = robot;
+    beyond[axis] = 3.5;
+    map.insertScan({beyond}, robot, robot);
+    Eigen::Vector3d last_voxel = robot;
+    last_voxel[axis] = 1.5;
+    ASSERT_EQ(map.getVoxelStatus(last_voxel), VoxelStatus::kFree);
+
+    Eigen::Vector3d on_max_face = robot;
+    on_max_face[axis] = map.window().max()[axis];
+    const std::uint64_t before = map.revision();
+    const MapChange change = map.insertScan({on_max_face}, robot, robot);
+    EXPECT_EQ(map.getVoxelStatus(last_voxel), VoxelStatus::kOccupied);
+    EXPECT_EQ(map.getVoxelStatus(on_max_face), VoxelStatus::kOccupied);
+    EXPECT_GT(change.revision, before);
+    EXPECT_TRUE(mgg::changeReaches(change, probe(last_voxel)));
+  }
+}
+
 TEST(RollingVoxelMap, StableKeys) {
   RollingVoxelMap map(RollingWindowParams{});
   const Eigen::Vector3d p(-3.33, 2.71, 0.47);

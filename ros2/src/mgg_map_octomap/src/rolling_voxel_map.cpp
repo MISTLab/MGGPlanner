@@ -261,11 +261,10 @@ MapChange RollingVoxelMap::insertScan(const std::vector<Eigen::Vector3d>& points
       mark(v.x, v.y, v.z, kMissed);
       return true;
     });
-    if (hit) {
-      VoxelIndex v;
-      if (voxelIndexOf(end, resolution_, v) && inWindow(v.x, v.y, v.z))
-        mark(v.x, v.y, v.z, kHit);
-    }
+    // The return's voxel as point queries resolve it: a return on the
+    // window's max face belongs to its last voxel.
+    VoxelKey k;
+    if (hit && cellOf(end, k)) mark(k.x, k.y, k.z, kHit);
   }
 
   // Each touched voxel is updated once; a hit anywhere in the scan wins.
