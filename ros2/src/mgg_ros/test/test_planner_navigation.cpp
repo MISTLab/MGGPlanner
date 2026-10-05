@@ -3,8 +3,7 @@
 // NAVIGATE objectives for a Bunker-sized ground robot (botman) on MOLA
 // planning products at its deployed 0.10 m resolution: what the lattice,
 // the goal link and the shortcut make of open floor, a wall and a ramp.
-// The mola_snapshot backend is always built, so these run with and without
-// OctoMap.
+// These persistent-map tests are always built.
 
 #include <gtest/gtest.h>
 

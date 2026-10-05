@@ -33,7 +33,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
       libprotobuf-dev \
       autoconf \
       libtool \
-      ros-noetic-octomap-ros \
       ros-noetic-tf \
       ros-noetic-tf2-ros \
       ros-noetic-tf-conversions \

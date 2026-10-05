@@ -8,7 +8,7 @@
 # Note what is NOT here: voxblox, protobuf_catkin, glog_catkin, gflags_catkin,
 # minkindr and eigen_checks are all absent by design. They are voxblox's
 # dependencies, not the planner's, and section 4 of the plan drops voxblox in
-# favour of an OctoMap-backed ternary occupancy map.
+# favour of the native MOLA ternary occupancy map.
 #
 # Build (from the repo root):
 #   docker build -f docker/jazzy-dev.Dockerfile -t mgg:jazzy .
@@ -24,9 +24,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
       python3-vcstool \
       libeigen3-dev \
       libyaml-cpp-dev \
-      ros-jazzy-octomap \
-      ros-jazzy-octomap-msgs \
-      ros-jazzy-octomap-ros \
       ros-jazzy-pcl-ros \
       ros-jazzy-pcl-conversions \
       ros-jazzy-tf2 \

@@ -20,7 +20,7 @@
 
 #include <rclcpp/rclcpp.hpp>
 
-#include "mgg_map_octomap/octomap_map.h"
+#include "native_scene_map.h"
 #include "mgg_ros/planner_node.h"
 
 namespace mgg_ros {
@@ -29,6 +29,17 @@ namespace mgg_ros {
 /// more): the small ground robot and map helpers that test uses.
 class PlannerNodeTestPeer {
  public:
+  static mgg_test::NativeSceneMap& sceneMap(PlannerNode& node) {
+    return dynamic_cast<mgg_test::NativeSceneMap&>(*node.map_);
+  }
+  static void installSceneMap(PlannerNode& node) {
+    node.mola_map_ = nullptr;
+    node.keyframe_source_.reset();
+    node.map_ = std::make_unique<mgg_test::NativeSceneMap>(
+        mgg_test::NativeSceneConfig{0.1});
+    node.ground_ = std::make_unique<mgg::GroundProjection>(
+        *node.map_, node.planning_params_);
+  }
   static void configureGroundRobot(PlannerNode& node) {
     const std::lock_guard<std::recursive_mutex> lock(node.planner_mutex_);
     node.robot_params_.type = mgg::RobotType::kGroundRobot;
@@ -84,11 +95,11 @@ class PlannerNodeTestPeer {
     }
     for (int repeat = 0; repeat < 6; ++repeat) {
       for (const Eigen::Vector3d& p : floor) {
-        node.cloud_map_->insertPointCloud({p},
+        sceneMap(node).insertPointCloud({p},
                                           Eigen::Vector3d(p.x(), p.y(), 1.5));
       }
     }
-    node.cloud_map_->augmentFreeBox(
+    sceneMap(node).augmentFreeBox(
         Eigen::Vector3d(0.5 * (xmin + xmax), 0.5 * (ymin + ymax), 0.40),
         Eigen::Vector3d(xmax - xmin, ymax - ymin, 0.60));
     ++node.map_revision_;
@@ -102,7 +113,7 @@ class PlannerNodeTestPeer {
     const std::lock_guard<std::recursive_mutex> lock(node.planner_mutex_);
     for (int repeat = 0; repeat < 6; ++repeat) {
       for (const Eigen::Vector3d& p : points) {
-        node.cloud_map_->insertPointCloud({p}, origin_of(p));
+        sceneMap(node).insertPointCloud({p}, origin_of(p));
       }
     }
     ++node.map_revision_;
@@ -203,7 +214,8 @@ std::shared_ptr<PlannerNode> makeFleetNode(int robot_id) {
        "neighbour_graph_out:=/fleet_itest/graphs", "-r",
        "neighbour_graph_in:=/fleet_itest/graphs"});
   options.parameter_overrides({
-      rclcpp::Parameter("map.backend", "cloud_octomap"),
+      rclcpp::Parameter("map.backend", "mola_snapshot"),
+      rclcpp::Parameter("map.mola.peer_root", "/nonexistent/test_scene"),
       rclcpp::Parameter("map.resolution", 0.10),
       rclcpp::Parameter("PlanningParams.global_frame_id", "world"),
       rclcpp::Parameter("PlanningParams.robot_id", robot_id),
@@ -225,6 +237,7 @@ std::shared_ptr<PlannerNode> makeFleetNode(int robot_id) {
   });
   options.automatically_declare_parameters_from_overrides(true);
   auto node = std::make_shared<PlannerNode>(options);
+  PlannerNodeTestPeer::installSceneMap(*node);
   PlannerNodeTestPeer::configureGroundRobot(*node);
   return node;
 }

@@ -1,2 +1,0 @@
-# Whether this install was built with the OctoMap backend (MGG_WITH_OCTOMAP).
-set(mgg_map_octomap_WITH_OCTOMAP @MGG_WITH_OCTOMAP@)

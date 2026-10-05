@@ -11,12 +11,12 @@
 // per-consumer cursors: the driver hands each consumer the MapChange of the
 // call it made.
 //
-// Occupancy follows OctomapMap's defaults: hit/miss probability .7/.4,
+// Occupancy uses: hit/miss probability .7/.4,
 // clamping .12/.97, occupied threshold .5, maximum range 20 m. Each scan
 // updates a voxel at most once, and a hit in the scan outranks a miss, so a
 // single grazing ray cannot flip a voxel that is solidly observed occupied.
 //
-// Built without OctoMap: this class must not depend on MGG_WITH_OCTOMAP.
+// Independent of the persistent map backend.
 
 #ifndef MGG_MAP_OCTOMAP_ROLLING_VOXEL_MAP_H_
 #define MGG_MAP_OCTOMAP_ROLLING_VOXEL_MAP_H_
@@ -125,7 +125,7 @@ class RollingVoxelMap : public MapInterface {
                                 std::vector<Eigen::Vector3d>& occupied_voxels,
                                 std::vector<Eigen::Vector3d>& free_voxels) override;
   /// Occupied voxel centres within `range`; known free ones as well with
-  /// `include_unknown_voxels`, as OctomapMap does.
+  /// `include_unknown_voxels`.
   void getLocalPointcloud(const Eigen::Vector3d& center, double range,
                           double yaw, std::vector<Eigen::Vector3d>& points,
                           bool include_unknown_voxels = false) override;

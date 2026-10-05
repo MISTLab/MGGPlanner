@@ -335,7 +335,7 @@ void MapManagerVoxblox<SDFServerType, SDFVoxelType>::extractLocalMap(
     std::vector<Eigen::Vector3d>& free_voxels) {
   // ROS_WARN_THROTTLE(5.0,
   //                   "MapManagerVoxblox::extractLocalMap --> Temporary
-  //                   solution " "to be consistent with Octomap interface.");
+  //                   solution " "to be consistent with occupancy map interface.");
   occupied_voxels.clear();
   free_voxels.clear();
   double resolution = getResolution();

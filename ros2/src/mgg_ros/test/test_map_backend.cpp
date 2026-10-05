@@ -1,6 +1,4 @@
-// Which map backends the planner node accepts. mola_snapshot is always built;
-// cloud_octomap only when mgg_map_octomap has OctoMap (MGG_WITH_OCTOMAP), and
-// asking for it otherwise fails at construction with a message saying why.
+// The persistent planner accepts only MOLA snapshots.
 
 #include <gtest/gtest.h>
 
@@ -49,6 +47,16 @@ class MapBackendTest : public ::testing::Test {
   static void SetUpTestSuite() { rclcpp::init(0, nullptr); }
   static void TearDownTestSuite() { rclcpp::shutdown(); }
 };
+
+TEST_F(MapBackendTest, DefaultBackendIsMolaSnapshot) {
+  rclcpp::NodeOptions options;
+  options.parameter_overrides({rclcpp::Parameter(
+      "map.mola.peer_root", "/nonexistent/mgg_peer_root")});
+  options.automatically_declare_parameters_from_overrides(true);
+  std::shared_ptr<PlannerNode> node;
+  ASSERT_NO_THROW(node = std::make_shared<PlannerNode>(options));
+  EXPECT_EQ(node->get_parameter("map.backend").as_string(), "mola_snapshot");
+}
 
 TEST_F(MapBackendTest, MolaSnapshotIsAlwaysAvailable) {
   EXPECT_NO_THROW(makeNode("mola_backend", "mola_snapshot"));
@@ -110,23 +118,6 @@ TEST_F(MapBackendTest, RebuildsReadTheGraphSolutionAndRobotTheyAreGiven) {
 TEST_F(MapBackendTest, AnUnknownBackendIsRefused) {
   EXPECT_THROW(makeNode("unknown_backend", "voxblox"), std::invalid_argument);
 }
-
-#ifdef MGG_WITH_OCTOMAP
-TEST_F(MapBackendTest, CloudOctomapIsAvailableWithOctomap) {
-  EXPECT_NO_THROW(makeNode("octomap_backend", "cloud_octomap"));
-}
-#else
-TEST_F(MapBackendTest, CloudOctomapIsRefusedWithoutOctomap) {
-  try {
-    makeNode("octomap_backend", "cloud_octomap");
-    FAIL() << "cloud_octomap was accepted without OctoMap";
-  } catch (const std::invalid_argument& e) {
-    EXPECT_NE(std::string(e.what()).find("MGG_WITH_OCTOMAP=OFF"),
-              std::string::npos)
-        << e.what();
-  }
-}
-#endif
 
 }  // namespace
 }  // namespace mgg_ros

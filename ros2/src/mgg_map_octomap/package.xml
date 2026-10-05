@@ -4,13 +4,8 @@
   <name>mgg_map_octomap</name>
   <version>1.0.0</version>
   <description>
-    An OctoMap-backed implementation of mgg_core's MapInterface, replacing
-    the ROS 1 voxblox map manager. The planner only ever queried ternary
-    occupancy, so a TSDF was never required; see section 4 of
-    ROS2_PORT_PLAN.md.
-
-    The OctomapMap class itself is free of ROS so it can be unit tested
-    off-robot; the PointCloud2 and TF front end is separate.
+    MOLA persistent products and a rolling local voxel implementation of
+    mgg_core's MapInterface, both independent of ROS.
   </description>
 
   <maintainer email="giovanni.beltrame@polymtl.ca">Giovanni Beltrame</maintainer>
@@ -19,21 +14,9 @@
   <buildtool_depend>ament_cmake</buildtool_depend>
 
   <depend>mgg_core</depend>
-  <!-- Only with -DMGG_WITH_OCTOMAP=ON (the default). octomap is not a
-       workspace package, so it never orders colcon's build; an OFF build
-       simply does not look for it. -->
-  <depend>octomap</depend>
   <depend>eigen</depend>
   <depend>nlohmann_json</depend>
   <depend>openssl</depend>
-
-  <!-- ROS dependencies of the ingest node only; the OctomapMap class itself
-       links none of these. -->
-  <depend>rclcpp</depend>
-  <depend>sensor_msgs</depend>
-  <depend>tf2</depend>
-  <depend>tf2_ros</depend>
-  <depend>tf2_geometry_msgs</depend>
 
   <test_depend>ament_cmake_gtest</test_depend>
 

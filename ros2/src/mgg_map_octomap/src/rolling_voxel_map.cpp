@@ -15,7 +15,7 @@ namespace {
 
 double logit(double p) { return std::log(p / (1.0 - p)); }
 
-// OctomapConfig's defaults.
+// Occupancy integration defaults.
 const float kLogHit = float(logit(0.7));
 const float kLogMiss = float(logit(0.4));
 const float kLogClampMin = float(logit(0.12));

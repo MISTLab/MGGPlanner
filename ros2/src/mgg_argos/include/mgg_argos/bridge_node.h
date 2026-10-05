@@ -128,7 +128,7 @@ class BridgeNode : public rclcpp::Node {
   std::string base_frame_suffix_;
   std::string lidar_frame_suffix_;
   std::vector<double> lidar_translation_;
-  /// Miss endpoints go out at max_range * this. Strictly above 1 so octomap
+  /// Miss endpoints go out at max_range * this. Strictly above 1 so the mapper
   /// treats them as beyond-range measurements, which clear the ray without
   /// marking an obstacle at the end of it.
   double miss_range_scale_ = 1.02;

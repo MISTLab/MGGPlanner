@@ -235,7 +235,7 @@ def main():
                         got = math.sqrt(x * x + y * y + z * z)
                         want = true_range(azimuth, elevation)
                         if want >= MAX_RANGE:
-                            # A miss must land beyond the range, or octomap
+                            # A miss must land beyond the range, or occupancy map
                             # marks an obstacle where nothing was seen.
                             if got <= MAX_RANGE:
                                 failures.append(

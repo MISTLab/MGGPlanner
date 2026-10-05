@@ -241,63 +241,13 @@ Verified against the code:
 Dropping voxblox also removes `protobuf_catkin`, `glog_catkin`,
 `gflags_catkin`, `minkindr`, `minkindr_ros`, and `eigen_checks`.
 
-**Recommendation: OctoMap** for `mgg_map_octomap`. ROS 2 native in Jazzy, and
-its semantics map one-to-one onto `MapInterface`: null node is unknown,
-`isNodeOccupied`, `computeRayKeys` / `castRay`, `insertPointCloud`. gbplanner1
-shipped an OctoMap map manager, so the interface is known to be satisfiable.
-For `mgg_cslam`, each keyframe submap is small, so a per-submap octree is a
-good fit.
+**Current backend:** `mgg_map_octomap` reads native MOLA ternary grids.
+The original occupancy-tree backend has been retired. The package name is
+retained for compatibility; renaming it is a separate follow-up.
 
-**Fallback** if octree lookup dominates the hot loops (27 `getPathStatus`
-sites): a flat voxel-hash occupancy grid behind the same interface, roughly
-600 to 900 LOC including an Amanatides-Woo DDA.
-
-**Caveat to validate:** TSDF truncation and log-odds raycasting disagree about
-free space near surfaces, so frontier positions and gain tallies will not be
-bit-identical to published runs. Capture a ROS 1 baseline before touching
-anything and compare.
-
-### 4.1 Result of that comparison (open question)
-
-The baseline was captured (`tools/map_baseline/baseline_ros1.csv`) and
-`mgg_map_octomap` was measured against it on the same scene and query battery.
-
-Agrees: voxel classification (free inside, occupied on surfaces, unknown
-outside), ray verdicts, path verdicts, resolution.
-
-Differs, understood: OctoMap reports more free and less unknown on the voxel
-lattice (1422/2512 against voxblox's 1047/2874), because it carves along every
-ray to `max_range` and its obstacles lack the truncation band, making them
-roughly a voxel thinner. `occupied_dilation_voxels` can compensate; it
-defaults to 0.
-
-Also learned: voxblox's `getScanStatus` deduplicates shared free space across
-neighbouring rays via its `starting_points` matrix, so the correct counterpart
-is `getScanStatusIterative`, not the plain variant.
-
-**Differs, decided:** the baseline ranks the room centre above the corner for
-unknown volume (2361 against 1798); exact traversal ranks them the other way.
-
-The difference traces to `nonuniform_ray_cast_`, on by default in the voxblox
-implementation. It grows the ray step with distance and multiplies each sample
-up by `ceil(step_size/og_step_size)`, so a ray can step straight over a
-one-voxel-thick wall and bank the unknown space behind it. That inflates the
-count from viewpoints whose walls are far away, which is why the room centre
-scored highest.
-
-**Decision: keep exact traversal.** `mgg_map_octomap` counts what its rays
-actually pass through, using OctoMap's own `computeRayKeys` traversal, with no
-step-size extrapolation. Reproducing the voxblox numbers would mean
-reproducing a sampling artifact deliberately.
-
-Consequence, accepted: **exploration decisions will differ from the published
-ROS 1 runs.** Frontier rankings between distant and nearby viewpoints are the
-place to expect it. Any quantitative comparison against the paper's results
-has to account for this rather than treat the two as interchangeable.
-
-The property chosen is pinned by
-`OctomapMap.GainCountsEachTraversedVoxelExactlyOnce` rather than by a
-scene-specific ordering, which would be brittle.
+The ROS 1 baseline remains in `tools/map_baseline/baseline_ros1.csv`.
+Exact voxel traversal, rather than extrapolated ray steps, remains the gain
+contract; native-grid tests cover deduplication and occlusion.
 
 ### 4.2 Sensor ray geometry corrected
 
@@ -462,7 +412,7 @@ by design rather than after debugging a hang.
 
 **Phase 0 [DONE]: baseline and skeleton (3 to 4 days).** Build the Jazzy dev image.
 Capture a ROS 1 behavioural baseline (gain values, frontier positions on a
-fixed cloud) as the reference for the OctoMap swap. Stand up the workspace on
+fixed cloud) as the reference for the map-backend migration. Stand up the workspace on
 a `ros2` branch so the ROS 1 tree stays runnable for comparison.
 
 **Phase 1 [DONE]: prune, on the ROS 1 tree (2 to 3 days).** Delete the dead
@@ -496,7 +446,7 @@ Carried over from phase 1, as interface-design changes rather than deletions:
 by re-running the `rosidl_adapter` check to 43/43.
 
 **Phase 4 [MOSTLY DONE]: `mgg_map_octomap` (4 days to 1.5 weeks).** `MapInterface` over
-OctoMap plus a `PointCloud2` + TF front end. Validate against the phase 0
+native MOLA grids delivered through mapping snapshots. Validate against the phase 0
 baseline before building on it.
 
 **Phase 5: `mgg_ros` + `mgg_pci` (2 to 3 weeks).** The rclcpp node, service
@@ -600,12 +550,12 @@ Phases 3, 4, and 6 are largely independent of 2 and 5 and can be parallelized.
 | Risk | Impact | Mitigation |
 |---|---|---|
 | Core extraction reveals hidden ROS coupling in `rrg.cpp` | Phase 2 slips | The 5% measurement is line-level, not semantic; budget the upper range |
-| OctoMap free-space carving differs from TSDF | Frontiers/gain shift vs published runs | Phase 0 baseline, phase 4 comparison gate |
+| Native MOLA grid free-space carving differs from TSDF | Frontiers/gain shift vs published runs | Phase 0 baseline, phase 4 comparison gate |
 | Loop-closure deformation corrupts the occupancy map | Global planning degrades after closures | Keyframe-anchored submaps (3.3); never re-integrate raw data |
 | cslam optimization rate too slow for planning | Planner acts on stale global geometry | Local grid uses live submap; only global graph waits on optimization |
 | Service-client deadlock under ROS 2 executors | Hangs resembling planner bugs | Design executors up front (section 6) |
 | Narrow-FOV sensor changes exploration behaviour | Not comparable to the paper | Depth camera ring (5.4) |
-| OctoMap query cost in hot loops | Planning rate drops | Voxel-hash fallback behind the same interface |
+| Native MOLA grid query cost in hot loops | Planning rate drops | Voxel-hash fallback behind the same interface |
 | Filament + Vulkan in Docker | Blocks all-in-Docker | Keep host-ARGoS working as fallback |
 
 ## 9. Status

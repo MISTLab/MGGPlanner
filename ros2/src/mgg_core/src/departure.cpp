@@ -240,8 +240,8 @@ VoxelStatus orientedBoxPathStatus(const MapInterface& map,
         std::abs(along.y()) * swept.size.x() + std::abs(across.y()) * swept.size.y(),
         swept.size.z());
     bound += span + Eigen::Vector3d(2 * resolution, 2 * resolution, 0);
-    // A backend may tolerate unknown volume in ordinary boxes (OctoMap:
-    // 25%). Averaging that over the bound cannot certify each swept column.
+    // A backend may tolerate unknown volume in ordinary boxes. Averaging
+    // that over the bound cannot certify each swept column.
     const auto bound_status = stop_at_unknown_voxel
         ? map.getStaticStrictBoxStatus((start + end) / 2, bound)
         : map.getStaticBoxStatus((start + end) / 2, bound, false);

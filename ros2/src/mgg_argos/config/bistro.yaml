@@ -29,7 +29,7 @@
 # overrides, because the merge keys every vertex by it.
 /**/mggplanner_node:
   ros__parameters:
-    # OctoMap resolution follows the robot: 0.2 m voxels are a fifth of the
+    # Map resolution follows the robot: 0.2 m voxels are a fifth of the
     # arena's gaps and would close the doorways the planner has to drive
     # through.
     map:
@@ -159,7 +159,7 @@
       # 1500, not the stock 8000. This is what actually bounds a planning
       # cycle. Gain evaluation costs vertices x rays x steps: the declared
       # 360 x 45 degree sensor at 5 degree resolution is 720 rays, each cast
-      # 20 m in 0.4 m steps, so 8000 vertices is about 290 million octomap
+      # 20 m in 0.4 m steps, so 8000 vertices is about 290 million map
       # queries and a cycle that never returns. Measured on an open street:
       # the lattice filled to the cap, all four planners sat at 100% CPU with
       # ARGoS killed and no data arriving at all, and not one cycle completed

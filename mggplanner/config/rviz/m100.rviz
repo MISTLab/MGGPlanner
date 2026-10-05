@@ -20,7 +20,6 @@ Panels:
         - /Sensors1
         - /Sensors1/VLP1
         - /Sensors1/VLP1/Autocompute Value Bounds1
-        - /Octomap1
         - /Axes1
         - /Axes1/BaseLink1
         - /Axes1/World1
@@ -291,26 +290,6 @@ Visualization Manager:
           Value: true
       Enabled: true
       Name: Sensors
-    - Class: rviz/Group
-      Displays:
-        - Class: rviz/MarkerArray
-          Enabled: false
-          Marker Topic: /mggplanner_node/octomap_free
-          Name: Free
-          Namespaces:
-            {}
-          Queue Size: 100
-          Value: false
-        - Class: rviz/MarkerArray
-          Enabled: false
-          Marker Topic: /mggplanner_node/octomap_occupied
-          Name: Occupied
-          Namespaces:
-            {}
-          Queue Size: 100
-          Value: false
-      Enabled: true
-      Name: Octomap
     - Class: rviz/Group
       Displays:
         - Class: rviz/TF

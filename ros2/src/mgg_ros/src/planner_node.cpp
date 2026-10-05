@@ -13,7 +13,6 @@
 #include <regex>
 #include <unordered_set>
 #include <sensor_msgs/msg/point_cloud2.hpp>
-#include <sensor_msgs/point_cloud2_iterator.hpp>
 #include <tf2/exceptions.hpp>
 
 #include "mgg_core/local_route.h"
@@ -23,9 +22,6 @@
 #include "mgg_ros/conversions.h"
 #include "mgg_ros/fleet_conversions.h"
 #include "mgg_ros/param_loader.h"
-#ifdef MGG_WITH_OCTOMAP
-#include "mgg_map_octomap/octomap_map.h"
-#endif
 
 namespace mgg_ros {
 
@@ -293,26 +289,10 @@ PlannerNode::PlannerNode(const rclcpp::NodeOptions& options)
     set_parameter(rclcpp::Parameter("exploration_architecture", "legacy"));
   }
 
-  // The map: an octree built from point clouds, or the MOLA product a
-  // mapping process publishes, placed in the planning frame by the
-  // MappingSnapshot heartbeats. Either way the planner only sees
-  // mgg::MapInterface.
+  // Persistent MOLA products are placed in the planning frame by snapshot heartbeats.
   const double map_resolution = declareOrGet<double>(this, "map.resolution", 0.2);
   map_backend_ = declareOrGet<std::string>(this, "map.backend", map_backend_);
-  if (map_backend_ == "cloud_octomap") {
-#ifdef MGG_WITH_OCTOMAP
-    mgg::OctomapConfig map_cfg;
-    map_cfg.resolution = map_resolution;
-    map_cfg.max_range = declareOrGet<double>(this, "map.max_range", 20.0);
-    auto backend = std::make_unique<mgg::OctomapMap>(map_cfg);
-    cloud_map_ = backend.get();
-    map_ = std::move(backend);
-#else
-    throw std::invalid_argument(
-        "map.backend cloud_octomap is not available: mgg_map_octomap was "
-        "built with MGG_WITH_OCTOMAP=OFF; use mola_snapshot");
-#endif
-  } else if (map_backend_ == "mola_snapshot") {
+  if (map_backend_ == "mola_snapshot") {
     mgg::MolaMapConfig map_cfg;
     map_cfg.resolution = map_resolution;
     map_cfg.peer_root = declareOrGet<std::string>(this, "map.mola.peer_root", "");
@@ -370,7 +350,7 @@ PlannerNode::PlannerNode(const rclcpp::NodeOptions& options)
                 map_cfg.resolution, map_cfg.snapshot_ttl_sec);
   } else {
     throw std::invalid_argument(
-        "map.backend must be cloud_octomap or mola_snapshot");
+        "map.backend must be mola_snapshot");
   }
   ground_ = std::make_unique<mgg::GroundProjection>(*map_, planning_params_);
   geofence_ = std::make_unique<mgg::GeofenceManager>();
@@ -430,8 +410,6 @@ PlannerNode::PlannerNode(const rclcpp::NodeOptions& options)
     }
   }
 
-  cloud_tf_timeout_sec_ =
-      declareOrGet<double>(this, "cloud_tf_timeout_sec", cloud_tf_timeout_sec_);
   tf_buffer_ = std::make_unique<tf2_ros::Buffer>(get_clock());
   tf_listener_ = std::make_shared<tf2_ros::TransformListener>(*tf_buffer_);
 
@@ -462,16 +440,6 @@ PlannerNode::PlannerNode(const rclcpp::NodeOptions& options)
       [this](nav_msgs::msg::Odometry::ConstSharedPtr m) { onOdometry(m); },
       input_opts);
 
-  if (cloud_map_ != nullptr) {
-    rclcpp::QoS cloud_qos(rclcpp::KeepLast(10));
-    cloud_qos.best_effort();
-    cloud_sub_ = create_subscription<sensor_msgs::msg::PointCloud2>(
-        "pointcloud", cloud_qos,
-        [this](sensor_msgs::msg::PointCloud2::ConstSharedPtr m) {
-          onPointCloud(m);
-        },
-        sub_opts);
-  }
   if (mola_map_ != nullptr) {
     snapshot_callback_group_ = create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive, false);
     rclcpp::SubscriptionOptions snapshot_opts;
@@ -2832,56 +2800,6 @@ void PlannerNode::applyLatestOdometryImpl() {
                                     "the global graph holds only its seed");
   }
   ingestOdometryIntoGlobalGraph();
-}
-
-void PlannerNode::onPointCloud(
-    sensor_msgs::msg::PointCloud2::ConstSharedPtr msg) {
-  if (msg->data.empty() || cloud_map_ == nullptr) return;
-
-  // Transform into world coordinates before projecting into the octree.
-  // The sensor publishes in its own frame (e.g. "r0/lidar") and the map lives
-  // in world_frame_.
-  geometry_msgs::msg::TransformStamped tf_msg;
-  try {
-    tf_msg = tf_buffer_->lookupTransform(
-        world_frame_, msg->header.frame_id, msg->header.stamp,
-        rclcpp::Duration::from_seconds(cloud_tf_timeout_sec_));
-  } catch (const tf2::TransformException& ex) {
-    RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000,
-                         "cannot transform point cloud from '%s' to '%s': %s",
-                         msg->header.frame_id.c_str(), world_frame_.c_str(),
-                         ex.what());
-    return;
-  }
-
-  const Eigen::Vector3d origin(tf_msg.transform.translation.x,
-                               tf_msg.transform.translation.y,
-                               tf_msg.transform.translation.z);
-  const Eigen::Quaterniond rot(
-      tf_msg.transform.rotation.w, tf_msg.transform.rotation.x,
-      tf_msg.transform.rotation.y, tf_msg.transform.rotation.z);
-
-  std::vector<Eigen::Vector3d> points;
-  points.reserve(msg->width * msg->height);
-  sensor_msgs::PointCloud2ConstIterator<float> it_x(*msg, "x");
-  sensor_msgs::PointCloud2ConstIterator<float> it_y(*msg, "y");
-  sensor_msgs::PointCloud2ConstIterator<float> it_z(*msg, "z");
-  for (; it_x != it_x.end(); ++it_x, ++it_y, ++it_z) {
-    // Non-finite entries are normal in organised clouds (no return on that
-    // ray) and would otherwise poison the octree bounds.
-    if (!std::isfinite(*it_x) || !std::isfinite(*it_y) ||
-        !std::isfinite(*it_z)) {
-      continue;
-    }
-    points.emplace_back(rot * Eigen::Vector3d(*it_x, *it_y, *it_z) + origin);
-  }
-  if (!points.empty()) {
-    const std::lock_guard<std::recursive_mutex> lock(planner_mutex_);
-#ifdef MGG_WITH_OCTOMAP
-    cloud_map_->insertPointCloud(points, origin);
-    ++map_revision_;
-#endif
-  }
 }
 
 void PlannerNode::onMappingSnapshot(

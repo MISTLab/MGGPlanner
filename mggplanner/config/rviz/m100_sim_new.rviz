@@ -19,8 +19,6 @@ Panels:
         - /PlannerViz1/ShortestPathsClustering1/Namespaces1
         - /Sensors1
         - /Sensors1/VLP1/Autocompute Value Bounds1
-        - /Octomap1
-        - /Octomap1/Occupied1/Namespaces1
         - /Voxblox1
         - /POST1/MarkerArray1
         - /POST1/MarkerArray2
@@ -317,26 +315,6 @@ Visualization Manager:
       Name: Sensors
     - Class: rviz/Group
       Displays:
-        - Class: rviz/MarkerArray
-          Enabled: false
-          Marker Topic: /mggplanner_node/octomap_free
-          Name: Free
-          Namespaces:
-            {}
-          Queue Size: 100
-          Value: false
-        - Class: rviz/MarkerArray
-          Enabled: true
-          Marker Topic: /mggplanner_node/octomap_occupied
-          Name: Occupied
-          Namespaces:
-            {}
-          Queue Size: 100
-          Value: true
-      Enabled: true
-      Name: Octomap
-    - Class: rviz/Group
-      Displays:
         - Class: voxblox_rviz_plugin/VoxbloxMesh
           Enabled: true
           Name: VoxbloxMesh
@@ -427,14 +405,6 @@ Visualization Manager:
         - Class: rviz/MarkerArray
           Enabled: true
           Marker Topic: /vis/planning_global_graph_post
-          Name: MarkerArray
-          Namespaces:
-            {}
-          Queue Size: 100
-          Value: true
-        - Class: rviz/MarkerArray
-          Enabled: true
-          Marker Topic: /mggplanner_node/octomap_occupied_post
           Name: MarkerArray
           Namespaces:
             {}

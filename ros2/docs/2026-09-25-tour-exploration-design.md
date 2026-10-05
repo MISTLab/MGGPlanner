@@ -348,7 +348,7 @@ cleanup. No SwarmDeck changes were committed.
 
 ## 6. Testing
 
-MGG unit tests (`colcon test`, both OctoMap OFF and ON builds), with in-memory
+MGG unit tests (`colcon test`, the sole map build), with in-memory
 roadmaps, bids and awards (no ROS):
 
 - Tour: stable cluster IDs across graph revisions; optimal on small synthetic

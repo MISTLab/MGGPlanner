@@ -44,7 +44,6 @@
 #include <std_msgs/msg/u_int64.hpp>
 #include <nav_msgs/msg/odometry.hpp>
 #include <nav_msgs/msg/path.hpp>
-#include <sensor_msgs/msg/point_cloud2.hpp>
 #include <rclcpp/rclcpp.hpp>
 #include <std_msgs/msg/float64.hpp>
 #include <std_msgs/msg/string.hpp>
@@ -88,12 +87,6 @@
 #include "mgg_core/fleet_coordinator.h"
 #include "mgg_map_octomap/mola_map.h"
 #include "mgg_ros/keyframe_trajectory.h"
-
-namespace mgg {
-// Declared only: the OctoMap backend is compiled in only when mgg_map_octomap
-// was built with MGG_WITH_OCTOMAP.
-class OctomapMap;
-}  // namespace mgg
 
 namespace mgg_ros {
 
@@ -152,7 +145,6 @@ class PlannerNode : public rclcpp::Node {
   void publishPlanningStatus();
   void setAcquiringObservations(bool acquiring);
   void onOdometry(nav_msgs::msg::Odometry::ConstSharedPtr msg);
-  void onPointCloud(sensor_msgs::msg::PointCloud2::ConstSharedPtr msg);
   void onMappingSnapshot(mgg_msgs::msg::MappingSnapshot::ConstSharedPtr msg);
   void onNeighbourGraph(mgg_msgs::msg::Graph::ConstSharedPtr msg);
   void onNeighbourTransforms(tf2_msgs::msg::TFMessage::ConstSharedPtr msg);
@@ -736,8 +728,7 @@ class PlannerNode : public rclcpp::Node {
 
   // Core state. None of these know about ROS.
   std::unique_ptr<mgg::MapInterface> map_;
-  /// The map backends behind map_: exactly one is non-null.
-  mgg::OctomapMap* cloud_map_ = nullptr;
+  /// Persistent backend owned by map_ (test fixtures may substitute map_).
   mgg::MolaMap* mola_map_ = nullptr;
   std::unique_ptr<mgg::GroundProjection> ground_;
   std::unique_ptr<mgg::GeofenceManager> geofence_;
@@ -836,10 +827,6 @@ class PlannerNode : public rclcpp::Node {
   /// Every callback here shares one reentrant group under a
   /// MultiThreadedExecutor - which the PCI needs, or a service call made from
   /// inside a callback deadlocks - and reentrant means genuinely concurrent.
-  /// OctoMap is not thread-safe, so two point clouds arriving faster than one
-  /// can be inserted will corrupt the octree and segfault inside
-  /// insertPointCloud. Slow, occasional callbacks hide this: it takes a real
-  /// sensor rate to make the callbacks overlap.
   ///
   /// One mutex rather than one per structure, because planning reads the map
   /// and writes the graphs as a single unit and would need both anyway.
@@ -871,7 +858,7 @@ class PlannerNode : public rclcpp::Node {
   std::atomic<std::int64_t> odometry_sample_stamp_ns_{0};
   std::atomic<double> odometry_ingest_lag_s_{0.0};
 
-  std::string map_backend_ = "cloud_octomap";
+  std::string map_backend_ = "mola_snapshot";
   mgg::StateVec current_state_ = mgg::StateVec::Zero();
   /// How far the robot is tilted from level, radians: its odometry's roll
   /// and pitch (mgg::PathTurnCheck::setRobotTilt).
@@ -894,8 +881,6 @@ class PlannerNode : public rclcpp::Node {
   /// origin.
   std::unique_ptr<tf2_ros::Buffer> tf_buffer_;
   std::shared_ptr<tf2_ros::TransformListener> tf_listener_;
-  /// How long to wait for the transform matching a cloud's stamp.
-  double cloud_tf_timeout_sec_ = 0.1;
 
   /// The MOLA product the planner reads and the transform placing it in the
   /// planning frame, from the latest MappingSnapshot heartbeat.
@@ -1252,7 +1237,6 @@ class PlannerNode : public rclcpp::Node {
   std::vector<MergeEvent> recent_merges_;
 
   rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr odom_sub_;
-  rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr cloud_sub_;
   rclcpp::Subscription<mgg_msgs::msg::MappingSnapshot>::SharedPtr
       mapping_snapshot_sub_;
   rclcpp::Subscription<mgg_msgs::msg::Graph>::SharedPtr neighbour_sub_;

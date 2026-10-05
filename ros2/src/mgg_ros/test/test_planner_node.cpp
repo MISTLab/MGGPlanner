@@ -37,7 +37,7 @@
 #include <tf2_msgs/msg/tf_message.hpp>
 
 #include "mgg_map_octomap/mola_map.h"
-#include "mgg_map_octomap/octomap_map.h"
+#include "native_scene_map.h"
 #include "mgg_ros/planner_node.h"
 #include "../../mgg_core/test/gain_model_benchmark.h"
 #include "mgg_msgs/srv/planner_set_exploration_region.hpp"
@@ -103,9 +103,9 @@ class SlowMolaPlanningMap : public mgg::MolaMap {
 
 };
 
-class SlowPlanningMap : public mgg::OctomapMap {
+class SlowPlanningMap : public mgg_test::NativeSceneMap {
  public:
-  SlowPlanningMap() : mgg::OctomapMap(mgg::OctomapConfig{0.1}) {}
+  SlowPlanningMap() : mgg_test::NativeSceneMap(mgg_test::NativeSceneConfig{0.1}) {}
   mutable std::atomic<bool> entered{false};
   std::atomic<bool> slow{false};
   mgg::VoxelStatus getBoxStatus(const Eigen::Vector3d& c,
@@ -114,7 +114,7 @@ class SlowPlanningMap : public mgg::OctomapMap {
       entered = true;
       std::this_thread::sleep_for(std::chrono::milliseconds(25));
     }
-    return mgg::OctomapMap::getBoxStatus(c, size, unknown);
+    return mgg_test::NativeSceneMap::getBoxStatus(c, size, unknown);
   }
   // NAVIGATE's conservative pre-filter uses the static strict query;
   // delaying only ordinary boxes no longer guarantees an in-flight request.
@@ -124,12 +124,12 @@ class SlowPlanningMap : public mgg::OctomapMap {
       entered = true;
       std::this_thread::sleep_for(std::chrono::milliseconds(25));
     }
-    return mgg::OctomapMap::getStaticStrictBoxStatus(c, size);
+    return mgg_test::NativeSceneMap::getStaticStrictBoxStatus(c, size);
   }
 
 };
 
-class SlowScanMap : public mgg::OctomapMap {
+class SlowScanMap : public mgg_test::NativeSceneMap {
  public:
   std::vector<double> scanned_x;
   void getScanStatusIterative(
@@ -139,7 +139,7 @@ class SlowScanMap : public mgg::OctomapMap {
       const mgg::SensorModel& sensor) override {
     scanned_x.push_back(pos.x());
     std::this_thread::sleep_for(std::chrono::milliseconds(25));
-    mgg::OctomapMap::getScanStatusIterative(pos, endpoints, gain, log, sensor);
+    mgg_test::NativeSceneMap::getScanStatusIterative(pos, endpoints, gain, log, sensor);
   }
 };
 
@@ -157,10 +157,10 @@ class MergeCountingMolaMap : public mgg::MolaMap {
   }
 };
 
-class CountingBoxMap : public mgg::OctomapMap {
+class CountingBoxMap : public mgg_test::NativeSceneMap {
  public:
-  CountingBoxMap() : mgg::OctomapMap([] {
-    mgg::OctomapConfig config;
+  CountingBoxMap() : mgg_test::NativeSceneMap([] {
+    mgg_test::NativeSceneConfig config;
     config.resolution = 0.1;
     return config;
   }()) {}
@@ -168,7 +168,7 @@ class CountingBoxMap : public mgg::OctomapMap {
   mgg::VoxelStatus getBoxStatus(const Eigen::Vector3d& center,
                                 const Eigen::Vector3d& size, bool stop) const override {
     ++box_queries;
-    return mgg::OctomapMap::getBoxStatus(center, size, stop);
+    return mgg_test::NativeSceneMap::getBoxStatus(center, size, stop);
   }
 };
 
@@ -372,6 +372,17 @@ class MolaFloorProduct {
 
 class PlannerNodeTestPeer {
  public:
+  static mgg_test::NativeSceneMap& sceneMap(PlannerNode& node) {
+    return dynamic_cast<mgg_test::NativeSceneMap&>(*node.map_);
+  }
+  static void installSceneMap(PlannerNode& node) {
+    node.mola_map_ = nullptr;
+    node.keyframe_source_.reset();
+    node.map_ = std::make_unique<mgg_test::NativeSceneMap>(
+        mgg_test::NativeSceneConfig{0.1});
+    node.ground_ = std::make_unique<mgg::GroundProjection>(
+        *node.map_, node.planning_params_);
+  }
   static void guidanceExploreCycle(PlannerNode& node) {
     if (node.guidance_.mode().session_id.empty()) {
       mgg_msgs::srv::SetLocalPlannerMode::Request request;
@@ -507,7 +518,7 @@ class PlannerNodeTestPeer {
   }
   static std::string retainBestPath(PlannerNode& node) { return node.rememberReverseExit(); }
   static void trackMeasuredGround(PlannerNode& node) {
-    node.cloud_map_->setTrackMeasuredSurfaceZ(true);
+    sceneMap(node).setTrackMeasuredSurfaceZ(true);
   }
   static std::pair<double, double> refugeSlopes(PlannerNode& node, const mgg::StateVec& pose) {
     const double radius = std::max(node.robot_params_.size.x(), node.robot_params_.size.y());
@@ -552,7 +563,7 @@ class PlannerNodeTestPeer {
     for (double x = 0.85; x < 7; x += 0.1) {
       for (double y : {-0.45, 0.45}) {
         for (int repeat = 0; repeat < 6; ++repeat) {
-          node.cloud_map_->insertPointCloud({Eigen::Vector3d(x, y, 0.25)},
+          sceneMap(node).insertPointCloud({Eigen::Vector3d(x, y, 0.25)},
                                             Eigen::Vector3d(x, y, 1.5));
         }
       }
@@ -563,9 +574,11 @@ class PlannerNodeTestPeer {
                                  const mgg::StateVec& to) {
     node.global_graph_->reset();
     auto* a = new mgg::Vertex(node.global_graph_->generateVertexID(), from);
-    auto* b = new mgg::Vertex(node.global_graph_->generateVertexID(), to);
-    a->robot_id = b->robot_id = node.planning_params_.robot_id;
+    a->robot_id = node.planning_params_.robot_id;
     node.global_graph_->addVertex(a);
+    // Adding the root resets the graph ID counter: allocate the next ID after it.
+    auto* b = new mgg::Vertex(node.global_graph_->generateVertexID(), to);
+    b->robot_id = node.planning_params_.robot_id;
     node.global_graph_->addVertex(b);
     node.global_graph_->addEdge(a, b, (to - from).head<3>().norm());
     ++node.graph_revision_;
@@ -641,7 +654,6 @@ class PlannerNodeTestPeer {
   static CountingBoxMap* countBoxQueries(PlannerNode& node) {
     auto map = std::make_unique<CountingBoxMap>();
     auto* result = map.get();
-    node.cloud_map_ = result;
     node.mola_map_ = nullptr;
     node.map_ = std::move(map);
     node.ground_ = std::make_unique<mgg::GroundProjection>(*node.map_, node.planning_params_);
@@ -662,7 +674,6 @@ class PlannerNodeTestPeer {
   }
   static void useMolaMap(PlannerNode& node, std::unique_ptr<mgg::MolaMap> map) {
     node.mola_map_ = map.get();
-    node.cloud_map_ = nullptr;
     node.map_ = std::move(map);
     node.ground_ = std::make_unique<mgg::GroundProjection>(
         *node.map_, node.planning_params_);
@@ -691,7 +702,6 @@ class PlannerNodeTestPeer {
     for (int x = -10; x < 20; ++x)  // a NaN top leaves the column unmapped
       for (int y = -10; y < 10; ++y)
         if (!std::isnan(top(x))) tops[{x, y}] = top(x);
-    node.cloud_map_ = nullptr;
     node.mola_map_ = nullptr;
     node.map_ = std::make_unique<mgg_test::TerrainFixture>(0.2, tops);
     node.robot_params_.type = mgg::RobotType::kGroundRobot;
@@ -718,8 +728,7 @@ class PlannerNodeTestPeer {
     for (const auto& state : path) poses.push_back(toPoseMsg(state));
     return node.groundPosePairsAdmissible(poses);
   }
-  static void useCloudMap(PlannerNode& node, std::unique_ptr<mgg::OctomapMap> map) {
-    node.cloud_map_ = map.get();
+  static void useSceneMap(PlannerNode& node, std::unique_ptr<mgg_test::NativeSceneMap> map) {
     node.mola_map_ = nullptr;
     node.map_ = std::move(map);
     node.ground_ = std::make_unique<mgg::GroundProjection>(
@@ -925,10 +934,10 @@ class PlannerNodeTestPeer {
     }
     for (int repeat = 0; repeat < 6; ++repeat) {
       for (const Eigen::Vector3d& p : floor) {
-        node.cloud_map_->insertPointCloud({p}, Eigen::Vector3d(p.x(), p.y(), 1.5));
+        sceneMap(node).insertPointCloud({p}, Eigen::Vector3d(p.x(), p.y(), 1.5));
       }
     }
-    node.cloud_map_->augmentFreeBox(
+    sceneMap(node).augmentFreeBox(
         Eigen::Vector3d(0.5 * (xmin + xmax), 0.5 * (ymin + ymax), 0.40),
         Eigen::Vector3d(xmax - xmin, ymax - ymin, 0.60));
     ++node.map_revision_;
@@ -974,7 +983,7 @@ class PlannerNodeTestPeer {
       for (double y = -outer; y <= outer + 1e-9; y += 0.1) {
         if (std::max(std::abs(x), std::abs(y)) < inner) continue;
         for (int repeat = 0; repeat < 8; ++repeat) {
-          node.cloud_map_->insertPointCloud({Eigen::Vector3d(x, y, z)},
+          sceneMap(node).insertPointCloud({Eigen::Vector3d(x, y, z)},
                                             Eigen::Vector3d(x, y, 1.5));
         }
       }
@@ -987,7 +996,7 @@ class PlannerNodeTestPeer {
     for (double x = x0; x <= x1 + 1e-9; x += 0.1) {
       for (double z = 0.1; z <= 0.6 + 1e-9; z += 0.1) {
         for (int repeat = 0; repeat < 6; ++repeat) {
-          node.cloud_map_->insertPointCloud({Eigen::Vector3d(x, y, z)},
+          sceneMap(node).insertPointCloud({Eigen::Vector3d(x, y, z)},
                                             Eigen::Vector3d(x, y - 1.0, z));
         }
       }
@@ -1001,7 +1010,7 @@ class PlannerNodeTestPeer {
     for (double y = y0; y <= y1 + 1e-9; y += 0.1) {
       for (double z = 0.1; z <= 0.6 + 1e-9; z += 0.1) {
         for (int repeat = 0; repeat < 6; ++repeat) {
-          node.cloud_map_->insertPointCloud({Eigen::Vector3d(x, y, z)},
+          sceneMap(node).insertPointCloud({Eigen::Vector3d(x, y, z)},
                                             Eigen::Vector3d(x - 1.0, y, z));
         }
       }
@@ -1164,14 +1173,14 @@ class PlannerNodeTestPeer {
   static void observeFreeBox(PlannerNode& node, const Eigen::Vector3d& center,
                              const Eigen::Vector3d& size) {
     const std::lock_guard<std::recursive_mutex> lock(node.planner_mutex_);
-    node.cloud_map_->augmentFreeBox(center, size);
+    sceneMap(node).augmentFreeBox(center, size);
     ++node.map_revision_;
   }
   /// One occupied return at `p`, observed from 1 m below it.
   static void observeOccupied(PlannerNode& node, const Eigen::Vector3d& p) {
     const std::lock_guard<std::recursive_mutex> lock(node.planner_mutex_);
     for (int repeat = 0; repeat < 8; ++repeat) {
-      node.cloud_map_->insertPointCloud({p}, p - Eigen::Vector3d(0, 0, 1.0));
+      sceneMap(node).insertPointCloud({p}, p - Eigen::Vector3d(0, 0, 1.0));
     }
     ++node.map_revision_;
   }
@@ -1371,7 +1380,7 @@ class PlannerNodeTestPeer {
     }
     for (int repeat = 0; repeat < 6; ++repeat) {
       for (const Eigen::Vector3d& p : floor) {
-        node.cloud_map_->insertPointCloud(
+        sceneMap(node).insertPointCloud(
             {p}, Eigen::Vector3d(p.x(), p.y(), p.z() + 1.5));
       }
     }
@@ -2222,7 +2231,7 @@ class PlannerNodeTestPeer {
     }
     return false;
   }
-  static void withdrawCloudMap(PlannerNode& node) { node.cloud_map_->resetMap(); }
+  static void withdrawSceneMap(PlannerNode& node) { sceneMap(node).resetMap(); }
   static const mgg::FlownTrail& flownTrail(PlannerNode& node) {
     return node.flown_trail_;
   }
@@ -2266,7 +2275,8 @@ std::shared_ptr<PlannerNode> makeNode(
   rclcpp::NodeOptions options;
   options.arguments({"--ros-args", "-r", "__node:=" + name});
   std::vector<rclcpp::Parameter> parameters{
-      rclcpp::Parameter("map.backend", "cloud_octomap"),
+      rclcpp::Parameter("map.backend", "mola_snapshot"),
+      rclcpp::Parameter("map.mola.peer_root", "/nonexistent/test_scene"),
       rclcpp::Parameter("map.resolution", 0.10),
       rclcpp::Parameter("PlanningParams.global_frame_id", frame),
   };
@@ -2275,6 +2285,7 @@ std::shared_ptr<PlannerNode> makeNode(
   // As mggplanner_node does: the nested PlanningParams are read undeclared.
   options.automatically_declare_parameters_from_overrides(true);
   auto node = std::make_shared<PlannerNode>(options);
+  PlannerNodeTestPeer::installSceneMap(*node);
   PlannerNodeTestPeer::configureGroundRobot(*node);
   return node;
 }
@@ -2743,7 +2754,7 @@ TEST_F(PlannerNodeTest, NavigateProbePreemptsExplorationWithoutLosingTargetBias)
   auto node = makeNode("probe_preempts_exploration");
   auto provider = std::make_unique<SlowPlanningMap>();
   auto* slow = provider.get();
-  PlannerNodeTestPeer::useCloudMap(*node, std::move(provider));
+  PlannerNodeTestPeer::useSceneMap(*node, std::move(provider));
   PlannerNodeTestPeer::observeFloor(*node, -2.5, 2.5, -2.5, 2.5);
   PlannerNodeTestPeer::setLattice(*node, {-2, -2}, {2, 2});
   PlannerNodeTestPeer::seeAllRound(*node);
@@ -2898,7 +2909,7 @@ TEST_F(PlannerNodeTest, CancellationInterruptsSlowPlanWithoutReturningPath) {
       [&](nav_msgs::msg::Path::ConstSharedPtr) { ++published; });
   auto map = std::make_unique<SlowPlanningMap>();
   auto* slow = map.get();
-  PlannerNodeTestPeer::useCloudMap(*node, std::move(map));
+  PlannerNodeTestPeer::useSceneMap(*node, std::move(map));
   PlannerNodeTestPeer::observeFloor(*node, -1.5, 4, -1.5, 1.5);
   PlannerNodeTestPeer::acceptOdometry(*node, 0, 0, 1);
   slow->slow = true;
@@ -2938,7 +2949,7 @@ TEST_F(PlannerNodeTest, ExplorationCancelInterruptsOnlyExplorationRequests) {
         [&](nav_msgs::msg::Path::ConstSharedPtr) { ++published; });
     auto provider = std::make_unique<SlowPlanningMap>();
     auto* slow = provider.get();
-    PlannerNodeTestPeer::useCloudMap(*node, std::move(provider));
+    PlannerNodeTestPeer::useSceneMap(*node, std::move(provider));
     PlannerNodeTestPeer::observeFloor(*node, -1.5, 4, -1.5, 1.5);
     PlannerNodeTestPeer::acceptOdometry(*node, 0, 0, 1);
     PlannerNodeTestPeer::acceptOdometry(*node, 0.5, 0, 2);
@@ -3006,7 +3017,7 @@ TEST_F(PlannerNodeTest, NewObjectiveSupersedesSlowPlanAndUsesNewestPose) {
   auto node = makeNode("preempt_slow_plan");
   auto provider = std::make_unique<SlowPlanningMap>();
   auto* slow = provider.get();
-  PlannerNodeTestPeer::useCloudMap(*node, std::move(provider));
+  PlannerNodeTestPeer::useSceneMap(*node, std::move(provider));
   PlannerNodeTestPeer::observeFloor(*node, -1.5, 4, -1.5, 1.5);
   PlannerNodeTestPeer::acceptOdometry(*node, 0, 0, 1);
   slow->slow = true;
@@ -3827,15 +3838,15 @@ TEST_F(PlannerNodeTest, ALowGainPathIsHandedOverToTheGlobalPlannerWhenDue) {
   // The low-gain rounds due, a low-gain lattice path is set aside for the
   // global planner: with a global frontier behind the robot worth more than
   // the threshold, it is routed there over the global graph instead. The
-  // lattice path scores 721 and the frontier 938 (discounted), so a
-  // threshold of 80 voxels at unknown_voxel_gain 10 lies between them.
+  // native-grid lattice path scores 871, so a threshold of 100 voxels
+  // at unknown_voxel_gain 10 makes it low gain without excluding the frontier.
   auto node = makeNode("low_gain_handoff");
   PlannerNodeTestPeer::observeFloor(*node, -1.5, 4.0, -1.5, 1.5);
   PlannerNodeTestPeer::acceptOdometry(*node, 0.0, 0.0, 1.0);
   PlannerNodeTestPeer::addGlobalChainToFrontier(
       *node, {{-0.5, 0.0}, {-1.0, 0.0}, {-1.5, 0.0}}, M_PI);
   PlannerNodeTestPeer::consultGlobalPlannerAtOnce(*node);
-  PlannerNodeTestPeer::setLowGainVoxels(*node, 80.0);
+  PlannerNodeTestPeer::setLowGainVoxels(*node, 100.0);
   auto response = std::make_shared<mgg_msgs::srv::PlannerSrv::Response>();
   PlannerNodeTestPeer::plan(*node, response);
   ASSERT_EQ(response->status, mgg_msgs::srv::PlannerSrv::Response::FORWARD);
@@ -3901,7 +3912,7 @@ TEST_F(PlannerNodeTest, ALowGainPathTowardTheTourTargetIsLeftToTheTour) {
 
 TEST_F(PlannerNodeTest, ALowGainPathIsKeptWhenNoGlobalFrontierIsWorthMore) {
   // The rounds due, and the only global frontier, the one the lattice path
-  // itself leaves (374), is worth less than the handoff minimum (50 voxels
+  // itself leaves (678), is worth less than the handoff minimum (100 voxels
   // at unknown_voxel_gain 10): it is not handed over for that, and the
   // low-gain path is sent after all, not exploration complete.
   auto node = makeNode("low_gain_kept");
@@ -3909,6 +3920,7 @@ TEST_F(PlannerNodeTest, ALowGainPathIsKeptWhenNoGlobalFrontierIsWorthMore) {
   PlannerNodeTestPeer::acceptOdometry(*node, 0.0, 0.0, 1.0);
   PlannerNodeTestPeer::consultGlobalPlannerAtOnce(*node);
   PlannerNodeTestPeer::setLowGainVoxels(*node, 1e9);
+  PlannerNodeTestPeer::setLowGainHandoffMinVoxels(*node, 100.0);
   auto response = std::make_shared<mgg_msgs::srv::PlannerSrv::Response>();
   PlannerNodeTestPeer::plan(*node, response);
   ASSERT_EQ(response->status, mgg_msgs::srv::PlannerSrv::Response::FORWARD);
@@ -4264,7 +4276,7 @@ TEST_F(PlannerNodeTest, LocalExplorationKeepsOutOfANoGoZoneOnEitherBackend) {
   // within its reach or gets past it, and without it the path goes on
   // beyond.
   for (const bool mola : {false, true}) {
-    SCOPED_TRACE(mola ? "mola_snapshot" : "cloud_octomap");
+    SCOPED_TRACE(mola ? "mola_snapshot" : "native_scene");
     std::unique_ptr<MolaFloorProduct> product;
     auto node = corridorNode(mola ? "no_go_explore_mola" : "no_go_explore_cloud",
                              mola, product);
@@ -4287,7 +4299,7 @@ TEST_F(PlannerNodeTest, NavigateInTheLatticeKeepsOutOfANoGoZoneOnEitherBackend) 
   // Review r0, I-5: a goal inside the lattice, beyond a zone closing the
   // corridor, is refused on either backend; cleared, it is routed.
   for (const bool mola : {false, true}) {
-    SCOPED_TRACE(mola ? "mola_snapshot" : "cloud_octomap");
+    SCOPED_TRACE(mola ? "mola_snapshot" : "native_scene");
     std::unique_ptr<MolaFloorProduct> product;
     auto node = corridorNode(mola ? "no_go_navigate_mola" : "no_go_navigate_cloud",
                              mola, product);
@@ -4318,7 +4330,7 @@ TEST_F(PlannerNodeTest, ExplorationFromInsideANoGoZoneOnlyDepartsOnEitherBackend
   // centre, facing east into it. It is sent a departure west that ends out
   // of the zone; nothing goes east past where it stands.
   for (const bool mola : {false, true}) {
-    SCOPED_TRACE(mola ? "mola_snapshot" : "cloud_octomap");
+    SCOPED_TRACE(mola ? "mola_snapshot" : "native_scene");
     std::unique_ptr<MolaFloorProduct> product;
     auto node = corridorNode(mola ? "no_go_depart_mola" : "no_go_depart_cloud",
                              mola, product);
@@ -5016,7 +5028,9 @@ TEST_F(PlannerNodeTest, ARobotAgainstAWallDepartsButItsPoseIsNoGoalLater) {
     stamp += 1.0;
   }
   // The 0.2 m box at y = 0.52 reaches into the wall voxels from y = 0.6.
-  PlannerNodeTestPeer::acceptOdometry(*node, 2.0, 0.52, stamp++);
+  // Native closed cells require a nonpenetrating starting box. A 1 mm
+  // gap still leaves no turning room beside the wall at y = 0.6.
+  PlannerNodeTestPeer::acceptOdometry(*node, 2.0, 0.499, stamp++);
 
   auto request = std::make_shared<mgg_msgs::srv::PlanObjective::Request>();
   request->objective = mgg_msgs::srv::PlanObjective::Request::RETURN_HOME;
@@ -5621,11 +5635,11 @@ TEST_F(PlannerNodeTest, MolaAerialMergeChecksBodyOffsetAndIncomingEdges) {
 TEST_F(PlannerNodeTest, AerialShortcutCannotCrossToleratedUnknownVoxel) {
   auto node = makeNode("aerial_strict_shortcut");
   PlannerNodeTestPeer::setAerialRobot(*node);
-  mgg::OctomapConfig config;
+  mgg_test::NativeSceneConfig config;
   config.resolution = 0.1;
-  auto map = std::make_unique<mgg::OctomapMap>(config);
-  // One unknown voxel in an otherwise observed room: small enough to pass
-  // Octomap's legacy 25-percent unknown box tolerance, not safe to shortcut.
+  auto map = std::make_unique<mgg_test::PermissiveSceneMap>(config);
+  // One unknown voxel in an otherwise observed room. The deliberately
+  // permissive ordinary query must never substitute for strict certification.
   for (int x = -3; x <= 23; ++x)
     for (int y = -3; y <= 10; ++y)
       for (int z = 0; z <= 7; ++z) {
@@ -5639,7 +5653,7 @@ TEST_F(PlannerNodeTest, AerialShortcutCannotCrossToleratedUnknownVoxel) {
                                 size, true), mgg::VoxelStatus::kFree);
   ASSERT_EQ(map->getStrictPathStatus({0.05, 0.05, 0.35}, {2.05, 0.05, 0.35},
                                       size), mgg::VoxelStatus::kUnknown);
-  PlannerNodeTestPeer::useCloudMap(*node, std::move(map));
+  PlannerNodeTestPeer::useSceneMap(*node, std::move(map));
   std::vector<mgg::StateVec> path{{0.05, 0.05, 0.35, 0},
                                   {0.05, 0.65, 0.35, 0},
                                   {2.05, 0.65, 0.35, 0},
@@ -5759,8 +5773,9 @@ std::shared_ptr<PlannerNode> boxedIn(const std::string& name, double from,
     // At voxel centres: stepping 0.1 m from -3.0 drifts across a voxel
     // boundary and leaves a row of the floor unseen.
     PlannerNodeTestPeer::observeFloor(*node, -1.55, 1.55, -3.05, 4.05);
-    PlannerNodeTestPeer::observeWallAlongY(*node, from, to, 0.25);
-    PlannerNodeTestPeer::observeWallAlongY(*node, from, to, -0.25);
+    const double wall = across ? 0.35 : 0.25;
+    PlannerNodeTestPeer::observeWallAlongY(*node, from, to, wall);
+    PlannerNodeTestPeer::observeWallAlongY(*node, from, to, -wall);
   } else {
     PlannerNodeTestPeer::observeFloor(*node, -3.0, 4.0, -1.5, 1.5);
     const double wall = across ? 0.35 : 0.25;
@@ -5843,7 +5858,7 @@ TEST_F(PlannerNodeTest, ABoxedInRobotReversesOutWhenOnlyBehindHasRoom) {
     SCOPED_TRACE(along_y ? "along y" : "along x");
     const double yaw = along_y ? M_PI / 2.0 : 0.0;
     auto node = boxedIn(along_y ? "boxed_behind_y" : "boxed_behind", -0.4,
-                        2.5, along_y);
+                        2.5, along_y, /*across=*/along_y);
     const mgg::StateVec start =
         PlannerNodeTestPeer::drivingState(*node, 0.0, 0.0, yaw);
     ASSERT_FALSE(PlannerNodeTestPeer::roomToTurn(*node, start));
@@ -7462,6 +7477,9 @@ TEST_F(PlannerNodeTest, LongNarrowCorridorAdmitsAnEndpointWithAValidatedReverseE
   // The local selector and its shortcut/resampling guard use the same
   // reverse validation, not just the global cutback path above.
   PlannerNodeTestPeer::setLattice(*node, {0, 0}, {5.5, 0});
+  // A shorter sensor range favours the far endpoint under native-grid
+  // scan traversal, independently of the long reverse-exit certification.
+  PlannerNodeTestPeer::seeGroundContinuation(*node, 4.0);
   const auto summary = PlannerNodeTestPeer::buildLocalGraph(*node);
   const auto local = PlannerNodeTestPeer::bestPath(*node);
   ASSERT_GE(local.size(), 2u) << summary;
@@ -9097,7 +9115,7 @@ TEST_F(PlannerNodeTest, ALeavingIdleRobotFallsBackInsteadOfWaitingForAnAuction) 
   // No tour target, but the greedy fallback can still reach the frontier.
   PlannerNodeTestPeer::setTour(*node, true, 1e9);
   PlannerNodeTestPeer::lowGainRoundsDueAtOnce(*node);
-  PlannerNodeTestPeer::setLowGainVoxels(*node, 80.0);
+  PlannerNodeTestPeer::setLowGainVoxels(*node, 100.0);
   ASSERT_TRUE(PlannerNodeTestPeer::leaveFleet(*node, true)->success);
   PlannerNodeTestPeer::hearPeer(*node, 2);
   ASSERT_EQ(PlannerNodeTestPeer::fleetGroup(*node), (std::vector<int>{1, 2}));
@@ -9513,7 +9531,7 @@ TEST_F(PlannerNodeTest, ImportedFrontierCountsNeedNoScanningBudget) {
   }
   auto map = std::make_unique<SlowScanMap>();
   auto* slow = map.get();
-  PlannerNodeTestPeer::useCloudMap(*node, std::move(map));
+  PlannerNodeTestPeer::useSceneMap(*node, std::move(map));
   EXPECT_EQ(PlannerNodeTestPeer::frontierClusters(*node).size(), 3u);
   EXPECT_TRUE(slow->scanned_x.empty());
 }
@@ -10815,7 +10833,7 @@ TEST_F(PlannerNodeTest, FlownPendingStaysBoundedWhileTheMapIsUnavailable) {
   PlannerNodeTestPeer::observeFreeBox(*node, {0, 0, 1}, {4, 4, 2});
   PlannerNodeTestPeer::acceptOdometry(*node, flownOdometry(0, 0, 1, 0, 1));
   ASSERT_EQ(PlannerNodeTestPeer::globalVertices(*node), 1);
-  PlannerNodeTestPeer::withdrawCloudMap(*node);
+  PlannerNodeTestPeer::withdrawSceneMap(*node);
   // Fast sampling exercises the count limit before the age limit.
   for (int i = 1; i <= 50; ++i) {
     PlannerNodeTestPeer::acceptOdometry(

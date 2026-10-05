@@ -2490,7 +2490,7 @@ void Rrg::freePointCloudtimerCallback(const ros::TimerEvent& event) {
         state, multiray_endpoints_body);
     std::vector<Eigen::Vector3d> multiray_endpoints;
     // Check it the full ray till max range is free(for voxblox only, for
-    // octomap just convert to world frame)
+    // occupancy map just convert to world frame)
     map_manager_->getFreeSpacePointCloud(multiray_endpoints_body, state,
                                          free_cloud_body);
     // convert the endpoint to sensor frame
@@ -5114,7 +5114,7 @@ bool Rrg::addRefPathToGraph(const std::shared_ptr<GraphManager> graph_manager,
 void Rrg::setState(StateVec& state) {
   if (!odometry_ready) {
     // First time receive the pose/odometry for planning purpose.
-    // Reset the octomap
+    // Reset the occupancy map
     ROS_WARN_COND(global_verbosity >= Verbosity::WARN, "Received the first odometry, reset the map");
     map_manager_->resetMap();
   }

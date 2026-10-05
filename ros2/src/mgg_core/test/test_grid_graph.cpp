@@ -140,7 +140,7 @@ class OccupiedProjectionMismatchSpace : public ProjectionMismatchSpace {
 
 /// A sparse sensor map has known ground at the candidate but does not prove
 /// the whole body volume free. The relaxed query still preserves a known
-/// obstacle, matching OctomapMap's stop-at-unknown contract.
+/// obstacle, matching the map's stop-at-unknown contract.
 class SparseBodySpace : public OpenSpace {
  public:
   SparseBodySpace(bool has_ground, bool occupied_candidate = false,

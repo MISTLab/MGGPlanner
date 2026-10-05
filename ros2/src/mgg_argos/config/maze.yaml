@@ -24,7 +24,7 @@
 # keys every vertex by it.
 /**/mggplanner_node:
   ros__parameters:
-    # OctoMap resolution follows the robot: 0.2 m voxels are a fifth of the
+    # Map resolution follows the robot: 0.2 m voxels are a fifth of the
     # arena's gaps and would close the doorways the planner has to drive
     # through.
     map:

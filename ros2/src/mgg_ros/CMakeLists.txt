@@ -60,10 +60,6 @@ target_include_directories(${PROJECT_NAME} PUBLIC
   $<INSTALL_INTERFACE:include>)
 target_link_libraries(${PROJECT_NAME} mgg_core::mgg_core
   mgg_map_octomap::mgg_map_octomap Eigen3::Eigen nlohmann_json::nlohmann_json OpenSSL::Crypto)
-# The cloud_octomap map backend exists only if mgg_map_octomap has OctoMap.
-if(mgg_map_octomap_WITH_OCTOMAP)
-  target_compile_definitions(${PROJECT_NAME} PRIVATE MGG_WITH_OCTOMAP)
-endif()
 ament_target_dependencies(${PROJECT_NAME}
   rclcpp std_msgs geometry_msgs visualization_msgs tf2 tf2_msgs tf2_ros
   tf2_geometry_msgs mgg_msgs nav_msgs sensor_msgs std_srvs rosbag2_cpp)
@@ -124,8 +120,6 @@ if(BUILD_TESTING)
     TIMEOUT 300)
   target_link_libraries(test_planner_navigation ${PROJECT_NAME})
   ament_target_dependencies(test_planner_navigation rclcpp mgg_msgs)
-  # The ground local planner uses the OctoMap-free rolling voxel map: its
-  # tests stay outside the MGG_WITH_OCTOMAP conditional.
   ament_add_gtest(test_local_path_conversions test/test_local_path_conversions.cpp)
   target_link_libraries(test_local_path_conversions ${PROJECT_NAME})
   ament_target_dependencies(test_local_path_conversions mgg_msgs)
@@ -146,19 +140,17 @@ if(BUILD_TESTING)
   target_link_libraries(test_local_planner_node ${PROJECT_NAME})
   ament_target_dependencies(test_local_planner_node rclcpp mgg_msgs
     sensor_msgs nav_msgs)
-  if(mgg_map_octomap_WITH_OCTOMAP)
-    target_compile_definitions(test_map_backend PRIVATE MGG_WITH_OCTOMAP)
-    # These scenes are built by inserting points into the OctoMap backend.
-    ament_add_gtest(test_planner_node test/test_planner_node.cpp)
-    target_link_libraries(test_planner_node ${PROJECT_NAME})
-    ament_target_dependencies(test_planner_node rclcpp mgg_msgs)
-    # Two planners exploring one corridor over real topics: seconds, not
-    # milliseconds.
-    ament_add_gtest(test_fleet_exploration test/test_fleet_exploration.cpp
-      TIMEOUT 600)
-    target_link_libraries(test_fleet_exploration ${PROJECT_NAME})
-    ament_target_dependencies(test_fleet_exploration rclcpp mgg_msgs)
-  endif()
+  ament_add_gtest(test_native_scene_map test/test_native_scene_map.cpp)
+  target_link_libraries(test_native_scene_map ${PROJECT_NAME})
+  ament_add_gtest(test_planner_node test/test_planner_node.cpp)
+  target_link_libraries(test_planner_node ${PROJECT_NAME})
+  ament_target_dependencies(test_planner_node rclcpp mgg_msgs)
+  # Two planners exploring one corridor over real topics: seconds, not
+  # milliseconds.
+  ament_add_gtest(test_fleet_exploration test/test_fleet_exploration.cpp
+    TIMEOUT 600)
+  target_link_libraries(test_fleet_exploration ${PROJECT_NAME})
+  ament_target_dependencies(test_fleet_exploration rclcpp mgg_msgs)
 endif()
 
 ament_package()

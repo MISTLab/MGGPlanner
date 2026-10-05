@@ -24,8 +24,7 @@ sudo apt install python3-catkin-tools \
 libgoogle-glog-dev \
 ros-noetic-joy \
 ros-noetic-twist-mux \
-ros-noetic-interactive-marker-twist-server \
-ros-noetic-octomap-ros
+ros-noetic-interactive-marker-twist-server
 ```
 
 

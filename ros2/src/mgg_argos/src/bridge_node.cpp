@@ -70,7 +70,7 @@ BridgeNode::BridgeNode(const rclcpp::NodeOptions& options)
     throw std::runtime_error("lidar_translation needs exactly 3 values");
   }
   if (miss_range_scale_ <= 1.0) {
-    // At exactly 1.0 octomap's `norm() <= max_range` test passes and every
+    // At exactly 1.0 an inclusive maximum-range test passes and every
     // miss becomes a phantom obstacle in a shell around the robot.
     throw std::runtime_error("miss_range_scale must be greater than 1");
   }
@@ -587,7 +587,7 @@ void BridgeNode::publishCloud(const Robot& robot, const Observation& obs,
               float(range * std::sin(elevation))});
         }
       } else if (obs.ranges[i] > 0.0f) {
-        // True open-air miss: push past max range so OctoMap clears free space.
+        // True open-air miss: push past max range to carve without a hit.
         // Rays occluded by host robot body have range == 0.0 and are dropped
         // so they do not falsely clear the ground underneath the chassis.
         const double range = double(obs.max_range) * miss_range_scale_;
