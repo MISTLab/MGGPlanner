@@ -48,11 +48,20 @@ class GroundLayer {
   /// the body band of a column reaching past the disk's edge too. A change
   /// withdraws every column.
   void setStandingStart(const std::optional<StandingStart>& standing);
-  void recheck(std::chrono::steady_clock::time_point deadline);
+  /// Rechecks dirty columns, nearest the robot first, except that columns
+  /// whose dependency reaches one of `first` (an executing commitment's
+  /// dependencies) come before all others.
+  void recheck(std::chrono::steady_clock::time_point deadline,
+               const std::vector<Eigen::AlignedBox3d>& first = {});
   /// Pending means work since the last change, not completed unknown space.
   int pendingCount() const;
   bool pending(const Eigen::AlignedBox3d& region) const;
   GroundVerdict verdict(const Eigen::Vector2d& position) const;
+  /// Whether a footprint of `size` centred at `at`, facing `heading`,
+  /// overlaps a column exported as refused (occupancy 100): Nav2's costmap
+  /// would put that footprint on lethal terrain.
+  bool refusedUnder(const Eigen::Vector2d& at, double heading,
+                    const Eigen::Vector2d& size) const;
   /// Row-major, x fastest: admitted 0, refused 100, unknown/pending -1.
   std::vector<int8_t> occupancy() const;
   Eigen::Vector2d origin() const { return origin_; }

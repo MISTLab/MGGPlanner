@@ -1,5 +1,7 @@
 #include <gtest/gtest.h>
 
+#include <algorithm>
+
 #include "local_planner_fixture.h"
 #include "mgg_core/graph_expansion.h"
 #include "mgg_core/local_route.h"
@@ -644,4 +646,124 @@ TEST(LocalPlanner, StandingStartTurnsSeeOnlyWholeDiskCellsAsObserved) {
                             StandingTurnBody::kWholeCellInDisk));
     EXPECT_FALSE(planner.pathStillCertified(turn, 0));
   }
+}
+
+// Spec §4.4 (v2-motionfix): only an unsafe commitment breaks it. The rest of
+// a path may lose its certificate while what the executor may still drive
+// keeps it; the next path then extends from the rest of that commitment.
+TEST(LocalPlanner, SuffixLossKeepsTheCommitment) {
+  mgg_test::LocalScene s;
+  LocalPlanner planner(s.map, s.layer, s.cache, s.planning, s.robot, s.sensor);
+  auto in = s.inputs();
+  const auto first = planner.plan(in, {});
+  ASSERT_TRUE(first.path) << first.reason;
+  ASSERT_NEAR(first.path->commit_length_m, 1.2, 1e-6);
+  ASSERT_GT(pathLength(*first.path), 4);
+  for (const auto& p : first.path->poses) ASSERT_NEAR(p.y(), 0, 1e-6);
+  // On the path, beyond where the body reaches by the commitment's end.
+  s.map.solids.emplace_back(Eigen::Vector3d(3.0, -0.3, 0.1),
+                            Eigen::Vector3d(3.4, 0.3, 0.9));
+  s.cache.flushAll();
+  EXPECT_FALSE(planner.pathStillCertified(*first.path, 0));
+  EXPECT_TRUE(planner.commitmentStillCertified(*first.path, 0));
+  // Faster now: this cycle's two-second horizon reaches the obstacle, the
+  // commitment the executor is held to does not. Extend, never BREAK.
+  in.executing_path = first.path;
+  in.speed_mps = 1.0;
+  ASSERT_GT(commitmentLength(in.speed_mps, in.braking) + 0.5, 3.0);
+  const auto next = planner.plan(in, {});
+  ASSERT_TRUE(next.path) << next.reason;
+  EXPECT_EQ(next.path->kind, LocalPathKind::kExtend);
+  EXPECT_EQ(next.path->extends_sequence_id, first.path->sequence_id);
+  const auto rest = remainingCommitment(*first.path, 0);
+  ASSERT_EQ(next.path->prefix_length, rest.poses.size());
+  for (size_t i = 0; i < rest.poses.size(); ++i)
+    EXPECT_EQ(next.path->poses[i], rest.poses[i]);
+  EXPECT_TRUE(planner.pathStillCertified(*next.path, 0));
+
+  // An obstacle the body meets within the commitment breaks it.
+  s.map.solids.emplace_back(Eigen::Vector3d(1.3, -0.3, 0.1),
+                            Eigen::Vector3d(1.5, 0.3, 0.9));
+  s.cache.flushAll();
+  EXPECT_FALSE(planner.commitmentStillCertified(*first.path, 0));
+  in.speed_mps = 0.6;
+  const auto broken = planner.plan(in, {});
+  if (broken.path) EXPECT_EQ(broken.path->kind, LocalPathKind::kBreak);
+}
+
+// Spec §4.3 as amended (v2-motionfix): 6-10 m is preferred, not a veto. With
+// no 6 m path (p1a-acc-2 robot_2: 208 routes to gain, all under 5.03 m),
+// the best-ranked certified one of at least a commitment is published.
+TEST(LocalPlanner, ShorterCertifiedPathWhenNoSixMetreOne) {
+  mgg_test::LocalScene s;
+  s.map.unknown_beside_corridor = true;
+  s.map.solids.emplace_back(Eigen::Vector3d(2.8, -1, 0.1),
+                            Eigen::Vector3d(3.0, 1, 0.9));
+  s.map.solids.emplace_back(Eigen::Vector3d(-3.0, -1, 0.1),
+                            Eigen::Vector3d(-2.8, 1, 0.9));
+  LocalPlanner planner(s.map, s.layer, s.cache, s.planning, s.robot, s.sensor);
+  auto in = s.inputs();
+  in.target.reset();
+  const auto result = planner.plan(in, {});
+  ASSERT_TRUE(result.path) << result.reason;
+  EXPECT_EQ(result.status, LocalStatus::kMoving);
+  EXPECT_EQ(result.reason, "certified local path");
+  EXPECT_FALSE(result.path->reaches_goal);
+  const double length = pathLength(*result.path);
+  EXPECT_LT(length, kPreferredPathM);
+  EXPECT_GE(length + 1e-9, commitmentLength(in.speed_mps, in.braking));
+  ASSERT_TRUE(result.refusals);
+  EXPECT_TRUE(planner.pathStillCertified(*result.path, 0));
+  // With a 6 m path available, it is preferred (CorridorAndSplice).
+}
+
+// MGG is the single terrain authority (v2-motionfix): Nav2's costmap carries
+// the layer's refusals and MPPI checks the footprint against them, so a
+// certified path must keep every footprint off them. A 0.38 m kerb beside
+// the corridor refuses the columns next to it; the planner's own checks
+// pass a body box riding over it, not the costmap.
+TEST(LocalPlanner, CertifiedFootprintsStayOffRefusedTerrain) {
+  auto tops = mgg_test::localFloor();
+  for (int x = 10; x < 25; ++x)
+    for (int y = 2; y < 4; ++y) tops[{x, y}] = 0.38;  // x 2-5 m, y 0.4-0.8 m
+  struct KerbMap : mgg_test::TerrainFixture {
+    using TerrainFixture::TerrainFixture;
+    std::optional<Eigen::AlignedBox3d> windowBounds() const override {
+      return Eigen::AlignedBox3d(Eigen::Vector3d(-8, -8, -2),
+                                 Eigen::Vector3d(8, 8, 4));
+    }
+  } map(0.2, tops);
+  const auto planning = mgg_test::localPlanning();
+  const auto robot = mgg_test::localRobot();
+  SensorParams sensor;
+  sensor.fov = {6.28, 0.2};
+  sensor.resolution = {0.4, 0.2};
+  sensor.update();
+  GroundLayer layer(map, planning, robot);
+  layer.reset({0, 0, 0.5}, 0);
+  layer.recheck(std::chrono::steady_clock::now() + std::chrono::seconds(20));
+  ASSERT_EQ(layer.verdict({3.1, 0.1}), GroundVerdict::kRefusedStepGrade);
+  ASSERT_EQ(layer.verdict({3.1, -0.1}), GroundVerdict::kAdmitted);
+  CertificationCache cache{dependencyHalos(robot, planning, 0.2, 5)};
+  LocalPlanner planner(map, layer, cache, planning, robot, sensor);
+  LocalPathPlan straight;
+  for (int i = 0; i <= 28; ++i) {
+    straight.poses.emplace_back(i * 0.25, 0, 0.5, 0);
+    straight.reverse.push_back(false);
+  }
+  EXPECT_FALSE(planner.pathStillCertified(straight, 0));
+  mgg_test::LocalScene scene;
+  auto in = scene.inputs();
+  const auto result = planner.plan(in, {});
+  ASSERT_TRUE(result.path) << result.reason;
+  const Eigen::Vector2d size = robot.getPlanningSize().head<2>();
+  for (const auto& pose : result.path->poses)
+    EXPECT_FALSE(layer.refusedUnder(pose.head<2>(), pose[3], size))
+        << pose.transpose();
+  // Round the kerb, not along it.
+  EXPECT_TRUE(std::any_of(
+      result.path->poses.begin(), result.path->poses.end(),
+      [](const StateVec& p) {
+        return p.x() > 2 && p.x() < 5 && p.y() < -0.1;
+      }));
 }

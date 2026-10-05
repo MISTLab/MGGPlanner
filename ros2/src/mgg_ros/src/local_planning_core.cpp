@@ -139,8 +139,9 @@ void LocalPlanningCore::afterChange(const MapChange& change) {
     cache_.withdraw(change);
   }
   // Recheck now, so retained paths are judged on completed certification
-  // where the budget allows; whatever stays pending fails them below.
-  layer_.recheck(after(ground_recheck_s_));
+  // where the budget allows, under the executing commitment first; whatever
+  // stays pending fails them below.
+  recheckGround(Clock::time_point::max());
   // Ground withdrawals reach beyond the change: a withdrawn flood parent
   // withdraws its descendants, and so does a scroll or a re-seed. Whatever
   // is still pending counts as changed for the paths depending on it.
@@ -165,10 +166,69 @@ void LocalPlanningCore::afterChange(const MapChange& change) {
     }
     if (!reached) continue;
     ++retained_rechecks_;
-    const double progress = sequence == executing_sequence_ ? progress_ : 0.0;
-    if (!planner_.pathStillCertified(retained.path, progress))
-      invalidate(sequence, "map change withdrew the path's certification");
+    const double progress = progressOn(sequence);
+    if (!retained.suffix_withdrawn &&
+        planner_.pathStillCertified(retained.path, progress))
+      continue;
+    if (planner_.commitmentStillCertified(retained.path, progress)) {
+      // Spec §4.4: only an unsafe commitment breaks it. Beyond it the path
+      // is withdrawn by replanning from the commitment, while the executor
+      // keeps driving within it.
+      if (!retained.suffix_withdrawn) {
+        ++suffix_withdrawals_;
+        if (sequence == executing_sequence_ ||
+            sequence == acknowledged_sequence_)
+          replan_requested_ = true;
+      }
+      retained.suffix_withdrawn = true;
+      continue;
+    }
+    invalidate(sequence, "map change withdrew the path's certification");
   }
+}
+
+double LocalPlanningCore::progressOn(std::uint64_t sequence) const {
+  return sequence == acknowledged_sequence_ ? progress_ : 0.0;
+}
+
+std::vector<Eigen::AlignedBox3d> LocalPlanningCore::commitmentDependencies()
+    const {
+  // The path the executor drives and, while it is in flight, the one it
+  // is about to.
+  std::vector<std::uint64_t> sequences{acknowledged_sequence_};
+  if (executing_sequence_ != acknowledged_sequence_)
+    sequences.push_back(executing_sequence_);
+  std::vector<Eigen::AlignedBox3d> boxes;
+  for (const auto sequence : sequences) {
+    const auto found = retained_.find(sequence);
+    if (found == retained_.end() || found->second.invalid) continue;
+    const auto rest =
+        remainingCommitment(found->second.path, progressOn(sequence));
+    boxes.insert(boxes.end(), rest.edge_dependencies.begin(),
+                 rest.edge_dependencies.end());
+  }
+  return boxes;
+}
+
+void LocalPlanningCore::recheckGround(Clock::time_point deadline) {
+  const auto commitment = commitmentDependencies();
+  layer_.recheck(std::min(deadline, after(ground_recheck_s_)), commitment);
+  // Some of the commitment's columns are reached only late in the flood,
+  // round an obstacle or a peer, or are cleared only when it completes
+  // (unreachable). Pending work alone must not break the commitment before
+  // it had a second slice (p1a-acc-2 robot_3: every commitment broken by a
+  // recheck was still pending, a few columns of it).
+  if (std::any_of(commitment.begin(), commitment.end(),
+                  [&](const Eigen::AlignedBox3d& box) {
+                    return layer_.pending(box);
+                  }))
+    layer_.recheck(std::min(deadline, after(ground_recheck_s_)), commitment);
+}
+
+bool LocalPlanningCore::takeReplanRequest() {
+  const bool requested = replan_requested_;
+  replan_requested_ = false;
+  return requested;
 }
 
 void LocalPlanningCore::acceptStandingStart(const LocalGuidance& guidance) {
@@ -244,7 +304,9 @@ void LocalPlanningCore::invalidate(std::uint64_t sequence,
 void LocalPlanningCore::clearSession() {
   retained_.clear();
   executing_sequence_ = 0;
-  fed_back_sequence_ = 0;
+  acknowledged_sequence_ = 0;
+  crossing_reports_ = 0;
+  replan_requested_ = false;
   progress_ = 0;
   speed_mps_ = 0;
   guidance_.reset();
@@ -338,7 +400,7 @@ void LocalPlanningCore::withdrawAgainstZones(
       continue;
     }
     if (zones->empty()) continue;
-    const double progress = sequence == executing_sequence_ ? progress_ : 0.0;
+    const double progress = progressOn(sequence);
     const auto remaining =
         committedPrefix(retained.path, progress, pathLength(retained.path));
     std::vector<Eigen::Vector3d> points;
@@ -353,17 +415,30 @@ void LocalPlanningCore::onFeedback(const LocalFeedback& feedback) {
       feedback.epoch != params_.epoch || !std::isfinite(feedback.progress_m) ||
       feedback.progress_m < 0)
     return;
-  if (feedback.executing && feedback.sequence_id != 0) {
-    fed_back_sequence_ = feedback.sequence_id;
-    executing_sequence_ = feedback.sequence_id;
-    progress_ = feedback.progress_m;
+  const std::uint64_t named =
+      feedback.executing ? feedback.sequence_id : std::uint64_t{0};
+  const auto acknowledge = [&] {
+    acknowledged_sequence_ = named;
+    progress_ = named != 0 ? feedback.progress_m : 0.0;
     // The executor has moved on from every older path.
-    retained_.erase(retained_.begin(),
-                    retained_.lower_bound(executing_sequence_));
+    if (named != 0)
+      retained_.erase(retained_.begin(), retained_.lower_bound(named));
+  };
+  if (named == acknowledged_sequence_ &&
+      executing_sequence_ != acknowledged_sequence_ && crossing_reports_ > 0) {
+    // Possibly sent before the executor received the newer publication:
+    // still its progress on the acknowledged path, but not yet its verdict.
+    --crossing_reports_;
+    acknowledge();
+  } else if (named > acknowledged_sequence_ && named < executing_sequence_ &&
+             retained_.count(named)) {
+    // An older publication accepted; a newer one is still in flight.
+    acknowledge();
+    crossing_reports_ = 1;
   } else {
-    fed_back_sequence_ = 0;
-    executing_sequence_ = 0;
-    progress_ = 0;
+    acknowledge();
+    executing_sequence_ = named;
+    crossing_reports_ = 0;
   }
   if (std::isfinite(feedback.speed_mps))
     speed_mps_ = std::abs(feedback.speed_mps);
@@ -404,9 +479,11 @@ LocalPlanResult LocalPlanningCore::plan(Clock::time_point deadline) {
     result.reason = "idle";
     return finish();
   }
+  // This cycle replans whatever asked for it.
+  replan_requested_ = false;
   // A transform that was missing when the guidance arrived may exist now.
   refreshStandingStart();
-  layer_.recheck(std::min(deadline, after(ground_recheck_s_)));
+  recheckGround(deadline);
 
   LocalPlanInputs in;
   std::string failed;
@@ -455,7 +532,7 @@ LocalPlanResult LocalPlanningCore::plan(Clock::time_point deadline) {
   if (executing != retained_.end()) {
     in.executing_path = executing->second.path;
     in.executing_invalid = executing->second.invalid;
-    in.progress_m = progress_;
+    in.progress_m = progressOn(executing_sequence_);
   }
   in.braking = braking_;
   {
@@ -465,15 +542,16 @@ LocalPlanResult LocalPlanningCore::plan(Clock::time_point deadline) {
   }
   if (result.path) {
     const std::uint64_t sequence = next_sequence_++;
-    retained_[sequence] = Retained{*result.path, false};
-    // Until feedback names another path, the executor drives this one.
+    retained_[sequence] = Retained{*result.path, false, false};
+    // The next plan extends it unless the executor's report says otherwise
+    // (onFeedback); one report already on its way may cross it.
     executing_sequence_ = sequence;
-    progress_ = 0;
+    crossing_reports_ = 1;
     while (retained_.size() > kMaxRetained) {
       // Publication changes the planning assumption, not the last executor
       // acknowledgement. Fence its path even if feedback skips a cycle;
       // retiring other ancestors silently avoids stopping newer paths.
-      if (retained_.begin()->first == fed_back_sequence_)
+      if (retained_.begin()->first == acknowledged_sequence_)
         invalidate(retained_.begin()->first, "retention limit");
       retained_.erase(retained_.begin());
     }

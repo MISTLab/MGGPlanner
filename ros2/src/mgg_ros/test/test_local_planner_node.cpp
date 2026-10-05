@@ -341,13 +341,16 @@ TEST_F(LocalPlannerNodeTest, MovingChurnRecoversWithinOneCycle) {
          invalidations_seen = h.invalidations.size();
 
   int extensions = 0, unsafe_outputs = 0, breaks_beside_corridor = 0,
-      intrusion_breaks = 0;
+      intrusion_breaks = 0, intrusion_withdrawals = 0;
+  auto suffixes_seen = h.node->core().suffixWithdrawals();
   double recovery_s = 0;
   std::optional<double> lost_at;
   Eigen::AlignedBox3d intrusion;
   // 10 Hz side-obstacle changes for 5 s while driving at 0.5 m/s. For one
-  // second the obstacle stands on the route instead: that withdrawal is
-  // real, and the planner must recover from it within a cycle.
+  // second the obstacle stands on the route instead, 3.3 m ahead, beyond
+  // the commitment and the refused ring the layer keeps round it (from
+  // 2.9 m): that withdrawal of the suffix is real, and the planner must
+  // recover from it within a cycle, without a BREAK.
   for (int step = 0; step < 50; ++step) {
     h.t += 0.1;
     const bool intruding = step >= 25 && step < 35;
@@ -356,8 +359,8 @@ TEST_F(LocalPlannerNodeTest, MovingChurnRecoversWithinOneCycle) {
         Eigen::Vector3d(x0, 1.3, -0.1), Eigen::Vector3d(x0 + 0.4, 1.7, 1.0));
     if (step == 25)
       intrusion =
-          Eigen::AlignedBox3d(Eigen::Vector3d(base.x() + 2.5, -0.1, -0.1),
-                              Eigen::Vector3d(base.x() + 2.9, 0.3, 1.0));
+          Eigen::AlignedBox3d(Eigen::Vector3d(base.x() + 3.3, -0.1, -0.1),
+                              Eigen::Vector3d(base.x() + 3.7, 0.3, 1.0));
     if (intruding) h.corridor.obstacle = intrusion;
     progress += 0.05;
     const StateVec along = mgg_test::poseAt(posesOf(executing), progress);
@@ -380,6 +383,11 @@ TEST_F(LocalPlannerNodeTest, MovingChurnRecoversWithinOneCycle) {
         if (intruding) ++intrusion_breaks;
         if (!lost_at) lost_at = h.t;
       }
+    if (h.node->core().suffixWithdrawals() > suffixes_seen) {
+      suffixes_seen = h.node->core().suffixWithdrawals();
+      if (intruding) ++intrusion_withdrawals;
+      if (intruding && !lost_at) lost_at = h.t;
+    }
     for (; paths_seen < h.paths.size(); ++paths_seen) {
       const auto& path = h.paths[paths_seen];
       if (path.kind == LocalPath::EXTEND) ++extensions;
@@ -402,8 +410,10 @@ TEST_F(LocalPlannerNodeTest, MovingChurnRecoversWithinOneCycle) {
     }
   }
   if (lost_at) recovery_s = std::max(recovery_s, h.t - *lost_at);
-  // The intrusion did withdraw the driven path, so recovery was measured.
-  EXPECT_GT(intrusion_breaks, 0);
+  // The intrusion did withdraw the driven path's suffix, so recovery was
+  // measured; its commitment stayed certified, so nothing broke it.
+  EXPECT_GT(intrusion_withdrawals, 0);
+  EXPECT_EQ(intrusion_breaks, 0);
   EXPECT_LE(recovery_s, 0.5);
   EXPECT_GT(extensions, 5);
   EXPECT_EQ(unsafe_outputs, 0);

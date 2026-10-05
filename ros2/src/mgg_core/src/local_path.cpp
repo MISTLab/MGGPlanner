@@ -62,6 +62,11 @@ LocalPathPlan committedPrefix(const LocalPathPlan& p, double progress,
   out.reaches_goal = p.reaches_goal && last + 1 == p.poses.size();
   return out;
 }
+LocalPathPlan remainingCommitment(const LocalPathPlan& p, double progress) {
+  progress = std::max(0.0, progress);
+  return committedPrefix(p, progress,
+                         std::max(0.0, p.commit_length_m - progress));
+}
 LocalPathPlan splicePath(const LocalPathPlan& prefix,
                          const LocalPathPlan& extension) {
   if (prefix.poses.empty()) return extension;

@@ -325,8 +325,10 @@ void LocalPlannerNode::publishInvalidations(bool plan_after) {
     msg.reason = invalidation.reason;
     invalidation_pub_->publish(msg);
   }
-  // A withdrawn path is replanned at once, not at the next period.
-  if (plan_after && !invalidations.empty()) runPlan();
+  // A withdrawn path, or a withdrawn suffix beyond a commitment still
+  // certified, is replanned at once, not at the next period.
+  const bool replan = core_.takeReplanRequest();
+  if (plan_after && (!invalidations.empty() || replan)) runPlan();
 }
 
 void LocalPlannerNode::publishGrid() {

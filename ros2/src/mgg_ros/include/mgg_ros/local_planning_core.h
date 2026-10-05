@@ -170,6 +170,16 @@ class LocalPlanningCore {
   /// have no transform, are invalidated at once (takeInvalidations).
   void setNoGoZones(const NoGoZones& zones, const std::string& frame_id = {});
   /// Ignored unless it is for the current session and epoch.
+  ///
+  /// The executing path, which the next plan extends, has one authority:
+  /// the acknowledged-tip watermark. A publication becomes it at once; the
+  /// executor's report moves it on, or back only when it confirms that it
+  /// still drives the older path. The executor reports every 0.2 s, so one
+  /// report naming the acknowledged path may cross a newer publication in
+  /// flight: that one cannot move the tip back (a sibling of the path the
+  /// executor already accepted would be refused as "wrong parent"). A
+  /// second such report after the publication, or any other path or IDLE,
+  /// is the executor's state.
   void onFeedback(const LocalFeedback& feedback);
   /// Resolves frames other than the odometry frame. Without it, only
   /// odometry-frame inputs can be planned with.
@@ -178,8 +188,12 @@ class LocalPlanningCore {
   void setGroundRecheckBudget(double seconds);
   /// One planning cycle. A path it returns carries the epoch, the next
   /// sequence id and the session; the core then treats it as executing
-  /// until feedback names another path.
+  /// (onFeedback).
   LocalPlanResult plan(std::chrono::steady_clock::time_point deadline);
+  /// Whether a map change withdrew only the suffix of a retained path,
+  /// beyond its still certified commitment, since the last call or plan:
+  /// no invalidation (motion goes on within the commitment), but plan now.
+  bool takeReplanRequest();
   /// Invalidations produced since the last call: paths withdrawn by map
   /// changes or resets, or the last feedback-confirmed executing path evicted
   /// by retention pruning. Retiring other paths is silent. Plan immediately
@@ -194,14 +208,22 @@ class LocalPlanningCore {
   std::uint64_t guidanceSequenceId() const {
     return guidance_ ? guidance_->sequence_id : 0;
   }
+  /// Progress along acknowledgedSequenceId(), as the executor reported it.
   double progress() const { return progress_; }
   std::uint64_t executingSequenceId() const { return executing_sequence_; }
+  /// The path the executor last reported driving; 0 when idle.
+  std::uint64_t acknowledgedSequenceId() const {
+    return acknowledged_sequence_;
+  }
   const RollingVoxelMap& map() const { return map_; }
   const GroundLayer& ground() const { return layer_; }
   /// Scans dropped because their robot pose or origin was not finite.
   std::uint64_t droppedScans() const { return dropped_scans_; }
   /// Retained paths re-certified because a map change reached them.
   std::uint64_t retainedRechecks() const { return retained_rechecks_; }
+  /// Retained paths whose suffix a map change withdrew, their commitment
+  /// still certified (takeReplanRequest).
+  std::uint64_t suffixWithdrawals() const { return suffix_withdrawals_; }
   /// The standing start applied now, in the odometry frame.
   std::optional<StandingStart> standingStart() const {
     return standing_applied_ ? std::optional<StandingStart>(standing_->odom)
@@ -212,6 +234,8 @@ class LocalPlanningCore {
   struct Retained {
     LocalPathPlan path;
     bool invalid = false;
+    /// Only its commitment is still certified (takeReplanRequest).
+    bool suffix_withdrawn = false;
   };
   /// The disk first applied, with the boot that proved it.
   struct AppliedStandingStart {
@@ -242,6 +266,16 @@ class LocalPlanningCore {
   void withdrawAgainstZones(const std::optional<NoGoZones>& zones,
                             const std::string& failed);
   void invalidate(std::uint64_t sequence, const std::string& reason);
+  /// Progress along a retained path: the executor's, for the acknowledged
+  /// path, else from its start.
+  double progressOn(std::uint64_t sequence) const;
+  /// Dependencies of the rest of the executing path's commitment, which
+  /// ground rechecks take first.
+  std::vector<Eigen::AlignedBox3d> commitmentDependencies() const;
+  /// Ground recheck slices of ground_recheck_s_ each, ending no later than
+  /// `deadline`: the commitment's pending work first, and a second slice
+  /// while any of it is still pending.
+  void recheckGround(std::chrono::steady_clock::time_point deadline);
   void clearSession();
   std::optional<Eigen::Isometry3d> resolve(const std::string& frame,
                                            std::string& failed) const;
@@ -277,14 +311,20 @@ class LocalPlanningCore {
 
   std::map<std::uint64_t, Retained> retained_;
   std::uint64_t next_sequence_ = 1;
+  /// The acknowledged-tip watermark (onFeedback): what the next plan extends.
   std::uint64_t executing_sequence_ = 0;
-  /// Last executor acknowledgement, independent of optimistic publications.
-  std::uint64_t fed_back_sequence_ = 0;
+  /// The executor's last report, independent of publications.
+  std::uint64_t acknowledged_sequence_ = 0;
+  /// Reports naming acknowledged_sequence_ that may still cross the latest
+  /// publication.
+  int crossing_reports_ = 0;
+  bool replan_requested_ = false;
   double progress_ = 0, speed_mps_ = 0;
   BrakingBounds braking_;
   std::vector<LocalInvalidation> invalidations_;
   std::uint64_t dropped_scans_ = 0;
   std::uint64_t retained_rechecks_ = 0;
+  std::uint64_t suffix_withdrawals_ = 0;
 };
 
 }  // namespace mgg

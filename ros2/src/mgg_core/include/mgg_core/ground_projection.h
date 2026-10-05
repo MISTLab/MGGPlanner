@@ -339,6 +339,35 @@ class GroundProjection {
   /// max_projection_length.
   bool groundBelow(const Eigen::Vector3d& point, Eigen::Vector3d& ground) const;
 
+  /// Ground support needs evidence. On a map that observes free space
+  /// (MapInterface::observesFreeSpace), an occupied voxel over an observed
+  /// free voxel above the level probed floats there (a peer's body, a table
+  /// top): projectSample's rays pass on below it. A step, a
+  /// ledge or a wall is solid, or unseen, under its top and stays ground, and
+  /// so does a deck seen from below by a robot now on it (the free voxel
+  /// under it is below the level). The v2 ground layer and local planner set
+  /// it (a parked Spot's torso, met by an offset ray 0.8 m away, refused the
+  /// terrain under a Bunker: v2-motionfix); off, the legacy planner is
+  /// unchanged.
+  /// With offset probes off, projectSample casts only the sample's own
+  /// column, so a step check reads each sampled column's own ground. The v2
+  /// ground layer turns them off: its verdict is per column, and probes
+  /// 0.4 m to the side turned anything solid within 0.8 m of a column (a
+  /// parked Bunker, as a box) into a refused ring round it (v2-motionfix).
+  /// Risers and drops are still met in the columns they stand in.
+  void setOffsetProbes(bool offset_probes) {
+    offset_probes_ = offset_probes;
+    projections_.clear();
+    ground_ahead_cache_.clear();
+  }
+
+  void setSupportedGroundOnly(bool supported_ground_only) {
+    supported_ground_only_ = supported_ground_only;
+    projections_.clear();
+    ground_below_column_.clear();
+    ground_ahead_cache_.clear();
+  }
+
   /// How far down projectSample looks. Was a bare 5.0 in the original.
   double max_projection_length = 5.0;
 
@@ -408,6 +437,17 @@ class GroundProjection {
                     double bottom) const;
   /// projectSample without its per-plan memo.
   double castProjection(Eigen::Vector3d& sample, VoxelStatus& status) const;
+  /// The free voxel under `hit` when it is a solid floating above `level`
+  /// (setSupportedGroundOnly), else nullopt.
+  std::optional<Eigen::Vector3d> floatsAbove(const Eigen::Vector3d& hit,
+                                             double level) const;
+  /// The map's ground ray, passing solids floating above `level` when
+  /// supported ground only is set (setSupportedGroundOnly).
+  VoxelStatus groundRay(const Eigen::Vector3d& start,
+                        const Eigen::Vector3d& end, double level,
+                        Eigen::Vector3d& end_voxel) const;
+  bool supported_ground_only_ = false;
+  bool offset_probes_ = true;
   using ProjectionKey = std::array<std::int64_t, 3>;
   struct Projection {
     double below = 0.0;

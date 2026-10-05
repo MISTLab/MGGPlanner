@@ -4,9 +4,11 @@
 #include <chrono>
 #include <cmath>
 #include <functional>
+#include <optional>
 #include <thread>
 
 #include "mgg_core/ground_layer.h"
+#include "mgg_core/planning_cancellation.h"
 #include "terrain_fixture.h"
 
 namespace mgg {
@@ -283,6 +285,167 @@ TEST(GroundLayer, DropEdgeCannotBorrowSupportFromRim) {
   EXPECT_EQ(cost(layer, {0.9, 0.1}), -1);
   EXPECT_EQ(layer.verdict({0.9, 0.1}), GroundVerdict::kUnknown);
   EXPECT_EQ(layer.pendingCount(), 0);
+}
+
+// Exact 0.2 m voxels, as the production rolling map stores them: a floor
+// voxel layer whose top is z = 0 and whose underside was never seen, air
+// observed free above it, and occupied boxes. Optionally a strip of floor
+// at 0.8 <= x < 1.2 the lidar never saw, or an observed drop to a floor
+// 0.4 m lower from drop_from_x on. Downward rays stop in the first occupied
+// voxel, the one they start in included.
+class VoxelSceneMap : public LayerMap {
+ public:
+  VoxelSceneMap() : LayerMap([](double) { return 0.0; }) {}
+  bool observesFreeSpace() const override { return true; }
+  VoxelStatus getVoxelStatus(const Eigen::Vector3d& p) const override {
+    return status(keyOf(p, getResolution()));
+  }
+  VoxelStatus getRayStatus(const Eigen::Vector3d& a, const Eigen::Vector3d& b,
+                           bool, Eigen::Vector3d& end) const override {
+    VoxelKey cell = keyOf(a, getResolution());
+    const int last_z = keyOf(b, getResolution()).z;
+    for (; cell.z >= last_z; --cell.z) {
+      if (status(cell) == VoxelStatus::kOccupied) {
+        end = centerOf(cell, getResolution());
+        return VoxelStatus::kOccupied;
+      }
+    }
+    end = b;
+    return VoxelStatus::kFree;
+  }
+  VoxelStatus getBoxStatus(const Eigen::Vector3d& p, const Eigen::Vector3d& size,
+                           bool stop) const override {
+    checked_bodies.push_back(p);
+    const VoxelKey low = keyOf(p - size / 2, getResolution());
+    const VoxelKey high = keyOf(p + size / 2, getResolution());
+    bool unknown = false;
+    for (int x = low.x; x <= high.x; ++x)
+      for (int y = low.y; y <= high.y; ++y)
+        for (int z = low.z; z <= high.z; ++z) {
+          const VoxelStatus s = status({x, y, z});
+          if (s == VoxelStatus::kOccupied) return s;
+          unknown |= s == VoxelStatus::kUnknown;
+        }
+    return stop && unknown ? VoxelStatus::kUnknown : VoxelStatus::kFree;
+  }
+  std::vector<Eigen::AlignedBox3d> solids;
+  bool unseen_strip = true;
+  std::optional<double> drop_from_x;
+
+ private:
+  VoxelStatus status(const VoxelKey& cell) const {
+    const Eigen::Vector3d c = centerOf(cell, getResolution());
+    for (const auto& solid : solids)
+      if (solid.contains(c)) return VoxelStatus::kOccupied;
+    const int floor = drop_from_x && c.x() >= *drop_from_x ? -3 : -1;
+    const bool unseen_floor = unseen_strip && (cell.x == 4 || cell.x == 5);
+    if (cell.z == floor)
+      return unseen_floor ? VoxelStatus::kUnknown : VoxelStatus::kOccupied;
+    return cell.z < floor ? VoxelStatus::kUnknown : VoxelStatus::kFree;
+  }
+};
+
+// p1a-acc-2 robot_1 (Bunker): a parked Spot's torso, 0.2-0.6 m over observed
+// floor 1.3 m behind it, was met from inside by a 0.4 m offset ray of a step
+// check sample 0.4 m along, whose own floor was unseen: ground 0.46 m up, so
+// the columns under the Bunker's rear were refused and MPPI could not start.
+TEST(GroundLayer, FloatingBodyIsAnObstacleNotRefusedTerrain) {
+  VoxelSceneMap peer;
+  // Over observed free air: the torso of a peer standing on the floor.
+  peer.solids.emplace_back(Eigen::Vector3d(1.2, -0.4, 0.2),
+                           Eigen::Vector3d(1.6, 0.6, 0.6));
+  GroundLayer layer(peer, planning(), robot());
+  layer.reset({0.1, 0.1, 0.5}, 0);  // floor voxel centre -0.1
+  finish(layer);
+  EXPECT_EQ(layer.verdict({0.1, 0.1}), GroundVerdict::kAdmitted);
+  EXPECT_EQ(layer.verdict({0.5, 0.1}), GroundVerdict::kAdmitted);
+  EXPECT_EQ(layer.verdict({0.7, 0.1}), GroundVerdict::kAdmitted);
+  EXPECT_EQ(layer.verdict({0.9, 0.1}), GroundVerdict::kUnknown);  // unseen
+}
+
+// A column's step check reads the ground of the columns it samples, not of
+// columns 0.4 m beside them: offset probes from samples whose own floor was
+// unseen turned solid things within 0.8 m into a refused ring (robot_2's
+// map at 127.1 s: 32/34/52 refused cells round three parked robots). A real
+// 0.38 m box is still a step at its riser, and an observed drop a drop.
+TEST(GroundLayer, StepCheckReadsEachColumnsOwnGround) {
+  const Eigen::AlignedBox3d box(Eigen::Vector3d(1.2, -0.4, 0.0),
+                                Eigen::Vector3d(1.6, 0.6, 0.38));
+  VoxelSceneMap shadowed;  // the floor in front of the box unseen
+  shadowed.solids.push_back(box);
+  GroundLayer ring(shadowed, planning(), robot());
+  ring.reset({0.1, 0.1, 0.5}, 0);
+  finish(ring);
+  EXPECT_EQ(ring.verdict({0.1, 0.1}), GroundVerdict::kAdmitted);
+  EXPECT_EQ(ring.verdict({0.5, 0.1}), GroundVerdict::kAdmitted);
+  EXPECT_EQ(ring.verdict({0.7, 0.1}), GroundVerdict::kAdmitted);
+
+  VoxelSceneMap seen;
+  seen.unseen_strip = false;
+  seen.solids.push_back(box);
+  GroundLayer riser(seen, planning(), robot());
+  riser.reset({0.1, 0.1, 0.5}, 0);
+  finish(riser);
+  EXPECT_EQ(riser.verdict({0.7, 0.1}), GroundVerdict::kAdmitted);
+  EXPECT_EQ(riser.verdict({0.9, 0.1}), GroundVerdict::kRefusedStepGrade);
+  EXPECT_EQ(riser.verdict({1.1, 0.1}), GroundVerdict::kRefusedStepGrade);
+
+  VoxelSceneMap drop;
+  drop.unseen_strip = false;
+  drop.drop_from_x = 1.2;
+  GroundLayer edge(drop, planning(), robot());
+  edge.reset({0.1, 0.1, 0.5}, 0);
+  finish(edge);
+  EXPECT_EQ(edge.verdict({0.7, 0.1}), GroundVerdict::kAdmitted);
+  EXPECT_EQ(edge.verdict({0.9, 0.1}), GroundVerdict::kRefusedStepGrade);
+  EXPECT_EQ(edge.verdict({1.1, 0.1}), GroundVerdict::kRefusedStepGrade);
+}
+
+TEST(GroundLayer, RefusedUnderAFootprint) {
+  VoxelSceneMap seen;
+  seen.unseen_strip = false;
+  seen.solids.emplace_back(Eigen::Vector3d(1.2, -0.4, 0.0),
+                           Eigen::Vector3d(1.6, 0.6, 0.38));
+  GroundLayer layer(seen, planning(), robot());
+  layer.reset({0.1, 0.1, 0.5}, 0);
+  finish(layer);
+  ASSERT_EQ(layer.verdict({0.9, 0.1}), GroundVerdict::kRefusedStepGrade);
+  const Eigen::Vector2d size(1.0, 0.4);
+  // The body's front edge at 0.79 m stays off the refused column at 0.8 m.
+  EXPECT_FALSE(layer.refusedUnder({0.29, 0.1}, 0, size));
+  EXPECT_TRUE(layer.refusedUnder({0.4, 0.1}, 0, size));
+  // Turned across the axis, the same centre clears it.
+  EXPECT_FALSE(layer.refusedUnder({0.4, 0.1}, M_PI / 2, size));
+}
+
+// The executing commitment's columns come first, however far along the
+// flood they lie; without it the nearest come first (the test below).
+TEST(GroundLayer, RechecksTheExecutingCommitmentFirst) {
+  const Eigen::AlignedBox3d commitment(Eigen::Vector3d(1.5, -0.1, -0.5),
+                                       Eigen::Vector3d(1.7, 0.1, 0.5));
+  for (const bool first : {false, true}) {
+    SCOPED_TRACE(first);
+    LayerMap map([](double) { return 0.0; });
+    GroundLayer layer(map, planning(), robot());
+    layer.reset({0.1, 0.1, 0.6}, 0);
+    finish(layer);
+    MapChange all;
+    all.everything = true;
+    layer.withdraw(all);
+    ASSERT_TRUE(layer.pending(commitment));
+    map.checked_bodies.clear();
+    // Interrupted after as many columns as a third of the window.
+    try {
+      PlanningCancellationScope budget(
+          [&] { return map.checked_bodies.size() >= 140; });
+      layer.recheck(Clock::now() + std::chrono::seconds(5),
+                    first ? std::vector<Eigen::AlignedBox3d>{commitment}
+                          : std::vector<Eigen::AlignedBox3d>{});
+    } catch (const PlanningInterrupted&) {
+    }
+    EXPECT_EQ(layer.pending(commitment), !first);
+    EXPECT_GT(layer.pendingCount(), 0);
+  }
 }
 
 TEST(GroundLayer, RampAdmissionExercisesGradeLimit) {

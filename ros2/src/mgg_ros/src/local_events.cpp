@@ -58,6 +58,12 @@ nlohmann::json localPlanPayload(const LocalPlanResult& result,
                       {"checks_complete", result.checks_complete},
                       {"reason", result.reason}};
   if (result.candidate_count) j["frontier_count"] = *result.candidate_count;
+  if (result.refusals) {
+    const auto& refused = *result.refusals;
+    j["candidate_refusals"] = {{"unrouted", refused.unrouted},
+                               {"too_short", refused.too_short},
+                               {"uncertified", refused.uncertified}};
+  }
   if (!result.path) {
     j["outcome"] = result.status == LocalStatus::kWaitingForMap ? "waiting_for_map"
                    : result.status == LocalStatus::kBlocked     ? "blocked"

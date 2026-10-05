@@ -38,7 +38,7 @@ std::string hashFile(const fs::path& file) {
 enum class Extra {
   None, KnownIdle, UnknownIdle, GuidanceAndZones, MissingTf,
   DroppedInputs, IdleGap, RestartFeedback, LateScans, SameTickFeedback,
-  SameTickUnmatchedFeedback
+  SameTickUnmatchedFeedback, UnreproducedFeedback
 };
 
 struct Bundle {
@@ -165,6 +165,21 @@ struct Bundle {
       for (int i = 0; i < 4; ++i) scan(3.1 + i * 0.1);
     }
     cycle("s1", "r1", 4, 3);
+    if (extra == Extra::UnreproducedFeedback) {
+      // A live path the replay does not reproduce (here: its cycle replays
+      // in IDLE), then the executor's report on it.
+      request("s1", "idle", 4.1);
+      events.back()["payload"]["mode"] = "idle";
+      events.back()["payload"]["continuation"] = true;
+      cycle("s1", "idle", 4.15, 50);
+      mgg_msgs::msg::LocalPathFeedback fb;
+      fb.session_id = "s1";
+      fb.epoch = 777;
+      fb.sequence_id = 50;
+      fb.state = "executing";
+      fb.progress_m = 0.5;
+      write(fb, "mgg/local_planner/local_path_feedback", 4.2);
+    }
     if (extra == Extra::IdleGap) {
       request("s1", "idle", 4.1);
       events.back()["payload"]["mode"] = "idle";
@@ -271,7 +286,9 @@ TEST(LocalReplay, RealSearchAndTimingScope) {
   ASSERT_EQ(rows.size(), 5u); ASSERT_EQ(open.size(), 5u);
   EXPECT_FALSE(rows[0]["path"].is_null());
   EXPECT_NE(rows[2]["output_digest"], open[2]["output_digest"]);
-  EXPECT_GT(rows[2]["invalidations"], 0);
+  // The wall stands beyond the commitment: only the suffix is withdrawn.
+  EXPECT_EQ(rows[2]["invalidations"], 0);
+  EXPECT_GT(rows[2]["suffix_withdrawals"], 0);
   EXPECT_EQ(rows[3]["admitted_cells"], 0);
   EXPECT_TRUE(rows[3]["path"].is_null());
   EXPECT_EQ(rows[3]["status"], "waiting_for_map");
@@ -369,6 +386,20 @@ TEST(LocalReplay, SameTickFeedbackWithoutItsPublicationFails) {
   EXPECT_NE(result, 0);
   EXPECT_NE(error.find("unmatched feedback epoch/sequence"), std::string::npos);
   EXPECT_FALSE(fs::exists(b.output));
+}
+// p1a-acc-2 robot_0's production replay failed "unmatched feedback
+// epoch/sequence": its wall-clock budgets need not reproduce every live
+// path. Feedback naming a recorded publication whose cycle replayed
+// without a path is counted, never mistaken for another path; one naming
+// no recorded publication still fails
+// (SameTickFeedbackWithoutItsPublicationFails).
+TEST(LocalReplay, FeedbackOnAnUnreproducedPathIsCounted) {
+  Bundle b(true, true, Extra::UnreproducedFeedback);
+  const auto rows = b.run();
+  ASSERT_EQ(rows.size(), 6u);
+  EXPECT_TRUE(rows[3]["path"].is_null());
+  EXPECT_EQ(rows.back()["unreproduced_feedback"], 1);
+  EXPECT_EQ(rows.back()["failures"], 0);
 }
 TEST(LocalReplay, IdleEpochMappingAndUnmatchedIdleCount) {
   Bundle known(true, false, Extra::KnownIdle), unknown(true, false, Extra::UnknownIdle);

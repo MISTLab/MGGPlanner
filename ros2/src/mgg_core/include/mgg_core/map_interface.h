@@ -88,6 +88,11 @@ class MapInterface {
   /// Edge length of one voxel, in metres.
   virtual double getResolution() const = 0;
 
+  /// Whether getVoxelStatus tells observed free space (cells rays carved)
+  /// from unknown space. A map of measured surfaces only, which answers
+  /// free for every other cell (NativeMolaGrid), does not.
+  virtual bool observesFreeSpace() const { return false; }
+
   /// Current finite rolling window, when the backend has one. Unbounded
   /// backends leave this unset; consumers supply their own explicit extent.
   virtual std::optional<Eigen::AlignedBox3d> windowBounds() const {

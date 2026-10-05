@@ -285,9 +285,11 @@ TEST(LocalPlanningCore, ObstacleOnRetainedPathInvalidates) {
   ASSERT_TRUE(first.path) << first.reason;
   EXPECT_TRUE(core.takeInvalidations().empty());
 
-  // A box across the corridor, on the path.
-  corridor.obstacle = Eigen::AlignedBox3d(Eigen::Vector3d(3.1, -2.5, -0.1),
-                                          Eigen::Vector3d(3.5, 2.5, 1.0));
+  // A box across the corridor, on the path where the body reaches before
+  // the commitment ends (1.2 m on at 0.6 m/s, the body 0.5 m ahead).
+  ASSERT_NEAR(first.path->commit_length_m, 1.2, 1e-6);
+  corridor.obstacle = Eigen::AlignedBox3d(Eigen::Vector3d(1.5, -2.5, -0.1),
+                                          Eigen::Vector3d(1.9, 2.5, 1.0));
   for (int i = 0; i < 4; ++i) core.onScan(corridor.odomScan(base), base);
   const auto invalidations = core.takeInvalidations();
   ASSERT_FALSE(invalidations.empty());
@@ -302,6 +304,105 @@ TEST(LocalPlanningCore, ObstacleOnRetainedPathInvalidates) {
     EXPECT_EQ(next.path->kind, LocalPathKind::kBreak);
     EXPECT_EQ(next.path->extends_sequence_id, first.path->sequence_id);
   }
+}
+
+// p1a-acc-2: 99 live breaks, each a stop, came from map changes beyond the
+// commitment (robot_2: an occupied segment 3 m on; a 1.2 m commitment still
+// passed). The suffix alone is withdrawn: no invalidation, an immediate
+// replan from the commitment, and motion goes on.
+TEST(LocalPlanningCore, SuffixObstacleKeepsTheCommitment) {
+  mgg_test::Corridor corridor;
+  const StateVec base = basePose(0.1, 0.1);
+  LocalPlanningCore core(mgg_test::sceneParams());
+  observe(core, corridor, base);
+  ASSERT_TRUE(
+      core.setMode(follow("s1", "r1", drivingPoint(6.1, 0.1))).accepted);
+  const auto first = core.plan(soon());
+  ASSERT_TRUE(first.path) << first.reason;
+  EXPECT_FALSE(core.takeReplanRequest());
+  // On the path 3 m on, leaving a gap on the left wide enough for the body
+  // between the refused rings the layer keeps round the box and the wall.
+  const Eigen::AlignedBox3d box(Eigen::Vector3d(3.1, -2.5, -0.1),
+                                Eigen::Vector3d(3.5, 0.3, 1.0));
+  ASSERT_TRUE(mgg_test::pathCrosses(first.path->poses, {3.3, 0.1}, 0.5));
+  corridor.obstacle = box;
+  for (int i = 0; i < 4; ++i) core.onScan(corridor.odomScan(base), base);
+  EXPECT_TRUE(core.takeInvalidations().empty());
+  EXPECT_EQ(core.suffixWithdrawals(), 1u);
+  EXPECT_TRUE(core.takeReplanRequest());
+  EXPECT_FALSE(core.takeReplanRequest());
+  const auto next = core.plan(soon());
+  ASSERT_TRUE(next.path) << next.reason;
+  EXPECT_EQ(next.path->kind, LocalPathKind::kExtend);
+  EXPECT_EQ(next.path->extends_sequence_id, first.path->sequence_id);
+  const auto rest = remainingCommitment(*first.path, 0);
+  ASSERT_GE(next.path->prefix_length, rest.poses.size());
+  for (size_t i = 0; i < rest.poses.size(); ++i)
+    EXPECT_EQ(next.path->poses[i], rest.poses[i]);
+  for (const auto& pose : next.path->poses)
+    EXPECT_FALSE(mgg_test::footprintOverlaps(pose, {1.0, 0.6}, box));
+}
+
+// p1a-acc-2: all 109 live splice rejections were "wrong parent". A report
+// already on its way when a path is published must not move the tip back
+// to its parent; a second report naming the parent is the executor's
+// refusal, and the next plan extends what it drives.
+TEST(LocalPlanningCore, StaleFeedbackCannotMoveTheTipBack) {
+  mgg_test::Corridor corridor;
+  const StateVec base = basePose(0.1, 0.1);
+  LocalPlanningCore core(mgg_test::sceneParams());
+  observe(core, corridor, base);
+  ASSERT_TRUE(
+      core.setMode(follow("s1", "r1", drivingPoint(6.1, 0.1))).accepted);
+  const auto report = [&](std::uint64_t sequence) {
+    LocalFeedback feedback;
+    feedback.session_id = "s1";
+    feedback.epoch = core.epoch();
+    feedback.sequence_id = sequence;
+    feedback.executing = sequence != 0;
+    core.onFeedback(feedback);
+  };
+  const auto plan = [&]() {
+    auto result = core.plan(soon());
+    EXPECT_TRUE(result.path) << result.reason;
+    return result.path ? *result.path : LocalPathPlan{};
+  };
+  const auto p1 = plan();
+  report(p1.sequence_id);
+  const auto p2 = plan();
+  EXPECT_EQ(p2.extends_sequence_id, p1.sequence_id);
+  report(p1.sequence_id);  // crossed p2 in flight
+  EXPECT_EQ(core.executingSequenceId(), p2.sequence_id);
+  EXPECT_EQ(core.acknowledgedSequenceId(), p1.sequence_id);
+  const auto p3 = plan();
+  EXPECT_EQ(p3.extends_sequence_id, p2.sequence_id);  // not a sibling of p2
+  // Two rapid replans interleaved with old feedback.
+  report(p2.sequence_id);  // p2 accepted; p3 still in flight
+  EXPECT_EQ(core.executingSequenceId(), p3.sequence_id);
+  EXPECT_EQ(core.acknowledgedSequenceId(), p2.sequence_id);
+  const auto p4 = plan();
+  EXPECT_EQ(p4.extends_sequence_id, p3.sequence_id);
+  // A refused child: the executor stays on p2. Its first report may have
+  // crossed p4; the second is its verdict.
+  report(p2.sequence_id);
+  EXPECT_EQ(core.executingSequenceId(), p4.sequence_id);
+  report(p2.sequence_id);
+  EXPECT_EQ(core.executingSequenceId(), p2.sequence_id);
+  const auto p5 = plan();
+  EXPECT_EQ(p5.extends_sequence_id, p2.sequence_id);
+  // Acknowledged: the next one extends it.
+  report(p5.sequence_id);
+  EXPECT_EQ(plan().extends_sequence_id, p5.sequence_id);
+  // The executor finished p5: IDLE. One more IDLE may cross the START
+  // that follows.
+  report(0);
+  EXPECT_EQ(core.executingSequenceId(), 0u);
+  const auto start = plan();
+  EXPECT_EQ(start.kind, LocalPathKind::kStart);
+  report(0);
+  EXPECT_EQ(core.executingSequenceId(), start.sequence_id);
+  report(start.sequence_id);
+  EXPECT_EQ(core.acknowledgedSequenceId(), start.sequence_id);
 }
 
 TEST(LocalPlanningCore, NoGoUpdateWithdrawsRetainedPath) {
@@ -464,7 +565,12 @@ TEST(LocalPlanningCore, RetentionInvalidatesFeedbackConfirmedPath) {
     feedback.executing = true;
     core.onFeedback(feedback);
     for (size_t i = 0; i < kMaxRetained; ++i) {
-      if (repeat_feedback) core.onFeedback(feedback);
+      // Twice: one report may cross the publication; two are the
+      // executor's refusal of it (StaleFeedbackCannotMoveTheTipBack).
+      if (repeat_feedback) {
+        core.onFeedback(feedback);
+        core.onFeedback(feedback);
+      }
       const auto next = core.plan(soon());
       ASSERT_TRUE(next.path) << next.reason;
       EXPECT_EQ(next.path->kind, LocalPathKind::kExtend);

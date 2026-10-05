@@ -79,6 +79,7 @@ bool LocalPlanner::certify(LocalPathPlan& path, const NoGoZones& zones) {
       if (!window->contains(p.head<3>())) return false;
   if (!zones.pathAdmissible(points(path))) return false;
   GroundProjection ground(map_, planning_, true);
+  ground.setSupportedGroundOnly(true);  // as the ground layer measures it
   ground.setStandingStart(standing_);
   ExpandContext ctx;
   ctx.map = &map_;
@@ -121,6 +122,10 @@ bool LocalPlanner::certify(LocalPathPlan& path, const NoGoZones& zones) {
            orientedBoxPathStatus(map_, center, center, body, true, nullptr) ==
                VoxelStatus::kFree;
   }
+  // MGG is the single terrain authority: Nav2's costmap carries the layer's
+  // refusals and checks the footprint against them (MPPI's CostCritic), so
+  // no certified pose may stand on one, turning on the spot included.
+  if (!footprintsOffRefusedTerrain(path)) return false;
   // A departure from a hanging root is the lattice's hanging-root edge:
   // to the last pose over observed ground within the disk's radius of the
   // root (hanging_root_edge_length_max), or the whole path when it stays
@@ -166,6 +171,46 @@ bool LocalPlanner::certify(LocalPathPlan& path, const NoGoZones& zones) {
   return ground.groundStepsAdmissible(pts,
                                       hanging_end > 0 ? &pts.front() : nullptr);
 }
+bool LocalPlanner::footprintOffRefusedTerrain(const Eigen::Vector3d& position,
+                                              double heading) const {
+  const Eigen::Vector3d body = position + robot_.offsetForHeading(heading);
+  return !layer_.refusedUnder(body.head<2>(), heading,
+                              robot_.getPlanningSize().head<2>());
+}
+bool LocalPlanner::footprintsOffRefusedTerrain(
+    const LocalPathPlan& path) const {
+  if (path.poses.empty()) return true;
+  // The body's heading: the first pose's, then each segment's travel
+  // (reversed when reversing). Turning on the spot sweeps those between.
+  double heading = path.poses.front()[3];
+  if (!footprintOffRefusedTerrain(path.poses.front().head<3>(), heading))
+    return false;
+  for (size_t i = 1; i < path.poses.size(); ++i) {
+    const Eigen::Vector3d a = path.poses[i - 1].head<3>();
+    const Eigen::Vector3d step = path.poses[i].head<3>() - a;
+    const double length = step.head<2>().norm();
+    if (length < 1e-9) continue;
+    const double travel = std::atan2(step.y(), step.x()) +
+                          (i - 1 < path.reverse.size() && path.reverse[i - 1]
+                               ? M_PI
+                               : 0.0);
+    const double turn = std::remainder(travel - heading, 2 * M_PI);
+    const int turns =
+        static_cast<int>(std::ceil(std::abs(turn) / (M_PI / 12)));
+    for (int k = 1; k <= turns; ++k)
+      if (!footprintOffRefusedTerrain(a, heading + turn * k / turns))
+        return false;
+    heading = travel;
+    // At most a map cell apart along the segment.
+    const int samples = std::max(
+        1, static_cast<int>(std::ceil(length / map_.getResolution())));
+    for (int k = 1; k <= samples; ++k)
+      if (!footprintOffRefusedTerrain(a + step * (double(k) / samples),
+                                      heading))
+        return false;
+  }
+  return true;
+}
 bool LocalPlanner::hangingRoot(const StateVec& pose) const {
   return standing_ && standing_->covers(pose.head<2>());
 }
@@ -185,6 +230,12 @@ bool LocalPlanner::pathStillCertified(const LocalPathPlan& path,
                                       double progress) {
   if (path.reverse.size() != path.poses.size()) return false;
   auto remaining = committedPrefix(path, progress, pathLength(path));
+  return certify(remaining, zones_);
+}
+bool LocalPlanner::commitmentStillCertified(const LocalPathPlan& path,
+                                            double progress) {
+  if (path.reverse.size() != path.poses.size()) return false;
+  auto remaining = remainingCommitment(path, progress);
   return certify(remaining, zones_);
 }
 double LocalPlanner::localGain(const StateVec& state,
@@ -282,6 +333,7 @@ LocalPlanResult LocalPlanner::search(const LocalPlanInputs& in,
       Eigen::AlignedBox3d(in.pose.head<3>() - Eigen::Vector3d(8, 8, 3),
                           in.pose.head<3>() + Eigen::Vector3d(8, 8, 3)));
   GroundProjection ground(map_, planning_, true);
+  ground.setSupportedGroundOnly(true);  // as the ground layer measures it
   ground.setStandingStart(standing_);
   // A goal's height is a hint (a 2-D objective is seeded at the robot's
   // altitude; guidance carries the global map's ground). Driving height over
@@ -316,28 +368,40 @@ LocalPlanResult LocalPlanner::search(const LocalPlanInputs& in,
   if (same && !in.executing_invalid &&
       in.executing_path->reverse.size() == in.executing_path->poses.size()) {
     prefix = committedPrefix(*in.executing_path, in.progress_m, commit);
-    if (!certify(prefix, in.no_go_zones)) prefix = LocalPathPlan{};
+    if (!certify(prefix, in.no_go_zones)) {
+      // The executor is held to the path's own commitment, not to this
+      // cycle's horizon. When only what lies beyond it lost certification,
+      // extend from the rest of that commitment: no BREAK, no stop.
+      prefix = remainingCommitment(*in.executing_path, in.progress_m);
+      if (!certify(prefix, in.no_go_zones)) prefix = LocalPathPlan{};
+    }
   }
   bool selection_complete = true;
-  auto publish = [&](LocalPathPlan path) -> bool {
+  const double speed = std::abs(in.speed_mps);
+  const double stopping =
+      speed * speed / (2 * in.braking.deceleration_mps2) +
+      speed * (in.braking.latency_s + in.braking.planning_latency_s) +
+      in.braking.margin_m;
+  // Every check a published path passes; certify() fills its dependencies.
+  auto admissible = [&](LocalPathPlan& path) -> bool {
     // Legacy's first-goal arrival protection: never stop in the disk.
     if (path.poses.size() > 1 &&
         !standingArrivalAdmissible(path.poses.back(), in.goal_tolerance_m))
       return false;
     if (!certify(path, in.no_go_zones)) return false;
-    const double length = pathLength(path);
-    const double speed = std::abs(in.speed_mps);
-    const double stopping =
-        speed * speed / (2 * in.braking.deceleration_mps2) +
-        speed * (in.braking.latency_s + in.braking.planning_latency_s) +
-        in.braking.margin_m;
     // A stationary terminal is a stop request, not a new motion segment.
     // Accept it even while slowing down; the executor fences velocity and
     // rechecks goal tolerance. Moving terminals still need stopping space.
     const bool stationary_terminal =
         path.reaches_goal && path.poses.size() == 1;
-    if (!stationary_terminal && speed > 0 && length + 1e-9 < stopping)
-      return false;
+    return stationary_terminal || speed <= 0 ||
+           pathLength(path) + 1e-9 >= stopping;
+  };
+  // Publishes an admissible path.
+  auto emit = [&](LocalPathPlan path) {
+    const double length = pathLength(path);
+    const bool stationary_terminal =
+        path.reaches_goal && path.poses.size() == 1;
     path.commit_length_m = std::min(length, commit);
     // Preserve the envelope, never silently shorten it to two seconds.
     // A cap lets subsequent cycles return to the nominal two-second horizon.
@@ -357,6 +421,10 @@ LocalPlanResult LocalPlanner::search(const LocalPlanInputs& in,
     result.reason = result.path->reaches_goal ? "final goal certified"
                                               : "certified local path";
     result.checks_complete = selection_complete;
+  };
+  auto publish = [&](LocalPathPlan path) -> bool {
+    if (!admissible(path)) return false;
+    emit(std::move(path));
     return true;
   };
   if (target &&
@@ -446,6 +514,16 @@ LocalPlanResult LocalPlanner::search(const LocalPlanInputs& in,
           a << edge[i - 1], 0;
           b << edge[i], 0;
           if (layer_.pending(dependency(a, b))) return false;
+          // Routes keep the body off refused terrain, as certification
+          // does, so the search goes round a refused ring.
+          const Eigen::Vector3d step = edge[i] - edge[i - 1];
+          const double heading = std::atan2(step.y(), step.x());
+          const int samples = std::max(
+              1, static_cast<int>(std::ceil(step.head<2>().norm() / 0.2)));
+          for (int k = i == 1 ? 0 : 1; k <= samples; ++k)
+            if (!footprintOffRefusedTerrain(
+                    edge[i - 1] + step * (double(k) / samples), heading))
+              return false;
         }
         return true;
       };
@@ -569,11 +647,17 @@ LocalPlanResult LocalPlanner::search(const LocalPlanInputs& in,
         return turns.sharpTurnAllowedAt(v.state.head<3>());
       },
       20000);
-  std::size_t too_short = 0;  // candidates refused only for their length
+  CandidateRefusals refusals;
+  // The best-ranked certified path shorter than 6 m, published only when no
+  // candidate gives a 6 m one.
+  std::optional<LocalPathPlan> shorter;
   for (const auto& candidate : candidates) {
     planningCheckpoint();
     auto found = routes.to.find(candidate.id);
-    if (found == routes.to.end() || !turns(found->second.path)) continue;
+    if (found == routes.to.end() || !turns(found->second.path)) {
+      ++refusals.unrouted;
+      continue;
+    }
     auto path = identity;
     path.poses = {root};
     path.reverse = {false};
@@ -581,13 +665,20 @@ LocalPlanResult LocalPlanner::search(const LocalPlanInputs& in,
     // checks still pass; no sharp-turn fallback to a geometric shortest path.
     std::vector<StateVec> route;
     for (const auto* v : found->second.path) route.push_back(v->state);
+    // Each shortcut certifies only its new leg, with the pose before it
+    // for the turn and the terrain windows across the joint: the path built
+    // so far is certified, and the whole path is certified again before
+    // publication. (Certifying the whole path for every j was the search's
+    // hot spot: v2-motionfix.)
     for (size_t i = 0; i + 1 < route.size();) {
       size_t next = i + 1;
       for (size_t j = route.size() - 1; j > i + 1; --j) {
-        LocalPathPlan shortcut = path;
-        shortcut.poses.push_back(route[j]);
-        shortcut.reverse.push_back(false);
-        if (certify(shortcut, in.no_go_zones)) {
+        LocalPathPlan leg = path;
+        const size_t joint = std::min<size_t>(2, path.poses.size());
+        leg.poses.assign(path.poses.end() - joint, path.poses.end());
+        leg.poses.push_back(route[j]);
+        leg.reverse.assign(leg.poses.size(), false);
+        if (certify(leg, in.no_go_zones)) {
           next = j;
           break;
         }
@@ -606,13 +697,13 @@ LocalPlanResult LocalPlanner::search(const LocalPlanInputs& in,
       i = next;
     }
     if (!prefix.poses.empty()) path = splicePath(prefix, path);
-    if (pathLength(path) > 10) {
+    if (pathLength(path) > kMaxPathM) {
       // Clip only the newly generated tail, never the exact retained prefix.
       double along = 0;
       size_t keep = 1;
       for (; keep < path.poses.size(); ++keep) {
         along += (path.poses[keep] - path.poses[keep - 1]).head<3>().norm();
-        if (along > 10) break;
+        if (along > kMaxPathM) break;
       }
       if (keep < path.prefix_length) continue;
       path.poses.resize(keep);
@@ -621,11 +712,27 @@ LocalPlanResult LocalPlanner::search(const LocalPlanInputs& in,
     path.reaches_goal =
         target && (path.poses.back().head<3>() - *target).norm() <=
                       in.goal_tolerance_m + 1e-9;
-    if (!path.reaches_goal && pathLength(path) < 6) {
-      ++too_short;
+    if (!path.reaches_goal && pathLength(path) < kPreferredPathM) {
+      // Never a margin-only escape: at least one whole commitment.
+      if (shorter || pathLength(path) + 1e-9 < commit) {
+        ++refusals.too_short;
+      } else if (admissible(path)) {
+        shorter = std::move(path);
+      } else {
+        ++refusals.uncertified;
+      }
       continue;
     }
-    if (publish(path)) return result;
+    if (publish(path)) {
+      result.refusals = refusals;
+      return result;
+    }
+    ++refusals.uncertified;
+  }
+  result.refusals = refusals;
+  if (shorter) {
+    emit(std::move(*shorter));
+    return result;
   }
   // Reverse is an escape to the first turn refuge, never a new reverse plan
   // through unexplored space. Validate all of it against today's map.
@@ -664,7 +771,8 @@ LocalPlanResult LocalPlanner::search(const LocalPlanInputs& in,
   } else if (!in.target && !candidates.empty()) {
     // Gain remains: a route or length refusal is not an empty window.
     result.status = LocalStatus::kBlocked;
-    result.reason = too_short == candidates.size()
+    // Only when length alone refused every routed candidate.
+    result.reason = refusals.too_short > 0 && refusals.uncertified == 0
                         ? "gain candidates are shorter than a useful path"
                         : "gain candidates have no certified local route";
   } else if (!in.target && !selection_complete) {

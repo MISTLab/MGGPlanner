@@ -88,7 +88,10 @@ double GroundProjection::castProjection(Eigen::Vector3d& sample,
   // is cast as below.
   if (cache_footprint_ground_ && sample.allFinite()) {
     Eigen::Vector3d ground;
-    if (footprintGroundBelow(sample + extra_samples[0], ground)) {
+    // The column cache keeps the map's own answer; a floating solid it
+    // found is passed below, as every ray does.
+    if (footprintGroundBelow(sample + extra_samples[0], ground) &&
+        !floatsAbove(ground, sample(2))) {
       status = VoxelStatus::kOccupied;
       return sample(2) - ground(2);
     }
@@ -102,7 +105,8 @@ double GroundProjection::castProjection(Eigen::Vector3d& sample,
   // lies", so measure that.
   const double sample_z = sample(2);
 
-  for (size_t i = 0; i < extra_samples.size(); ++i) {
+  const std::size_t rays = offset_probes_ ? extra_samples.size() : 1;
+  for (size_t i = 0; i < rays; ++i) {
     checkpoint_.check();
     const Eigen::Vector3d start = sample + extra_samples[i];
     const Eigen::Vector3d end =
@@ -113,8 +117,7 @@ double GroundProjection::castProjection(Eigen::Vector3d& sample,
     // Ground rays may cross unobserved air above the lidar. Ordinary body and edge
     // collision checks still run; only known occupied ground can support a
     // projected point.
-    const VoxelStatus vs =
-        map_.getGroundRayStatus(start, end, false, end_voxel);
+    const VoxelStatus vs = groundRay(start, end, sample_z, end_voxel);
 
     if (vs == VoxelStatus::kOccupied) {
       const double ray_len = sample_z - end_voxel(2);
@@ -130,7 +133,7 @@ double GroundProjection::castProjection(Eigen::Vector3d& sample,
     }
   }
 
-  if (unknown_count >= static_cast<int>(extra_samples.size())) {
+  if (unknown_count >= static_cast<int>(rays)) {
     status = VoxelStatus::kUnknown;
     return central_ray_len;
   }
@@ -696,6 +699,41 @@ bool GroundProjection::groundBelow(const Eigen::Vector3d& point,
   ProfileScope timed_ray(profile_ ? &profile_->ground_rays : nullptr);
   return map_.getGroundRayStatus(point, end, false, ground) ==
          VoxelStatus::kOccupied;
+}
+
+std::optional<Eigen::Vector3d> GroundProjection::floatsAbove(
+    const Eigen::Vector3d& hit, double level) const {
+  const double resolution = map_.getResolution();
+  if (!supported_ground_only_ || !(resolution > 0.0) ||
+      !map_.observesFreeSpace())
+    return std::nullopt;
+  const Eigen::Vector3d under(
+      hit.x(), hit.y(), (std::floor(hit.z() / resolution) - 0.5) * resolution);
+  if (!(under.z() > level) || map_.getVoxelStatus(under) != VoxelStatus::kFree)
+    return std::nullopt;
+  return under;
+}
+
+VoxelStatus GroundProjection::groundRay(const Eigen::Vector3d& start,
+                                        const Eigen::Vector3d& end,
+                                        double level,
+                                        Eigen::Vector3d& end_voxel) const {
+  VoxelStatus status = map_.getGroundRayStatus(start, end, false, end_voxel);
+  // Each pass looks on from the free voxel under one floating solid,
+  // strictly lower each time, until the ray's end.
+  double lowest = start.z();
+  while (status == VoxelStatus::kOccupied) {
+    checkpoint_.check();
+    const auto under = floatsAbove(end_voxel, level);
+    if (!under || !(under->z() < lowest)) break;
+    lowest = under->z();
+    if (under->z() <= end.z()) {
+      end_voxel = end;
+      return VoxelStatus::kFree;
+    }
+    status = map_.getGroundRayStatus(*under, end, false, end_voxel);
+  }
+  return status;
 }
 
 double GroundProjection::crossSlope(const std::vector<Eigen::Vector3d>& edge,

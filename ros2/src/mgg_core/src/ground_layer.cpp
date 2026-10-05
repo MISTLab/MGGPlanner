@@ -5,6 +5,7 @@
 #include <limits>
 #include <queue>
 #include <stdexcept>
+#include <tuple>
 #include <utility>
 
 namespace mgg {
@@ -215,7 +216,8 @@ void GroundLayer::withdraw(const MapChange& change) {
   withdrawDescendants();
 }
 
-void GroundLayer::recheck(std::chrono::steady_clock::time_point deadline) {
+void GroundLayer::recheck(std::chrono::steady_clock::time_point deadline,
+                          const std::vector<Eigen::AlignedBox3d>& first) {
   using Clock = std::chrono::steady_clock;
   if (seed_ < 0 || Clock::now() >= deadline) return;
   const auto* parent_cancelled = planning_cancelled;
@@ -224,15 +226,26 @@ void GroundLayer::recheck(std::chrono::steady_clock::time_point deadline) {
   });
   GroundProjection projection(map_, planning_);
   projection.max_projection_length = projection_length_;
-  using Work = std::pair<double, int>;
+  // A body standing on observed floor is an obstacle, not refused terrain,
+  // and each column's verdict rests on the ground of the columns it checks.
+  projection.setSupportedGroundOnly(true);
+  projection.setOffsetProbes(false);
+  // (later tier, squared distance from the robot, column): the executing
+  // commitment's columns form tier 0.
+  using Work = std::tuple<int, double, int>;
   std::priority_queue<Work, std::vector<Work>, std::greater<Work>> queue;
   std::vector<bool> queued(columns_.size(), false);
   std::vector<int> parents(columns_.size(), -1);
+  MapChange priority;
+  priority.boxes = first;
   const auto enqueue = [&](int i, int parent) {
     if (i < 0 || queued[i] || !columns_[i].dirty) return;
     queued[i] = true;
     parents[i] = parent;
-    queue.emplace((center(i) - robot_.head<2>()).squaredNorm(), i);
+    const bool commitment =
+        !first.empty() && changeReaches(priority, columns_[i].dependency);
+    const int tier = commitment ? 0 : 1;
+    queue.emplace(tier, (center(i) - robot_.head<2>()).squaredNorm(), i);
   };
   const auto neighbours = [&](int i, const auto& visit) {
     const int x = i % width_, y = i / width_;
@@ -251,7 +264,7 @@ void GroundLayer::recheck(std::chrono::steady_clock::time_point deadline) {
     }
     while (!queue.empty()) {
       planningCheckpoint();
-      const int i = queue.top().second;
+      const int i = std::get<2>(queue.top());
       queue.pop();
       Column checked = columns_[i];
       checked.evaluated = true;
@@ -428,6 +441,47 @@ bool GroundLayer::pending(const Eigen::AlignedBox3d& region) const {
     return c.dirty && changeReaches(change, c.dependency);
   });
 }
+bool GroundLayer::refusedUnder(const Eigen::Vector2d& at, double heading,
+                               const Eigen::Vector2d& size) const {
+  if (columns_.empty() || !at.allFinite() || !std::isfinite(heading))
+    return false;
+  const Eigen::Vector2d u(std::cos(heading), std::sin(heading));
+  const Eigen::Vector2d v(-u.y(), u.x());
+  const Eigen::Vector2d half = size / 2;
+  const double reach = half.norm() + resolution_;
+  const auto cell = [&](double value, double origin, int count) {
+    const int i = static_cast<int>(std::floor((value - origin) / resolution_));
+    return std::clamp(i, 0, count - 1);
+  };
+  const int x0 = cell(at.x() - reach, origin_.x(), width_);
+  const int x1 = cell(at.x() + reach, origin_.x(), width_);
+  const int y0 = cell(at.y() - reach, origin_.y(), height_);
+  const int y1 = cell(at.y() + reach, origin_.y(), height_);
+  for (int y = y0; y <= y1; ++y) {
+    for (int x = x0; x <= x1; ++x) {
+      const int i = y * width_ + x;
+      if (!refused(columns_[i].verdict)) continue;
+      // Separating axes of the column's square and the footprint: only a
+      // true overlap counts, not a shared edge.
+      const Eigen::Vector2d d = center(i) - at;
+      bool overlaps = true;
+      for (const Eigen::Vector2d& axis :
+           {Eigen::Vector2d(1, 0), Eigen::Vector2d(0, 1), u, v}) {
+        const double footprint =
+            half.x() * std::abs(u.dot(axis)) + half.y() * std::abs(v.dot(axis));
+        const double square =
+            resolution_ / 2 * (std::abs(axis.x()) + std::abs(axis.y()));
+        if (std::abs(d.dot(axis)) >= footprint + square - 1e-9) {
+          overlaps = false;
+          break;
+        }
+      }
+      if (overlaps) return true;
+    }
+  }
+  return false;
+}
+
 GroundVerdict GroundLayer::verdict(const Eigen::Vector2d& p) const {
   const int i = index(p);
   return i < 0 ? GroundVerdict::kUnknown : columns_[i].verdict;

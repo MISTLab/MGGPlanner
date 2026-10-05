@@ -34,3 +34,19 @@ TEST(LocalPath, ExactPrefixAndSplice) {
   extension.poses.front()[0] += .01;
   EXPECT_THROW(splicePath(prefix, extension), std::invalid_argument);
 }
+TEST(LocalPath, RemainingCommitmentEndsAtTheCommitment) {
+  LocalPathPlan path;
+  for (int i = 0; i <= 40; ++i) {
+    path.poses.emplace_back(i * .25, 0, 0, 0);
+    path.reverse.push_back(false);
+  }
+  path.commit_length_m = 1.5;
+  // From progress 0.6 to the commitment's end at 1.5 m, original vertices.
+  auto rest = remainingCommitment(path, .6);
+  EXPECT_EQ(rest.poses.front(), path.poses[2]);
+  EXPECT_EQ(rest.poses.back(), path.poses[6]);
+  // Past the commitment: the segment the robot is on, nothing more.
+  rest = remainingCommitment(path, 2.1);
+  EXPECT_EQ(rest.poses.front(), path.poses[8]);
+  EXPECT_EQ(rest.poses.back(), path.poses[9]);
+}

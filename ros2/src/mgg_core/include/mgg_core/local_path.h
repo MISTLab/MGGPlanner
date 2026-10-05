@@ -37,6 +37,9 @@ double commitmentSpeedCap(double available_m, const BrakingBounds& bounds);
 // the end outward. No interpolation may alter an already certified prefix.
 LocalPathPlan committedPrefix(const LocalPathPlan&, double progress_m,
                               double length_m);
+// What the executor may still drive of `path` without a newer one: from
+// progress_m to its commit_length_m (at least the segment it is on).
+LocalPathPlan remainingCommitment(const LocalPathPlan& path, double progress_m);
 LocalPathPlan splicePath(const LocalPathPlan& prefix,
                          const LocalPathPlan& extension);
 }  // namespace mgg

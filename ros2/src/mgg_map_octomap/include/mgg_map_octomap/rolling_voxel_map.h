@@ -72,6 +72,8 @@ class RollingVoxelMap : public MapInterface {
   // ------------------------------------------------------ MapInterface
 
   double getResolution() const override { return resolution_; }
+  /// Every cell starts unknown; scans carve free space and mark returns.
+  bool observesFreeSpace() const override { return true; }
   bool getAxisAlignedXYCellCenter(const Eigen::Vector2d& position,
                                   Eigen::Vector2d& center) const override;
   /// True once a scan has been integrated since construction or reset.

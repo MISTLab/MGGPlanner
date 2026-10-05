@@ -14,6 +14,21 @@
 namespace mgg {
 inline constexpr double kLocalPlanningPeriodS = 0.5;
 inline constexpr double kLocalPlanningBudgetS = 0.3;
+/// Spec §4.3 as amended (v2-motionfix): a path of 6-10 m is preferred.
+/// Without one, the best-ranked certified path at least one commitment long.
+inline constexpr double kPreferredPathM = 6;
+inline constexpr double kMaxPathM = 10;
+/// Why the routed candidates of one search were not published. Telemetry,
+/// not policy.
+struct CandidateRefusals {
+  /// No turn-compliant route reached the candidate.
+  std::size_t unrouted = 0;
+  /// Shorter than one commitment, or shorter than 6 m once a shorter
+  /// certified path was kept.
+  std::size_t too_short = 0;
+  /// Its route did not pass the final certificate.
+  std::size_t uncertified = 0;
+};
 struct LocalPlanInputs {
   // All positions are driving-height references in the same odometry frame.
   StateVec pose = StateVec::Zero();
@@ -45,6 +60,8 @@ struct LocalPlanResult {
   // its scoring slice; set only when gain scoring ran. Telemetry, not
   // policy: fewer scored than offered is "not every viewpoint scored".
   std::optional<std::size_t> viewpoints_offered, viewpoints_scored;
+  // Set when the search reached candidate routing.
+  std::optional<CandidateRefusals> refusals;
 };
 class LocalPlanner {
  public:
@@ -53,7 +70,12 @@ class LocalPlanner {
   LocalPlanResult plan(const LocalPlanInputs&, const MapChange&);
   // Driver withdraws map/ground/cache changes before this check. No pending
   // admission is reusable, even if the old path carries a dependency box.
+  // The whole rest of the path, from progress_m on.
   bool pathStillCertified(const LocalPathPlan&, double progress_m);
+  // Only the rest of its commitment (commit_length_m from the path's start):
+  // all the executor may drive without a newer path. Failing this breaks
+  // the commitment; failing only pathStillCertified withdraws the suffix.
+  bool commitmentStillCertified(const LocalPathPlan&, double progress_m);
   // Node calls for every odometry sample, not only each planning cycle.
   void recordPose(const StateVec& pose) { track_.add(pose); }
   void reset() {
@@ -78,6 +100,14 @@ class LocalPlanner {
   LocalPlanResult search(const LocalPlanInputs&,
                          std::chrono::steady_clock::time_point);
   bool certify(LocalPathPlan&, const NoGoZones&);
+  /// Whether the planning footprint at `position` (driving height), facing
+  /// `heading`, stays off every column the ground layer exports as refused.
+  bool footprintOffRefusedTerrain(const Eigen::Vector3d& position,
+                                  double heading) const;
+  /// No planning footprint along the path, at most a map cell apart and
+  /// turning on the spot at its vertices included, overlaps a column the
+  /// ground layer exports as refused.
+  bool footprintsOffRefusedTerrain(const LocalPathPlan&) const;
   Eigen::AlignedBox3d dependency(const StateVec&, const StateVec&) const;
   double localGain(const StateVec&, const Eigen::AlignedBox3d&) const;
   /// Whether a root at `pose` departs as a hanging root: in the standing

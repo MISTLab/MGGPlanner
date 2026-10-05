@@ -316,11 +316,16 @@ struct Replay {
   std::string odom_frame, boot;
   using Identity = std::tuple<std::string, std::uint64_t, std::uint64_t>;
   std::map<Identity, std::uint64_t> publications;
+  // Recorded publications whose cycle replayed without a path: the replay's
+  // wall-clock budgets need not reproduce every live path. Feedback on one
+  // is counted and skipped; it names nothing this core published.
+  std::set<Identity> unreproduced;
   json sessions = json::array(), counts = json::object();
   std::size_t resets = 0, unmatched_idle_feedback = 0;
   std::size_t dropped_scans = 0, integrated_scans = 0, cycles_with_usable_scan = 0;
   std::size_t ignored_odometry = 0, ignored_guidance = 0, ignored_no_go_centres = 0;
   std::size_t ignored_stale_feedback = 0, callback_count = 0;
+  std::size_t unreproduced_feedback = 0;
   bool core_has_scan = false;
   double accumulated_ms = 0;
   // One sim-clock tick can stamp a plan and the feedback it caused alike
@@ -486,7 +491,12 @@ struct Replay {
     require(m.state == Feedback::EXECUTING || m.state == Feedback::IDLE,
             "unknown local_path_feedback state");
     if (feedback.executing || m.sequence_id != 0) {
-      const auto it = publications.find({m.session_id, m.epoch, m.sequence_id});
+      const Identity identity{m.session_id, m.epoch, m.sequence_id};
+      const auto it = publications.find(identity);
+      if (it == publications.end() && unreproduced.count(identity)) {
+        ++unreproduced_feedback;
+        return;
+      }
       require(it != publications.end(), "unmatched feedback epoch/sequence for " + m.session_id);
       feedback.sequence_id = it->second;
     } else {
@@ -509,7 +519,7 @@ struct Replay {
         recorded.request.session_id != core->sessionId() || boot != current_boot)
       clearTiming();
     if (!boot.empty() && boot != current_boot) {
-      newCore(); publications.clear(); ++resets;
+      newCore(); publications.clear(); unreproduced.clear(); ++resets;
       if (base) core->onOdometry(*base);
     }
     boot = current_boot;
@@ -536,11 +546,15 @@ struct Replay {
     const double duration = accumulated_ms + milliseconds(Clock::now() - start);
     const auto measured_callbacks = callback_count;
     clearTiming();
-    if (result.path && p.contains("sequence_id") && p.contains("epoch")) {
+    if (p.contains("sequence_id") && p.contains("epoch")) {
       const Identity key{core->sessionId(), p.at("epoch").get<std::uint64_t>(),
                          p.at("sequence_id").get<std::uint64_t>()};
-      require(publications.emplace(key, result.path->sequence_id).second,
+      require(!publications.count(key) && !unreproduced.count(key),
               "duplicate recorded path identity");
+      if (result.path)
+        publications.emplace(key, result.path->sequence_id);
+      else
+        unreproduced.insert(key);
     }
     if (p.contains("sequence_id") && p.contains("epoch"))
       tick_publications.erase({p.at("session_id").get<std::string>(),
@@ -564,11 +578,16 @@ struct Replay {
             {"path", path}, {"progress_m", progress}, {"tags", tags},
             {"callback_count", measured_callbacks},
             {"reset_count", resets}, {"invalidations", invalidations.size()},
+            {"suffix_withdrawals", core->suffixWithdrawals()},
             {"admitted_cells", std::count(occupancy.begin(), occupancy.end(), 0)}};
     if (result.viewpoints_offered && result.viewpoints_scored) {
       row["viewpoints_offered"] = *result.viewpoints_offered;
       row["viewpoints_scored"] = *result.viewpoints_scored;
     }
+    if (result.refusals)
+      row["candidate_refusals"] = {{"unrouted", result.refusals->unrouted},
+                                   {"too_short", result.refusals->too_short},
+                                   {"uncertified", result.refusals->uncertified}};
     return row;
   }
 };
@@ -614,6 +633,7 @@ int runLocalReplay(const fs::path& manifest, const fs::path& output,
         {"ignored_odometry", replay.ignored_odometry}, {"ignored_guidance", replay.ignored_guidance},
         {"ignored_no_go_centres", replay.ignored_no_go_centres},
         {"ignored_stale_feedback", replay.ignored_stale_feedback},
+        {"unreproduced_feedback", replay.unreproduced_feedback},
         {"local_params", fs::absolute(local_params).string()}, {"local_params_sha256", b.params_hash}};
     // Never expose a partially successful run as a C5 report.
     const fs::path temporary = output.string() + ".tmp";
