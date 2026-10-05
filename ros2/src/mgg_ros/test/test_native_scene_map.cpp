@@ -1,5 +1,6 @@
 #include <gtest/gtest.h>
 
+#include "mgg_core/departure.h"
 #include "native_scene_map.h"
 
 using mgg::VoxelStatus;
@@ -48,4 +49,22 @@ TEST(NativeSceneMap, MeasuredGroundAndStrictQueriesUseNativeGridSemantics) {
     EXPECT_EQ(map.getStrictBoxStatus({x, 0.05, 0.15}, {0.01, 0.01, 0.01}),
               reference.getStrictBoxStatus({x, 0.05, 0.15}, {0.01, 0.01, 0.01}));
   }
+}
+
+// The prefilter must preserve strict swept-column checks for native maps too.
+TEST(NativeMolaSweep, StrictPrefilterCannotAverageAwayAnUnknownColumn) {
+  std::vector<mgg::NativeMolaGrid::Cell> free;
+  for (int x = -15; x <= 30; ++x)
+    for (int y = -15; y <= 15; ++y)
+      for (int z = 0; z <= 20; ++z) {
+        if (x == 8 && y == 0) continue;
+        free.push_back({x, y, z});
+      }
+  mgg::NativeMolaGrid map(.1, {}, std::move(free), {});
+  mgg::OrientedBox body;
+  body.size = Eigen::Vector3d(1.2, .6, .8);
+  const Eigen::Vector3d a(0, 0, 1), b(1.6, 0, 1);
+  const auto exact = mgg::orientedBoxPathStatus(map, a, b, body, true, nullptr, false);
+  ASSERT_EQ(exact, mgg::VoxelStatus::kUnknown);
+  EXPECT_EQ(mgg::orientedBoxPathStatus(map, a, b, body, true, nullptr, true), exact);
 }
