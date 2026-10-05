@@ -187,6 +187,17 @@ void LocalPlanningCore::afterChange(const MapChange& change) {
   }
 }
 
+void LocalPlanningCore::updateExecutingSequence() {
+  executing_sequence_ = acknowledged_sequence_;
+  for (auto it = retained_.rbegin();
+       it != retained_.rend() && it->first > acknowledged_high_; ++it) {
+    if (!it->second.refused) {
+      executing_sequence_ = it->first;
+      return;
+    }
+  }
+}
+
 double LocalPlanningCore::progressOn(std::uint64_t sequence) const {
   return sequence == acknowledged_sequence_ ? progress_ : 0.0;
 }
@@ -305,7 +316,7 @@ void LocalPlanningCore::clearSession() {
   retained_.clear();
   executing_sequence_ = 0;
   acknowledged_sequence_ = 0;
-  crossing_reports_ = 0;
+  acknowledged_high_ = 0;
   replan_requested_ = false;
   progress_ = 0;
   speed_mps_ = 0;
@@ -415,30 +426,35 @@ void LocalPlanningCore::onFeedback(const LocalFeedback& feedback) {
       feedback.epoch != params_.epoch || !std::isfinite(feedback.progress_m) ||
       feedback.progress_m < 0)
     return;
-  const std::uint64_t named =
-      feedback.executing ? feedback.sequence_id : std::uint64_t{0};
-  const auto acknowledge = [&] {
-    acknowledged_sequence_ = named;
-    progress_ = named != 0 ? feedback.progress_m : 0.0;
-    // The executor has moved on from every older path.
-    if (named != 0)
-      retained_.erase(retained_.begin(), retained_.lower_bound(named));
-  };
-  if (named == acknowledged_sequence_ &&
-      executing_sequence_ != acknowledged_sequence_ && crossing_reports_ > 0) {
-    // Possibly sent before the executor received the newer publication:
-    // still its progress on the acknowledged path, but not yet its verdict.
-    --crossing_reports_;
-    acknowledge();
-  } else if (named > acknowledged_sequence_ && named < executing_sequence_ &&
-             retained_.count(named)) {
-    // An older publication accepted; a newer one is still in flight.
-    acknowledge();
-    crossing_reports_ = 1;
+  if (feedback.refused) {
+    if (feedback.sequence_id != 0) {
+      // Every publication up to it the executor has not acknowledged is
+      // decided against, and so is whatever extends a refused path.
+      for (auto& [sequence, retained] : retained_) {
+        const auto parent = retained_.find(retained.path.extends_sequence_id);
+        const bool parent_refused =
+            retained.path.kind != LocalPathKind::kStart &&
+            parent != retained_.end() && parent->second.refused;
+        if ((sequence > acknowledged_high_ &&
+             sequence <= feedback.sequence_id) ||
+            parent_refused)
+          retained.refused = true;
+      }
+      updateExecutingSequence();
+    }
   } else {
-    acknowledge();
-    executing_sequence_ = named;
-    crossing_reports_ = 0;
+    const std::uint64_t named =
+        feedback.executing ? feedback.sequence_id : std::uint64_t{0};
+    // The executor never goes back to an older path: a stale report.
+    if (named == 0 || named >= acknowledged_high_) {
+      acknowledged_sequence_ = named;
+      acknowledged_high_ = std::max(acknowledged_high_, named);
+      progress_ = named != 0 ? feedback.progress_m : 0.0;
+      // The executor has moved on from every older path.
+      if (named != 0)
+        retained_.erase(retained_.begin(), retained_.lower_bound(named));
+      updateExecutingSequence();
+    }
   }
   if (std::isfinite(feedback.speed_mps))
     speed_mps_ = std::abs(feedback.speed_mps);
@@ -535,18 +551,13 @@ LocalPlanResult LocalPlanningCore::plan(Clock::time_point deadline) {
     in.progress_m = progressOn(executing_sequence_);
   }
   in.braking = braking_;
-  {
-    PlanningCancellationScope scope(
-        [deadline] { return Clock::now() >= deadline; });
-    result = planner_.plan(in, MapChange{map_.revision(), {}, false});
-  }
+  in.deadline = deadline;
+  result = planner_.plan(in, MapChange{map_.revision(), {}, false});
   if (result.path) {
     const std::uint64_t sequence = next_sequence_++;
-    retained_[sequence] = Retained{*result.path, false, false};
-    // The next plan extends it unless the executor's report says otherwise
-    // (onFeedback); one report already on its way may cross it.
+    retained_[sequence] = Retained{*result.path, false, false, false};
+    // The next plan extends it unless the executor refuses it (onFeedback).
     executing_sequence_ = sequence;
-    crossing_reports_ = 1;
     while (retained_.size() > kMaxRetained) {
       // Publication changes the planning assumption, not the last executor
       // acknowledgement. Fence its path even if feedback skips a cycle;

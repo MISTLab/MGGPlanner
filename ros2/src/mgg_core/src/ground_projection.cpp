@@ -707,8 +707,14 @@ std::optional<Eigen::Vector3d> GroundProjection::floatsAbove(
   if (!supported_ground_only_ || !(resolution > 0.0) ||
       !map_.observesFreeSpace())
     return std::nullopt;
-  const Eigen::Vector3d under(
-      hit.x(), hit.y(), (std::floor(hit.z() / resolution) - 0.5) * resolution);
+  // Down the hit's contiguous occupied run to its underside: a solid floats
+  // only over observed free space above the level; one standing on the
+  // level, or over unknown space, stays support.
+  Eigen::Vector3d under(hit.x(), hit.y(),
+                        (std::floor(hit.z() / resolution) - 0.5) * resolution);
+  while (under.z() > level &&
+         map_.getVoxelStatus(under) == VoxelStatus::kOccupied)
+    under.z() -= resolution;
   if (!(under.z() > level) || map_.getVoxelStatus(under) != VoxelStatus::kFree)
     return std::nullopt;
   return under;

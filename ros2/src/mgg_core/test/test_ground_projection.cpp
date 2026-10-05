@@ -1250,3 +1250,76 @@ TEST(GroundProjection, AQuantisedSixteenDegreeRampKeepsTheStepContract) {
   }
   EXPECT_TRUE(ground.groundStepsAdmissible(at(0.05), at(3.05)));
 }
+
+namespace {
+
+// Exact 0.2 m voxels on a map that observes free space: a floor voxel layer
+// whose top is z = 0 (unseen below), observed free air above, and occupied
+// boxes. Downward rays stop in the first occupied voxel, the start's own
+// included, as RollingVoxelMap's.
+class FreeSpaceVoxels : public mgg_test::TerrainFixture {
+ public:
+  FreeSpaceVoxels() : TerrainFixture(0.2, {}) {}
+  bool observesFreeSpace() const override { return true; }
+  VoxelStatus getVoxelStatus(const Eigen::Vector3d& p) const override {
+    const std::int64_t z = static_cast<std::int64_t>(std::floor(p.z() / 0.2));
+    for (const auto& solid : solids)
+      if (solid.contains(Eigen::Vector3d(p.x(), p.y(), (z + 0.5) * 0.2)))
+        return VoxelStatus::kOccupied;
+    if (z == -1) return VoxelStatus::kOccupied;
+    return z < -1 ? VoxelStatus::kUnknown : VoxelStatus::kFree;
+  }
+  VoxelStatus getRayStatus(const Eigen::Vector3d& a, const Eigen::Vector3d& b,
+                           bool, Eigen::Vector3d& end) const override {
+    for (double z = (std::floor(a.z() / 0.2) + 0.5) * 0.2; z >= b.z();
+         z -= 0.2) {
+      const Eigen::Vector3d c(a.x(), a.y(), z);
+      if (getVoxelStatus(c) == VoxelStatus::kOccupied) {
+        end = c;
+        return VoxelStatus::kOccupied;
+      }
+    }
+    end = b;
+    return VoxelStatus::kFree;
+  }
+  std::vector<Eigen::AlignedBox3d> solids;
+};
+
+double groundUnder(const FreeSpaceVoxels& map, double z, bool supported) {
+  PlanningParams params;
+  GroundProjection projection(map, params);
+  projection.setOffsetProbes(false);
+  projection.setSupportedGroundOnly(supported);
+  Eigen::Vector3d sample(0.1, 0.1, z);
+  VoxelStatus status = VoxelStatus::kUnknown;
+  const double below = projection.projectSample(sample, status);
+  EXPECT_EQ(status, VoxelStatus::kOccupied);
+  return z - below;
+}
+
+}  // namespace
+
+// A solid floating over observed free air is passed below, however many
+// voxels tall and wherever the ray meets it: probed from z = 0 the ray
+// starts at 0.4 m in the upper torso voxel (review-r0 finding 3).
+TEST(GroundProjection, SupportedGroundPassesMultiVoxelFloatingBodies) {
+  FreeSpaceVoxels torso;
+  torso.solids.emplace_back(Eigen::Vector3d(-1, -1, 0.2),
+                            Eigen::Vector3d(1, 1, 0.6));
+  EXPECT_NEAR(groundUnder(torso, 0.0, false), 0.5, 1e-9);
+  EXPECT_NEAR(groundUnder(torso, 0.0, true), -0.1, 1e-9);
+  EXPECT_NEAR(groundUnder(torso, -0.1, true), -0.1, 1e-9);
+}
+
+// A riser solid down to the floor and a deck the robot stands on (free air
+// under it lies below the level probed) stay ground.
+TEST(GroundProjection, SupportedGroundKeepsRisersAndDecks) {
+  FreeSpaceVoxels riser;
+  riser.solids.emplace_back(Eigen::Vector3d(-1, -1, 0.0),
+                            Eigen::Vector3d(1, 1, 0.6));
+  EXPECT_NEAR(groundUnder(riser, 0.0, true), 0.5, 1e-9);
+  FreeSpaceVoxels deck;
+  deck.solids.emplace_back(Eigen::Vector3d(-1, -1, 0.8),
+                           Eigen::Vector3d(1, 1, 1.0));
+  EXPECT_NEAR(groundUnder(deck, 0.9, true), 0.9, 1e-9);
+}

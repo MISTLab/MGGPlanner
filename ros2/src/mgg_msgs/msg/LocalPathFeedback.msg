@@ -2,12 +2,16 @@
 # planner. A feedback from another session or epoch is ignored.
 string EXECUTING=executing
 string IDLE=idle
+# The executor's refusal of path sequence_id, sent at once with its reason
+# logged executor-side: the planner's explicit evidence that a publication
+# will not be driven (an acceptance is the first EXECUTING report naming it).
+string REFUSED=refused
 std_msgs/Header header
 string session_id
 uint64 epoch
-# The executed path; 0 when none.
+# The executed path; 0 when none. REFUSED: the refused path.
 uint64 sequence_id
-# EXECUTING or IDLE.
+# EXECUTING, IDLE or REFUSED.
 string state
 # Distance travelled along path sequence_id, metres.
 float64 progress_m

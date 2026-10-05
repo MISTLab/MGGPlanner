@@ -103,6 +103,8 @@ struct LocalFeedback {
   std::uint64_t epoch = 0, sequence_id = 0;
   /// False when the executor drives no local path (state IDLE).
   bool executing = false;
+  /// The executor refused path sequence_id (state REFUSED).
+  bool refused = false;
   double progress_m = 0, speed_mps = 0;
   /// Braking bounds; non-positive or non-finite values keep the current ones.
   double deceleration_mps2 = 0, latency_s = 0, speed_cap_mps = 0;
@@ -171,15 +173,16 @@ class LocalPlanningCore {
   void setNoGoZones(const NoGoZones& zones, const std::string& frame_id = {});
   /// Ignored unless it is for the current session and epoch.
   ///
-  /// The executing path, which the next plan extends, has one authority:
-  /// the acknowledged-tip watermark. A publication becomes it at once; the
-  /// executor's report moves it on, or back only when it confirms that it
-  /// still drives the older path. The executor reports every 0.2 s, so one
-  /// report naming the acknowledged path may cross a newer publication in
-  /// flight: that one cannot move the tip back (a sibling of the path the
-  /// executor already accepted would be refused as "wrong parent"). A
-  /// second such report after the publication, or any other path or IDLE,
-  /// is the executor's state.
+  /// The executing path, which the next plan extends, follows from two
+  /// monotone facts and nothing else: the acknowledged path (the executor's
+  /// newest EXECUTING report; IDLE clears it, an older path is a stale
+  /// report) and the publications it explicitly refused (REFUSED). It is
+  /// the newest publication in flight (newer than every path ever
+  /// acknowledged) and not refused, else the acknowledged path. Reports
+  /// naming an older path, however many cross a publication in flight,
+  /// move nothing back; only a refusal does. A refusal of path N also covers every undecided older
+  /// publication (the executor decides paths in order and reports each
+  /// acceptance before its next decision) and their descendants.
   void onFeedback(const LocalFeedback& feedback);
   /// Resolves frames other than the odometry frame. Without it, only
   /// odometry-frame inputs can be planned with.
@@ -236,6 +239,8 @@ class LocalPlanningCore {
     bool invalid = false;
     /// Only its commitment is still certified (takeReplanRequest).
     bool suffix_withdrawn = false;
+    /// The executor refused it, or a path it extends (onFeedback).
+    bool refused = false;
   };
   /// The disk first applied, with the boot that proved it.
   struct AppliedStandingStart {
@@ -266,6 +271,8 @@ class LocalPlanningCore {
   void withdrawAgainstZones(const std::optional<NoGoZones>& zones,
                             const std::string& failed);
   void invalidate(std::uint64_t sequence, const std::string& reason);
+  /// The executing path from the acknowledged path and the refusals.
+  void updateExecutingSequence();
   /// Progress along a retained path: the executor's, for the acknowledged
   /// path, else from its start.
   double progressOn(std::uint64_t sequence) const;
@@ -311,13 +318,13 @@ class LocalPlanningCore {
 
   std::map<std::uint64_t, Retained> retained_;
   std::uint64_t next_sequence_ = 1;
-  /// The acknowledged-tip watermark (onFeedback): what the next plan extends.
+  /// What the next plan extends (onFeedback).
   std::uint64_t executing_sequence_ = 0;
-  /// The executor's last report, independent of publications.
+  /// The executor's newest EXECUTING report; 0 after IDLE.
   std::uint64_t acknowledged_sequence_ = 0;
-  /// Reports naming acknowledged_sequence_ that may still cross the latest
-  /// publication.
-  int crossing_reports_ = 0;
+  /// The newest path the executor ever reported EXECUTING: publications
+  /// after it are in flight.
+  std::uint64_t acknowledged_high_ = 0;
   bool replan_requested_ = false;
   double progress_ = 0, speed_mps_ = 0;
   BrakingBounds braking_;

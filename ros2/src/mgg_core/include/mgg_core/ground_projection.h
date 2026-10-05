@@ -437,8 +437,8 @@ class GroundProjection {
                     double bottom) const;
   /// projectSample without its per-plan memo.
   double castProjection(Eigen::Vector3d& sample, VoxelStatus& status) const;
-  /// The free voxel under `hit` when it is a solid floating above `level`
-  /// (setSupportedGroundOnly), else nullopt.
+  /// The free voxel under the occupied run `hit` belongs to when that run
+  /// floats above `level` (setSupportedGroundOnly), else nullopt.
   std::optional<Eigen::Vector3d> floatsAbove(const Eigen::Vector3d& hit,
                                              double level) const;
   /// The map's ground ray, passing solids floating above `level` when

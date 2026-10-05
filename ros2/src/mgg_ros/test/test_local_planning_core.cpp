@@ -343,10 +343,11 @@ TEST(LocalPlanningCore, SuffixObstacleKeepsTheCommitment) {
     EXPECT_FALSE(mgg_test::footprintOverlaps(pose, {1.0, 0.6}, box));
 }
 
-// p1a-acc-2: all 109 live splice rejections were "wrong parent". A report
-// already on its way when a path is published must not move the tip back
-// to its parent; a second report naming the parent is the executor's
-// refusal, and the next plan extends what it drives.
+// p1a-acc-2: all 109 live splice rejections were "wrong parent". However
+// many reports naming an older path cross a publication in flight, none
+// moves the tip back; only the executor's explicit refusal does, and it
+// covers the refused path's undecided predecessors and its descendants, as
+// the executor's splicer (one current path, decided in order) refuses them.
 TEST(LocalPlanningCore, StaleFeedbackCannotMoveTheTipBack) {
   mgg_test::Corridor corridor;
   const StateVec base = basePose(0.1, 0.1);
@@ -354,12 +355,13 @@ TEST(LocalPlanningCore, StaleFeedbackCannotMoveTheTipBack) {
   observe(core, corridor, base);
   ASSERT_TRUE(
       core.setMode(follow("s1", "r1", drivingPoint(6.1, 0.1))).accepted);
-  const auto report = [&](std::uint64_t sequence) {
+  const auto report = [&](std::uint64_t sequence, bool refused = false) {
     LocalFeedback feedback;
     feedback.session_id = "s1";
     feedback.epoch = core.epoch();
     feedback.sequence_id = sequence;
-    feedback.executing = sequence != 0;
+    feedback.executing = sequence != 0 && !refused;
+    feedback.refused = refused;
     core.onFeedback(feedback);
   };
   const auto plan = [&]() {
@@ -371,31 +373,40 @@ TEST(LocalPlanningCore, StaleFeedbackCannotMoveTheTipBack) {
   report(p1.sequence_id);
   const auto p2 = plan();
   EXPECT_EQ(p2.extends_sequence_id, p1.sequence_id);
-  report(p1.sequence_id);  // crossed p2 in flight
+  // Queued reports naming p1 that crossed p2 in flight, any number of them.
+  for (int i = 0; i < 4; ++i) report(p1.sequence_id);
   EXPECT_EQ(core.executingSequenceId(), p2.sequence_id);
   EXPECT_EQ(core.acknowledgedSequenceId(), p1.sequence_id);
   const auto p3 = plan();
   EXPECT_EQ(p3.extends_sequence_id, p2.sequence_id);  // not a sibling of p2
-  // Two rapid replans interleaved with old feedback.
-  report(p2.sequence_id);  // p2 accepted; p3 still in flight
-  EXPECT_EQ(core.executingSequenceId(), p3.sequence_id);
+  // p2 accepted while p3 is in flight; a later stale report naming p1 is
+  // older than the acknowledged path and changes nothing.
+  report(p2.sequence_id);
+  report(p1.sequence_id);
   EXPECT_EQ(core.acknowledgedSequenceId(), p2.sequence_id);
+  EXPECT_EQ(core.executingSequenceId(), p3.sequence_id);
   const auto p4 = plan();
   EXPECT_EQ(p4.extends_sequence_id, p3.sequence_id);
-  // A refused child: the executor stays on p2. Its first report may have
-  // crossed p4; the second is its verdict.
+  // The executor refused p3 (so p4, extending it, is refused too) while
+  // still on p2: the next plan extends p2.
   report(p2.sequence_id);
   EXPECT_EQ(core.executingSequenceId(), p4.sequence_id);
-  report(p2.sequence_id);
+  report(p3.sequence_id, true);
   EXPECT_EQ(core.executingSequenceId(), p2.sequence_id);
   const auto p5 = plan();
   EXPECT_EQ(p5.extends_sequence_id, p2.sequence_id);
-  // Acknowledged: the next one extends it.
+  // A refusal of p4 as it arrives changes nothing more: p5 stays in flight.
+  report(p4.sequence_id, true);
+  EXPECT_EQ(core.executingSequenceId(), p5.sequence_id);
   report(p5.sequence_id);
-  EXPECT_EQ(plan().extends_sequence_id, p5.sequence_id);
-  // The executor finished p5: IDLE. One more IDLE may cross the START
-  // that follows.
+  // The executor finished p5: IDLE, with p6 in flight, which it refuses
+  // (it extends p5). An IDLE sent before a START arrived does not undo it
+  // either; the executor's acceptance of it is its report naming it.
+  const auto p6 = plan();
+  EXPECT_EQ(p6.extends_sequence_id, p5.sequence_id);
   report(0);
+  EXPECT_EQ(core.executingSequenceId(), p6.sequence_id);
+  report(p6.sequence_id, true);
   EXPECT_EQ(core.executingSequenceId(), 0u);
   const auto start = plan();
   EXPECT_EQ(start.kind, LocalPathKind::kStart);
@@ -545,7 +556,7 @@ TEST(LocalPlanningCore, RetentionDoesNotInvalidateExtensionChain) {
 }
 
 TEST(LocalPlanningCore, RetentionInvalidatesFeedbackConfirmedPath) {
-  // Repeated feedback reproduces the rejected-sibling case. One-shot feedback
+  // Explicit refusals reproduce the rejected-sibling case. One-shot feedback
   // also has to survive intervening publications without another executor ack.
   for (const bool repeat_feedback : {false, true}) {
     SCOPED_TRACE(repeat_feedback);
@@ -565,10 +576,13 @@ TEST(LocalPlanningCore, RetentionInvalidatesFeedbackConfirmedPath) {
     feedback.executing = true;
     core.onFeedback(feedback);
     for (size_t i = 0; i < kMaxRetained; ++i) {
-      // Twice: one report may cross the publication; two are the
-      // executor's refusal of it (StaleFeedbackCannotMoveTheTipBack).
-      if (repeat_feedback) {
-        core.onFeedback(feedback);
+      // The executor refuses each new path and stays on the first.
+      if (repeat_feedback && i > 0) {
+        LocalFeedback refusal = feedback;
+        refusal.executing = false;
+        refusal.refused = true;
+        refusal.sequence_id = core.executingSequenceId();
+        core.onFeedback(refusal);
         core.onFeedback(feedback);
       }
       const auto next = core.plan(soon());

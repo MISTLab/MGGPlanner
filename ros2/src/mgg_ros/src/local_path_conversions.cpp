@@ -114,6 +114,7 @@ LocalFeedback fromFeedbackMsg(const mgg_msgs::msg::LocalPathFeedback& msg) {
   feedback.epoch = msg.epoch;
   feedback.sequence_id = msg.sequence_id;
   feedback.executing = msg.state == mgg_msgs::msg::LocalPathFeedback::EXECUTING;
+  feedback.refused = msg.state == mgg_msgs::msg::LocalPathFeedback::REFUSED;
   feedback.progress_m = msg.progress_m;
   feedback.speed_mps = msg.speed_mps;
   feedback.deceleration_mps2 = msg.deceleration_mps2;

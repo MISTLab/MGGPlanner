@@ -278,9 +278,10 @@ double LocalPlanner::localGain(const StateVec& state,
 LocalPlanResult LocalPlanner::plan(const LocalPlanInputs& in,
                                    const MapChange& change) {
   const auto start = Clock::now();
-  const auto deadline =
-      start + std::chrono::duration_cast<Clock::duration>(
-                  std::chrono::duration<double>(kLocalPlanningBudgetS));
+  const auto deadline = std::min(
+      in.deadline, start + std::chrono::duration_cast<Clock::duration>(
+                               std::chrono::duration<double>(
+                                   kLocalPlanningBudgetS)));
   cache_.withdraw(change);
   if (change.everything) track_.clear();
   // No-go policy is not part of cache keys. Flushing avoids stale admissions
@@ -292,6 +293,7 @@ LocalPlanResult LocalPlanner::plan(const LocalPlanInputs& in,
   track_.add(in.pose);
   LocalPlanResult result;
   const auto* parent = planning_cancelled;
+  external_cancelled_ = parent;
   PlanningCancellationScope scope(
       [&] { return Clock::now() >= deadline || (parent && (*parent)()); });
   try {
@@ -651,83 +653,90 @@ LocalPlanResult LocalPlanner::search(const LocalPlanInputs& in,
   // The best-ranked certified path shorter than 6 m, published only when no
   // candidate gives a 6 m one.
   std::optional<LocalPathPlan> shorter;
-  for (const auto& candidate : candidates) {
-    planningCheckpoint();
-    auto found = routes.to.find(candidate.id);
-    if (found == routes.to.end() || !turns(found->second.path)) {
-      ++refusals.unrouted;
-      continue;
-    }
-    auto path = identity;
-    path.poses = {root};
-    path.reverse = {false};
-    // Shortcut only when the whole candidate and native-spacing terrain
-    // checks still pass; no sharp-turn fallback to a geometric shortest path.
-    std::vector<StateVec> route;
-    for (const auto* v : found->second.path) route.push_back(v->state);
-    // Each shortcut certifies only its new leg, with the pose before it
-    // for the turn and the terrain windows across the joint: the path built
-    // so far is certified, and the whole path is certified again before
-    // publication. (Certifying the whole path for every j was the search's
-    // hot spot: v2-motionfix.)
-    for (size_t i = 0; i + 1 < route.size();) {
-      size_t next = i + 1;
-      for (size_t j = route.size() - 1; j > i + 1; --j) {
-        LocalPathPlan leg = path;
-        const size_t joint = std::min<size_t>(2, path.poses.size());
-        leg.poses.assign(path.poses.end() - joint, path.poses.end());
-        leg.poses.push_back(route[j]);
-        leg.reverse.assign(leg.poses.size(), false);
-        if (certify(leg, in.no_go_zones)) {
-          next = j;
-          break;
+  try {
+    for (const auto& candidate : candidates) {
+      planningCheckpoint();
+      auto found = routes.to.find(candidate.id);
+      if (found == routes.to.end() || !turns(found->second.path)) {
+        ++refusals.unrouted;
+        continue;
+      }
+      auto path = identity;
+      path.poses = {root};
+      path.reverse = {false};
+      // Shortcut only when the whole candidate and native-spacing terrain
+      // checks still pass; no sharp-turn fallback to a geometric shortest path.
+      std::vector<StateVec> route;
+      for (const auto* v : found->second.path) route.push_back(v->state);
+      // Each shortcut certifies only its new leg, with the pose before it
+      // for the turn and the terrain windows across the joint: the path built
+      // so far is certified, and the whole path is certified again before
+      // publication. (Certifying the whole path for every j was the search's
+      // hot spot: v2-motionfix.)
+      for (size_t i = 0; i + 1 < route.size();) {
+        size_t next = i + 1;
+        for (size_t j = route.size() - 1; j > i + 1; --j) {
+          LocalPathPlan leg = path;
+          const size_t joint = std::min<size_t>(2, path.poses.size());
+          leg.poses.assign(path.poses.end() - joint, path.poses.end());
+          leg.poses.push_back(route[j]);
+          leg.reverse.assign(leg.poses.size(), false);
+          if (certify(leg, in.no_go_zones)) {
+            next = j;
+            break;
+          }
         }
+        const StateVec start = path.poses.back();
+        const auto end = route[next];
+        const double distance = (end - start).head<3>().norm();
+        const int steps =
+            std::max(1, static_cast<int>(std::ceil(distance / 0.25)));
+        for (int k = 1; k <= steps; ++k) {
+          StateVec p = start + (end - start) * (double(k) / steps);
+          p[3] = std::atan2(end.y() - start.y(), end.x() - start.x());
+          path.poses.push_back(p);
+          path.reverse.push_back(false);
+        }
+        i = next;
       }
-      const StateVec start = path.poses.back();
-      const auto end = route[next];
-      const double distance = (end - start).head<3>().norm();
-      const int steps =
-          std::max(1, static_cast<int>(std::ceil(distance / 0.25)));
-      for (int k = 1; k <= steps; ++k) {
-        StateVec p = start + (end - start) * (double(k) / steps);
-        p[3] = std::atan2(end.y() - start.y(), end.x() - start.x());
-        path.poses.push_back(p);
-        path.reverse.push_back(false);
+      if (!prefix.poses.empty()) path = splicePath(prefix, path);
+      if (pathLength(path) > kMaxPathM) {
+        // Clip only the newly generated tail, never the exact retained prefix.
+        double along = 0;
+        size_t keep = 1;
+        for (; keep < path.poses.size(); ++keep) {
+          along += (path.poses[keep] - path.poses[keep - 1]).head<3>().norm();
+          if (along > kMaxPathM) break;
+        }
+        if (keep < path.prefix_length) continue;
+        path.poses.resize(keep);
+        path.reverse.resize(keep);
       }
-      i = next;
-    }
-    if (!prefix.poses.empty()) path = splicePath(prefix, path);
-    if (pathLength(path) > kMaxPathM) {
-      // Clip only the newly generated tail, never the exact retained prefix.
-      double along = 0;
-      size_t keep = 1;
-      for (; keep < path.poses.size(); ++keep) {
-        along += (path.poses[keep] - path.poses[keep - 1]).head<3>().norm();
-        if (along > kMaxPathM) break;
+      path.reaches_goal =
+          target && (path.poses.back().head<3>() - *target).norm() <=
+                        in.goal_tolerance_m + 1e-9;
+      if (!path.reaches_goal && pathLength(path) < kPreferredPathM) {
+        // Never a margin-only escape: at least one whole commitment.
+        if (shorter || pathLength(path) + 1e-9 < commit) {
+          ++refusals.too_short;
+        } else if (admissible(path)) {
+          shorter = std::move(path);
+        } else {
+          ++refusals.uncertified;
+        }
+        continue;
       }
-      if (keep < path.prefix_length) continue;
-      path.poses.resize(keep);
-      path.reverse.resize(keep);
-    }
-    path.reaches_goal =
-        target && (path.poses.back().head<3>() - *target).norm() <=
-                      in.goal_tolerance_m + 1e-9;
-    if (!path.reaches_goal && pathLength(path) < kPreferredPathM) {
-      // Never a margin-only escape: at least one whole commitment.
-      if (shorter || pathLength(path) + 1e-9 < commit) {
-        ++refusals.too_short;
-      } else if (admissible(path)) {
-        shorter = std::move(path);
-      } else {
-        ++refusals.uncertified;
+      if (publish(path)) {
+        result.refusals = refusals;
+        return result;
       }
-      continue;
+      ++refusals.uncertified;
     }
-    if (publish(path)) {
-      result.refusals = refusals;
-      return result;
-    }
-    ++refusals.uncertified;
+  } catch (const PlanningInterrupted&) {
+    // The budget ran out with a certified shorter path in hand: publish it
+    // rather than nothing, never past an external cancellation.
+    if (!shorter || (external_cancelled_ && (*external_cancelled_)())) throw;
+    selection_complete = false;
   }
   result.refusals = refusals;
   if (shorter) {

@@ -1,6 +1,9 @@
 #include <gtest/gtest.h>
 
 #include <algorithm>
+#include <chrono>
+#include <memory>
+#include <thread>
 
 #include "local_planner_fixture.h"
 #include "mgg_core/graph_expansion.h"
@@ -777,4 +780,64 @@ TEST(LocalPlanner, CertifiedFootprintsStayOffRefusedTerrain) {
       [](const StateVec& p) {
         return p.x() > 2 && p.x() < 5 && p.y() < -0.1;
       }));
+}
+
+// review-r0 finding 4: the budget running out after a shorter path was
+// certified publishes that path, with selection incomplete; an external
+// cancellation publishes nothing. Deterministic: the caller's cancellation
+// is consulted at every checkpoint, so its count places the budget's end
+// (a 0.4 s stall) after the fallback's certificate.
+TEST(LocalPlanner, BudgetKeepsACertifiedShorterPath) {
+  const auto scene = [] {
+    auto s = std::make_unique<mgg_test::LocalScene>();
+    s->map.unknown_beside_corridor = true;
+    s->map.solids.emplace_back(Eigen::Vector3d(2.8, -1, 0.1),
+                               Eigen::Vector3d(3.0, 1, 0.9));
+    s->map.solids.emplace_back(Eigen::Vector3d(-3.0, -1, 0.1),
+                               Eigen::Vector3d(-2.8, 1, 0.9));
+    return s;
+  };
+  std::size_t checkpoints = 0;
+  {
+    auto s = scene();
+    LocalPlanner planner(s->map, s->layer, s->cache, s->planning, s->robot,
+                         s->sensor);
+    auto in = s->inputs();
+    in.target.reset();
+    PlanningCancellationScope count([&] {
+      ++checkpoints;
+      return false;
+    });
+    const auto whole = planner.plan(in, {});
+    ASSERT_TRUE(whole.path) << whole.reason;
+    ASSERT_LT(pathLength(*whole.path), kPreferredPathM);
+    ASSERT_TRUE(whole.checks_complete);
+  }
+  ASSERT_GT(checkpoints, 2u);
+  for (const bool external : {false, true}) {
+    SCOPED_TRACE(external);
+    auto s = scene();
+    LocalPlanner planner(s->map, s->layer, s->cache, s->planning, s->robot,
+                         s->sensor);
+    auto in = s->inputs();
+    in.target.reset();
+    std::size_t calls = 0;
+    PlanningCancellationScope late([&] {
+      if (++calls < checkpoints - 1) return false;
+      if (external) return true;
+      if (calls == checkpoints - 1)
+        std::this_thread::sleep_for(std::chrono::milliseconds(400));
+      return false;
+    });
+    const auto result = planner.plan(in, {});
+    if (external) {
+      EXPECT_FALSE(result.path);
+    } else {
+      ASSERT_TRUE(result.path) << result.reason;
+      EXPECT_EQ(result.status, LocalStatus::kMoving);
+      EXPECT_FALSE(result.checks_complete);
+      EXPECT_LT(pathLength(*result.path), kPreferredPathM);
+      EXPECT_TRUE(planner.pathStillCertified(*result.path, 0));
+    }
+  }
 }

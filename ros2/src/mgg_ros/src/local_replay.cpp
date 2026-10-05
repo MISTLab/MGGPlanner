@@ -330,8 +330,8 @@ struct Replay {
   double accumulated_ms = 0;
   // One sim-clock tick can stamp a plan and the feedback it caused alike
   // (the recorder stamps callbacks with its latest /clock). Within a tick,
-  // EXECUTING feedback waits for the local_plan event it names; later
-  // feedback queues behind it to keep receipt order.
+  // EXECUTING or REFUSED feedback waits for the local_plan event it names;
+  // later feedback queues behind it to keep receipt order.
   double tick = std::numeric_limits<double>::quiet_NaN();
   std::set<Identity> tick_publications;  // recorded, not yet replayed
   std::deque<BagInput> deferred_feedback;
@@ -379,7 +379,8 @@ struct Replay {
   }
   bool awaitsPublication(const BagInput& input) const {
     const auto* m = std::get_if<Feedback>(&input.message);
-    return m && m->state == Feedback::EXECUTING &&
+    return m &&
+           (m->state == Feedback::EXECUTING || m->state == Feedback::REFUSED) &&
            tick_publications.count({m->session_id, m->epoch, m->sequence_id});
   }
   /// Delivers deferred feedback whose publication has replayed. At the end
@@ -488,7 +489,8 @@ struct Replay {
         }
       }
     }
-    require(m.state == Feedback::EXECUTING || m.state == Feedback::IDLE,
+    require(m.state == Feedback::EXECUTING || m.state == Feedback::IDLE ||
+                m.state == Feedback::REFUSED,
             "unknown local_path_feedback state");
     if (feedback.executing || m.sequence_id != 0) {
       const Identity identity{m.session_id, m.epoch, m.sequence_id};

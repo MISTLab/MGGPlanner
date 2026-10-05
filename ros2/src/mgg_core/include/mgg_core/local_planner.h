@@ -1,6 +1,8 @@
 #ifndef MGG_CORE_LOCAL_PLANNER_H_
 #define MGG_CORE_LOCAL_PLANNER_H_
+#include <chrono>
 #include <cstddef>
+#include <functional>
 #include <optional>
 
 #include "mgg_core/certification_cache.h"
@@ -43,6 +45,12 @@ struct LocalPlanInputs {
   double goal_tolerance_m = 0.2;
   NoGoZones no_go_zones;
   BrakingBounds braking;
+  /// The driver's cycle deadline; the search also keeps its own budget
+  /// (kLocalPlanningBudgetS). Both are budgets: a certified shorter path in
+  /// hand is still published when either runs out. A cancellation scope
+  /// around plan() (planning_cancelled) is external and publishes nothing.
+  std::chrono::steady_clock::time_point deadline =
+      std::chrono::steady_clock::time_point::max();
 };
 struct LocalPlanResult {
   std::optional<LocalPathPlan> path;
@@ -132,6 +140,8 @@ class LocalPlanner {
   RecentTrack track_;
   NoGoZones zones_;
   uint64_t sequence_ = 0;
+  /// plan()'s caller's cancellation, while plan() runs.
+  const std::function<bool()>* external_cancelled_ = nullptr;
 };
 }  // namespace mgg
 #endif
