@@ -98,6 +98,10 @@ bool pointInBox(const Eigen::Vector2d& point, const OrientedBox& box);
 /// strict check. With `standing_unknown_only`, `standing` uses this same
 /// bounded-height rule and occupied cells still block. The default retains
 /// the pre-existing boxed-in departure semantics described above.
+/// With `unknown_body_disk`, a standing start's disk, a cell lying wholly in
+/// it (StandingStart::coversCell) may hold unknown volume at any height;
+/// occupied still blocks there. Every other cell, including the part of the
+/// body reaching past the disk, is checked as the other arguments say.
 VoxelStatus orientedBoxPathStatus(const MapInterface& map,
                                   const Eigen::Vector3d& start,
                                   const Eigen::Vector3d& end,
@@ -107,7 +111,8 @@ VoxelStatus orientedBoxPathStatus(const MapInterface& map,
                                   bool clearance_prefilter = false,
                                   std::optional<double> unknown_above_center = std::nullopt,
                                   const KnownFreeBodyVolumes* known_free = nullptr,
-                                  bool standing_unknown_only = false);
+                                  bool standing_unknown_only = false,
+                                  const StandingStart* unknown_body_disk = nullptr);
 
 /// Aerial sweep from the physical root. The ordinary sweep permits unknown
 /// volume only inside the original root body. On occupied-sweep failure a

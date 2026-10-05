@@ -125,9 +125,10 @@ bool LocalPlanner::certify(LocalPathPlan& path, const NoGoZones& zones) {
   // root (hanging_root_edge_length_max), or the whole path when it stays
   // within that (a committed prefix; publication keeps ends out of the
   // disk). Every resampled segment of it is certified as that edge is
-  // (unobserved ground in the disk, unknown body volume; occupied blocks),
-  // and the whole path's terrain with the root's floor as evidence. Beyond
-  // it, the strict checks.
+  // (unobserved ground in the disk; unknown body volume only in the map
+  // cells wholly in the fixed disk, occupied blocking everywhere), and the
+  // whole path's terrain with the root's floor as evidence. Beyond it, the
+  // strict checks.
   const auto pts = points(path);
   std::size_t hanging_end = 0;
   if (!reversing && hangingRoot(path.poses.front())) {
@@ -155,8 +156,9 @@ bool LocalPlanner::certify(LocalPathPlan& path, const NoGoZones& zones) {
           !reverseExitEdgeAdmissible(map_, ground, robot_, planning_, a, b))
         return false;
     } else if (!groundShortcutSegmentAdmissible(
-                   ctx, pts[i - 1], pts[i], i > hanging_end, i <= hanging_end,
-                   i == 1 && hanging_end > 0 ? &pts.front() : nullptr))
+                   ctx, pts[i - 1], pts[i], true, i <= hanging_end,
+                   i == 1 && hanging_end > 0 ? &pts.front() : nullptr,
+                   i <= hanging_end ? &*standing_ : nullptr))
       return false;
     path.edge_dependencies.push_back(dep);
   }
@@ -451,7 +453,7 @@ LocalPlanResult LocalPlanner::search(const LocalPlanInputs& in,
   const bool hanging_root = hangingRoot(root);
   if (hanging_root) {
     ctx.hanging_root_edge_length_max = standing_->radius;
-    ctx.hanging_root_unknown_body = true;
+    ctx.hanging_root_unknown_body_disk = standing_;
     ctx.preserve_hanging_root_start_height = true;
     ctx.root_is_robot = true;
   }
@@ -524,6 +526,7 @@ LocalPlanResult LocalPlanner::search(const LocalPlanInputs& in,
                  deadline - std::chrono::milliseconds(100));
     const auto* parent = planning_cancelled;
     bool parent_interrupted = false;
+    std::size_t scored = 0;
     {
       PlanningCancellationScope scoring_scope([&] {
         if (parent && (*parent)()) {
@@ -536,6 +539,7 @@ LocalPlanResult LocalPlanner::search(const LocalPlanInputs& in,
         for (const Vertex* v : viewpoints) {
           planningCheckpoint();
           const double gain = localGain(v->state, window);
+          ++scored;
           if (gain > 0) candidates.push_back({v->id, -gain});
         }
       } catch (const PlanningInterrupted&) {
@@ -543,6 +547,8 @@ LocalPlanResult LocalPlanner::search(const LocalPlanInputs& in,
         selection_complete = false;
       }
     }
+    result.viewpoints_offered = viewpoints.size();
+    result.viewpoints_scored = scored;
     // Only the scoring slice may be recovered. Never swallow cancellation or
     // the outer cycle deadline and publish a partial safety certificate.
     planningCheckpoint();

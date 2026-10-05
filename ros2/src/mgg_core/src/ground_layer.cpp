@@ -376,8 +376,10 @@ void GroundLayer::recheck(std::chrono::steady_clock::time_point deadline) {
         // an ordinary ramp under its uphill end as an overhang.
         const double column_size = resolution_ - 1e-6;
         // In the standing start's disk the lidar cannot see the body band
-        // near itself: unknown volume passes there, occupied still refuses.
-        const bool blind_band = standing_ && standing_->covers(xy);
+        // near itself: unknown volume passes in a column wholly in the
+        // disk, occupied still refuses.
+        const bool blind_band =
+            standing_ && standing_->coversCell(xy, resolution_);
         const VoxelStatus body = map_.getBoxStatus(
             {xy.x(), xy.y(), (low + high) / 2},
             {column_size, column_size, std::max(0.0, high - low)}, !blind_band);

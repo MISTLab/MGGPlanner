@@ -112,6 +112,17 @@ struct StandingStart {
   bool covers(const Eigen::Vector2d& point) const {
     return (point - center).norm() <= radius;
   }
+  /// Whether the closed XY square of a map cell, centred on `cell` with
+  /// sides `resolution` along x and y, lies wholly in the disk: the only
+  /// cells where a standing start lets unknown body volume pass. A cell
+  /// reaching past the disk's edge is checked as any other.
+  bool coversCell(const Eigen::Vector2d& cell, double resolution) const {
+    const double half = resolution / 2;
+    for (const double dx : {-half, half})
+      for (const double dy : {-half, half})
+        if (!covers(cell + Eigen::Vector2d(dx, dy))) return false;
+    return true;
+  }
   /// A first goal must not stop in the prior's disk after the allowance
   /// expires en route, including an early controller arrival.
   bool admitsGoal(const Eigen::Vector2d& point, double arrival_tolerance) const {

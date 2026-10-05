@@ -281,4 +281,57 @@ TEST(OrientedBoxPathStatus, APostJustPastTheStandingBodysFrontIsChecked) {
   }
 }
 
+/// Unknown body volume wherever `unknown` says, occupied wherever
+/// `occupied` says; a non-strict query sees unknown as free.
+class UnknownColumns : public Columns {
+ public:
+  UnknownColumns(std::function<bool(double, double)> unknown,
+                 std::function<bool(double, double)> occupied)
+      : Columns([](double, double) { return false; }),
+        unknown_(std::move(unknown)), occupied_(std::move(occupied)) {}
+  VoxelStatus getBoxStatus(const Eigen::Vector3d& c, const Eigen::Vector3d&,
+                           bool strict) const override {
+    if (occupied_(c.x(), c.y())) return VoxelStatus::kOccupied;
+    if (unknown_(c.x(), c.y()))
+      return strict ? VoxelStatus::kUnknown : VoxelStatus::kFree;
+    return VoxelStatus::kFree;
+  }
+
+ private:
+  std::function<bool(double, double)> unknown_, occupied_;
+};
+
+TEST(OrientedBoxPathStatus, UnknownBodyPassesOnlyInCellsWhollyInTheDisk) {
+  // A standing start's disk of radius 2 round the origin, the whole body
+  // band unknown, and a 1 x 0.4 m body facing +x.
+  const mgg::StandingStart disk{Eigen::Vector2d::Zero(), 2.0};
+  const UnknownColumns map([](double, double) { return true; },
+                           [](double, double) { return false; });
+  const OrientedBox body{{0.5, 0.0, 0.5}, 0.0, {1.0, 0.4, 0.2}};
+  const auto sweep = [&](const UnknownColumns& m, double from, double to,
+                         const mgg::StandingStart* d) {
+    return mgg::orientedBoxPathStatus(m, {from, 0.0, 0.5}, {to, 0.0, 0.5},
+                                      body, true, nullptr, false,
+                                      std::nullopt, nullptr, false, d);
+  };
+  // Inside the disk the unknown passes; without the disk it does not.
+  EXPECT_EQ(sweep(map, 0.5, 1.0, &disk), VoxelStatus::kFree);
+  EXPECT_EQ(sweep(map, 0.5, 1.0, nullptr), VoxelStatus::kUnknown);
+  // Driven past the edge, the body beyond it is checked as anywhere.
+  EXPECT_EQ(sweep(map, 1.5, 2.5, &disk), VoxelStatus::kUnknown);
+  // Standing with its front 0.1 m short of the edge: the body lies in the
+  // disk, but the cells under its front corners reach past it.
+  EXPECT_FALSE(disk.coversCell({1.9, 0.1}, 0.2));
+  EXPECT_TRUE(disk.coversCell({1.7, 0.1}, 0.2));
+  EXPECT_EQ(sweep(map, 1.4, 1.4, &disk), VoxelStatus::kUnknown);
+  EXPECT_EQ(sweep(map, 1.2, 1.2, &disk), VoxelStatus::kFree);
+  // Occupied in the disk still blocks.
+  const UnknownColumns post(
+      [](double, double) { return true; },
+      [](double x, double y) {
+        return std::abs(x - 1.1) < 0.05 && std::abs(y - 0.1) < 0.05;
+      });
+  EXPECT_EQ(sweep(post, 0.5, 1.0, &disk), VoxelStatus::kOccupied);
+}
+
 }  // namespace

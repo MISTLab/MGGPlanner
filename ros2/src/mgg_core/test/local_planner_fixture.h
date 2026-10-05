@@ -30,6 +30,7 @@ class LocalMap : public TerrainFixture {
                              ? mgg::VoxelStatus::kOccupied
                              : mgg::VoxelStatus::kFree;
     if (blind(p) && p.z() <= 0.6) return mgg::VoxelStatus::kUnknown;
+    if (unseen(p, Eigen::Vector3d::Zero())) return mgg::VoxelStatus::kUnknown;
     if (band_unknown_beyond_y > 0 && std::abs(p.y()) > band_unknown_beyond_y &&
         p.z() > 0 && p.z() < 0.6)
       return mgg::VoxelStatus::kUnknown;
@@ -51,6 +52,7 @@ class LocalMap : public TerrainFixture {
                                 const Eigen::Vector3d& size,
                                 bool stop) const override {
     if (solid(p, size)) return mgg::VoxelStatus::kOccupied;
+    if (stop && unseen(p, size)) return mgg::VoxelStatus::kUnknown;
     // The body band a standing lidar cannot see near itself: within
     // 0.5 m less than its blind floor.
     if (stop && blind_radius > 0 && p.z() - size.z() / 2 < 0.6 &&
@@ -107,6 +109,8 @@ class LocalMap : public TerrainFixture {
   double band_unknown_beyond_y = 0;
   /// Occupied boxes.
   std::vector<Eigen::AlignedBox3d> solids;
+  /// Unknown boxes of body volume; downward ground rays still see the floor.
+  std::vector<Eigen::AlignedBox3d> unseen_volumes;
   /// An observed drop: the floor under it lies at kPitFloor, seen.
   std::optional<Eigen::AlignedBox2d> pit;
   static constexpr double kPitFloor = -1.0;
@@ -129,6 +133,11 @@ class LocalMap : public TerrainFixture {
     return std::any_of(solids.begin(), solids.end(), [&](const auto& s) {
       return s.intersects(box);
     });
+  }
+  bool unseen(const Eigen::Vector3d& p, const Eigen::Vector3d& size) const {
+    const Eigen::AlignedBox3d box(p - size / 2, p + size / 2);
+    return std::any_of(unseen_volumes.begin(), unseen_volumes.end(),
+                       [&](const auto& u) { return u.intersects(box); });
   }
 };
 inline mgg::RobotParams localRobot() {

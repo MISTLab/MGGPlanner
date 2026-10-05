@@ -89,7 +89,7 @@ MapChange LocalPlanningCore::place(const StateVec& anchor, bool* reset) {
       !have_pose_ ||
       (anchor.head<3>() - anchor_.head<3>()).norm() > params_.reset_jump_m;
   // After a jump the robot's place is no proof it never left its start.
-  if (jump && have_pose_) left_standing_start_ = true;
+  if (jump && have_pose_) standing_start_ended_ = true;
   if (jump) resetAll(anchor, change);
   if (reset) *reset = jump;
   anchor_ = anchor;
@@ -171,42 +171,49 @@ void LocalPlanningCore::afterChange(const MapChange& change) {
   }
 }
 
+void LocalPlanningCore::acceptStandingStart(const LocalGuidance& guidance) {
+  const GuidanceStandingStart& block = guidance.standing_start;
+  // Once a disk is applied, only the boot that proved it speaks for it.
+  if (standing_ && block.boot != standing_->boot) return;
+  // Stale or repeated: an older block never overrides a newer one. Before
+  // a disk is applied, a later boot (a restarted planner) is newer.
+  const std::pair<std::uint64_t, std::uint64_t> identity{block.boot,
+                                                         guidance.sequence_id};
+  if (standing_identity_ && identity <= *standing_identity_) return;
+  standing_identity_ = identity;
+  standing_block_ = StandingBlock{block, guidance.frame_id};
+  // A revocation after the disk was applied is final; before, a later
+  // valid block may still be the first applied.
+  if (!usable(block) && standing_) standing_start_ended_ = true;
+}
+
+bool LocalPlanningCore::usable(const GuidanceStandingStart& block) {
+  return block.valid && block.center.allFinite() &&
+         std::isfinite(block.radius) && block.radius > 0;
+}
+
 void LocalPlanningCore::refreshStandingStart() {
-  std::optional<AppliedStandingStart> next;
-  const GuidanceStandingStart* block =
-      guidance_ && guidance_->standing_start.valid &&
-              guidance_->standing_start.center.allFinite() &&
-              std::isfinite(guidance_->standing_start.radius) &&
-              guidance_->standing_start.radius > 0
-          ? &guidance_->standing_start
-          : nullptr;
-  if (block && have_pose_ && !left_standing_start_) {
-    if (standing_ && standing_->boot == block->boot &&
-        standing_->frame_id == guidance_->frame_id &&
-        standing_->center == block->center &&
-        standing_->radius == block->radius) {
-      next = standing_;
-    } else {
-      // Placed once per identity: map-to-odometry corrections must not
-      // move the disk under the robot and withdraw everything each cycle.
+  bool apply = false;
+  if (standing_block_ && usable(standing_block_->block) && have_pose_ &&
+      !standing_start_ended_) {
+    if (!standing_) {
+      // Placed once, at first application: neither map-to-odometry
+      // corrections nor later blocks move or enlarge it.
       std::string failed;
-      if (const auto T = resolve(guidance_->frame_id, failed)) {
-        next = AppliedStandingStart{
-            block->boot, guidance_->frame_id, block->center, block->radius,
-            StandingStart{(*T * block->center).head<2>(), block->radius}};
+      if (const auto T = resolve(standing_block_->frame_id, failed)) {
+        const GuidanceStandingStart& block = standing_block_->block;
+        standing_ = AppliedStandingStart{
+            block.boot,
+            StandingStart{(*T * block.center).head<2>(), block.radius}};
       }
     }
-    if (next && !next->odom.covers(anchor_.head<2>())) {
-      left_standing_start_ = true;
-      next.reset();
+    if (standing_) {
+      apply = standing_->odom.covers(anchor_.head<2>());
+      if (!apply) standing_start_ended_ = true;
     }
   }
-  const bool changed =
-      next.has_value() != standing_.has_value() ||
-      (next && (next->odom.center != standing_->odom.center ||
-                next->odom.radius != standing_->odom.radius));
-  standing_ = next;
-  if (!changed) return;
+  if (apply == standing_applied_) return;
+  standing_applied_ = apply;
   const std::optional<StandingStart> applied = standingStart();
   layer_.setStandingStart(applied);
   planner_.setStandingStart(applied);
@@ -236,6 +243,9 @@ void LocalPlanningCore::clearSession() {
   progress_ = 0;
   speed_mps_ = 0;
   guidance_.reset();
+  // The session's block goes with it; its identity fence and an ended
+  // standing start stay.
+  standing_block_.reset();
 }
 
 LocalModeResponse LocalPlanningCore::setMode(const LocalModeRequest& request) {
@@ -264,8 +274,10 @@ LocalModeResponse LocalPlanningCore::setMode(const LocalModeRequest& request) {
   mode_ = request.mode;
   request_ = request;
   if (!continuation && early_guidance_ &&
-      early_guidance_->session_id == session_id_)
+      early_guidance_->session_id == session_id_) {
     guidance_ = early_guidance_;
+    acceptStandingStart(*guidance_);
+  }
   early_guidance_.reset();
   refreshStandingStart();
   response.accepted = true;
@@ -276,10 +288,17 @@ LocalModeResponse LocalPlanningCore::setMode(const LocalModeRequest& request) {
 void LocalPlanningCore::setGuidance(const LocalGuidance& guidance) {
   if (guidance.session_id.empty()) return;
   if (guidance.session_id != session_id_) {
-    early_guidance_ = guidance;
+    // An older message of the held session never replaces a newer one.
+    const auto identity = [](const LocalGuidance& g) {
+      return std::make_pair(g.standing_start.boot, g.sequence_id);
+    };
+    if (!early_guidance_ || early_guidance_->session_id != guidance.session_id ||
+        identity(guidance) > identity(*early_guidance_))
+      early_guidance_ = guidance;
     return;
   }
   guidance_ = guidance;
+  acceptStandingStart(guidance);
   refreshStandingStart();
 }
 

@@ -87,7 +87,7 @@ void observeBlind(LocalPlanningCore& core, const mgg_test::Corridor& corridor,
 LocalGuidance standingGuidance(const std::string& session,
                                std::uint64_t sequence, bool valid,
                                const Eigen::Vector2d& center,
-                               double radius = 2.0) {
+                               double radius = 2.0, std::uint64_t boot = 7) {
   LocalGuidance g;
   g.session_id = session;
   g.sequence_id = sequence;
@@ -95,7 +95,7 @@ LocalGuidance standingGuidance(const std::string& session,
   g.standing_start.valid = valid;
   g.standing_start.center = Eigen::Vector3d(center.x(), center.y(), 0);
   g.standing_start.radius = radius;
-  g.standing_start.boot = 7;
+  g.standing_start.boot = boot;
   return g;
 }
 
@@ -595,7 +595,8 @@ TEST(LocalPlanningCore, StandingStartHoldsAcrossItsDiskThenExpires) {
 TEST(LocalPlanningCore, StandingStartRevocationWithdraws) {
   // Expiry: the guidance planner's proof lapses (valid=false). Admissions
   // and the path that relied on the prior are withdrawn, and the same
-  // unseen ground refuses again until a proof returns.
+  // unseen ground refuses again: a revocation after the prior was applied
+  // is final for its boot, whatever valid block follows.
   mgg_test::Corridor corridor;
   const StateVec base = basePose(0.1, 0.1);
   LocalPlanningCore core(mgg_test::sceneParams());
@@ -618,8 +619,127 @@ TEST(LocalPlanningCore, StandingStartRevocationWithdraws) {
   EXPECT_FALSE(refused.path) << refused.reason;
 
   core.setGuidance(standingGuidance("s1", 3, true, {0.1, 0.1}));
+  EXPECT_FALSE(core.standingStart());
+  EXPECT_EQ(admittedCells(core), 0);
+  const auto still = core.plan(soon(5));
+  EXPECT_FALSE(still.path) << still.reason;
+  // Nor does a new session bring it back.
+  ASSERT_TRUE(
+      core.setMode(follow("s2", "r2", drivingPoint(4.6, 0.1))).accepted);
+  core.setGuidance(standingGuidance("s2", 4, true, {0.1, 0.1}));
+  EXPECT_FALSE(core.standingStart());
+}
+
+TEST(LocalPlanningCore, StandingStartRevokedBeforeItsFirstApplicationMayApply) {
+  // A revocation before any prior was applied (the proof not yet there) is
+  // not final: the first valid block then applies.
+  mgg_test::Corridor corridor;
+  const StateVec base = basePose(0.1, 0.1);
+  LocalPlanningCore core(mgg_test::sceneParams());
+  core.setGroundRecheckBudget(5);
+  observeBlind(core, corridor, base);
+  ASSERT_TRUE(
+      core.setMode(follow("s1", "r1", drivingPoint(4.6, 0.1))).accepted);
+  core.setGuidance(standingGuidance("s1", 1, false, {0.1, 0.1}));
+  EXPECT_FALSE(core.standingStart());
+  EXPECT_FALSE(core.plan(soon(5)).path);
+  core.setGuidance(standingGuidance("s1", 2, true, {0.1, 0.1}));
   ASSERT_TRUE(core.standingStart());
-  EXPECT_TRUE(core.plan(soon(5)).path);
+  const auto moving = core.plan(soon(5));
+  EXPECT_TRUE(moving.path) << moving.reason;
+}
+
+TEST(LocalPlanningCore, StandingStartIgnoresStaleAndRepeatedBlocks) {
+  mgg_test::Corridor corridor;
+  const StateVec base = basePose(0.1, 0.1);
+  {
+    // Before any application: a valid block older than a revocation does
+    // not apply; a newer valid one does.
+    LocalPlanningCore core(mgg_test::sceneParams());
+    observeBlind(core, corridor, base);
+    ASSERT_TRUE(
+        core.setMode(follow("s1", "r1", drivingPoint(4.6, 0.1))).accepted);
+    core.setGuidance(standingGuidance("s1", 5, false, {0.1, 0.1}));
+    core.setGuidance(standingGuidance("s1", 4, true, {0.1, 0.1}));
+    EXPECT_FALSE(core.standingStart());
+    core.setGuidance(standingGuidance("s1", 5, true, {0.1, 0.1}));
+    EXPECT_FALSE(core.standingStart());  // a repeated identity
+    core.setGuidance(standingGuidance("s1", 6, true, {0.1, 0.1}));
+    EXPECT_TRUE(core.standingStart());
+  }
+  {
+    // Applied: a repeated identity revokes nothing, and a valid block older
+    // than the revocation that followed does not undo it.
+    LocalPlanningCore core(mgg_test::sceneParams());
+    observeBlind(core, corridor, base);
+    ASSERT_TRUE(
+        core.setMode(follow("s1", "r1", drivingPoint(4.6, 0.1))).accepted);
+    core.setGuidance(standingGuidance("s1", 1, true, {0.1, 0.1}));
+    ASSERT_TRUE(core.standingStart());
+    core.setGuidance(standingGuidance("s1", 1, false, {0.1, 0.1}));
+    EXPECT_TRUE(core.standingStart());
+    core.setGuidance(standingGuidance("s1", 3, false, {0.1, 0.1}));
+    EXPECT_FALSE(core.standingStart());
+    core.setGuidance(standingGuidance("s1", 2, true, {0.1, 0.1}));
+    EXPECT_FALSE(core.standingStart());
+  }
+}
+
+TEST(LocalPlanningCore, StandingStartIsHeldToTheBootAndDiskFirstApplied) {
+  // Once applied, another boot can neither replace, enlarge, shift nor
+  // revoke the disk, and its own boot's later blocks only keep or revoke
+  // it: the disk stays where it was first placed.
+  mgg_test::Corridor corridor;
+  const StateVec base = basePose(0.1, 0.1);
+  LocalPlanningCore core(mgg_test::sceneParams());
+  observeBlind(core, corridor, base);
+  ASSERT_TRUE(
+      core.setMode(follow("s1", "r1", drivingPoint(4.6, 0.1))).accepted);
+  core.setGuidance(standingGuidance("s1", 1, true, {0.1, 0.1}, 2.0, 7));
+  const auto applied = core.standingStart();
+  ASSERT_TRUE(applied);
+  const auto same = [&] {
+    const auto now = core.standingStart();
+    return now && now->center == applied->center &&
+           now->radius == applied->radius;
+  };
+  core.takeInvalidations();
+  core.setGuidance(standingGuidance("s1", 2, true, {1.1, 0.1}, 4.0, 8));
+  EXPECT_TRUE(same());
+  core.setGuidance(standingGuidance("s1", 3, true, {-0.9, 0.1}, 3.0, 6));
+  EXPECT_TRUE(same());
+  core.setGuidance(standingGuidance("s1", 4, false, {0.1, 0.1}, 2.0, 8));
+  EXPECT_TRUE(same());
+  core.setGuidance(standingGuidance("s1", 5, true, {1.1, 0.1}, 4.0, 7));
+  EXPECT_TRUE(same());
+  EXPECT_TRUE(core.takeInvalidations().empty());
+  core.setGuidance(standingGuidance("s1", 6, false, {0.1, 0.1}, 2.0, 7));
+  EXPECT_FALSE(core.standingStart());
+}
+
+TEST(LocalPlanningCore, EarlyGuidanceKeepsTheNewestStandingBlock) {
+  // Guidance answering before the session starts, out of order: the held
+  // message is the newest, so a stale valid block cannot override the
+  // revocation that superseded it.
+  mgg_test::Corridor corridor;
+  const StateVec base = basePose(0.1, 0.1);
+  LocalPlanningCore core(mgg_test::sceneParams());
+  observeBlind(core, corridor, base);
+  core.setGuidance(standingGuidance("s1", 2, false, {0.1, 0.1}));
+  core.setGuidance(standingGuidance("s1", 1, true, {0.1, 0.1}));
+  ASSERT_TRUE(
+      core.setMode(follow("s1", "r1", drivingPoint(4.6, 0.1))).accepted);
+  EXPECT_FALSE(core.standingStart());
+  EXPECT_EQ(core.guidanceSequenceId(), 2u);
+  core.setGuidance(standingGuidance("s1", 3, true, {0.1, 0.1}));
+  EXPECT_TRUE(core.standingStart());
+  // A held block older than one already accepted is fenced at setMode.
+  core.setGuidance(standingGuidance("s2", 2, true, {0.1, 0.1}));
+  ASSERT_TRUE(
+      core.setMode(follow("s2", "r2", drivingPoint(4.6, 0.1))).accepted);
+  EXPECT_FALSE(core.standingStart());
+  core.setGuidance(standingGuidance("s2", 4, true, {0.1, 0.1}));
+  EXPECT_TRUE(core.standingStart());
 }
 
 TEST(LocalPlanningCore, RestartAwayFromTheDiskHasNoStandingStart) {

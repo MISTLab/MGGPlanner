@@ -555,7 +555,7 @@ struct Replay {
            w.at("session_id") == core->sessionId()))
         tags.push_back(w.at("tag"));
     const auto occupancy = core->ground().occupancy();
-    return {{"component", "local"}, {"measured_scope", "local_map_ground_invalidation_search"},
+    json row = {{"component", "local"}, {"measured_scope", "local_map_ground_invalidation_search"},
             {"session_id", core->sessionId()}, {"input_seq", event.line}, {"sim_s", event.time},
             {"map_revision", core->map().revision()}, {"duration_ms", duration},
             {"complete", result.checks_complete}, {"status", status},
@@ -565,6 +565,11 @@ struct Replay {
             {"callback_count", measured_callbacks},
             {"reset_count", resets}, {"invalidations", invalidations.size()},
             {"admitted_cells", std::count(occupancy.begin(), occupancy.end(), 0)}};
+    if (result.viewpoints_offered && result.viewpoints_scored) {
+      row["viewpoints_offered"] = *result.viewpoints_offered;
+      row["viewpoints_scored"] = *result.viewpoints_scored;
+    }
+    return row;
   }
 };
 }  // namespace

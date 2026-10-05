@@ -66,15 +66,19 @@ bool edgeTraversable(const ExpandContext& ctx, const Eigen::Vector3d& start,
                      EdgeTravel travel = EdgeTravel::kBothWays,
                      const OrientedBox* standing = nullptr,
                      bool root_edge = false,
-                     const Eigen::Vector3d* physical_root = nullptr) {
+                     const Eigen::Vector3d* physical_root = nullptr,
+                     const StandingStart* unknown_body_disk = nullptr) {
   if (ctx.robot->type == RobotType::kAerialRobot) {
     return ctx.map->getStrictPathStatus(start, end, ctx.robot_box_size) ==
            VoxelStatus::kFree;
   }
   EdgeVerdictCache::Key key{};
   // Root evidence is outside the sweep's cache key. Never reuse a root
-  // verdict (including a supported root's) across different physical poses.
-  if (ctx.edge_verdicts != nullptr && !root_edge) {
+  // verdict (including a supported root's) across different physical poses,
+  // nor one swept with a standing start's disk.
+  const bool cacheable =
+      ctx.edge_verdicts != nullptr && !root_edge && !unknown_body_disk;
+  if (cacheable) {
     const auto exactBits = [](double value) {
       std::int64_t bits;
       if (value == 0.0) value = 0.0;  // canonicalize signed zero
@@ -108,7 +112,8 @@ bool edgeTraversable(const ExpandContext& ctx, const Eigen::Vector3d& start,
   check.sweep = [&](const Eigen::Vector3d& a, const Eigen::Vector3d& b) {
     return orientedBoxPathStatus(*ctx.map, a, b, body, stop_at_unknown, standing, true,
                                   ctx.unknown_body_above_center,
-                                  ctx.own_body_known_free.get(), true);
+                                  ctx.own_body_known_free.get(), true,
+                                  unknown_body_disk);
   };
   // Ground robot: the edge has to follow the terrain.
   ProjectedEdgeStatus es = ctx.ground->getProjectedEdgeStatus(
@@ -128,7 +133,7 @@ bool edgeTraversable(const ExpandContext& ctx, const Eigen::Vector3d& start,
         stop_at_unknown, reverse, is_hanging, false, &check, EdgeTravel::kBothWays);
   }
   ++rep.edge_status[static_cast<int>(es)];
-  if (ctx.edge_verdicts != nullptr && !root_edge) {
+  if (cacheable) {
     ctx.edge_verdicts->add(
         key, {es, es == ProjectedEdgeStatus::kAdmissible
                       ? projected_edge
@@ -302,9 +307,7 @@ void expandGraphFrom(GraphManager& graph, Vertex& new_vertex,
           : edgeTraversable(
                 ctx, start_pos, end_pos, is_hanging,
                 ctx.preserve_hanging_root_start_height && nearest_vertex->id == 0,
-                projected_edge, rep,
-                ctx.stop_at_unknown &&
-                    !(hanging_root && ctx.hanging_root_unknown_body),
+                projected_edge, rep, ctx.stop_at_unknown,
                 nearest_vertex->id == 0 && ctx.root_is_robot
                     ? EdgeTravel::kForward : EdgeTravel::kBothWays,
                 nearest_vertex->id == 0 && ctx.root_is_robot && ctx.standing_body
@@ -313,7 +316,9 @@ void expandGraphFrom(GraphManager& graph, Vertex& new_vertex,
                 ctx.preserve_hanging_root_start_height &&
                         nearest_vertex->id == 0 && ctx.root_is_robot &&
                         nearest_vertex->is_hanging
-                    ? &origin : nullptr);
+                    ? &origin : nullptr,
+                hanging_root && ctx.hanging_root_unknown_body_disk
+                    ? &*ctx.hanging_root_unknown_body_disk : nullptr);
   if (admissible_edge && ctx.projected_edge_admissible &&
       !ctx.projected_edge_admissible(projected_edge)) {
     admissible_edge = false;

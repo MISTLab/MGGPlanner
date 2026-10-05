@@ -43,9 +43,10 @@ class GroundLayer {
   /// found under it then counts as supported at the seed floor hint; ground
   /// observed in the disk is used as observed, so a drop stays refused, and
   /// so does a column the lidar looked into (free kGroundBridgeHoleDepth
-  /// below the hint). In the disk an unknown body band passes; occupied
-  /// still refuses. Elsewhere unknown stays unknown. A change withdraws
-  /// every column.
+  /// below the hint). In a column wholly in the disk an unknown body band
+  /// passes; occupied still refuses. Elsewhere unknown stays unknown, in
+  /// the body band of a column reaching past the disk's edge too. A change
+  /// withdraws every column.
   void setStandingStart(const std::optional<StandingStart>& standing);
   void recheck(std::chrono::steady_clock::time_point deadline);
   /// Pending means work since the last change, not completed unknown space.

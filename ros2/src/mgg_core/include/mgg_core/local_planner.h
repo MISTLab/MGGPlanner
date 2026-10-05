@@ -41,6 +41,10 @@ struct LocalPlanResult {
   // Destinations considered (the goal, or scored gain viewpoints); set only
   // when the search reached candidate selection. Telemetry, not policy.
   std::optional<std::size_t> candidate_count;
+  // Gain viewpoints the search would score, and how many it scored within
+  // its scoring slice; set only when gain scoring ran. Telemetry, not
+  // policy: fewer scored than offered is "not every viewpoint scored".
+  std::optional<std::size_t> viewpoints_offered, viewpoints_scored;
 };
 class LocalPlanner {
  public:
@@ -60,7 +64,9 @@ class LocalPlanner {
   /// the guidance planner): unobserved ground in it counts as ground, and
   /// from a root in the disk a departure may hang across it up to the disk's
   /// radius (hanging_root_edge_length_max) to observed ground, through the
-  /// body band the lidar cannot see (occupied still blocks). Turns use it as
+  /// body band the lidar cannot see where that lies wholly in the disk
+  /// (StandingStart::coversCell; occupied still blocks, and unknown body
+  /// volume past the disk's edge blocks as anywhere). Turns use it as
   /// legacy does, and a path may not end in it (StandingStart::admitsGoal)
   /// unless its arrival disk is observed. The driver withdraws the cache and
   /// every retained path on a change.

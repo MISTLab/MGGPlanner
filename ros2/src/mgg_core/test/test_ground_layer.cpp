@@ -485,6 +485,9 @@ TEST(GroundLayer, StandingStartSeedsBlindDisk) {
   layer.setStandingStart(StandingStart{Eigen::Vector2d::Zero(), 1.0});
   finish(layer);
   EXPECT_EQ(layer.verdict({0.5, 0.1}), GroundVerdict::kAdmitted);
+  // A column whose centre lies in the disk but whose square reaches past
+  // its edge: the unseen body band there stays unknown.
+  EXPECT_EQ(layer.verdict({0.9, 0.1}), GroundVerdict::kUnknown);
   EXPECT_EQ(layer.verdict({1.3, 0.1}), GroundVerdict::kUnknown);
   EXPECT_EQ(layer.verdict({2.5, 0.1}), GroundVerdict::kUnknown);
 

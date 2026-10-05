@@ -200,7 +200,8 @@ VoxelStatus orientedBoxPathStatus(const MapInterface& map,
                                   bool clearance_prefilter,
                                   std::optional<double> unknown_above_center,
                                   const KnownFreeBodyVolumes* known_free,
-                                  bool standing_unknown_only) {
+                                  bool standing_unknown_only,
+                                  const StandingStart* unknown_body_disk) {
   const double resolution = map.getResolution();
   if (!start.allFinite() || !end.allFinite() || !box.size.allFinite() ||
       (box.size.array() < 0.0).any() || !std::isfinite(box.heading) ||
@@ -262,6 +263,17 @@ VoxelStatus orientedBoxPathStatus(const MapInterface& map,
       if (!cellMeetsBox(cell.center, resolution, swept, -1e-9)) continue;
       if (standing != nullptr && !standing_unknown_only &&
           !entersBeyondStanding(cell.center, resolution, swept, *standing)) {
+        continue;
+      }
+      if (unknown_body_disk &&
+          unknown_body_disk->coversCell(cell.center, resolution)) {
+        // The standing lidar cannot see this column: only occupied counts.
+        if (map.getStaticBoxStatus(
+                Eigen::Vector3d(cell.center.x(), cell.center.y(),
+                                swept.center.z()),
+                Eigen::Vector3d(0.0, 0.0, swept.size.z()), false) ==
+            VoxelStatus::kOccupied)
+          return VoxelStatus::kOccupied;
         continue;
       }
       const bool masked = known_free || (standing && standing_unknown_only);

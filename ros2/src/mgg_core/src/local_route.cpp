@@ -352,14 +352,16 @@ bool groundShortcutSegmentAdmissible(const ExpandContext& ctx,
                                      const Eigen::Vector3d& from,
                                      const Eigen::Vector3d& to,
                                      bool stop_at_unknown, bool is_hanging,
-                                     const Eigen::Vector3d* physical_root) {
+                                     const Eigen::Vector3d* physical_root,
+                                     const StandingStart* unknown_body_disk) {
   OrientedBox body;
   body.heading = std::atan2(to.y() - from.y(), to.x() - from.x());
   body.size = ctx.robot_box_size;
   EdgeBodyCheck check;
   check.sweep = [&](const Eigen::Vector3d& a, const Eigen::Vector3d& b) {
     return orientedBoxPathStatus(*ctx.map, a, b, body, stop_at_unknown,
-                                 nullptr, true, ctx.unknown_body_above_center, ctx.own_body_known_free.get());
+                                 nullptr, true, ctx.unknown_body_above_center, ctx.own_body_known_free.get(),
+                                 false, unknown_body_disk);
   };
   std::vector<Eigen::Vector3d> projected;
   const Eigen::Vector3d offset = ctx.robot->offsetForHeading(body.heading);

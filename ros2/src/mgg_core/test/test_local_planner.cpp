@@ -1,6 +1,7 @@
 #include <gtest/gtest.h>
 
 #include "local_planner_fixture.h"
+#include "mgg_core/graph_expansion.h"
 #include "mgg_core/local_route.h"
 #include "mgg_core/planning_cancellation.h"
 using namespace mgg;
@@ -82,6 +83,8 @@ TEST(LocalPlanner, StatusCompleteness) {
     EXPECT_EQ(unscored.status, LocalStatus::kWaitingForMap) << unscored.reason;
     EXPECT_EQ(unscored.reason, "not every viewpoint was scored");
     EXPECT_FALSE(unscored.checks_complete);
+    ASSERT_TRUE(unscored.viewpoints_offered && unscored.viewpoints_scored);
+    EXPECT_LT(*unscored.viewpoints_scored, *unscored.viewpoints_offered);
   }
   {
     // Fully observed and enclosed: walls round the robot, every cell seen.
@@ -97,6 +100,8 @@ TEST(LocalPlanner, StatusCompleteness) {
     auto enclosed = closed_planner.plan(in, {});
     EXPECT_EQ(enclosed.status, LocalStatus::kNoLocalTarget) << enclosed.reason;
     EXPECT_TRUE(enclosed.checks_complete);
+    ASSERT_TRUE(enclosed.viewpoints_offered && enclosed.viewpoints_scored);
+    EXPECT_EQ(*enclosed.viewpoints_scored, *enclosed.viewpoints_offered);
   }
   {
     // Gain beyond reach of a useful path: blocked, not "no gain".
@@ -503,4 +508,77 @@ TEST(LocalPlanner, StandingStartDepartsAcrossItsBlindDisk) {
   auto revoked = planner.plan(in, MapChange{5, {}, true});
   EXPECT_FALSE(revoked.path) << revoked.reason;
   EXPECT_FALSE(planner.pathStillCertified(*departure.path, 0));
+}
+
+TEST(LocalPlanner, StandingStartUnknownBodyStaysInItsDisk) {
+  // The disk is fixed round where the robot started (0, 0), radius 2; the
+  // robot has since moved to x = 1.5, still in it. Its hanging departure
+  // may reach 2 m from there, to x = 3.5: the unknown body volume it may
+  // pass is the disk's, never a strip beyond the disk's edge, whatever the
+  // ground under it.
+  const StandingStart standing{Eigen::Vector2d::Zero(), 2.0};
+  const Eigen::AlignedBox3d outside(Eigen::Vector3d(2.2, -8, 0.3),
+                                    Eigen::Vector3d(2.6, 8, 0.6));
+  const Eigen::AlignedBox3d inside(Eigen::Vector3d(1.6, -8, 0.3),
+                                   Eigen::Vector3d(1.8, 8, 0.6));
+  const auto line = [](const std::vector<double>& xs) {
+    LocalPathPlan path;
+    for (const double x : xs) path.poses.push_back(StateVec(x, 0, 0.5, 0));
+    path.reverse.assign(path.poses.size(), false);
+    return path;
+  };
+  for (const bool beyond : {true, false}) {
+    SCOPED_TRACE(beyond ? "strip beyond the disk" : "strip in the disk");
+    mgg_test::LocalScene s;
+    s.map.unseen_volumes.push_back(beyond ? outside : inside);
+    const double root_x = beyond ? 1.5 : 1.0;
+    s.layer.setStandingStart(standing);
+    s.layer.reset({root_x, 0, 0.5}, 0);
+    s.layer.recheck(std::chrono::steady_clock::now() +
+                    std::chrono::seconds(20));
+
+    // Expansion: the root's hanging edge across the strip.
+    GroundProjection ground(s.map, s.planning, true);
+    ground.setStandingStart(standing);
+    ExpandContext ctx;
+    ctx.map = &s.map;
+    ctx.ground = &ground;
+    ctx.planning = &s.planning;
+    ctx.robot = &s.robot;
+    ctx.robot_box_size = s.robot.getPlanningSize();
+    ctx.stop_at_unknown = true;
+    ctx.root_is_robot = true;
+    ctx.hanging_root_edge_length_max = standing.radius;
+    ctx.preserve_hanging_root_start_height = true;
+    ctx.hanging_root_unknown_body_disk = standing;
+    GraphManager graph;
+    auto* root = new Vertex(0, StateVec(root_x, 0, 0.5, 0));
+    root->is_hanging = true;
+    graph.addVertex(root);
+    Vertex candidate(1, StateVec(root_x + 2.0, 0, 0.5, 0));
+    ExpandGraphReport report;
+    expandGraph(graph, candidate, report, ctx);
+    EXPECT_EQ(report.num_vertices_added, beyond ? 0 : 1);
+
+    // Certification: the same departure, then on to observed ground.
+    LocalPlanner planner(s.map, s.layer, s.cache, s.planning, s.robot,
+                         s.sensor);
+    planner.setStandingStart(standing);
+    EXPECT_EQ(planner.pathStillCertified(line({root_x, root_x + 2.0, 7.0}), 0),
+              !beyond);
+
+    // The whole cycle, to a goal past the strip.
+    auto in = s.inputs();
+    in.pose = StateVec(root_x, 0, 0.5, 0);
+    auto result = planner.plan(in, MapChange{1, {}, true});
+    EXPECT_EQ(result.path.has_value(), !beyond) << result.reason;
+    // Occupied in the disk blocks, as anywhere.
+    if (!beyond) {
+      s.map.solids.push_back(inside);
+      s.cache.flushAll();
+      EXPECT_FALSE(
+          planner.pathStillCertified(line({root_x, root_x + 2.0, 7.0}), 0));
+      EXPECT_FALSE(planner.plan(in, MapChange{2, {}, true}).path);
+    }
+  }
 }
