@@ -47,7 +47,18 @@ TEST(LocalPlanner, StatusCompleteness) {
   EXPECT_FALSE(pending.checks_complete);
   s.layer.recheck(std::chrono::steady_clock::now() + std::chrono::seconds(20));
   in.target.reset();
-  auto empty = planner.plan(in, {});
+  // Scoring its 1368 viewpoints takes about 60 ms of the 100 ms wall-clock
+  // scoring slice here; a loaded gate machine can run out of it. A cycle
+  // that did must say so (below), never "no local target"; the empty
+  // window is judged on the first cycle that scored every viewpoint.
+  LocalPlanResult empty;
+  for (int attempt = 0; attempt < 5; ++attempt) {
+    empty = planner.plan(in, {});
+    ASSERT_TRUE(empty.viewpoints_offered && empty.viewpoints_scored);
+    if (*empty.viewpoints_scored == *empty.viewpoints_offered) break;
+    EXPECT_EQ(empty.reason, "not every viewpoint was scored");
+    EXPECT_FALSE(empty.checks_complete);
+  }
   EXPECT_EQ(empty.status, LocalStatus::kNoLocalTarget) << empty.reason;
   EXPECT_TRUE(empty.checks_complete);
   in.target = Eigen::Vector3d(7, 0, 0.5);
