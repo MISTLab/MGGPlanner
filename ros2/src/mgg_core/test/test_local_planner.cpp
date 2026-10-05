@@ -582,3 +582,66 @@ TEST(LocalPlanner, StandingStartUnknownBodyStaysInItsDisk) {
     }
   }
 }
+
+TEST(LocalPlanner, StandingStartTurnsSeeOnlyWholeDiskCellsAsObserved) {
+  // The disk round the origin, radius 2. The robot at (1.5, 0.5) facing +x
+  // turns about to drive off along -x: its turning circle (0.54 m) reaches
+  // the cell at (1.7, 0.9), whose centre lies in the disk but whose square
+  // reaches past its edge, and the cell at (1.3, 0.9), wholly in it. Its
+  // straight sweep along -x meets neither. Ground is observed throughout.
+  const StandingStart standing{Eigen::Vector2d::Zero(), 2.0};
+  EXPECT_TRUE(standing.covers({1.7, 0.9}));
+  EXPECT_FALSE(standing.coversCell({1.7, 0.9}, 0.2));
+  EXPECT_TRUE(standing.coversCell({1.3, 0.9}, 0.2));
+  const auto column = [](double x, double y) {
+    return Eigen::AlignedBox3d(Eigen::Vector3d(x - 0.1, y - 0.1, 0.3),
+                               Eigen::Vector3d(x + 0.1, y + 0.1, 0.7));
+  };
+  const StateVec at(1.5, 0.5, 0.5, 0);
+  LocalPathPlan turn;
+  for (const double x : {1.5, -0.5, -5.0})
+    turn.poses.push_back(StateVec(x, 0.5, 0.5, x == 1.5 ? 0 : M_PI));
+  turn.reverse.assign(turn.poses.size(), false);
+
+  // Nothing unseen: the turn and the departure certify.
+  {
+    mgg_test::LocalScene s;
+    LocalPlanner planner(s.map, s.layer, s.cache, s.planning, s.robot,
+                         s.sensor);
+    planner.setStandingStart(standing);
+    EXPECT_TRUE(planner.pathStillCertified(turn, 0));
+  }
+  // An unseen body column straddling the disk's edge in the turning circle:
+  // observed for the legacy policy, never for the v2 one, and the turn is
+  // refused.
+  {
+    mgg_test::LocalScene s;
+    s.map.unseen_volumes.push_back(column(1.7, 0.9));
+    EXPECT_TRUE(turnSpaceObserved(s.map, s.robot, s.planning, at, &standing,
+                                  StandingTurnBody::kCellCentreInDisk));
+    EXPECT_FALSE(turnSpaceObserved(s.map, s.robot, s.planning, at, &standing,
+                                   StandingTurnBody::kWholeCellInDisk));
+    LocalPlanner planner(s.map, s.layer, s.cache, s.planning, s.robot,
+                         s.sensor);
+    planner.setStandingStart(standing);
+    EXPECT_FALSE(planner.pathStillCertified(turn, 0));
+  }
+  // The same unseen column wholly in the disk passes; made occupied, it
+  // blocks the turn.
+  {
+    mgg_test::LocalScene s;
+    s.map.unseen_volumes.push_back(column(1.3, 0.9));
+    EXPECT_TRUE(turnSpaceObserved(s.map, s.robot, s.planning, at, &standing,
+                                  StandingTurnBody::kWholeCellInDisk));
+    LocalPlanner planner(s.map, s.layer, s.cache, s.planning, s.robot,
+                         s.sensor);
+    planner.setStandingStart(standing);
+    EXPECT_TRUE(planner.pathStillCertified(turn, 0));
+    s.map.unseen_volumes.clear();
+    s.map.solids.push_back(column(1.3, 0.9));
+    s.cache.flushAll();
+    EXPECT_FALSE(roomToTurn(s.map, s.robot, s.planning, at, &standing,
+                            StandingTurnBody::kWholeCellInDisk));
+    EXPECT_FALSE(planner.pathStillCertified(turn, 0));
+  }
+}

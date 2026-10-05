@@ -775,3 +775,59 @@ TEST(LocalPlanningCore, OdometryJumpRevokesStandingStartForGood) {
   core.setGuidance(standingGuidance("s1", 2, true, {0.1, 0.1}));
   EXPECT_FALSE(core.standingStart());
 }
+
+TEST(LocalPlanningCore, LeavingTheDiskBetweenSessionsEndsTheStandingStart) {
+  // Applied in s1; then no block is held (a new session before its
+  // guidance, or IDLE) while the robot drives out of the disk and back in
+  // steps short of a jump. A valid block of the same boot arriving after
+  // that, even one issued before the drive, never re-applies it.
+  mgg_test::Corridor corridor;
+  const StateVec base = basePose(0.1, 0.1);
+  const auto outAndBack = [](LocalPlanningCore& core) {
+    for (double x = 0.35; x <= 2.6; x += 0.25) core.onOdometry(basePose(x, 0.1));
+    for (double x = 2.35; x >= 0.1; x -= 0.25) core.onOdometry(basePose(x, 0.1));
+    core.onOdometry(basePose(0.1, 0.1));
+  };
+  LocalModeRequest idle;
+  idle.session_id = "s1";
+  idle.request_id = "r-idle";
+  idle.mode = LocalMode::kIdle;
+  for (const bool use_idle : {false, true}) {
+    SCOPED_TRACE(use_idle ? "IDLE" : "session change");
+    LocalPlanningCore core(mgg_test::sceneParams());
+    observeBlind(core, corridor, base);
+    ASSERT_TRUE(
+        core.setMode(follow("s1", "r1", drivingPoint(4.6, 0.1))).accepted);
+    core.setGuidance(standingGuidance("s1", 1, true, {0.1, 0.1}));
+    ASSERT_TRUE(core.standingStart());
+    if (use_idle) {
+      ASSERT_TRUE(core.setMode(idle).accepted);
+    } else {
+      ASSERT_TRUE(
+          core.setMode(follow("s2", "r2", drivingPoint(4.6, 0.1))).accepted);
+    }
+    EXPECT_FALSE(core.standingStart());
+    outAndBack(core);
+    const std::string session = use_idle ? "s1" : "s2";
+    if (use_idle)
+      ASSERT_TRUE(
+          core.setMode(follow("s1", "r3", drivingPoint(4.6, 0.1))).accepted);
+    core.setGuidance(standingGuidance(session, 2, true, {0.1, 0.1}));
+    EXPECT_FALSE(core.standingStart());
+    core.setGuidance(standingGuidance(session, 3, true, {0.1, 0.1}));
+    EXPECT_FALSE(core.standingStart());
+  }
+  {
+    // Control: no drive in between, so the next session's block applies.
+    LocalPlanningCore core(mgg_test::sceneParams());
+    observeBlind(core, corridor, base);
+    ASSERT_TRUE(
+        core.setMode(follow("s1", "r1", drivingPoint(4.6, 0.1))).accepted);
+    core.setGuidance(standingGuidance("s1", 1, true, {0.1, 0.1}));
+    ASSERT_TRUE(
+        core.setMode(follow("s2", "r2", drivingPoint(4.6, 0.1))).accepted);
+    EXPECT_FALSE(core.standingStart());
+    core.setGuidance(standingGuidance("s2", 2, true, {0.1, 0.1}));
+    EXPECT_TRUE(core.standingStart());
+  }
+}

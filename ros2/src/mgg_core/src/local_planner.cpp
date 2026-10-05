@@ -90,7 +90,8 @@ bool LocalPlanner::certify(LocalPathPlan& path, const NoGoZones& zones) {
   GraphManager graph;
   auto room = cache_.turnRoom([&](const StateVec& p) {
     return roomToTurn(map_, robot_, planning_, p,
-                      standing_ ? &*standing_ : nullptr);
+                      standing_ ? &*standing_ : nullptr,
+                      StandingTurnBody::kWholeCellInDisk);
   });
   auto slope = cache_.slope([&](const Eigen::Vector3d& p) {
     return groundSlope(ground, p, robot_.size.head<2>().maxCoeff(), nullptr);
@@ -371,7 +372,8 @@ LocalPlanResult LocalPlanner::search(const LocalPlanInputs& in,
     // recorded reverse odometry must not become a fresh backwards escape,
     // nor may a forward suffix be appended to a reverse commitment.
     if (!roomToTurn(map_, robot_, planning_, in.pose,
-                    standing_ ? &*standing_ : nullptr)) {
+                    standing_ ? &*standing_ : nullptr,
+                    StandingTurnBody::kWholeCellInDisk)) {
       auto remaining = committedPrefix(*in.executing_path, in.progress_m,
                                        pathLength(*in.executing_path));
       auto continuation = identity;
@@ -481,7 +483,8 @@ LocalPlanResult LocalPlanner::search(const LocalPlanInputs& in,
   const auto lattice = buildGridGraph(graph, root, grid, ctx, 0);
   auto room = cache_.turnRoom([&](const StateVec& p) {
     return roomToTurn(map_, robot_, planning_, p,
-                      standing_ ? &*standing_ : nullptr);
+                      standing_ ? &*standing_ : nullptr,
+                      StandingTurnBody::kWholeCellInDisk);
   });
   auto slope = cache_.slope([&](const Eigen::Vector3d& p) {
     return groundSlope(ground, p, robot_.size.head<2>().maxCoeff(), nullptr);

@@ -157,12 +157,13 @@ class LocalPlanningCore {
   /// robot's anchor stays in its disk, placed in the odometry frame at
   /// first application (needing a transform then) and never moved or
   /// enlarged after. It ends for good, never applied again by this core,
-  /// when the anchor leaves the disk, odometry jumps, or an accepted block
-  /// revokes it (valid false) after it was applied; a revocation before
-  /// the first application is not final. A new session drops the block
-  /// until that session's guidance brings one. Every change withdraws the
-  /// ground layer, the certification cache and every retained path, as a
-  /// map change of everything does.
+  /// when the anchor leaves the disk (tracked on every pose once the disk
+  /// is placed, with or without a block held), odometry jumps, or an
+  /// accepted block revokes it (valid false) after it was applied; a
+  /// revocation before the first application is not final. A new session
+  /// drops the block until that session's guidance brings one. Every
+  /// change withdraws the ground layer, the certification cache and every
+  /// retained path, as a map change of everything does.
   void setGuidance(const LocalGuidance& guidance);
   /// Zones in `frame_id` (empty: odometry), re-transformed every cycle.
   /// Retained paths entering them, or every retained path when the zones

@@ -87,6 +87,17 @@ double groundSlope(const GroundProjection& ground,
 bool turnClear(const MapInterface& map, const RobotParams& robot,
                const StateVec& state);
 
+/// Which map cells of a standing start's disk turnSpaceObserved takes as
+/// observed body volume, unseen though it is.
+enum class StandingTurnBody {
+  /// Every cell whose centre lies in the disk (StandingStart::covers): the
+  /// legacy planner's policy.
+  kCellCentreInDisk,
+  /// Only a cell whose whole square lies in the disk
+  /// (StandingStart::coversCell): the v2 local planner's, as its sweeps.
+  kWholeCellInDisk,
+};
+
 /// Whether the robot at `state`, at driving height, has observed where it
 /// would turn in place: with PlanningParams::min_observed_ground_fraction
 /// set, at least that fraction of the map cells meeting its turning circle
@@ -99,16 +110,21 @@ bool turnClear(const MapInterface& map, const RobotParams& robot,
 /// planner grids carve free space more sparsely higher up (robot_1's run-5
 /// grid leaves 23 % of the voxels 0.6 to 0.8 m over the floor unknown). True
 /// when the fraction is 0. With `standing`, a cell in its disk counts as
-/// observed ground unless ground was found under it too far down.
+/// observed ground unless ground was found under it too far down, and its
+/// body column as observed where `standing_body` says.
 bool turnSpaceObserved(const MapInterface& map, const RobotParams& robot,
                        const PlanningParams& planning, const StateVec& state,
-                       const StandingStart* standing = nullptr);
+                       const StandingStart* standing = nullptr,
+                       StandingTurnBody standing_body =
+                           StandingTurnBody::kCellCentreInDisk);
 
 /// Whether a ground robot may turn in place at `state`: turnClear, and
 /// turnSpaceObserved. Unknown space passes turnClear alone.
 bool roomToTurn(const MapInterface& map, const RobotParams& robot,
                 const PlanningParams& planning, const StateVec& state,
-                const StandingStart* standing = nullptr);
+                const StandingStart* standing = nullptr,
+                StandingTurnBody standing_body =
+                    StandingTurnBody::kCellCentreInDisk);
 
 /// A fully observed first-goal arrival disk, independent of the standing
 /// prior. Every ground column touched by any arrival's turn circle must

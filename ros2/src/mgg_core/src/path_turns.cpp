@@ -389,7 +389,8 @@ bool turnClear(const MapInterface& map, const RobotParams& robot,
 
 bool turnSpaceObserved(const MapInterface& map, const RobotParams& robot,
                        const PlanningParams& planning, const StateVec& state,
-                       const StandingStart* standing) {
+                       const StandingStart* standing,
+                       StandingTurnBody standing_body) {
   const double min_ground = planning.min_observed_ground_fraction;
   if (!(min_ground > 0.0)) return true;
   const Eigen::Vector3d center = turnCenter(robot, state);
@@ -410,7 +411,10 @@ bool turnSpaceObserved(const MapInterface& map, const RobotParams& robot,
     // seen: observed unless it was seen to fall away.
     const bool standing_on =
         standing != nullptr && standing->covers(cell.center);
-    bool observed = standing_on;
+    bool observed =
+        standing_on &&
+        (standing_body == StandingTurnBody::kCellCentreInDisk ||
+         standing->coversCell(cell.center, resolution));
     for (double z = center.z() - 0.5 * height;
          z <= center.z() + 0.5 * height + 1e-9 && !observed;
          z += resolution) {
@@ -438,9 +442,11 @@ bool turnSpaceObserved(const MapInterface& map, const RobotParams& robot,
 
 bool roomToTurn(const MapInterface& map, const RobotParams& robot,
                 const PlanningParams& planning, const StateVec& state,
-                const StandingStart* standing) {
+                const StandingStart* standing,
+                StandingTurnBody standing_body) {
   return turnClear(map, robot, state) &&
-         turnSpaceObserved(map, robot, planning, state, standing);
+         turnSpaceObserved(map, robot, planning, state, standing,
+                           standing_body);
 }
 
 bool observedArrivalDisk(const MapInterface& map, const RobotParams& robot,

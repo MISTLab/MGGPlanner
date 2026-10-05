@@ -193,6 +193,11 @@ bool LocalPlanningCore::usable(const GuidanceStandingStart& block) {
 }
 
 void LocalPlanningCore::refreshStandingStart() {
+  // Leaving a placed disk ends it whether or not a block is held now: across
+  // a session change or IDLE, a robot that left and came back never stands
+  // again.
+  if (standing_ && have_pose_ && !standing_->odom.covers(anchor_.head<2>()))
+    standing_start_ended_ = true;
   bool apply = false;
   if (standing_block_ && usable(standing_block_->block) && have_pose_ &&
       !standing_start_ended_) {
@@ -209,7 +214,7 @@ void LocalPlanningCore::refreshStandingStart() {
     }
     if (standing_) {
       apply = standing_->odom.covers(anchor_.head<2>());
-      if (!apply) standing_start_ended_ = true;
+      if (!apply) standing_start_ended_ = true;  // placed outside it
     }
   }
   if (apply == standing_applied_) return;
