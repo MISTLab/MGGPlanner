@@ -29,10 +29,15 @@ namespace mgg_ros {
 /// more): the small ground robot and map helpers that test uses.
 class PlannerNodeTestPeer {
  public:
+  static bool hasSnapshotSubscription(const PlannerNode& node) {
+    return node.mapping_snapshot_sub_ != nullptr;
+  }
   static mgg_test::NativeSceneMap& sceneMap(PlannerNode& node) {
     return dynamic_cast<mgg_test::NativeSceneMap&>(*node.map_);
   }
   static void installSceneMap(PlannerNode& node) {
+    // Disconnect callbacks before replacing their MOLA target.
+    node.mapping_snapshot_sub_.reset();
     node.mola_map_ = nullptr;
     node.keyframe_source_.reset();
     node.map_ = std::make_unique<mgg_test::NativeSceneMap>(
@@ -243,6 +248,20 @@ std::shared_ptr<PlannerNode> makeFleetNode(int robot_id) {
 }
 
 }  // namespace
+
+TEST(FleetExploration, SceneFixtureDisconnectsSnapshotSubscription) {
+  rclcpp::init(0, nullptr);
+  rclcpp::NodeOptions options;
+  options.parameter_overrides({rclcpp::Parameter(
+      "map.mola.peer_root", "/nonexistent/test_scene")});
+  options.automatically_declare_parameters_from_overrides(true);
+  auto node = std::make_shared<PlannerNode>(options);
+  EXPECT_TRUE(PlannerNodeTestPeer::hasSnapshotSubscription(*node));
+  PlannerNodeTestPeer::installSceneMap(*node);
+  EXPECT_FALSE(PlannerNodeTestPeer::hasSnapshotSubscription(*node));
+  node.reset();
+  rclcpp::shutdown();
+}
 
 TEST(FleetExploration, TwoPlannersSplitTheFrontiersAndExploreTheCorridor) {
   rclcpp::init(0, nullptr);

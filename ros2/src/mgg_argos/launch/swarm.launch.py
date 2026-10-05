@@ -1,5 +1,9 @@
 """Four foot-bots exploring under the MGG planner.
 
+Persistent-map migration is incomplete: the shipped parameters lack a MOLA
+product root and this launch starts no MOLA producer. Planner construction fails
+until those inputs are supplied; see ROS2_PORT_PLAN.md migration follow-ups.
+
 Used for both scenes: the maze and the Bistro street differ only in the
 experiment file and the parameters, not in how the nodes are wired.
 
@@ -64,7 +68,6 @@ def generate_launch_description():
             parameters=[params, sim_time, robot_id],
             remappings=[
                 ('odometry', f'/{robot}/odometry'),
-                ('pointcloud', f'/{robot}/pointcloud'),
                 ('graph_markers', f'/{robot}/graph_markers'),
                 # One topic, all four planners. Self-messages are discarded by
                 # the planner, so this is a full mesh without the wiring.

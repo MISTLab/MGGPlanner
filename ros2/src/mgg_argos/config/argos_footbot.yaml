@@ -21,7 +21,6 @@ mggplanner_node:
     # through.
     map:
       resolution: 0.1
-      max_range: 20.0
 
     RobotParams:
       type: kGroundRobot

@@ -372,10 +372,15 @@ class MolaFloorProduct {
 
 class PlannerNodeTestPeer {
  public:
+  static bool hasSnapshotSubscription(const PlannerNode& node) {
+    return node.mapping_snapshot_sub_ != nullptr;
+  }
   static mgg_test::NativeSceneMap& sceneMap(PlannerNode& node) {
     return dynamic_cast<mgg_test::NativeSceneMap&>(*node.map_);
   }
   static void installSceneMap(PlannerNode& node) {
+    // Disconnect callbacks before replacing their MOLA target.
+    node.mapping_snapshot_sub_.reset();
     node.mola_map_ = nullptr;
     node.keyframe_source_.reset();
     node.map_ = std::make_unique<mgg_test::NativeSceneMap>(
@@ -654,6 +659,8 @@ class PlannerNodeTestPeer {
   static CountingBoxMap* countBoxQueries(PlannerNode& node) {
     auto map = std::make_unique<CountingBoxMap>();
     auto* result = map.get();
+    // Disconnect callbacks before replacing their MOLA target.
+    node.mapping_snapshot_sub_.reset();
     node.mola_map_ = nullptr;
     node.map_ = std::move(map);
     node.ground_ = std::make_unique<mgg::GroundProjection>(*node.map_, node.planning_params_);
@@ -729,6 +736,8 @@ class PlannerNodeTestPeer {
     return node.groundPosePairsAdmissible(poses);
   }
   static void useSceneMap(PlannerNode& node, std::unique_ptr<mgg_test::NativeSceneMap> map) {
+    // Disconnect callbacks before replacing their MOLA target.
+    node.mapping_snapshot_sub_.reset();
     node.mola_map_ = nullptr;
     node.map_ = std::move(map);
     node.ground_ = std::make_unique<mgg::GroundProjection>(
@@ -2358,6 +2367,34 @@ class PlannerNodeTest : public ::testing::Test {
   static void SetUpTestSuite() { rclcpp::init(0, nullptr); }
   static void TearDownTestSuite() { rclcpp::shutdown(); }
 };
+
+TEST_F(PlannerNodeTest, SceneMapReplacementsDisconnectSnapshotSubscription) {
+  const auto verify = [](const auto& replace) {
+    rclcpp::NodeOptions options;
+    options.parameter_overrides({rclcpp::Parameter(
+        "map.mola.peer_root", "/nonexistent/test_scene")});
+    options.automatically_declare_parameters_from_overrides(true);
+    auto node = std::make_shared<PlannerNode>(options);
+    ASSERT_TRUE(PlannerNodeTestPeer::hasSnapshotSubscription(*node));
+    replace(*node);
+    EXPECT_FALSE(PlannerNodeTestPeer::hasSnapshotSubscription(*node));
+  };
+  {
+    SCOPED_TRACE("installSceneMap");
+    verify(PlannerNodeTestPeer::installSceneMap);
+  }
+  {
+    SCOPED_TRACE("useSceneMap");
+    verify([](PlannerNode& node) {
+      PlannerNodeTestPeer::useSceneMap(
+          node, std::make_unique<mgg_test::NativeSceneMap>());
+    });
+  }
+  {
+    SCOPED_TRACE("countBoxQueries");
+    verify([](PlannerNode& node) { PlannerNodeTestPeer::countBoxQueries(node); });
+  }
+}
 
 TEST_F(PlannerNodeTest, ArchitectureParameter) {
   auto node = makeNode("architecture_default");
@@ -5012,11 +5049,11 @@ TEST_F(PlannerNodeTest, NeighbourRoadmapDoesNotReachThroughAKnownWall) {
 }
 
 TEST_F(PlannerNodeTest, ARobotAgainstAWallDepartsButItsPoseIsNoGoalLater) {
-  // The robot stopped with its box touching a wall (robot_1 on the SubT
-  // return, 2026-09-23). Its home route starts with a turn without room,
+  // A near-wall variant of the robot_1 SubT return incident (2026-09-23).
+  // Its home route starts with a turn without room,
   // so a validated departure must precede the whole home route. The initial
   // roadmap link is clear only for its centre line. Once driven away, the
-  // same pose as a goal is refused: that segment was never checked for the
+  // nearby wall-penetrating pose as a goal is refused: it was never checked for the
   // box, so it is not a roadmap edge (review r0).
   auto node = makeNode("wall_departure");
   PlannerNodeTestPeer::observeFloor(*node, -1.5, 6.0, -1.5, 1.5);
@@ -5027,9 +5064,10 @@ TEST_F(PlannerNodeTest, ARobotAgainstAWallDepartsButItsPoseIsNoGoalLater) {
     PlannerNodeTestPeer::acceptOdometry(*node, x, 0.0, stamp);
     stamp += 1.0;
   }
-  // The 0.2 m box at y = 0.52 reaches into the wall voxels from y = 0.6.
-  // Native closed cells require a nonpenetrating starting box. A 1 mm
-  // gap still leaves no turning room beside the wall at y = 0.6.
+  // At y = 0.499, the 0.2 m box stops 1 mm short of wall cells at y = 0.6,
+  // but still has no turning room. The later goal at y = 0.52 penetrates
+  // those cells. Recovery from a penetrating start remains a separate
+  // native-map qualification (ROS2_PORT_PLAN.md migration follow-ups).
   PlannerNodeTestPeer::acceptOdometry(*node, 2.0, 0.499, stamp++);
 
   auto request = std::make_shared<mgg_msgs::srv::PlanObjective::Request>();
@@ -5757,28 +5795,27 @@ TEST_F(PlannerNodeTest, SharpTurnFallbackShortcutStillPreservesItsReverseRefuge)
 
 namespace {
 
-/// A robot 0.6 m long and 0.2 m wide in a corridor 0.5 m wide from `from`
-/// to `to` along x (walls at y = +-0.25) or, `along_y`, along y (walls at
-/// x = +-0.25), on a floor mapped from -3 to 4 along it and -1.5 to 1.5
-/// across: room to drive it along the corridor, not to turn it in place,
-/// since its corners reach 0.32 m from its centre. With `across`, the
-/// corridor runs along x and is 0.6 m wide (walls' faces at y = +-0.3), so
-/// that the robot fits in it facing across, its ends against the walls.
+/// A robot 0.6 m long and 0.2 m wide on a mapped corridor floor. Wall
+/// observations are at +/-0.25 m across the corridor, which runs along x
+/// or, with `along_y`, along y. With `wide_corridor`, observations move to
+/// +/-0.35 m on either axis (inner cell faces at +/-0.3 m), providing extra
+/// straight-line clearance without turning room: corners reach 0.32 m from
+/// the robot's centre. On the x axis this also fits the robot facing across.
 std::shared_ptr<PlannerNode> boxedIn(const std::string& name, double from,
                                      double to, bool along_y = false,
-                                     bool across = false) {
+                                     bool wide_corridor = false) {
   auto node = makeNode(name);
   PlannerNodeTestPeer::setRobotFootprint(*node, 0.6, 0.2);
   if (along_y) {
     // At voxel centres: stepping 0.1 m from -3.0 drifts across a voxel
     // boundary and leaves a row of the floor unseen.
     PlannerNodeTestPeer::observeFloor(*node, -1.55, 1.55, -3.05, 4.05);
-    const double wall = across ? 0.35 : 0.25;
+    const double wall = wide_corridor ? 0.35 : 0.25;
     PlannerNodeTestPeer::observeWallAlongY(*node, from, to, wall);
     PlannerNodeTestPeer::observeWallAlongY(*node, from, to, -wall);
   } else {
     PlannerNodeTestPeer::observeFloor(*node, -3.0, 4.0, -1.5, 1.5);
-    const double wall = across ? 0.35 : 0.25;
+    const double wall = wide_corridor ? 0.35 : 0.25;
     PlannerNodeTestPeer::observeWall(*node, from, to, wall);
     PlannerNodeTestPeer::observeWall(*node, from, to, -wall);
   }
@@ -5858,7 +5895,7 @@ TEST_F(PlannerNodeTest, ABoxedInRobotReversesOutWhenOnlyBehindHasRoom) {
     SCOPED_TRACE(along_y ? "along y" : "along x");
     const double yaw = along_y ? M_PI / 2.0 : 0.0;
     auto node = boxedIn(along_y ? "boxed_behind_y" : "boxed_behind", -0.4,
-                        2.5, along_y, /*across=*/along_y);
+                        2.5, along_y, /*wide_corridor=*/along_y);
     const mgg::StateVec start =
         PlannerNodeTestPeer::drivingState(*node, 0.0, 0.0, yaw);
     ASSERT_FALSE(PlannerNodeTestPeer::roomToTurn(*node, start));

@@ -111,7 +111,7 @@ mgg_core/          ROS-free C++17 library.  Eigen only.
 
 mgg_msgs/          planner_msgs, cleaned and made ROS 2 legal
 mgg_ros/           rclcpp node: params, services, TF, viz, core<->msg conversion
-mgg_map_octomap/   MapInterface from PointCloud2 + TF (standalone / ARGoS / robot)
+mgg_map_octomap/   MOLA snapshot MapInterface and native grids; local rolling voxels
 mgg_cslam/         MapInterface + PoseSource from Swarm-SLAM   <- section 3
 mgg_pci/           control interface; path out to whatever tracks it
 mgg_argos/         ARGoS bridge, controller, experiments, compose  <- section 5
@@ -550,12 +550,12 @@ Phases 3, 4, and 6 are largely independent of 2 and 5 and can be parallelized.
 | Risk | Impact | Mitigation |
 |---|---|---|
 | Core extraction reveals hidden ROS coupling in `rrg.cpp` | Phase 2 slips | The 5% measurement is line-level, not semantic; budget the upper range |
-| Native MOLA grid free-space carving differs from TSDF | Frontiers/gain shift vs published runs | Phase 0 baseline, phase 4 comparison gate |
+| MOLA product observation semantics differ from historical TSDF maps | Frontiers/gain shift vs published runs | Validate producer free/occupied/unknown evidence and replay representative snapshots through native-grid gain tests |
 | Loop-closure deformation corrupts the occupancy map | Global planning degrades after closures | Keyframe-anchored submaps (3.3); never re-integrate raw data |
 | cslam optimization rate too slow for planning | Planner acts on stale global geometry | Local grid uses live submap; only global graph waits on optimization |
 | Service-client deadlock under ROS 2 executors | Hangs resembling planner bugs | Design executors up front (section 6) |
 | Narrow-FOV sensor changes exploration behaviour | Not comparable to the paper | Depth camera ring (5.4) |
-| Native MOLA grid query cost in hot loops | Planning rate drops | Voxel-hash fallback behind the same interface |
+| Native MOLA grid query cost in hot loops | Planning rate drops | Profile representative native-grid fixtures and enforce query work bounds and planner deadlines |
 | Filament + Vulkan in Docker | Blocks all-in-Docker | Keep host-ARGoS working as fallback |
 
 ## 9. Status
@@ -578,3 +578,27 @@ by robot id and the protocol carries a robot list.
 Phases 0 and 1 are cheap, are pure improvements to the existing ROS 1 codebase,
 and de-risk the largest assumption in the plan. Start there before committing
 to the rest.
+
+## Persistent-map migration follow-ups
+
+The standalone `argos_single.launch.py` and `swarm.launch.py` are not currently
+runnable with their shipped planner parameters. They previously relied on direct
+cloud ingestion; the persistent planner now requires MOLA snapshots. The
+`argos_footbot.yaml`, `maze.yaml`, `bistro.yaml`, and `bunker_maze.yaml` configurations
+do not supply an absolute `map.mola.peer_root`, so planner construction fails.
+Removing obsolete cloud remaps and `map.max_range` settings does not restore
+these launches. Before claiming ARGoS exploration support, connect a MOLA product
+producer, configure each robot's product root and matching `mapping_snapshot`
+stream, and qualify the launch end to end. Bridge-only checks remain valid.
+
+The native wall-departure fixture uses a nonpenetrating start with 1 mm clearance.
+It does not qualify recovery from the original wall-penetrating start at
+(x=2.0, y=0.52), whose 0.2 m body overlaps wall cells beginning at y=0.6.
+A native persistent-map regression for that incident is still needed: explicitly
+verify occupied-root handling and certify any permitted departure without
+relaxing the swept-body or subsequent goal checks. Recovery behavior must be
+qualified separately, not inferred from the near-wall departure test.
+
+Removal-lane build timings are warm incremental measurements. They demonstrate
+the expanded test gate, not a cold-build saving; a controlled cold-build
+comparison is required before making a build-cost claim.

@@ -34,7 +34,6 @@
     # through.
     map:
       resolution: 0.15
-      max_range: 20.0
 
     RobotParams:
       type: kGroundRobot

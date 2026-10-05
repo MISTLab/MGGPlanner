@@ -1,5 +1,9 @@
 """One foot-bot exploring under the MGG planner, driven by ARGoS.
 
+Persistent-map migration is incomplete: the shipped parameters lack a MOLA
+product root and this launch starts no MOLA producer. Planner construction fails
+until those inputs are supplied; see ROS2_PORT_PLAN.md migration follow-ups.
+
 Start this first: the bridge creates the Unix socket and ARGoS connects to
 it. Then run the simulator with the matching experiment file,
 
@@ -56,7 +60,6 @@ def generate_launch_description():
         parameters=[params, sim_time],
         remappings=[
             ('odometry', [robot, '/odometry']),
-            ('pointcloud', [robot, '/pointcloud']),
             ('graph_markers', [robot, '/graph_markers']),
         ])
 
