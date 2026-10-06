@@ -660,5 +660,28 @@ TEST(GroundLayer, StandingStartSeedsBlindDisk) {
   finish(layer);
   EXPECT_EQ(admitted(layer), 0);
 }
+
+TEST(GroundLayer, MovingStandingDiskMatchesAFreshLayer) {
+  // The v2 local planner centres the disk on the robot every cycle. A move
+  // withdraws only what reads either disk and what rests on that, and
+  // certifies what a layer given the new disk from the start would.
+  BlindStartMap map;
+  GroundLayer moved(map, planning(), robot());
+  moved.reset({0.1, 0.1, 0.6}, 0);
+  moved.setStandingStart(StandingStart{Eigen::Vector2d(0.1, 0.1), 2.0});
+  finish(moved);
+  const auto columns = moved.occupancy().size();
+  moved.setStandingStart(StandingStart{Eigen::Vector2d(0.3, 0.1), 2.0});
+  EXPECT_GT(moved.pendingCount(), 0);
+  EXPECT_LT(moved.pendingCount(), static_cast<int>(columns));
+  finish(moved);
+
+  GroundLayer fresh(map, planning(), robot());
+  fresh.reset({0.1, 0.1, 0.6}, 0);
+  fresh.setStandingStart(StandingStart{Eigen::Vector2d(0.3, 0.1), 2.0});
+  finish(fresh);
+  EXPECT_GT(admitted(fresh), 0);
+  EXPECT_EQ(moved.occupancy(), fresh.occupancy());
+}
 }  // namespace
 }  // namespace mgg

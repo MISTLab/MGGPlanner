@@ -92,16 +92,6 @@ TEST(LocalPathConversions, RoundTripAndStatus) {
   EXPECT_EQ(guidance.frame_id, "map");
   EXPECT_EQ(guidance.route.size(), 2u);
   EXPECT_DOUBLE_EQ(guidance.route[1].y(), 2);
-  EXPECT_FALSE(guidance.standing_start.valid);
-  g.standing_start.valid = true;
-  g.standing_start.center.x = -1;
-  g.standing_start.radius = 1.5;
-  g.standing_start.boot = 11;
-  const auto standing = fromGuidanceMsg(g).standing_start;
-  EXPECT_TRUE(standing.valid);
-  EXPECT_DOUBLE_EQ(standing.center.x(), -1);
-  EXPECT_DOUBLE_EQ(standing.radius, 1.5);
-  EXPECT_EQ(standing.boot, 11u);
   g.kind = 9;
   EXPECT_THROW(fromGuidanceMsg(g), std::invalid_argument);
 

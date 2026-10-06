@@ -110,6 +110,11 @@ LocalPlanningParams LocalPlannerNode::loadParameters() {
       this, "local_map.resolution", params.window.resolution);
   params.ground_recheck_s = mgg_ros::declareOrGet<double>(
       this, "ground_recheck_s", params.ground_recheck_s);
+  // The planner node's parameter, from the same overrides: the lidar's
+  // ground blind radius, the standing disk's.
+  params.hanging_root_edge_length_max = std::max(
+      0.0, mgg_ros::declareOrGet<double>(this, "hanging_root_edge_length_max",
+                                         params.hanging_root_edge_length_max));
   // A fresh epoch per process: the executor tells a restarted planner's
   // paths from the old process's by it, and sequences restart at 1.
   params.epoch = static_cast<std::uint64_t>(
@@ -203,8 +208,6 @@ void LocalPlannerNode::onGuidance(const mgg_msgs::msg::GlobalGuidance& msg) {
   } catch (const std::invalid_argument& error) {
     RCLCPP_WARN(get_logger(), "ignoring guidance: %s", error.what());
   }
-  // A revoked standing start withdraws the paths that relied on it at once.
-  publishInvalidations(true);
 }
 
 void LocalPlannerNode::onNoGoZones(const geometry_msgs::msg::PoseArray& msg) {

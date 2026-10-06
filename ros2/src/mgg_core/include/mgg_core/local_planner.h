@@ -90,16 +90,17 @@ class LocalPlanner {
     track_.clear();
     cache_.flushAll();
   }
-  /// The robot stands in the disk where it started (StandingStart, owned by
-  /// the guidance planner): unobserved ground in it counts as ground, and
-  /// from a root in the disk a departure may hang across it up to the disk's
-  /// radius (hanging_root_edge_length_max) to observed ground, through the
-  /// body band the lidar cannot see where that lies wholly in the disk
+  /// The robot stands in the standing disk (StandingStart, which the v2
+  /// local core centres on the robot): unobserved ground in it counts as
+  /// ground, and from a root in the disk a departure may hang across it up
+  /// to the disk's radius (hanging_root_edge_length_max) to observed
+  /// ground, through the body band the lidar cannot see where that lies
+  /// wholly in the disk
   /// (StandingStart::coversCell; occupied still blocks, and unknown body
   /// volume past the disk's edge blocks as anywhere). Turns use it as
   /// legacy does, and a path may not end in it (StandingStart::admitsGoal)
-  /// unless its arrival disk is observed. The driver withdraws the cache and
-  /// every retained path on a change.
+  /// unless its arrival disk is observed. The driver withdraws the cache
+  /// where the disk was and is on a change.
   void setStandingStart(const std::optional<StandingStart>& standing) {
     standing_ = standing;
   }

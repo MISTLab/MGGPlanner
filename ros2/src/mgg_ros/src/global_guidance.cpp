@@ -19,8 +19,7 @@ bool GlobalGuidance::setMode(const mgg_msgs::srv::SetLocalPlannerMode::Request& 
 mgg_msgs::msg::GlobalGuidance GlobalGuidance::message(
     const std::vector<geometry_msgs::msg::Point>& route, bool complete,
     const std::string& frame, const std::string& reason,
-    const builtin_interfaces::msg::Time& stamp,
-    const std::optional<StandingStart>& standing, std::uint64_t boot) {
+    const builtin_interfaces::msg::Time& stamp) {
   mgg_msgs::msg::GlobalGuidance out;
   out.header.frame_id = frame;
   out.header.stamp = stamp;
@@ -34,13 +33,6 @@ mgg_msgs::msg::GlobalGuidance GlobalGuidance::message(
     out.target = route.back();
   } else if (complete) {
     out.kind = out.COMPLETE;
-  }
-  out.standing_start.boot = boot;
-  if (standing) {
-    out.standing_start.valid = true;
-    out.standing_start.center.x = standing->center.x();
-    out.standing_start.center.y = standing->center.y();
-    out.standing_start.radius = standing->radius;
   }
   last_ = out;
   return out;

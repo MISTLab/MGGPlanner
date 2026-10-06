@@ -206,9 +206,21 @@ void GroundLayer::setStandingStart(const std::optional<StandingStart>& standing)
       (!standing || (standing_->center == standing->center &&
                      standing_->radius == standing->radius));
   if (same) return;
+  // A column reads the disk only through whether it covers the column's
+  // centre and its whole cell; admissions resting on a column withdrawn
+  // here go with it (withdrawDescendants). The v2 local planner moves the
+  // disk with the robot every cycle: the columns both disks read alike
+  // keep their verdicts.
+  const auto reads = [this](const std::optional<StandingStart>& disk,
+                            const Eigen::Vector2d& xy) {
+    return std::make_pair(disk && disk->covers(xy),
+                          disk && disk->coversCell(xy, resolution_));
+  };
+  const std::optional<StandingStart> old = standing_;
   standing_ = standing;
-  // Admissions may rest on the old disk anywhere the flood went through it.
-  for (int i = 0; i < static_cast<int>(columns_.size()); ++i) markPending(i);
+  for (int i = 0; i < static_cast<int>(columns_.size()); ++i)
+    if (reads(old, center(i)) != reads(standing_, center(i))) markPending(i);
+  withdrawDescendants();
 }
 void GroundLayer::withdraw(const MapChange& change) {
   for (int i = 0; i < static_cast<int>(columns_.size()); ++i)

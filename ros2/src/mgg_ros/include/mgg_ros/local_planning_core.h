@@ -74,18 +74,6 @@ enum class GuidanceKind : std::uint8_t {
   kComplete = 2
 };
 
-/// GlobalGuidance's standing_start block (mgg_msgs/StandingStart): the
-/// guidance planner's proof that the robot stands in the disk where it
-/// started. Center is in the guidance frame.
-struct GuidanceStandingStart {
-  bool valid = false;
-  Eigen::Vector3d center = Eigen::Vector3d::Zero();
-  double radius = 0;
-  /// The guidance planner's incarnation; with LocalGuidance::sequence_id,
-  /// the block's identity.
-  std::uint64_t boot = 0;
-};
-
 struct LocalGuidance {
   std::string session_id;
   std::uint64_t sequence_id = 0;
@@ -95,7 +83,6 @@ struct LocalGuidance {
   Eigen::Vector3d target = Eigen::Vector3d::Zero();
   std::vector<Eigen::Vector3d> route;
   std::string reason;
-  GuidanceStandingStart standing_start;
 };
 
 struct LocalFeedback {
@@ -129,6 +116,10 @@ struct LocalPlanningParams {
   double ground_recheck_s = 0.02;
   /// An odometry step longer than this resets map, ground, cache and track.
   double reset_jump_m = 1.0;
+  /// The standing disk's radius (StandingStart), the planner node's
+  /// hanging_root_edge_length_max: the lidar's ground blind radius. Each
+  /// planning cycle centres the disk on the robot. 0 turns it off.
+  double hanging_root_edge_length_max = 0;
 };
 
 /// odom_T_frame for a named frame, or nullopt when there is no transform.
@@ -147,25 +138,7 @@ class LocalPlanningCore {
   LocalModeResponse setMode(const LocalModeRequest& request);
   /// The latest guidance of the current session wins. Guidance of another
   /// session is held until setMode starts that session (the global planner
-  /// may answer before the local planner hears of the session); a held
-  /// message never replaces a newer one, by (standing_start.boot,
-  /// sequence_id).
-  ///
-  /// The standing_start block is fenced by its identity before it changes
-  /// anything: a block no newer, by (boot, sequence_id), than the newest
-  /// accepted is ignored (stale or repeated), and once a disk is applied
-  /// only that disk's boot is heard. The current session's latest accepted
-  /// valid block is applied to the ground layer and the planner while the
-  /// robot's anchor stays in its disk, placed in the odometry frame at
-  /// first application (needing a transform then) and never moved or
-  /// enlarged after. It ends for good, never applied again by this core,
-  /// when the anchor leaves the disk (tracked on every pose once the disk
-  /// is placed, with or without a block held), odometry jumps, or an
-  /// accepted block revokes it (valid false) after it was applied; a
-  /// revocation before the first application is not final. A new session
-  /// drops the block until that session's guidance brings one. Every
-  /// change withdraws the ground layer, the certification cache and every
-  /// retained path, as a map change of everything does.
+  /// may answer before the local planner hears of the session).
   void setGuidance(const LocalGuidance& guidance);
   /// Zones in `frame_id` (empty: odometry), re-transformed every cycle.
   /// Retained paths entering them, or every retained path when the zones
@@ -191,7 +164,8 @@ class LocalPlanningCore {
   void setGroundRecheckBudget(double seconds);
   /// One planning cycle. A path it returns carries the epoch, the next
   /// sequence id and the session; the core then treats it as executing
-  /// (onFeedback).
+  /// (onFeedback). It first centres the standing disk on the robot
+  /// (standingStart).
   LocalPlanResult plan(std::chrono::steady_clock::time_point deadline);
   /// Whether a map change withdrew only the suffix of a retained path,
   /// beyond its still certified commitment, since the last call or plan:
@@ -227,11 +201,13 @@ class LocalPlanningCore {
   /// Retained paths whose suffix a map change withdrew, their commitment
   /// still certified (takeReplanRequest).
   std::uint64_t suffixWithdrawals() const { return suffix_withdrawals_; }
-  /// The standing start applied now, in the odometry frame.
-  std::optional<StandingStart> standingStart() const {
-    return standing_applied_ ? std::optional<StandingStart>(standing_->odom)
-                             : std::nullopt;
-  }
+  /// The standing disk applied now, in the odometry frame: legacy's
+  /// standing start, round where the robot was at the last planning cycle,
+  /// of radius hanging_root_edge_length_max. The ground layer seeds it as
+  /// ground and the planner departs from a hanging root across it; observed
+  /// drops, steps and occupied space still block. nullopt before the first
+  /// cycle or with a zero radius.
+  std::optional<StandingStart> standingStart() const { return standing_; }
 
  private:
   struct Retained {
@@ -241,16 +217,9 @@ class LocalPlanningCore {
     bool suffix_withdrawn = false;
     /// The executor refused it, or a path it extends (onFeedback).
     bool refused = false;
-  };
-  /// The disk first applied, with the boot that proved it.
-  struct AppliedStandingStart {
-    std::uint64_t boot = 0;
-    StandingStart odom;
-  };
-  /// An accepted standing_start block, with its guidance's frame.
-  struct StandingBlock {
-    GuidanceStandingStart block;
-    std::string frame_id;
+    /// The standing disk it was certified with: map changes recheck it
+    /// with this disk, not the one that moved with the robot since.
+    std::optional<StandingStart> standing;
   };
   StateVec anchorOf(const StateVec& base) const;
   double floorUnder(const StateVec& anchor) const;
@@ -258,13 +227,10 @@ class LocalPlanningCore {
   MapChange place(const StateVec& anchor, bool* reset);
   void resetAll(const StateVec& anchor, MapChange& change);
   void afterChange(const MapChange& change);
-  /// Takes the guidance's standing_start block unless the identity fence
-  /// refuses it (setGuidance); ends an applied standing start it revokes.
-  void acceptStandingStart(const LocalGuidance& guidance);
-  /// Whether a block is valid with a finite centre and positive radius.
-  static bool usable(const GuidanceStandingStart& block);
-  /// Applies, keeps or revokes the standing start (setGuidance).
-  void refreshStandingStart();
+  /// Centres the standing disk on the anchor. Not a map change: the ground
+  /// layer and the cache are withdrawn where the disk was and is, retained
+  /// paths keep the disk they were certified with.
+  void applyStandingDisk();
   /// The zones in the odometry frame; nullopt (naming `failed`) without a
   /// transform. Empty zones need none.
   std::optional<NoGoZones> zonesInOdom(std::string& failed) const;
@@ -303,16 +269,7 @@ class LocalPlanningCore {
   LocalModeRequest request_;
   std::optional<LocalGuidance> guidance_;
   std::optional<LocalGuidance> early_guidance_;
-  /// The current session's latest accepted block.
-  std::optional<StandingBlock> standing_block_;
-  /// The newest (boot, sequence_id) a block was accepted with.
-  std::optional<std::pair<std::uint64_t, std::uint64_t>> standing_identity_;
-  /// Set at first application, then fixed.
-  std::optional<AppliedStandingStart> standing_;
-  bool standing_applied_ = false;
-  /// The anchor left the disk, odometry jumped, or an applied standing
-  /// start was revoked: never stand again.
-  bool standing_start_ended_ = false;
+  std::optional<StandingStart> standing_;
   NoGoZones zones_;
   std::string zones_frame_;
 

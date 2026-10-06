@@ -76,27 +76,63 @@ OdomScan blindScan(const mgg_test::Corridor& corridor, const StateVec& base) {
   return scan;
 }
 
+/// Rays from `origin` down onto every 0.1 m of floor within 0.6 m along x
+/// and across the corridor: a view from above, into what the robot's own
+/// lidar cannot see.
+OdomScan surveyScan(const mgg_test::Corridor& corridor,
+                    const Eigen::Vector3d& origin) {
+  OdomScan scan;
+  scan.origin = origin;
+  for (double x = origin.x() - 0.6; x <= origin.x() + 0.6; x += 0.1) {
+    for (double y = -mgg_test::kWallY + 0.05; y < mgg_test::kWallY; y += 0.1) {
+      const Eigen::Vector3d direction =
+          (Eigen::Vector3d(x, y, mgg_test::kFloorTop) - origin).normalized();
+      double nearest = std::numeric_limits<double>::infinity();
+      for (const auto& solid : corridor.solids) {
+        const auto d = mgg::test::rayBoxDistance(origin, direction, solid);
+        if (d && *d < nearest) nearest = *d;
+      }
+      if (nearest <= 20) scan.points.push_back(origin + nearest * direction);
+    }
+  }
+  return scan;
+}
+
 void observeBlind(LocalPlanningCore& core, const mgg_test::Corridor& corridor,
                   const StateVec& base, int scans = 2) {
   core.onOdometry(base);
   for (int i = 0; i < scans; ++i) core.onScan(blindScan(corridor, base), base);
 }
 
-/// Guidance without a target, carrying the guidance planner's standing
-/// start block.
-LocalGuidance standingGuidance(const std::string& session,
-                               std::uint64_t sequence, bool valid,
-                               const Eigen::Vector2d& center,
-                               double radius = 2.0, std::uint64_t boot = 7) {
-  LocalGuidance g;
-  g.session_id = session;
-  g.sequence_id = sequence;
-  g.kind = GuidanceKind::kNone;
-  g.standing_start.valid = valid;
-  g.standing_start.center = Eigen::Vector3d(center.x(), center.y(), 0);
-  g.standing_start.radius = radius;
-  g.standing_start.boot = boot;
-  return g;
+/// The scene's parameters with a standing disk of `radius` (the lidar's
+/// ground blind radius is 1.45 m).
+LocalPlanningParams standingParams(double radius = 2.0) {
+  auto params = mgg_test::sceneParams();
+  params.hanging_root_edge_length_max = radius;
+  return params;
+}
+
+/// The executor driving `path` from `from` to `to` metres along it, every
+/// 0.25 m: feedback, odometry and a blind scan at each step. Returns the
+/// pose reached.
+StateVec drive(LocalPlanningCore& core, const mgg_test::Corridor& corridor,
+               const LocalPathPlan& path, double from, double to) {
+  StateVec moved = basePose(0, 0);
+  for (double progress = from + 0.25; progress <= to + 1e-9; progress += 0.25) {
+    LocalFeedback feedback;
+    feedback.session_id = path.session_id;
+    feedback.epoch = core.epoch();
+    feedback.sequence_id = path.sequence_id;
+    feedback.executing = true;
+    feedback.progress_m = progress;
+    feedback.speed_mps = 0.6;
+    core.onFeedback(feedback);
+    const StateVec at = mgg_test::poseAt(path.poses, progress);
+    moved = basePose(at.x(), at.y(), at[3]);
+    core.onOdometry(moved);
+    core.onScan(blindScan(corridor, moved), moved);
+  }
+  return moved;
 }
 
 int admittedCells(const LocalPlanningCore& core) {
@@ -641,313 +677,244 @@ TEST(LocalPlanningCore, RetentionFeedbackStopIsSessionAndEpochFenced) {
   }
 }
 
-TEST(LocalPlanningCore, StandingStartMovesFromRest) {
-  // Scans that leave the floor round the robot unseen. Without the guidance
-  // planner's proof the robot stays where it stands; with it, it departs.
+TEST(LocalPlanningCore, StandingDiskStartsBlindAnywhere) {
+  // Legacy's standing start, centred on the robot every cycle: wherever it
+  // stands, its lidar blind to the floor within 1.45 m, it departs. Without
+  // the disk it stays where it stands.
   mgg_test::Corridor corridor;
-  const StateVec base = basePose(0.1, 0.1);
-  LocalPlanningCore core(mgg_test::sceneParams());
-  core.setGroundRecheckBudget(5);
-  observeBlind(core, corridor, base);
-  ASSERT_TRUE(
-      core.setMode(follow("s1", "r1", drivingPoint(4.6, 0.1))).accepted);
-  EXPECT_EQ(admittedCells(core), 0);
-  const auto blind = core.plan(soon(5));
-  EXPECT_FALSE(blind.path) << blind.reason;
-
-  core.setGuidance(standingGuidance("s1", 1, true, {0.1, 0.1}));
-  ASSERT_TRUE(core.standingStart());
-  EXPECT_GT(admittedCells(core), 0);
-  const auto moving = core.plan(soon(5));
-  ASSERT_TRUE(moving.path) << moving.reason;
-  EXPECT_EQ(moving.status, LocalStatus::kMoving);
-  EXPECT_TRUE(moving.path->reaches_goal);
-  EXPECT_GE(mgg_test::pathLength(moving.path->poses), 4.2);
-}
-
-TEST(LocalPlanningCore, StandingStartHoldsAcrossItsDiskThenExpires) {
-  // The robot drives its departure across the blind disk, past 0.5 m to its
-  // edge: the executing path stays certified until the anchor leaves the
-  // disk. Then the prior is revoked for good, and the path is re-certified
-  // without it.
-  mgg_test::Corridor corridor;
-  const StateVec base = basePose(0.1, 0.1);
-  LocalPlanningCore core(mgg_test::sceneParams());
-  core.setGroundRecheckBudget(5);
-  observeBlind(core, corridor, base);
-  ASSERT_TRUE(
-      core.setMode(follow("s1", "r1", drivingPoint(4.6, 0.1))).accepted);
-  core.setGuidance(standingGuidance("s1", 1, true, {0.1, 0.1}));
-  const auto departure = core.plan(soon(5));
-  ASSERT_TRUE(departure.path) << departure.reason;
-  const auto& poses = departure.path->poses;
-  ASSERT_TRUE(core.takeInvalidations().empty());
-  bool left = false;
-  for (double progress = 0.25; progress <= 2.6; progress += 0.25) {
-    const StateVec at = mgg_test::poseAt(poses, progress);
-    LocalFeedback feedback;
-    feedback.session_id = "s1";
-    feedback.epoch = core.epoch();
-    feedback.sequence_id = departure.path->sequence_id;
-    feedback.executing = true;
-    feedback.progress_m = progress;
-    feedback.speed_mps = 0.6;
-    core.onFeedback(feedback);
-    const StateVec moved = basePose(at.x(), at.y(), at[3]);
-    const auto rechecks = core.retainedRechecks();
-    core.onOdometry(moved);
-    core.onScan(blindScan(corridor, moved), moved);
-    const bool inside =
-        (at.head<2>() - Eigen::Vector2d(0.1, 0.1)).norm() <= 2.0;
-    EXPECT_TRUE(core.takeInvalidations().empty()) << "at " << progress;
-    EXPECT_EQ(core.standingStart().has_value(), inside) << "at " << progress;
-    if (!inside && !left) {
-      left = true;
-      EXPECT_GT(core.retainedRechecks(), rechecks);
+  for (const StateVec& base : {basePose(0.1, 0.1), basePose(-2.1, 0.1, 0.6),
+                               basePose(5.9, 0.7, -2.0)}) {
+    for (const double radius : {0.0, 2.0}) {
+      SCOPED_TRACE(::testing::Message() << "at " << base.transpose()
+                                        << ", radius " << radius);
+      LocalPlanningCore core(standingParams(radius));
+      core.setGroundRecheckBudget(5);
+      observeBlind(core, corridor, base);
+      ASSERT_TRUE(core.setMode(follow("s1", "r1",
+                                      drivingPoint(base.x() + 4.5, 0.1)))
+                      .accepted);
+      const auto result = core.plan(soon(5));
+      if (radius == 0) {
+        EXPECT_FALSE(core.standingStart());
+        EXPECT_EQ(admittedCells(core), 0);
+        EXPECT_FALSE(result.path) << result.reason;
+        continue;
+      }
+      ASSERT_TRUE(core.standingStart());
+      EXPECT_TRUE(core.standingStart()->center.isApprox(base.head<2>()));
+      EXPECT_DOUBLE_EQ(core.standingStart()->radius, 2.0);
+      ASSERT_TRUE(result.path) << result.reason;
+      EXPECT_EQ(result.status, LocalStatus::kMoving);
+      EXPECT_TRUE(result.path->reaches_goal);
     }
   }
-  ASSERT_TRUE(left);
-  // Left, it never stands again, whatever the guidance says.
-  core.setGuidance(standingGuidance("s1", 2, true, {0.1, 0.1}));
-  EXPECT_FALSE(core.standingStart());
 }
 
-TEST(LocalPlanningCore, StandingStartRevocationWithdraws) {
-  // Expiry: the guidance planner's proof lapses (valid=false). Admissions
-  // and the path that relied on the prior are withdrawn, and the same
-  // unseen ground refuses again: a revocation after the prior was applied
-  // is final for its boot, whatever valid block follows.
+TEST(LocalPlanningCore, StandingDiskKeepsObservedDrops) {
+  // A pit across the corridor 0.8 to 1.2 m ahead, in the robot's blind
+  // ring and its disk, observed from above (surveyScan): still refused.
+  // The same scans over an unbroken floor give a path to the goal.
+  for (const bool pit : {false, true}) {
+    SCOPED_TRACE(pit ? "pit" : "floor");
+    mgg_test::Corridor corridor;
+    const Eigen::AlignedBox3d hole(Eigen::Vector3d(0.9, -2.5, -1.1),
+                                   Eigen::Vector3d(1.3, 2.5, 0.0));
+    if (pit) {
+      Eigen::AlignedBox3d beyond = corridor.solids.front();
+      corridor.solids.front().max().x() = hole.min().x();
+      beyond.min().x() = hole.max().x();
+      corridor.solids.push_back(beyond);
+      // Its bottom, 1 m down.
+      corridor.solids.emplace_back(
+          Eigen::Vector3d(-30, -10, mgg_test::kFloorTop - 1.2),
+          Eigen::Vector3d(40, 10, mgg_test::kFloorTop - 1.0));
+    }
+    LocalPlanningCore core(standingParams());
+    core.setGroundRecheckBudget(5);
+    const StateVec base = basePose(0.1, 0.1);
+    observeBlind(core, corridor, base);
+    core.onScan(surveyScan(corridor, Eigen::Vector3d(1.1, 0.1, 1.9)), base);
+    ASSERT_TRUE(
+        core.setMode(follow("s1", "r1", drivingPoint(4.6, 0.1))).accepted);
+    const auto result = core.plan(soon(5));
+    ASSERT_TRUE(core.standingStart());
+    if (!pit) {
+      ASSERT_TRUE(result.path) << result.reason;
+      EXPECT_TRUE(result.path->reaches_goal);
+      continue;
+    }
+    if (result.path) {
+      EXPECT_FALSE(result.path->reaches_goal);
+      for (const auto& pose : result.path->poses)
+        EXPECT_FALSE(mgg_test::footprintOverlaps(pose, {1.0, 0.6}, hole));
+    }
+  }
+}
+
+TEST(LocalPlanningCore, UnknownBeyondTheStandingDiskStillRefuses) {
+  // A disk smaller than the blind ring: the unseen ground between its edge
+  // and the observed floor stays unknown, and nothing crosses it.
   mgg_test::Corridor corridor;
   const StateVec base = basePose(0.1, 0.1);
-  LocalPlanningCore core(mgg_test::sceneParams());
+  LocalPlanningCore core(standingParams(1.0));
   core.setGroundRecheckBudget(5);
   observeBlind(core, corridor, base);
   ASSERT_TRUE(
       core.setMode(follow("s1", "r1", drivingPoint(4.6, 0.1))).accepted);
-  core.setGuidance(standingGuidance("s1", 1, true, {0.1, 0.1}));
+  const auto result = core.plan(soon(5));
+  ASSERT_TRUE(core.standingStart());
+  EXPECT_EQ(core.ground().verdict({0.3, 0.1}), GroundVerdict::kAdmitted);
+  EXPECT_NE(core.ground().verdict({1.35, 0.1}), GroundVerdict::kAdmitted);
+  EXPECT_FALSE(result.path) << result.reason;
+}
+
+TEST(LocalPlanningCore, StandingDiskSurvivesSessionStopAndRestart) {
+  // The live failure: a session ended, guidance went idle, and Explore could
+  // not restart. The disk belongs to the local core alone: after IDLE, a
+  // drive and a new session, the robot departs again.
+  mgg_test::Corridor corridor;
+  LocalPlanningCore core(standingParams());
+  core.setGroundRecheckBudget(5);
+  observeBlind(core, corridor, basePose(0.1, 0.1));
+  ASSERT_TRUE(
+      core.setMode(follow("s1", "r1", drivingPoint(4.6, 0.1))).accepted);
   const auto first = core.plan(soon(5));
   ASSERT_TRUE(first.path) << first.reason;
-  ASSERT_TRUE(core.takeInvalidations().empty());
+  const StateVec stopped = drive(core, corridor, *first.path, 0, 1.0);
 
-  core.setGuidance(standingGuidance("s1", 2, false, {0.1, 0.1}));
-  EXPECT_FALSE(core.standingStart());
-  const auto invalidations = core.takeInvalidations();
-  ASSERT_EQ(invalidations.size(), 1u);
-  EXPECT_EQ(invalidations.front().sequence_id, first.path->sequence_id);
-  EXPECT_EQ(admittedCells(core), 0);
-  const auto refused = core.plan(soon(5));
-  EXPECT_FALSE(refused.path) << refused.reason;
-
-  core.setGuidance(standingGuidance("s1", 3, true, {0.1, 0.1}));
-  EXPECT_FALSE(core.standingStart());
-  EXPECT_EQ(admittedCells(core), 0);
-  const auto still = core.plan(soon(5));
-  EXPECT_FALSE(still.path) << still.reason;
-  // Nor does a new session bring it back.
-  ASSERT_TRUE(
-      core.setMode(follow("s2", "r2", drivingPoint(4.6, 0.1))).accepted);
-  core.setGuidance(standingGuidance("s2", 4, true, {0.1, 0.1}));
-  EXPECT_FALSE(core.standingStart());
-}
-
-TEST(LocalPlanningCore, StandingStartRevokedBeforeItsFirstApplicationMayApply) {
-  // A revocation before any prior was applied (the proof not yet there) is
-  // not final: the first valid block then applies.
-  mgg_test::Corridor corridor;
-  const StateVec base = basePose(0.1, 0.1);
-  LocalPlanningCore core(mgg_test::sceneParams());
-  core.setGroundRecheckBudget(5);
-  observeBlind(core, corridor, base);
-  ASSERT_TRUE(
-      core.setMode(follow("s1", "r1", drivingPoint(4.6, 0.1))).accepted);
-  core.setGuidance(standingGuidance("s1", 1, false, {0.1, 0.1}));
-  EXPECT_FALSE(core.standingStart());
-  EXPECT_FALSE(core.plan(soon(5)).path);
-  core.setGuidance(standingGuidance("s1", 2, true, {0.1, 0.1}));
-  ASSERT_TRUE(core.standingStart());
-  const auto moving = core.plan(soon(5));
-  EXPECT_TRUE(moving.path) << moving.reason;
-}
-
-TEST(LocalPlanningCore, StandingStartIgnoresStaleAndRepeatedBlocks) {
-  mgg_test::Corridor corridor;
-  const StateVec base = basePose(0.1, 0.1);
-  {
-    // Before any application: a valid block older than a revocation does
-    // not apply; a newer valid one does.
-    LocalPlanningCore core(mgg_test::sceneParams());
-    observeBlind(core, corridor, base);
-    ASSERT_TRUE(
-        core.setMode(follow("s1", "r1", drivingPoint(4.6, 0.1))).accepted);
-    core.setGuidance(standingGuidance("s1", 5, false, {0.1, 0.1}));
-    core.setGuidance(standingGuidance("s1", 4, true, {0.1, 0.1}));
-    EXPECT_FALSE(core.standingStart());
-    core.setGuidance(standingGuidance("s1", 5, true, {0.1, 0.1}));
-    EXPECT_FALSE(core.standingStart());  // a repeated identity
-    core.setGuidance(standingGuidance("s1", 6, true, {0.1, 0.1}));
-    EXPECT_TRUE(core.standingStart());
-  }
-  {
-    // Applied: a repeated identity revokes nothing, and a valid block older
-    // than the revocation that followed does not undo it.
-    LocalPlanningCore core(mgg_test::sceneParams());
-    observeBlind(core, corridor, base);
-    ASSERT_TRUE(
-        core.setMode(follow("s1", "r1", drivingPoint(4.6, 0.1))).accepted);
-    core.setGuidance(standingGuidance("s1", 1, true, {0.1, 0.1}));
-    ASSERT_TRUE(core.standingStart());
-    core.setGuidance(standingGuidance("s1", 1, false, {0.1, 0.1}));
-    EXPECT_TRUE(core.standingStart());
-    core.setGuidance(standingGuidance("s1", 3, false, {0.1, 0.1}));
-    EXPECT_FALSE(core.standingStart());
-    core.setGuidance(standingGuidance("s1", 2, true, {0.1, 0.1}));
-    EXPECT_FALSE(core.standingStart());
-  }
-}
-
-TEST(LocalPlanningCore, StandingStartIsHeldToTheBootAndDiskFirstApplied) {
-  // Once applied, another boot can neither replace, enlarge, shift nor
-  // revoke the disk, and its own boot's later blocks only keep or revoke
-  // it: the disk stays where it was first placed.
-  mgg_test::Corridor corridor;
-  const StateVec base = basePose(0.1, 0.1);
-  LocalPlanningCore core(mgg_test::sceneParams());
-  observeBlind(core, corridor, base);
-  ASSERT_TRUE(
-      core.setMode(follow("s1", "r1", drivingPoint(4.6, 0.1))).accepted);
-  core.setGuidance(standingGuidance("s1", 1, true, {0.1, 0.1}, 2.0, 7));
-  const auto applied = core.standingStart();
-  ASSERT_TRUE(applied);
-  const auto same = [&] {
-    const auto now = core.standingStart();
-    return now && now->center == applied->center &&
-           now->radius == applied->radius;
-  };
-  core.takeInvalidations();
-  core.setGuidance(standingGuidance("s1", 2, true, {1.1, 0.1}, 4.0, 8));
-  EXPECT_TRUE(same());
-  core.setGuidance(standingGuidance("s1", 3, true, {-0.9, 0.1}, 3.0, 6));
-  EXPECT_TRUE(same());
-  core.setGuidance(standingGuidance("s1", 4, false, {0.1, 0.1}, 2.0, 8));
-  EXPECT_TRUE(same());
-  core.setGuidance(standingGuidance("s1", 5, true, {1.1, 0.1}, 4.0, 7));
-  EXPECT_TRUE(same());
-  EXPECT_TRUE(core.takeInvalidations().empty());
-  core.setGuidance(standingGuidance("s1", 6, false, {0.1, 0.1}, 2.0, 7));
-  EXPECT_FALSE(core.standingStart());
-}
-
-TEST(LocalPlanningCore, EarlyGuidanceKeepsTheNewestStandingBlock) {
-  // Guidance answering before the session starts, out of order: the held
-  // message is the newest, so a stale valid block cannot override the
-  // revocation that superseded it.
-  mgg_test::Corridor corridor;
-  const StateVec base = basePose(0.1, 0.1);
-  LocalPlanningCore core(mgg_test::sceneParams());
-  observeBlind(core, corridor, base);
-  core.setGuidance(standingGuidance("s1", 2, false, {0.1, 0.1}));
-  core.setGuidance(standingGuidance("s1", 1, true, {0.1, 0.1}));
-  ASSERT_TRUE(
-      core.setMode(follow("s1", "r1", drivingPoint(4.6, 0.1))).accepted);
-  EXPECT_FALSE(core.standingStart());
-  EXPECT_EQ(core.guidanceSequenceId(), 2u);
-  core.setGuidance(standingGuidance("s1", 3, true, {0.1, 0.1}));
-  EXPECT_TRUE(core.standingStart());
-  // A held block older than one already accepted is fenced at setMode.
-  core.setGuidance(standingGuidance("s2", 2, true, {0.1, 0.1}));
-  ASSERT_TRUE(
-      core.setMode(follow("s2", "r2", drivingPoint(4.6, 0.1))).accepted);
-  EXPECT_FALSE(core.standingStart());
-  core.setGuidance(standingGuidance("s2", 4, true, {0.1, 0.1}));
-  EXPECT_TRUE(core.standingStart());
-}
-
-TEST(LocalPlanningCore, RestartAwayFromTheDiskHasNoStandingStart) {
-  // A local planner restarted mid-run beside the disk of a latched proof:
-  // its own odometry shows the robot is not in it, so no prior, ever.
-  mgg_test::Corridor corridor;
-  const StateVec away = basePose(3.1, 0.1);
-  LocalPlanningCore core(mgg_test::sceneParams());
-  observeBlind(core, corridor, away);
-  ASSERT_TRUE(
-      core.setMode(follow("s1", "r1", drivingPoint(4.6, 0.1))).accepted);
-  core.setGuidance(standingGuidance("s1", 1, true, {0.1, 0.1}));
-  EXPECT_FALSE(core.standingStart());
-  EXPECT_FALSE(core.plan(soon(5)).path);
-  core.onOdometry(basePose(2.6, 0.1));
-  core.onOdometry(basePose(1.6, 0.1));
-  core.setGuidance(standingGuidance("s1", 2, true, {0.1, 0.1}));
-  EXPECT_FALSE(core.standingStart());
-}
-
-TEST(LocalPlanningCore, OdometryJumpRevokesStandingStartForGood) {
-  mgg_test::Corridor corridor;
-  const StateVec base = basePose(0.1, 0.1);
-  LocalPlanningCore core(mgg_test::sceneParams());
-  observeBlind(core, corridor, base);
-  ASSERT_TRUE(
-      core.setMode(follow("s1", "r1", drivingPoint(4.6, 0.1))).accepted);
-  core.setGuidance(standingGuidance("s1", 1, true, {0.1, 0.1}));
-  ASSERT_TRUE(core.standingStart());
-  // A jump that stays in the disk is still no proof of standing there.
-  core.onOdometry(basePose(1.3, 0.1));
-  EXPECT_FALSE(core.standingStart());
-  core.setGuidance(standingGuidance("s1", 2, true, {0.1, 0.1}));
-  EXPECT_FALSE(core.standingStart());
-}
-
-TEST(LocalPlanningCore, LeavingTheDiskBetweenSessionsEndsTheStandingStart) {
-  // Applied in s1; then no block is held (a new session before its
-  // guidance, or IDLE) while the robot drives out of the disk and back in
-  // steps short of a jump. A valid block of the same boot arriving after
-  // that, even one issued before the drive, never re-applies it.
-  mgg_test::Corridor corridor;
-  const StateVec base = basePose(0.1, 0.1);
-  const auto outAndBack = [](LocalPlanningCore& core) {
-    for (double x = 0.35; x <= 2.6; x += 0.25) core.onOdometry(basePose(x, 0.1));
-    for (double x = 2.35; x >= 0.1; x -= 0.25) core.onOdometry(basePose(x, 0.1));
-    core.onOdometry(basePose(0.1, 0.1));
-  };
   LocalModeRequest idle;
   idle.session_id = "s1";
   idle.request_id = "r-idle";
   idle.mode = LocalMode::kIdle;
-  for (const bool use_idle : {false, true}) {
-    SCOPED_TRACE(use_idle ? "IDLE" : "session change");
-    LocalPlanningCore core(mgg_test::sceneParams());
-    observeBlind(core, corridor, base);
-    ASSERT_TRUE(
-        core.setMode(follow("s1", "r1", drivingPoint(4.6, 0.1))).accepted);
-    core.setGuidance(standingGuidance("s1", 1, true, {0.1, 0.1}));
+  ASSERT_TRUE(core.setMode(idle).accepted);
+  LocalGuidance none;
+  none.session_id = "s1";
+  none.sequence_id = 9;
+  none.reason = "idle";
+  core.setGuidance(none);
+  EXPECT_EQ(core.plan(soon(5)).status, LocalStatus::kNoLocalTarget);
+  observeBlind(core, corridor, stopped);
+
+  ASSERT_TRUE(
+      core.setMode(follow("s2", "r2", drivingPoint(6.1, 0.1))).accepted);
+  const auto restarted = core.plan(soon(5));
+  ASSERT_TRUE(restarted.path) << restarted.reason;
+  EXPECT_EQ(restarted.path->session_id, "s2");
+  EXPECT_EQ(restarted.path->kind, LocalPathKind::kStart);
+  ASSERT_TRUE(core.standingStart());
+  EXPECT_TRUE(core.standingStart()->center.isApprox(
+      (stopped.head<2>()), 1e-9));
+}
+
+TEST(LocalPlanningCore, MovingStandingDiskKeepsTheExecutingPath) {
+  // The disk follows the robot each cycle across its blind departure; no
+  // path is withdrawn, and every next path extends the executing one.
+  mgg_test::Corridor corridor;
+  LocalPlanningCore core(standingParams());
+  core.setGroundRecheckBudget(5);
+  observeBlind(core, corridor, basePose(0.1, 0.1));
+  ASSERT_TRUE(
+      core.setMode(follow("s1", "r1", drivingPoint(6.1, 0.1))).accepted);
+  const auto first = core.plan(soon(5));
+  ASSERT_TRUE(first.path) << first.reason;
+  // The deployed recheck budget from here: each move's ground work fits it.
+  core.setGroundRecheckBudget(LocalPlanningParams{}.ground_recheck_s);
+  LocalPathPlan executing = *first.path;
+  double progress = 0;
+  for (int step = 0; step < 8; ++step) {
+    SCOPED_TRACE(::testing::Message() << "step " << step);
+    const StateVec at = drive(core, corridor, executing, progress, progress + 0.25);
+    progress += 0.25;
+    EXPECT_TRUE(core.takeInvalidations().empty());
+    const auto next = core.plan(soon(5));
     ASSERT_TRUE(core.standingStart());
-    if (use_idle) {
-      ASSERT_TRUE(core.setMode(idle).accepted);
-    } else {
-      ASSERT_TRUE(
-          core.setMode(follow("s2", "r2", drivingPoint(4.6, 0.1))).accepted);
+    EXPECT_TRUE(core.standingStart()->center.isApprox(at.head<2>(), 1e-9));
+    EXPECT_EQ(core.ground().pendingCount(), 0);
+    EXPECT_TRUE(core.takeInvalidations().empty());
+    if (next.path) {
+      EXPECT_EQ(next.path->kind, LocalPathKind::kExtend);
+      EXPECT_EQ(next.path->extends_sequence_id, executing.sequence_id);
+      executing = *next.path;
+      progress = 0;
     }
-    EXPECT_FALSE(core.standingStart());
-    outAndBack(core);
-    const std::string session = use_idle ? "s1" : "s2";
-    if (use_idle)
-      ASSERT_TRUE(
-          core.setMode(follow("s1", "r3", drivingPoint(4.6, 0.1))).accepted);
-    core.setGuidance(standingGuidance(session, 2, true, {0.1, 0.1}));
-    EXPECT_FALSE(core.standingStart());
-    core.setGuidance(standingGuidance(session, 3, true, {0.1, 0.1}));
-    EXPECT_FALSE(core.standingStart());
   }
-  {
-    // Control: no drive in between, so the next session's block applies.
-    LocalPlanningCore core(mgg_test::sceneParams());
-    observeBlind(core, corridor, base);
-    ASSERT_TRUE(
-        core.setMode(follow("s1", "r1", drivingPoint(4.6, 0.1))).accepted);
-    core.setGuidance(standingGuidance("s1", 1, true, {0.1, 0.1}));
-    ASSERT_TRUE(
-        core.setMode(follow("s2", "r2", drivingPoint(4.6, 0.1))).accepted);
-    EXPECT_FALSE(core.standingStart());
-    core.setGuidance(standingGuidance("s2", 2, true, {0.1, 0.1}));
-    EXPECT_TRUE(core.standingStart());
+}
+
+TEST(LocalPlanningCore, RetainedPathKeepsTheDiskItWasCertifiedWith) {
+  // The executing departure was certified with the disk round its start.
+  // The disk then moves 2.2 m aside with the robot's odometry, off that
+  // departure's blind ground, and the next path is refused. A map change
+  // reaching the departure rechecks it with its own disk: it stays.
+  mgg_test::Corridor corridor;
+  LocalPlanningCore core(standingParams());
+  core.setGroundRecheckBudget(5);
+  observeBlind(core, corridor, basePose(0.1, 0.1));
+  ASSERT_TRUE(
+      core.setMode(follow("s1", "r1", drivingPoint(4.6, 0.1))).accepted);
+  const auto first = core.plan(soon(5));
+  ASSERT_TRUE(first.path) << first.reason;
+  LocalFeedback feedback;
+  feedback.session_id = "s1";
+  feedback.epoch = core.epoch();
+  feedback.sequence_id = first.path->sequence_id;
+  feedback.executing = true;
+  core.onFeedback(feedback);
+  StateVec aside = basePose(0.1, 0.1);
+  for (const double y : {-0.4, -0.9, -1.4, -1.9, -2.1}) {
+    aside = basePose(0.1, y);
+    core.onOdometry(aside);
   }
+  const auto next = core.plan(soon(5));
+  ASSERT_TRUE(core.standingStart());
+  ASSERT_FALSE(core.standingStart()->covers(first.path->poses.front().head<2>()));
+  if (next.path) {
+    LocalFeedback refusal = feedback;
+    refusal.sequence_id = next.path->sequence_id;
+    refusal.executing = false;
+    refusal.refused = true;
+    core.onFeedback(refusal);
+  }
+  ASSERT_EQ(core.executingSequenceId(), first.path->sequence_id);
+  ASSERT_TRUE(core.takeInvalidations().empty());
+  // A cable 1.2 m over the floor beside the departure, 1.5 m along it:
+  // a change it depends on, harmless, and nothing seen of its blind start.
+  OdomScan ahead;
+  ahead.origin = mgg_test::lidarOrigin(aside);
+  for (double x = 1.3; x <= 1.7; x += 0.1)
+    ahead.points.emplace_back(x, 0.7, 1.1);
+  const auto rechecks = core.retainedRechecks();
+  core.onScan(ahead, aside);
+  ASSERT_GT(core.retainedRechecks(), rechecks);
+  for (const auto& invalidation : core.takeInvalidations())
+    EXPECT_NE(invalidation.sequence_id, first.path->sequence_id);
+}
+
+TEST(LocalPlanningCore, MapChangeWithdrawsAPathAfterTheDiskMoved) {
+  // The executing path keeps the disk it was certified with, but a real map
+  // change that makes its commitment unsafe still withdraws it.
+  mgg_test::Corridor corridor;
+  LocalPlanningCore core(standingParams());
+  core.setGroundRecheckBudget(5);
+  observeBlind(core, corridor, basePose(0.1, 0.1));
+  ASSERT_TRUE(
+      core.setMode(follow("s1", "r1", drivingPoint(6.1, 0.1))).accepted);
+  const auto first = core.plan(soon(5));
+  ASSERT_TRUE(first.path) << first.reason;
+  const StateVec at = drive(core, corridor, *first.path, 0, 0.5);
+  const auto next = core.plan(soon(5));
+  ASSERT_TRUE(next.path) << next.reason;
+  ASSERT_TRUE(core.standingStart());
+  ASSERT_FALSE(core.standingStart()->center.isApprox(
+      first.path->poses.front().head<2>(), 1e-3));
+  ASSERT_TRUE(core.takeInvalidations().empty());
+  // A box across the corridor 1 m ahead, within the commitment (blindScan
+  // sees solids only).
+  corridor.solids.emplace_back(Eigen::Vector3d(at.x() + 0.9, -2.5, -0.1),
+                               Eigen::Vector3d(at.x() + 1.3, 2.5, 1.0));
+  for (int i = 0; i < 3; ++i) core.onScan(blindScan(corridor, at), at);
+  const auto invalidations = core.takeInvalidations();
+  ASSERT_FALSE(invalidations.empty());
+  EXPECT_EQ(invalidations.back().sequence_id, next.path->sequence_id);
+  EXPECT_EQ(invalidations.back().reason,
+            "map change withdrew the path's certification");
 }

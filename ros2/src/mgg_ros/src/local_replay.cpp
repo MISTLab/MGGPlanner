@@ -161,6 +161,8 @@ LocalPlanningParams parameters(const fs::path& file, const std::string& robot) {
             "invalid SensorParams");
   loader.get("local_map/resolution", p.window.resolution);
   loader.get("ground_recheck_s", p.ground_recheck_s);
+  loader.get("hanging_root_edge_length_max", p.hanging_root_edge_length_max);
+  p.hanging_root_edge_length_max = std::max(0.0, p.hanging_root_edge_length_max);
   p.epoch = 1;  // Recorded path identities are translated, never guessed.
   node.reset();
   context->shutdown("parameters loaded");

@@ -58,12 +58,10 @@ void PlannerNode::guidanceTick() {
   std::vector<geometry_msgs::msg::Point> route;
   std::string reason = mode.mode == mode.IDLE ? "idle" : "objective route";
   bool complete = false;
-  std::optional<mgg::StandingStart> standing;
   guidance_target_.reset();
   if (mode.mode != mode.IDLE) {
     try {
       applyLatestOdometry();
-      standing = guidanceStandingStart();
       auto map_read = mapReadLease();
       refreshMapRevision();
       refreshNoGoZones();
@@ -140,9 +138,7 @@ void PlannerNode::guidanceTick() {
       reason = "guidance search interrupted";
     }
   }
-  const auto message = guidance_.message(route, complete, world_frame_, reason,
-                                         now(), standing,
-                                         planner_config_state_.incarnation);
+  const auto message = guidance_.message(route, complete, world_frame_, reason, now());
   guidance_pub_->publish(message);
 }
 

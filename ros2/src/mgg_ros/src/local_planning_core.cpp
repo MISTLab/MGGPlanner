@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <limits>
 #include <stdexcept>
 
 #include "mgg_core/planning_cancellation.h"
@@ -21,10 +22,12 @@ const LocalPlanningParams& validated(const LocalPlanningParams& params) {
     throw std::invalid_argument(
         "LocalPlanningCore plans for ground robots only");
   if (!std::isfinite(params.ground_recheck_s) || params.ground_recheck_s < 0 ||
-      !std::isfinite(params.reset_jump_m) || params.reset_jump_m <= 0)
+      !std::isfinite(params.reset_jump_m) || params.reset_jump_m <= 0 ||
+      !std::isfinite(params.hanging_root_edge_length_max) ||
+      params.hanging_root_edge_length_max < 0)
     throw std::invalid_argument(
-        "LocalPlanningCore: ground_recheck_s must be finite and non-negative, "
-        "reset_jump_m finite and positive");
+        "LocalPlanningCore: ground_recheck_s and hanging_root_edge_length_max "
+        "must be finite and non-negative, reset_jump_m finite and positive");
   return params;
 }
 
@@ -45,6 +48,33 @@ std::vector<Eigen::Vector3d> transformed(
   out.reserve(points.size());
   for (const auto& p : points) out.push_back(T * p);
   return out;
+}
+
+/// The vertical prism over a standing disk's XY bounds: every cached verdict
+/// that may read the disk depends on it.
+Eigen::AlignedBox3d standingBox(const StandingStart& disk) {
+  const double inf = std::numeric_limits<double>::infinity();
+  return Eigen::AlignedBox3d(
+      Eigen::Vector3d(disk.center.x() - disk.radius,
+                      disk.center.y() - disk.radius, -inf),
+      Eigen::Vector3d(disk.center.x() + disk.radius,
+                      disk.center.y() + disk.radius, inf));
+}
+
+/// Where cached verdicts may differ between two standing disks.
+MapChange standingChange(const std::optional<StandingStart>& a,
+                         const std::optional<StandingStart>& b,
+                         std::uint64_t revision) {
+  MapChange change{revision, {}, false};
+  if (a) change.boxes.push_back(standingBox(*a));
+  if (b) change.boxes.push_back(standingBox(*b));
+  return change;
+}
+
+bool sameDisk(const std::optional<StandingStart>& a,
+              const std::optional<StandingStart>& b) {
+  return a.has_value() == b.has_value() &&
+         (!a || (a->center == b->center && a->radius == b->radius));
 }
 
 }  // namespace
@@ -88,8 +118,6 @@ MapChange LocalPlanningCore::place(const StateVec& anchor, bool* reset) {
   const bool jump =
       !have_pose_ ||
       (anchor.head<3>() - anchor_.head<3>()).norm() > params_.reset_jump_m;
-  // After a jump the robot's place is no proof it never left its start.
-  if (jump && have_pose_) standing_start_ended_ = true;
   if (jump) resetAll(anchor, change);
   if (reset) *reset = jump;
   anchor_ = anchor;
@@ -108,7 +136,6 @@ MapChange LocalPlanningCore::onOdometry(const StateVec& robot) {
   }
   planner_.recordPose(anchor);
   afterChange(change);
-  refreshStandingStart();
   return change;
 }
 
@@ -128,7 +155,6 @@ MapChange LocalPlanningCore::onScan(const OdomScan& scan,
   merge(change, map_.insertScan(points, scan.origin, anchor.head<3>()));
   layer_.recenter(anchor.head<3>(), floorUnder(anchor));
   afterChange(change);
-  refreshStandingStart();
   return change;
 }
 
@@ -167,10 +193,27 @@ void LocalPlanningCore::afterChange(const MapChange& change) {
     if (!reached) continue;
     ++retained_rechecks_;
     const double progress = progressOn(sequence);
-    if (!retained.suffix_withdrawn &&
-        planner_.pathStillCertified(retained.path, progress))
-      continue;
-    if (planner_.commitmentStillCertified(retained.path, progress)) {
+    // Judged with the disk it was certified with (applyStandingDisk). The
+    // cache holds verdicts read with the current disk: none crosses over.
+    const bool other_disk = !sameDisk(retained.standing, standing_);
+    const MapChange disks =
+        standingChange(retained.standing, standing_, map_.revision());
+    if (other_disk) {
+      cache_.withdraw(disks);
+      planner_.setStandingStart(retained.standing);
+    }
+    const bool path_certified =
+        !retained.suffix_withdrawn &&
+        planner_.pathStillCertified(retained.path, progress);
+    const bool commitment_certified =
+        path_certified ||
+        planner_.commitmentStillCertified(retained.path, progress);
+    if (other_disk) {
+      planner_.setStandingStart(standing_);
+      cache_.withdraw(disks);
+    }
+    if (path_certified) continue;
+    if (commitment_certified) {
       // Spec §4.4: only an unsafe commitment breaks it. Beyond it the path
       // is withdrawn by replanning from the commitment, while the executor
       // keeps driving within it.
@@ -242,59 +285,19 @@ bool LocalPlanningCore::takeReplanRequest() {
   return requested;
 }
 
-void LocalPlanningCore::acceptStandingStart(const LocalGuidance& guidance) {
-  const GuidanceStandingStart& block = guidance.standing_start;
-  // Once a disk is applied, only the boot that proved it speaks for it.
-  if (standing_ && block.boot != standing_->boot) return;
-  // Stale or repeated: an older block never overrides a newer one. Before
-  // a disk is applied, a later boot (a restarted planner) is newer.
-  const std::pair<std::uint64_t, std::uint64_t> identity{block.boot,
-                                                         guidance.sequence_id};
-  if (standing_identity_ && identity <= *standing_identity_) return;
-  standing_identity_ = identity;
-  standing_block_ = StandingBlock{block, guidance.frame_id};
-  // A revocation after the disk was applied is final; before, a later
-  // valid block may still be the first applied.
-  if (!usable(block) && standing_) standing_start_ended_ = true;
-}
-
-bool LocalPlanningCore::usable(const GuidanceStandingStart& block) {
-  return block.valid && block.center.allFinite() &&
-         std::isfinite(block.radius) && block.radius > 0;
-}
-
-void LocalPlanningCore::refreshStandingStart() {
-  // Leaving a placed disk ends it whether or not a block is held now: across
-  // a session change or IDLE, a robot that left and came back never stands
-  // again.
-  if (standing_ && have_pose_ && !standing_->odom.covers(anchor_.head<2>()))
-    standing_start_ended_ = true;
-  bool apply = false;
-  if (standing_block_ && usable(standing_block_->block) && have_pose_ &&
-      !standing_start_ended_) {
-    if (!standing_) {
-      // Placed once, at first application: neither map-to-odometry
-      // corrections nor later blocks move or enlarge it.
-      std::string failed;
-      if (const auto T = resolve(standing_block_->frame_id, failed)) {
-        const GuidanceStandingStart& block = standing_block_->block;
-        standing_ = AppliedStandingStart{
-            block.boot,
-            StandingStart{(*T * block.center).head<2>(), block.radius}};
-      }
-    }
-    if (standing_) {
-      apply = standing_->odom.covers(anchor_.head<2>());
-      if (!apply) standing_start_ended_ = true;  // placed outside it
-    }
-  }
-  if (apply == standing_applied_) return;
-  standing_applied_ = apply;
-  const std::optional<StandingStart> applied = standingStart();
-  layer_.setStandingStart(applied);
-  planner_.setStandingStart(applied);
-  // Admissions, cached decisions and retained paths may all rest on it.
-  afterChange(MapChange{map_.revision(), {}, true});
+void LocalPlanningCore::applyStandingDisk() {
+  const double radius = params_.hanging_root_edge_length_max;
+  if (!have_pose_ || !(radius > 0)) return;
+  const std::optional<StandingStart> disk =
+      StandingStart{anchor_.head<2>(), radius};
+  if (sameDisk(disk, standing_)) return;
+  const MapChange moved = standingChange(standing_, disk, map_.revision());
+  standing_ = disk;
+  layer_.setStandingStart(standing_);
+  planner_.setStandingStart(standing_);
+  // Cached verdicts read the disk only where it was or is. Retained paths
+  // are not rechecked: the disk moving is no map change under them.
+  cache_.withdraw(moved);
 }
 
 void LocalPlanningCore::setGroundRecheckBudget(double seconds) {
@@ -321,9 +324,6 @@ void LocalPlanningCore::clearSession() {
   progress_ = 0;
   speed_mps_ = 0;
   guidance_.reset();
-  // The session's block goes with it; its identity fence and an ended
-  // standing start stay.
-  standing_block_.reset();
 }
 
 LocalModeResponse LocalPlanningCore::setMode(const LocalModeRequest& request) {
@@ -352,12 +352,9 @@ LocalModeResponse LocalPlanningCore::setMode(const LocalModeRequest& request) {
   mode_ = request.mode;
   request_ = request;
   if (!continuation && early_guidance_ &&
-      early_guidance_->session_id == session_id_) {
+      early_guidance_->session_id == session_id_)
     guidance_ = early_guidance_;
-    acceptStandingStart(*guidance_);
-  }
   early_guidance_.reset();
-  refreshStandingStart();
   response.accepted = true;
   response.reason = continuation ? "session continued" : "session started";
   return response;
@@ -366,18 +363,10 @@ LocalModeResponse LocalPlanningCore::setMode(const LocalModeRequest& request) {
 void LocalPlanningCore::setGuidance(const LocalGuidance& guidance) {
   if (guidance.session_id.empty()) return;
   if (guidance.session_id != session_id_) {
-    // An older message of the held session never replaces a newer one.
-    const auto identity = [](const LocalGuidance& g) {
-      return std::make_pair(g.standing_start.boot, g.sequence_id);
-    };
-    if (!early_guidance_ || early_guidance_->session_id != guidance.session_id ||
-        identity(guidance) > identity(*early_guidance_))
-      early_guidance_ = guidance;
+    early_guidance_ = guidance;
     return;
   }
   guidance_ = guidance;
-  acceptStandingStart(guidance);
-  refreshStandingStart();
 }
 
 void LocalPlanningCore::setNoGoZones(const NoGoZones& zones,
@@ -497,8 +486,7 @@ LocalPlanResult LocalPlanningCore::plan(Clock::time_point deadline) {
   }
   // This cycle replans whatever asked for it.
   replan_requested_ = false;
-  // A transform that was missing when the guidance arrived may exist now.
-  refreshStandingStart();
+  applyStandingDisk();
   recheckGround(deadline);
 
   LocalPlanInputs in;
@@ -555,7 +543,7 @@ LocalPlanResult LocalPlanningCore::plan(Clock::time_point deadline) {
   result = planner_.plan(in, MapChange{map_.revision(), {}, false});
   if (result.path) {
     const std::uint64_t sequence = next_sequence_++;
-    retained_[sequence] = Retained{*result.path, false, false, false};
+    retained_[sequence] = Retained{*result.path, false, false, false, standing_};
     // The next plan extends it unless the executor refuses it (onFeedback).
     executing_sequence_ = sequence;
     while (retained_.size() > kMaxRetained) {

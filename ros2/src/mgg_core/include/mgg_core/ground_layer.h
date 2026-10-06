@@ -46,7 +46,8 @@ class GroundLayer {
   /// below the hint). In a column wholly in the disk an unknown body band
   /// passes; occupied still refuses. Elsewhere unknown stays unknown, in
   /// the body band of a column reaching past the disk's edge too. A change
-  /// withdraws every column.
+  /// withdraws the columns the two disks read differently, and every
+  /// column whose admission rests on one of them.
   void setStandingStart(const std::optional<StandingStart>& standing);
   /// Rechecks dirty columns, nearest the robot first, except that columns
   /// whose dependency reaches one of `first` (an executing commitment's

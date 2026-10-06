@@ -1,15 +1,11 @@
 #ifndef MGG_ROS_GLOBAL_GUIDANCE_H_
 #define MGG_ROS_GLOBAL_GUIDANCE_H_
 
-#include <cstdint>
-#include <optional>
 #include <string>
 #include <vector>
 #include <mgg_msgs/msg/global_guidance.hpp>
 #include <mgg_msgs/msg/local_planner_status.hpp>
 #include <mgg_msgs/srv/set_local_planner_mode.hpp>
-
-#include "mgg_core/ground_projection.h"
 
 namespace mgg {
 
@@ -19,14 +15,10 @@ class GlobalGuidance {
  public:
   bool setMode(const mgg_msgs::srv::SetLocalPlannerMode::Request& request);
   const mgg_msgs::srv::SetLocalPlannerMode::Request& mode() const { return mode_; }
-  /// `standing` (in `frame`) fills the standing_start block, valid when
-  /// set; `boot` is the planner's incarnation, the block's identity.
   mgg_msgs::msg::GlobalGuidance message(
       const std::vector<geometry_msgs::msg::Point>& route, bool complete,
       const std::string& frame, const std::string& reason,
-      const builtin_interfaces::msg::Time& stamp,
-      const std::optional<StandingStart>& standing = std::nullopt,
-      std::uint64_t boot = 0);
+      const builtin_interfaces::msg::Time& stamp);
   bool setsTargetAside(const mgg_msgs::msg::LocalPlannerStatus& status) const;
 
  private:

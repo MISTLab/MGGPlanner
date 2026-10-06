@@ -2429,7 +2429,6 @@ void PlannerNode::refreshMapRevision() {
       global_exploration_ongoing_ = false;
       standing_start_xy_.reset();
       left_standing_start_ = false;
-      guidance_left_standing_disk_ = false;
       bootstrap_started_ns_ = 0;
       setAcquiringObservations(true);
       ++map_identity_changes_;
@@ -2624,36 +2623,6 @@ std::optional<mgg::StandingStart> PlannerNode::readStandingStart() {
   // Round where it stood, the blind disk of its first scans: not where it
   // has crept to since, whose ground its lidar could see.
   return mgg::StandingStart{*standing_start_xy_, hanging_root_edge_length_max_};
-}
-
-std::optional<mgg::StandingStart> PlannerNode::guidanceStandingStart() {
-  if (robot_params_.type != mgg::RobotType::kGroundRobot ||
-      guidance_left_standing_disk_ || !have_odometry_ ||
-      !(hanging_root_edge_length_max_ > 0.0) || keyframe_source_ == nullptr ||
-      !have_mapping_snapshot_) {
-    return std::nullopt;
-  }
-  KeyframeTrajectory trajectory;
-  std::string error;
-  if (!readOwnKeyframes(trajectory, error) || trajectory.poses.empty() ||
-      trajectory.component_id != mapping_snapshot_.component_id ||
-      trajectory.epoch != mapping_snapshot_.epoch) {
-    return std::nullopt;
-  }
-  const Eigen::Isometry3d navigation_from_component = navigationFromComponent();
-  const mgg::StandingStart disk{
-      (navigation_from_component * trajectory.poses.front().translation())
-          .head<2>(),
-      hanging_root_edge_length_max_};
-  bool inside = disk.covers(current_state_.head<2>());
-  for (const Eigen::Isometry3d& pose : trajectory.poses)
-    inside = inside &&
-             disk.covers((navigation_from_component * pose.translation()).head<2>());
-  if (!inside) {
-    guidance_left_standing_disk_ = true;
-    return std::nullopt;
-  }
-  return disk;
 }
 
 bool PlannerNode::standingStartGoalAdmissible(const mgg::StateVec& goal) {
